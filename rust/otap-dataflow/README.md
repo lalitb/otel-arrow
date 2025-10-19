@@ -195,6 +195,12 @@ gRPC streams.
 The OTLP unary gRPC exporter. This corresponds with the `otlp`
 Collector exporter component, exports standard OTLP bytes.
 
+#### Geneva exporter
+
+Uploads OTLP logs and traces to Azure Monitor Geneva using the shared
+`geneva-uploader` client. See [`docs/geneva-exporter.md`](docs/geneva-exporter.md)
+for configuration details and sample pipelines.
+
 [RECEIVER]: https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/receiver/otelarrowreceiver/README.md
 [EXPORTER]: https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/exporter/otelarrowexporter/README.md
 

@@ -49,6 +49,8 @@ otap-df-config = { path = "../config" }
 otap-df-pdata = { path = "../pdata" }
 otap-df-telemetry = { path = "../telemetry" }
 otap-df-telemetry-macros = { path = "../telemetry-macros" }
+geneva-exporter = { path = "../geneva-exporter" }
+opentelemetry-proto = { version = "0.31", default-features = false, features = ["logs", "trace", "gen-tonic-messages"] }
 
 chrono.workspace = true
 tower-service.workspace = true

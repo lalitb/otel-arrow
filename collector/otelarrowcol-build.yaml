@@ -28,6 +28,7 @@ dist:
 exporters:
   # This is the core OpenTelemetry Protocol with Apache Arrow exporter
   - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/otelarrowexporter v0.137.0
+  - gomod: github.com/open-telemetry/otel-azuregigwarm-exporter/exporter/azuregigwarmexporter v0.1.0
 
   - gomod: go.opentelemetry.io/collector/exporter/debugexporter v0.137.0
   - gomod: go.opentelemetry.io/collector/exporter/otlphttpexporter v0.137.0
@@ -50,3 +51,4 @@ extensions:
 
 replaces:
   - github.com/open-telemetry/otel-arrow/go => ../../../go
+  - github.com/open-telemetry/otel-azuregigwarm-exporter => ../../otel-azuregigwarm-exporter

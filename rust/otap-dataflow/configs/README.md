@@ -56,6 +56,14 @@ A pipeline configuration to measure performance metrics, which:
 - Measures and exports performance metrics
 - Default channel sizes of 100
 
+### `otlp-geneva.yaml`
+
+A sample OTLP-to-Geneva pipeline configuration that:
+
+- Receives OTLP traffic on `0.0.0.0:4317`
+- Exports logs and traces via the Geneva exporter (`urn:otel:geneva:exporter`)
+- Demonstrates managed identity settings and retry tuning
+
 ## Usage
 
 You can use these configurations with the following CLI command:

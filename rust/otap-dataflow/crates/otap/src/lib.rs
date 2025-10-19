@@ -9,6 +9,9 @@ use otap_df_engine_macros::pipeline_factory;
 
 /// Code for encoding OTAP batch from pdata view
 pub mod encoder;
+/**/
+/// Implementation of Geneva exporter backed by the Geneva uploader
+pub mod geneva_exporter;
 /// Implementation of OTAP Exporter that implements the exporter trait
 pub mod otap_exporter;
 /// gRPC service implementation

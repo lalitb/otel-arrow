@@ -1,0 +1,15 @@
+[package]
+name = "geneva-exporter"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+description = "Geneva exporter utilities for OTAP dataflow"
+
+[dependencies]
+geneva-uploader = "0.3.0"
+humantime-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
