@@ -50,6 +50,9 @@ otap-df-pdata = { path = "../pdata" }
 otap-df-telemetry = { path = "../telemetry" }
 otap-df-telemetry-macros = { path = "../telemetry-macros" }
 
+# Geneva uploader for sending telemetry to Microsoft Geneva
+geneva-uploader = { path = "../../../../../opentelemetry-rust-contrib/opentelemetry-exporter-geneva/geneva-uploader" }
+
 chrono.workspace = true
 tower-service.workspace = true
 fluke-hpack.workspace = true

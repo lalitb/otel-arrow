@@ -175,6 +175,7 @@ impl OtapBatchProcessor {
     /// with optional metrics for internal telemetry. Functional behavior is unchanged.
     pub fn from_config(
         node: NodeId,
+        node_config: Arc<NodeUserConfig>,
         cfg: &Value,
         proc_cfg: &ProcessorConfig,
         metrics: MetricSet<OtapBatchProcessorMetrics>,
@@ -207,9 +208,6 @@ impl OtapBatchProcessor {
                 config.metadata_cardinality_limit = Some(MIN_METADATA_CARDINALITY_LIMIT);
             }
         }
-        let user_config = Arc::new(NodeUserConfig::new_processor_config(
-            OTAP_BATCH_PROCESSOR_URN,
-        ));
         let proc = OtapBatchProcessor {
             config,
             current_logs: Vec::new(),
@@ -223,7 +221,7 @@ impl OtapBatchProcessor {
             dirty_traces: false,
             metrics,
         };
-        Ok(ProcessorWrapper::local(proc, node, user_config, proc_cfg))
+        Ok(ProcessorWrapper::local(proc, node, node_config, proc_cfg))
     }
 
     /// Flush all per-signal buffers (logs, metrics, traces). Does nothing if all are empty.
@@ -549,7 +547,7 @@ pub fn create_otap_batch_processor(
     processor_config: &ProcessorConfig,
 ) -> Result<ProcessorWrapper<OtapPdata>, ConfigError> {
     let metrics = pipeline_ctx.register_metrics::<OtapBatchProcessorMetrics>();
-    OtapBatchProcessor::from_config(node, &node_config.config, processor_config, metrics)
+    OtapBatchProcessor::from_config(node, node_config.clone(), &node_config.config, processor_config, metrics)
 }
 
 #[async_trait(?Send)]

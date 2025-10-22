@@ -1,0 +1,72 @@
+# End-to-end test configuration: OTLP receiver → Geneva exporter
+# This configuration receives OTLP logs and exports them to Geneva backend
+
+settings:
+  default_pipeline_ctrl_msg_channel_size: 100
+  default_node_ctrl_msg_channel_size: 100
+  default_pdata_channel_size: 100
+
+nodes:
+  # OTLP receiver listening on gRPC port 4317
+  otlp_receiver:
+    kind: receiver
+    plugin_urn: "urn:otel:otlp:receiver"
+    out_ports:
+      out_port:
+        destinations:
+          - otap_batch_processor
+        dispatch_strategy: round_robin
+    config:
+      listening_addr: "127.0.0.1:4317"
+  
+  # OTAP batch processor - converts OTLP to OTAP Arrow format
+  otap_batch_processor:
+    kind: processor
+    plugin_urn: "urn:otap:processor:batch"
+    out_ports:
+      out_port:
+        destinations:
+          - geneva_exporter
+        dispatch_strategy: round_robin
+    config:
+      send_batch_size: 10
+      send_batch_max_size: 100
+      timeout: "100ms"
+  
+  # Geneva exporter - sends to Geneva backend
+  geneva_exporter:
+    kind: exporter
+    plugin_urn: "urn:otel:geneva:exporter"
+    config:
+      # Geneva backend configuration
+      endpoint: "https://gcs.ppe.monitoring.core.windows.net"
+      environment: "Test"
+      account: "PipelineAgent2Demo"
+      namespace: "PAdemo2"
+      region: "eastus"
+      
+      # Service identity
+      tenant: "Default"
+      role_name: "OtelCollector"
+      role_instance: "test-instance-1"
+      
+      # Geneva config version
+      config_major_version: 2
+      
+      # Authentication configuration
+      # Option 1: Certificate-based authentication (recommended for production)
+      # NOTE: Requires PKCS#12 (.p12) format. Convert from PEM:
+      #   openssl pkcs12 -export -in cert.pem -inkey key.pem -out client.p12
+      auth:
+        type: "certificate"
+        path: "/tmp/client.p12"
+        password: "password"
+      
+      # Option 2: Mock authentication (for testing without real backend)
+      # Uncomment the following to use mock auth:
+      # auth:
+      #   type: "mock"
+      
+      # Performance tuning (reduced for testing to see immediate output)
+      max_concurrent_uploads: 2
+      max_buffer_size: 1

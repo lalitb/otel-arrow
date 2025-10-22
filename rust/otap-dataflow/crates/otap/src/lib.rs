@@ -23,6 +23,9 @@ pub mod otlp_receiver;
 /// Implementation of OTLP exporter that implements the exporter trait
 pub mod otlp_exporter;
 
+/// Implementation of Geneva exporter that sends logs to Microsoft Geneva
+pub mod geneva_exporter;
+
 // OTAP batch processor
 pub mod otap_batch_processor;
 
