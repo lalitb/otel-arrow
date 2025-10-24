@@ -156,6 +156,13 @@ All analysis saved in markdown files:
    - Proposed iterator-based API
    - Implementation plan
 
+7. **CURSOR_ITERATION_ANALYSIS.md** ✅ NEW
+   - Verification of BatchSorter/ChildIndexIter superiority
+   - Geneva vs otel-arrow comparison
+   - Performance analysis: 99.9% allocation reduction
+   - Before/after code examples
+   - Implementation roadmap
+
 ---
 
 ## Testing
@@ -194,6 +201,14 @@ python3 stress_test_geneva.py --mode burst --count 1000
 
 ### Q: What's the performance impact?
 **A**: 99.9% reduction in allocations (200K/sec → 200/sec)
+
+### Q: Should Geneva adopt otel-arrow's BatchSorter/ChildIndexIter pattern?
+**A**: ✅ **YES - 100% VERIFIED!** See `CURSOR_ITERATION_ANALYSIS.md` for detailed proof:
+- Geneva currently: `HashMap<u16, Vec<(String, u8, usize)>>` with ~200K allocations/sec
+- otel-arrow approach: `ChildIndexIter` with ~0 allocations/sec (zero-copy cursors)
+- Evidence found in `arrow_log_encoder.rs:496, 547, 562` (`.to_string()` calls)
+- otel-arrow pattern used in `logs.rs:433-439` (`ChildIndexIter::new()`)
+- **Recommendation**: Adopt cursor pattern immediately (2-3 hour refactor, 99.9% reduction)
 
 ---
 

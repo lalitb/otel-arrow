@@ -10,7 +10,10 @@ pub mod metrics;
 pub mod traces;
 
 mod common;
-pub use common::ProtoBuffer;
+pub use common::{ProtoBuffer, BatchSorter, ChildIndexIter, SortedBatchCursor};
+
+// Re-export array accessor types for external use
+pub use crate::arrays::{NullableArrayAccessor, ByteArrayAccessor, StringArrayAccessor, Int32ArrayAccessor};
 
 use crate::{error::Result, otap::OtapArrowRecords};
 

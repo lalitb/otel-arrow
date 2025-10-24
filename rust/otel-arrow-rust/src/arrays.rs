@@ -14,11 +14,15 @@ use arrow::datatypes::{
 use paste::paste;
 use snafu::{OptionExt, ensure};
 
+/// Trait for accessing nullable Arrow array values with zero-copy semantics
 pub trait NullableArrayAccessor {
+    /// The native Rust type for values in this array
     type Native;
 
+    /// Get the value at the specified index, returning None if null
     fn value_at(&self, idx: usize) -> Option<Self::Native>;
 
+    /// Get the value at the specified index, returning the default if null
     fn value_at_or_default(&self, idx: usize) -> Self::Native
     where
         Self::Native: Default,
@@ -115,6 +119,7 @@ impl NullableArrayAccessor for StringArray {
 macro_rules! impl_downcast {
     ($suffix:ident, $data_type:expr, $array_type:ident) => {
         paste!{
+            #[doc = "Get an optional array from a RecordBatch by column name"]
             pub fn [<get_ $suffix _array_opt> ]<'a>(rb: &'a RecordBatch, name: &str) -> error::Result<Option<&'a $array_type>> {
                 use arrow::datatypes::DataType::*;
                 rb.column_by_name(name)
@@ -129,6 +134,7 @@ macro_rules! impl_downcast {
                 }).transpose()
             }
 
+            #[doc = "Get a required array from a RecordBatch by column name"]
               pub fn [<get_ $suffix _array> ]<'a>(rb: &'a RecordBatch, name: &str) -> error::Result<&'a $array_type> {
                 use arrow::datatypes::DataType::*;
                 let arr = get_required_array(rb, name)?;
@@ -239,11 +245,14 @@ where
 /// this delegates to the underlying NullableArrayAccessor implementation
 /// for the Arrow array which copies the bytes when value_at is called
 pub enum ByteArrayAccessor<'a> {
+    /// Binary array accessor
     Binary(MaybeDictArrayAccessor<'a, BinaryArray>),
+    /// Fixed-size binary array accessor
     FixedSizeBinary(MaybeDictArrayAccessor<'a, FixedSizeBinaryArray>),
 }
 
 impl<'a> ByteArrayAccessor<'a> {
+    /// Create a new ByteArrayAccessor for the specified column in a RecordBatch
     pub fn try_new_for_column(
         record_batch: &'a RecordBatch,
         column_name: &str,
@@ -251,6 +260,7 @@ impl<'a> ByteArrayAccessor<'a> {
         Self::try_new(get_required_array(record_batch, column_name)?)
     }
 
+    /// Create a new ByteArrayAccessor from an ArrayRef
     pub fn try_new(arr: &'a ArrayRef) -> error::Result<Self> {
         match arr.data_type() {
             DataType::Binary => {
@@ -308,6 +318,7 @@ impl NullableArrayAccessor for ByteArrayAccessor<'_> {
 }
 
 impl<'a> ByteArrayAccessor<'a> {
+    /// Get a byte slice at the specified index without copying
     pub fn slice_at(&self, idx: usize) -> Option<&[u8]> {
         match self {
             Self::Binary(b) => b.slice_at(idx),
@@ -507,11 +518,17 @@ impl<'a> MaybeDictArrayAccessor<'a, StringArray> {
     }
 }
 
+/// Accessor for UInt32 arrays (may be dictionary-encoded)
 pub type UInt32ArrayAccessor<'a> = MaybeDictArrayAccessor<'a, UInt32Array>;
+/// Accessor for Int32 arrays (may be dictionary-encoded)
 pub type Int32ArrayAccessor<'a> = MaybeDictArrayAccessor<'a, Int32Array>;
+/// Accessor for Int64 arrays (may be dictionary-encoded)
 pub type Int64ArrayAccessor<'a> = MaybeDictArrayAccessor<'a, Int64Array>;
+/// Accessor for String arrays (may be dictionary-encoded)
 pub type StringArrayAccessor<'a> = MaybeDictArrayAccessor<'a, StringArray>;
+/// Accessor for FixedSizeBinary arrays (may be dictionary-encoded)
 pub type FixedSizeBinaryArrayAccessor<'a> = MaybeDictArrayAccessor<'a, FixedSizeBinaryArray>;
+/// Accessor for DurationNanosecond arrays (may be dictionary-encoded)
 pub type DurationNanosArrayAccessor<'a> = MaybeDictArrayAccessor<'a, DurationNanosecondArray>;
 
 pub struct DictionaryArrayAccessor<'a, K, V>

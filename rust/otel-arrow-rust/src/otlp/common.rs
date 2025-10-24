@@ -256,7 +256,7 @@ impl fmt::Display for AnyValue {
     }
 }
 
-pub(crate) struct AnyValueArrays<'a> {
+pub struct AnyValueArrays<'a> {
     pub attr_type: &'a UInt8Array,
     pub attr_str: Option<StringArrayAccessor<'a>>,
     pub attr_int: Option<Int64ArrayAccessor<'a>>,
@@ -466,9 +466,9 @@ pub(crate) fn patch_len_placeholder(
 /// The motivation behind using this cursor is that it will hopefully be more efficient to
 /// initialize this than sorting the entire [`RecordBatch`].
 #[derive(Debug)]
-pub(crate) struct SortedBatchCursor {
-    sorted_indices: Vec<usize>,
-    curr_index: usize,
+pub struct SortedBatchCursor {
+    pub sorted_indices: Vec<usize>,
+    pub curr_index: usize,
 }
 
 impl SortedBatchCursor {
@@ -505,7 +505,7 @@ impl SortedBatchCursor {
 
 /// This is used to initialize the [`SortedBatchCursor`]. It does this by sorting the IDs and then
 /// filling in the cursors indices to visit based on the sorted ID column.
-pub(crate) struct BatchSorter {
+pub struct BatchSorter {
     row_converter: RowConverter,
 
     // when we sort the record batch, to it's indices we put the ID columns into these Vecs before
@@ -686,7 +686,7 @@ impl BatchSorter {
 }
 
 /// Iterates the indices of some child record batch
-pub(crate) struct ChildIndexIter<'a, T: ArrowPrimitiveType> {
+pub struct ChildIndexIter<'a, T: ArrowPrimitiveType> {
     pub parent_id: T::Native,
     pub parent_id_col: &'a MaybeDictArrayAccessor<'a, PrimitiveArray<T>>,
     pub cursor: &'a mut SortedBatchCursor,

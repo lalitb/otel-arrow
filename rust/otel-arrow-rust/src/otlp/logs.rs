@@ -33,19 +33,19 @@ use crate::schema::consts;
 
 use super::attributes::AttributeValueType;
 
-struct LogsArrays<'a> {
-    id: &'a UInt16Array,
-    schema_url: Option<StringArrayAccessor<'a>>,
-    time_unix_nano: Option<&'a TimestampNanosecondArray>,
-    observed_time_unix_nano: Option<&'a TimestampNanosecondArray>,
-    trace_id: Option<ByteArrayAccessor<'a>>,
-    span_id: Option<ByteArrayAccessor<'a>>,
-    severity_number: Option<Int32ArrayAccessor<'a>>,
-    severity_text: Option<StringArrayAccessor<'a>>,
-    body: Option<LogBodyArrays<'a>>,
-    dropped_attributes_count: Option<&'a UInt32Array>,
-    flags: Option<&'a UInt32Array>,
-    event_name: Option<StringArrayAccessor<'a>>,
+pub struct LogsArrays<'a> {
+    pub id: &'a UInt16Array,
+    pub schema_url: Option<StringArrayAccessor<'a>>,
+    pub time_unix_nano: Option<&'a TimestampNanosecondArray>,
+    pub observed_time_unix_nano: Option<&'a TimestampNanosecondArray>,
+    pub trace_id: Option<ByteArrayAccessor<'a>>,
+    pub span_id: Option<ByteArrayAccessor<'a>>,
+    pub severity_number: Option<Int32ArrayAccessor<'a>>,
+    pub severity_text: Option<StringArrayAccessor<'a>>,
+    pub body: Option<LogBodyArrays<'a>>,
+    pub dropped_attributes_count: Option<&'a UInt32Array>,
+    pub flags: Option<&'a UInt32Array>,
+    pub event_name: Option<StringArrayAccessor<'a>>,
 }
 
 impl<'a> TryFrom<&'a RecordBatch> for LogsArrays<'a> {
@@ -117,9 +117,9 @@ impl<'a> TryFrom<&'a RecordBatch> for LogsArrays<'a> {
     }
 }
 
-struct LogBodyArrays<'a> {
-    body: &'a StructArray,
-    anyval_arrays: AnyValueArrays<'a>,
+pub struct LogBodyArrays<'a> {
+    pub body: &'a StructArray,
+    pub anyval_arrays: AnyValueArrays<'a>,
 }
 
 impl<'a> LogBodyArrays<'a> {

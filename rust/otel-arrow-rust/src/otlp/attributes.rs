@@ -35,10 +35,10 @@ pub enum AttributeValueType {
     Bytes = 7,
 }
 
-pub(crate) type Attribute16Arrays<'a> = AttributeArrays<'a, UInt16Type>;
-pub(crate) type Attribute32Arrays<'a> = AttributeArrays<'a, UInt32Type>;
+pub type Attribute16Arrays<'a> = AttributeArrays<'a, UInt16Type>;
+pub type Attribute32Arrays<'a> = AttributeArrays<'a, UInt32Type>;
 
-pub(crate) struct AttributeArrays<'a, T: ArrowPrimitiveType> {
+pub struct AttributeArrays<'a, T: ArrowPrimitiveType> {
     pub parent_id: MaybeDictArrayAccessor<'a, PrimitiveArray<T>>,
     pub attr_key: MaybeDictArrayAccessor<'a, StringArray>,
     pub anyval_arrays: AnyValueArrays<'a>,
