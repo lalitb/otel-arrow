@@ -32,7 +32,7 @@ echo
 PROTO_PATH="/Users/lalitb/work/obs/otel/rust-collector-2/otel-arrow/proto/opentelemetry-proto"
 
 for i in {1..10}; do
-  echo "  Sending log $i/1..."
+  echo "  Sending log $i/10..."
   grpcurl -plaintext \
     -proto "$PROTO_PATH/opentelemetry/proto/collector/logs/v1/logs_service.proto" \
     -import-path "$PROTO_PATH" \
@@ -61,7 +61,7 @@ for i in {1..10}; do
         "attributes": [
           {"key": "event_name", "value": {"string_value": "testevent"}},
           {"key": "user_id", "value": {"string_value": "user123"}},
-          {"key": "status_code", "value": {"string_value": "200"}}
+          {"key": "status_code", "value": {"int_value": "200"}}
         ]
       }]
     }]

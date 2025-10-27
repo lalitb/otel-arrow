@@ -29,6 +29,7 @@
 //! - **SYSLOG Backend**: Zero-allocation parsing of syslog/CEF strings
 
 pub mod otlp;
+pub mod otap;
 
 pub mod common;
 pub mod logs;
