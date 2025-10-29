@@ -205,6 +205,25 @@ See the instructions in [RELEASING.md][].
 
 ### Local development issues: Rust
 
+#### VSCode rust-analyzer Setup
+
+This repository contains multiple Rust workspaces in the `rust/` directory. For
+proper rust-analyzer support in VSCode, configure the
+`rust-analyzer.linkedProjects` setting in `.vscode/settings.json` to list all
+`Cargo.toml` files:
+
+```json
+{
+  "rust-analyzer.linkedProjects": [
+    "${workspaceFolder}/rust/<project1>/Cargo.toml",
+    "${workspaceFolder}/rust/<project2>/Cargo.toml"
+  ]
+}
+```
+
+This ensures rust-analyzer recognizes all Rust projects for proper code
+completion and diagnostics.
+
 See the `otap-dataflow`-specific [CONTRIBUTING][OTAPDATAFLOWCONTRIBUTING].
 
 [OTAPDATAFLOWCONTRIBUTING]: ./rust/otap-dataflow/CONTRIBUTING.md
