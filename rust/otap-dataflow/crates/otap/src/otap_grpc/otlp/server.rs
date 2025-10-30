@@ -244,43 +244,61 @@ impl UnaryService<OtapPdata> for OtapBatchService {
     type Future = BoxFuture<'static, Result<tonic::Response<Self::Response>, Status>>;
 
     fn call(&mut self, request: tonic::Request<OtapPdata>) -> Self::Future {
+        eprintln!("[DEBUG] OTLP server: received gRPC request");
         let mut otap_batch = request.into_inner();
+        eprintln!("[DEBUG] OTLP server: extracted OtapPdata from request");
 
         let effect_handler = self
             .effect_handler
             .take()
             .expect("`OtapBatchService` is not reused for multiple calls");
         let state = self.state.clone();
+        eprintln!("[DEBUG] OTLP server: wait_for_result={}", state.is_some());
         Box::pin(async move {
             let cancel_rx = if let Some(state) = state {
+                eprintln!("[DEBUG] OTLP server: allocating slot for wait_for_result");
                 // Try to allocate a slot (under the mutex) for calldata.
                 let (key, rx) = match state
                     .0
                     .lock()
                     .map(|mut state| state.allocate(|| oneshot::channel()))
                 {
-                    Err(_) => return Err(Status::internal("Mutex poisoned")),
+                    Err(_) => {
+                        eprintln!("[DEBUG] OTLP server: FAILED - mutex poisoned");
+                        return Err(Status::internal("Mutex poisoned"));
+                    }
                     Ok(None) => {
+                        eprintln!("[DEBUG] OTLP server: FAILED - too many concurrent requests");
                         return Err(Status::resource_exhausted("Too many concurrent requests"));
                     }
-                    Ok(Some(pair)) => pair,
+                    Ok(Some(pair)) => {
+                        eprintln!("[DEBUG] OTLP server: allocated slot key={:?}", pair.0);
+                        pair
+                    }
                 };
 
                 // Enter the subscription. Slot key becomes calldata.
+                eprintln!("[DEBUG] OTLP server: subscribing to Acks/Nacks");
                 effect_handler.subscribe_to(
                     Interests::ACKS | Interests::NACKS,
                     key.into(),
                     &mut otap_batch,
                 );
+                eprintln!("[DEBUG] OTLP server: subscription complete");
                 Some((SlotGuard { key, state }, rx))
             } else {
+                eprintln!("[DEBUG] OTLP server: no wait_for_result, proceeding without slot");
                 None
             };
 
             // Send and wait for Ack/Nack
+            eprintln!("[DEBUG] OTLP server: sending message to pipeline");
             match effect_handler.send_message(otap_batch).await {
-                Ok(_) => {}
+                Ok(_) => {
+                    eprintln!("[DEBUG] OTLP server: message sent successfully to pipeline");
+                }
                 Err(e) => {
+                    eprintln!("[DEBUG] OTLP server: FAILED to send to pipeline: {}", e);
                     return Err(Status::internal(format!("Failed to send to pipeline: {e}")));
                 }
             };
@@ -288,9 +306,13 @@ impl UnaryService<OtapPdata> for OtapBatchService {
             // If backpressure, await a response. The guard will cancel and return the
             // slot if Tonic times-out this task.
             if let Some((_cancel_guard, rx)) = cancel_rx {
+                eprintln!("[DEBUG] OTLP server: waiting for Ack/Nack response");
                 match rx.await {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => {
+                        eprintln!("[DEBUG] OTLP server: received Ack from pipeline");
+                    }
                     Ok(Err(nack)) => {
+                        eprintln!("[DEBUG] OTLP server: received Nack from pipeline: {}", nack.reason);
                         // TODO: Use more specific status codes based on nack reason/type
                         // when more detailed error information is available from the pipeline
                         return Err(Status::unavailable(format!(
@@ -299,11 +321,15 @@ impl UnaryService<OtapPdata> for OtapBatchService {
                         )));
                     }
                     Err(_) => {
+                        eprintln!("[DEBUG] OTLP server: response channel closed unexpectedly");
                         return Err(Status::internal("Response channel closed unexpectedly"));
                     }
                 }
+            } else {
+                eprintln!("[DEBUG] OTLP server: no wait_for_result, returning immediately");
             }
 
+            eprintln!("[DEBUG] OTLP server: request completed successfully");
             Ok(tonic::Response::new(()))
         })
     }
