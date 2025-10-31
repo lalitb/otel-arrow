@@ -312,7 +312,10 @@ impl UnaryService<OtapPdata> for OtapBatchService {
                         eprintln!("[DEBUG] OTLP server: received Ack from pipeline");
                     }
                     Ok(Err(nack)) => {
-                        eprintln!("[DEBUG] OTLP server: received Nack from pipeline: {}", nack.reason);
+                        eprintln!(
+                            "[DEBUG] OTLP server: received Nack from pipeline: {}",
+                            nack.reason
+                        );
                         // TODO: Use more specific status codes based on nack reason/type
                         // when more detailed error information is available from the pipeline
                         return Err(Status::unavailable(format!(

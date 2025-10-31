@@ -164,35 +164,46 @@ impl GenevaExporter {
                 error: e.to_string(),
             }
         })?;
-        eprintln!("[DEBUG] Geneva exporter: config parsed successfully - endpoint={}, account={}, namespace={}", 
-            config.endpoint, config.account, config.namespace);
+        eprintln!(
+            "[DEBUG] Geneva exporter: config parsed successfully - endpoint={}, account={}, namespace={}",
+            config.endpoint, config.account, config.namespace
+        );
 
         // Convert AuthConfig to AuthMethod
         eprintln!("[DEBUG] Geneva exporter: converting auth config to auth method");
         let auth_method = match &config.auth {
             AuthConfig::Certificate { path, password } => {
-                eprintln!("[DEBUG] Geneva exporter: using Certificate auth, path={}", path);
+                eprintln!(
+                    "[DEBUG] Geneva exporter: using Certificate auth, path={}",
+                    path
+                );
                 AuthMethod::Certificate {
                     path: PathBuf::from(path),
                     password: password.clone(),
                 }
-            },
+            }
             AuthConfig::SystemManagedIdentity { .. } => {
                 eprintln!("[DEBUG] Geneva exporter: using SystemManagedIdentity auth");
                 AuthMethod::SystemManagedIdentity
-            },
+            }
             AuthConfig::UserManagedIdentity { client_id, .. } => {
-                eprintln!("[DEBUG] Geneva exporter: using UserManagedIdentity auth, client_id={}", client_id);
+                eprintln!(
+                    "[DEBUG] Geneva exporter: using UserManagedIdentity auth, client_id={}",
+                    client_id
+                );
                 AuthMethod::UserManagedIdentity {
                     client_id: client_id.clone(),
                 }
-            },
+            }
             AuthConfig::WorkloadIdentity { msi_resource } => {
-                eprintln!("[DEBUG] Geneva exporter: using WorkloadIdentity auth, resource={}", msi_resource);
+                eprintln!(
+                    "[DEBUG] Geneva exporter: using WorkloadIdentity auth, resource={}",
+                    msi_resource
+                );
                 AuthMethod::WorkloadIdentity {
                     resource: msi_resource.clone(),
                 }
-            },
+            }
         };
 
         // Get MSI resource if needed for managed identity
@@ -222,7 +233,10 @@ impl GenevaExporter {
         // Initialize Geneva client
         eprintln!("[DEBUG] Geneva exporter: initializing GenevaClient");
         let geneva_client = GenevaClient::new(client_config).map_err(|e| {
-            eprintln!("[DEBUG] Geneva exporter: FAILED to initialize GenevaClient: {}", e);
+            eprintln!(
+                "[DEBUG] Geneva exporter: FAILED to initialize GenevaClient: {}",
+                e
+            );
             otap_df_config::error::Error::InvalidUserConfig {
                 error: format!("Failed to initialize Geneva client: {}", e),
             }
@@ -261,7 +275,7 @@ impl GenevaExporter {
         effect_handler: &EffectHandler<OtapPdata>,
     ) -> Result<(), String> {
         eprintln!("[DEBUG] Geneva exporter: handle_pdata called");
-        
+
         // Split pdata into context and payload
         let (_context, payload) = pdata.into_parts();
         eprintln!("[DEBUG] Geneva exporter: split pdata into context and payload");
@@ -269,30 +283,39 @@ impl GenevaExporter {
         // Convert OTAP payload to OTLP bytes
         // TODO: This conversion step should be eliminated (see method documentation above)
         eprintln!("[DEBUG] Geneva exporter: converting OTAP to OTLP");
-        let otlp_bytes: OtlpProtoBytes = payload
-            .try_into()
-            .map_err(|e| {
-                eprintln!("[DEBUG] Geneva exporter: FAILED to convert OTAP to OTLP: {:?}", e);
-                format!("Failed to convert OTAP to OTLP: {:?}", e)
-            })?;
+        let otlp_bytes: OtlpProtoBytes = payload.try_into().map_err(|e| {
+            eprintln!(
+                "[DEBUG] Geneva exporter: FAILED to convert OTAP to OTLP: {:?}",
+                e
+            );
+            format!("Failed to convert OTAP to OTLP: {:?}", e)
+        })?;
         eprintln!("[DEBUG] Geneva exporter: successfully converted to OTLP");
 
         // Process based on signal type
         match otlp_bytes {
             OtlpProtoBytes::ExportLogsRequest(bytes) => {
-                eprintln!("[DEBUG] Geneva exporter: processing logs request, {} bytes", bytes.len());
+                eprintln!(
+                    "[DEBUG] Geneva exporter: processing logs request, {} bytes",
+                    bytes.len()
+                );
                 effect_handler
                     .info("Converting and uploading logs to Geneva")
                     .await;
 
                 // Decode OTLP bytes to ResourceLogs
                 eprintln!("[DEBUG] Geneva exporter: decoding OTLP bytes to ResourceLogs");
-                let logs_request = ExportLogsServiceRequest::decode(&bytes[..])
-                    .map_err(|e| {
-                        eprintln!("[DEBUG] Geneva exporter: FAILED to decode logs request: {}", e);
-                        format!("Failed to decode logs request: {}", e)
-                    })?;
-                eprintln!("[DEBUG] Geneva exporter: decoded {} resource logs", logs_request.resource_logs.len());
+                let logs_request = ExportLogsServiceRequest::decode(&bytes[..]).map_err(|e| {
+                    eprintln!(
+                        "[DEBUG] Geneva exporter: FAILED to decode logs request: {}",
+                        e
+                    );
+                    format!("Failed to decode logs request: {}", e)
+                })?;
+                eprintln!(
+                    "[DEBUG] Geneva exporter: decoded {} resource logs",
+                    logs_request.resource_logs.len()
+                );
 
                 // Encode and compress using Geneva client
                 eprintln!("[DEBUG] Geneva exporter: encoding and compressing logs");
@@ -303,24 +326,39 @@ impl GenevaExporter {
                         eprintln!("[DEBUG] Geneva exporter: FAILED to encode logs: {}", e);
                         format!("Failed to encode logs: {}", e)
                     })?;
-                eprintln!("[DEBUG] Geneva exporter: created {} batches for upload", batches.len());
+                eprintln!(
+                    "[DEBUG] Geneva exporter: created {} batches for upload",
+                    batches.len()
+                );
 
                 // TODO: This is sequential batch upload.
                 // Consider revisiting to implementing concurrent uploads
                 // Upload each batch
                 for (i, batch) in batches.iter().enumerate() {
-                    eprintln!("[DEBUG] Geneva exporter: uploading batch {}/{}", i + 1, batches.len());
-                    self.geneva_client
-                        .upload_batch(batch)
-                        .await
-                        .map_err(|e| {
-                            eprintln!("[DEBUG] Geneva exporter: FAILED to upload batch {}: {}", i + 1, e);
-                            format!("Failed to upload log batch: {}", e)
-                        })?;
-                    eprintln!("[DEBUG] Geneva exporter: successfully uploaded batch {}/{}", i + 1, batches.len());
+                    eprintln!(
+                        "[DEBUG] Geneva exporter: uploading batch {}/{}",
+                        i + 1,
+                        batches.len()
+                    );
+                    self.geneva_client.upload_batch(batch).await.map_err(|e| {
+                        eprintln!(
+                            "[DEBUG] Geneva exporter: FAILED to upload batch {}: {}",
+                            i + 1,
+                            e
+                        );
+                        format!("Failed to upload log batch: {}", e)
+                    })?;
+                    eprintln!(
+                        "[DEBUG] Geneva exporter: successfully uploaded batch {}/{}",
+                        i + 1,
+                        batches.len()
+                    );
                 }
 
-                eprintln!("[DEBUG] Geneva exporter: all {} batches uploaded successfully", batches.len());
+                eprintln!(
+                    "[DEBUG] Geneva exporter: all {} batches uploaded successfully",
+                    batches.len()
+                );
                 effect_handler
                     .info(&format!(
                         "Successfully uploaded {} log batches to Geneva",
@@ -329,19 +367,28 @@ impl GenevaExporter {
                     .await;
             }
             OtlpProtoBytes::ExportTracesRequest(bytes) => {
-                eprintln!("[DEBUG] Geneva exporter: processing traces request, {} bytes", bytes.len());
+                eprintln!(
+                    "[DEBUG] Geneva exporter: processing traces request, {} bytes",
+                    bytes.len()
+                );
                 effect_handler
                     .info("Converting and uploading traces to Geneva")
                     .await;
 
                 // Decode OTLP bytes to ResourceSpans
                 eprintln!("[DEBUG] Geneva exporter: decoding OTLP bytes to ResourceSpans");
-                let traces_request = ExportTraceServiceRequest::decode(&bytes[..])
-                    .map_err(|e| {
-                        eprintln!("[DEBUG] Geneva exporter: FAILED to decode traces request: {}", e);
+                let traces_request =
+                    ExportTraceServiceRequest::decode(&bytes[..]).map_err(|e| {
+                        eprintln!(
+                            "[DEBUG] Geneva exporter: FAILED to decode traces request: {}",
+                            e
+                        );
                         format!("Failed to decode traces request: {}", e)
                     })?;
-                eprintln!("[DEBUG] Geneva exporter: decoded {} resource spans", traces_request.resource_spans.len());
+                eprintln!(
+                    "[DEBUG] Geneva exporter: decoded {} resource spans",
+                    traces_request.resource_spans.len()
+                );
 
                 // Encode and compress using Geneva client
                 eprintln!("[DEBUG] Geneva exporter: encoding and compressing spans");
@@ -352,24 +399,39 @@ impl GenevaExporter {
                         eprintln!("[DEBUG] Geneva exporter: FAILED to encode spans: {}", e);
                         format!("Failed to encode spans: {}", e)
                     })?;
-                eprintln!("[DEBUG] Geneva exporter: created {} batches for upload", batches.len());
+                eprintln!(
+                    "[DEBUG] Geneva exporter: created {} batches for upload",
+                    batches.len()
+                );
 
                 // TODO: This is sequential batch upload.
                 // Consider revisiting to implementing concurrent uploads
                 // Upload each batch
                 for (i, batch) in batches.iter().enumerate() {
-                    eprintln!("[DEBUG] Geneva exporter: uploading batch {}/{}", i + 1, batches.len());
-                    self.geneva_client
-                        .upload_batch(batch)
-                        .await
-                        .map_err(|e| {
-                            eprintln!("[DEBUG] Geneva exporter: FAILED to upload batch {}: {}", i + 1, e);
-                            format!("Failed to upload trace batch: {}", e)
-                        })?;
-                    eprintln!("[DEBUG] Geneva exporter: successfully uploaded batch {}/{}", i + 1, batches.len());
+                    eprintln!(
+                        "[DEBUG] Geneva exporter: uploading batch {}/{}",
+                        i + 1,
+                        batches.len()
+                    );
+                    self.geneva_client.upload_batch(batch).await.map_err(|e| {
+                        eprintln!(
+                            "[DEBUG] Geneva exporter: FAILED to upload batch {}: {}",
+                            i + 1,
+                            e
+                        );
+                        format!("Failed to upload trace batch: {}", e)
+                    })?;
+                    eprintln!(
+                        "[DEBUG] Geneva exporter: successfully uploaded batch {}/{}",
+                        i + 1,
+                        batches.len()
+                    );
                 }
 
-                eprintln!("[DEBUG] Geneva exporter: all {} batches uploaded successfully", batches.len());
+                eprintln!(
+                    "[DEBUG] Geneva exporter: all {} batches uploaded successfully",
+                    batches.len()
+                );
                 effect_handler
                     .info(&format!(
                         "Successfully uploaded {} trace batches to Geneva",
@@ -445,7 +507,10 @@ impl Exporter<OtapPdata> for GenevaExporter {
                     eprintln!("[DEBUG] Geneva exporter: received PData message");
                     // Convert OTAP to OTLP and upload to Geneva
                     if let Err(e) = self.handle_pdata(pdata, &effect_handler).await {
-                        eprintln!("[DEBUG] Geneva exporter: handle_pdata returned error: {}", e);
+                        eprintln!(
+                            "[DEBUG] Geneva exporter: handle_pdata returned error: {}",
+                            e
+                        );
                         effect_handler
                             .info(&format!("ERROR: Failed to export to Geneva: {}", e))
                             .await;

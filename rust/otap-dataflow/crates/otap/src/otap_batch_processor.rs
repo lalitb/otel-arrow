@@ -178,14 +178,16 @@ impl OtapBatchProcessor {
         cfg: &Value,
         metrics: MetricSet<OtapBatchProcessorMetrics>,
     ) -> Result<Self, ConfigError> {
-        eprintln!("[DEBUG] Batch processor: build_from_json called with config: {:?}", cfg);
-        let mut config: Config =
-            serde_json::from_value(cfg.clone()).map_err(|e| {
-                eprintln!("[DEBUG] Batch processor: FAILED to parse config: {}", e);
-                ConfigError::InvalidUserConfig {
-                    error: format!("invalid OTAP batch processor config: {e}"),
-                }
-            })?;
+        eprintln!(
+            "[DEBUG] Batch processor: build_from_json called with config: {:?}",
+            cfg
+        );
+        let mut config: Config = serde_json::from_value(cfg.clone()).map_err(|e| {
+            eprintln!("[DEBUG] Batch processor: FAILED to parse config: {}", e);
+            ConfigError::InvalidUserConfig {
+                error: format!("invalid OTAP batch processor config: {e}"),
+            }
+        })?;
         eprintln!("[DEBUG] Batch processor: config parsed successfully");
 
         // Basic validation/normalization
@@ -221,7 +223,8 @@ impl OtapBatchProcessor {
             dirty_metrics: false,
             dirty_traces: false,
             metrics,
-        }).map(|p| {
+        })
+        .map(|p| {
             eprintln!("[DEBUG] Batch processor: OtapBatchProcessor instance created successfully");
             p
         })
@@ -267,32 +270,49 @@ impl OtapBatchProcessor {
         effect: &mut local::EffectHandler<OtapPdata>,
         reason: FlushReason,
     ) -> Result<(), EngineError> {
-        eprintln!("[DEBUG] Batch processor: flush_logs called, reason={:?}, buffered={}", reason, self.current_logs.len());
+        eprintln!(
+            "[DEBUG] Batch processor: flush_logs called, reason={:?}, buffered={}",
+            reason,
+            self.current_logs.len()
+        );
         // Only return early if there is nothing buffered for this signal at all
         if self.current_logs.is_empty() {
             eprintln!("[DEBUG] Batch processor: flush_logs - nothing buffered, returning");
             return Ok(());
         }
         let input = std::mem::take(&mut self.current_logs);
-        eprintln!("[DEBUG] Batch processor: flush_logs - processing {} records", input.len());
+        eprintln!(
+            "[DEBUG] Batch processor: flush_logs - processing {} records",
+            input.len()
+        );
         if !input.is_empty() {
             self.inc_flushes(reason);
 
             let max_val = self.config.send_batch_max_size;
             if max_val <= MIN_SEND_BATCH_SIZE {
-                    // Bypass upstream splitter for degenerate max; just forward each record
-                    eprintln!("[DEBUG] Batch processor: bypass mode, sending {} records individually", input.len());
-                    for (idx, records) in input.into_iter().enumerate() {
-                        eprintln!("[DEBUG] Batch processor: sending record {}", idx + 1);
-                        let pdata = OtapPdata::new_todo_context(records.into());
-                        match effect.send_message(pdata).await {
-                            Ok(_) => eprintln!("[DEBUG] Batch processor: record {} sent successfully", idx + 1),
-                            Err(e) => {
-                                eprintln!("[DEBUG] Batch processor: FAILED to send record {}: {}", idx + 1, e);
-                                return Err(e);
-                            }
+                // Bypass upstream splitter for degenerate max; just forward each record
+                eprintln!(
+                    "[DEBUG] Batch processor: bypass mode, sending {} records individually",
+                    input.len()
+                );
+                for (idx, records) in input.into_iter().enumerate() {
+                    eprintln!("[DEBUG] Batch processor: sending record {}", idx + 1);
+                    let pdata = OtapPdata::new_todo_context(records.into());
+                    match effect.send_message(pdata).await {
+                        Ok(_) => eprintln!(
+                            "[DEBUG] Batch processor: record {} sent successfully",
+                            idx + 1
+                        ),
+                        Err(e) => {
+                            eprintln!(
+                                "[DEBUG] Batch processor: FAILED to send record {}: {}",
+                                idx + 1,
+                                e
+                            );
+                            return Err(e.into());
                         }
                     }
+                }
                 // Always reset counter in the degenerate path
                 self.rows_logs = 0;
                 if reason == FlushReason::Size {
@@ -576,8 +596,14 @@ pub fn create_otap_batch_processor(
     node_config: Arc<NodeUserConfig>,
     processor_config: &ProcessorConfig,
 ) -> Result<ProcessorWrapper<OtapPdata>, ConfigError> {
-    eprintln!("[DEBUG] Batch processor: create_otap_batch_processor called for node {:?}", node);
-    eprintln!("[DEBUG] Batch processor: node_config.plugin_urn = {}", node_config.plugin_urn);
+    eprintln!(
+        "[DEBUG] Batch processor: create_otap_batch_processor called for node {:?}",
+        node
+    );
+    eprintln!(
+        "[DEBUG] Batch processor: node_config.plugin_urn = {}",
+        node_config.plugin_urn
+    );
     eprintln!("[DEBUG] Batch processor: registering metrics");
     let metrics = pipeline_ctx.register_metrics::<OtapBatchProcessorMetrics>();
     eprintln!("[DEBUG] Batch processor: calling build_from_json");
@@ -586,12 +612,7 @@ pub fn create_otap_batch_processor(
     // IMPORTANT: preserve the original node_config so engine wiring (out_ports/default_out_port)
     // remains intact.
     eprintln!("[DEBUG] Batch processor: creating ProcessorWrapper::local");
-    let wrapper = ProcessorWrapper::local(
-        proc,
-        node,
-        node_config,
-        processor_config,
-    );
+    let wrapper = ProcessorWrapper::local(proc, node, node_config, processor_config);
     eprintln!("[DEBUG] Batch processor: ProcessorWrapper created successfully");
     Ok(wrapper)
 }
@@ -603,7 +624,8 @@ impl local::Processor<OtapPdata> for OtapBatchProcessor {
         msg: Message<OtapPdata>,
         effect: &mut local::EffectHandler<OtapPdata>,
     ) -> Result<(), EngineError> {
-        eprintln!("[DEBUG] Batch processor: process() called with message type: {}", 
+        eprintln!(
+            "[DEBUG] Batch processor: process() called with message type: {}",
             match &msg {
                 Message::Control(_) => "Control",
                 Message::PData(_) => "PData",
@@ -611,7 +633,8 @@ impl local::Processor<OtapPdata> for OtapBatchProcessor {
         );
         match msg {
             Message::Control(ctrl) => {
-                eprintln!("[DEBUG] Batch processor: received Control message: {:?}", 
+                eprintln!(
+                    "[DEBUG] Batch processor: received Control message: {:?}",
                     match &ctrl {
                         NodeControlMsg::TimerTick { .. } => "TimerTick",
                         NodeControlMsg::Config { .. } => "Config",
@@ -657,7 +680,9 @@ impl local::Processor<OtapPdata> for OtapBatchProcessor {
                         Ok(())
                     }
                     NodeControlMsg::Shutdown { .. } => {
-                        eprintln!("[DEBUG] Batch processor: received Shutdown, flushing all buffers");
+                        eprintln!(
+                            "[DEBUG] Batch processor: received Shutdown, flushing all buffers"
+                        );
                         // Flush and shutdown
                         self.flush_current(effect, FlushReason::Shutdown).await?;
                         effect.info(LOG_MSG_SHUTTING_DOWN).await;
@@ -678,7 +703,10 @@ impl local::Processor<OtapPdata> for OtapBatchProcessor {
                 }
             }
             Message::PData(request) => {
-                eprintln!("[DEBUG] Batch processor: received PData message, signal={:?}", request.signal_type());
+                eprintln!(
+                    "[DEBUG] Batch processor: received PData message, signal={:?}",
+                    request.signal_type()
+                );
                 let max = self.config.send_batch_max_size;
                 let signal_type = request.signal_type();
 
@@ -689,23 +717,34 @@ impl local::Processor<OtapPdata> for OtapBatchProcessor {
                 match OtapArrowRecords::try_from(data) {
                     Ok(rec) => {
                         let rows = rec.batch_length();
-                        eprintln!("[DEBUG] Batch processor: converted successfully, rows={}", rows);
+                        eprintln!(
+                            "[DEBUG] Batch processor: converted successfully, rows={}",
+                            rows
+                        );
                         // Per-signal policy: drop zero-row; pre-flush if exceeding max; append rows; flush on max or send_batch_size.
                         match &rec {
                             OtapArrowRecords::Logs(_) => {
-                                eprintln!("[DEBUG] Batch processor: processing logs, current_buffer={}, new_rows={}", self.rows_logs, rows);
+                                eprintln!(
+                                    "[DEBUG] Batch processor: processing logs, current_buffer={}, new_rows={}",
+                                    self.rows_logs, rows
+                                );
                                 if rows == 0 {
                                     self.metrics.dropped_empty_records.inc();
                                     effect.info(LOG_MSG_DROP_EMPTY).await;
                                     Ok(())
                                 } else {
-                                    eprintln!("[DEBUG] Batch processor: consuming {} log rows", rows);
+                                    eprintln!(
+                                        "[DEBUG] Batch processor: consuming {} log rows",
+                                        rows
+                                    );
                                     self.metrics.consumed_items_logs.add(rows as u64);
                                     // Pre-append: flush if the incoming record would exceed max.
                                     if max > FOLLOW_SEND_BATCH_SIZE_SENTINEL
                                         && self.rows_logs + rows > max
                                     {
-                                        eprintln!("[DEBUG] Batch processor: pre-flush triggered (would exceed max)");
+                                        eprintln!(
+                                            "[DEBUG] Batch processor: pre-flush triggered (would exceed max)"
+                                        );
                                         // Would exceed max: mark as threshold-crossed and flush current
                                         self.metrics.dirty_set_logs.inc();
                                         self.dirty_logs = true;
@@ -713,7 +752,11 @@ impl local::Processor<OtapPdata> for OtapBatchProcessor {
                                     }
                                     self.rows_logs += rows;
                                     self.current_logs.push(rec);
-                                    eprintln!("[DEBUG] Batch processor: buffered, total_rows={}, buffer_size={}", self.rows_logs, self.current_logs.len());
+                                    eprintln!(
+                                        "[DEBUG] Batch processor: buffered, total_rows={}, buffer_size={}",
+                                        self.rows_logs,
+                                        self.current_logs.len()
+                                    );
                                     // Post-append: flush when we hit the boundary exactly (>= max),
                                     // and also honor send_batch_size as a trigger (0 => immediate).
                                     if (max > FOLLOW_SEND_BATCH_SIZE_SENTINEL
@@ -721,7 +764,9 @@ impl local::Processor<OtapPdata> for OtapBatchProcessor {
                                         || matches!(self.config.send_batch_size, Some(s) if self.rows_logs >= s)
                                         || matches!(self.config.send_batch_size, Some(0))
                                     {
-                                        eprintln!("[DEBUG] Batch processor: post-append flush triggered");
+                                        eprintln!(
+                                            "[DEBUG] Batch processor: post-append flush triggered"
+                                        );
                                         // Threshold crossed: mark dirty and flush by size
                                         self.metrics.dirty_set_logs.inc();
                                         self.dirty_logs = true;
@@ -799,7 +844,10 @@ impl local::Processor<OtapPdata> for OtapBatchProcessor {
                     }
                     Err(e) => {
                         // Conversion failed: log and drop (TODO: Nack)
-                        eprintln!("[DEBUG] Batch processor: FAILED to convert to OtapArrowRecords: {:?}", e);
+                        eprintln!(
+                            "[DEBUG] Batch processor: FAILED to convert to OtapArrowRecords: {:?}",
+                            e
+                        );
                         self.metrics.dropped_conversion.inc();
                         match signal_type {
                             SignalType::Logs => {
