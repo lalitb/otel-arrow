@@ -1,0 +1,123 @@
+# Example Configuration: FanoutSender with Smart Cloning
+#
+# This configuration demonstrates the FanoutSequential dispatch strategy
+# with smart cloning based on processor capabilities.
+#
+# Pipeline Flow:
+#   Fake Data Generator (receiver)
+#       └─> FanoutSender (fanout_sequential) splits to:
+#           ├─> Batch Processor (mutates_data: true)  - Gets CLONE
+#           ├─> Debug Processor 1 (mutates_data: false) - Gets CLONE (marked readonly)
+#           ├─> Debug Processor 2 (mutates_data: false) - Gets CLONE (marked readonly)
+#           └─> Noop Exporter (mutates_data: false) - Gets ORIGINAL (last consumer)
+#
+# How it works:
+# - Batch processor mutates data (aggregates), so it gets its own clone
+# - Debug processors only read/log, so they can share readonly data
+# - Last consumer (noop exporter) gets the original data (zero-copy optimization)
+#
+# To run this example:
+#   cargo run --bin df_engine -- --config configs/fanout-example.yaml --cores 1
+#
+# Expected behavior:
+# - You'll see debug output from both debug processors
+# - Batch processor aggregates data independently
+# - Clone count: 3 (batch + debug1 + debug2), original goes to noop
+# - Total consumers: 4
+#
+# Note: Ordering limitation - mutating consumers processed before readonly ones
+# So actual send order is: [Batch, Debug1, Debug2, Noop]
+# Not config order: [Batch, Debug1, Debug2, Noop] (happens to match here)
+
+settings:
+  default_pipeline_ctrl_msg_channel_size: 100
+  default_node_ctrl_msg_channel_size: 100
+  default_pdata_channel_size: 100
+
+nodes:
+  # Fake data generator - produces test telemetry data
+  receiver:
+    kind: receiver
+    plugin_urn: "urn:otel:otap:fake_data_generator:receiver"
+    out_ports:
+      out_port:
+        destinations:
+          - batch       # Mutating processor (gets clone)
+          - debug1      # Readonly processor (gets clone + readonly mark)
+          - debug2      # Readonly processor (gets clone + readonly mark)
+          - noop        # Readonly exporter (gets ORIGINAL - last consumer)
+        dispatch_strategy: fanout_sequential  # ← KEY: Enables smart cloning!
+    config:
+      traffic_config:
+        max_signal_count: 100     # Generate 100 signals total
+        max_batch_size: 10        # 10 signals per batch
+        signals_per_second: 10    # 10 signals/second (slow for observation)
+        log_weight: 100           # Only generate logs
+      registry_path: https://github.com/open-telemetry/semantic-conventions.git[model]
+
+  # MUTATING PROCESSOR - Gets its own clone
+  batch:
+    kind: processor
+    plugin_urn: "urn:otel:otap:batch:processor"
+    out_ports:
+      out_port:
+        destinations:
+          - batch_out
+        dispatch_strategy: round_robin
+    config:
+      timeout_ms: 1000          # Batch every 1 second
+      max_batch_size: 50        # Or when 50 signals accumulated
+
+  # READONLY PROCESSOR 1 - Gets clone (marked readonly if multiple readonly share)
+  debug1:
+    kind: processor
+    plugin_urn: "urn:otel:debug:processor"
+    out_ports:
+      out_port:
+        destinations:
+          - debug1_out
+        dispatch_strategy: round_robin
+    config:
+      verbosity: basic          # Less verbose
+      mode: signal              # Log per signal
+      output:
+        destination: stdout
+        format: json
+
+  # READONLY PROCESSOR 2 - Gets clone (marked readonly)
+  debug2:
+    kind: processor
+    plugin_urn: "urn:otel:debug:processor"
+    out_ports:
+      out_port:
+        destinations:
+          - debug2_out
+        dispatch_strategy: round_robin
+    config:
+      verbosity: detailed       # More verbose than debug1
+      mode: batch               # Log per batch
+      output:
+        destination: stdout
+        format: text
+
+  # READONLY EXPORTER - Gets ORIGINAL (last consumer, zero-copy!)
+  noop:
+    kind: exporter
+    plugin_urn: "urn:otel:noop:exporter"
+    config: {}
+
+  # Downstream exporters (just to complete the pipeline)
+  batch_out:
+    kind: exporter
+    plugin_urn: "urn:otel:noop:exporter"
+    config: {}
+
+  debug1_out:
+    kind: exporter
+    plugin_urn: "urn:otel:noop:exporter"
+    config: {}
+
+  debug2_out:
+    kind: exporter
+    plugin_urn: "urn:otel:noop:exporter"
+    config: {}

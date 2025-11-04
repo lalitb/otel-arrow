@@ -1,0 +1,83 @@
+# Simplified FanoutSender Example
+#
+# This is a minimal example showing FanoutSequential with just 3 destinations.
+#
+# Pipeline Flow:
+#   Receiver → FanoutSender → [Debug1, Debug2, Noop]
+#
+# Clone behavior:
+# - Debug1: Gets clone (readonly)
+# - Debug2: Gets clone (readonly, marked)
+# - Noop: Gets ORIGINAL (last consumer, zero-copy!)
+#
+# Run with:
+#   cargo run --bin df_engine -- --config configs/fanout-simple.yaml --cores 1
+
+settings:
+  default_pipeline_ctrl_msg_channel_size: 100
+  default_node_ctrl_msg_channel_size: 100
+  default_pdata_channel_size: 100
+
+nodes:
+  receiver:
+    kind: receiver
+    plugin_urn: "urn:otel:otap:fake_data_generator:receiver"
+    out_ports:
+      out_port:
+        destinations:
+          - debug1
+          - debug2
+          - noop
+        dispatch_strategy: fanout_sequential  # Smart cloning enabled
+    config:
+      traffic_config:
+        max_signal_count: 50
+        max_batch_size: 5
+        signals_per_second: 5
+        log_weight: 100
+      registry_path: https://github.com/open-telemetry/semantic-conventions.git[model]
+
+  debug1:
+    kind: processor
+    plugin_urn: "urn:otel:debug:processor"
+    out_ports:
+      out_port:
+        destinations:
+          - noop1
+        dispatch_strategy: round_robin
+    config:
+      verbosity: basic
+      mode: signal
+      output:
+        destination: stdout
+        format: text
+
+  debug2:
+    kind: processor
+    plugin_urn: "urn:otel:debug:processor"
+    out_ports:
+      out_port:
+        destinations:
+          - noop2
+        dispatch_strategy: round_robin
+    config:
+      verbosity: basic
+      mode: signal
+      output:
+        destination: stdout
+        format: text
+
+  noop:
+    kind: exporter
+    plugin_urn: "urn:otel:noop:exporter"
+    config: {}
+
+  noop1:
+    kind: exporter
+    plugin_urn: "urn:otel:noop:exporter"
+    config: {}
+
+  noop2:
+    kind: exporter
+    plugin_urn: "urn:otel:noop:exporter"
+    config: {}
