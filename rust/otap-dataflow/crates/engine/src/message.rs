@@ -108,6 +108,7 @@ impl ReadonlyMarkable for () {
 /// - Clones data for all mutating consumers except the last one
 /// - Shares the original data among readonly consumers
 /// - Marks data as readonly when multiple readonly consumers share it
+#[must_use = "FanoutSender should be used to send messages"]
 pub struct FanoutSender<T> {
     /// All senders to downstream consumers
     senders: Vec<Sender<T>>,
@@ -125,11 +126,86 @@ impl<T: Clone + ReadonlyMarkable> FanoutSender<T> {
     /// * `senders` - All downstream senders (one per destination)
     /// * `mutable_indices` - Indices of senders whose consumers mutate data
     /// * `readonly_indices` - Indices of senders whose consumers only read data
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - Any index is out of bounds
+    /// - Indices overlap (same index in both lists)
+    /// - Not all senders are referenced by an index
+    /// - No consumers provided (empty senders list)
+    #[must_use = "FanoutSender must be used after construction"]
     pub fn new(
         senders: Vec<Sender<T>>,
         mutable_indices: Vec<usize>,
         readonly_indices: Vec<usize>,
     ) -> Self {
+        let num_senders = senders.len();
+
+        // Validate at least one consumer
+        assert!(
+            num_senders > 0,
+            "FanoutSender requires at least one consumer (got 0 senders)"
+        );
+
+        // Validate indices are within bounds
+        for &idx in &mutable_indices {
+            assert!(
+                idx < num_senders,
+                "Mutable index {} out of bounds (total senders: {})",
+                idx,
+                num_senders
+            );
+        }
+        for &idx in &readonly_indices {
+            assert!(
+                idx < num_senders,
+                "Readonly index {} out of bounds (total senders: {})",
+                idx,
+                num_senders
+            );
+        }
+
+        // Validate no duplicate indices within mutable list
+        for (i, &idx_i) in mutable_indices.iter().enumerate() {
+            for &idx_j in &mutable_indices[i + 1..] {
+                assert!(
+                    idx_i != idx_j,
+                    "Duplicate index {} in mutable_indices",
+                    idx_i
+                );
+            }
+        }
+
+        // Validate no duplicate indices within readonly list
+        for (i, &idx_i) in readonly_indices.iter().enumerate() {
+            for &idx_j in &readonly_indices[i + 1..] {
+                assert!(
+                    idx_i != idx_j,
+                    "Duplicate index {} in readonly_indices",
+                    idx_i
+                );
+            }
+        }
+
+        // Validate no overlapping indices between lists
+        for &mutable_idx in &mutable_indices {
+            assert!(
+                !readonly_indices.contains(&mutable_idx),
+                "Index {} appears in both mutable and readonly lists",
+                mutable_idx
+            );
+        }
+
+        // Validate all senders are accounted for
+        assert_eq!(
+            mutable_indices.len() + readonly_indices.len(),
+            num_senders,
+            "Total indices ({}) must equal total senders ({})",
+            mutable_indices.len() + readonly_indices.len(),
+            num_senders
+        );
+
         Self {
             senders,
             mutable_indices,

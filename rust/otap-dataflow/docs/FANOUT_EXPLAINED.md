@@ -259,6 +259,62 @@ pub struct FanoutSender<T> {
 }
 ```
 
+#### Input Validation
+
+The `new()` constructor validates inputs to prevent bugs:
+
+```rust
+pub fn new(
+    senders: Vec<Sender<T>>,
+    mutable_indices: Vec<usize>,
+    readonly_indices: Vec<usize>,
+) -> Self {
+    // Validate at least one consumer
+    assert!(senders.len() > 0, "FanoutSender requires at least one consumer");
+
+    // Validate indices are within bounds
+    for &idx in &mutable_indices {
+        assert!(idx < senders.len(), "Index out of bounds");
+    }
+
+    // Validate no duplicate indices within mutable list
+    for (i, &idx_i) in mutable_indices.iter().enumerate() {
+        for &idx_j in &mutable_indices[i + 1..] {
+            assert!(idx_i != idx_j, "Duplicate index in mutable_indices");
+        }
+    }
+
+    // Validate no duplicate indices within readonly list
+    for (i, &idx_i) in readonly_indices.iter().enumerate() {
+        for &idx_j in &readonly_indices[i + 1..] {
+            assert!(idx_i != idx_j, "Duplicate index in readonly_indices");
+        }
+    }
+
+    // Validate no overlapping indices between lists
+    for &mutable_idx in &mutable_indices {
+        assert!(!readonly_indices.contains(&mutable_idx),
+                "Index appears in both lists");
+    }
+
+    // Validate all senders are accounted for
+    assert_eq!(mutable_indices.len() + readonly_indices.len(),
+               senders.len(),
+               "All senders must be indexed");
+
+    Self { senders, mutable_indices, readonly_indices }
+}
+```
+
+**Why these checks matter**:
+- **Non-empty check**: Prevents silent data loss with zero consumers
+- **Bounds checking**: Prevents array access panics
+- **No duplicates**: Catches `vec![0, 0]` double-send bugs
+- **No overlap**: Each sender can only be mutable OR readonly, not both
+- **Complete coverage**: Every sender must be categorized (no orphans)
+
+These assertions catch configuration errors at construction time rather than during message sending!
+
 #### The Smart Send Algorithm
 
 ```rust
@@ -827,6 +883,212 @@ FanoutSender created: 2 mutating, 1 readonly
 1. **Single destination**: No fanout needed
 2. **All mutating processors**: Still need clones
 3. **Tiny payloads**: Clone overhead negligible
+
+---
+
+# Part 6.5: Known Limitations and Design Trade-offs
+
+Understanding what FanoutSender **doesn't** do (and why) is as important as understanding what it does.
+
+## Limitation 1: Consumer Ordering Not Preserved
+
+**Current Behavior**: Mutating consumers are always processed before readonly consumers.
+
+**Example**:
+```yaml
+processors:
+  - debug_processor       # Readonly (index 0)
+  - batch_processor       # Mutating (index 1)
+  - attributes_processor  # Mutating (index 2)
+```
+
+**Actual Send Order**: batch (1) → attributes (2) → debug (0)
+
+**Not**: debug (0) → batch (1) → attributes (2)
+
+### Why Not Fixed?
+
+To preserve configuration order while minimizing clones would require:
+
+```rust
+// Would need to allocate and sort in hot path
+let mut all_indices: Vec<(usize, bool)> = Vec::new();  // ❌ Heap allocation
+for &idx in &mutable_indices {
+    all_indices.push((idx, true));
+}
+for &idx in &readonly_indices {
+    all_indices.push((idx, false));
+}
+all_indices.sort_by_key(|(idx, _)| *idx);  // ❌ O(n log n) per send
+
+// Then iterate in order...
+```
+
+**Problems**:
+- ❌ Heap allocation in hot path (violates zero-allocation goal)
+- ❌ O(n log n) sorting overhead per message
+- ❌ Complicates the already-complex send algorithm
+
+**Workaround**: If ordering is critical, use separate pipelines or single-consumer fanouts.
+
+**Status**: **By design** - Performance trumps configurable ordering
+
+---
+
+## Limitation 2: Box::pin Required for Recursion
+
+**Current Code**:
+```rust
+impl<T> Sender<T> {
+    pub async fn send(&self, msg: T) -> Result<(), SendError<T>> {
+        match self {
+            Sender::Fanout(fanout) => Box::pin(fanout.send(msg)).await,  // Must box
+        }
+    }
+}
+```
+
+### Why Not Removed?
+
+Rust's type system requires boxing for recursive async functions:
+
+```rust
+// Without Box::pin:
+error[E0733]: recursion in an async fn requires boxing
+   --> message.rs:252:52
+    |
+252 |     Sender::Fanout(fanout) => fanout.send(msg).await,
+    |                               ---------------------- recursive call
+```
+
+**The Recursion**:
+1. `Sender::send()` calls `FanoutSender::send()`
+2. `FanoutSender::send()` calls `Sender::send()` on inner senders
+3. Back to step 1 → infinite type size!
+
+**Box::pin Solution**:
+- Breaks recursion by heap-allocating the future
+- Standard Rust practice for recursive async
+- ~40 bytes per fanout send (negligible for 10KB+ payloads)
+
+**Status**: **Compiler requirement** - Cannot be removed
+
+---
+
+## Limitation 3: Clone Panics on FanoutSender
+
+**Current Behavior**:
+```rust
+let sender1 = Sender::Fanout(...);
+let sender2 = sender1.clone();  // ❌ Panics!
+```
+
+### Why Intentional?
+
+FanoutSender owns multiple senders and can't be meaningfully cloned:
+
+```rust
+// What would clone do?
+FanoutSender {
+    senders: vec![sender_a, sender_b, sender_c],  // Each is owned
+    mutable_indices: vec![0, 1],
+    readonly_indices: vec![2],
+}
+
+// Clone would need to clone all inner senders, but:
+// - LocalSender can't be cloned (unique ownership)
+// - Cloning would create duplicate sends
+// - Not semantically meaningful
+```
+
+**Alternative Considered**: Wrap in `Arc<FanoutSender<T>>`
+- ❌ Adds atomic ref-counting overhead
+- ❌ Complicates ownership model
+- ✅ Current panic prevents misuse
+
+**Status**: **By design** - Panic prevents logic errors
+
+---
+
+## Limitation 4: Panic vs Result in new()
+
+**Current Behavior**:
+```rust
+let fanout = FanoutSender::new(senders, mut_idx, ro_idx);  // Panics on error
+```
+
+### Why Panic Instead of Result?
+
+This follows Rust conventions for **programmer errors** vs **runtime errors**:
+
+```rust
+// Programmer errors (panic):
+vec.remove(100);  // Out of bounds
+assert_eq!(2 + 2, 5);  // Logic error
+
+// Runtime errors (Result):
+file.read()?;  // File might not exist
+network.send()?;  // Network might be down
+```
+
+**Invalid indices are programmer errors**:
+- Configuration happens at graph build time (cold path)
+- Indices are computed from static pipeline config
+- If indices are wrong, the pipeline definition is wrong
+- Should fail fast with clear error message
+
+**Alternative**: Add `try_new() -> Result<FanoutSender, Error>` for dynamic configs
+
+**Status**: **Idiomatic Rust** - Panics appropriate for config errors
+
+---
+
+## Limitation 5: O(n²) Duplicate Detection
+
+**Current Validation**:
+```rust
+for (i, &idx_i) in mutable_indices.iter().enumerate() {
+    for &idx_j in &mutable_indices[i + 1..] {
+        assert!(idx_i != idx_j, "Duplicate");
+    }
+}
+```
+
+### Why Not Use HashSet?
+
+```rust
+// Alternative with HashSet:
+use std::collections::HashSet;
+let mut seen = HashSet::new();
+for &idx in &mutable_indices {
+    assert!(seen.insert(idx), "Duplicate");
+}
+```
+
+**Why Current Approach**:
+- ✅ No dependencies
+- ✅ Simpler code
+- ✅ O(n²) acceptable for small n (typical fanouts: 2-10 consumers)
+- ❌ HashSet adds hashing overhead
+- ❌ Not worth complexity for construction-time validation
+
+**Benchmark**: For 10 consumers → ~45 comparisons vs ~10 hash operations (negligible)
+
+**Status**: **Acceptable trade-off** - Simplicity over micro-optimization
+
+---
+
+## Design Trade-offs Summary
+
+| Decision | Chosen Approach | Rejected Alternative | Reason |
+|----------|----------------|---------------------|---------|
+| **Consumer order** | Mutating → Readonly | Config order | Heap alloc + sort in hot path |
+| **Async recursion** | Box::pin | Direct .await | Compiler requirement |
+| **Clone behavior** | Panic | Arc wrapper | Atomic overhead + complexity |
+| **Error handling** | Panic | Result | Idiomatic for config errors |
+| **Duplicate check** | O(n²) loop | HashSet | Simpler for small n |
+
+**Philosophy**: Optimize hot path, keep cold path simple, fail fast on config errors.
 
 ---
 
