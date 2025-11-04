@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 
 /// A trait for processors in the pipeline (Send definition).
 #[async_trait]
-pub trait Processor<PData> {
+pub trait Processor<PData>: Send {
     /// Processes a message and optionally produces effects, such as generating new pdata messages.
     ///
     /// This method is called by the pipeline engine for each message that arrives at the processor.
@@ -84,6 +84,27 @@ pub trait Processor<PData> {
         msg: Message<PData>,
         effect_handler: &mut EffectHandler<PData>,
     ) -> Result<(), Error>;
+
+    /// Returns the capabilities of this processor.
+    ///
+    /// This method is used by the pipeline engine to determine how to handle data flow
+    /// in fanout scenarios. By default, processors are assumed to be readonly (non-mutating).
+    ///
+    /// Processors that modify the data they receive should override this method and return
+    /// `Capabilities { mutates_data: true }` to ensure proper data isolation in fanout pipelines.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// fn capabilities(&self) -> otap_df_engine::Capabilities {
+    ///     otap_df_engine::Capabilities { mutates_data: true }
+    /// }
+    /// ```
+    fn capabilities(&self) -> crate::Capabilities {
+        crate::Capabilities {
+            mutates_data: false,
+        }
+    }
 }
 
 /// A `Send` implementation of the EffectHandler.

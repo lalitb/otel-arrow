@@ -90,6 +90,22 @@ pub enum DispatchStrategy {
     Random,
     /// Dispatch the data to the least loaded target node.
     LeastLoaded,
+    /// Sequential fanout with smart cloning based on mutation semantics.
+    ///
+    /// This strategy implements the OpenTelemetry Collector's fanout consumer pattern:
+    /// - Queries each destination node for its capabilities (mutates_data flag)
+    /// - Clones data only for mutating consumers that need isolation
+    /// - Shares data among readonly consumers to avoid unnecessary clones
+    /// - Sends to all destinations in sequence
+    ///
+    /// Cloning behavior:
+    /// - If all destinations are mutating: Clone for N-1 destinations, last one gets original
+    /// - If all destinations are readonly: All share the original (no clones)
+    /// - If mixed: Clone for mutating destinations, readonly destinations share original
+    ///
+    /// This strategy is invisible to metrics - the receiver's "produced" count will equal
+    /// each pipeline's "consumed" count separately, just like in the OTel Collector.
+    FanoutSequential,
 }
 
 /// Node kinds

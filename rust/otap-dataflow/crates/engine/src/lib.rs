@@ -177,7 +177,40 @@ pub struct Interests: u8 {
 
     /// Return data
     const RETURN_DATA = 1 << 2;
+
+    /// Mutation interest - indicates that this component may mutate the data.
+    /// When set, the fanout logic will clone data before sending to this component
+    /// to ensure isolation from other components in the pipeline.
+    const MUTATION = 1 << 3;
 }
+}
+
+/// Capabilities describes the capabilities of a component.
+///
+/// This is modeled after the OpenTelemetry Collector's consumer capabilities,
+/// which allows the pipeline engine to make smart decisions about data cloning
+/// in fanout scenarios.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Capabilities {
+    /// MutatesData is set to true if the component may mutate the data it receives.
+    ///
+    /// When set to true, the fanout logic will clone data before sending to this component
+    /// to ensure isolation from other components in the pipeline. When set to false (the default),
+    /// the component can safely share data with other readonly components, avoiding unnecessary clones.
+    ///
+    /// # Examples
+    ///
+    /// Components that should set `mutates_data: true`:
+    /// - Batch processors (aggregate multiple requests)
+    /// - Attribute processors (modify attributes)
+    /// - Filter processors (remove items from requests)
+    /// - Transform processors (change data structure)
+    ///
+    /// Components that should set `mutates_data: false`:
+    /// - Debug processors (only read/log data)
+    /// - Metrics processors (only observe data)
+    /// - Pass-through processors (no modification)
+    pub mutates_data: bool,
 }
 
 /// Effect handler extensions for producers specific to data type.

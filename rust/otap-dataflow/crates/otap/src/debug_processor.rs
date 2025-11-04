@@ -327,6 +327,13 @@ impl local::Processor<OtapPdata> for DebugProcessor {
             }
         }
     }
+
+    fn capabilities(&self) -> otap_df_engine::Capabilities {
+        // Debug processor only reads and logs data, doesn't mutate it
+        otap_df_engine::Capabilities {
+            mutates_data: false,
+        }
+    }
 }
 
 impl DebugProcessor {

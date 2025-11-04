@@ -760,6 +760,11 @@ impl local::Processor<OtapPdata> for OtapBatchProcessor {
             }
         }
     }
+
+    fn capabilities(&self) -> otap_df_engine::Capabilities {
+        // Batch processors aggregate multiple requests, modifying the data structure
+        otap_df_engine::Capabilities { mutates_data: true }
+    }
 }
 
 /// Register factory for OTAP batch processor
