@@ -326,7 +326,7 @@ impl<PData: Clone> PipelineCtrlMsgManager<PData> {
 
 // Test-only helpers to introspect internal state without exposing fields publicly.
 #[cfg(test)]
-impl<PData> PipelineCtrlMsgManager<PData> {
+impl<PData: Clone> PipelineCtrlMsgManager<PData> {
     pub(crate) fn test_tick_count(&self) -> usize {
         self.tick_timers.timers.len()
     }
@@ -381,7 +381,7 @@ mod tests {
         )
     }
 
-    fn setup_test_manager<PData>() -> (
+    fn setup_test_manager<PData: Clone>() -> (
         PipelineCtrlMsgManager<PData>,
         crate::control::PipelineCtrlMsgSender<PData>,
         HashMap<usize, Receiver<NodeControlMsg<PData>>>,

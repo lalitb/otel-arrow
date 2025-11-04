@@ -94,6 +94,13 @@ pub trait ReadonlyMarkable {
     fn mark_readonly(&mut self);
 }
 
+/// Implementation for unit type (used in tests).
+impl ReadonlyMarkable for () {
+    fn mark_readonly(&mut self) {
+        // No-op for unit type
+    }
+}
+
 /// A fanout sender that implements smart cloning based on consumer capabilities.
 ///
 /// This sender wraps multiple downstream senders and implements the OpenTelemetry

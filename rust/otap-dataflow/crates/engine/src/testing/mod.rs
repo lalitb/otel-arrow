@@ -39,6 +39,12 @@ impl TestMsg {
     }
 }
 
+impl crate::message::ReadonlyMarkable for TestMsg {
+    fn mark_readonly(&mut self) {
+        // No-op for test messages
+    }
+}
+
 /// Set of counters for tracking the number of control messages processed.
 #[derive(Clone)]
 pub struct CtrlMsgCounters {

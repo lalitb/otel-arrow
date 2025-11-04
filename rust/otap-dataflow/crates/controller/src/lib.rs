@@ -56,7 +56,10 @@ pub struct Controller<PData: 'static + Clone + Send + Sync + std::fmt::Debug> {
     pipeline_factory: &'static PipelineFactory<PData>,
 }
 
-impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug> Controller<PData> {
+impl<
+    PData: 'static + Clone + Send + Sync + std::fmt::Debug + otap_df_engine::message::ReadonlyMarkable,
+> Controller<PData>
+{
     /// Creates a new controller with the given pipeline factory.
     pub fn new(pipeline_factory: &'static PipelineFactory<PData>) -> Self {
         Self { pipeline_factory }
