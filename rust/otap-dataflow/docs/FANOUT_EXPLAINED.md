@@ -122,6 +122,208 @@ Original Data → Clone → [House 1 (filter)]
 
 ---
 
+# Part 1.5: Important Context - Fanout vs Multi-Core Distribution
+
+**Common Question**: "Does FanoutSender distribute work across CPU cores?"
+
+**Short Answer**: **No!** FanoutSender operates **within a single core**. Multi-core distribution happens at a different level.
+
+## Understanding the Two Levels of Distribution
+
+### Level 1: Multi-Core Distribution (Across Cores)
+
+OTAP Dataflow uses a **thread-per-core architecture**. Each CPU core runs its own **independent pipeline instance**.
+
+```
+Network Traffic (SO_REUSEPORT load balancing)
+       │
+       ├─→ Core 0: ┌─────────────────────────────┐
+       │           │ Pipeline Instance 1         │
+       │           │ Receiver → Processors → Exp │
+       │           └─────────────────────────────┘
+       │
+       ├─→ Core 1: ┌─────────────────────────────┐
+       │           │ Pipeline Instance 2         │
+       │           │ Receiver → Processors → Exp │
+       │           └─────────────────────────────┘
+       │
+       ├─→ Core 2: ┌─────────────────────────────┐
+       │           │ Pipeline Instance 3         │
+       │           │ Receiver → Processors → Exp │
+       │           └─────────────────────────────┘
+       │
+       └─→ Core 3: ┌─────────────────────────────┐
+                   │ Pipeline Instance 4         │
+                   │ Receiver → Processors → Exp │
+                   └─────────────────────────────┘
+```
+
+**How it works**:
+- ✅ Linux kernel's `SO_REUSEPORT` distributes incoming network connections across cores
+- ✅ Each core has a completely independent pipeline (no sharing)
+- ✅ No cross-core communication (zero contention)
+- ✅ Scales linearly with CPU cores
+
+**This is NOT what FanoutSender does!**
+
+---
+
+### Level 2: Intra-Core Fanout (Within a Single Core)
+
+FanoutSender distributes data to **multiple processors within the same core's pipeline**.
+
+```
+┌────────────────── Core 0 (single thread) ──────────────────┐
+│                                                             │
+│  ┌─────────────┐                                           │
+│  │  Receiver   │ (receives data from network)              │
+│  └──────┬──────┘                                           │
+│         │                                                   │
+│         ▼                                                   │
+│  ┌─────────────────┐                                       │
+│  │  FanoutSender   │ ← Smart cloning happens HERE          │
+│  │ (intra-core)    │                                       │
+│  └─┬──────┬───────┬┘                                       │
+│    │      │       │                                         │
+│  Clone  Clone  Original                                    │
+│    │      │       │                                         │
+│    ▼      ▼       ▼                                         │
+│ ┌─────┐ ┌─────┐ ┌─────┐                                   │
+│ │Batch│ │Attrs│ │Debug│                                   │
+│ │ Proc│ │ Proc│ │ Proc│                                   │
+│ └──┬──┘ └──┬──┘ └──┬──┘                                   │
+│    │       │       │                                        │
+│    └───────┴───────┘                                        │
+│            │                                                 │
+│            ▼                                                 │
+│     ┌──────────┐                                            │
+│     │ Exporter │                                            │
+│     └──────────┘                                            │
+│                                                             │
+│  Uses: Local channels (!Send)                               │
+│  Runtime: Tokio LocalRuntime (single-threaded async)       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**How it works**:
+- ✅ One receiver sends data to **multiple processors on the same core**
+- ✅ Uses **Local channels** (no atomic operations, faster)
+- ✅ Single-threaded async (Tokio LocalRuntime)
+- ✅ Smart cloning minimizes copies
+
+---
+
+## Complete Picture: Both Levels Together
+
+```
+Network (Load Balancer)
+       │
+   SO_REUSEPORT (kernel distributes across cores)
+       │
+       ├──────────────────────────────────────────────┐
+       │                                              │
+   ┌───▼──── Core 0 ─────────┐         ┌──── Core 1 ──────────┐
+   │                         │         │                        │
+   │  Receiver               │         │  Receiver              │
+   │     │                   │         │     │                  │
+   │     ▼                   │         │     ▼                  │
+   │  FanoutSender           │         │  FanoutSender          │
+   │     ├─→ Batch Proc      │         │     ├─→ Batch Proc     │
+   │     ├─→ Attrs Proc      │         │     └─→ Debug Proc     │
+   │     └─→ Debug Proc      │         │            │           │
+   │            │            │         │            ▼           │
+   │            ▼            │         │       Exporter         │
+   │       Exporter          │         │                        │
+   │                         │         │                        │
+   └─────────────────────────┘         └────────────────────────┘
+    Intra-core fanout                   Intra-core fanout
+```
+
+**Key Points**:
+
+1. **Multi-Core (SO_REUSEPORT)**:
+   - Handled by OS kernel
+   - Distributes network connections across cores
+   - Each core gets different data
+   - See: `docs/load-balancing.md`
+
+2. **Intra-Core (FanoutSender)**:
+   - Handled by FanoutSender
+   - Distributes data to multiple processors **on the same core**
+   - Each processor on that core gets the same data (or a clone)
+   - This is what this implementation is about!
+
+---
+
+## Why This Matters for Understanding FanoutSender
+
+When you read about FanoutSender optimizations like "smart cloning" and "readonly marking", remember:
+
+- ✅ It's optimizing **within a single CPU core**
+- ✅ Uses **Local channels** (no atomic operations)
+- ✅ Single-threaded async (no locking needed)
+- ✅ Performance-critical because it runs in the hot path
+
+**Not trying to**:
+- ❌ Distribute across cores (that's SO_REUSEPORT's job)
+- ❌ Use Shared channels for cross-thread communication (only if `is_shared()` is true)
+- ❌ Add multi-threading overhead
+
+---
+
+## Channel Types: Local vs Shared
+
+FanoutSender can use two types of channels based on component requirements:
+
+### Default: Local Channels (!Send) - Optimal
+
+```rust
+// Within one core only
+let (tx, rx) = otap_df_channel::mpsc::Channel::new(buffer_size);
+senders.push(Sender::Local(LocalSender::MpscSender(tx)));
+```
+
+**Characteristics**:
+- ✅ `!Send` - Cannot cross thread boundaries
+- ✅ No atomic operations (faster)
+- ✅ Single-threaded async only
+- ✅ **This is the primary use case**
+
+### Special Case: Shared Channels (Send)
+
+```rust
+// When component is shared across threads
+let (tx, rx) = tokio::sync::mpsc::channel::<PData>(buffer_size);
+senders.push(Sender::Shared(SharedSender::MpscSender(tx)));
+```
+
+**Characteristics**:
+- 🔧 `Send` - Can cross thread boundaries
+- 🔧 Uses atomic operations (slower)
+- 🔧 Multi-thread safe
+- 🔧 Only used when `node.is_shared()` returns `true`
+
+**Example**: A shared exporter accessed by multiple cores.
+
+---
+
+## Summary: What FanoutSender Is and Isn't
+
+| Aspect | What It IS | What It ISN'T |
+|--------|------------|---------------|
+| **Scope** | Intra-core distribution | Cross-core distribution |
+| **Purpose** | Send to multiple processors on same core | Balance load across CPUs |
+| **Threading** | Single-threaded async | Multi-threaded |
+| **Channels** | Local (!Send) by default | Always Shared channels |
+| **Performance Goal** | Minimize clones within core | Distribute CPU load |
+| **Works With** | Tokio LocalRuntime | Kernel load balancing |
+
+**For multi-core distribution**: See `docs/load-balancing.md` for SO_REUSEPORT details.
+
+**For intra-core fanout**: Keep reading this document! 👇
+
+---
+
 # Part 2: Deep Dive - Understanding the Implementation
 
 ## Why This Problem Existed

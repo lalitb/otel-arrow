@@ -219,11 +219,35 @@ impl<T: Clone + ReadonlyMarkable> FanoutSender<T> {
     /// - Clone for all consumers except the very last one
     /// - Mark data as readonly if multiple readonly consumers share it
     /// - Last consumer (mutating or readonly) gets the original
+    ///
+    /// # Known Limitation: Ordering
+    ///
+    /// TODO: Consumer ordering not preserved - mutating consumers are always processed
+    /// before readonly consumers, regardless of configuration order.
+    ///
+    /// Example: Config order [readonly A, mutable B, readonly C] delivers as [B, A, C]
+    ///
+    /// To fix would require:
+    /// ```ignore
+    /// let mut all_indices: Vec<(usize, bool)> = Vec::new();  // Heap allocation per send
+    /// // ... populate from mutable_indices and readonly_indices ...
+    /// all_indices.sort_by_key(|(idx, _)| *idx);  // O(n log n) per send
+    /// ```
+    ///
+    /// Trade-off decision:
+    /// - ❌ Adds heap allocation in hot path (Vec::new per send)
+    /// - ❌ Adds O(n log n) sorting overhead per message
+    /// - ❌ Violates zero-allocation design goal
+    /// - ✅ Current approach: Deterministic (mutating→readonly), zero allocations
+    ///
+    /// Workaround: If ordering critical, use separate pipelines or single-consumer fanouts
+    /// See: docs/FANOUT_EXPLAINED.md "Known Limitations" section
     pub async fn send(&self, mut data: T) -> Result<(), SendError<T>> {
         let total_consumers = self.mutable_indices.len() + self.readonly_indices.len();
         let mut sent_count = 0;
 
         // Send clones to all mutating consumers except if it's the last overall consumer
+        // NOTE: Mutating consumers processed first - see TODO above about ordering limitation
         for &idx in &self.mutable_indices {
             sent_count += 1;
             if sent_count < total_consumers {
@@ -258,11 +282,16 @@ impl<T: Clone + ReadonlyMarkable> FanoutSender<T> {
     /// Attempts to send data to all consumers without awaiting.
     ///
     /// Uses the same smart cloning logic as `send()`.
+    ///
+    /// # Known Limitation: Ordering
+    ///
+    /// TODO: Same ordering limitation as `send()` - see `send()` documentation above.
+    /// Mutating consumers processed before readonly consumers regardless of config order.
     pub fn try_send(&self, mut data: T) -> Result<(), SendError<T>> {
         let total_consumers = self.mutable_indices.len() + self.readonly_indices.len();
         let mut sent_count = 0;
 
-        // Send to all mutating consumers
+        // Send to all mutating consumers (processed first - see TODO above)
         for &idx in &self.mutable_indices {
             sent_count += 1;
             if sent_count < total_consumers {
@@ -332,6 +361,19 @@ impl<T> Sender<T> {
         match self {
             Sender::Local(sender) => sender.send(msg).await,
             Sender::Shared(sender) => sender.send(msg).await,
+            // NOTE: Box::pin is REQUIRED here (not a TODO - compiler enforced)
+            //
+            // This creates recursive async: Sender::send() -> FanoutSender::send()
+            // -> self.senders[idx].send() (which is Sender::send() again)
+            //
+            // Without Box::pin:
+            //   error[E0733]: recursion in an async fn requires boxing
+            //
+            // The ~40 byte allocation per fanout send is unavoidable and acceptable
+            // for typical 10KB+ telemetry payloads. This is a Rust compiler requirement,
+            // not a design choice.
+            //
+            // See: docs/FANOUT_EXPLAINED.md "Limitation 2: Box::pin Required"
             Sender::Fanout(fanout) => Box::pin(fanout.send(msg)).await,
         }
     }
