@@ -56,7 +56,7 @@ impl<PData> Clone for TestContext<PData> {
     }
 }
 
-impl<PData> TestContext<PData> {
+impl<PData: Clone + crate::message::ReadonlyMarkable> TestContext<PData> {
     /// Creates a new TestContext with the given transmitters.
     #[must_use]
     pub fn new(
@@ -189,7 +189,7 @@ pub struct ValidationPhase<PData> {
     run_exporter_handle: tokio::task::JoinHandle<Result<(), Error>>,
 }
 
-impl<PData: Clone + Debug + 'static> TestRuntime<PData> {
+impl<PData: Clone + Debug + 'static + crate::message::ReadonlyMarkable> TestRuntime<PData> {
     /// Creates a new test runtime with channels of the specified capacity.
     #[must_use]
     pub fn new() -> Self {
@@ -278,13 +278,15 @@ impl<PData: Clone + Debug + 'static> TestRuntime<PData> {
     }
 }
 
-impl<PData: Clone + Debug + 'static> Default for TestRuntime<PData> {
+impl<PData: Clone + Debug + 'static + crate::message::ReadonlyMarkable> Default
+    for TestRuntime<PData>
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<PData: Debug + 'static> TestPhase<PData> {
+impl<PData: Clone + Debug + 'static + crate::message::ReadonlyMarkable> TestPhase<PData> {
     /// Starts the test scenario by executing the provided function with the test context.
     pub fn run_test<F, Fut>(self, f: F) -> ValidationPhase<PData>
     where

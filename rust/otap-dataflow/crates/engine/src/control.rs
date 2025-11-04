@@ -6,7 +6,7 @@
 //! configuration updates, and timer management.
 
 use crate::error::{Error, TypedError};
-use crate::message::Sender;
+use crate::message::{ReadonlyMarkable, Sender};
 use crate::node::{NodeId, NodeType};
 use crate::shared::message::{SharedReceiver, SharedSender};
 use bytemuck::Pod;
@@ -258,6 +258,14 @@ impl<PData> NodeControlMsg<PData> {
     }
 }
 
+/// Control messages don't support readonly marking (no-op implementation).
+/// This is needed to satisfy trait bounds when using Sender<NodeControlMsg<PData>>.
+impl<PData> ReadonlyMarkable for NodeControlMsg<PData> {
+    fn mark_readonly(&mut self) {
+        // No-op: Control messages don't have a readonly concept
+    }
+}
+
 /// Type alias for the channel sender used by nodes to send requests to the pipeline engine.
 ///
 /// This is a multi-producer, single-consumer (MPSC) channel.
@@ -311,7 +319,7 @@ pub struct ControlSenders<PData> {
     senders: HashMap<usize, TypedControlSender<PData>>,
 }
 
-impl<PData> TypedControlSender<PData> {
+impl<PData: Clone> TypedControlSender<PData> {
     /// Sends a control message to the node, awaiting until the message is sent.
     #[inline]
     pub async fn send(
@@ -331,13 +339,13 @@ impl<PData> TypedControlSender<PData> {
     }
 }
 
-impl<PData> Default for ControlSenders<PData> {
+impl<PData: Clone> Default for ControlSenders<PData> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<PData> ControlSenders<PData> {
+impl<PData: Clone> ControlSenders<PData> {
     /// Creates a new `ControlSenders` instance.
     #[must_use]
     pub fn new() -> Self {

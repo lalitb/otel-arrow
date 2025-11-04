@@ -37,6 +37,19 @@ pub trait Node<PData> {
         &self,
         msg: NodeControlMsg<PData>,
     ) -> Result<(), SendError<NodeControlMsg<PData>>>;
+
+    /// Returns the capabilities of this node.
+    ///
+    /// This method is used by the pipeline engine to determine how to handle data flow
+    /// in fanout scenarios. By default, nodes are assumed to be readonly (non-mutating).
+    ///
+    /// Nodes that modify the data they receive should override this method and return
+    /// `Capabilities { mutates_data: true }` to ensure proper data isolation in fanout pipelines.
+    fn capabilities(&self) -> crate::Capabilities {
+        crate::Capabilities {
+            mutates_data: false,
+        }
+    }
 }
 
 /// NodeId consists of a unique integer index and a name.

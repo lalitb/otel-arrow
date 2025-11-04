@@ -46,7 +46,7 @@ pub struct SendValidateContext<PData> {
     counters: CtrlMsgCounters,
 }
 
-impl<PData> TestContext<PData> {
+impl<PData: Clone + crate::message::ReadonlyMarkable> TestContext<PData> {
     /// Sends a control message to the receiver.
     pub async fn send_control_msg(&self, msg: NodeControlMsg<PData>) -> Result<(), Error> {
         self.control_sender
@@ -87,7 +87,7 @@ impl<PData> TestContext<PData> {
     }
 }
 
-impl<PData> NotSendValidateContext<PData> {
+impl<PData: Clone + crate::message::ReadonlyMarkable> NotSendValidateContext<PData> {
     /// Receives a pdata message produced by the receiver.
     pub async fn recv(&mut self) -> Result<PData, RecvError> {
         self.pdata_receiver.recv().await
@@ -113,7 +113,7 @@ impl<PData> NotSendValidateContext<PData> {
     }
 }
 
-impl<PData> SendValidateContext<PData> {
+impl<PData: Clone + crate::message::ReadonlyMarkable> SendValidateContext<PData> {
     /// Receives a pdata message produced by the receiver.
     pub async fn recv(&mut self) -> Result<PData, Error> {
         self.pdata_receiver
@@ -186,7 +186,7 @@ pub struct ValidationPhase<PData> {
     pipeline_ctrl_msg_receiver: PipelineCtrlMsgReceiver<PData>,
 }
 
-impl<PData: Clone + Debug + 'static> TestRuntime<PData> {
+impl<PData: Clone + Debug + 'static + crate::message::ReadonlyMarkable> TestRuntime<PData> {
     /// Creates a new test runtime with channels of the specified capacity.
     #[must_use]
     pub fn new() -> Self {
@@ -225,13 +225,15 @@ impl<PData: Clone + Debug + 'static> TestRuntime<PData> {
     }
 }
 
-impl<PData: Clone + Debug + 'static> Default for TestRuntime<PData> {
+impl<PData: Clone + Debug + 'static + crate::message::ReadonlyMarkable> Default
+    for TestRuntime<PData>
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<PData: Debug + 'static> TestPhase<PData> {
+impl<PData: Clone + Debug + 'static + crate::message::ReadonlyMarkable> TestPhase<PData> {
     /// Starts the test scenario by executing the provided function with the test context.
     pub fn run_test<F, Fut>(mut self, f: F) -> ValidationPhase<PData>
     where
@@ -310,7 +312,7 @@ impl<PData: Debug + 'static> TestPhase<PData> {
     }
 }
 
-impl<PData> ValidationPhase<PData> {
+impl<PData: Clone + crate::message::ReadonlyMarkable> ValidationPhase<PData> {
     /// Runs all spawned tasks to completion, then executes the validation sequentially.
     ///
     /// This is the traditional approach where validation runs after the test scenario

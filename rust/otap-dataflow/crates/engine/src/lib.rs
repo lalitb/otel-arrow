@@ -263,7 +263,7 @@ pub struct PipelineFactory<PData: 'static + Clone> {
     exporter_factories: &'static [ExporterFactory<PData>],
 }
 
-impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
+impl<PData: 'static + Clone + Debug + message::ReadonlyMarkable> PipelineFactory<PData> {
     /// Creates a new factory registry with the given factory slices.
     #[must_use]
     pub const fn new(
@@ -412,6 +412,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             let (pdata_sender, pdata_receivers) = Self::select_channel_type(
                 src_node,
                 &dest_nodes,
+                &hyper_edge.dispatch_strategy,
                 NonZeroUsize::new(1000).expect("Buffer size must be non-zero"),
             )?;
 
@@ -456,21 +457,62 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
     /// Determines the best channel type from the following parameters:
     /// - Flag specifying if the channel is shared (true) or local (false).
     /// - The number of destinations connected to the channel.
-    /// - The dispatch strategy for the channel (not yet supported).
+    /// - The dispatch strategy for the channel.
     ///
     /// This function returns a tuple containing the selected sender and one receiver per
     /// destination.
     ///
-    /// ToDo (LQ): Support dispatch strategies.
+    /// For `FanoutSequential` strategy, implements smart cloning based on component capabilities:
+    /// - Queries each destination's capabilities (mutates_data flag)
+    /// - Clones data only for mutating consumers that need isolation
+    /// - Shares data among readonly consumers to avoid unnecessary clones
     fn select_channel_type(
         src_node: &dyn Node<PData>,
         dest_nodes: &Vec<&dyn Node<PData>>,
+        dispatch_strategy: &DispatchStrategy,
         buffer_size: NonZeroUsize,
     ) -> Result<(Sender<PData>, Vec<Receiver<PData>>), Error> {
         let source_is_shared = src_node.is_shared();
         let any_dest_is_shared = dest_nodes.iter().any(|dest| dest.is_shared());
         let use_shared_channels = source_is_shared || any_dest_is_shared;
         let num_destinations = dest_nodes.len();
+
+        // Handle FanoutSequential strategy with smart cloning
+        if matches!(dispatch_strategy, DispatchStrategy::FanoutSequential) && num_destinations > 1 {
+            // Query capabilities of all destinations
+            let mut mutable_indices = Vec::new();
+            let mut readonly_indices = Vec::new();
+
+            for (idx, dest) in dest_nodes.iter().enumerate() {
+                if dest.capabilities().mutates_data {
+                    mutable_indices.push(idx);
+                } else {
+                    readonly_indices.push(idx);
+                }
+            }
+
+            // Create separate channels for each destination
+            let mut senders = Vec::new();
+            let mut receivers = Vec::new();
+
+            for _ in 0..num_destinations {
+                if use_shared_channels {
+                    let (tx, rx) = tokio::sync::mpsc::channel::<PData>(buffer_size.get());
+                    senders.push(Sender::Shared(SharedSender::MpscSender(tx)));
+                    receivers.push(Receiver::Shared(SharedReceiver::MpscReceiver(rx)));
+                } else {
+                    let (tx, rx) = otap_df_channel::mpsc::Channel::new(buffer_size.get());
+                    senders.push(Sender::Local(LocalSender::MpscSender(tx)));
+                    receivers.push(Receiver::Local(LocalReceiver::MpscReceiver(rx)));
+                }
+            }
+
+            // Create FanoutSender with smart cloning logic
+            use crate::message::FanoutSender;
+            let fanout_sender = FanoutSender::new(senders, mutable_indices, readonly_indices);
+
+            return Ok((Sender::Fanout(fanout_sender), receivers));
+        }
 
         if use_shared_channels {
             // Shared channels
@@ -658,7 +700,7 @@ struct HyperEdgeRuntime {
     // ToDo(LQ): Use port name for telemetry and debugging purposes.
     port: PortName,
 
-    #[allow(dead_code)]
+    /// The dispatch strategy for this hyper-edge
     dispatch_strategy: DispatchStrategy,
 
     // names are from the configuration, not yet resolved

@@ -81,6 +81,7 @@
 use async_trait::async_trait;
 use otap_df_config::experimental::SignalType;
 use otap_df_engine::error::Error;
+use otap_df_engine::message::ReadonlyMarkable;
 use otap_df_engine::{
     ConsumerEffectHandlerExtension, Interests, ProducerEffectHandlerExtension,
     control::{AckMsg, CallData, NackMsg},
@@ -249,6 +250,10 @@ pub enum OtapPayload {
 pub struct OtapPdata {
     context: Context,
     payload: OtapPayload,
+    /// Indicates whether this data is readonly and should not be mutated.
+    /// This is used in fanout scenarios where multiple readonly consumers
+    /// share the same data to prevent accidental mutation.
+    readonly: bool,
 }
 
 /* -------- Signal type -------- */
@@ -262,6 +267,7 @@ impl OtapPdata {
         Self {
             context: Context::default(),
             payload,
+            readonly: false,
         }
     }
 
@@ -272,13 +278,18 @@ impl OtapPdata {
         Self {
             context: Context::default(),
             payload,
+            readonly: false,
         }
     }
 
     /// Construct new OtapData with context and payload
     #[must_use]
     pub fn new(context: Context, payload: OtapPayload) -> Self {
-        Self { context, payload }
+        Self {
+            context,
+            payload,
+            readonly: false,
+        }
     }
 
     /// Returns the type of signal represented by this `OtapPdata` instance.
@@ -340,6 +351,44 @@ impl OtapPdata {
     #[must_use]
     pub fn current_calldata(&self) -> Option<CallData> {
         self.context.current_calldata()
+    }
+
+    /// Marks this data as readonly, indicating it should not be mutated.
+    ///
+    /// This is used in fanout scenarios where multiple readonly consumers share
+    /// the same data. Once marked readonly, the data should not be modified to
+    /// prevent race conditions and ensure data integrity across consumers.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Multiple readonly consumers will share this data
+    /// if readonly_consumers.len() > 1 {
+    ///     pdata.mark_readonly();
+    /// }
+    /// ```
+    pub fn mark_readonly(&mut self) {
+        self.readonly = true;
+    }
+
+    /// Returns whether this data is marked as readonly.
+    ///
+    /// Readonly data should not be mutated to ensure data integrity when
+    /// multiple consumers share the same data in fanout scenarios.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the data is readonly, `false` otherwise.
+    #[must_use]
+    pub fn is_readonly(&self) -> bool {
+        self.readonly
+    }
+}
+
+/// Implement ReadonlyMarkable for OtapPdata to support fanout sender.
+impl ReadonlyMarkable for OtapPdata {
+    fn mark_readonly(&mut self) {
+        self.mark_readonly();
     }
 }
 

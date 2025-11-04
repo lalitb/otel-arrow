@@ -85,6 +85,133 @@ impl<Data> Message<Data> {
     }
 }
 
+/// Trait for data types that can be marked as readonly.
+///
+/// This is used by the fanout sender to mark data as readonly when multiple
+/// readonly consumers share the same data instance.
+pub trait ReadonlyMarkable {
+    /// Marks this data as readonly to prevent mutation.
+    fn mark_readonly(&mut self);
+}
+
+/// A fanout sender that implements smart cloning based on consumer capabilities.
+///
+/// This sender wraps multiple downstream senders and implements the OpenTelemetry
+/// Collector's fanout consumer pattern:
+/// - Clones data for all mutating consumers except the last one
+/// - Shares the original data among readonly consumers
+/// - Marks data as readonly when multiple readonly consumers share it
+pub struct FanoutSender<T> {
+    /// All senders to downstream consumers
+    senders: Vec<Sender<T>>,
+    /// Indices of consumers that mutate data (need clones)
+    mutable_indices: Vec<usize>,
+    /// Indices of consumers that only read data (can share)
+    readonly_indices: Vec<usize>,
+}
+
+impl<T: Clone + ReadonlyMarkable> FanoutSender<T> {
+    /// Creates a new FanoutSender with the given senders and capability information.
+    ///
+    /// # Arguments
+    ///
+    /// * `senders` - All downstream senders (one per destination)
+    /// * `mutable_indices` - Indices of senders whose consumers mutate data
+    /// * `readonly_indices` - Indices of senders whose consumers only read data
+    pub fn new(
+        senders: Vec<Sender<T>>,
+        mutable_indices: Vec<usize>,
+        readonly_indices: Vec<usize>,
+    ) -> Self {
+        Self {
+            senders,
+            mutable_indices,
+            readonly_indices,
+        }
+    }
+
+    /// Sends data to all consumers with smart cloning.
+    ///
+    /// Cloning behavior:
+    /// - Clone for all consumers except the very last one
+    /// - Mark data as readonly if multiple readonly consumers share it
+    /// - Last consumer (mutating or readonly) gets the original
+    pub async fn send(&self, mut data: T) -> Result<(), SendError<T>> {
+        let total_consumers = self.mutable_indices.len() + self.readonly_indices.len();
+        let mut sent_count = 0;
+
+        // Send clones to all mutating consumers except if it's the last overall consumer
+        for &idx in &self.mutable_indices {
+            sent_count += 1;
+            if sent_count < total_consumers {
+                self.senders[idx].send(data.clone()).await?;
+            } else {
+                // Last consumer overall - send original
+                self.senders[idx].send(data).await?;
+                return Ok(());
+            }
+        }
+
+        // Mark data as readonly if multiple readonly consumers will share it
+        if self.readonly_indices.len() > 1 {
+            data.mark_readonly();
+        }
+
+        // Send to readonly consumers
+        for &idx in &self.readonly_indices {
+            sent_count += 1;
+            if sent_count < total_consumers {
+                self.senders[idx].send(data.clone()).await?;
+            } else {
+                // Last consumer - send original
+                self.senders[idx].send(data).await?;
+                return Ok(());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Attempts to send data to all consumers without awaiting.
+    ///
+    /// Uses the same smart cloning logic as `send()`.
+    pub fn try_send(&self, mut data: T) -> Result<(), SendError<T>> {
+        let total_consumers = self.mutable_indices.len() + self.readonly_indices.len();
+        let mut sent_count = 0;
+
+        // Send to all mutating consumers
+        for &idx in &self.mutable_indices {
+            sent_count += 1;
+            if sent_count < total_consumers {
+                self.senders[idx].try_send(data.clone())?;
+            } else {
+                // Last consumer overall - send original
+                self.senders[idx].try_send(data)?;
+                return Ok(());
+            }
+        }
+
+        // Mark data as readonly if multiple readonly consumers will share it
+        if self.readonly_indices.len() > 1 {
+            data.mark_readonly();
+        }
+
+        // Send to readonly consumers
+        for &idx in &self.readonly_indices {
+            sent_count += 1;
+            if sent_count < total_consumers {
+                self.senders[idx].try_send(data.clone())?;
+            } else {
+                // Last consumer - send original
+                self.senders[idx].try_send(data)?;
+                return Ok(());
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// A generic channel Sender supporting both local and shared semantic (i.e. !Send and Send).
 #[must_use = "A `Sender` is requested but not used."]
 pub enum Sender<T> {
@@ -92,6 +219,8 @@ pub enum Sender<T> {
     Local(LocalSender<T>),
     /// Sender of a shared channel.
     Shared(SharedSender<T>),
+    /// Fanout sender with smart cloning based on consumer capabilities.
+    Fanout(FanoutSender<T>),
 }
 
 impl<T> Clone for Sender<T> {
@@ -99,6 +228,9 @@ impl<T> Clone for Sender<T> {
         match self {
             Sender::Local(sender) => Sender::Local(sender.clone()),
             Sender::Shared(sender) => Sender::Shared(sender.clone()),
+            Sender::Fanout(_) => {
+                panic!("FanoutSender cannot be cloned - it owns multiple senders")
+            }
         }
     }
 }
@@ -110,18 +242,26 @@ impl<T> Sender<T> {
     }
 
     /// Sends a message to the channel.
-    pub async fn send(&self, msg: T) -> Result<(), SendError<T>> {
+    pub async fn send(&self, msg: T) -> Result<(), SendError<T>>
+    where
+        T: Clone + ReadonlyMarkable,
+    {
         match self {
             Sender::Local(sender) => sender.send(msg).await,
             Sender::Shared(sender) => sender.send(msg).await,
+            Sender::Fanout(fanout) => Box::pin(fanout.send(msg)).await,
         }
     }
 
     /// Attempts to send a message without awaiting.
-    pub fn try_send(&self, msg: T) -> Result<(), SendError<T>> {
+    pub fn try_send(&self, msg: T) -> Result<(), SendError<T>>
+    where
+        T: Clone + ReadonlyMarkable,
+    {
         match self {
             Sender::Local(sender) => sender.try_send(msg),
             Sender::Shared(sender) => sender.try_send(msg),
+            Sender::Fanout(fanout) => fanout.try_send(msg),
         }
     }
 }
