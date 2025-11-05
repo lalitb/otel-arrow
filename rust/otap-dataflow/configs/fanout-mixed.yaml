@@ -1,0 +1,82 @@
+# Fan-out demonstration pipeline
+# - Receiver generates fake OTLP telemetry
+# - Fanout processor (urn:otel:fanout:processor) distributes each PData to 3 downstream nodes
+#   (two debug processors + noop exporter)
+# - Current processors do not declare MUTATION interests, so fanout treats all as read-only and
+#   shares clone_read_only() copies. To exercise MUTATION semantics, add interest-setting code
+#   in a mutating processor (e.g., attributes_processor) calling EffectHandler::set_port_interests(..., Interests::MUTATION).
+#
+# Run example (adjust CLI as needed):
+#   cargo run -p otap-dataflow -- --config configs/fanout-mixed.yaml
+#
+# Expected behavior:
+# - fake_data_generator emits batches
+# - fanout sends identical pdata to debug1, debug2, noop exporter
+# - debug processors print summaries; noop discards
+# - Channel cloning path for read-only ports is exercised.
+
+settings:
+  default_pipeline_ctrl_msg_channel_size: 100
+  default_node_ctrl_msg_channel_size: 100
+  default_pdata_channel_size: 100
+
+nodes:
+  receiver:
+    kind: receiver
+    plugin_urn: "urn:otel:otap:fake_data_generator:receiver"
+    default_out_port: out
+    out_ports:
+      out:
+        destinations:
+          - fanout
+        dispatch_strategy: round_robin
+    config:
+      traffic_config:
+        max_signal_count: 100
+        max_batch_size: 100
+        signals_per_second: 50
+        log_weight: 100
+      registry_path: https://github.com/open-telemetry/semantic-conventions.git[model]
+
+  fanout:
+    kind: processor
+    plugin_urn: "urn:otel:fanout:processor"
+    default_out_port: out
+    # No config fields yet (reserved for COW tuning / mutation overrides)
+    config: {}
+
+    out_ports:
+      out:
+        destinations:
+          - debug1
+          - debug2
+        dispatch_strategy: round_robin
+
+  debug1:
+    kind: processor
+    plugin_urn: "urn:otel:debug:processor"
+    default_out_port: out_port
+    out_ports:
+      out_port:
+        destinations:
+          - noop
+        dispatch_strategy: round_robin
+    config:
+      verbosity: basic
+
+  debug2:
+    kind: processor
+    plugin_urn: "urn:otel:debug:processor"
+    default_out_port: out_port
+    out_ports:
+      out_port:
+        destinations:
+          - noop
+        dispatch_strategy: round_robin
+    config:
+      verbosity: basic
+
+  noop:
+    kind: exporter
+    plugin_urn: "urn:otel:noop:exporter"
+    config: {}

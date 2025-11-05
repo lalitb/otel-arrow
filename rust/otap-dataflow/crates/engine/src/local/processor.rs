@@ -38,6 +38,7 @@ use crate::error::{Error, ProcessorErrorKind, TypedError};
 use crate::local::message::LocalSender;
 use crate::message::Message;
 use crate::node::NodeId;
+use crate::Interests;
 use async_trait::async_trait;
 use otap_df_config::PortName;
 use otap_df_telemetry::error::Error as TelemetryError;
@@ -95,6 +96,10 @@ pub struct EffectHandler<PData> {
     /// A sender used to forward messages from the processor.
     /// Supports multiple named output ports.
     msg_senders: HashMap<PortName, LocalSender<PData>>,
+
+    /// Per-port declared interests (e.g. ACKS, NACKS, MUTATION). Currently defaults to empty.
+    port_interests: HashMap<PortName, Interests>,
+
     /// Cached default sender for fast access in the hot path
     default_sender: Option<LocalSender<PData>>,
 }
@@ -120,9 +125,17 @@ impl<PData> EffectHandler<PData> {
             None
         };
 
+        // Default all port interests to empty set; may be overridden later.
+        let port_interests = msg_senders
+            .keys()
+            .cloned()
+            .map(|p| (p, Interests::default()))
+            .collect();
+
         EffectHandler {
             core,
             msg_senders,
+            port_interests,
             default_sender,
         }
     }
@@ -137,6 +150,45 @@ impl<PData> EffectHandler<PData> {
     #[must_use]
     pub fn connected_ports(&self) -> Vec<PortName> {
         self.msg_senders.keys().cloned().collect()
+    }
+
+    /// Returns declared interests for a specific port (defaults to empty).
+    pub fn port_interests<P>(&self, port: P) -> Interests
+    where
+        P: Into<PortName>,
+    {
+        let p = port.into();
+        self.port_interests.get(&p).copied().unwrap_or_default()
+    }
+
+    /// Sets interests for a specific port.
+    pub fn set_port_interests<P>(&mut self, port: P, interests: Interests) -> Result<(), Error>
+    where
+        P: Into<PortName>,
+    {
+        let p = port.into();
+        if !self.msg_senders.contains_key(&p) {
+            return Err(Error::ProcessorError {
+                processor: self.processor_id(),
+                kind: ProcessorErrorKind::Configuration,
+                error: format!("Cannot set interests on unknown out port '{p}'"),
+                source_detail: String::new(),
+            });
+        }
+        let _ = self.port_interests.insert(p, interests);
+        Ok(())
+    }
+
+    /// Returns all connected ports with their interests.
+    pub fn connected_port_metas(&self) -> Vec<(PortName, Interests)> {
+        self.msg_senders
+            .keys()
+            .cloned()
+            .map(|p| {
+                let i = self.port_interests.get(&p).copied().unwrap_or_default();
+                (p, i)
+            })
+            .collect()
     }
 
     /// Sends a message to the next node(s) in the pipeline using the default port.

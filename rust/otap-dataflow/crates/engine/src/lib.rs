@@ -34,6 +34,13 @@ pub mod exporter;
 pub mod message;
 pub mod processor;
 pub mod receiver;
+pub mod readonly;
+/// Fan-out processor module.
+///
+/// Provides mutation-aware fan-out semantics (read-only clone sharing and
+/// isolation for mutators). See `fanout_processor.rs` for implementation
+/// details and tests.
+pub mod fanout_processor;
 
 mod attributes;
 pub mod config;
@@ -47,6 +54,7 @@ pub mod runtime_pipeline;
 pub mod shared;
 pub mod terminal_state;
 pub mod testing;
+// Fan-out readonly support (clone-on-write scaffolding) lives in readonly.rs
 
 /// Trait for factory types that expose a name.
 ///
@@ -177,6 +185,9 @@ pub struct Interests: u8 {
 
     /// Return data
     const RETURN_DATA = 1 << 2;
+
+    /// Downstream stage declares it will mutate received data
+    const MUTATION = 1 << 3;
 }
 }
 
@@ -508,6 +519,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             .ok_or_else(|| Error::UnknownReceiver {
                 plugin_urn: node_config.plugin_urn.clone(),
             })?;
+        // TODO: allow receivers to advertise Interests (incl MUTATION) so fan-out can clone.
         let runtime_config = ReceiverConfig::new(name.clone());
         let create = factory.create;
 

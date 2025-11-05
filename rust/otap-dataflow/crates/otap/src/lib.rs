@@ -47,6 +47,7 @@ pub mod fake_data_generator;
 pub mod debug_processor;
 
 pub mod filter_processor;
+pub mod fanout_processor;
 
 /// Implementation of a noop exporter that acts as a exporter placeholder
 pub mod noop_exporter;
