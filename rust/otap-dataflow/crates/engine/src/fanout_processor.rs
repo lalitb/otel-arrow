@@ -1,9 +1,9 @@
 use crate::{
+    Interests,
     error::Error,
     local::processor::{EffectHandler as LocalEffectHandler, Processor},
     message::Message,
     readonly::ReadonlyMarkable,
-    Interests,
 };
 
 /// FanoutProcessor
@@ -70,6 +70,22 @@ async fn dispatch<PData: ReadonlyMarkable>(
         } else {
             read_only_ports.push(port);
         }
+    }
+
+    // Optimization: Single readonly consumer with no mutators can receive original (MOVE)
+    if mutator_ports.is_empty() && read_only_ports.len() == 1 {
+        let port = &read_only_ports[0];
+        eprintln!(
+            "[FanoutProcessor:{}]   MOVE (no clone) -> single readonly port '{}'",
+            node_id, port
+        );
+        effect
+            .send_message_to(port.clone(), data)
+            .await
+            .map_err(|e| Error::ChannelSendError {
+                error: format!("fanout send (single readonly) to port '{port}' failed: {e}"),
+            })?;
+        return Ok(());
     }
 
     // === OTel Collector Ordering ===
@@ -150,12 +166,12 @@ async fn dispatch<PData: ReadonlyMarkable>(
 mod tests {
     #![allow(missing_docs)]
     use super::*;
-    use crate::local::processor::EffectHandler;
     use crate::local::message::LocalSender;
+    use crate::local::processor::EffectHandler;
     use crate::testing::test_node;
     use otap_df_channel::mpsc;
     use otap_df_telemetry::reporter::MetricsReporter;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     // Simple pdata type
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -167,9 +183,7 @@ mod tests {
     }
 
     // Build an EffectHandler with given ports.
-    fn make_effect_handler(
-        ports: &[&str],
-    ) -> (EffectHandler<PTest>, Vec<mpsc::Receiver<PTest>>) {
+    fn make_effect_handler(ports: &[&str]) -> (EffectHandler<PTest>, Vec<mpsc::Receiver<PTest>>) {
         let mut senders = std::collections::HashMap::new();
         let mut receivers = Vec::new();
         for p in ports {
@@ -188,7 +202,9 @@ mod tests {
         let (mut eh, receivers) = make_effect_handler(&ports);
         // No MUTATION interests set (all read-only)
         let mut proc = FanoutProcessor;
-        proc.process(Message::PData(PTest(7)), &mut eh).await.unwrap();
+        proc.process(Message::PData(PTest(7)), &mut eh)
+            .await
+            .unwrap();
 
         // Expect one message per port
         for rx in receivers {
@@ -210,7 +226,9 @@ mod tests {
         eh.set_port_interests("mut2", Interests::MUTATION).unwrap();
 
         let mut proc = FanoutProcessor;
-        proc.process(Message::PData(PTest(11)), &mut eh).await.unwrap();
+        proc.process(Message::PData(PTest(11)), &mut eh)
+            .await
+            .unwrap();
 
         // Collect received values
         let mut got = 0;
@@ -236,10 +254,13 @@ mod tests {
         // - Phase 2 will add is_read_only() when COW layer is implemented
         let ports = ["mut_only"];
         let (mut eh, receivers) = make_effect_handler(&ports);
-        eh.set_port_interests("mut_only", Interests::MUTATION).unwrap();
+        eh.set_port_interests("mut_only", Interests::MUTATION)
+            .unwrap();
 
         let mut proc = FanoutProcessor;
-        proc.process(Message::PData(PTest(3)), &mut eh).await.unwrap();
+        proc.process(Message::PData(PTest(3)), &mut eh)
+            .await
+            .unwrap();
 
         let v = timeout(Duration::from_millis(50), receivers[0].recv())
             .await
@@ -263,7 +284,9 @@ mod tests {
         // ro1 and ro2 have no MUTATION interest (default)
 
         let mut proc = FanoutProcessor;
-        proc.process(Message::PData(PTest(42)), &mut eh).await.unwrap();
+        proc.process(Message::PData(PTest(42)), &mut eh)
+            .await
+            .unwrap();
 
         // All consumers should receive the data
         for (idx, rx) in receivers.iter().enumerate() {
@@ -286,7 +309,9 @@ mod tests {
         eh.set_port_interests("mut3", Interests::MUTATION).unwrap();
 
         let mut proc = FanoutProcessor;
-        proc.process(Message::PData(PTest(99)), &mut eh).await.unwrap();
+        proc.process(Message::PData(PTest(99)), &mut eh)
+            .await
+            .unwrap();
 
         // All mutators should receive the data
         for (idx, rx) in receivers.iter().enumerate() {

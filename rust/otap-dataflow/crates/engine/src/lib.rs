@@ -31,16 +31,16 @@ use std::{collections::HashMap, sync::OnceLock};
 
 pub mod error;
 pub mod exporter;
-pub mod message;
-pub mod processor;
-pub mod receiver;
-pub mod readonly;
 /// Fan-out processor module.
 ///
 /// Provides mutation-aware fan-out semantics (read-only clone sharing and
 /// isolation for mutators). See `fanout_processor.rs` for implementation
 /// details and tests.
 pub mod fanout_processor;
+pub mod message;
+pub mod processor;
+pub mod readonly;
+pub mod receiver;
 
 mod attributes;
 pub mod config;

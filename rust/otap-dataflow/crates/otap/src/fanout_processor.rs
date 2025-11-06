@@ -11,17 +11,17 @@
 //!
 //! Plugin URN: `urn:otel:fanout:processor`
 
-use crate::pdata::OtapPdata;
 use crate::OTAP_PROCESSOR_FACTORIES;
+use crate::pdata::OtapPdata;
 use linkme::distributed_slice;
+use otap_df_config::error::Error as ConfigError;
+use otap_df_config::node::NodeUserConfig;
+use otap_df_engine::ProcessorFactory;
 use otap_df_engine::config::ProcessorConfig;
 use otap_df_engine::context::PipelineContext;
 use otap_df_engine::fanout_processor::FanoutProcessor;
 use otap_df_engine::node::NodeId;
 use otap_df_engine::processor::ProcessorWrapper;
-use otap_df_engine::ProcessorFactory;
-use otap_df_config::error::Error as ConfigError;
-use otap_df_config::node::NodeUserConfig;
 use std::sync::Arc;
 
 /// URN for the fan-out processor
@@ -51,5 +51,7 @@ pub static FANOUT_PROCESSOR_FACTORY: ProcessorFactory<OtapPdata> = ProcessorFact
     create: |pipeline_ctx: PipelineContext,
              node: NodeId,
              node_config: Arc<NodeUserConfig>,
-             proc_cfg: &ProcessorConfig| { create_fanout_processor(pipeline_ctx, node, node_config, proc_cfg) },
+             proc_cfg: &ProcessorConfig| {
+        create_fanout_processor(pipeline_ctx, node, node_config, proc_cfg)
+    },
 };
