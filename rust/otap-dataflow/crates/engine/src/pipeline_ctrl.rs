@@ -178,7 +178,7 @@ pub struct PipelineCtrlMsgManager<PData> {
     metrics_reporter: MetricsReporter,
 }
 
-impl<PData> PipelineCtrlMsgManager<PData> {
+impl<PData: Clone> PipelineCtrlMsgManager<PData> {
     /// Creates a new PipelineCtrlMsgManager.
     #[must_use]
     pub fn new(
@@ -381,7 +381,7 @@ mod tests {
         )
     }
 
-    fn setup_test_manager<PData>() -> (
+    fn setup_test_manager<PData: Clone>() -> (
         PipelineCtrlMsgManager<PData>,
         crate::control::PipelineCtrlMsgSender<PData>,
         HashMap<usize, Receiver<NodeControlMsg<PData>>>,

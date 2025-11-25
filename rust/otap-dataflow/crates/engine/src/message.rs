@@ -92,6 +92,8 @@ pub enum Sender<T> {
     Local(LocalSender<T>),
     /// Sender of a shared channel.
     Shared(SharedSender<T>),
+    /// Broadcast sender that sends to multiple destinations.
+    Broadcast(Vec<Sender<T>>),
 }
 
 impl<T> Clone for Sender<T> {
@@ -99,6 +101,7 @@ impl<T> Clone for Sender<T> {
         match self {
             Sender::Local(sender) => Sender::Local(sender.clone()),
             Sender::Shared(sender) => Sender::Shared(sender.clone()),
+            Sender::Broadcast(senders) => Sender::Broadcast(senders.clone()),
         }
     }
 }
@@ -110,18 +113,50 @@ impl<T> Sender<T> {
     }
 
     /// Sends a message to the channel.
-    pub async fn send(&self, msg: T) -> Result<(), SendError<T>> {
+    pub async fn send(&self, msg: T) -> Result<(), SendError<T>>
+    where
+        T: Clone,
+    {
         match self {
             Sender::Local(sender) => sender.send(msg).await,
             Sender::Shared(sender) => sender.send(msg).await,
+            Sender::Broadcast(senders) => {
+                if senders.is_empty() {
+                    return Ok(());
+                }
+                // Send clones to all but the last sender
+                let num_senders = senders.len();
+                for sender in &senders[..num_senders - 1] {
+                    Box::pin(sender.send(msg.clone())).await?;
+                }
+                // Send original to the last sender (avoid final clone)
+                Box::pin(senders[num_senders - 1].send(msg)).await?;
+                Ok(())
+            }
         }
     }
 
     /// Attempts to send a message without awaiting.
-    pub fn try_send(&self, msg: T) -> Result<(), SendError<T>> {
+    pub fn try_send(&self, msg: T) -> Result<(), SendError<T>>
+    where
+        T: Clone,
+    {
         match self {
             Sender::Local(sender) => sender.try_send(msg),
             Sender::Shared(sender) => sender.try_send(msg),
+            Sender::Broadcast(senders) => {
+                if senders.is_empty() {
+                    return Ok(());
+                }
+                // Send clones to all but the last sender
+                let num_senders = senders.len();
+                for sender in &senders[..num_senders - 1] {
+                    sender.try_send(msg.clone())?;
+                }
+                // Send original to the last sender (avoid final clone)
+                senders[num_senders - 1].try_send(msg)?;
+                Ok(())
+            }
         }
     }
 }
@@ -325,3 +360,7 @@ impl<PData> MessageChannel<PData> {
         drop(self.pdata_rx.take().expect("pdata_rx must exist"));
     }
 }
+
+#[cfg(test)]
+#[path = "message_tests.rs"]
+mod message_tests;

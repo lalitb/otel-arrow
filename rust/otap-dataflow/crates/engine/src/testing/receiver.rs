@@ -46,7 +46,7 @@ pub struct SendValidateContext<PData> {
     counters: CtrlMsgCounters,
 }
 
-impl<PData> TestContext<PData> {
+impl<PData: Clone> TestContext<PData> {
     /// Sends a control message to the receiver.
     pub async fn send_control_msg(&self, msg: NodeControlMsg<PData>) -> Result<(), Error> {
         self.control_sender
@@ -87,7 +87,7 @@ impl<PData> TestContext<PData> {
     }
 }
 
-impl<PData> NotSendValidateContext<PData> {
+impl<PData: Clone> NotSendValidateContext<PData> {
     /// Receives a pdata message produced by the receiver.
     pub async fn recv(&mut self) -> Result<PData, RecvError> {
         self.pdata_receiver.recv().await

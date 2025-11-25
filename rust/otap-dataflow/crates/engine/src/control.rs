@@ -311,7 +311,7 @@ pub struct ControlSenders<PData> {
     senders: HashMap<usize, TypedControlSender<PData>>,
 }
 
-impl<PData> TypedControlSender<PData> {
+impl<PData: Clone> TypedControlSender<PData> {
     /// Sends a control message to the node, awaiting until the message is sent.
     #[inline]
     pub async fn send(
@@ -388,7 +388,9 @@ impl<PData> ControlSenders<PData> {
     pub fn is_empty(&self) -> bool {
         self.senders.is_empty()
     }
+}
 
+impl<PData: Clone> ControlSenders<PData> {
     /// Broadcast a shutdown control message to all receivers in order to drain the pipelines.
     ///
     /// Returns `Ok(())` if all messages were sent successfully, or a vector of errors

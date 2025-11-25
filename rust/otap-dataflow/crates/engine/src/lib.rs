@@ -380,6 +380,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
                 src_node,
                 &dest_nodes,
                 NonZeroUsize::new(1000).expect("Buffer size must be non-zero"),
+                &hyper_edge.dispatch_strategy,
             )?;
 
             // Prepare assignments
@@ -423,21 +424,49 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
     /// Determines the best channel type from the following parameters:
     /// - Flag specifying if the channel is shared (true) or local (false).
     /// - The number of destinations connected to the channel.
-    /// - The dispatch strategy for the channel (not yet supported).
+    /// - The dispatch strategy for the channel.
     ///
     /// This function returns a tuple containing the selected sender and one receiver per
     /// destination.
     ///
-    /// ToDo (LQ): Support dispatch strategies.
+    /// Supported dispatch strategies:
+    /// - Broadcast: Creates separate channels for each destination, cloning data to all.
+    ///
+    /// ToDo (LQ): Support RoundRobin, Random, and LeastLoaded dispatch strategies.
     fn select_channel_type(
         src_node: &dyn Node<PData>,
         dest_nodes: &Vec<&dyn Node<PData>>,
         buffer_size: NonZeroUsize,
+        dispatch_strategy: &DispatchStrategy,
     ) -> Result<(Sender<PData>, Vec<Receiver<PData>>), Error> {
         let source_is_shared = src_node.is_shared();
         let any_dest_is_shared = dest_nodes.iter().any(|dest| dest.is_shared());
         let use_shared_channels = source_is_shared || any_dest_is_shared;
         let num_destinations = dest_nodes.len();
+
+        // Handle broadcast dispatch strategy by creating separate channels for each destination
+        if matches!(dispatch_strategy, DispatchStrategy::Broadcast) && num_destinations > 1 {
+            let mut senders = Vec::with_capacity(num_destinations);
+            let mut receivers = Vec::with_capacity(num_destinations);
+
+            for _ in 0..num_destinations {
+                if use_shared_channels {
+                    let (pdata_sender, pdata_receiver) =
+                        tokio::sync::mpsc::channel::<PData>(buffer_size.get());
+                    senders.push(Sender::Shared(SharedSender::MpscSender(pdata_sender)));
+                    receivers.push(Receiver::Shared(SharedReceiver::MpscReceiver(
+                        pdata_receiver,
+                    )));
+                } else {
+                    let (pdata_sender, pdata_receiver) =
+                        otap_df_channel::mpsc::Channel::new(buffer_size.get());
+                    senders.push(Sender::Local(LocalSender::MpscSender(pdata_sender)));
+                    receivers.push(Receiver::Local(LocalReceiver::MpscReceiver(pdata_receiver)));
+                }
+            }
+
+            return Ok((Sender::Broadcast(senders), receivers));
+        }
 
         if use_shared_channels {
             // Shared channels
@@ -625,7 +654,6 @@ struct HyperEdgeRuntime {
     // ToDo(LQ): Use port name for telemetry and debugging purposes.
     port: PortName,
 
-    #[allow(dead_code)]
     dispatch_strategy: DispatchStrategy,
 
     // names are from the configuration, not yet resolved
@@ -674,5 +702,58 @@ mod test {
     #[test]
     fn test_interests() {
         assert_eq!(Interests::ACKS | Interests::NACKS, Interests::ACKS_OR_NACKS);
+    }
+
+    #[test]
+    fn test_select_channel_type_broadcast() {
+        use crate::control::NodeControlMsg;
+        use otap_df_channel::error::SendError;
+
+        struct MockNode;
+
+        #[async_trait::async_trait(?Send)]
+        impl Node<String> for MockNode {
+            fn is_shared(&self) -> bool {
+                false
+            }
+            fn node_id(&self) -> NodeId {
+                NodeId {
+                    index: 0,
+                    name: "mock".into(),
+                }
+            }
+            fn user_config(&self) -> Arc<NodeUserConfig> {
+                Arc::new(NodeUserConfig::new_processor_config("mock_processor"))
+            }
+            async fn send_control_msg(
+                &self,
+                _msg: NodeControlMsg<String>,
+            ) -> Result<(), SendError<NodeControlMsg<String>>> {
+                Ok(())
+            }
+        }
+
+        let src_node = MockNode;
+        let dest_node1 = MockNode;
+        let dest_node2 = MockNode;
+        let dest_nodes: Vec<&dyn Node<String>> = vec![&dest_node1, &dest_node2];
+        let buffer_size = NonZeroUsize::new(10).unwrap();
+        let dispatch_strategy = DispatchStrategy::Broadcast;
+
+        let (sender, receivers) = PipelineFactory::<String>::select_channel_type(
+            &src_node,
+            &dest_nodes,
+            buffer_size,
+            &dispatch_strategy,
+        )
+        .unwrap();
+
+        match sender {
+            Sender::Broadcast(senders) => {
+                assert_eq!(senders.len(), 2);
+                assert_eq!(receivers.len(), 2);
+            }
+            _ => panic!("Expected Sender::Broadcast"),
+        }
     }
 }

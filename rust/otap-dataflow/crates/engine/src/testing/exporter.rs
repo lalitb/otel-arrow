@@ -83,7 +83,9 @@ impl<PData> TestContext<PData> {
     pub fn take_pipeline_ctrl_receiver(&mut self) -> Option<PipelineCtrlMsgReceiver<PData>> {
         self.pipeline_ctrl_msg_receiver.take()
     }
+}
 
+impl<PData: Clone> TestContext<PData> {
     /// Sends a timer tick control message.
     ///
     /// # Errors
