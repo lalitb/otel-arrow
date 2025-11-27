@@ -117,6 +117,7 @@ tonic = { version = "0.14", default-features = false, features = [
     "router",
     "server",
     "transport",
+    "tls-native-roots",
     "zstd",
 ] }
 tonic-middleware = "0.4.0"
