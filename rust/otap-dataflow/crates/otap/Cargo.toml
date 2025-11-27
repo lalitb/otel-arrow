@@ -73,6 +73,8 @@ azure_core = { workspace = true, optional = true }
 
 # OpenTelemetry proto with tonic feature enabled
 opentelemetry-proto = { workspace = true, optional = true }
+rustls-native-certs = "0.8.2"
+base64 = "0.22.1"
 
 [features]
 # Base experimental feature - enabled by all experimental exporters

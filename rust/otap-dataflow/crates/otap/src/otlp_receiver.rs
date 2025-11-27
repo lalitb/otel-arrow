@@ -1,14 +1,14 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use otap_df_config::tls::TlsServerConfig;
-use crate::tls_utils::load_server_tls_config;
 use crate::OTAP_RECEIVER_FACTORIES;
 use crate::otap_grpc::otlp::server::{
-    LogsServiceServer, MetricsServiceServer, RouteResponse, Settings, SharedState,
-    TraceServiceServer,
+    LogsServiceServer, MetricsServiceServer, RouteResponse, SharedState, TraceServiceServer,
 };
+use crate::otap_grpc::server_settings::GrpcServerSettings;
 use crate::pdata::OtapPdata;
+use crate::tls_utils::load_server_tls_config;
+use otap_df_config::tls::TlsServerConfig;
 
 use crate::compression::CompressionMethod;
 use async_trait::async_trait;
@@ -29,13 +29,9 @@ use otap_df_telemetry::metrics::MetricSet;
 use otap_df_telemetry_macros::metric_set;
 use serde::Deserialize;
 use serde_json::Value;
-use std::net::SocketAddr;
 use std::ops::Add;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio_stream::wrappers::TcpListenerStream;
-use tonic::codec::EnabledCompressionEncodings;
-use std::path::PathBuf;
 use tonic::transport::Server;
 
 /// URN for the OTLP Receiver
@@ -45,48 +41,17 @@ pub const OTLP_RECEIVER_URN: &str = "urn:otel:otlp:receiver";
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// The endpoint details: protocol, name, port.
-    listening_addr: SocketAddr,
+    /// gRPC server settings
+    #[serde(flatten)]
+    pub settings: GrpcServerSettings,
 
     /// Compression methods accepted
     /// TODO: this should be (CompressionMethod, CompressionMethod), with separate settings
     /// (as tonic supports) for request and response compression.
-    compression_method: Option<CompressionMethod>,
-
-    /// Maximum number of concurrent (in-flight) requests (default: 1000)
-    #[serde(default = "default_max_concurrent_requests")]
-    max_concurrent_requests: usize,
-
-    /// Whether to wait for the result (default: true)
-    ///
-    /// When enabled, the receiver will not send a response until the
-    /// immediate downstream component has acknowledged receipt of the
-    /// data.  This does not guarantee that data has been fully
-    /// processed or successfully exported to the final destination,
-    /// since components are able acknowledge early.
-    ///
-    /// Note when wait_for_result=false, it is impossible to
-    /// see a failure, errors are effectively suppressed.
-    #[serde(default = "default_wait_for_result")]
-    wait_for_result: bool,
-
-    /// Timeout for RPC requests. If not specified, no timeout is applied.
-    /// Format: humantime format (e.g., "30s", "5m", "1h", "500ms")
-    #[serde(default, with = "humantime_serde")]
-    pub timeout: Option<Duration>,
+    pub compression_method: Option<CompressionMethod>,
 
     /// TLS configuration
     pub tls: Option<TlsServerConfig>,
-}
-
-const fn default_max_concurrent_requests() -> usize {
-    1000
-}
-
-const fn default_wait_for_result() -> bool {
-    // See https://github.com/open-telemetry/otel-arrow/issues/1311
-    // This matches the OTel Collector default for wait_for_result, presently.
-    false
 }
 
 /// Receiver implementation that receives OTLP grpc service requests and decodes the data into OTAP.
@@ -127,11 +92,18 @@ impl OTLPReceiver {
         pipeline_ctx: PipelineContext,
         config: &Value,
     ) -> Result<Self, otap_df_config::error::Error> {
-        let config: Config = serde_json::from_value(config.clone()).map_err(|e| {
+        let mut config: Config = serde_json::from_value(config.clone()).map_err(|e| {
             otap_df_config::error::Error::InvalidUserConfig {
                 error: e.to_string(),
             }
         })?;
+
+        // Map legacy compression_method to settings if needed
+        if let Some(method) = config.compression_method {
+            if config.settings.request_compression.is_none() {
+                config.settings.request_compression = Some(vec![method]);
+            }
+        }
 
         // Register OTLP receiver metrics for this node.
         let metrics = pipeline_ctx.register_metrics::<OtlpReceiverMetrics>();
@@ -226,23 +198,10 @@ impl shared::Receiver<OtapPdata> for OTLPReceiver {
         effect_handler: shared::EffectHandler<OtapPdata>,
     ) -> Result<TerminalState, Error> {
         // Make the receiver mutable so we can update metrics on telemetry collection.
-        let listener = effect_handler.tcp_listener(self.config.listening_addr)?;
-        let listener_stream = TcpListenerStream::new(listener);
+        let listener = effect_handler.tcp_listener(self.config.settings.listening_addr)?;
+        let listener_stream = self.config.settings.build_tcp_incoming(listener);
 
-        let mut compression = EnabledCompressionEncodings::default();
-        let _ = self
-            .config
-            .compression_method
-            .as_ref()
-            .map(|method| compression.enable(method.map_to_compression_encoding()));
-
-        let settings = Settings {
-            max_concurrent_requests: self.config.max_concurrent_requests,
-            wait_for_result: self.config.wait_for_result,
-            max_decoding_message_size: None, // [lq] will be used in a future PR
-            request_compression_encodings: compression,
-            response_compression_encodings: compression,
-        };
+        let settings = self.config.settings.build_settings();
 
         let logs_server = LogsServiceServer::new(effect_handler.clone(), &settings);
         let metrics_server = MetricsServiceServer::new(effect_handler.clone(), &settings);
@@ -257,23 +216,30 @@ impl shared::Receiver<OtapPdata> for OTLPReceiver {
         let mut server_builder = Server::builder();
 
         // Apply timeout if configured
-        if let Some(timeout) = self.config.timeout {
+        if let Some(timeout) = self.config.settings.timeout {
             server_builder = server_builder.timeout(timeout);
         }
 
         if let Some(tls_config) = &self.config.tls {
-            if let Some(tls_builder) = load_server_tls_config(tls_config).await.map_err(|e| Error::ReceiverError {
-                receiver: effect_handler.receiver_id(),
-                kind: ReceiverErrorKind::Configuration,
-                error: format!("Failed to configure TLS: {}", e),
-                source_detail: format_error_sources(&e),
-            })? {
-                server_builder = server_builder.tls_config(tls_builder).map_err(|e| Error::ReceiverError {
-                    receiver: effect_handler.receiver_id(),
-                    kind: ReceiverErrorKind::Configuration,
-                    error: format!("Failed to configure TLS: {}", e),
-                    source_detail: format_error_sources(&e),
-                })?;
+            if let Some(tls_builder) =
+                load_server_tls_config(tls_config)
+                    .await
+                    .map_err(|e| Error::ReceiverError {
+                        receiver: effect_handler.receiver_id(),
+                        kind: ReceiverErrorKind::Configuration,
+                        error: format!("Failed to configure TLS: {}", e),
+                        source_detail: format_error_sources(&e),
+                    })?
+            {
+                server_builder =
+                    server_builder
+                        .tls_config(tls_builder)
+                        .map_err(|e| Error::ReceiverError {
+                            receiver: effect_handler.receiver_id(),
+                            kind: ReceiverErrorKind::Configuration,
+                            error: format!("Failed to configure TLS: {}", e),
+                            source_detail: format_error_sources(&e),
+                        })?;
             }
         }
 
@@ -345,6 +311,8 @@ impl shared::Receiver<OtapPdata> for OTLPReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
 
     use otap_df_config::node::NodeUserConfig;
     use otap_df_engine::context::ControllerContext;
@@ -465,13 +433,13 @@ mod tests {
         let receiver =
             OTLPReceiver::from_config(pipeline_ctx.clone(), &config_with_max_concurrent_requests)
                 .unwrap();
-        assert_eq!(receiver.config.max_concurrent_requests, 5000);
+        assert_eq!(receiver.config.settings.max_concurrent_requests, 5000);
 
         let config_default = json!({
             "listening_addr": "127.0.0.1:4317"
         });
         let receiver = OTLPReceiver::from_config(pipeline_ctx.clone(), &config_default).unwrap();
-        assert_eq!(receiver.config.max_concurrent_requests, 1000);
+        assert_eq!(receiver.config.settings.max_concurrent_requests, 0); // Default is 0 in GrpcServerSettings
 
         let config_full = json!({
             "listening_addr": "127.0.0.1:4317",
@@ -479,7 +447,18 @@ mod tests {
             "max_concurrent_requests": 2500
         });
         let receiver = OTLPReceiver::from_config(pipeline_ctx.clone(), &config_full).unwrap();
-        assert_eq!(receiver.config.max_concurrent_requests, 2500);
+        assert_eq!(receiver.config.settings.max_concurrent_requests, 2500);
+        // Check if compression_method was mapped to request_compression
+        assert!(receiver.config.settings.request_compression.is_some());
+        assert_eq!(
+            receiver
+                .config
+                .settings
+                .request_compression
+                .as_ref()
+                .unwrap()[0],
+            CompressionMethod::Gzip
+        );
 
         let config_with_timeout = json!({
             "listening_addr": "127.0.0.1:4317",
@@ -487,14 +466,21 @@ mod tests {
         });
         let receiver =
             OTLPReceiver::from_config(pipeline_ctx.clone(), &config_with_timeout).unwrap();
-        assert_eq!(receiver.config.timeout, Some(Duration::from_secs(30)));
+        assert_eq!(
+            receiver.config.settings.timeout,
+            Some(Duration::from_secs(30))
+        );
 
         let config_with_timeout_ms = json!({
             "listening_addr": "127.0.0.1:4317",
             "timeout": "500ms"
         });
-        let receiver = OTLPReceiver::from_config(pipeline_ctx.clone(), &config_with_timeout_ms).unwrap();
-        assert_eq!(receiver.config.timeout, Some(Duration::from_millis(500)));
+        let receiver =
+            OTLPReceiver::from_config(pipeline_ctx.clone(), &config_with_timeout_ms).unwrap();
+        assert_eq!(
+            receiver.config.settings.timeout,
+            Some(Duration::from_millis(500))
+        );
 
         let config_tls = json!({
             "listening_addr": "127.0.0.1:4317",
@@ -689,11 +675,14 @@ mod tests {
         let receiver = ReceiverWrapper::shared(
             OTLPReceiver {
                 config: Config {
-                    wait_for_result: true,
-                    listening_addr: addr,
+                    settings: GrpcServerSettings {
+                        wait_for_result: true,
+                        listening_addr: addr,
+                        max_concurrent_requests: 1000,
+                        timeout: None,
+                        ..Default::default()
+                    },
                     compression_method: None,
-                    max_concurrent_requests: 1000,
-                    timeout: None,
                     tls: None,
                 },
                 metrics: pipeline_ctx.register_metrics::<OtlpReceiverMetrics>(),
@@ -728,11 +717,14 @@ mod tests {
         let receiver = ReceiverWrapper::shared(
             OTLPReceiver {
                 config: Config {
-                    wait_for_result: true,
-                    listening_addr: addr,
+                    settings: GrpcServerSettings {
+                        wait_for_result: true,
+                        listening_addr: addr,
+                        max_concurrent_requests: 1000,
+                        timeout: None,
+                        ..Default::default()
+                    },
                     compression_method: None,
-                    max_concurrent_requests: 1000,
-                    timeout: None,
                     tls: None,
                 },
                 metrics: pipeline_ctx.register_metrics::<OtlpReceiverMetrics>(),
@@ -789,17 +781,23 @@ mod tests {
 
     fn generate_test_certs(dir: &std::path::Path) {
         use std::process::Command;
-        
+
         // 1. Generate CA
         let status = Command::new("openssl")
             .args(&[
-                "req", "-x509",
-                "-newkey", "rsa:2048",
-                "-keyout", "ca.key",
-                "-out", "ca.crt",
-                "-days", "365",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-keyout",
+                "ca.key",
+                "-out",
+                "ca.crt",
+                "-days",
+                "365",
                 "-nodes",
-                "-subj", "/CN=Test CA"
+                "-subj",
+                "/CN=Test CA",
             ])
             .current_dir(dir)
             .output()
@@ -811,31 +809,47 @@ mod tests {
         // 2. Generate Server Key and CSR
         let status = Command::new("openssl")
             .args(&[
-                "req", "-newkey", "rsa:2048",
-                "-keyout", "server.key",
-                "-out", "server.csr",
+                "req",
+                "-newkey",
+                "rsa:2048",
+                "-keyout",
+                "server.key",
+                "-out",
+                "server.csr",
                 "-nodes",
-                "-subj", "/CN=localhost",
-                "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"
+                "-subj",
+                "/CN=localhost",
+                "-addext",
+                "subjectAltName=DNS:localhost,IP:127.0.0.1",
             ])
             .current_dir(dir)
             .output()
             .expect("Failed to generate CSR");
         if !status.status.success() {
-            panic!("CSR gen failed: {}", String::from_utf8_lossy(&status.stderr));
+            panic!(
+                "CSR gen failed: {}",
+                String::from_utf8_lossy(&status.stderr)
+            );
         }
 
         // 3. Sign Server CSR with CA
         let status = Command::new("openssl")
             .args(&[
-                "x509", "-req",
-                "-in", "server.csr",
-                "-CA", "ca.crt",
-                "-CAkey", "ca.key",
+                "x509",
+                "-req",
+                "-in",
+                "server.csr",
+                "-CA",
+                "ca.crt",
+                "-CAkey",
+                "ca.key",
                 "-CAcreateserial",
-                "-out", "server.crt",
-                "-days", "365",
-                "-copy_extensions", "copy" 
+                "-out",
+                "server.crt",
+                "-days",
+                "365",
+                "-copy_extensions",
+                "copy",
             ])
             .current_dir(dir)
             .output()
@@ -877,11 +891,14 @@ mod tests {
         let receiver = ReceiverWrapper::shared(
             OTLPReceiver {
                 config: Config {
-                    wait_for_result: true,
-                    listening_addr: addr,
+                    settings: GrpcServerSettings {
+                        wait_for_result: true,
+                        listening_addr: addr,
+                        max_concurrent_requests: 1000,
+                        timeout: None,
+                        ..Default::default()
+                    },
                     compression_method: None,
-                    max_concurrent_requests: 1000,
-                    timeout: None,
                     tls: Some(TlsServerConfig {
                         config: otap_df_config::tls::TlsConfig {
                             cert_pem: Some(cert_pem),
@@ -907,14 +924,17 @@ mod tests {
                     .ca_certificate(ca_cert)
                     .domain_name("localhost");
 
-                let channel = timeout(Duration::from_secs(5), tonic::transport::Channel::from_shared(grpc_endpoint.clone())
-                    .expect("Invalid URI")
-                    .tls_config(tls_config)
-                    .expect("Failed to configure TLS")
-                    .connect())
-                    .await
-                    .expect("Connection timed out")
-                    .expect("Failed to connect");
+                let channel = timeout(
+                    Duration::from_secs(5),
+                    tonic::transport::Channel::from_shared(grpc_endpoint.clone())
+                        .expect("Invalid URI")
+                        .tls_config(tls_config)
+                        .expect("Failed to configure TLS")
+                        .connect(),
+                )
+                .await
+                .expect("Connection timed out")
+                .expect("Failed to connect");
 
                 let mut logs_client = LogsServiceClient::new(channel.clone());
 
@@ -923,7 +943,7 @@ mod tests {
                     .await
                     .expect("Can send log request")
                     .into_inner();
-                
+
                 assert_eq!(
                     logs_response,
                     ExportLogsServiceResponse {
@@ -966,6 +986,320 @@ mod tests {
         test_runtime
             .set_receiver(receiver)
             .run_test(tls_scenario)
+            .run_validation_concurrent(validation_procedure());
+    }
+
+    fn generate_client_certs(dir: &std::path::Path) {
+        use std::process::Command;
+        // Generate Client Key and CSR
+        let status = Command::new("openssl")
+            .args(&[
+                "req",
+                "-newkey",
+                "rsa:2048",
+                "-keyout",
+                "client.key",
+                "-out",
+                "client.csr",
+                "-nodes",
+                "-subj",
+                "/CN=client",
+            ])
+            .current_dir(dir)
+            .output()
+            .expect("Failed to generate client CSR");
+        if !status.status.success() {
+            panic!(
+                "Client CSR gen failed: {}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+        }
+
+        // Sign Client CSR with CA
+        let status = Command::new("openssl")
+            .args(&[
+                "x509",
+                "-req",
+                "-in",
+                "client.csr",
+                "-CA",
+                "ca.crt",
+                "-CAkey",
+                "ca.key",
+                "-CAcreateserial",
+                "-out",
+                "client.crt",
+                "-days",
+                "365",
+            ])
+            .current_dir(dir)
+            .output()
+            .expect("Failed to sign client cert");
+        if !status.status.success() {
+            panic!(
+                "Client Sign failed: {}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn test_otlp_receiver_tls_file_based() {
+        let test_runtime = TestRuntime::new();
+
+        let grpc_addr = "127.0.0.1";
+        let grpc_port = portpicker::pick_unused_port().expect("No free ports");
+        let grpc_endpoint = format!("https://{grpc_addr}:{grpc_port}");
+        let addr: SocketAddr = format!("{grpc_addr}:{grpc_port}").parse().unwrap();
+
+        let node_config = Arc::new(NodeUserConfig::new_receiver_config(OTLP_RECEIVER_URN));
+
+        let metrics_registry_handle = MetricsRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(metrics_registry_handle);
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 0);
+
+        // Generate certs in a temp dir
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        generate_test_certs(temp_dir.path());
+        let cert_path = temp_dir.path().join("server.crt");
+        let key_path = temp_dir.path().join("server.key");
+        let ca_path = temp_dir.path().join("ca.crt");
+
+        // Read CA pem for client config
+        let ca_pem = std::fs::read_to_string(&ca_path).expect("failed to read ca cert");
+
+        let receiver = ReceiverWrapper::shared(
+            OTLPReceiver {
+                config: Config {
+                    settings: GrpcServerSettings {
+                        wait_for_result: true,
+                        listening_addr: addr,
+                        max_concurrent_requests: 1000,
+                        timeout: None,
+                        ..Default::default()
+                    },
+                    compression_method: None,
+                    tls: Some(TlsServerConfig {
+                        config: otap_df_config::tls::TlsConfig {
+                            cert_file: Some(cert_path),
+                            key_file: Some(key_path),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                },
+                metrics: pipeline_ctx.register_metrics::<OtlpReceiverMetrics>(),
+            },
+            test_node(test_runtime.config().name.clone()),
+            node_config,
+            test_runtime.config(),
+        );
+
+        let tls_scenario = move |ctx: TestContext<OtapPdata>| {
+            Box::pin(async move {
+                let ca_cert = tonic::transport::Certificate::from_pem(ca_pem);
+                let tls_config = tonic::transport::ClientTlsConfig::new()
+                    .ca_certificate(ca_cert)
+                    .domain_name("localhost");
+
+                let channel = timeout(
+                    Duration::from_secs(5),
+                    tonic::transport::Channel::from_shared(grpc_endpoint.clone())
+                        .expect("Invalid URI")
+                        .tls_config(tls_config)
+                        .expect("Failed to configure TLS")
+                        .connect(),
+                )
+                .await
+                .expect("Connection timed out")
+                .expect("Failed to connect");
+
+                let mut logs_client = LogsServiceClient::new(channel.clone());
+                let logs_response = logs_client
+                    .export(create_logs_service_request())
+                    .await
+                    .expect("Can send log request")
+                    .into_inner();
+
+                assert_eq!(
+                    logs_response,
+                    ExportLogsServiceResponse {
+                        partial_success: None
+                    }
+                );
+
+                let mut metrics_client = MetricsServiceClient::new(channel.clone());
+                let metrics_response = metrics_client
+                    .export(create_metrics_service_request())
+                    .await
+                    .expect("can send metrics request")
+                    .into_inner();
+                assert_eq!(
+                    metrics_response,
+                    ExportMetricsServiceResponse {
+                        partial_success: None
+                    }
+                );
+
+                let mut traces_client = TraceServiceClient::new(channel);
+                let traces_response = traces_client
+                    .export(create_traces_service_request())
+                    .await
+                    .expect("can send traces request")
+                    .into_inner();
+                assert_eq!(
+                    traces_response,
+                    ExportTraceServiceResponse {
+                        partial_success: None
+                    }
+                );
+
+                ctx.send_shutdown(Instant::now(), "Test")
+                    .await
+                    .expect("Failed to send Shutdown");
+            }) as Pin<Box<dyn Future<Output = ()>>>
+        };
+
+        test_runtime
+            .set_receiver(receiver)
+            .run_test(tls_scenario)
+            .run_validation_concurrent(validation_procedure());
+    }
+
+    #[test]
+    fn test_otlp_receiver_mtls() {
+        let test_runtime = TestRuntime::new();
+
+        let grpc_addr = "127.0.0.1";
+        let grpc_port = portpicker::pick_unused_port().expect("No free ports");
+        let grpc_endpoint = format!("https://{grpc_addr}:{grpc_port}");
+        let addr: SocketAddr = format!("{grpc_addr}:{grpc_port}").parse().unwrap();
+
+        let node_config = Arc::new(NodeUserConfig::new_receiver_config(OTLP_RECEIVER_URN));
+
+        let metrics_registry_handle = MetricsRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(metrics_registry_handle);
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 0);
+
+        // Generate certs in a temp dir
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        generate_test_certs(temp_dir.path());
+        generate_client_certs(temp_dir.path());
+
+        let cert_path = temp_dir.path().join("server.crt");
+        let key_path = temp_dir.path().join("server.key");
+        let ca_path = temp_dir.path().join("ca.crt");
+        let client_cert_path = temp_dir.path().join("client.crt");
+        let client_key_path = temp_dir.path().join("client.key");
+
+        // Read certs
+        let ca_pem = std::fs::read_to_string(&ca_path).expect("failed to read ca cert");
+        let client_cert_pem =
+            std::fs::read_to_string(&client_cert_path).expect("failed to read client cert");
+        let client_key_pem =
+            std::fs::read_to_string(&client_key_path).expect("failed to read client key");
+
+        let receiver = ReceiverWrapper::shared(
+            OTLPReceiver {
+                config: Config {
+                    settings: GrpcServerSettings {
+                        wait_for_result: true,
+                        listening_addr: addr,
+                        max_concurrent_requests: 1000,
+                        timeout: None,
+                        ..Default::default()
+                    },
+                    compression_method: None,
+                    tls: Some(TlsServerConfig {
+                        config: otap_df_config::tls::TlsConfig {
+                            cert_file: Some(cert_path),
+                            key_file: Some(key_path),
+                            ..Default::default()
+                        },
+                        client_ca_file: Some(ca_path), // Enable mTLS
+                    }),
+                },
+                metrics: pipeline_ctx.register_metrics::<OtlpReceiverMetrics>(),
+            },
+            test_node(test_runtime.config().name.clone()),
+            node_config,
+            test_runtime.config(),
+        );
+
+        let mtls_scenario = move |ctx: TestContext<OtapPdata>| {
+            Box::pin(async move {
+                let ca_cert = tonic::transport::Certificate::from_pem(ca_pem);
+                let client_identity =
+                    tonic::transport::Identity::from_pem(client_cert_pem, client_key_pem);
+
+                let tls_config = tonic::transport::ClientTlsConfig::new()
+                    .ca_certificate(ca_cert)
+                    .identity(client_identity)
+                    .domain_name("localhost");
+
+                let channel = timeout(
+                    Duration::from_secs(5),
+                    tonic::transport::Channel::from_shared(grpc_endpoint.clone())
+                        .expect("Invalid URI")
+                        .tls_config(tls_config)
+                        .expect("Failed to configure TLS")
+                        .connect(),
+                )
+                .await
+                .expect("Connection timed out")
+                .expect("Failed to connect");
+
+                let mut logs_client = LogsServiceClient::new(channel.clone());
+                let logs_response = logs_client
+                    .export(create_logs_service_request())
+                    .await
+                    .expect("Can send log request")
+                    .into_inner();
+
+                assert_eq!(
+                    logs_response,
+                    ExportLogsServiceResponse {
+                        partial_success: None
+                    }
+                );
+
+                let mut metrics_client = MetricsServiceClient::new(channel.clone());
+                let metrics_response = metrics_client
+                    .export(create_metrics_service_request())
+                    .await
+                    .expect("can send metrics request")
+                    .into_inner();
+                assert_eq!(
+                    metrics_response,
+                    ExportMetricsServiceResponse {
+                        partial_success: None
+                    }
+                );
+
+                let mut traces_client = TraceServiceClient::new(channel);
+                let traces_response = traces_client
+                    .export(create_traces_service_request())
+                    .await
+                    .expect("can send traces request")
+                    .into_inner();
+                assert_eq!(
+                    traces_response,
+                    ExportTraceServiceResponse {
+                        partial_success: None
+                    }
+                );
+
+                ctx.send_shutdown(Instant::now(), "Test")
+                    .await
+                    .expect("Failed to send Shutdown");
+            }) as Pin<Box<dyn Future<Output = ()>>>
+        };
+
+        test_runtime
+            .set_receiver(receiver)
+            .run_test(mtls_scenario)
             .run_validation_concurrent(validation_procedure());
     }
 }

@@ -17,10 +17,12 @@ use crate::otap_grpc::{
     ArrowLogsServiceImpl, ArrowMetricsServiceImpl, ArrowTracesServiceImpl, Settings,
 };
 use crate::pdata::OtapPdata;
+use crate::tls_utils::load_server_tls_config;
 use async_trait::async_trait;
 use linkme::distributed_slice;
 use otap_df_config::SignalType;
 use otap_df_config::node::NodeUserConfig;
+use otap_df_config::tls::TlsServerConfig;
 use otap_df_engine::ReceiverFactory;
 use otap_df_engine::config::ReceiverConfig;
 use otap_df_engine::context::PipelineContext;
@@ -44,8 +46,8 @@ use std::net::SocketAddr;
 use std::ops::Add;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tonic::codegen::tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
+use tonic::transport::server::TcpIncoming;
 use tonic_middleware::MiddlewareLayer;
 
 const OTAP_RECEIVER_URN: &str = "urn:otel:otap:receiver";
@@ -82,6 +84,9 @@ pub struct Config {
     /// Format: humantime format (e.g., "30s", "5m", "1h", "500ms")
     #[serde(default, with = "humantime_serde")]
     pub timeout: Option<Duration>,
+
+    /// TLS configuration
+    pub tls: Option<TlsServerConfig>,
 }
 
 const fn default_max_concurrent_requests() -> usize {
@@ -227,7 +232,11 @@ impl shared::Receiver<OtapPdata> for OTAPReceiver {
     ) -> Result<TerminalState, Error> {
         // create listener on addr provided from config
         let listener = effect_handler.tcp_listener(self.config.listening_addr)?;
-        let listener_stream = TcpListenerStream::new(listener);
+        let listener_stream = TcpIncoming::from(listener)
+            .with_nodelay(Some(true))
+            .with_keepalive(Some(Duration::from_secs(45)))
+            .with_keepalive_interval(Some(Duration::from_secs(15)))
+            .with_keepalive_retries(Some(5));
 
         let settings = Settings {
             response_stream_channel_size: self.config.response_stream_channel_size,
@@ -270,6 +279,29 @@ impl shared::Receiver<OtapPdata> for OTAPReceiver {
         // Apply timeout if configured
         if let Some(timeout) = self.config.timeout {
             server_builder = server_builder.timeout(timeout);
+        }
+
+        if let Some(tls_config) = &self.config.tls {
+            if let Some(tls_builder) =
+                load_server_tls_config(tls_config)
+                    .await
+                    .map_err(|e| Error::ReceiverError {
+                        receiver: effect_handler.receiver_id(),
+                        kind: ReceiverErrorKind::Configuration,
+                        error: format!("Failed to configure TLS: {}", e),
+                        source_detail: format_error_sources(&e),
+                    })?
+            {
+                server_builder =
+                    server_builder
+                        .tls_config(tls_builder)
+                        .map_err(|e| Error::ReceiverError {
+                            receiver: effect_handler.receiver_id(),
+                            kind: ReceiverErrorKind::Configuration,
+                            error: format!("Failed to configure TLS: {}", e),
+                            source_detail: format_error_sources(&e),
+                        })?;
+            }
         }
 
         let server = server_builder
@@ -459,6 +491,9 @@ mod tests {
                 ctx.send_shutdown(Instant::now(), "Test")
                     .await
                     .expect("Failed to send Shutdown");
+
+                // Give the server a moment to shut down
+                tokio::time::sleep(Duration::from_millis(100)).await;
 
                 // server should be down after shutdown
                 let fail_metrics_client =
@@ -998,5 +1033,229 @@ mod tests {
             .set_receiver(receiver)
             .run_test(nack_scenario(grpc_endpoint)) // Use NACK-specific scenario
             .run_validation_concurrent(nack_validation_procedure()); // Use NACK-specific validation
+    }
+
+    fn generate_test_certs(dir: &std::path::Path) {
+        use std::process::Command;
+
+        // 1. Generate CA
+        let status = Command::new("openssl")
+            .args(&[
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-keyout",
+                "ca.key",
+                "-out",
+                "ca.crt",
+                "-days",
+                "365",
+                "-nodes",
+                "-subj",
+                "/CN=Test CA",
+            ])
+            .current_dir(dir)
+            .output()
+            .expect("Failed to generate CA");
+        if !status.status.success() {
+            panic!("CA gen failed: {}", String::from_utf8_lossy(&status.stderr));
+        }
+
+        // 2. Generate Server Key and CSR
+        let status = Command::new("openssl")
+            .args(&[
+                "req",
+                "-newkey",
+                "rsa:2048",
+                "-keyout",
+                "server.key",
+                "-out",
+                "server.csr",
+                "-nodes",
+                "-subj",
+                "/CN=localhost",
+                "-addext",
+                "subjectAltName=DNS:localhost,IP:127.0.0.1",
+            ])
+            .current_dir(dir)
+            .output()
+            .expect("Failed to generate CSR");
+        if !status.status.success() {
+            panic!(
+                "CSR gen failed: {}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+        }
+
+        // 3. Sign Server CSR with CA
+        let status = Command::new("openssl")
+            .args(&[
+                "x509",
+                "-req",
+                "-in",
+                "server.csr",
+                "-CA",
+                "ca.crt",
+                "-CAkey",
+                "ca.key",
+                "-CAcreateserial",
+                "-out",
+                "server.crt",
+                "-days",
+                "365",
+                "-copy_extensions",
+                "copy",
+            ])
+            .current_dir(dir)
+            .output()
+            .expect("Failed to sign cert");
+        if !status.status.success() {
+            panic!("Sign failed: {}", String::from_utf8_lossy(&status.stderr));
+        }
+    }
+
+    #[test]
+    fn test_otap_receiver_tls() {
+        let test_runtime = TestRuntime::new();
+
+        let grpc_addr = "127.0.0.1";
+        let grpc_port = portpicker::pick_unused_port().expect("No free ports");
+        let grpc_endpoint = format!("https://{grpc_addr}:{grpc_port}");
+        let addr: SocketAddr = format!("{grpc_addr}:{grpc_port}").parse().unwrap();
+
+        let node_config = Arc::new(NodeUserConfig::new_receiver_config(OTAP_RECEIVER_URN));
+
+        use otap_df_engine::context::ControllerContext;
+        use otap_df_telemetry::registry::MetricsRegistryHandle;
+        use serde_json::json;
+
+        let metrics_registry_handle = MetricsRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(metrics_registry_handle);
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 0);
+
+        // Generate certs in a temp dir
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        generate_test_certs(temp_dir.path());
+        let cert_path = temp_dir.path().join("server.crt");
+        let key_path = temp_dir.path().join("server.key");
+        let ca_path = temp_dir.path().join("ca.crt");
+
+        // Read certs into memory
+        let cert_pem = std::fs::read_to_string(&cert_path).expect("failed to read server cert");
+        let key_pem = std::fs::read_to_string(&key_path).expect("failed to read server key");
+        let ca_pem = std::fs::read_to_string(&ca_path).expect("failed to read ca cert");
+
+        let config = json!({
+            "listening_addr": addr.to_string(),
+            "response_stream_channel_size": 100,
+            "wait_for_result": true,
+            "tls": {
+                "cert_pem": cert_pem,
+                "key_pem": key_pem
+            }
+        });
+
+        let receiver = ReceiverWrapper::shared(
+            OTAPReceiver::from_config(pipeline_ctx, &config).unwrap(),
+            test_node(test_runtime.config().name.clone()),
+            node_config,
+            test_runtime.config(),
+        );
+
+        let tls_scenario = move |ctx: TestContext<OtapPdata>| {
+            Box::pin(async move {
+                // Use the in-memory CA pem
+                let ca_cert = tonic::transport::Certificate::from_pem(ca_pem);
+
+                let tls_config = tonic::transport::ClientTlsConfig::new()
+                    .ca_certificate(ca_cert)
+                    .domain_name("localhost");
+
+                let channel = timeout(
+                    Duration::from_secs(5),
+                    tonic::transport::Channel::from_shared(grpc_endpoint.clone())
+                        .expect("Invalid URI")
+                        .tls_config(tls_config)
+                        .expect("Failed to configure TLS")
+                        .connect(),
+                )
+                .await
+                .expect("Connection timed out")
+                .expect("Failed to connect");
+
+                // Test with metrics client
+                let mut arrow_metrics_client = ArrowMetricsServiceClient::new(channel.clone());
+
+                #[allow(tail_expr_drop_order)]
+                let metrics_stream = stream! {
+                    let mut producer = Producer::new();
+                    for batch_id in 0..3 {
+                        let mut metrics_records = create_otap_batch(batch_id, ArrowPayloadType::MultivariateMetrics);
+                        let bar = producer.produce_bar(&mut metrics_records).unwrap();
+                        yield bar
+                    }
+                };
+                let metrics_response = arrow_metrics_client
+                    .arrow_metrics(metrics_stream)
+                    .await
+                    .expect("Failed to receive response after sending Metrics Request");
+
+                validate_batch_responses(
+                    metrics_response.into_inner(),
+                    0,
+                    "Successfully received",
+                    "metrics",
+                )
+                .await;
+
+                ctx.send_shutdown(Instant::now(), "Test")
+                    .await
+                    .expect("Failed to send Shutdown");
+            }) as Pin<Box<dyn Future<Output = ()>>>
+        };
+
+        test_runtime
+            .set_receiver(receiver)
+            .run_test(tls_scenario)
+            .run_validation_concurrent(tls_validation_procedure());
+    }
+
+    /// Specific validation procedure for the TLS test that only checks for metrics.
+    fn tls_validation_procedure()
+    -> impl FnOnce(NotSendValidateContext<OtapPdata>) -> Pin<Box<dyn Future<Output = ()>>> {
+        |mut ctx| {
+            Box::pin(async move {
+                // read from the effect handler
+                for batch_id in 0..3 {
+                    let metrics_pdata = timeout(Duration::from_secs(3), ctx.recv())
+                        .await
+                        .expect("Timed out waiting for message")
+                        .expect("No message received");
+
+                    // Validate the payload
+                    let metrics_records: OtapArrowRecords = metrics_pdata
+                        .clone()
+                        .payload()
+                        .try_into()
+                        .expect("Could convert pdata to OTAPData");
+
+                    // Assert that the message received is what the test client sent.
+                    let _expected_metrics_message =
+                        create_otap_batch(batch_id, ArrowPayloadType::MultivariateMetrics);
+                    assert!(matches!(metrics_records, _expected_metrics_message));
+
+                    // Send ACK if wait_for_result is enabled
+                    if let Some((_node_id, ack)) =
+                        crate::pdata::Context::next_ack(AckMsg::new(metrics_pdata))
+                    {
+                        ctx.send_control_msg(NodeControlMsg::Ack(ack))
+                            .await
+                            .expect("Failed to send Ack for metrics");
+                    }
+                }
+            })
+        }
     }
 }
