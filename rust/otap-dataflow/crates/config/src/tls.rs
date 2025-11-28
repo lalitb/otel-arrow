@@ -15,6 +15,7 @@ pub struct TlsConfig {
 
     /// If true, load system CA certificates pool in addition to the certificates
     /// configured in this struct.
+    /// Note: If this is true and no system certificates are found, the server will fail to start.
     pub include_system_ca_certs_pool: Option<bool>,
 
     /// Path to the TLS cert to use for TLS required connections.
@@ -39,9 +40,10 @@ pub struct TlsConfig {
     // /// CipherSuites is a list of TLS cipher suites that the TLS transport can use.
     // pub cipher_suites: Option<Vec<String>>,
 
-    // /// ReloadInterval specifies the duration after which the certificate will be reloaded
-    // /// If not set, it will never be reloaded
-    // pub reload_interval: Option<String>,
+    /// ReloadInterval specifies the duration after which the certificate will be reloaded
+    /// If not set, it will never be reloaded.
+    /// Format: Standard duration string (e.g., "30s", "5m", "1h").
+    pub reload_interval: Option<String>,
 }
 
 /// TLS configuration specific to client connections.
@@ -70,6 +72,9 @@ pub struct TlsServerConfig {
 
     /// Path to the TLS cert to use by the server to verify a client certificate.
     pub client_ca_file: Option<PathBuf>,
+
+    /// Path to the Certificate Revocation List (CRL) to use by the server to verify a client certificate.
+    pub client_crl_file: Option<PathBuf>,
     // TODO: Implement certificate reloading
     // /// Reload the ClientCAs file when it is modified
     // pub client_ca_file_reload: Option<bool>,

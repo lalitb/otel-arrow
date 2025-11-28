@@ -17,10 +17,12 @@ use crate::otap_grpc::{
     ArrowLogsServiceImpl, ArrowMetricsServiceImpl, ArrowTracesServiceImpl, Settings,
 };
 use crate::pdata::OtapPdata;
-use crate::tls_utils::load_server_tls_config;
+use crate::tls_utils::build_reloadable_server_config;
 use async_trait::async_trait;
+use futures::TryStreamExt;
 use linkme::distributed_slice;
 use otap_df_config::SignalType;
+use std::io;
 use otap_df_config::node::NodeUserConfig;
 use otap_df_config::tls::TlsServerConfig;
 use otap_df_engine::ReceiverFactory;
@@ -50,7 +52,8 @@ use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
 use tonic_middleware::MiddlewareLayer;
 
-const OTAP_RECEIVER_URN: &str = "urn:otel:otap:receiver";
+/// URN for the OTAP Receiver
+pub const OTAP_RECEIVER_URN: &str = "urn:otel:otap:receiver";
 
 /// Configuration for the OTAP Receiver
 #[derive(Debug, Deserialize)]
@@ -281,28 +284,19 @@ impl shared::Receiver<OtapPdata> for OTAPReceiver {
             server_builder = server_builder.timeout(timeout);
         }
 
-        if let Some(tls_config) = &self.config.tls {
-            if let Some(tls_builder) =
-                load_server_tls_config(tls_config)
-                    .await
-                    .map_err(|e| Error::ReceiverError {
-                        receiver: effect_handler.receiver_id(),
-                        kind: ReceiverErrorKind::Configuration,
-                        error: format!("Failed to configure TLS: {}", e),
-                        source_detail: format_error_sources(&e),
-                    })?
-            {
-                server_builder =
-                    server_builder
-                        .tls_config(tls_builder)
-                        .map_err(|e| Error::ReceiverError {
-                            receiver: effect_handler.receiver_id(),
-                            kind: ReceiverErrorKind::Configuration,
-                            error: format!("Failed to configure TLS: {}", e),
-                            source_detail: format_error_sources(&e),
-                        })?;
-            }
-        }
+        let maybe_tls_acceptor = if let Some(tls_config) = &self.config.tls {
+            let server_config = build_reloadable_server_config(tls_config)
+                .await
+                .map_err(|e| Error::ReceiverError {
+                    receiver: effect_handler.receiver_id(),
+                    kind: ReceiverErrorKind::Configuration,
+                    error: format!("Failed to configure TLS: {}", e),
+                    source_detail: format_error_sources(&e),
+                })?;
+            Some(tokio_rustls::TlsAcceptor::from(server_config))
+        } else {
+            None
+        };
 
         let server = server_builder
             .layer(MiddlewareLayer::new(ZstdRequestHeaderAdapter::default()))
@@ -350,7 +344,20 @@ impl shared::Receiver<OtapPdata> for OTAPReceiver {
             },
 
             // Run server
-            result = server.serve_with_incoming(listener_stream) => {
+            result = async {
+                match maybe_tls_acceptor {
+                    Some(tls_acceptor) => {
+                        let tls_stream = listener_stream.and_then(move |conn| {
+                            let acceptor = tls_acceptor.clone();
+                            async move { acceptor.accept(conn).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e)) }
+                        });
+                        server.serve_with_incoming(tls_stream).await
+                    }
+                    None => {
+                        server.serve_with_incoming(listener_stream).await
+                    }
+                }
+            } => {
                 if let Err(error) = result {
                     // Report receiver error
                     let source_detail = format_error_sources(&error);
@@ -1117,6 +1124,7 @@ mod tests {
 
     #[test]
     fn test_otap_receiver_tls() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let test_runtime = TestRuntime::new();
 
         let grpc_addr = "127.0.0.1";
