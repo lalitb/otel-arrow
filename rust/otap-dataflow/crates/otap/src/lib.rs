@@ -65,7 +65,8 @@ mod otlp_mock;
 #[cfg(test)]
 mod fixtures;
 
-#[cfg(test)]
+/// Testing utilities
+#[doc(hidden)]
 pub mod testing;
 
 /// Signal-type router processor (OTAP-based)

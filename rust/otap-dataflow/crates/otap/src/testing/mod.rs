@@ -14,7 +14,97 @@ use otap_df_pdata::OtlpProtoBytes;
 use prost::Message;
 use serde_json::Value;
 use std::ops::Add;
+use std::process::Command;
 use std::time::Instant;
+
+/// Generates a CA certificate in the given directory.
+pub fn generate_ca(dir: &std::path::Path) {
+    let status = Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            "ca.key",
+            "-out",
+            "ca.crt",
+            "-days",
+            "365",
+            "-nodes",
+            "-subj",
+            "/CN=Test CA",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+        ])
+        .current_dir(dir)
+        .output()
+        .expect("Failed to generate CA");
+    if !status.status.success() {
+        panic!("CA gen failed: {}", String::from_utf8_lossy(&status.stderr));
+    }
+}
+
+/// Generates a server certificate signed by the CA in the given directory.
+pub fn generate_server_cert(dir: &std::path::Path, cn: &str) {
+    // Generate Server Key and CSR
+    let status = Command::new("openssl")
+        .args([
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            "server.key",
+            "-out",
+            "server.csr",
+            "-nodes",
+            "-subj",
+            &format!("/CN={}", cn),
+            "-addext",
+            &format!("subjectAltName=DNS:{},IP:127.0.0.1", cn),
+        ])
+        .current_dir(dir)
+        .output()
+        .expect("Failed to generate CSR");
+    if !status.status.success() {
+        panic!(
+            "CSR gen failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+    }
+
+    // Sign Server CSR with CA
+    let status = Command::new("openssl")
+        .args([
+            "x509",
+            "-req",
+            "-in",
+            "server.csr",
+            "-CA",
+            "ca.crt",
+            "-CAkey",
+            "ca.key",
+            "-CAcreateserial",
+            "-out",
+            "server.crt",
+            "-days",
+            "365",
+            "-copy_extensions",
+            "copy",
+        ])
+        .current_dir(dir)
+        .output()
+        .expect("Failed to sign cert");
+    if !status.status.success() {
+        panic!("Sign failed: {}", String::from_utf8_lossy(&status.stderr));
+    }
+}
+
+/// Generates test certificates (CA and server cert with CN=localhost) in the given directory.
+pub fn generate_test_certs(dir: &std::path::Path) {
+    generate_ca(dir);
+    generate_server_cert(dir, "localhost");
+}
 
 /// TestCallData helps test the CallData type.
 #[derive(Eq, PartialEq, Debug, Clone)]

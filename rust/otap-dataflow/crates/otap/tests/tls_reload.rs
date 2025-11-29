@@ -1,13 +1,12 @@
 //! Test for TLS reloading.
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use std::process::Command;
-use tokio::time::sleep;
 use serde_json::json;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::future::Future;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::time::sleep;
 use tokio::time::timeout;
 
 use otap_df_config::node::NodeUserConfig;
@@ -21,34 +20,22 @@ use otap_df_otap::pdata::OtapPdata;
 use otap_df_telemetry::registry::MetricsRegistryHandle;
 
 // OTLP imports
-use otap_df_otap::otlp_receiver::{OTLPReceiver, OTLP_RECEIVER_URN};
-use otap_df_pdata::proto::opentelemetry::collector::logs::v1::logs_service_client::LogsServiceClient;
+use otap_df_otap::otlp_receiver::{OTLP_RECEIVER_URN, OTLPReceiver};
 use otap_df_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest;
+use otap_df_pdata::proto::opentelemetry::collector::logs::v1::logs_service_client::LogsServiceClient;
 
 // OTAP imports
-use otap_df_otap::otap_receiver::{OTAPReceiver, OTAP_RECEIVER_URN as OTAP_URN};
-use otap_df_pdata::proto::opentelemetry::arrow::v1::arrow_logs_service_client::ArrowLogsServiceClient;
-use async_stream::stream;
-use otap_df_pdata::Producer;
-use otap_df_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 use arrow::array::{RecordBatch, UInt16Array};
 use arrow::datatypes::{DataType, Field, Schema};
+use async_stream::stream;
+use otap_df_otap::otap_receiver::{OTAP_RECEIVER_URN as OTAP_URN, OTAPReceiver};
+use otap_df_pdata::Producer;
 use otap_df_pdata::otap::{Logs, Metrics, OtapArrowRecords, Traces};
+use otap_df_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
+use otap_df_pdata::proto::opentelemetry::arrow::v1::arrow_logs_service_client::ArrowLogsServiceClient;
 use otap_df_pdata::schema::consts;
 
-fn pick_unused_port() -> u16 {
-    use rand::Rng;
-    let mut rng = rand::rng();
-    // Try multiple times to find a free port in a safe range.
-    // We avoid binding to port 0 as some restricted environments disallow it.
-    for _ in 0..50 {
-        let port = rng.random_range(20000..60000);
-        if std::net::TcpListener::bind(format!("127.0.0.1:{}", port)).is_ok() {
-            return port;
-        }
-    }
-    panic!("Failed to find a free port after multiple attempts");
-}
+use otap_df_otap::testing::{generate_ca, generate_server_cert};
 
 fn create_otap_batch(batch_id: u64, payload_type: ArrowPayloadType) -> OtapArrowRecords {
     let record_batch = RecordBatch::try_new(
@@ -79,58 +66,13 @@ fn create_otap_batch(batch_id: u64, payload_type: ArrowPayloadType) -> OtapArrow
     otap_batch
 }
 
-fn generate_ca(dir: &std::path::Path) {
-    let status = Command::new("openssl")
-        .args(&[
-            "req", "-x509", "-newkey", "rsa:2048", "-keyout", "ca.key", "-out", "ca.crt",
-            "-days", "365", "-nodes", "-subj", "/CN=Test CA",
-            "-addext", "basicConstraints=critical,CA:TRUE",
-        ])
-        .current_dir(dir)
-        .output()
-        .expect("Failed to generate CA");
-    if !status.status.success() {
-        panic!("CA gen failed: {}", String::from_utf8_lossy(&status.stderr));
-    }
-}
-
-fn generate_server_cert(dir: &std::path::Path, cn: &str) {
-    // Generate Server Key and CSR
-    let status = Command::new("openssl")
-        .args(&[
-            "req", "-newkey", "rsa:2048", "-keyout", "server.key", "-out", "server.csr",
-            "-nodes", "-subj", &format!("/CN={}", cn),
-            "-addext", &format!("subjectAltName=DNS:{},IP:127.0.0.1", cn),
-        ])
-        .current_dir(dir)
-        .output()
-        .expect("Failed to generate CSR");
-    if !status.status.success() {
-        panic!("CSR gen failed: {}", String::from_utf8_lossy(&status.stderr));
-    }
-
-    // Sign Server CSR with CA
-    let status = Command::new("openssl")
-        .args(&[
-            "x509", "-req", "-in", "server.csr", "-CA", "ca.crt", "-CAkey", "ca.key",
-            "-CAcreateserial", "-out", "server.crt", "-days", "365",
-            "-copy_extensions", "copy",
-        ])
-        .current_dir(dir)
-        .output()
-        .expect("Failed to sign cert");
-    if !status.status.success() {
-        panic!("Sign failed: {}", String::from_utf8_lossy(&status.stderr));
-    }
-}
-
 #[test]
 fn test_otlp_receiver_tls_reload() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let test_runtime = TestRuntime::new();
 
     let grpc_addr = "127.0.0.1";
-    let grpc_port = pick_unused_port();
+    let grpc_port = portpicker::pick_unused_port().expect("No free ports");
     let grpc_endpoint = format!("https://{grpc_addr}:{grpc_port}");
     let addr: SocketAddr = format!("{grpc_addr}:{grpc_port}").parse().unwrap();
 
@@ -138,8 +80,7 @@ fn test_otlp_receiver_tls_reload() {
 
     let metrics_registry_handle = MetricsRegistryHandle::new();
     let controller_ctx = ControllerContext::new(metrics_registry_handle);
-    let pipeline_ctx =
-        controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 0);
+    let pipeline_ctx = controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 0);
 
     // Generate certs in a temp dir
     let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
@@ -187,52 +128,65 @@ fn test_otlp_receiver_tls_reload() {
 
             let mut logs_client = LogsServiceClient::new(channel);
             let request = ExportLogsServiceRequest::default();
-            let _ = logs_client.export(request.clone()).await.expect("Initial request failed");
+            let _ = logs_client
+                .export(request.clone())
+                .await
+                .expect("Initial request failed");
 
             // 2. Rotate cert
             sleep(Duration::from_secs(2)).await;
-            
+
             let dir_path = temp_dir.path().to_path_buf();
-            
+
             // Regenerate cert
             {
                 let dir_path = dir_path.clone();
                 tokio::task::spawn_blocking(move || {
                     generate_server_cert(&dir_path, "localhost");
-                }).await.expect("Failed to regenerate cert");
+                })
+                .await
+                .expect("Failed to regenerate cert");
             }
 
             // 3. Connect again with new cert expectation
             println!("Connecting with new cert expectation...");
-            
+
             sleep(Duration::from_secs(2)).await; // Give some time for reload to happen
 
             // Regenerate with different CN
-             {
+            {
                 let dir_path = dir_path.clone();
                 tokio::task::spawn_blocking(move || {
                     generate_server_cert(&dir_path, "otherhost");
-                }).await.expect("Failed to regenerate cert");
+                })
+                .await
+                .expect("Failed to regenerate cert");
             }
             println!("Regenerated cert with CN=otherhost");
-            
+
             // Client expecting "otherhost"
             let tls_config_new = tonic::transport::ClientTlsConfig::new()
                 .ca_certificate(ca_cert)
                 .domain_name("otherhost");
 
-            let channel_result = timeout(Duration::from_secs(5), tonic::transport::Channel::from_shared(grpc_endpoint.clone())
-                .expect("Invalid URI")
-                .tls_config(tls_config_new)
-                .expect("Failed to configure TLS")
-                .connect())
-                .await;
+            let channel_result = timeout(
+                Duration::from_secs(5),
+                tonic::transport::Channel::from_shared(grpc_endpoint.clone())
+                    .expect("Invalid URI")
+                    .tls_config(tls_config_new)
+                    .expect("Failed to configure TLS")
+                    .connect(),
+            )
+            .await;
 
             match channel_result {
                 Ok(Ok(channel)) => {
-                     println!("Connected successfully with new cert!");
-                     let mut logs_client = LogsServiceClient::new(channel);
-                     let _ = logs_client.export(request).await.expect("Request with new cert failed");
+                    println!("Connected successfully with new cert!");
+                    let mut logs_client = LogsServiceClient::new(channel);
+                    let _ = logs_client
+                        .export(request)
+                        .await
+                        .expect("Request with new cert failed");
                 }
                 Ok(Err(e)) => {
                     panic!("Failed to connect with new cert (connect error): {}", e);
@@ -251,7 +205,7 @@ fn test_otlp_receiver_tls_reload() {
     let validation = |mut ctx: NotSendValidateContext<OtapPdata>| {
         Box::pin(async move {
             // Just drain messages until channel closed
-            while let Ok(_) = ctx.recv().await {
+            while ctx.recv().await.is_ok() {
                 // ignore
             }
         }) as Pin<Box<dyn Future<Output = ()>>>
@@ -269,7 +223,7 @@ fn test_otap_receiver_tls_reload() {
     let test_runtime = TestRuntime::new();
 
     let grpc_addr = "127.0.0.1";
-    let grpc_port = pick_unused_port();
+    let grpc_port = portpicker::pick_unused_port().expect("No free ports");
     let grpc_endpoint = format!("https://{grpc_addr}:{grpc_port}");
     let addr: SocketAddr = format!("{grpc_addr}:{grpc_port}").parse().unwrap();
 
@@ -277,8 +231,7 @@ fn test_otap_receiver_tls_reload() {
 
     let metrics_registry_handle = MetricsRegistryHandle::new();
     let controller_ctx = ControllerContext::new(metrics_registry_handle);
-    let pipeline_ctx =
-        controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 0);
+    let pipeline_ctx = controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 0);
 
     // Generate certs in a temp dir
     let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
@@ -326,7 +279,7 @@ fn test_otap_receiver_tls_reload() {
                 .expect("Failed to connect initially");
 
             let mut logs_client = ArrowLogsServiceClient::new(channel);
-            
+
             // Send initial request
             let logs_stream = stream! {
                 let mut producer = Producer::new();
@@ -334,22 +287,27 @@ fn test_otap_receiver_tls_reload() {
                 let bar = producer.produce_bar(&mut logs_records).unwrap();
                 yield bar;
             };
-            let _ = logs_client.arrow_logs(logs_stream).await.expect("Initial request failed");
+            let _ = logs_client
+                .arrow_logs(logs_stream)
+                .await
+                .expect("Initial request failed");
 
             // 2. Rotate cert
             sleep(Duration::from_secs(2)).await;
-            
+
             let dir_path = temp_dir.path().to_path_buf();
-            
+
             // Regenerate cert with different CN
-             {
+            {
                 let dir_path = dir_path.clone();
                 tokio::task::spawn_blocking(move || {
                     generate_server_cert(&dir_path, "otherhost");
-                }).await.expect("Failed to regenerate cert");
+                })
+                .await
+                .expect("Failed to regenerate cert");
             }
             println!("Regenerated cert with CN=otherhost");
-            
+
             // 3. Connect again with new cert expectation
             sleep(Duration::from_secs(2)).await; // Give some time for reload to happen
 
@@ -358,24 +316,30 @@ fn test_otap_receiver_tls_reload() {
                 .ca_certificate(ca_cert)
                 .domain_name("otherhost");
 
-            let channel_result = timeout(Duration::from_secs(5), tonic::transport::Channel::from_shared(grpc_endpoint.clone())
-                .expect("Invalid URI")
-                .tls_config(tls_config_new)
-                .expect("Failed to configure TLS")
-                .connect())
-                .await;
+            let channel_result = timeout(
+                Duration::from_secs(5),
+                tonic::transport::Channel::from_shared(grpc_endpoint.clone())
+                    .expect("Invalid URI")
+                    .tls_config(tls_config_new)
+                    .expect("Failed to configure TLS")
+                    .connect(),
+            )
+            .await;
 
             match channel_result {
                 Ok(Ok(channel)) => {
-                     println!("Connected successfully with new cert!");
-                     let mut logs_client = ArrowLogsServiceClient::new(channel);
-                     let logs_stream = stream! {
+                    println!("Connected successfully with new cert!");
+                    let mut logs_client = ArrowLogsServiceClient::new(channel);
+                    let logs_stream = stream! {
                         let mut producer = Producer::new();
                         let mut logs_records = create_otap_batch(1, ArrowPayloadType::Logs);
                         let bar = producer.produce_bar(&mut logs_records).unwrap();
                         yield bar;
                     };
-                     let _ = logs_client.arrow_logs(logs_stream).await.expect("Request with new cert failed");
+                    let _ = logs_client
+                        .arrow_logs(logs_stream)
+                        .await
+                        .expect("Request with new cert failed");
                 }
                 Ok(Err(e)) => {
                     panic!("Failed to connect with new cert (connect error): {}", e);
@@ -394,7 +358,7 @@ fn test_otap_receiver_tls_reload() {
     let validation = |mut ctx: NotSendValidateContext<OtapPdata>| {
         Box::pin(async move {
             // Just drain messages until channel closed
-            while let Ok(_) = ctx.recv().await {
+            while ctx.recv().await.is_ok() {
                 // ignore
             }
         }) as Pin<Box<dyn Future<Output = ()>>>

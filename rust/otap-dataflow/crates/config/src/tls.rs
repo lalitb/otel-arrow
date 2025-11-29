@@ -39,7 +39,6 @@ pub struct TlsConfig {
 
     // /// CipherSuites is a list of TLS cipher suites that the TLS transport can use.
     // pub cipher_suites: Option<Vec<String>>,
-
     /// ReloadInterval specifies the duration after which the certificate will be reloaded
     /// If not set, it will never be reloaded.
     /// Format: Standard duration string (e.g., "30s", "5m", "1h").

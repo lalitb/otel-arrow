@@ -9,8 +9,8 @@ use rustls::{DigitallySignedStruct, DistinguishedName, Error, SignatureScheme};
 use rustls_native_certs::load_native_certs;
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
@@ -165,9 +165,7 @@ impl LazyReloadableCertResolver {
             cert_mtime: AtomicU64::new(cert_mtime),
             key_mtime: AtomicU64::new(key_mtime),
             last_check_time: AtomicU64::new(now),
-            check_interval_secs: check_interval
-                .map(|d| d.as_secs())
-                .unwrap_or(300), // Default: 5 minutes
+            check_interval_secs: check_interval.map(|d| d.as_secs()).unwrap_or(300), // Default: 5 minutes
             is_reloading: AtomicBool::new(false),
         })
     }
@@ -183,12 +181,11 @@ impl LazyReloadableCertResolver {
         }
 
         // Interval expired - try to win the check race
-        if self.last_check_time.compare_exchange(
-            last_check,
-            now,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ).is_err() {
+        if self
+            .last_check_time
+            .compare_exchange(last_check, now, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             // Another thread just updated, skip
             return false;
         }
@@ -219,12 +216,11 @@ impl LazyReloadableCertResolver {
         }
 
         // Files changed! Reload
-        if self.is_reloading.compare_exchange(
-            false,
-            true,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ).is_err() {
+        if self
+            .is_reloading
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             return false; // Another thread reloading
         }
 
@@ -321,12 +317,11 @@ impl LazyReloadableClientCaVerifier {
             return;
         }
 
-        if self.last_check_time.compare_exchange(
-            last_check,
-            now,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ).is_err() {
+        if self
+            .last_check_time
+            .compare_exchange(last_check, now, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             return;
         }
 
@@ -357,12 +352,11 @@ impl LazyReloadableClientCaVerifier {
             return;
         }
 
-        if self.is_reloading.compare_exchange(
-            false,
-            true,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ).is_err() {
+        if self
+            .is_reloading
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             return;
         }
 
@@ -399,7 +393,9 @@ impl ClientCertVerifier for LazyReloadableClientCaVerifier {
         now: UnixTime,
     ) -> Result<ClientCertVerified, Error> {
         self.check_and_reload_if_interval_expired();
-        self.inner.load().verify_client_cert(end_entity, intermediates, now)
+        self.inner
+            .load()
+            .verify_client_cert(end_entity, intermediates, now)
     }
 
     fn verify_tls12_signature(
@@ -484,7 +480,8 @@ fn load_client_verifier_sync(
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     for cert in certs {
-        roots.add(cert)
+        roots
+            .add(cert)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     }
 
@@ -495,7 +492,7 @@ fn load_client_verifier_sync(
         let crls = rustls_pemfile::crls(&mut io::BufReader::new(&crl_pem[..]))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        
+
         if !crls.is_empty() {
             builder = builder.with_crls(crls);
         }
@@ -504,7 +501,7 @@ fn load_client_verifier_sync(
     let verifier = builder
         .build()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    
+
     Ok(verifier)
 }
 
@@ -518,7 +515,9 @@ fn load_client_verifier_sync(
 pub async fn build_reloadable_server_config(
     config: &TlsServerConfig,
 ) -> Result<Arc<rustls::ServerConfig>, io::Error> {
-    let check_interval = config.config.reload_interval
+    let check_interval = config
+        .config
+        .reload_interval
         .as_ref()
         .map(|s| humantime::parse_duration(s))
         .transpose()
@@ -531,7 +530,7 @@ pub async fn build_reloadable_server_config(
         let client_verifier = Arc::new(LazyReloadableClientCaVerifier::new(
             client_ca_file.clone(),
             config.client_crl_file.clone(),
-            check_interval
+            check_interval,
         )?);
         builder.with_client_cert_verifier(client_verifier)
     } else if let Some(ca_file) = &config.config.ca_file {
@@ -539,50 +538,59 @@ pub async fn build_reloadable_server_config(
         let client_verifier = Arc::new(LazyReloadableClientCaVerifier::new(
             ca_file.clone(),
             config.client_crl_file.clone(),
-            check_interval
+            check_interval,
         )?);
         builder.with_client_cert_verifier(client_verifier)
     } else if let Some(ca_pem) = &config.config.ca_pem {
-         // Static CA from PEM
-         let mut roots = rustls::RootCertStore::empty();
-         let certs = rustls_pemfile::certs(&mut io::BufReader::new(ca_pem.as_bytes()))
+        // Static CA from PEM
+        let mut roots = rustls::RootCertStore::empty();
+        let certs = rustls_pemfile::certs(&mut io::BufReader::new(ca_pem.as_bytes()))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-         for cert in certs {
-             roots.add(cert).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-         }
-         let verifier = WebPkiClientVerifier::builder(roots.into()).build()
+        for cert in certs {
+            roots
+                .add(cert)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        }
+        let verifier = WebPkiClientVerifier::builder(roots.into())
+            .build()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-         builder.with_client_cert_verifier(verifier)
+        builder.with_client_cert_verifier(verifier)
     } else {
         builder.with_no_client_auth()
     };
 
     // Cert resolver
-    let server_config = if let (Some(cert_path), Some(key_path)) = (&config.config.cert_file, &config.config.key_file) {
+    let server_config = if let (Some(cert_path), Some(key_path)) =
+        (&config.config.cert_file, &config.config.key_file)
+    {
         // File-based: use lazy reloader
-        let cert_resolver = Arc::new(
-            LazyReloadableCertResolver::new(
-                cert_path.clone(),
-                key_path.clone(),
-                check_interval,
-            )?
-        );
+        let cert_resolver = Arc::new(LazyReloadableCertResolver::new(
+            cert_path.clone(),
+            key_path.clone(),
+            check_interval,
+        )?);
         builder.with_cert_resolver(cert_resolver)
-    } else if let (Some(cert_pem), Some(key_pem)) = (&config.config.cert_pem, &config.config.key_pem) {
+    } else if let (Some(cert_pem), Some(key_pem)) =
+        (&config.config.cert_pem, &config.config.key_pem)
+    {
         // PEM-based: static
         let certs = rustls_pemfile::certs(&mut io::BufReader::new(cert_pem.as_bytes()))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        
+
         let key = rustls_pemfile::private_key(&mut io::BufReader::new(key_pem.as_bytes()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "No key found in PEM"))?;
-            
-        builder.with_single_cert(certs, key)
+
+        builder
+            .with_single_cert(certs, key)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
     } else {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "TLS requires either cert_file/key_file or cert_pem/key_pem"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "TLS requires either cert_file/key_file or cert_pem/key_pem",
+        ));
     };
 
     let mut server_config = server_config;
@@ -637,24 +645,37 @@ mod tests {
         // Generate Key and Cert in one go (self-signed)
         let status = Command::new("openssl")
             .args(&[
-                "req", "-x509", "-newkey", "rsa:2048",
-                "-keyout", &format!("{}.key", name),
-                "-out", &format!("{}.crt", name),
-                "-days", "1", "-nodes",
-                "-subj", &format!("/CN={}", cn),
-                "-addext", "basicConstraints=critical,CA:TRUE",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-keyout",
+                &format!("{}.key", name),
+                "-out",
+                &format!("{}.crt", name),
+                "-days",
+                "1",
+                "-nodes",
+                "-subj",
+                &format!("/CN={}", cn),
+                "-addext",
+                "basicConstraints=critical,CA:TRUE",
             ])
             .current_dir(dir)
             .output()
             .expect("Failed to generate cert");
-        
+
         if !status.status.success() {
-            panic!("Cert gen failed: {}", String::from_utf8_lossy(&status.stderr));
+            panic!(
+                "Cert gen failed: {}",
+                String::from_utf8_lossy(&status.stderr)
+            );
         }
     }
 
     #[test]
     fn test_lazy_reload_resolver() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path();
         let cert_path = path.join("server.crt");
@@ -670,7 +691,8 @@ mod tests {
             cert_path.clone(),
             key_path.clone(),
             Some(Duration::from_millis(500)),
-        ).expect("Failed to create resolver");
+        )
+        .expect("Failed to create resolver");
 
         let initial_cert = resolver.current_cert_key();
         assert!(!initial_cert.cert.is_empty());
@@ -680,8 +702,8 @@ mod tests {
 
         // 4. Update cert file (ensure mtime changes)
         // Sleep a bit to ensure FS mtime granularity (some systems are 1s)
-        thread::sleep(Duration::from_millis(1100)); 
-        
+        thread::sleep(Duration::from_millis(1100));
+
         generate_cert(path, "cert2", "otherhost");
         let _ = fs::copy(path.join("cert2.crt"), &cert_path).unwrap();
         let _ = fs::copy(path.join("cert2.key"), &key_path).unwrap();
@@ -692,7 +714,7 @@ mod tests {
 
         let new_cert = resolver.current_cert_key();
         assert_ne!(initial_cert.cert, new_cert.cert, "Cert should have changed");
-        
+
         // 6. Trigger again immediately - should not reload
         let reloaded_again = resolver.check_and_reload_if_interval_expired();
         assert!(!reloaded_again, "Should not reload again immediately");
@@ -719,12 +741,13 @@ mod tests {
         // Wait, if it fails to parse, load_client_verifier_sync will fail.
         // So we need a valid CRL or we test just the CA reload part.
         // Let's test CA reload first.
-        
+
         let verifier = LazyReloadableClientCaVerifier::new(
             ca_path.clone(),
             None,
             Some(Duration::from_millis(500)),
-        ).expect("Failed to create verifier");
+        )
+        .expect("Failed to create verifier");
 
         // 3. Wait
         thread::sleep(Duration::from_millis(600));
@@ -734,19 +757,19 @@ mod tests {
         generate_cert(path, "ca2", "Test CA 2");
         let _ = fs::copy(path.join("ca2.crt"), &ca_path).unwrap();
 
-        // 5. Trigger reload (we can't easily check internal state, but we can check logs or 
+        // 5. Trigger reload (we can't easily check internal state, but we can check logs or
         // rely on the fact that it didn't panic and code path is same as server cert)
-        // We can check if it reloads by checking if hints changed? 
+        // We can check if it reloads by checking if hints changed?
         // No, hints are static.
         // But we can check if verify_client_cert calls check_and_reload.
-        
-        // Since we can't inspect inner state easily without exposing it, 
+
+        // Since we can't inspect inner state easily without exposing it,
         // we rely on the unit test for LazyReloadableCertResolver which shares the exact same logic.
         // But let's at least ensure it constructs and runs without error.
-        
+
         // To verify reload, we can use the fact that we added logging.
         // Or we can add a method to inspect mtime for testing.
-        
+
         // Let's just ensure it compiles and runs.
         let _ = verifier.root_hint_subjects();
     }

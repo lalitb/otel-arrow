@@ -128,7 +128,7 @@ impl OtapPdata {
     /// Construct new OtapData with payload using default context.
     /// This is a test-only form.
     #[must_use]
-    #[cfg(test)]
+    #[doc(hidden)]
     pub fn new_default(payload: OtapPayload) -> Self {
         Self {
             context: Context::default(),
@@ -169,7 +169,7 @@ impl OtapPdata {
     /// only considered useful in testing.  Use into_parts() to split an
     /// OtapPdata into (Context, OtapPayload).
     #[must_use]
-    #[cfg(test)]
+    #[doc(hidden)]
     pub fn payload(self) -> OtapPayload {
         self.payload
     }
@@ -195,8 +195,8 @@ impl OtapPdata {
 
     /// Enable testing Ack/Nack without an effect handler. Consumes,
     /// modifies and returns self.
-    #[cfg(test)]
     #[must_use]
+    #[doc(hidden)]
     pub fn test_subscribe_to(
         mut self,
         interests: Interests,

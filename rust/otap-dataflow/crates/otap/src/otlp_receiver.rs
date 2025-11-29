@@ -785,86 +785,6 @@ mod tests {
             .run_validation_concurrent(nack_validation);
     }
 
-    fn generate_test_certs(dir: &std::path::Path) {
-        use std::process::Command;
-
-        // 1. Generate CA
-        let status = Command::new("openssl")
-            .args(&[
-                "req",
-                "-x509",
-                "-newkey",
-                "rsa:2048",
-                "-keyout",
-                "ca.key",
-                "-out",
-                "ca.crt",
-                "-days",
-                "365",
-                "-nodes",
-                "-subj",
-                "/CN=Test CA",
-            ])
-            .current_dir(dir)
-            .output()
-            .expect("Failed to generate CA");
-        if !status.status.success() {
-            panic!("CA gen failed: {}", String::from_utf8_lossy(&status.stderr));
-        }
-
-        // 2. Generate Server Key and CSR
-        let status = Command::new("openssl")
-            .args(&[
-                "req",
-                "-newkey",
-                "rsa:2048",
-                "-keyout",
-                "server.key",
-                "-out",
-                "server.csr",
-                "-nodes",
-                "-subj",
-                "/CN=localhost",
-                "-addext",
-                "subjectAltName=DNS:localhost,IP:127.0.0.1",
-            ])
-            .current_dir(dir)
-            .output()
-            .expect("Failed to generate CSR");
-        if !status.status.success() {
-            panic!(
-                "CSR gen failed: {}",
-                String::from_utf8_lossy(&status.stderr)
-            );
-        }
-
-        // 3. Sign Server CSR with CA
-        let status = Command::new("openssl")
-            .args(&[
-                "x509",
-                "-req",
-                "-in",
-                "server.csr",
-                "-CA",
-                "ca.crt",
-                "-CAkey",
-                "ca.key",
-                "-CAcreateserial",
-                "-out",
-                "server.crt",
-                "-days",
-                "365",
-                "-copy_extensions",
-                "copy",
-            ])
-            .current_dir(dir)
-            .output()
-            .expect("Failed to sign cert");
-        if !status.status.success() {
-            panic!("Sign failed: {}", String::from_utf8_lossy(&status.stderr));
-        }
-    }
-
     #[test]
     fn test_otlp_receiver_tls() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -885,7 +805,7 @@ mod tests {
 
         // Generate certs in a temp dir
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
-        generate_test_certs(temp_dir.path());
+        crate::testing::generate_test_certs(temp_dir.path());
         let cert_path = temp_dir.path().join("server.crt");
         let key_path = temp_dir.path().join("server.key");
         let ca_path = temp_dir.path().join("ca.crt");
@@ -1069,7 +989,7 @@ mod tests {
 
         // Generate certs in a temp dir
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
-        generate_test_certs(temp_dir.path());
+        crate::testing::generate_test_certs(temp_dir.path());
         let cert_path = temp_dir.path().join("server.crt");
         let key_path = temp_dir.path().join("server.key");
         let ca_path = temp_dir.path().join("ca.crt");
@@ -1194,7 +1114,7 @@ mod tests {
 
         // Generate certs in a temp dir
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
-        generate_test_certs(temp_dir.path());
+        crate::testing::generate_test_certs(temp_dir.path());
         generate_client_certs(temp_dir.path());
 
         let cert_path = temp_dir.path().join("server.crt");
