@@ -155,7 +155,9 @@ pub fn create_test_pdata() -> OtapPdata {
     // Note this has to be one log record for existing tests.
     let otlp_service_req = otap_df_pdata::testing::fixtures::log_with_no_scope();
     let mut otlp_bytes = vec![];
-    otlp_service_req.encode(&mut otlp_bytes).unwrap();
+    otlp_service_req
+        .encode(&mut otlp_bytes)
+        .expect("failed to encode otlp request");
 
     OtapPdata::new_default(OtlpProtoBytes::ExportLogsRequest(Bytes::from(otlp_bytes)).into())
 }
@@ -163,23 +165,28 @@ pub fn create_test_pdata() -> OtapPdata {
 /// Simple exporter test where there is NO subscribe_to() in the context.
 pub fn test_exporter_no_subscription(factory: &ExporterFactory<OtapPdata>, config: Value) {
     let test_runtime = TestRuntime::new();
-    let exporter = create_exporter_from_factory(factory, config).unwrap();
+    let exporter =
+        create_exporter_from_factory(factory, config).expect("failed to create exporter");
 
     test_runtime
         .set_exporter(exporter)
         .run_test(|ctx| async move {
-            ctx.send_pdata(create_test_pdata()).await.unwrap();
+            ctx.send_pdata(create_test_pdata())
+                .await
+                .expect("failed to send pdata");
             ctx.send_shutdown(
                 Instant::now().add(std::time::Duration::from_secs(1)),
                 "test shutdown",
             )
             .await
-            .unwrap();
+            .expect("failed to send shutdown");
         })
         .run_validation(|mut ctx, result| async move {
             result.expect("success");
 
-            let mut pipeline_rx = ctx.take_pipeline_ctrl_receiver().unwrap();
+            let mut pipeline_rx = ctx
+                .take_pipeline_ctrl_receiver()
+                .expect("failed to take pipeline ctrl receiver");
 
             match pipeline_rx.recv().await {
                 Ok(received_msg) => {
@@ -200,21 +207,22 @@ pub fn test_exporter_with_subscription(
     expect_interest: Interests,
 ) {
     let test_runtime = TestRuntime::new();
-    let exporter = create_exporter_from_factory(factory, config).unwrap();
+    let exporter =
+        create_exporter_from_factory(factory, config).expect("failed to create exporter");
     test_runtime
         .set_exporter(exporter)
         .run_test(move |ctx| async move {
             let req_data = create_test_pdata()
                 .test_subscribe_to(subscribe_interests, TestCallData::default().into(), 654321);
-            ctx.send_pdata(req_data).await.unwrap();
+            ctx.send_pdata(req_data).await.expect("failed to send pdata");
             ctx.send_shutdown(Instant::now().add(std::time::Duration::from_secs(1)), "test shutdown")
                 .await
-                .unwrap();
+                .expect("failed to send shutdown");
         })
         .run_validation(|mut ctx, result| async move {
             result.expect("success");
 
-            let mut pipeline_rx = ctx.take_pipeline_ctrl_receiver().unwrap();
+            let mut pipeline_rx = ctx.take_pipeline_ctrl_receiver().expect("failed to take pipeline ctrl receiver");
             let (trigger, calldata, reqdata, reason) = match pipeline_rx.recv().await {
                 Ok(PipelineControlMsg::DeliverAck { ack, node_id }) => {
                     assert_eq!(node_id, 654321);
@@ -240,7 +248,7 @@ pub fn test_exporter_with_subscription(
             assert_eq!(expect_interest&Interests::ACKS_OR_NACKS, trigger);
 
             if !trigger.is_empty() {
-                let got: TestCallData = calldata.try_into().unwrap();
+                let got: TestCallData = calldata.try_into().expect("failed to convert calldata");
                 assert_eq!(TestCallData::default(), got);
                 assert_eq!(
                     reason,

@@ -437,7 +437,7 @@ fn get_mtime(path: &PathBuf) -> Result<u64, io::Error> {
         .modified()?
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        .map_err(io::Error::other)
 }
 
 fn load_certified_key_sync(
