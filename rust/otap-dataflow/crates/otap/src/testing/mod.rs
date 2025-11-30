@@ -18,6 +18,10 @@ use std::process::Command;
 use std::time::Instant;
 
 /// Generates a CA certificate in the given directory.
+///
+/// Requires `openssl` to be installed and available in the system PATH.
+/// This function may fail if `openssl` is not installed.
+/// This is particularly important for CI/CD environments or developer setups.
 pub fn generate_ca(dir: &std::path::Path) {
     let status = Command::new("openssl")
         .args([
@@ -46,6 +50,8 @@ pub fn generate_ca(dir: &std::path::Path) {
 }
 
 /// Generates a server certificate signed by the CA in the given directory.
+///
+/// Requires `openssl` to be installed and available in the PATH.
 pub fn generate_server_cert(dir: &std::path::Path, cn: &str) {
     // Generate Server Key and CSR
     let status = Command::new("openssl")

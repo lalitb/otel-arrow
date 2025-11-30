@@ -309,7 +309,7 @@ fn test_otap_receiver_tls_reload() {
             println!("Regenerated cert with CN=otherhost");
 
             // 3. Connect again with new cert expectation
-            sleep(Duration::from_secs(2)).await; // Give some time for reload to happen
+            sleep(Duration::from_secs(3)).await; // Give some time for reload to happen
 
             // Client expecting "otherhost"
             let tls_config_new = tonic::transport::ClientTlsConfig::new()

@@ -7,12 +7,11 @@ use crate::otap_grpc::otlp::server::{
 };
 use crate::otap_grpc::server_settings::GrpcServerSettings;
 use crate::pdata::OtapPdata;
-use crate::tls_utils::build_reloadable_server_config;
+use crate::tls_utils::{build_reloadable_server_config, create_tls_stream};
 use otap_df_config::tls::TlsServerConfig;
 
 use crate::compression::CompressionMethod;
 use async_trait::async_trait;
-use futures::TryStreamExt;
 use linkme::distributed_slice;
 use otap_df_config::SignalType;
 use otap_df_config::node::NodeUserConfig;
@@ -30,7 +29,6 @@ use otap_df_telemetry::metrics::MetricSet;
 use otap_df_telemetry_macros::metric_set;
 use serde::Deserialize;
 use serde_json::Value;
-use std::io;
 use std::ops::Add;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -284,10 +282,7 @@ impl shared::Receiver<OtapPdata> for OTLPReceiver {
             result = async {
                 match maybe_tls_acceptor {
                     Some(tls_acceptor) => {
-                        let tls_stream = listener_stream.and_then(move |conn| {
-                            let acceptor = tls_acceptor.clone();
-                            async move { acceptor.accept(conn).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e)) }
-                        });
+                        let tls_stream = create_tls_stream(listener_stream, tls_acceptor);
                         server.serve_with_incoming(tls_stream).await
                     }
                     None => {

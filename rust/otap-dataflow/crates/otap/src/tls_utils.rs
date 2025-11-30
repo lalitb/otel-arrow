@@ -1,5 +1,6 @@
 use arc_swap::ArcSwap;
 use base64::prelude::*;
+use futures::{Stream, StreamExt, TryStreamExt};
 use otap_df_config::tls::TlsServerConfig;
 use rustls::pki_types::{CertificateDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
@@ -9,8 +10,8 @@ use rustls::{DigitallySignedStruct, DistinguishedName, Error, SignatureScheme};
 use rustls_native_certs::load_native_certs;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
@@ -120,6 +121,42 @@ pub async fn load_server_tls_config(
     }
 
     Ok(Some(tls_builder))
+}
+
+/// Creates a TLS stream from a TCP listener stream and a TLS acceptor.
+///
+/// This function handles the TLS handshake for each incoming connection.
+/// It filters out connections where the handshake fails, logging the error
+/// instead of terminating the stream.
+pub fn create_tls_stream<S, T>(
+    listener_stream: S,
+    tls_acceptor: tokio_rustls::TlsAcceptor,
+) -> impl Stream<Item = Result<tokio_rustls::server::TlsStream<T>, io::Error>>
+where
+    S: Stream<Item = Result<T, io::Error>> + Send + 'static,
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
+    listener_stream
+        .and_then(move |conn| {
+            let acceptor = tls_acceptor.clone();
+            async move {
+                acceptor
+                    .accept(conn)
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            }
+        })
+        // Filter out TLS handshake errors so they don't terminate the stream
+        .filter_map(|res| async move {
+            match res {
+                Ok(stream) => Some(Ok::<_, io::Error>(stream)),
+                Err(e) => {
+                    // Log the error but continue accepting connections
+                    log::warn!("TLS handshake failed: {}", e);
+                    None
+                }
+            }
+        })
 }
 
 /// Lazy-reloading certificate resolver with throttled mtime checks
@@ -276,7 +313,7 @@ pub struct LazyReloadableClientCaVerifier {
     last_check_time: AtomicU64,
     check_interval_secs: u64,
     is_reloading: AtomicBool,
-    hints: Vec<DistinguishedName>,
+    hints: RwLock<&'static [DistinguishedName]>,
 }
 
 impl LazyReloadableClientCaVerifier {
@@ -288,6 +325,11 @@ impl LazyReloadableClientCaVerifier {
     ) -> Result<Self, io::Error> {
         let verifier = load_client_verifier_sync(&ca_path, crl_path.as_ref())?;
         let hints = verifier.root_hint_subjects().to_vec();
+        // We leak the hints to get a static reference, which is required by the trait signature
+        // and allows us to update it safely using RwLock without unsafe code.
+        // This is acceptable because CA rotation is a rare operation.
+        let leaked_hints = Box::leak(hints.into_boxed_slice());
+
         let ca_mtime = get_mtime(&ca_path)?;
         let crl_mtime = if let Some(p) = &crl_path {
             get_mtime(p)?
@@ -305,7 +347,7 @@ impl LazyReloadableClientCaVerifier {
             last_check_time: AtomicU64::new(now),
             check_interval_secs: check_interval.map(|d| d.as_secs()).unwrap_or(300),
             is_reloading: AtomicBool::new(false),
-            hints,
+            hints: RwLock::new(leaked_hints),
         })
     }
 
@@ -367,8 +409,13 @@ impl LazyReloadableClientCaVerifier {
     fn do_reload(&self, new_ca_mtime: u64, new_crl_mtime: u64) {
         match load_client_verifier_sync(&self.ca_path, self.crl_path.as_ref()) {
             Ok(new_verifier) => {
-                // Note: we cannot update hints because root_hint_subjects returns a slice
-                // tied to &self. We keep the initial hints.
+                let new_hints = new_verifier.root_hint_subjects().to_vec();
+                let leaked_hints = Box::leak(new_hints.into_boxed_slice());
+
+                if let Ok(mut guard) = self.hints.write() {
+                    *guard = leaked_hints;
+                }
+
                 self.inner.store(Arc::new(new_verifier));
                 self.ca_mtime.store(new_ca_mtime, Ordering::Relaxed);
                 self.crl_mtime.store(new_crl_mtime, Ordering::Relaxed);
@@ -421,7 +468,9 @@ impl ClientCertVerifier for LazyReloadableClientCaVerifier {
     }
 
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
-        &self.hints
+        // We return a static reference which is safe because we leak the memory on update.
+        // If the lock is poisoned, we panic (standard behavior).
+        *self.hints.read().unwrap()
     }
 }
 
@@ -460,7 +509,12 @@ fn load_certified_key_sync(
 
     let key = private_key(&mut BufReader::new(&key_pem[..]))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "No key"))?;
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "No private key found in key file",
+            )
+        })?;
 
     let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -581,7 +635,12 @@ pub async fn build_reloadable_server_config(
 
         let key = rustls_pemfile::private_key(&mut io::BufReader::new(key_pem.as_bytes()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "No key found in PEM"))?;
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "No server private key found in PEM",
+                )
+            })?;
 
         builder
             .with_single_cert(certs, key)
@@ -726,6 +785,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path();
         let ca_path = path.join("ca.crt");
+        // CRL path is defined but currently unused in this test as we focus on CA reload.
+        // It's kept here to indicate where the CRL file would be if we were testing CRL reloading.
         let _crl_path = path.join("ca.crl");
 
         // 1. Generate CA
