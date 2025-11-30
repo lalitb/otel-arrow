@@ -233,6 +233,11 @@ impl shared::Receiver<OtapPdata> for OTAPReceiver {
     ) -> Result<TerminalState, Error> {
         // create listener on addr provided from config
         let listener = effect_handler.tcp_listener(self.config.listening_addr)?;
+        // Note: These TCP settings are currently hardcoded for the OTAP receiver.
+        // Ideally, they should be configurable or derived from GrpcServerSettings defaults.
+        // However, since OTAPReceiver uses a custom Config struct that doesn't embed GrpcServerSettings,
+        // we explicitly set them here to match the behavior of other receivers.
+        // Future refactoring should consider unifying the configuration.
         let listener_stream = TcpIncoming::from(listener)
             .with_nodelay(Some(true))
             .with_keepalive(Some(Duration::from_secs(45)))
