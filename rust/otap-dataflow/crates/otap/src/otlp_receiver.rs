@@ -915,7 +915,7 @@ mod tests {
         use std::process::Command;
         // Generate Client Key and CSR
         let status = Command::new("openssl")
-            .args(&[
+            .args([
                 "req",
                 "-newkey",
                 "rsa:2048",
@@ -939,7 +939,7 @@ mod tests {
 
         // Sign Client CSR with CA
         let status = Command::new("openssl")
-            .args(&[
+            .args([
                 "x509",
                 "-req",
                 "-in",
