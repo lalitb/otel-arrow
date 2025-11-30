@@ -139,12 +139,7 @@ where
     listener_stream
         .and_then(move |conn| {
             let acceptor = tls_acceptor.clone();
-            async move {
-                acceptor
-                    .accept(conn)
-                    .await
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-            }
+            async move { acceptor.accept(conn).await.map_err(io::Error::other) }
         })
         // Filter out TLS handshake errors so they don't terminate the stream
         .filter_map(|res| async move {
@@ -470,7 +465,7 @@ impl ClientCertVerifier for LazyReloadableClientCaVerifier {
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
         // We return a static reference which is safe because we leak the memory on update.
         // If the lock is poisoned, we panic (standard behavior).
-        *self.hints.read().unwrap()
+        *self.hints.read().expect("lock poisoned")
     }
 }
 
@@ -703,7 +698,7 @@ mod tests {
     fn generate_cert(dir: &std::path::Path, name: &str, cn: &str) {
         // Generate Key and Cert in one go (self-signed)
         let status = Command::new("openssl")
-            .args(&[
+            .args([
                 "req",
                 "-x509",
                 "-newkey",
