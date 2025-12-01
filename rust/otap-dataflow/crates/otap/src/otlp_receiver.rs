@@ -498,6 +498,77 @@ mod tests {
         assert_eq!(tls.client_ca_file, Some(PathBuf::from("/path/to/ca")));
     }
 
+    #[test]
+    fn test_multi_compression_config() {
+        use crate::compression::CompressionMethod;
+        use serde_json::json;
+
+        let metrics_registry_handle = MetricsRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(metrics_registry_handle);
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 0);
+
+        // Test new multi-compression config
+        let config = json!({
+            "listening_addr": "127.0.0.1:4317",
+            "request_compression": ["zstd", "gzip"],
+            "response_compression": ["zstd"]
+        });
+        let receiver = OTLPReceiver::from_config(pipeline_ctx.clone(), &config).unwrap();
+        assert_eq!(
+            receiver.config.settings.request_compression_methods(),
+            vec![CompressionMethod::Zstd, CompressionMethod::Gzip]
+        );
+        assert_eq!(
+            receiver.config.settings.response_compression_methods(),
+            vec![CompressionMethod::Zstd]
+        );
+
+        // Test legacy compression_method maps to request_compression
+        let config_legacy = json!({
+            "listening_addr": "127.0.0.1:4318",
+            "compression_method": "gzip"
+        });
+        let receiver = OTLPReceiver::from_config(pipeline_ctx.clone(), &config_legacy).unwrap();
+        assert_eq!(
+            receiver.config.settings.request_compression_methods(),
+            vec![CompressionMethod::Gzip]
+        );
+
+        // Test explicit request_compression takes precedence over legacy
+        let config_both = json!({
+            "listening_addr": "127.0.0.1:4319",
+            "compression_method": "gzip",
+            "request_compression": ["zstd"]
+        });
+        let receiver = OTLPReceiver::from_config(pipeline_ctx.clone(), &config_both).unwrap();
+        assert_eq!(
+            receiver.config.settings.request_compression_methods(),
+            vec![CompressionMethod::Zstd]
+        );
+
+        // Test defaults: request accepts all, response is empty
+        let config_defaults = json!({
+            "listening_addr": "127.0.0.1:4320"
+        });
+        let receiver = OTLPReceiver::from_config(pipeline_ctx, &config_defaults).unwrap();
+        assert_eq!(
+            receiver.config.settings.request_compression_methods(),
+            vec![
+                CompressionMethod::Zstd,
+                CompressionMethod::Gzip,
+                CompressionMethod::Deflate
+            ]
+        );
+        assert!(
+            receiver
+                .config
+                .settings
+                .response_compression_methods()
+                .is_empty()
+        );
+    }
+
     fn scenario(
         grpc_endpoint: String,
     ) -> impl FnOnce(TestContext<OtapPdata>) -> Pin<Box<dyn Future<Output = ()>>> {

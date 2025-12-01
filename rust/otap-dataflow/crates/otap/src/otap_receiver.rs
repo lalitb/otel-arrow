@@ -105,11 +105,18 @@ impl OTAPReceiver {
         pipeline_ctx: PipelineContext,
         config: &Value,
     ) -> Result<Self, otap_df_config::error::Error> {
-        let config: Config = serde_json::from_value(config.clone()).map_err(|e| {
+        let mut config: Config = serde_json::from_value(config.clone()).map_err(|e| {
             otap_df_config::error::Error::InvalidUserConfig {
                 error: e.to_string(),
             }
         })?;
+
+        // Map legacy compression_method to settings if needed
+        if let Some(method) = config.compression_method {
+            if config.settings.request_compression.is_none() {
+                config.settings.request_compression = Some(vec![method]);
+            }
+        }
 
         // Register OTAP receiver metrics for this node.
         let metrics = pipeline_ctx.register_metrics::<OtapReceiverMetrics>();
@@ -229,19 +236,18 @@ impl shared::Receiver<OtapPdata> for OTAPReceiver {
         let mut metrics_server = ArrowMetricsServiceServer::new(metrics_service);
         let mut traces_server = ArrowTracesServiceServer::new(traces_service);
 
-        // apply the tonic compression if it is set
-        if let Some(ref compression) = self.config.compression_method {
-            let encoding = compression.map_to_compression_encoding();
-
-            logs_server = logs_server
-                .send_compressed(encoding)
-                .accept_compressed(encoding);
-            metrics_server = metrics_server
-                .send_compressed(encoding)
-                .accept_compressed(encoding);
-            traces_server = traces_server
-                .send_compressed(encoding)
-                .accept_compressed(encoding);
+        // Apply compression encodings from settings
+        for method in self.config.settings.request_compression_methods() {
+            let encoding = method.map_to_compression_encoding();
+            logs_server = logs_server.accept_compressed(encoding);
+            metrics_server = metrics_server.accept_compressed(encoding);
+            traces_server = traces_server.accept_compressed(encoding);
+        }
+        for method in self.config.settings.response_compression_methods() {
+            let encoding = method.map_to_compression_encoding();
+            logs_server = logs_server.send_compressed(encoding);
+            metrics_server = metrics_server.send_compressed(encoding);
+            traces_server = traces_server.send_compressed(encoding);
         }
 
         let mut server_builder = Server::builder();
@@ -944,6 +950,82 @@ mod tests {
             Some(CompressionMethod::Deflate)
         ));
         assert!(receiver.config.settings.timeout.is_none());
+    }
+
+    #[test]
+    fn test_multi_compression_config() {
+        use crate::compression::CompressionMethod;
+        use serde_json::json;
+
+        let metrics_registry_handle = otap_df_telemetry::registry::MetricsRegistryHandle::new();
+        let controller_ctx =
+            otap_df_engine::context::ControllerContext::new(metrics_registry_handle);
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 0);
+
+        // Test new multi-compression config
+        let config = json!({
+            "listening_addr": "127.0.0.1:4317",
+            "response_stream_channel_size": 100,
+            "request_compression": ["zstd", "gzip"],
+            "response_compression": ["zstd"]
+        });
+        let receiver = OTAPReceiver::from_config(pipeline_ctx.clone(), &config).unwrap();
+        assert_eq!(
+            receiver.config.settings.request_compression_methods(),
+            vec![CompressionMethod::Zstd, CompressionMethod::Gzip]
+        );
+        assert_eq!(
+            receiver.config.settings.response_compression_methods(),
+            vec![CompressionMethod::Zstd]
+        );
+
+        // Test legacy compression_method maps to request_compression
+        let config_legacy = json!({
+            "listening_addr": "127.0.0.1:4318",
+            "response_stream_channel_size": 100,
+            "compression_method": "gzip"
+        });
+        let receiver = OTAPReceiver::from_config(pipeline_ctx.clone(), &config_legacy).unwrap();
+        assert_eq!(
+            receiver.config.settings.request_compression_methods(),
+            vec![CompressionMethod::Gzip]
+        );
+
+        // Test explicit request_compression takes precedence over legacy
+        let config_both = json!({
+            "listening_addr": "127.0.0.1:4319",
+            "response_stream_channel_size": 100,
+            "compression_method": "gzip",
+            "request_compression": ["zstd"]
+        });
+        let receiver = OTAPReceiver::from_config(pipeline_ctx.clone(), &config_both).unwrap();
+        assert_eq!(
+            receiver.config.settings.request_compression_methods(),
+            vec![CompressionMethod::Zstd]
+        );
+
+        // Test defaults: request accepts all, response is empty
+        let config_defaults = json!({
+            "listening_addr": "127.0.0.1:4320",
+            "response_stream_channel_size": 100
+        });
+        let receiver = OTAPReceiver::from_config(pipeline_ctx, &config_defaults).unwrap();
+        assert_eq!(
+            receiver.config.settings.request_compression_methods(),
+            vec![
+                CompressionMethod::Zstd,
+                CompressionMethod::Gzip,
+                CompressionMethod::Deflate
+            ]
+        );
+        assert!(
+            receiver
+                .config
+                .settings
+                .response_compression_methods()
+                .is_empty()
+        );
     }
 
     #[test]
