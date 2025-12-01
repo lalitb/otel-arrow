@@ -70,7 +70,7 @@ pub async fn load_server_tls_config(
     let mut client_ca_pem = Vec::new();
 
     // Load system roots if requested
-    if config.config.include_system_ca_certs_pool == Some(true) {
+    if config.include_system_ca_certs_pool == Some(true) {
         let cert_res = tokio::task::spawn_blocking(load_native_certs)
             .await
             .map_err(io::Error::other)?;
@@ -93,13 +93,8 @@ pub async fn load_server_tls_config(
         client_ca_pem.extend_from_slice(&ca);
         trim_trailing_whitespace(&mut client_ca_pem);
         client_ca_pem.push(b'\n');
-    } else if let Some(ca_file) = &config.config.ca_file {
-        let ca = tokio::fs::read(ca_file).await?;
-        client_ca_pem.extend_from_slice(&ca);
-        trim_trailing_whitespace(&mut client_ca_pem);
-        client_ca_pem.push(b'\n');
-    } else if let Some(ca_pem) = &config.config.ca_pem {
-        client_ca_pem.extend_from_slice(ca_pem.clone().into_bytes().as_slice());
+    } else if let Some(client_ca_pem_str) = &config.client_ca_pem {
+        client_ca_pem.extend_from_slice(client_ca_pem_str.clone().into_bytes().as_slice());
         trim_trailing_whitespace(&mut client_ca_pem);
         client_ca_pem.push(b'\n');
     }
@@ -107,7 +102,7 @@ pub async fn load_server_tls_config(
     if !client_ca_pem.is_empty() {
         let ca_cert = Certificate::from_pem(client_ca_pem);
         tls_builder = tls_builder.client_ca_root(ca_cert);
-    } else if config.config.include_system_ca_certs_pool == Some(true) {
+    } else if config.include_system_ca_certs_pool == Some(true) {
         return Err(io::Error::other(
             "TLS configuration error: include_system_ca_certs_pool is true, but no CA certificates were loaded. \
              Ensure system certificates are available or provide a client_ca_file.",
@@ -645,18 +640,10 @@ pub async fn build_reloadable_server_config(
             check_interval,
         )?);
         builder.with_client_cert_verifier(client_verifier)
-    } else if let Some(ca_file) = &config.config.ca_file {
-        // Fallback to common ca_file if client_ca_file is not set
-        let client_verifier = Arc::new(LazyReloadableClientCaVerifier::new(
-            ca_file.clone(),
-            config.client_crl_file.clone(),
-            check_interval,
-        )?);
-        builder.with_client_cert_verifier(client_verifier)
-    } else if let Some(ca_pem) = &config.config.ca_pem {
+    } else if let Some(client_ca_pem) = &config.client_ca_pem {
         // Static CA from PEM
         let mut roots = rustls::RootCertStore::empty();
-        let certs = rustls_pemfile::certs(&mut io::BufReader::new(ca_pem.as_bytes()))
+        let certs = rustls_pemfile::certs(&mut io::BufReader::new(client_ca_pem.as_bytes()))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         for cert in certs {

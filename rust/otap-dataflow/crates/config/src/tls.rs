@@ -8,43 +8,6 @@ use std::path::PathBuf;
 /// Common TLS configuration for both client and server.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
 pub struct TlsConfig {
-    /// Path to the CA cert. For a client (Exporter) this verifies the server certificate.
-    /// For a server (Receiver) this verifies client certificates.
-    /// To use system root CAs, set include_system_ca_certs_pool to true.
-    pub ca_file: Option<PathBuf>,
-
-    /// In memory PEM encoded cert.
-    pub ca_pem: Option<String>,
-
-    /// Controls whether system CA certificates are loaded for certificate verification.
-    ///
-    /// # Behavior
-    ///
-    /// - **`None` or `Some(false)`**: System CA certificates are **not** loaded. Only explicitly
-    ///   configured CA sources (`ca_file`, `ca_pem`, or `client_ca_file`) are used for verification.
-    ///   If no CA is configured, client certificate verification is disabled (server) or server
-    ///   certificate verification uses only the provided CAs (client).
-    ///
-    /// - **`Some(true)`**: System CA certificates are loaded from the OS trust store **in addition to**
-    ///   any user-provided CA files (`ca_file`, `ca_pem`, `client_ca_file`). Both sources are combined
-    ///   into a single trust store for verification.
-    ///
-    /// # Failure Conditions
-    ///
-    /// When set to `true`, the server/client will fail to start if no system certificates are found.
-    /// This can happen when:
-    /// 1. The system has no CA certificates installed at all
-    /// 2. The `rustls-native-certs` crate failed to locate them (e.g., due to permissions or
-    ///    platform-specific issues)
-    /// 3. An empty list was returned by the crate
-    ///
-    /// # Deployment Note
-    ///
-    /// Ensure your environment provides accessible system CA certificates when enabling this option.
-    /// Container environments may need to install CA certificate packages (e.g., `ca-certificates`
-    /// on Debian/Ubuntu, `ca-certificates-bundle` on Alpine).
-    pub include_system_ca_certs_pool: Option<bool>,
-
     /// Path to the TLS cert to use for TLS required connections.
     pub cert_file: Option<PathBuf>,
 
@@ -79,6 +42,41 @@ pub struct TlsClientConfig {
     #[serde(flatten)]
     pub config: TlsConfig,
 
+    /// Path to the CA cert. For a client this verifies the server certificate.
+    /// To use system root CAs, set include_system_ca_certs_pool to true.
+    pub ca_file: Option<PathBuf>,
+
+    /// In memory PEM encoded cert.
+    pub ca_pem: Option<String>,
+
+    /// Controls whether system CA certificates are loaded for certificate verification.
+    ///
+    /// # Behavior
+    ///
+    /// - **`None` or `Some(false)`**: System CA certificates are **not** loaded. Only explicitly
+    ///   configured CA sources (`ca_file`, `ca_pem`) are used for verification.
+    ///   If no CA is configured, server certificate verification uses only the provided CAs.
+    ///
+    /// - **`Some(true)`**: System CA certificates are loaded from the OS trust store **in addition to**
+    ///   any user-provided CA files (`ca_file`, `ca_pem`). Both sources are combined
+    ///   into a single trust store for verification.
+    ///
+    /// # Failure Conditions
+    ///
+    /// When set to `true`, the client will fail to start if no system certificates are found.
+    /// This can happen when:
+    /// 1. The system has no CA certificates installed at all
+    /// 2. The `rustls-native-certs` crate failed to locate them (e.g., due to permissions or
+    ///    platform-specific issues)
+    /// 3. An empty list was returned by the crate
+    ///
+    /// # Deployment Note
+    ///
+    /// Ensure your environment provides accessible system CA certificates when enabling this option.
+    /// Container environments may need to install CA certificate packages (e.g., `ca-certificates`
+    /// on Debian/Ubuntu, `ca-certificates-bundle` on Alpine).
+    pub include_system_ca_certs_pool: Option<bool>,
+
     /// In gRPC and HTTP when set to true, this is used to disable the client transport security.
     pub insecure: Option<bool>,
 
@@ -98,6 +96,37 @@ pub struct TlsServerConfig {
 
     /// Path to the TLS cert to use by the server to verify a client certificate.
     pub client_ca_file: Option<PathBuf>,
+
+    /// In memory PEM encoded cert to use by the server to verify a client certificate.
+    pub client_ca_pem: Option<String>,
+
+    /// Controls whether system CA certificates are loaded for client certificate verification.
+    ///
+    /// # Behavior
+    ///
+    /// - **`None` or `Some(false)`**: System CA certificates are **not** loaded. Only explicitly
+    ///   configured CA sources (`client_ca_file`, `client_ca_pem`) are used for verification.
+    ///   If no CA is configured, client certificate verification is disabled.
+    ///
+    /// - **`Some(true)`**: System CA certificates are loaded from the OS trust store **in addition to**
+    ///   any user-provided CA files (`client_ca_file`, `client_ca_pem`). Both sources are combined
+    ///   into a single trust store for verification.
+    ///
+    /// # Failure Conditions
+    ///
+    /// When set to `true`, the server will fail to start if no system certificates are found.
+    /// This can happen when:
+    /// 1. The system has no CA certificates installed at all
+    /// 2. The `rustls-native-certs` crate failed to locate them (e.g., due to permissions or
+    ///    platform-specific issues)
+    /// 3. An empty list was returned by the crate
+    ///
+    /// # Deployment Note
+    ///
+    /// Ensure your environment provides accessible system CA certificates when enabling this option.
+    /// Container environments may need to install CA certificate packages (e.g., `ca-certificates`
+    /// on Debian/Ubuntu, `ca-certificates-bundle` on Alpine).
+    pub include_system_ca_certs_pool: Option<bool>,
 
     /// Path to the Certificate Revocation List (CRL) to use by the server to verify a client certificate.
     pub client_crl_file: Option<PathBuf>,

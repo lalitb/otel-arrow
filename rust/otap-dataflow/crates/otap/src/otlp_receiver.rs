@@ -1215,6 +1215,8 @@ mod tests {
                         },
                         client_ca_file: Some(ca_path), // Enable mTLS
                         client_crl_file: None,
+                        client_ca_pem: None,
+                        include_system_ca_certs_pool: None,
                     }),
                 },
                 metrics: pipeline_ctx.register_metrics::<OtlpReceiverMetrics>(),
