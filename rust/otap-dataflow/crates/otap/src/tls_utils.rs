@@ -91,20 +91,17 @@ pub async fn load_server_tls_config(
     if let Some(client_ca_file) = &config.client_ca_file {
         let ca = tokio::fs::read(client_ca_file).await?;
         client_ca_pem.extend_from_slice(&ca);
-        if !client_ca_pem.ends_with(b"\n") {
-            client_ca_pem.push(b'\n');
-        }
+        trim_trailing_whitespace(&mut client_ca_pem);
+        client_ca_pem.push(b'\n');
     } else if let Some(ca_file) = &config.config.ca_file {
         let ca = tokio::fs::read(ca_file).await?;
         client_ca_pem.extend_from_slice(&ca);
-        if !client_ca_pem.ends_with(b"\n") {
-            client_ca_pem.push(b'\n');
-        }
+        trim_trailing_whitespace(&mut client_ca_pem);
+        client_ca_pem.push(b'\n');
     } else if let Some(ca_pem) = &config.config.ca_pem {
         client_ca_pem.extend_from_slice(ca_pem.clone().into_bytes().as_slice());
-        if !client_ca_pem.ends_with(b"\n") {
-            client_ca_pem.push(b'\n');
-        }
+        trim_trailing_whitespace(&mut client_ca_pem);
+        client_ca_pem.push(b'\n');
     }
 
     if !client_ca_pem.is_empty() {
