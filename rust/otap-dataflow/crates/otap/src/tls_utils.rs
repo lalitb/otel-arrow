@@ -1,3 +1,6 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
 use arc_swap::ArcSwap;
 use base64::prelude::*;
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -10,12 +13,14 @@ use rustls::{DigitallySignedStruct, DistinguishedName, Error, SignatureScheme};
 use rustls_native_certs::load_native_certs;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
 /// Loads TLS configuration for a server.
+///
+/// Returns `Ok(None)` when no cert/key material is provided, indicating TLS is disabled.
 pub async fn load_server_tls_config(
     config: &TlsServerConfig,
 ) -> Result<Option<ServerTlsConfig>, io::Error> {
@@ -42,10 +47,7 @@ pub async fn load_server_tls_config(
             (cert_pem.clone().into_bytes(), key_pem.clone().into_bytes())
         }
         (None, None, None, None) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "TLS configuration error: both certificate and key must be provided",
-            ));
+            return Ok(None);
         }
         _ => {
             return Err(io::Error::new(
@@ -308,7 +310,9 @@ pub struct LazyReloadableClientCaVerifier {
     last_check_time: AtomicU64,
     check_interval_secs: u64,
     is_reloading: AtomicBool,
-    hints: RwLock<&'static [DistinguishedName]>,
+    // We leak the hints slice to satisfy the trait's &'static requirement from rustls; avoiding the leak
+    // would require fragile pointer juggling/unsafe to extend lifetimes across reloads.
+    hints: ArcSwap<&'static [DistinguishedName]>,
 }
 
 impl LazyReloadableClientCaVerifier {
@@ -319,11 +323,8 @@ impl LazyReloadableClientCaVerifier {
         check_interval: Option<Duration>,
     ) -> Result<Self, io::Error> {
         let verifier = load_client_verifier_sync(&ca_path, crl_path.as_ref())?;
-        let hints = verifier.root_hint_subjects().to_vec();
-        // We leak the hints to get a static reference, which is required by the trait signature
-        // and allows us to update it safely using RwLock without unsafe code.
-        // This is acceptable because CA rotation is a rare operation.
-        let leaked_hints = Box::leak(hints.into_boxed_slice());
+        let hints: Vec<DistinguishedName> = verifier.root_hint_subjects().to_vec();
+        let hints_static: &'static [DistinguishedName] = Box::leak(hints.into_boxed_slice());
 
         let ca_mtime = get_mtime(&ca_path)?;
         let crl_mtime = if let Some(p) = &crl_path {
@@ -342,7 +343,7 @@ impl LazyReloadableClientCaVerifier {
             last_check_time: AtomicU64::new(now),
             check_interval_secs: check_interval.map(|d| d.as_secs()).unwrap_or(300),
             is_reloading: AtomicBool::new(false),
-            hints: RwLock::new(leaked_hints),
+            hints: ArcSwap::new(Arc::new(hints_static)),
         })
     }
 
@@ -404,12 +405,10 @@ impl LazyReloadableClientCaVerifier {
     fn do_reload(&self, new_ca_mtime: u64, new_crl_mtime: u64) {
         match load_client_verifier_sync(&self.ca_path, self.crl_path.as_ref()) {
             Ok(new_verifier) => {
-                let new_hints = new_verifier.root_hint_subjects().to_vec();
-                let leaked_hints = Box::leak(new_hints.into_boxed_slice());
-
-                if let Ok(mut guard) = self.hints.write() {
-                    *guard = leaked_hints;
-                }
+                let new_hints: Vec<DistinguishedName> = new_verifier.root_hint_subjects().to_vec();
+                let hints_static: &'static [DistinguishedName] =
+                    Box::leak(new_hints.into_boxed_slice());
+                self.hints.store(Arc::new(hints_static));
 
                 self.inner.store(Arc::new(new_verifier));
                 self.ca_mtime.store(new_ca_mtime, Ordering::Relaxed);
@@ -463,9 +462,7 @@ impl ClientCertVerifier for LazyReloadableClientCaVerifier {
     }
 
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
-        // We return a static reference which is safe because we leak the memory on update.
-        // If the lock is poisoned, we panic (standard behavior).
-        *self.hints.read().expect("lock poisoned")
+        **self.hints.load()
     }
 }
 
@@ -610,7 +607,7 @@ pub async fn build_reloadable_server_config(
     };
 
     // Cert resolver
-    let server_config = if let (Some(cert_path), Some(key_path)) =
+    let mut server_config = if let (Some(cert_path), Some(key_path)) =
         (&config.config.cert_file, &config.config.key_file)
     {
         // File-based: use lazy reloader
@@ -647,7 +644,6 @@ pub async fn build_reloadable_server_config(
         ));
     };
 
-    let mut server_config = server_config;
     server_config.alpn_protocols = vec![b"h2".to_vec()];
 
     Ok(Arc::new(server_config))
