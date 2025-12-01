@@ -15,6 +15,8 @@ nodes:
     config:
       listening_addr: "127.0.0.1:4320"
       response_stream_channel_size: 100
+      # NOTE: Replace the following certificate and key file paths with the actual locations of your TLS certificate and key.
+      # You may also use in-memory PEM configuration if supported.
       tls:
         cert_file: "test_certs/server.crt"
         key_file: "test_certs/server.key"
