@@ -3,7 +3,7 @@
 
 use arc_swap::ArcSwap;
 use base64::prelude::*;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt};
 use otap_df_config::tls::TlsServerConfig;
 use rustls::pki_types::{CertificateDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};

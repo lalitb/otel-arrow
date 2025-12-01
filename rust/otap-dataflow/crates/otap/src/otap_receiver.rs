@@ -13,6 +13,7 @@ use crate::OTAP_RECEIVER_FACTORIES;
 use crate::compression::CompressionMethod;
 use crate::otap_grpc::middleware::zstd_header::ZstdRequestHeaderAdapter;
 use crate::otap_grpc::otlp::server::{RouteResponse, SharedState};
+use crate::otap_grpc::server_settings::GrpcServerSettings;
 use crate::otap_grpc::{
     ArrowLogsServiceImpl, ArrowMetricsServiceImpl, ArrowTracesServiceImpl, Settings,
 };
@@ -42,12 +43,10 @@ use otap_df_telemetry::metrics::MetricSet;
 use otap_df_telemetry_macros::metric_set;
 use serde::Deserialize;
 use serde_json::Value;
-use std::net::SocketAddr;
 use std::ops::Add;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tonic::transport::Server;
-use tonic::transport::server::TcpIncoming;
 use tonic_middleware::MiddlewareLayer;
 
 /// URN for the OTAP Receiver
@@ -57,47 +56,20 @@ pub const OTAP_RECEIVER_URN: &str = "urn:otel:otap:receiver";
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    listening_addr: SocketAddr,
+    /// gRPC server settings (shared with OTLP receiver)
+    #[serde(flatten)]
+    pub settings: GrpcServerSettings,
 
-    compression_method: Option<CompressionMethod>,
+    /// Compression methods accepted (legacy field for backward compatibility)
+    /// TODO: Remove in favor of settings.request_compression / settings.response_compression
+    pub compression_method: Option<CompressionMethod>,
 
     /// Size of the channel used to buffer outgoing responses to the client.
-    response_stream_channel_size: usize,
-
-    /// Maximum number of concurrent (in-flight) requests (default: 1000)
-    #[serde(default = "default_max_concurrent_requests")]
-    max_concurrent_requests: usize,
-
-    /// Whether to wait for the result (default: true)
-    ///
-    /// When enabled, the receiver will not send a response until the
-    /// immediate downstream component has acknowledged receipt of the
-    /// data.  This does not guarantee that data has been fully
-    /// processed or successfully exported to the final destination,
-    /// since components are able acknowledge early.
-    ///
-    /// Note when wait_for_result=false, it is impossible to
-    /// see a failure, errors are effectively suppressed.
-    #[serde(default = "default_wait_for_result")]
-    wait_for_result: bool,
-
-    /// Timeout for RPC requests. If not specified, no timeout is applied.
-    /// Format: humantime format (e.g., "30s", "5m", "1h", "500ms")
-    #[serde(default, with = "humantime_serde")]
-    pub timeout: Option<Duration>,
+    /// This is OTAP-specific and not part of the shared GrpcServerSettings.
+    pub response_stream_channel_size: usize,
 
     /// TLS configuration
     pub tls: Option<TlsServerConfig>,
-}
-
-const fn default_max_concurrent_requests() -> usize {
-    1000
-}
-
-const fn default_wait_for_result() -> bool {
-    // See https://github.com/open-telemetry/otel-arrow/issues/1311
-    // This matches the OTel Collector default for wait_for_result, presently.
-    false
 }
 
 /// A Receiver that listens for OTAP messages
@@ -232,30 +204,20 @@ impl shared::Receiver<OtapPdata> for OTAPReceiver {
         effect_handler: shared::EffectHandler<OtapPdata>,
     ) -> Result<TerminalState, Error> {
         // create listener on addr provided from config
-        let listener = effect_handler.tcp_listener(self.config.listening_addr)?;
-        // Note: These TCP settings are currently hardcoded for the OTAP receiver.
-        // Ideally, they should be configurable or derived from GrpcServerSettings defaults.
-        // However, since OTAPReceiver uses a custom Config struct that doesn't embed GrpcServerSettings,
-        // we explicitly set them here to match the behavior of other receivers.
-        // This creates a potential inconsistency with the OTLP receiver's behavior.
-        // TODO: Unify configuration by either embedding GrpcServerSettings or extracting
-        // these settings into a shared configuration struct. See issue #XXXX.
-        let listener_stream = TcpIncoming::from(listener)
-            .with_nodelay(Some(true))
-            .with_keepalive(Some(Duration::from_secs(45)))
-            .with_keepalive_interval(Some(Duration::from_secs(15)))
-            .with_keepalive_retries(Some(5));
+        let listener = effect_handler.tcp_listener(self.config.settings.listening_addr)?;
+        // Use shared GrpcServerSettings for TCP configuration (consistent with OTLP receiver)
+        let listener_stream = self.config.settings.build_tcp_incoming(listener);
 
-        let settings = Settings {
+        let otap_settings = Settings {
             response_stream_channel_size: self.config.response_stream_channel_size,
-            max_concurrent_requests: self.config.max_concurrent_requests,
-            wait_for_result: self.config.wait_for_result,
+            max_concurrent_requests: self.config.settings.max_concurrent_requests,
+            wait_for_result: self.config.settings.wait_for_result,
         };
 
         //create services for the grpc server and clone the effect handler to pass message
-        let logs_service = ArrowLogsServiceImpl::new(effect_handler.clone(), &settings);
-        let metrics_service = ArrowMetricsServiceImpl::new(effect_handler.clone(), &settings);
-        let traces_service = ArrowTracesServiceImpl::new(effect_handler.clone(), &settings);
+        let logs_service = ArrowLogsServiceImpl::new(effect_handler.clone(), &otap_settings);
+        let metrics_service = ArrowMetricsServiceImpl::new(effect_handler.clone(), &otap_settings);
+        let traces_service = ArrowTracesServiceImpl::new(effect_handler.clone(), &otap_settings);
 
         let states = SharedStates {
             logs: logs_service.state(),
@@ -285,7 +247,7 @@ impl shared::Receiver<OtapPdata> for OTAPReceiver {
         let mut server_builder = Server::builder();
 
         // Apply timeout if configured
-        if let Some(timeout) = self.config.timeout {
+        if let Some(timeout) = self.config.settings.timeout {
             server_builder = server_builder.timeout(timeout);
         }
 
@@ -884,7 +846,7 @@ mod tests {
         let pipeline_ctx =
             controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 0);
 
-        // Test with custom max_concurrent_requests, max_concurrent_requests defaults to 1000
+        // Test with custom max_concurrent_requests, GrpcServerSettings defaults to 0
         let config_with_max_concurrent_requests = json!({
             "listening_addr": "127.0.0.1:4317",
             "response_stream_channel_size": 100,
@@ -893,12 +855,15 @@ mod tests {
         let receiver =
             OTAPReceiver::from_config(pipeline_ctx.clone(), &config_with_max_concurrent_requests)
                 .unwrap();
-        assert_eq!(receiver.config.listening_addr.to_string(), "127.0.0.1:4317");
+        assert_eq!(
+            receiver.config.settings.listening_addr.to_string(),
+            "127.0.0.1:4317"
+        );
         assert_eq!(receiver.config.response_stream_channel_size, 100);
-        assert_eq!(receiver.config.max_concurrent_requests, 5000);
-        assert!(!receiver.config.wait_for_result);
+        assert_eq!(receiver.config.settings.max_concurrent_requests, 5000);
+        assert!(!receiver.config.settings.wait_for_result);
         assert!(receiver.config.compression_method.is_none());
-        assert!(receiver.config.timeout.is_none());
+        assert!(receiver.config.settings.timeout.is_none());
 
         // Test with minimal required fields, max_concurrent_requests defaults to 1000, wait_for_result defaults to false
         let config_minimal = json!({
@@ -906,12 +871,15 @@ mod tests {
             "response_stream_channel_size": 200
         });
         let receiver = OTAPReceiver::from_config(pipeline_ctx.clone(), &config_minimal).unwrap();
-        assert_eq!(receiver.config.listening_addr.to_string(), "127.0.0.1:4318");
+        assert_eq!(
+            receiver.config.settings.listening_addr.to_string(),
+            "127.0.0.1:4318"
+        );
         assert_eq!(receiver.config.response_stream_channel_size, 200);
-        assert_eq!(receiver.config.max_concurrent_requests, 1000);
-        assert!(!receiver.config.wait_for_result);
+        assert_eq!(receiver.config.settings.max_concurrent_requests, 0);
+        assert!(!receiver.config.settings.wait_for_result);
         assert!(receiver.config.compression_method.is_none());
-        assert!(receiver.config.timeout.is_none());
+        assert!(receiver.config.settings.timeout.is_none());
 
         // Test with full configuration including gzip compression
         let config_full_gzip = json!({
@@ -923,15 +891,21 @@ mod tests {
             "timeout": "30s"
         });
         let receiver = OTAPReceiver::from_config(pipeline_ctx.clone(), &config_full_gzip).unwrap();
-        assert_eq!(receiver.config.listening_addr.to_string(), "127.0.0.1:4319");
+        assert_eq!(
+            receiver.config.settings.listening_addr.to_string(),
+            "127.0.0.1:4319"
+        );
         assert_eq!(receiver.config.response_stream_channel_size, 150);
-        assert_eq!(receiver.config.max_concurrent_requests, 2500);
-        assert!(receiver.config.wait_for_result);
+        assert_eq!(receiver.config.settings.max_concurrent_requests, 2500);
+        assert!(receiver.config.settings.wait_for_result);
         assert!(matches!(
             receiver.config.compression_method,
             Some(CompressionMethod::Gzip)
         ));
-        assert_eq!(receiver.config.timeout, Some(Duration::from_secs(30)));
+        assert_eq!(
+            receiver.config.settings.timeout,
+            Some(Duration::from_secs(30))
+        );
 
         // Test with zstd compression
         let config_with_zstd = json!({
@@ -941,14 +915,17 @@ mod tests {
             "wait_for_result": false
         });
         let receiver = OTAPReceiver::from_config(pipeline_ctx.clone(), &config_with_zstd).unwrap();
-        assert_eq!(receiver.config.listening_addr.to_string(), "127.0.0.1:4320");
+        assert_eq!(
+            receiver.config.settings.listening_addr.to_string(),
+            "127.0.0.1:4320"
+        );
         assert_eq!(receiver.config.response_stream_channel_size, 50);
-        assert!(!receiver.config.wait_for_result);
+        assert!(!receiver.config.settings.wait_for_result);
         assert!(matches!(
             receiver.config.compression_method,
             Some(CompressionMethod::Zstd)
         ));
-        assert!(receiver.config.timeout.is_none());
+        assert!(receiver.config.settings.timeout.is_none());
 
         // Test with deflate compression
         let config_with_deflate = json!({
@@ -957,13 +934,16 @@ mod tests {
             "compression_method": "deflate"
         });
         let receiver = OTAPReceiver::from_config(pipeline_ctx, &config_with_deflate).unwrap();
-        assert_eq!(receiver.config.listening_addr.to_string(), "127.0.0.1:4321");
+        assert_eq!(
+            receiver.config.settings.listening_addr.to_string(),
+            "127.0.0.1:4321"
+        );
         assert_eq!(receiver.config.response_stream_channel_size, 75);
         assert!(matches!(
             receiver.config.compression_method,
             Some(CompressionMethod::Deflate)
         ));
-        assert!(receiver.config.timeout.is_none());
+        assert!(receiver.config.settings.timeout.is_none());
     }
 
     #[test]

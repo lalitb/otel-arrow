@@ -136,7 +136,7 @@ fn test_otlp_receiver_tls_reload() {
                 .await
                 .expect("Initial request failed");
 
-            // 2. Rotate cert
+            // 2. Rotate cert with different CN to test reload
             // Wait for at least one reload interval (1s) to pass before modifying the file.
             // This ensures we don't hit a race where the reloader reads the file *while* we are writing it,
             // or reads it just before we write it and then sleeps for another interval.
@@ -144,24 +144,7 @@ fn test_otlp_receiver_tls_reload() {
 
             let dir_path = temp_dir.path().to_path_buf();
 
-            // Regenerate cert
-            {
-                let dir_path = dir_path.clone();
-                tokio::task::spawn_blocking(move || {
-                    generate_server_cert(&dir_path, "localhost");
-                })
-                .await
-                .expect("Failed to regenerate cert");
-            }
-
-            // 3. Connect again with new cert expectation
-            println!("Connecting with new cert expectation...");
-
-            // Wait for the reload interval (1s) to trigger a reload of the new certificate.
-            // We wait 2s to be safe and avoid flakiness in CI.
-            sleep(Duration::from_secs(2)).await;
-
-            // Regenerate with different CN
+            // Regenerate cert with different CN to verify reload worked
             {
                 let dir_path = dir_path.clone();
                 tokio::task::spawn_blocking(move || {
@@ -171,6 +154,10 @@ fn test_otlp_receiver_tls_reload() {
                 .expect("Failed to regenerate cert");
             }
             println!("Regenerated cert with CN=otherhost");
+
+            // Give the server time to detect and reload the new certificate
+            // (reload_interval is 1s, we wait 2s to be safe)
+            sleep(Duration::from_secs(2)).await;
 
             // Client expecting "otherhost"
             let tls_config_new = tonic::transport::ClientTlsConfig::new()
