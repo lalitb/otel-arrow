@@ -76,7 +76,7 @@ opentelemetry-proto = { workspace = true, optional = true }
 rustls-native-certs = "0.8.2"
 base64 = "0.22.1"
 arc-swap = "1.7"
-rustls = { version = "0.23", features = ["ring"] }
+rustls = { workspace = true, features = ["logging"] }
 rustls-pemfile = "2.0"
 tokio-rustls = "0.26"
 
