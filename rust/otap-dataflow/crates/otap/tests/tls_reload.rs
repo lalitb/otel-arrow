@@ -137,6 +137,9 @@ fn test_otlp_receiver_tls_reload() {
                 .expect("Initial request failed");
 
             // 2. Rotate cert
+            // Wait for at least one reload interval (1s) to pass before modifying the file.
+            // This ensures we don't hit a race where the reloader reads the file *while* we are writing it,
+            // or reads it just before we write it and then sleeps for another interval.
             sleep(Duration::from_secs(2)).await;
 
             let dir_path = temp_dir.path().to_path_buf();
@@ -154,7 +157,9 @@ fn test_otlp_receiver_tls_reload() {
             // 3. Connect again with new cert expectation
             println!("Connecting with new cert expectation...");
 
-            sleep(Duration::from_secs(2)).await; // Give some time for reload to happen
+            // Wait for the reload interval (1s) to trigger a reload of the new certificate.
+            // We wait 2s to be safe and avoid flakiness in CI.
+            sleep(Duration::from_secs(2)).await;
 
             // Regenerate with different CN
             {
@@ -301,6 +306,9 @@ fn test_otap_receiver_tls_reload() {
                 .expect("Initial request failed");
 
             // 2. Rotate cert
+            // Wait for at least one reload interval (1s) to pass before modifying the file.
+            // This ensures we don't hit a race where the reloader reads the file *while* we are writing it,
+            // or reads it just before we write it and then sleeps for another interval.
             sleep(Duration::from_secs(2)).await;
 
             let dir_path = temp_dir.path().to_path_buf();
@@ -317,7 +325,9 @@ fn test_otap_receiver_tls_reload() {
             println!("Regenerated cert with CN=otherhost");
 
             // 3. Connect again with new cert expectation
-            sleep(Duration::from_secs(3)).await; // Give some time for reload to happen
+            // Wait for the reload interval (1s) to trigger a reload of the new certificate.
+            // We wait 3s to be safe and avoid flakiness in CI.
+            sleep(Duration::from_secs(3)).await;
 
             // Client expecting "otherhost"
             let tls_config_new = tonic::transport::ClientTlsConfig::new()
