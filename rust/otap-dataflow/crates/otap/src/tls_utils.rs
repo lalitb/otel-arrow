@@ -128,8 +128,8 @@ pub async fn load_server_tls_config(
 /// Creates a TLS stream from a TCP listener stream and a TLS acceptor.
 ///
 /// This function handles the TLS handshake for each incoming connection.
-/// It filters out connections where the handshake fails, logging the error
-/// instead of terminating the stream.
+/// TLS handshake failures are logged and filtered out (non-fatal).
+/// Transport-level listener errors are propagated to terminate the server.
 pub fn create_tls_stream<S, T>(
     listener_stream: S,
     tls_acceptor: tokio_rustls::TlsAcceptor,
@@ -138,22 +138,28 @@ where
     S: Stream<Item = Result<T, io::Error>> + Send + 'static,
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
-    listener_stream
-        .and_then(move |conn| {
-            let acceptor = tls_acceptor.clone();
-            async move { acceptor.accept(conn).await.map_err(io::Error::other) }
-        })
-        // Filter out TLS handshake errors so they don't terminate the stream
-        .filter_map(|res| async move {
-            match res {
-                Ok(stream) => Some(Ok::<_, io::Error>(stream)),
+    listener_stream.filter_map(move |conn_res| {
+        let acceptor = tls_acceptor.clone();
+        async move {
+            match conn_res {
+                Ok(conn) => {
+                    // Try TLS handshake
+                    match acceptor.accept(conn).await {
+                        Ok(stream) => Some(Ok::<_, io::Error>(stream)),
+                        Err(e) => {
+                            // TLS handshake failed - log and continue
+                            log::warn!("TLS handshake failed: {}", e);
+                            None
+                        }
+                    }
+                }
                 Err(e) => {
-                    // Log the error but continue accepting connections
-                    log::warn!("TLS handshake failed: {}", e);
-                    None
+                    // Transport-level listener error - propagate to terminate server
+                    Some(Err(e))
                 }
             }
-        })
+        }
+    })
 }
 
 /// Lazy-reloading certificate resolver with throttled mtime checks

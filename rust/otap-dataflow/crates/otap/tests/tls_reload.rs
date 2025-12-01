@@ -48,7 +48,7 @@ fn create_otap_batch(batch_id: u64, payload_type: ArrowPayloadType) -> OtapArrow
             batch_id as u16,
         ]))],
     )
-    .unwrap();
+    .expect("Failed to create test record batch");
 
     let mut otap_batch = match payload_type {
         ArrowPayloadType::Logs => OtapArrowRecords::Logs(Logs::default()),
@@ -74,7 +74,9 @@ fn test_otlp_receiver_tls_reload() {
     let grpc_addr = "127.0.0.1";
     let grpc_port = portpicker::pick_unused_port().expect("No free ports");
     let grpc_endpoint = format!("https://{grpc_addr}:{grpc_port}");
-    let addr: SocketAddr = format!("{grpc_addr}:{grpc_port}").parse().unwrap();
+    let addr: SocketAddr = format!("{grpc_addr}:{grpc_port}")
+        .parse()
+        .expect("Failed to parse socket address");
 
     let node_config = Arc::new(NodeUserConfig::new_receiver_config(OTLP_RECEIVER_URN));
 
@@ -104,7 +106,8 @@ fn test_otlp_receiver_tls_reload() {
     });
 
     let receiver = ReceiverWrapper::shared(
-        OTLPReceiver::from_config(pipeline_ctx, &config).unwrap(),
+        OTLPReceiver::from_config(pipeline_ctx, &config)
+            .expect("Failed to create OTLP receiver from config"),
         test_node(test_runtime.config().name.clone()),
         node_config,
         test_runtime.config(),
@@ -225,7 +228,9 @@ fn test_otap_receiver_tls_reload() {
     let grpc_addr = "127.0.0.1";
     let grpc_port = portpicker::pick_unused_port().expect("No free ports");
     let grpc_endpoint = format!("https://{grpc_addr}:{grpc_port}");
-    let addr: SocketAddr = format!("{grpc_addr}:{grpc_port}").parse().unwrap();
+    let addr: SocketAddr = format!("{grpc_addr}:{grpc_port}")
+        .parse()
+        .expect("Failed to parse socket address");
 
     let node_config = Arc::new(NodeUserConfig::new_receiver_config(OTAP_URN));
 
@@ -256,7 +261,8 @@ fn test_otap_receiver_tls_reload() {
     });
 
     let receiver = ReceiverWrapper::shared(
-        OTAPReceiver::from_config(pipeline_ctx, &config).unwrap(),
+        OTAPReceiver::from_config(pipeline_ctx, &config)
+            .expect("Failed to create OTAP receiver from config"),
         test_node(test_runtime.config().name.clone()),
         node_config,
         test_runtime.config(),
@@ -284,7 +290,9 @@ fn test_otap_receiver_tls_reload() {
             let logs_stream = stream! {
                 let mut producer = Producer::new();
                 let mut logs_records = create_otap_batch(0, ArrowPayloadType::Logs);
-                let bar = producer.produce_bar(&mut logs_records).unwrap();
+                let bar = producer
+                    .produce_bar(&mut logs_records)
+                    .expect("Failed to produce test batch");
                 yield bar;
             };
             let _ = logs_client
@@ -333,7 +341,9 @@ fn test_otap_receiver_tls_reload() {
                     let logs_stream = stream! {
                         let mut producer = Producer::new();
                         let mut logs_records = create_otap_batch(1, ArrowPayloadType::Logs);
-                        let bar = producer.produce_bar(&mut logs_records).unwrap();
+                        let bar = producer
+                    .produce_bar(&mut logs_records)
+                    .expect("Failed to produce test batch");
                         yield bar;
                     };
                     let _ = logs_client
