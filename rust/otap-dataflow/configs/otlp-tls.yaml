@@ -14,6 +14,10 @@ nodes:
         dispatch_strategy: round_robin
     config:
       listening_addr: "127.0.0.1:4319"
+      # The following TLS configuration uses example paths for cert_file and key_file.
+      # Replace "certs/cert.pem" and "certs/key.pem" with the actual locations of your certificate and key files.
+      # Paths can be absolute or relative to the working directory.
+      # Alternatively, you can use the cert_pem and key_pem fields to provide certificate and key data directly in-memory.
       tls:
         cert_file: "test_certs/server.crt"
         key_file: "test_certs/server.key"
