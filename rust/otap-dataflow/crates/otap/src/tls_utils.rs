@@ -217,7 +217,23 @@ impl LazyReloadableCertResolver {
         })
     }
 
-    /// Check if enough time has passed, then check mtime and reload if needed
+    /// Check if enough time has passed, then check mtime and reload if needed.
+    ///
+    /// # Concurrency Design
+    ///
+    /// This method uses a "leader election" pattern: multiple concurrent callers race to win
+    /// the compare-exchange on `last_check_time`. The winner performs the mtime check and
+    /// potential reload; losers return immediately.
+    ///
+    /// This is intentional: we want exactly one thread to do the I/O-heavy mtime check per
+    /// interval. Other threads returning early is correct behavior, not a bug. The `is_reloading`
+    /// flag provides additional protection to ensure only one reload happens even if multiple
+    /// threads detect a change simultaneously.
+    ///
+    /// The trade-off is that if a file changes *during* the winner's mtime check (after it read
+    /// the old mtime but before it completes), that change won't be detected until the next
+    /// interval. This is acceptable for certificate rotation, which typically has much longer
+    /// lead times than the check interval.
     pub fn check_and_reload_if_interval_expired(&self) -> bool {
         let now = current_timestamp();
         let last_check = self.last_check_time.load(Ordering::Relaxed);
@@ -227,13 +243,13 @@ impl LazyReloadableCertResolver {
             return false; // Skip mtime check entirely
         }
 
-        // Interval expired - try to win the check race
+        // Interval expired - try to win the check race (leader election)
         if self
             .last_check_time
             .compare_exchange(last_check, now, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            // Another thread just updated, skip
+            // Another thread won - they'll handle the check
             return false;
         }
 
