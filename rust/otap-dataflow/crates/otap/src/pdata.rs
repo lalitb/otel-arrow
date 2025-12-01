@@ -126,7 +126,9 @@ pub struct OtapPdata {
 
 impl OtapPdata {
     /// Construct new OtapData with payload using default context.
-    /// This is a test-only form.
+    /// This is a test-only method, made available via `#[doc(hidden)]` for integration tests.
+    /// It is public (not `#[cfg(test)]`) so that integration tests in other crates can use it,
+    /// but hidden from public documentation to discourage general use.
     #[must_use]
     #[doc(hidden)]
     pub fn new_default(payload: OtapPayload) -> Self {

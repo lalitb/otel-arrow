@@ -237,7 +237,9 @@ impl shared::Receiver<OtapPdata> for OTAPReceiver {
         // Ideally, they should be configurable or derived from GrpcServerSettings defaults.
         // However, since OTAPReceiver uses a custom Config struct that doesn't embed GrpcServerSettings,
         // we explicitly set them here to match the behavior of other receivers.
-        // Future refactoring should consider unifying the configuration.
+        // This creates a potential inconsistency with the OTLP receiver's behavior.
+        // TODO: Unify configuration by either embedding GrpcServerSettings or extracting
+        // these settings into a shared configuration struct. See issue #XXXX.
         let listener_stream = TcpIncoming::from(listener)
             .with_nodelay(Some(true))
             .with_keepalive(Some(Duration::from_secs(45)))

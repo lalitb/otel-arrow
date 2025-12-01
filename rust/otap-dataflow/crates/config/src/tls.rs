@@ -16,6 +16,11 @@ pub struct TlsConfig {
     /// If true, load system CA certificates pool in addition to the certificates
     /// configured in this struct.
     /// Note: If this is true and no system certificates are found, the server will fail to start.
+    /// "No system certificates are found" means one of the following:
+    /// 1. The system has no CA certificates installed at all,
+    /// 2. The `rustls-native-certs` crate failed to locate them (e.g., due to permissions or platform issues),
+    /// 3. An empty list was returned by the crate.
+    /// This distinction is important for deployment: ensure your environment provides accessible system CA certificates.
     pub include_system_ca_certs_pool: Option<bool>,
 
     /// Path to the TLS cert to use for TLS required connections.

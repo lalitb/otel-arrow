@@ -65,7 +65,10 @@ mod otlp_mock;
 #[cfg(test)]
 mod fixtures;
 
-/// Testing utilities
+/// Testing utilities (internal use only)
+///
+/// These utilities are used for internal integration tests and require `openssl`
+/// to be installed. The API is not stable and subject to change.
 #[doc(hidden)]
 pub mod testing;
 
