@@ -314,20 +314,39 @@ impl ResolvesServerCert for LazyReloadableCertResolver {
 
 /// Lazy-reloading client CA verifier with throttled mtime checks.
 ///
-/// # Memory Leak Note
+/// This verifier wraps an inner `WebPkiClientVerifier` and reloads it when the CA or CRL
+/// files change on disk. The reload is throttled to avoid excessive filesystem checks.
 ///
-/// This implementation leaks memory for the `hints` slice on each CA reload. This is due to
-/// the `rustls::ClientCertVerifier::root_hint_subjects()` trait method requiring a `&[DistinguishedName]`
-/// tied to `&self`, but we need to swap in new hints atomically without blocking concurrent handshakes.
+/// # Note on `root_hint_subjects()`
 ///
-/// **Impact**: Each reload leaks the old hints (typically ~100 bytes to a few KB depending on CA count).
-/// With the default `reload_interval` of 5 minutes, this amounts to ~30 KB/day, which is acceptable
-/// for long-running services. For high-frequency reloads (e.g., every second), consider the memory
-/// implications or use a longer reload interval.
+/// The `root_hint_subjects()` method returns an empty slice. Root hints are optional in TLS -
+/// they're sent to the client as a hint about which CAs are acceptable, but the actual
+/// certificate verification still works correctly without them.
 ///
-/// **Why not use `unsafe` with `AtomicPtr`?** Unlike `LazyReloadableCertResolver` where we control
-/// the entire lifecycle, here the trait signature forces us to return a reference that outlives
-/// any guard we could hold. The leak approach is simpler and avoids subtle use-after-free bugs.
+/// ## Why not provide real hints?
+///
+/// The `rustls::ClientCertVerifier::root_hint_subjects()` trait method returns `&[DistinguishedName]`
+/// with a lifetime tied to `&self`. This creates a challenge for hot-reloading because:
+///
+/// 1. **Memory leak approach**: Using `Box::leak()` to create `&'static` hints works but leaks
+///    memory on every CA reload (~100 bytes to a few KB per reload). With a 5-minute reload
+///    interval, this accumulates ~30 KB/day - acceptable but not ideal for long-running services.
+///
+/// 2. **Unsafe pointer approach**: Storing hints in an `Arc` and using `AtomicPtr` with manual
+///    memory management could work, but introduces subtle use-after-free risks if a TLS handshake
+///    holds a reference while a reload occurs. The complexity isn't justified for optional hints.
+///
+/// 3. **Empty slice approach (current)**: Simple, safe, zero overhead. Clients don't receive
+///    CA hints but verification works correctly. Most mTLS deployments work fine without hints
+///    since clients typically know which certificate to present.
+///
+/// ## When to revisit
+///
+/// If your use case requires root hints (e.g., clients that dynamically select certificates
+/// based on server hints), consider:
+/// - Using static CA configuration instead of hot-reloading
+/// - Implementing a custom solution with `Box::leak()` if the memory cost is acceptable
+/// - Contributing an `Arc`-based solution if you can prove it's safe
 #[derive(Debug)]
 pub struct LazyReloadableClientCaVerifier {
     inner: Arc<ArcSwap<Arc<dyn ClientCertVerifier>>>,
@@ -338,9 +357,6 @@ pub struct LazyReloadableClientCaVerifier {
     last_check_time: AtomicU64,
     check_interval_secs: u64,
     is_reloading: AtomicBool,
-    /// Leaked hints slice to satisfy rustls trait's lifetime requirements.
-    /// See struct-level documentation for memory implications.
-    hints: ArcSwap<&'static [DistinguishedName]>,
 }
 
 impl LazyReloadableClientCaVerifier {
@@ -351,8 +367,6 @@ impl LazyReloadableClientCaVerifier {
         check_interval: Option<Duration>,
     ) -> Result<Self, io::Error> {
         let verifier = load_client_verifier_sync(&ca_path, crl_path.as_ref())?;
-        let hints: Vec<DistinguishedName> = verifier.root_hint_subjects().to_vec();
-        let hints_static: &'static [DistinguishedName] = Box::leak(hints.into_boxed_slice());
 
         let ca_mtime = get_mtime(&ca_path)?;
         let crl_mtime = if let Some(p) = &crl_path {
@@ -371,7 +385,6 @@ impl LazyReloadableClientCaVerifier {
             last_check_time: AtomicU64::new(now),
             check_interval_secs: check_interval.map(|d| d.as_secs()).unwrap_or(300),
             is_reloading: AtomicBool::new(false),
-            hints: ArcSwap::new(Arc::new(hints_static)),
         })
     }
 
@@ -433,11 +446,6 @@ impl LazyReloadableClientCaVerifier {
     fn do_reload(&self, new_ca_mtime: u64, new_crl_mtime: u64) {
         match load_client_verifier_sync(&self.ca_path, self.crl_path.as_ref()) {
             Ok(new_verifier) => {
-                let new_hints: Vec<DistinguishedName> = new_verifier.root_hint_subjects().to_vec();
-                let hints_static: &'static [DistinguishedName] =
-                    Box::leak(new_hints.into_boxed_slice());
-                self.hints.store(Arc::new(hints_static));
-
                 self.inner.store(Arc::new(new_verifier));
                 self.ca_mtime.store(new_ca_mtime, Ordering::Relaxed);
                 self.crl_mtime.store(new_crl_mtime, Ordering::Relaxed);
@@ -490,7 +498,13 @@ impl ClientCertVerifier for LazyReloadableClientCaVerifier {
     }
 
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
-        **self.hints.load()
+        // Return empty slice - root hints are optional in TLS.
+        // They're just a hint to the client about acceptable CAs;
+        // actual certificate verification works correctly without them.
+        //
+        // See struct-level documentation for why we don't provide real hints
+        // and the trade-offs involved (memory leak vs unsafe vs empty).
+        &[]
     }
 }
 
@@ -817,10 +831,12 @@ mod tests {
         )
         .expect("Failed to create verifier");
 
-        // 3. Get initial hints count
+        // 3. Verify root_hint_subjects returns empty slice (by design - see struct docs)
         let initial_hints = verifier.root_hint_subjects();
-        let initial_hints_len = initial_hints.len();
-        assert!(initial_hints_len > 0, "Should have at least one CA hint");
+        assert!(
+            initial_hints.is_empty(),
+            "Root hints are intentionally empty to avoid memory leaks"
+        );
 
         // 4. Wait for interval to expire + filesystem mtime granularity
         thread::sleep(Duration::from_millis(600));
@@ -833,16 +849,17 @@ mod tests {
         // 6. Trigger reload via trait method (which calls check_and_reload internally)
         let new_hints = verifier.root_hint_subjects();
 
-        // The hints should still be valid (reload happened or not, verifier still works)
-        // We can't directly compare hints content easily, but we verify it doesn't panic
-        // and returns a valid slice
+        // Hints should still be empty (this is by design)
         assert!(
-            !new_hints.is_empty(),
-            "Should still have CA hints after reload"
+            new_hints.is_empty(),
+            "Root hints are intentionally empty to avoid memory leaks"
         );
+
+        // Verify the verifier still works by checking supported schemes
+        let schemes = verifier.supported_verify_schemes();
+        assert!(!schemes.is_empty(), "Should support verification schemes");
     }
 
-    /// Helper to generate a CRL signed by a CA.
     #[test]
     fn test_lazy_reload_client_ca_with_crl_path() {
         // This test verifies that the verifier can be constructed with a CRL path
@@ -870,9 +887,12 @@ mod tests {
         )
         .expect("Failed to create verifier");
 
-        // Verify it works
+        // Verify root_hint_subjects returns empty (by design)
         let hints = verifier.root_hint_subjects();
-        assert!(!hints.is_empty(), "Should have CA hints");
+        assert!(
+            hints.is_empty(),
+            "Root hints are intentionally empty to avoid memory leaks"
+        );
 
         // Verify supported schemes work
         let schemes = verifier.supported_verify_schemes();

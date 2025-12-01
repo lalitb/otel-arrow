@@ -13,14 +13,33 @@ pub struct TlsConfig {
     /// In memory PEM encoded cert.
     pub ca_pem: Option<String>,
 
-    /// If true, load system CA certificates pool in addition to the certificates
-    /// configured in this struct.
-    /// Note: If this is true and no system certificates are found, the server will fail to start.
-    /// "No system certificates are found" means one of the following:
-    /// 1. The system has no CA certificates installed at all,
-    /// 2. The `rustls-native-certs` crate failed to locate them (e.g., due to permissions or platform issues),
-    /// 3. An empty list was returned by the crate.
-    /// This distinction is important for deployment: ensure your environment provides accessible system CA certificates.
+    /// Controls whether system CA certificates are loaded for certificate verification.
+    ///
+    /// # Behavior
+    ///
+    /// - **`None` or `Some(false)`**: System CA certificates are **not** loaded. Only explicitly
+    ///   configured CA sources (`ca_file`, `ca_pem`, or `client_ca_file`) are used for verification.
+    ///   If no CA is configured, client certificate verification is disabled (server) or server
+    ///   certificate verification uses only the provided CAs (client).
+    ///
+    /// - **`Some(true)`**: System CA certificates are loaded from the OS trust store **in addition to**
+    ///   any user-provided CA files (`ca_file`, `ca_pem`, `client_ca_file`). Both sources are combined
+    ///   into a single trust store for verification.
+    ///
+    /// # Failure Conditions
+    ///
+    /// When set to `true`, the server/client will fail to start if no system certificates are found.
+    /// This can happen when:
+    /// 1. The system has no CA certificates installed at all
+    /// 2. The `rustls-native-certs` crate failed to locate them (e.g., due to permissions or
+    ///    platform-specific issues)
+    /// 3. An empty list was returned by the crate
+    ///
+    /// # Deployment Note
+    ///
+    /// Ensure your environment provides accessible system CA certificates when enabling this option.
+    /// Container environments may need to install CA certificate packages (e.g., `ca-certificates`
+    /// on Debian/Ubuntu, `ca-certificates-bundle` on Alpine).
     pub include_system_ca_certs_pool: Option<bool>,
 
     /// Path to the TLS cert to use for TLS required connections.
