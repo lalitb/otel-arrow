@@ -8,8 +8,8 @@ use std::path::PathBuf;
 /// Common TLS configuration for both client and server.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
 pub struct TlsConfig {
-    /// Path to the CA cert. For a client this verifies the server certificate.
-    /// For a server this verifies client certificates.
+    /// Path to the CA cert. For a client (Exporter) this verifies the server certificate.
+    /// For a server (Receiver) this verifies client certificates.
     /// To use system root CAs, set include_system_ca_certs_pool to true.
     pub ca_file: Option<PathBuf>,
 
