@@ -29,6 +29,14 @@ categories = ["asynchronous", "network-programming"]
 name = "df_engine"
 path = "src/main.rs"
 
+[[example]]
+name = "otap_tls_client"
+path = "examples/otap_tls_client.rs"
+
+[[example]]
+name = "otlp_tls_client"
+path = "examples/otlp_tls_client.rs"
+
 [dependencies]
 otap-df-config.workspace = true
 otap-df-controller.workspace = true
@@ -37,6 +45,14 @@ thiserror.workspace = true
 serde_json.workspace = true
 clap.workspace = true
 mimalloc-rust.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
+[dev-dependencies]
+otap-df-pdata = { path = "crates/pdata" }
+arrow.workspace = true
+async-stream.workspace = true
+tokio.workspace = true
+tonic.workspace = true
 
 [workspace.dependencies]
 otap-df-pdata-otlp-macros = { path = "./crates/pdata/src/otlp/macros"}

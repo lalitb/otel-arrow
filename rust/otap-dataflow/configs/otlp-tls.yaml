@@ -10,19 +10,26 @@ nodes:
     out_ports:
       out_port:
         destinations:
-          - perf
+          - debug
         dispatch_strategy: round_robin
     config:
       listening_addr: "127.0.0.1:4319"
       tls:
-        cert_file: "certs/cert.pem"
-        key_file: "certs/key.pem"
-  perf:
-    kind: exporter
-    plugin_urn: "urn:otel:otap:perf:exporter"
+        cert_file: "test_certs/server.crt"
+        key_file: "test_certs/server.key"
+        client_ca_file: "test_certs/ca.crt"  # Enables mTLS - remove to disable client auth
+        reload_interval: "30s"  # Hot-reload certificates
+  debug:
+    kind: processor
+    plugin_urn: "urn:otel:debug:processor"
+    out_ports:
+      out_port:
+        destinations:
+          - noop
+        dispatch_strategy: round_robin
     config:
-      frequency: 1000
-      cpu_usage: false
-      mem_usage: false
-      disk_usage: false
-      io_usage: false
+      verbosity: detailed
+  noop:
+    kind: exporter
+    plugin_urn: "urn:otel:noop:exporter"
+    config:

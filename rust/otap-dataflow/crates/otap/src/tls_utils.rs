@@ -522,6 +522,14 @@ impl ClientCertVerifier for LazyReloadableClientCaVerifier {
         // and the trade-offs involved (memory leak vs unsafe vs empty).
         &[]
     }
+
+    fn offer_client_auth(&self) -> bool {
+        self.inner.load().offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.inner.load().client_auth_mandatory()
+    }
 }
 
 fn current_timestamp() -> u64 {

@@ -101,7 +101,11 @@ pub struct TlsServerConfig {
 
     /// Path to the Certificate Revocation List (CRL) to use by the server to verify a client certificate.
     pub client_crl_file: Option<PathBuf>,
-    // TODO: Implement certificate reloading
-    // /// Reload the ClientCAs file when it is modified
+    // Note: Client CA/CRL reloading is currently implemented via polling (using `reload_interval`
+    // from TlsConfig). The server periodically checks file modification times and reloads if changed.
+    //
+    // TODO: Implement file watcher-based reloading for immediate response to certificate changes.
+    // This would provide faster reload than polling and be more efficient for infrequent changes.
+    // /// Reload the ClientCAs file when it is modified (using file watcher instead of polling)
     // pub client_ca_file_reload: Option<bool>,
 }
