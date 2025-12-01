@@ -29,14 +29,6 @@ categories = ["asynchronous", "network-programming"]
 name = "df_engine"
 path = "src/main.rs"
 
-[[example]]
-name = "otap_tls_client"
-path = "examples/otap_tls_client.rs"
-
-[[example]]
-name = "otlp_tls_client"
-path = "examples/otlp_tls_client.rs"
-
 [dependencies]
 otap-df-config.workspace = true
 otap-df-controller.workspace = true
