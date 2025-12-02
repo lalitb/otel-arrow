@@ -39,6 +39,10 @@ pub struct TlsConfig {
 }
 
 /// TLS configuration specific to client connections.
+///
+/// This configuration is used by components that initiate TLS connections, such as:
+/// - **Exporters**: When sending telemetry to a backend.
+/// - **Receivers (Scrapers)**: When pulling data from a target (e.g. Prometheus).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
 pub struct TlsClientConfig {
     /// Common TLS configuration.
@@ -47,9 +51,13 @@ pub struct TlsClientConfig {
 
     /// Path to the CA cert. For a client this verifies the server certificate.
     /// To use system root CAs, set include_system_ca_certs_pool to true.
+    ///
+    /// Used by Exporters and Scrapers.
     pub ca_file: Option<PathBuf>,
 
     /// In memory PEM encoded cert.
+    ///
+    /// Used by Exporters and Scrapers.
     pub ca_pem: Option<String>,
 
     /// Controls whether system CA certificates are loaded for certificate verification.
@@ -78,19 +86,34 @@ pub struct TlsClientConfig {
     /// Ensure your environment provides accessible system CA certificates when enabling this option.
     /// Container environments may need to install CA certificate packages (e.g., `ca-certificates`
     /// on Debian/Ubuntu, `ca-certificates-bundle` on Alpine).
+    ///
+    /// Used by Exporters and Scrapers.
     pub include_system_ca_certs_pool: Option<bool>,
 
     /// In gRPC and HTTP when set to true, this is used to disable the client transport security.
+    ///
+    /// Used by Exporters and Scrapers.
     pub insecure: Option<bool>,
 
     /// InsecureSkipVerify will enable TLS but not verify the certificate.
+    ///
+    /// Used by Exporters and Scrapers.
     pub insecure_skip_verify: Option<bool>,
 
     /// ServerName requested by client for virtual hosting.
+    ///
+    /// This is required for the TLS SNI (Server Name Indication) handshake when the
+    /// connection address (e.g. IP address) does not match the hostname in the
+    /// server's certificate.
+    ///
+    /// Used by Exporters and Scrapers.
     pub server_name_override: Option<String>,
 }
 
 /// TLS configuration specific to server connections.
+///
+/// This configuration is used by components that accept TLS connections, such as:
+/// - **Receivers**: When accepting telemetry from agents or other collectors.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
 pub struct TlsServerConfig {
     /// Common TLS configuration.
