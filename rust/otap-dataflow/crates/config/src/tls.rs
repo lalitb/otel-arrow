@@ -32,8 +32,9 @@ pub struct TlsConfig {
 
     // /// Trusted platform module configuration
     // pub tpm_config: Option<TpmConfig>,
-    /// ReloadInterval specifies the duration after which the certificate will be reloaded.
-    /// If not set, it defaults to 5 minutes (300 seconds).
+    /// Minimum interval between certificate reload checks.
+    /// Certificates are only reloaded if file modification time has changed.
+    /// If not set, defaults to 5 minutes (300 seconds).
     /// Format: Standard duration string (e.g., "30s", "5m", "1h").
     pub reload_interval: Option<String>,
 }
