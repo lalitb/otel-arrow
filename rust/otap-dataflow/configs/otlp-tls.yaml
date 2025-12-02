@@ -15,7 +15,7 @@ nodes:
     config:
       listening_addr: "127.0.0.1:4319"
       # NOTE: Replace the following certificate and key file paths with the actual locations of your TLS certificate and key.
-      # You may also use in-memory PEM configuration if supported.
+      # Alternatively, use cert_pem and key_pem for in-memory PEM configuration.
       tls:
         cert_file: "test_certs/server.crt"
         key_file: "test_certs/server.key"
