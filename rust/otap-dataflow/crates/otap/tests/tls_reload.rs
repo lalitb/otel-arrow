@@ -3,6 +3,8 @@
 
 //! Test for TLS reloading.
 
+#![cfg(feature = "experimental-tls")]
+
 use serde_json::json;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -40,7 +42,7 @@ use otap_df_pdata::schema::consts;
 
 use otap_df_otap::testing::{generate_ca, generate_server_cert};
 
-fn create_otap_batch(batch_id: u64, payload_type: ArrowPayloadType) -> OtapArrowRecords {
+fn create_otap_batch(batch_id: u64, payload_type: ArrowPayloadType) -> Result<OtapArrowRecords, String> {
     let record_batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new(
             consts::ID,
@@ -51,7 +53,7 @@ fn create_otap_batch(batch_id: u64, payload_type: ArrowPayloadType) -> OtapArrow
             batch_id as u16,
         ]))],
     )
-    .expect("Failed to create test record batch");
+    .map_err(|e| format!("Failed to create test record batch: {}", e))?;
 
     let mut otap_batch = match payload_type {
         ArrowPayloadType::Logs => OtapArrowRecords::Logs(Logs::default()),
@@ -59,14 +61,12 @@ fn create_otap_batch(batch_id: u64, payload_type: ArrowPayloadType) -> OtapArrow
         ArrowPayloadType::UnivariateMetrics | ArrowPayloadType::MultivariateMetrics => {
             OtapArrowRecords::Metrics(Metrics::default())
         }
-        _ => {
-            panic!("unexpected payload_type")
-        }
+        _ => return Err(format!("unexpected payload_type: {:?}", payload_type)),
     };
 
     otap_batch.set(payload_type, record_batch);
 
-    otap_batch
+    Ok(otap_batch)
 }
 
 #[test]
@@ -284,7 +284,8 @@ fn test_otap_receiver_tls_reload() {
             // Send initial request
             let logs_stream = stream! {
                 let mut producer = Producer::new();
-                let mut logs_records = create_otap_batch(0, ArrowPayloadType::Logs);
+                let mut logs_records = create_otap_batch(0, ArrowPayloadType::Logs)
+                    .expect("Failed to create batch");
                 let bar = producer
                     .produce_bar(&mut logs_records)
                     .expect("Failed to produce test batch");
@@ -340,7 +341,8 @@ fn test_otap_receiver_tls_reload() {
                     let mut logs_client = ArrowLogsServiceClient::new(channel);
                     let logs_stream = stream! {
                         let mut producer = Producer::new();
-                        let mut logs_records = create_otap_batch(1, ArrowPayloadType::Logs);
+                        let mut logs_records = create_otap_batch(1, ArrowPayloadType::Logs)
+                            .expect("Failed to create batch");
                         let bar = producer
                     .produce_bar(&mut logs_records)
                     .expect("Failed to produce test batch");

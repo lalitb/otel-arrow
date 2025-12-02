@@ -70,7 +70,13 @@ pub fn generate_ca(dir: &std::path::Path) {
 /// * The `openssl` command cannot be found or fails to execute.
 /// * The CSR generation fails.
 /// * The certificate signing fails.
+/// * The `cn` contains characters other than alphanumeric, dots, and hyphens.
 pub fn generate_server_cert(dir: &std::path::Path, cn: &str) {
+    // Input validation to prevent command injection
+    if cn.chars().any(|c| !c.is_alphanumeric() && c != '.' && c != '-') {
+        panic!("CN must contain only alphanumeric characters, dots, and hyphens");
+    }
+
     // Generate Server Key and CSR
     let status = Command::new("openssl")
         .args([
