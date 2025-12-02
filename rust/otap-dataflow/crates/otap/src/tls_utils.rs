@@ -441,10 +441,12 @@ impl ResolvesServerCert for LazyReloadableCertResolver {
 /// - Using static CA configuration instead of hot-reloading
 /// - Implementing a custom solution with `Box::leak()` if the memory cost is acceptable
 /// - Contributing an `Arc`-based solution if you can prove it's safe
+///
+/// **Limitation:** The [`root_hint_subjects()`](#method.root_hint_subjects) method for this verifier always returns an empty slice due to safe memory management constraints. See the method-level documentation for details and trade-offs.
+///
 #[derive(Debug)]
 pub struct LazyReloadableClientCaVerifier {
     inner: Arc<ArcSwap<Arc<dyn ClientCertVerifier>>>,
-    ca_path: PathBuf,
     crl_path: Option<PathBuf>,
     ca_mtime: AtomicU64,
     crl_mtime: AtomicU64,
