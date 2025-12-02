@@ -871,7 +871,7 @@ mod tests {
         assert!(receiver.config.compression_method.is_none());
         assert!(receiver.config.settings.timeout.is_none());
 
-        // Test with minimal required fields, max_concurrent_requests defaults to 1000, wait_for_result defaults to false
+        // Test with minimal required fields, max_concurrent_requests defaults to 0, wait_for_result defaults to false
         let config_minimal = json!({
             "listening_addr": "127.0.0.1:4318",
             "response_stream_channel_size": 200
@@ -882,7 +882,7 @@ mod tests {
             "127.0.0.1:4318"
         );
         assert_eq!(receiver.config.response_stream_channel_size, 200);
-        assert_eq!(receiver.config.settings.max_concurrent_requests, 0);
+        assert_eq!(receiver.config.settings.max_concurrent_requests, 0); // Default is 0 in GrpcServerSettings
         assert!(!receiver.config.settings.wait_for_result);
         assert!(receiver.config.compression_method.is_none());
         assert!(receiver.config.settings.timeout.is_none());
