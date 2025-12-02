@@ -88,7 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // This must happen early, before any code tries to use TLS.
     rustls::crypto::ring::default_provider()
         .install_default()
-        .expect("Failed to install rustls crypto provider");
+        .expect("Failed to install rustls crypto provider. This typically means another provider was already installed or the provider is incompatible.");
 
     let args = Args::parse();
 
