@@ -852,7 +852,7 @@ mod tests {
         let pipeline_ctx =
             controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 0);
 
-        // Test with custom max_concurrent_requests, GrpcServerSettings defaults to 0
+        // Test parsing of custom max_concurrent_requests in config
         let config_with_max_concurrent_requests = json!({
             "listening_addr": "127.0.0.1:4317",
             "response_stream_channel_size": 100,
