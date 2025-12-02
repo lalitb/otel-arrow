@@ -42,7 +42,7 @@ pub struct TlsConfig {
 ///
 /// This configuration is used by components that initiate TLS connections, such as:
 /// - **Exporters**: When sending telemetry to a backend.
-/// - **Receivers (Scrapers)**: When pulling data from a target (e.g. Prometheus).
+/// - **Scrapers/clients**: When pulling data from a target (e.g., Prometheus scrape, OTLP/HTTP client).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
 pub struct TlsClientConfig {
     /// Common TLS configuration.
@@ -51,13 +51,10 @@ pub struct TlsClientConfig {
 
     /// Path to the CA cert. For a client this verifies the server certificate.
     /// To use system root CAs, set include_system_ca_certs_pool to true.
-    ///
-    /// Used by Exporters and Receivers.
     pub ca_file: Option<PathBuf>,
 
     /// In memory PEM encoded cert.
     ///
-    /// Used by Exporters and Receivers.
     pub ca_pem: Option<String>,
 
     /// Controls whether system CA certificates are loaded for certificate verification.
@@ -87,33 +84,29 @@ pub struct TlsClientConfig {
     /// Container environments may need to install CA certificate packages (e.g., `ca-certificates`
     /// on Debian/Ubuntu, `ca-certificates-bundle` on Alpine).
     ///
-    /// Used by Exporters and Receivers.
     pub include_system_ca_certs_pool: Option<bool>,
 
     /// In gRPC and HTTP when set to true, this is used to disable the client transport security.
-    ///
-    /// Used by Exporters and Receivers.
     pub insecure: Option<bool>,
 
     /// InsecureSkipVerify will enable TLS but not verify the certificate.
     ///
-    /// Used by Exporters and Receivers.
+    /// Note: In the current implementation, this flag is not supported by the tonic 0.14 client
+    /// APIs; setting it disables TLS instead of keeping TLS with verification off. Prefer supplying
+    /// a private CA via `ca_file`/`ca_pem` for self-signed endpoints.
     pub insecure_skip_verify: Option<bool>,
 
-    /// ServerName requested by client for virtual hosting.
+    /// ServerName requested by clients for virtual hosting (SNI).
     ///
-    /// This is required for the TLS SNI (Server Name Indication) handshake when the
-    /// connection address (e.g. IP address) does not match the hostname in the
-    /// server's certificate.
-    ///
-    /// Used by Exporters and Receivers.
+    /// This is required when the connection address (e.g. IP) does not match the hostname
+    /// in the server's certificate.
     pub server_name_override: Option<String>,
 }
 
-/// TLS configuration specific to server connections.
+/// TLS configuration specific to server connections (terminating TLS/mTLS).
 ///
-/// This configuration is used by components that accept TLS connections, such as:
-/// - **Receivers**: When accepting telemetry from agents or other collectors.
+/// This configuration is used by components that accept inbound TLS connections, such as:
+/// - **Servers/receivers**: When accepting telemetry from agents or other collectors.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
 pub struct TlsServerConfig {
     /// Common TLS configuration.

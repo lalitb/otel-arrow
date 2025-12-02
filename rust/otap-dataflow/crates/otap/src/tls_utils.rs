@@ -447,6 +447,7 @@ impl ResolvesServerCert for LazyReloadableCertResolver {
 #[derive(Debug)]
 pub struct LazyReloadableClientCaVerifier {
     inner: Arc<ArcSwap<Arc<dyn ClientCertVerifier>>>,
+    ca_path: PathBuf,
     crl_path: Option<PathBuf>,
     ca_mtime: AtomicU64,
     crl_mtime: AtomicU64,
