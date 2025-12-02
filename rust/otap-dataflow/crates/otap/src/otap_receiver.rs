@@ -10,7 +10,6 @@
 //!
 
 use crate::OTAP_RECEIVER_FACTORIES;
-use crate::compression::CompressionMethod;
 use crate::otap_grpc::middleware::zstd_header::ZstdRequestHeaderAdapter;
 use crate::otap_grpc::otlp::server::{RouteResponse, SharedState};
 use crate::otap_grpc::server_settings::GrpcServerSettings;
@@ -49,7 +48,8 @@ use std::time::{Duration, Instant};
 use tonic::transport::Server;
 use tonic_middleware::MiddlewareLayer;
 
-/// URN for the OTAP Receiver
+/// The URN for the OTAP receiver
+#[doc(hidden)]
 pub const OTAP_RECEIVER_URN: &str = "urn:otel:otap:receiver";
 
 /// Configuration for the OTAP Receiver
@@ -59,10 +59,6 @@ pub struct Config {
     /// gRPC server settings (shared with OTLP receiver)
     #[serde(flatten)]
     pub settings: GrpcServerSettings,
-
-    /// Compression methods accepted (legacy field for backward compatibility)
-    /// TODO: Remove in favor of settings.request_compression / settings.response_compression
-    pub compression_method: Option<CompressionMethod>,
 
     /// Size of the channel used to buffer outgoing responses to the client.
     /// This is OTAP-specific and not part of the shared GrpcServerSettings.
@@ -105,18 +101,11 @@ impl OTAPReceiver {
         pipeline_ctx: PipelineContext,
         config: &Value,
     ) -> Result<Self, otap_df_config::error::Error> {
-        let mut config: Config = serde_json::from_value(config.clone()).map_err(|e| {
+        let config: Config = serde_json::from_value(config.clone()).map_err(|e| {
             otap_df_config::error::Error::InvalidUserConfig {
                 error: e.to_string(),
             }
         })?;
-
-        // Map legacy compression_method to settings if needed
-        if let Some(method) = config.compression_method {
-            if config.settings.request_compression.is_none() {
-                config.settings.request_compression = Some(vec![method]);
-            }
-        }
 
         // Register OTAP receiver metrics for this node.
         let metrics = pipeline_ctx.register_metrics::<OtapReceiverMetrics>();
@@ -868,7 +857,6 @@ mod tests {
         assert_eq!(receiver.config.response_stream_channel_size, 100);
         assert_eq!(receiver.config.settings.max_concurrent_requests, 5000);
         assert!(!receiver.config.settings.wait_for_result);
-        assert!(receiver.config.compression_method.is_none());
         assert!(receiver.config.settings.timeout.is_none());
 
         // Test with minimal required fields, max_concurrent_requests defaults to 0, wait_for_result defaults to false
@@ -884,14 +872,13 @@ mod tests {
         assert_eq!(receiver.config.response_stream_channel_size, 200);
         assert_eq!(receiver.config.settings.max_concurrent_requests, 0); // Default is 0 in GrpcServerSettings
         assert!(!receiver.config.settings.wait_for_result);
-        assert!(receiver.config.compression_method.is_none());
         assert!(receiver.config.settings.timeout.is_none());
 
         // Test with full configuration including gzip compression
         let config_full_gzip = json!({
             "listening_addr": "127.0.0.1:4319",
             "response_stream_channel_size": 150,
-            "compression_method": "gzip",
+            "request_compression": ["gzip"],
             "max_concurrent_requests": 2500,
             "wait_for_result": true,
             "timeout": "30s"
@@ -904,10 +891,10 @@ mod tests {
         assert_eq!(receiver.config.response_stream_channel_size, 150);
         assert_eq!(receiver.config.settings.max_concurrent_requests, 2500);
         assert!(receiver.config.settings.wait_for_result);
-        assert!(matches!(
-            receiver.config.compression_method,
-            Some(CompressionMethod::Gzip)
-        ));
+        assert_eq!(
+            receiver.config.settings.request_compression_methods(),
+            vec![CompressionMethod::Gzip]
+        );
         assert_eq!(
             receiver.config.settings.timeout,
             Some(Duration::from_secs(30))
@@ -917,7 +904,7 @@ mod tests {
         let config_with_zstd = json!({
             "listening_addr": "127.0.0.1:4320",
             "response_stream_channel_size": 50,
-            "compression_method": "zstd",
+            "request_compression": ["zstd"],
             "wait_for_result": false
         });
         let receiver = OTAPReceiver::from_config(pipeline_ctx.clone(), &config_with_zstd).unwrap();
@@ -927,17 +914,17 @@ mod tests {
         );
         assert_eq!(receiver.config.response_stream_channel_size, 50);
         assert!(!receiver.config.settings.wait_for_result);
-        assert!(matches!(
-            receiver.config.compression_method,
-            Some(CompressionMethod::Zstd)
-        ));
+        assert_eq!(
+            receiver.config.settings.request_compression_methods(),
+            vec![CompressionMethod::Zstd]
+        );
         assert!(receiver.config.settings.timeout.is_none());
 
         // Test with deflate compression
         let config_with_deflate = json!({
             "listening_addr": "127.0.0.1:4321",
             "response_stream_channel_size": 75,
-            "compression_method": "deflate"
+            "request_compression": ["deflate"]
         });
         let receiver = OTAPReceiver::from_config(pipeline_ctx, &config_with_deflate).unwrap();
         assert_eq!(
@@ -945,10 +932,10 @@ mod tests {
             "127.0.0.1:4321"
         );
         assert_eq!(receiver.config.response_stream_channel_size, 75);
-        assert!(matches!(
-            receiver.config.compression_method,
-            Some(CompressionMethod::Deflate)
-        ));
+        assert_eq!(
+            receiver.config.settings.request_compression_methods(),
+            vec![CompressionMethod::Deflate]
+        );
         assert!(receiver.config.settings.timeout.is_none());
     }
 
@@ -977,31 +964,6 @@ mod tests {
         );
         assert_eq!(
             receiver.config.settings.response_compression_methods(),
-            vec![CompressionMethod::Zstd]
-        );
-
-        // Test legacy compression_method maps to request_compression
-        let config_legacy = json!({
-            "listening_addr": "127.0.0.1:4318",
-            "response_stream_channel_size": 100,
-            "compression_method": "gzip"
-        });
-        let receiver = OTAPReceiver::from_config(pipeline_ctx.clone(), &config_legacy).unwrap();
-        assert_eq!(
-            receiver.config.settings.request_compression_methods(),
-            vec![CompressionMethod::Gzip]
-        );
-
-        // Test explicit request_compression takes precedence over legacy
-        let config_both = json!({
-            "listening_addr": "127.0.0.1:4319",
-            "response_stream_channel_size": 100,
-            "compression_method": "gzip",
-            "request_compression": ["zstd"]
-        });
-        let receiver = OTAPReceiver::from_config(pipeline_ctx.clone(), &config_both).unwrap();
-        assert_eq!(
-            receiver.config.settings.request_compression_methods(),
             vec![CompressionMethod::Zstd]
         );
 

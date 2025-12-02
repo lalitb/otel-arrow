@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 use tonic::transport::Server;
 
 /// URN for the OTLP Receiver
+#[doc(hidden)]
 pub const OTLP_RECEIVER_URN: &str = "urn:otel:otlp:receiver";
 
 /// Configuration for OTLP Receiver
