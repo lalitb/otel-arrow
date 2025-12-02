@@ -18,9 +18,9 @@ nodes:
       # NOTE: Replace the following certificate and key file paths with the actual locations of your TLS certificate and key.
       # Alternatively, use cert_pem and key_pem for in-memory PEM configuration.
       tls:
-        cert_file: "test_certs/server.crt"
-        key_file: "test_certs/server.key"
-        client_ca_file: "test_certs/ca.crt"  # Enables mTLS - remove to disable client auth
+        cert_file: "test_certs/server.crt"  # Relative to working directory, or use absolute path like "/etc/otap/certs/server.crt"
+        key_file: "test_certs/server.key"  # Relative to working directory, or use absolute path like "/etc/otap/certs/server.key"
+        client_ca_file: "test_certs/ca.crt"  # Relative to working directory, or use absolute path. Enables mTLS - remove to disable client auth
         reload_interval: "30s"  # Hot-reload certificates
   batch:
     kind: processor
