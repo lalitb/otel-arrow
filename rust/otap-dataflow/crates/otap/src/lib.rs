@@ -84,6 +84,7 @@ mod metrics;
 pub mod otlp_grpc;
 
 /// TLS utilities
+#[cfg(feature = "experimental-tls")]
 pub mod tls_utils;
 
 /// Factory for OTAP-based pipeline

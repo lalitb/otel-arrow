@@ -17,11 +17,13 @@ use crate::otap_grpc::{
     ArrowLogsServiceImpl, ArrowMetricsServiceImpl, ArrowTracesServiceImpl, Settings,
 };
 use crate::pdata::OtapPdata;
+#[cfg(feature = "experimental-tls")]
 use crate::tls_utils::{build_reloadable_server_config, create_tls_stream};
 use async_trait::async_trait;
 use linkme::distributed_slice;
 use otap_df_config::SignalType;
 use otap_df_config::node::NodeUserConfig;
+#[cfg(feature = "experimental-tls")]
 use otap_df_config::tls::TlsServerConfig;
 use otap_df_engine::ReceiverFactory;
 use otap_df_engine::config::ReceiverConfig;
@@ -65,6 +67,7 @@ pub struct Config {
     pub response_stream_channel_size: usize,
 
     /// TLS configuration
+    #[cfg(feature = "experimental-tls")]
     pub tls: Option<TlsServerConfig>,
 }
 
@@ -246,6 +249,7 @@ impl shared::Receiver<OtapPdata> for OTAPReceiver {
             server_builder = server_builder.timeout(timeout);
         }
 
+        #[cfg(feature = "experimental-tls")]
         let maybe_tls_acceptor = if let Some(tls_config) = &self.config.tls {
             let server_config = build_reloadable_server_config(tls_config)
                 .await
@@ -307,14 +311,21 @@ impl shared::Receiver<OtapPdata> for OTAPReceiver {
 
             // Run server
             result = async {
-                match maybe_tls_acceptor {
-                    Some(tls_acceptor) => {
-                        let tls_stream = create_tls_stream(listener_stream, tls_acceptor);
-                        server.serve_with_incoming(tls_stream).await
+                #[cfg(feature = "experimental-tls")]
+                {
+                    match maybe_tls_acceptor {
+                        Some(tls_acceptor) => {
+                            let tls_stream = create_tls_stream(listener_stream, tls_acceptor);
+                            server.serve_with_incoming(tls_stream).await
+                        }
+                        None => {
+                            server.serve_with_incoming(listener_stream).await
+                        }
                     }
-                    None => {
-                        server.serve_with_incoming(listener_stream).await
-                    }
+                }
+                #[cfg(not(feature = "experimental-tls"))]
+                {
+                    server.serve_with_incoming(listener_stream).await
                 }
             } => {
                 if let Err(error) = result {
@@ -1069,6 +1080,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "experimental-tls")]
     fn test_otap_receiver_tls() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let test_runtime = TestRuntime::new();
@@ -1177,6 +1189,7 @@ mod tests {
     }
 
     /// Specific validation procedure for the TLS test that only checks for metrics.
+    #[cfg(feature = "experimental-tls")]
     fn tls_validation_procedure()
     -> impl FnOnce(NotSendValidateContext<OtapPdata>) -> Pin<Box<dyn Future<Output = ()>>> {
         |mut ctx| {

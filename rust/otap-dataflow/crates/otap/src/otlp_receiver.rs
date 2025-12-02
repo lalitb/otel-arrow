@@ -7,7 +7,9 @@ use crate::otap_grpc::otlp::server::{
 };
 use crate::otap_grpc::server_settings::GrpcServerSettings;
 use crate::pdata::OtapPdata;
+#[cfg(feature = "experimental-tls")]
 use crate::tls_utils::{build_reloadable_server_config, create_tls_stream};
+#[cfg(feature = "experimental-tls")]
 use otap_df_config::tls::TlsServerConfig;
 
 use crate::compression::CompressionMethod;
@@ -52,6 +54,7 @@ pub struct Config {
     pub compression_method: Option<CompressionMethod>,
 
     /// TLS configuration
+    #[cfg(feature = "experimental-tls")]
     pub tls: Option<TlsServerConfig>,
 }
 
@@ -221,6 +224,7 @@ impl shared::Receiver<OtapPdata> for OTLPReceiver {
             server_builder = server_builder.timeout(timeout);
         }
 
+        #[cfg(feature = "experimental-tls")]
         let maybe_tls_acceptor = if let Some(tls_config) = &self.config.tls {
             let server_config = build_reloadable_server_config(tls_config)
                 .await
@@ -281,6 +285,7 @@ impl shared::Receiver<OtapPdata> for OTLPReceiver {
 
             // Run server
             result = async {
+                #[cfg(feature = "experimental-tls")]
                 match maybe_tls_acceptor {
                     Some(tls_acceptor) => {
                         let tls_stream = create_tls_stream(listener_stream, tls_acceptor);
@@ -289,6 +294,10 @@ impl shared::Receiver<OtapPdata> for OTLPReceiver {
                     None => {
                         server.serve_with_incoming(listener_stream).await
                     }
+                }
+                #[cfg(not(feature = "experimental-tls"))]
+                {
+                    server.serve_with_incoming(listener_stream).await
                 }
             } => {
                 if let Err(error) = result {
@@ -484,19 +493,22 @@ mod tests {
             Some(Duration::from_millis(500))
         );
 
-        let config_tls = json!({
-            "listening_addr": "127.0.0.1:4317",
-            "tls": {
-                "cert_file": "/path/to/cert",
-                "key_file": "/path/to/key",
-                "client_ca_file": "/path/to/ca"
-            }
-        });
-        let receiver = OTLPReceiver::from_config(pipeline_ctx, &config_tls).unwrap();
-        let tls = receiver.config.tls.as_ref().unwrap();
-        assert_eq!(tls.config.cert_file, Some(PathBuf::from("/path/to/cert")));
-        assert_eq!(tls.config.key_file, Some(PathBuf::from("/path/to/key")));
-        assert_eq!(tls.client_ca_file, Some(PathBuf::from("/path/to/ca")));
+        #[cfg(feature = "experimental-tls")]
+        {
+            let config_tls = json!({
+                "listening_addr": "127.0.0.1:4317",
+                "tls": {
+                    "cert_file": "/path/to/cert",
+                    "key_file": "/path/to/key",
+                    "client_ca_file": "/path/to/ca"
+                }
+            });
+            let receiver = OTLPReceiver::from_config(pipeline_ctx, &config_tls).unwrap();
+            let tls = receiver.config.tls.as_ref().unwrap();
+            assert_eq!(tls.config.cert_file, Some(PathBuf::from("/path/to/cert")));
+            assert_eq!(tls.config.key_file, Some(PathBuf::from("/path/to/key")));
+            assert_eq!(tls.client_ca_file, Some(PathBuf::from("/path/to/ca")));
+        }
     }
 
     #[test]
@@ -756,6 +768,7 @@ mod tests {
                         ..Default::default()
                     },
                     compression_method: None,
+                    #[cfg(feature = "experimental-tls")]
                     tls: None,
                 },
                 metrics: pipeline_ctx.register_metrics::<OtlpReceiverMetrics>(),
@@ -798,6 +811,7 @@ mod tests {
                         ..Default::default()
                     },
                     compression_method: None,
+                    #[cfg(feature = "experimental-tls")]
                     tls: None,
                 },
                 metrics: pipeline_ctx.register_metrics::<OtlpReceiverMetrics>(),
@@ -853,6 +867,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "experimental-tls")]
     fn test_otlp_receiver_tls() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let test_runtime = TestRuntime::new();
@@ -983,6 +998,7 @@ mod tests {
             .run_validation_concurrent(validation_procedure());
     }
 
+    #[cfg(feature = "experimental-tls")]
     fn generate_client_certs(dir: &std::path::Path) {
         use std::process::Command;
         // Generate Client Key and CSR
@@ -1038,6 +1054,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "experimental-tls")]
     fn test_otlp_receiver_tls_file_based() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let test_runtime = TestRuntime::new();
@@ -1163,6 +1180,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "experimental-tls")]
     fn test_otlp_receiver_mtls() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let test_runtime = TestRuntime::new();
