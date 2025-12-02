@@ -4,7 +4,8 @@
 use arc_swap::ArcSwap;
 use base64::prelude::*;
 use futures::{Stream, StreamExt};
-use otap_df_config::tls::TlsServerConfig;
+use otap_df_config::tls::{TlsClientConfig, TlsServerConfig};
+use rustls::client::danger::HandshakeSignatureValid;
 use rustls::pki_types::{CertificateDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
@@ -16,7 +17,82 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
-use tonic::transport::{Certificate, Identity, ServerTlsConfig};
+use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
+
+/// Loads TLS configuration for a client.
+///
+/// Returns `Ok(None)` when `insecure` is true, indicating TLS is disabled.
+/// Otherwise returns a `ClientTlsConfig` configured according to the provided settings.
+pub async fn load_client_tls_config(
+    config: &TlsClientConfig,
+) -> Result<Option<ClientTlsConfig>, io::Error> {
+    if config.insecure == Some(true) {
+        return Ok(None);
+    }
+
+    // Collect CA certificates (system and user-provided) into a single PEM blob
+    let mut ca_pem = Vec::new();
+
+    if config.include_system_ca_certs_pool == Some(true) {
+        let cert_res = tokio::task::spawn_blocking(load_native_certs)
+            .await
+            .map_err(io::Error::other)?;
+
+        for error in &cert_res.errors {
+            log::warn!("Error loading native cert: {}", error);
+        }
+        for cert in cert_res.certs {
+            let pem = format!(
+                "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+                BASE64_STANDARD.encode(cert.as_ref())
+            );
+            ca_pem.extend_from_slice(pem.as_bytes());
+        }
+    }
+
+    if let Some(ca_file) = &config.ca_file {
+        let ca_bytes = tokio::fs::read(ca_file).await?;
+        ca_pem.extend_from_slice(&ca_bytes);
+    } else if let Some(ca_pem_str) = &config.ca_pem {
+        ca_pem.extend_from_slice(ca_pem_str.as_bytes());
+    }
+
+    let mut tonic_tls_config = ClientTlsConfig::new();
+
+    if config.insecure_skip_verify == Some(true) {
+        // Prefer trusting a private CA via ca_file/ca_pem for self-signed setups.
+        // tonic 0.14 does not expose a hook to keep TLS while skipping verification
+        // (the rustls extension API is removed), so if insecure_skip_verify is set
+        // we disable TLS instead.
+        log::warn!("insecure_skip_verify=true is not supported with this client; disabling TLS");
+        return Ok(None);
+    } else if !ca_pem.is_empty() {
+        tonic_tls_config = tonic_tls_config.ca_certificate(Certificate::from_pem(ca_pem));
+    } else {
+        log::warn!(
+            "No CA certificates loaded for TLS client config, and insecure_skip_verify is false. Connection may fail."
+        );
+    }
+
+    // Client Identity (mTLS)
+    if let (Some(cert_file), Some(key_file)) = (&config.config.cert_file, &config.config.key_file) {
+        let cert_pem = tokio::fs::read(cert_file).await?;
+        let key_pem = tokio::fs::read(key_file).await?;
+        let identity = Identity::from_pem(cert_pem, key_pem);
+        tonic_tls_config = tonic_tls_config.identity(identity);
+    } else if let (Some(cert_pem), Some(key_pem)) =
+        (&config.config.cert_pem, &config.config.key_pem)
+    {
+        let identity = Identity::from_pem(cert_pem.clone(), key_pem.clone());
+        tonic_tls_config = tonic_tls_config.identity(identity);
+    }
+
+    if let Some(domain) = &config.server_name_override {
+        tonic_tls_config = tonic_tls_config.domain_name(domain);
+    }
+
+    Ok(Some(tonic_tls_config))
+}
 
 /// Loads TLS configuration for a server.
 ///
@@ -491,7 +567,7 @@ impl ClientCertVerifier for LazyReloadableClientCaVerifier {
         message: &[u8],
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, Error> {
+    ) -> Result<HandshakeSignatureValid, Error> {
         self.inner.load().verify_tls12_signature(message, cert, dss)
     }
 
@@ -500,7 +576,7 @@ impl ClientCertVerifier for LazyReloadableClientCaVerifier {
         message: &[u8],
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, Error> {
+    ) -> Result<HandshakeSignatureValid, Error> {
         self.inner.load().verify_tls13_signature(message, cert, dss)
     }
 

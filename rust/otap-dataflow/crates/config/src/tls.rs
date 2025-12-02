@@ -52,12 +52,12 @@ pub struct TlsClientConfig {
     /// Path to the CA cert. For a client this verifies the server certificate.
     /// To use system root CAs, set include_system_ca_certs_pool to true.
     ///
-    /// Used by Exporters and Scrapers.
+    /// Used by Exporters and Receivers.
     pub ca_file: Option<PathBuf>,
 
     /// In memory PEM encoded cert.
     ///
-    /// Used by Exporters and Scrapers.
+    /// Used by Exporters and Receivers.
     pub ca_pem: Option<String>,
 
     /// Controls whether system CA certificates are loaded for certificate verification.
@@ -87,17 +87,17 @@ pub struct TlsClientConfig {
     /// Container environments may need to install CA certificate packages (e.g., `ca-certificates`
     /// on Debian/Ubuntu, `ca-certificates-bundle` on Alpine).
     ///
-    /// Used by Exporters and Scrapers.
+    /// Used by Exporters and Receivers.
     pub include_system_ca_certs_pool: Option<bool>,
 
     /// In gRPC and HTTP when set to true, this is used to disable the client transport security.
     ///
-    /// Used by Exporters and Scrapers.
+    /// Used by Exporters and Receivers.
     pub insecure: Option<bool>,
 
     /// InsecureSkipVerify will enable TLS but not verify the certificate.
     ///
-    /// Used by Exporters and Scrapers.
+    /// Used by Exporters and Receivers.
     pub insecure_skip_verify: Option<bool>,
 
     /// ServerName requested by client for virtual hosting.
@@ -106,7 +106,7 @@ pub struct TlsClientConfig {
     /// connection address (e.g. IP address) does not match the hostname in the
     /// server's certificate.
     ///
-    /// Used by Exporters and Scrapers.
+    /// Used by Exporters and Receivers.
     pub server_name_override: Option<String>,
 }
 
