@@ -299,7 +299,7 @@ fn test_otap_receiver_tls_reload() {
             // Wait for at least one reload interval (1s) to pass before modifying the file.
             // This ensures we don't hit a race where the reloader reads the file *while* we are writing it,
             // or reads it just before we write it and then sleeps for another interval.
-            sleep(Duration::from_secs(2)).await;
+            sleep(Duration::from_millis(1500)).await;
 
             let dir_path = temp_dir.path().to_path_buf();
 
