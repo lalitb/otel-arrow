@@ -181,7 +181,7 @@ pub fn create_test_pdata() -> OtapPdata {
     let mut otlp_bytes = vec![];
     otlp_service_req
         .encode(&mut otlp_bytes)
-        .expect("failed to encode otlp request");
+        .unwrap_or_else(|err| panic!("failed to encode OTLP request: {err}"));
 
     OtapPdata::new_default(OtlpProtoBytes::ExportLogsRequest(Bytes::from(otlp_bytes)).into())
 }
