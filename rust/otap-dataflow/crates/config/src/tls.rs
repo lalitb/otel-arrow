@@ -29,6 +29,9 @@ pub struct TlsConfig {
 
     // /// CipherSuites is a list of TLS cipher suites that the TLS transport can use.
     // pub cipher_suites: Option<Vec<String>>,
+
+    // /// Trusted platform module configuration
+    // pub tpm_config: Option<TpmConfig>,
     /// ReloadInterval specifies the duration after which the certificate will be reloaded.
     /// If not set, it defaults to 5 minutes (300 seconds).
     /// Format: Standard duration string (e.g., "30s", "5m", "1h").
