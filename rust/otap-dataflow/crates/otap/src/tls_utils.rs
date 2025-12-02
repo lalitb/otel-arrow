@@ -305,6 +305,13 @@ impl LazyReloadableCertResolver {
     /// the old mtime but before it completes), that change won't be detected until the next
     /// interval. This is acceptable for certificate rotation, which typically has much longer
     /// lead times than the check interval.
+    ///
+    /// # Minimum Recommended Interval
+    ///
+    /// **Warning:** Intervals shorter than 1 second may not provide enough time for atomic file
+    /// operations (such as certificate/key replacement) to complete, and could lead to partial
+    /// reads or inconsistent state. It is recommended to set `check_interval_secs` to at least
+    /// 1 second to avoid these issues.
     pub fn check_and_reload_if_interval_expired(&self) -> bool {
         let now = current_timestamp();
         let last_check = self.last_check_time.load(Ordering::Relaxed);
