@@ -1,36 +1,41 @@
 # OTAP Dataflow Extension System
 
-This crate provides an extensible extension system for the OTAP dataflow pipeline engine, following the same patterns used by the OpenTelemetry Go Collector.
+This crate provides an extensible extension system for the OTAP dataflow
+pipeline engine, following the same patterns used by the OpenTelemetry Go
+Collector.
 
 ## Overview
 
-Extensions are shared components that provide auxiliary functionality to pipeline components (receivers, processors, exporters). They don't participate directly in data pipelines but provide services like:
+Extensions are shared components that provide auxiliary functionality to
+pipeline components (receivers, processors, exporters). They don't participate
+directly in data pipelines but provide services like:
 
-- **Authentication**: Provide credentials for outgoing requests or validate incoming requests
+- **Authentication**: Provide credentials for outgoing requests or validate
+  incoming requests
 - **Middleware**: Wrap HTTP/gRPC handlers and clients
 - **Capabilities**: Health checks, config watching, etc.
 
 ## Architecture
 
 ```text
-┌─────────────────────────────────────────────────────────────┐
-│                      EXTENSIONS                              │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐       │
-│  │ Bearer Token │  │  Azure Auth  │  │  Basic Auth  │  ...  │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘       │
-└─────────┼─────────────────┼─────────────────┼───────────────┘
-          │                 │                 │
-          ▼                 ▼                 ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   ExtensionHost                              │
-│         (provides extensions to components)                  │
-└─────────────────────────────────────────────────────────────┘
-          │
-          ▼
-┌─────────────────────────────────────────────────────────────┐
-│              Pipeline Components                             │
-│    (Receivers, Processors, Exporters access extensions)      │
-└─────────────────────────────────────────────────────────────┘
++-------------------------------------------------------------+
+|                      EXTENSIONS                             |
+|  +--------------+  +--------------+  +--------------+       |
+|  | Bearer Token |  |  Azure Auth  |  |  Basic Auth  |  ...  |
+|  +------+-------+  +------+-------+  +------+-------+       |
++---------+-----------------+-----------------+---------------+
+          |                 |                 |
+          v                 v                 v
++-------------------------------------------------------------+
+|                   ExtensionHost                             |
+|         (provides extensions to components)                 |
++-------------------------------------------------------------+
+          |
+          v
++-------------------------------------------------------------+
+|              Pipeline Components                            |
+|    (Receivers, Processors, Exporters access extensions)     |
++-------------------------------------------------------------+
 ```
 
 ## Usage
