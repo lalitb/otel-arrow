@@ -18,7 +18,10 @@ pub enum ExtensionError {
 
     /// Extension does not implement the requested capability.
     #[error("extension '{id}' does not implement {capability}")]
-    CapabilityNotSupported { id: String, capability: &'static str },
+    CapabilityNotSupported {
+        id: String,
+        capability: &'static str,
+    },
 
     /// Invalid extension configuration.
     #[error("invalid extension configuration: {message}")]

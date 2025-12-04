@@ -8,9 +8,10 @@
 
 use crate::auth::{ClientAuth, CredentialProvider, ServerAuth};
 use crate::error::ExtensionError;
-use crate::middleware::{GrpcClientMiddleware, GrpcServerMiddleware, HttpClientMiddleware, HttpServerMiddleware};
+use crate::middleware::{
+    GrpcClientMiddleware, GrpcServerMiddleware, HttpClientMiddleware, HttpServerMiddleware,
+};
 use crate::{Extension, ExtensionId, create_extension};
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -143,7 +144,10 @@ impl ExtensionHost {
     }
 
     /// Gets a credential provider extension by ID.
-    pub fn get_credential_provider(&self, id: &str) -> Result<&dyn CredentialProvider, ExtensionError> {
+    pub fn get_credential_provider(
+        &self,
+        id: &str,
+    ) -> Result<&dyn CredentialProvider, ExtensionError> {
         let ext = self
             .extensions
             .get(id)
@@ -157,7 +161,10 @@ impl ExtensionHost {
     }
 
     /// Gets an HTTP server middleware extension by ID.
-    pub fn get_http_server_middleware(&self, id: &str) -> Result<&dyn HttpServerMiddleware, ExtensionError> {
+    pub fn get_http_server_middleware(
+        &self,
+        id: &str,
+    ) -> Result<&dyn HttpServerMiddleware, ExtensionError> {
         let ext = self
             .extensions
             .get(id)
@@ -171,7 +178,10 @@ impl ExtensionHost {
     }
 
     /// Gets an HTTP client middleware extension by ID.
-    pub fn get_http_client_middleware(&self, id: &str) -> Result<&dyn HttpClientMiddleware, ExtensionError> {
+    pub fn get_http_client_middleware(
+        &self,
+        id: &str,
+    ) -> Result<&dyn HttpClientMiddleware, ExtensionError> {
         let ext = self
             .extensions
             .get(id)
@@ -185,7 +195,10 @@ impl ExtensionHost {
     }
 
     /// Gets a gRPC server middleware extension by ID.
-    pub fn get_grpc_server_middleware(&self, id: &str) -> Result<&dyn GrpcServerMiddleware, ExtensionError> {
+    pub fn get_grpc_server_middleware(
+        &self,
+        id: &str,
+    ) -> Result<&dyn GrpcServerMiddleware, ExtensionError> {
         let ext = self
             .extensions
             .get(id)
@@ -199,7 +212,10 @@ impl ExtensionHost {
     }
 
     /// Gets a gRPC client middleware extension by ID.
-    pub fn get_grpc_client_middleware(&self, id: &str) -> Result<&dyn GrpcClientMiddleware, ExtensionError> {
+    pub fn get_grpc_client_middleware(
+        &self,
+        id: &str,
+    ) -> Result<&dyn GrpcClientMiddleware, ExtensionError> {
         let ext = self
             .extensions
             .get(id)
@@ -258,7 +274,10 @@ impl ExtensionRef {
     }
 
     /// Resolves the extension from the host.
-    pub fn resolve<'a>(&self, host: &'a ExtensionHost) -> Result<&'a Arc<dyn Extension>, ExtensionError> {
+    pub fn resolve<'a>(
+        &self,
+        host: &'a ExtensionHost,
+    ) -> Result<&'a Arc<dyn Extension>, ExtensionError> {
         host.get_extension(&self.id)
             .ok_or_else(|| ExtensionError::NotFoundById {
                 id: self.id.clone(),

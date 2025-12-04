@@ -12,7 +12,7 @@ Extensions are shared components that provide auxiliary functionality to pipelin
 
 ## Architecture
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │                      EXTENSIONS                              │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐       │

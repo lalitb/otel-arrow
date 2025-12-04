@@ -8,9 +8,9 @@
 
 use crate::auth::{AuthInfo, ServerAuth};
 use crate::error::ExtensionError;
-use crate::{Extension, ExtensionFactory, EXTENSION_FACTORIES};
+use crate::{EXTENSION_FACTORIES, Extension, ExtensionFactory};
 use async_trait::async_trait;
-use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec, TokenReviewStatus, UserInfo};
+use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec};
 use kube::{Api, Client};
 use linkme::distributed_slice;
 use serde::Deserialize;
@@ -25,7 +25,11 @@ pub const SAT_EXTENSION_URN: &str = "urn:otel:extension:auth:sat";
 /// Trait for validating tokens (allows mocking for tests).
 #[async_trait]
 pub trait TokenReviewer: Send + Sync {
-    async fn review(&self, token: &str, audiences: &[String]) -> Result<TokenReview, ExtensionError>;
+    async fn review(
+        &self,
+        token: &str,
+        audiences: &[String],
+    ) -> Result<TokenReview, ExtensionError>;
 }
 
 /// Default implementation using Kubernetes API.
@@ -43,7 +47,11 @@ impl K8sTokenReviewer {
 
 #[async_trait]
 impl TokenReviewer for K8sTokenReviewer {
-    async fn review(&self, token: &str, audiences: &[String]) -> Result<TokenReview, ExtensionError> {
+    async fn review(
+        &self,
+        token: &str,
+        audiences: &[String],
+    ) -> Result<TokenReview, ExtensionError> {
         let client = self
             .client
             .get_or_try_init(|| async {
@@ -67,10 +75,9 @@ impl TokenReviewer for K8sTokenReviewer {
         };
 
         let pp = kube::api::PostParams::default();
-        token_reviews
-            .create(&pp, &tr)
-            .await
-            .map_err(|e| ExtensionError::Other(format!("failed to create TokenReview: {}", e).into()))
+        token_reviews.create(&pp, &tr).await.map_err(|e| {
+            ExtensionError::Other(format!("failed to create TokenReview: {}", e).into())
+        })
     }
 }
 
@@ -79,13 +86,13 @@ impl TokenReviewer for K8sTokenReviewer {
 pub struct ExtensionAuthConfig {
     /// The resource ID that this auth config applies to.
     pub extension_rid: String,
-    
+
     /// The type of extension (for telemetry).
     pub extension_type: String,
-    
+
     /// The required namespace of the service account.
     pub service_account_namespace: String,
-    
+
     /// The allowed service account names.
     pub service_account_names: Vec<String>,
 }
@@ -171,33 +178,47 @@ impl ServerAuth for SatExtension {
         }
 
         let token = match auth_header {
-            Some(h) if h.to_lowercase().starts_with("bearer ") => &h[7..],
-            _ => {
+            Some(h) => {
+                if h.len() > 7 && h[..7].eq_ignore_ascii_case("Bearer ") {
+                    &h[7..]
+                } else if self.config.allow_no_auth {
+                    return Ok(AuthInfo::new());
+                } else {
+                    return Err(ExtensionError::Other(
+                        "missing or invalid authorization header".into(),
+                    ));
+                }
+            }
+            None => {
                 if self.config.allow_no_auth {
-                    // Legacy bypass
                     return Ok(AuthInfo::new());
                 }
-                return Err(ExtensionError::Other("missing or invalid authorization header".into()));
+                return Err(ExtensionError::Other(
+                    "missing or invalid authorization header".into(),
+                ));
             }
         };
 
         let audiences: Vec<String> = self.audience_map.keys().cloned().collect();
         let result = self.reviewer.review(token, &audiences).await?;
 
-        let status = result.status.ok_or_else(|| {
-            ExtensionError::Other("TokenReview response missing status".into())
-        })?;
+        let status = result
+            .status
+            .ok_or_else(|| ExtensionError::Other("TokenReview response missing status".into()))?;
 
         if !status.authenticated.unwrap_or(false) {
-            return Err(ExtensionError::Other(format!(
-                "authentication failed: {}",
-                status.error.unwrap_or_else(|| "unknown error".into())
-            ).into()));
+            return Err(ExtensionError::Other(
+                format!(
+                    "authentication failed: {}",
+                    status.error.unwrap_or_else(|| "unknown error".into())
+                )
+                .into(),
+            ));
         }
 
-        let user = status.user.ok_or_else(|| {
-            ExtensionError::Other("TokenReview missing user info".into())
-        })?;
+        let user = status
+            .user
+            .ok_or_else(|| ExtensionError::Other("TokenReview missing user info".into()))?;
 
         let username = user.username.unwrap_or_default();
         let matched_audiences = status.audiences.unwrap_or_default();
@@ -216,7 +237,8 @@ impl ServerAuth for SatExtension {
                     {
                         // Success
                         let mut info = AuthInfo::with_principal(username);
-                        info.metadata.insert("extension_rid".to_string(), config.extension_rid.clone());
+                        info.metadata
+                            .insert("extension_rid".to_string(), config.extension_rid.clone());
                         info.groups = user.groups.unwrap_or_default();
                         return Ok(info);
                     }
@@ -229,9 +251,7 @@ impl ServerAuth for SatExtension {
 }
 
 /// Factory function for creating SAT extensions.
-fn create_sat_extension(
-    config: &serde_json::Value,
-) -> Result<Arc<dyn Extension>, ExtensionError> {
+fn create_sat_extension(config: &serde_json::Value) -> Result<Arc<dyn Extension>, ExtensionError> {
     Ok(Arc::new(SatExtension::from_config(config)?))
 }
 
@@ -255,7 +275,11 @@ mod tests {
 
     #[async_trait]
     impl TokenReviewer for MockTokenReviewer {
-        async fn review(&self, _token: &str, _audiences: &[String]) -> Result<TokenReview, ExtensionError> {
+        async fn review(
+            &self,
+            _token: &str,
+            _audiences: &[String],
+        ) -> Result<TokenReview, ExtensionError> {
             Ok(TokenReview {
                 status: Some(TokenReviewStatus {
                     authenticated: Some(self.authenticated),
@@ -291,13 +315,19 @@ mod tests {
         });
 
         let ext = SatExtension::with_reviewer(config, reviewer);
-        
+
         let mut headers = HashMap::new();
         headers.insert("Authorization".into(), vec!["Bearer valid-token".into()]);
 
         let auth_info = ext.authenticate(&headers).await.unwrap();
-        assert_eq!(auth_info.principal, Some("system:serviceaccount:default:my-sa".into()));
-        assert_eq!(auth_info.metadata.get("extension_rid"), Some(&"my-resource".to_string()));
+        assert_eq!(
+            auth_info.principal,
+            Some("system:serviceaccount:default:my-sa".into())
+        );
+        assert_eq!(
+            auth_info.metadata.get("extension_rid"),
+            Some(&"my-resource".to_string())
+        );
     }
 
     #[tokio::test]
@@ -319,12 +349,14 @@ mod tests {
         });
 
         let ext = SatExtension::with_reviewer(config, reviewer);
-        
+
         let mut headers = HashMap::new();
         headers.insert("Authorization".into(), vec!["Bearer valid-token".into()]);
 
         let err = ext.authenticate(&headers).await.unwrap_err();
-        assert!(matches!(err, ExtensionError::Other(msg) if msg.to_string().contains("RBAC validation failed")));
+        assert!(
+            matches!(err, ExtensionError::Other(msg) if msg.to_string().contains("RBAC validation failed"))
+        );
     }
 
     #[tokio::test]
@@ -341,7 +373,7 @@ mod tests {
         });
 
         let ext = SatExtension::with_reviewer(config, reviewer);
-        
+
         let headers = HashMap::new();
         let auth_info = ext.authenticate(&headers).await.unwrap();
         assert!(auth_info.principal.is_none());

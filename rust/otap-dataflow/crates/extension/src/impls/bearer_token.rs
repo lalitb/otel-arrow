@@ -18,7 +18,7 @@
 
 use crate::auth::ClientAuth;
 use crate::error::ExtensionError;
-use crate::{Extension, ExtensionFactory, EXTENSION_FACTORIES};
+use crate::{EXTENSION_FACTORIES, Extension, ExtensionFactory};
 use async_trait::async_trait;
 use linkme::distributed_slice;
 use serde::Deserialize;
