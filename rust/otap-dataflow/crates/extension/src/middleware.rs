@@ -21,10 +21,7 @@ pub trait HttpServerMiddleware: Send + Sync {
     ///
     /// The returned function should call the `next` handler after
     /// performing any pre/post processing.
-    fn wrap_handler<H, R>(&self, next: H) -> Box<dyn HttpHandler<Response = R> + Send + Sync>
-    where
-        H: HttpHandler<Response = R> + Send + Sync + 'static,
-        R: Send + 'static;
+    fn wrap_handler(&self, next: Box<dyn HttpHandler>) -> Box<dyn HttpHandler>;
 }
 
 /// HTTP client middleware.
@@ -43,11 +40,17 @@ pub trait HttpClientMiddleware: Send + Sync {
 ///
 /// This is a simplified abstraction - real implementations would use
 /// actual HTTP framework types (hyper, axum, etc.).
-pub trait HttpHandler {
-    type Response;
-
+pub trait HttpHandler: Send + Sync {
     /// Handles an HTTP request.
-    fn handle(&self, request: HttpRequest) -> Self::Response;
+    fn handle(&self, request: HttpRequest) -> Result<HttpResponse, ExtensionError>;
+}
+
+/// Simplified HTTP response representation.
+#[derive(Debug, Clone)]
+pub struct HttpResponse {
+    pub status: u16,
+    pub headers: std::collections::HashMap<String, String>,
+    pub body: Vec<u8>,
 }
 
 /// Simplified HTTP request representation.

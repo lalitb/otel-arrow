@@ -7,3 +7,4 @@
 //! as templates for creating new extensions.
 
 pub mod bearer_token;
+pub mod experimental;
