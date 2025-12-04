@@ -38,10 +38,14 @@ struct K8sTokenReviewer {
 }
 
 impl K8sTokenReviewer {
-    fn new() -> Self {
-        Self {
-            client: OnceCell::new(),
+    fn new(client: Option<Client>) -> Self {
+        let cell = OnceCell::new();
+        if let Some(c) = client {
+            // If a client is provided (e.g. for testing), set it immediately.
+            // We can ignore the error because the cell is new.
+            let _ = cell.set(c);
         }
+        Self { client: cell }
     }
 }
 
@@ -119,7 +123,12 @@ pub struct SatExtension {
 impl SatExtension {
     /// Creates a new SAT extension with the default K8s reviewer.
     pub fn new(config: SatConfig) -> Self {
-        Self::with_reviewer(config, Arc::new(K8sTokenReviewer::new()))
+        Self::with_reviewer(config, Arc::new(K8sTokenReviewer::new(None)))
+    }
+
+    /// Creates a new SAT extension with a specific K8s client (useful for testing).
+    pub fn new_with_client(config: SatConfig, client: Client) -> Self {
+        Self::with_reviewer(config, Arc::new(K8sTokenReviewer::new(Some(client))))
     }
 
     /// Creates a new SAT extension with a custom reviewer.
