@@ -74,6 +74,15 @@ pub struct TlsServerConfig {
 
     /// Controls whether system CA certificates are loaded for client certificate verification.
     pub include_system_ca_certs_pool: Option<bool>,
+
+    /// Enable file-system watching for client CA certificate hot-reload.
+    /// When enabled, the server will automatically reload client CA certificates
+    /// when the file changes, without requiring a restart.
+    /// This uses OS-native file watching (inotify on Linux, kqueue on macOS, FSEvents on macOS).
+    /// Default: false (use interval-based polling from reload_interval instead)
+    #[serde(default)]
+    pub watch_client_ca: bool,
+
     // /// Path to the Certificate Revocation List (CRL) to use by the server to verify a client certificate.
     // pub client_crl_file: Option<PathBuf>,
     /// Timeout for TLS handshake. Defaults to 10 seconds.

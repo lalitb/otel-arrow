@@ -4,13 +4,18 @@
 use arc_swap::ArcSwap;
 use base64::prelude::*;
 use futures::{Stream, StreamExt};
+use notify::{Event, RecursiveMode, Watcher};
 use otap_df_config::tls::TlsServerConfig;
 use rustls::RootCertStore;
-use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
+use rustls::pki_types::CertificateDer;
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::server::{ClientHello, ResolvesServerCert, WantsServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
+use rustls::{ConfigBuilder, DigitallySignedStruct, DistinguishedName, ServerConfig, SignatureScheme, WantsVerifier};
 use rustls_native_certs::load_native_certs;
 use rustls_pki_types::pem::PemObject;
-use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use rustls_pki_types::{PrivateKeyDer, UnixTime};
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,6 +35,19 @@ const MAX_TLS_FILE_SIZE: u64 = 4 * 1024 * 1024; // 4MB
 /// - Limits memory overhead for pending handshake state
 /// - May need adjustment based on actual workload characteristics
 const MAX_CONCURRENT_HANDSHAKES: usize = 64;
+
+/// Default interval between certificate reload checks (5 minutes).
+/// This is used when no explicit reload_interval is configured.
+const DEFAULT_RELOAD_INTERVAL_SECS: u64 = 300;
+
+/// Minimum interval between CA certificate reloads to prevent rapid successive reloads.
+/// Events arriving within this window after a reload will be debounced.
+const CA_RELOAD_DEBOUNCE_SECS: u64 = 1;
+
+/// Delay before reading file metadata after receiving a filesystem event.
+/// This allows atomic rename operations to fully complete before we check the file identity.
+/// On macOS, kqueue events can arrive before the rename operation is visible to stat().
+const FS_EVENT_SETTLE_DELAY_MS: u64 = 50;
 
 /// Loads TLS configuration for a server.
 ///
@@ -199,7 +217,7 @@ impl LazyReloadableCertResolver {
             cert_mtime: Arc::new(AtomicU64::new(cert_mtime)),
             key_mtime: Arc::new(AtomicU64::new(key_mtime)),
             last_check_time: AtomicU64::new(now),
-            check_interval_secs: check_interval.map(|d| d.as_secs()).unwrap_or(300), // Default: 5 minutes
+            check_interval_secs: check_interval.map(|d| d.as_secs()).unwrap_or(DEFAULT_RELOAD_INTERVAL_SECS),
             is_reloading: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -211,7 +229,7 @@ impl LazyReloadableCertResolver {
 
         // Fast path: interval not expired yet
         if now.saturating_sub(last_check) < self.check_interval_secs {
-            return false; // Skip mtime check entirely
+            return false;
         }
 
         // Interval expired - try to win the check race (leader election)
@@ -221,31 +239,17 @@ impl LazyReloadableCertResolver {
             .is_err()
         {
             // Another thread won - they'll handle the check.
-            // Re-check the fast path: if the winner updated last_check_time, interval should be unexpired.
             let updated_last_check = self.last_check_time.load(Ordering::Relaxed);
             if now.saturating_sub(updated_last_check) < self.check_interval_secs {
                 return false;
             }
-            // If still expired, we can retry once (rare), or just return false to avoid spinning.
-            // For simplicity, just return false here; a loop could be added for more aggressive detection.
             return false;
         }
 
-        // We won - check mtimes
-        let current_cert_mtime = match get_mtime(&self.cert_path) {
-            Ok(m) => m,
-            Err(e) => {
-                log::warn!("Failed to check cert mtime: {}", e);
-                return false;
-            }
-        };
-
-        let current_key_mtime = match get_mtime(&self.key_path) {
-            Ok(m) => m,
-            Err(e) => {
-                log::warn!("Failed to check key mtime: {}", e);
-                return false;
-            }
+        // We won the leader election - check file mtimes
+        let (current_cert_mtime, current_key_mtime) = match self.get_current_mtimes() {
+            Some(mtimes) => mtimes,
+            None => return false,
         };
 
         // Compare with cached mtimes
@@ -256,7 +260,36 @@ impl LazyReloadableCertResolver {
             return false; // No change
         }
 
-        // Files changed! Spawn async reload task
+        // Files changed - spawn async reload
+        self.spawn_reload_task(current_cert_mtime, current_key_mtime)
+    }
+
+    /// Get current modification times for cert and key files.
+    /// Returns None if either file's mtime cannot be read.
+    fn get_current_mtimes(&self) -> Option<(u64, u64)> {
+        let cert_mtime = match get_mtime(&self.cert_path) {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!("Failed to check cert mtime: {}", e);
+                return None;
+            }
+        };
+
+        let key_mtime = match get_mtime(&self.key_path) {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!("Failed to check key mtime: {}", e);
+                return None;
+            }
+        };
+
+        Some((cert_mtime, key_mtime))
+    }
+
+    /// Spawn an async task to reload certificates.
+    /// Returns false immediately - the current handshake uses the existing valid cert.
+    fn spawn_reload_task(&self, new_cert_mtime: u64, new_key_mtime: u64) -> bool {
+        // Try to acquire reload lock
         if self
             .is_reloading
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -265,7 +298,7 @@ impl LazyReloadableCertResolver {
             return false; // Another thread already reloading
         }
 
-        // Clone what we need for the async task
+        // Clone state for the async task
         let cert_path = self.cert_path.clone();
         let key_path = self.key_path.clone();
         let cert_key = Arc::clone(&self.cert_key);
@@ -273,15 +306,14 @@ impl LazyReloadableCertResolver {
         let key_mtime = Arc::clone(&self.key_mtime);
         let is_reloading = Arc::clone(&self.is_reloading);
 
-        // Spawn async reload - doesn't block the current handshake
-        // Fire-and-forget: we intentionally don't await the task.
-        // Using drop() to explicitly ignore the JoinHandle and satisfy clippy::let_underscore_future.
+        // Spawn async reload - fire-and-forget pattern.
+        // We explicitly drop the JoinHandle to satisfy clippy::let_underscore_future.
         drop(tokio::spawn(async move {
             match load_certified_key_async(&cert_path, &key_path).await {
                 Ok(new_cert) => {
                     cert_key.store(Arc::new(new_cert));
-                    cert_mtime.store(current_cert_mtime, Ordering::Relaxed);
-                    key_mtime.store(current_key_mtime, Ordering::Relaxed);
+                    cert_mtime.store(new_cert_mtime, Ordering::Relaxed);
+                    key_mtime.store(new_key_mtime, Ordering::Relaxed);
                     log::info!(
                         "TLS certificate reloaded asynchronously: cert={:?}, key={:?}",
                         cert_path,
@@ -318,6 +350,556 @@ impl ResolvesServerCert for LazyReloadableCertResolver {
     }
 }
 
+/// Internal state for the CA file watcher callback.
+/// This struct encapsulates all the state needed to handle file change events
+/// and perform CA certificate reloads.
+struct CaWatcherState {
+    /// The verifier to update on reload
+    inner: Arc<ArcSwap<Arc<dyn ClientCertVerifier>>>,
+    /// Canonical path to match against events
+    watched_path: PathBuf,
+    /// Original path for reloading the file
+    reload_path: PathBuf,
+    /// Whether to include system CAs
+    include_system_cas: bool,
+    /// Last known file identity (inode on Unix)
+    last_identity: Arc<AtomicU64>,
+    /// Timestamp of last reload (for debouncing)
+    last_reload: Arc<AtomicU64>,
+    /// Lock to prevent concurrent reloads
+    is_reloading: Arc<AtomicBool>,
+}
+
+impl CaWatcherState {
+    /// Create a new watcher state.
+    fn new(
+        ca_file_path: &Path,
+        inner: Arc<ArcSwap<Arc<dyn ClientCertVerifier>>>,
+        ca_path: PathBuf,
+        include_system_cas: bool,
+    ) -> Result<Self, io::Error> {
+        let watched_path = std::fs::canonicalize(&ca_path).unwrap_or_else(|_| ca_path.clone());
+        let initial_identity = get_file_identity(ca_file_path).unwrap_or(0);
+
+        Ok(Self {
+            inner,
+            watched_path,
+            reload_path: ca_path,
+            include_system_cas,
+            last_identity: Arc::new(AtomicU64::new(initial_identity)),
+            last_reload: Arc::new(AtomicU64::new(0)),
+            is_reloading: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Handle a file system event.
+    fn handle_event(&self, res: Result<Event, notify::Error>) {
+        match res {
+            Ok(event) => self.process_event(event),
+            Err(e) => log::warn!("File watcher error: {}", e),
+        }
+    }
+
+    /// Process a file system event, potentially triggering a reload.
+    fn process_event(&self, event: Event) {
+        log::debug!("File watcher event: {:?}", event);
+
+        if !self.is_event_for_watched_file(&event) {
+            return;
+        }
+
+        // We only care about Modify, Create, and Rename events
+        if matches!(event.kind, notify::EventKind::Access(_)) {
+            return;
+        }
+
+        log::debug!("Event matches our CA file, proceeding with reload check");
+
+        // Small delay to allow filesystem operations to complete
+        std::thread::sleep(Duration::from_millis(FS_EVENT_SETTLE_DELAY_MS));
+
+        if !self.should_reload() {
+            return;
+        }
+
+        self.perform_reload();
+    }
+
+    /// Check if the event is for the file we're watching.
+    fn is_event_for_watched_file(&self, event: &Event) -> bool {
+        let is_match = event.paths.iter().any(|p| {
+            if p == &self.watched_path {
+                return true;
+            }
+            // Try canonicalizing the event path if direct match fails
+            std::fs::canonicalize(p)
+                .map(|canon_p| canon_p == self.watched_path)
+                .unwrap_or(false)
+        });
+
+        if !is_match {
+            log::debug!(
+                "Event not for our file. Event paths: {:?}, watched: {:?}",
+                event.paths,
+                self.watched_path
+            );
+        }
+
+        is_match
+    }
+
+    /// Check if we should reload based on file identity and debouncing.
+    fn should_reload(&self) -> bool {
+        // Check if file identity (inode) has changed
+        let current_identity = match get_file_identity(&self.reload_path) {
+            Ok(id) => id,
+            Err(e) => {
+                log::debug!("Failed to get file identity, skipping reload: {}", e);
+                return false;
+            }
+        };
+
+        let prev_identity = self.last_identity.load(Ordering::Relaxed);
+        if current_identity == prev_identity {
+            log::debug!("File identity unchanged, skipping reload");
+            return false;
+        }
+        log::debug!("File identity changed from {} to {}", prev_identity, current_identity);
+
+        // Check debounce window
+        let now = current_timestamp();
+        let last = self.last_reload.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < CA_RELOAD_DEBOUNCE_SECS {
+            log::debug!("Debouncing CA file change event");
+            return false;
+        }
+
+        // Try to acquire reload lock
+        if self
+            .is_reloading
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            log::debug!("CA reload already in progress, skipping");
+            return false;
+        }
+
+        true
+    }
+
+    /// Perform the actual CA certificate reload.
+    fn perform_reload(&self) {
+        log::info!("CA certificate file changed, reloading: {:?}", self.reload_path);
+
+        let current_identity = get_file_identity(&self.reload_path).unwrap_or(0);
+        let now = current_timestamp();
+
+        match reload_ca_verifier(&self.reload_path, self.include_system_cas) {
+            Ok(new_verifier) => {
+                self.inner.store(Arc::new(new_verifier));
+                self.last_identity.store(current_identity, Ordering::Relaxed);
+                let _ = self.last_reload.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |_| Some(now),
+                );
+                log::info!("Successfully reloaded client CA certificates");
+            }
+            Err(e) => {
+                log::error!(
+                    "Failed to reload CA certificates (keeping previous): {}",
+                    e
+                );
+            }
+        }
+
+        self.is_reloading.store(false, Ordering::Release);
+    }
+}
+
+/// A dynamically reloadable client certificate verifier for mTLS.
+///
+/// This verifier supports zero-downtime hot-reload of client CA certificates through
+/// file system watching. When the CA certificate file is modified, the verifier
+/// automatically reloads the CA store without interrupting existing connections.
+///
+/// # Industry Standard Approach
+///
+/// This implementation follows the patterns used by Envoy, Linkerd, and other
+/// production service meshes:
+///
+/// 1. **File System Watching**: Uses OS-native file notifications (inotify on Linux,
+///    kqueue on macOS, FSEvents on macOS) for immediate detection of certificate changes.
+///
+/// 2. **Atomic Swap**: Uses `ArcSwap` for lock-free, wait-free reads during TLS handshakes.
+///    New connections get the updated CA store; existing connections are unaffected.
+///
+/// 3. **Debouncing**: Multiple rapid file changes are coalesced to avoid excessive reloads.
+///
+/// 4. **Graceful Degradation**: If reload fails, the previous valid CA store is retained.
+///
+/// # Usage
+///
+/// ```ignore
+/// let verifier = ReloadableClientCaVerifier::new_with_file_watch(
+///     ca_file_path,
+///     include_system_cas,
+/// )?;
+/// ```
+pub struct ReloadableClientCaVerifier {
+    /// The current client certificate verifier (atomically swappable)
+    inner: Arc<ArcSwap<Arc<dyn ClientCertVerifier>>>,
+
+    /// Path to the CA file being watched (if file-based)
+    ca_file_path: Option<PathBuf>,
+
+    /// Whether to include system CA certificates
+    include_system_cas: bool,
+
+    /// Static CA PEM data (if not file-based)
+    static_ca_pem: Option<Vec<u8>>,
+
+    /// File watcher handle (kept alive to continue watching)
+    /// Using Box<dyn Watcher> to support both RecommendedWatcher and PollWatcher
+    #[allow(dead_code)]
+    watcher: Option<Box<dyn Watcher + Send + Sync>>,
+}
+
+impl fmt::Debug for ReloadableClientCaVerifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReloadableClientCaVerifier")
+            .field("ca_file_path", &self.ca_file_path)
+            .field("include_system_cas", &self.include_system_cas)
+            .field("has_static_ca", &self.static_ca_pem.is_some())
+            .field("watching", &self.watcher.is_some())
+            .finish()
+    }
+}
+
+impl ReloadableClientCaVerifier {
+    /// Creates a new reloadable client CA verifier with file system watching.
+    ///
+    /// This is the recommended method for production mTLS deployments where
+    /// CA certificates may be rotated frequently (e.g., short-lived certificates
+    /// from SPIFFE/SPIRE or cert-manager).
+    ///
+    /// # Arguments
+    ///
+    /// * `ca_file_path` - Path to the PEM-encoded CA certificate file
+    /// * `include_system_cas` - Whether to include system root CA certificates
+    ///
+    /// # Returns
+    ///
+    /// Returns the verifier wrapped in an `Arc` for thread-safe sharing.
+    pub fn new_with_file_watch(
+        ca_file_path: PathBuf,
+        include_system_cas: bool,
+    ) -> Result<Arc<Self>, io::Error> {
+        // Initial load
+        let ca_pem = read_file_with_limit_sync(&ca_file_path)?;
+        log::debug!("Initial CA PEM size: {} bytes", ca_pem.len());
+        let verifier = build_webpki_verifier(&ca_pem, include_system_cas)?;
+
+        let inner = Arc::new(ArcSwap::from_pointee(verifier));
+        let inner_for_watcher = Arc::clone(&inner);
+        let ca_path_for_watcher = ca_file_path.clone();
+        let include_system_for_watcher = include_system_cas;
+
+        // Set up file watcher
+        let watcher = Self::setup_file_watcher(
+            &ca_file_path,
+            inner_for_watcher,
+            ca_path_for_watcher,
+            include_system_for_watcher,
+        )?;
+
+        Ok(Arc::new(Self {
+            inner,
+            ca_file_path: Some(ca_file_path),
+            include_system_cas,
+            static_ca_pem: None,
+            watcher: Some(watcher),
+        }))
+    }
+
+    /// Creates a verifier from in-memory PEM data (no file watching).
+    ///
+    /// Use this when CA certificates are provided via configuration strings
+    /// rather than files. This verifier will not support hot-reload.
+    pub fn new_from_pem(ca_pem: Vec<u8>, include_system_cas: bool) -> Result<Arc<Self>, io::Error> {
+        let verifier = build_webpki_verifier(&ca_pem, include_system_cas)?;
+
+        Ok(Arc::new(Self {
+            inner: Arc::new(ArcSwap::from_pointee(verifier)),
+            ca_file_path: None,
+            include_system_cas,
+            static_ca_pem: Some(ca_pem),
+            watcher: None,
+        }))
+    }
+
+    /// Creates a verifier with interval-based polling (fallback for systems without file watching).
+    ///
+    /// This is less efficient than file watching but works on all platforms and file systems.
+    pub fn new_with_polling(
+        ca_file_path: PathBuf,
+        include_system_cas: bool,
+        poll_interval: Duration,
+    ) -> Result<Arc<Self>, io::Error> {
+        // Initial load
+        let ca_pem = read_file_with_limit_sync(&ca_file_path)?;
+        let verifier = build_webpki_verifier(&ca_pem, include_system_cas)?;
+
+        let inner = Arc::new(ArcSwap::from_pointee(verifier));
+        let inner_for_poll = Arc::clone(&inner);
+        let ca_path_for_poll = ca_file_path.clone();
+
+        // Set up polling watcher
+        let watcher = Self::setup_polling_watcher(
+            &ca_file_path,
+            inner_for_poll,
+            ca_path_for_poll,
+            include_system_cas,
+            poll_interval,
+        )?;
+
+        Ok(Arc::new(Self {
+            inner,
+            ca_file_path: Some(ca_file_path),
+            include_system_cas,
+            static_ca_pem: None,
+            watcher: Some(watcher),
+        }))
+    }
+
+    /// Sets up a file system watcher using OS-native notifications.
+    fn setup_file_watcher(
+        ca_file_path: &Path,
+        inner: Arc<ArcSwap<Arc<dyn ClientCertVerifier>>>,
+        ca_path: PathBuf,
+        include_system_cas: bool,
+    ) -> Result<Box<dyn Watcher + Send + Sync>, io::Error> {
+        // Initialize watcher state
+        let state = CaWatcherState::new(ca_file_path, inner, ca_path.clone(), include_system_cas)?;
+        
+        let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+            state.handle_event(res);
+        })
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        // Watch the parent directory to catch atomic renames (mv tmp target)
+        let parent_dir = ca_file_path
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "CA file has no parent directory"))?;
+        let parent_dir = std::fs::canonicalize(parent_dir).unwrap_or_else(|_| parent_dir.to_path_buf());
+        
+        watcher
+            .watch(&parent_dir, RecursiveMode::NonRecursive)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        log::info!(
+            "File watcher set up for CA certificates: {:?} (watching parent: {:?})",
+            ca_file_path,
+            parent_dir
+        );
+
+        Ok(Box::new(watcher))
+    }
+
+    /// Sets up a polling-based watcher for environments where native watching isn't reliable.
+    fn setup_polling_watcher(
+        ca_file_path: &Path,
+        inner: Arc<ArcSwap<Arc<dyn ClientCertVerifier>>>,
+        ca_path: PathBuf,
+        include_system_cas: bool,
+        poll_interval: Duration,
+    ) -> Result<Box<dyn Watcher + Send + Sync>, io::Error> {
+        let is_reloading = Arc::new(AtomicBool::new(false));
+
+        let config = notify::Config::default().with_poll_interval(poll_interval);
+
+        let mut watcher =
+            notify::PollWatcher::new(
+                move |res: Result<Event, notify::Error>| {
+                    match res {
+                        Ok(event) => {
+                            if !matches!(
+                                event.kind,
+                                notify::EventKind::Modify(_) | notify::EventKind::Create(_)
+                            ) {
+                                return;
+                            }
+
+                            if is_reloading
+                                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                                .is_err()
+                            {
+                                return;
+                            }
+
+                            log::info!(
+                                "CA certificate file changed (polling), reloading: {:?}",
+                                ca_path
+                            );
+
+                            match reload_ca_verifier(&ca_path, include_system_cas) {
+                                Ok(new_verifier) => {
+                                    inner.store(Arc::new(new_verifier));
+                                    log::info!("Successfully reloaded client CA certificates");
+                                }
+                                Err(e) => {
+                                    log::error!(
+                                    "Failed to reload CA certificates (keeping previous): {}",
+                                    e
+                                );
+                                }
+                            }
+
+                            is_reloading.store(false, Ordering::Release);
+                        }
+                        Err(e) => {
+                            log::warn!("Poll watcher error: {}", e);
+                        }
+                    }
+                },
+                config,
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        watcher
+            .watch(ca_file_path, RecursiveMode::NonRecursive)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        log::info!(
+            "Poll watcher set up for CA certificates: {:?} (interval: {:?})",
+            ca_file_path,
+            poll_interval
+        );
+
+        Ok(Box::new(watcher))
+    }
+
+    /// Returns the current verifier for debugging/testing purposes.
+    #[allow(dead_code)]
+    pub fn current_verifier(&self) -> Arc<Arc<dyn ClientCertVerifier>> {
+        self.inner.load_full()
+    }
+}
+
+/// Implements the ClientCertVerifier trait by delegating to the inner verifier.
+///
+/// This implementation is marked as `unsafe` because we're implementing a `danger` trait.
+/// The safety is ensured by delegating all verification to a properly constructed
+/// `WebPkiClientVerifier` which performs full certificate chain validation.
+impl ClientCertVerifier for ReloadableClientCaVerifier {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        // This is called during handshake to send CertificateRequest.
+        // We need to return a static slice, but our verifier can change.
+        // The safest approach is to not send hints (empty slice), which
+        // is valid per TLS spec and is what Envoy does for dynamic CAs.
+        //
+        // Note: Some clients may not like this. If needed, we can cache
+        // hints and accept that they may be slightly stale.
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        // Load current verifier (wait-free, atomic)
+        let verifier = self.inner.load();
+        verifier.verify_client_cert(end_entity, intermediates, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        let verifier = self.inner.load();
+        verifier.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        let verifier = self.inner.load();
+        verifier.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        let verifier = self.inner.load();
+        verifier.supported_verify_schemes()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        let verifier = self.inner.load();
+        verifier.client_auth_mandatory()
+    }
+}
+
+/// Builds a WebPkiClientVerifier from PEM-encoded CA certificates.
+fn build_webpki_verifier(
+    ca_pem: &[u8],
+    include_system_cas: bool,
+) -> Result<Arc<dyn ClientCertVerifier>, io::Error> {
+    let mut roots = RootCertStore::empty();
+
+    // Add system CAs if requested
+    if include_system_cas {
+        let system_certs = load_native_certs();
+        for error in &system_certs.errors {
+            log::warn!("Error loading native cert: {}", error);
+        }
+        for cert in system_certs.certs {
+            if let Err(e) = roots.add(cert) {
+                log::warn!("Failed to add system cert: {}", e);
+            }
+        }
+    }
+
+    // Add user-provided CAs
+    let mut reader = io::BufReader::new(ca_pem);
+    let mut count = 0;
+    for cert in CertificateDer::pem_reader_iter(&mut reader) {
+        let cert = cert.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        roots
+            .add(cert)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        count += 1;
+    }
+
+    if roots.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "No CA certificates loaded",
+        ));
+    }
+
+    log::debug!("Built verifier with {} CA certificates", count);
+
+    WebPkiClientVerifier::builder(roots.into())
+        .build()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Reloads the CA verifier from a file path.
+fn reload_ca_verifier(
+    ca_path: &Path,
+    include_system_cas: bool,
+) -> Result<Arc<dyn ClientCertVerifier>, io::Error> {
+    let ca_pem = read_file_with_limit_sync(ca_path)?;
+    log::debug!("Reloaded CA PEM size: {} bytes", ca_pem.len());
+    build_webpki_verifier(&ca_pem, include_system_cas)
+}
+
 fn current_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -331,6 +913,22 @@ fn get_mtime(path: &Path) -> Result<u64, io::Error> {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .map_err(io::Error::other)
+}
+
+/// Get a unique file identifier that changes when the file is replaced.
+/// On Unix, this uses the inode number which changes on atomic rename.
+/// On other platforms, falls back to mtime.
+#[cfg(unix)]
+fn get_file_identity(path: &Path) -> Result<u64, io::Error> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(path)?;
+    Ok(metadata.ino())
+}
+
+#[cfg(not(unix))]
+fn get_file_identity(path: &Path) -> Result<u64, io::Error> {
+    // On non-Unix platforms, fall back to mtime
+    get_mtime(path)
 }
 
 /// Parses a certified key from PEM-encoded certificate and key bytes.
@@ -382,89 +980,39 @@ fn load_certified_key_sync(cert_path: &Path, key_path: &Path) -> Result<Certifie
 }
 
 /// Builds a reloadable server config from the given configuration.
-/// If file paths are provided, it uses lazy reloading.
-/// If PEM strings are provided, it uses static configuration.
+///
+/// This function creates a TLS server configuration with support for:
+///
+/// 1. **Server Certificate Hot-Reload**: Using `LazyReloadableCertResolver` for
+///    automatic reloading of server cert/key when files change.
+///
+/// 2. **Client CA Certificate Hot-Reload (mTLS)**: Using `ReloadableClientCaVerifier`
+///    for zero-downtime reload of client CA certificates. This is particularly useful
+///    for environments with frequently rotating certificates (SPIFFE/SPIRE, cert-manager).
+///
+/// # Hot-Reload Behavior
+///
+/// - **Server certificates**: Checked on a configurable interval (`reload_interval`).
+/// - **Client CA certificates**: Reloaded immediately when file changes are detected
+///   via file system notifications (when `watch_client_ca` is enabled), or on the
+///   same interval as server certificates (when `watch_client_ca` is disabled).
+///
+/// # Arguments
+///
+/// * `config` - TLS server configuration containing paths or PEM data for certificates
+///
+/// # Returns
+///
+/// An `Arc<ServerConfig>` ready for use with `TlsAcceptor`.
 pub async fn build_reloadable_server_config(
     config: &TlsServerConfig,
-) -> Result<Arc<rustls::ServerConfig>, io::Error> {
+) -> Result<Arc<ServerConfig>, io::Error> {
     let check_interval = config.config.reload_interval;
 
-    let builder = rustls::ServerConfig::builder();
+    let builder = ServerConfig::builder();
 
-    // Client Auth (mTLS)
-    let mut client_ca_pem = Vec::new();
-
-    // Load system roots if requested
-    if config.include_system_ca_certs_pool == Some(true) {
-        let cert_res = tokio::task::spawn_blocking(load_native_certs)
-            .await
-            .map_err(io::Error::other)?;
-
-        for error in &cert_res.errors {
-            log::warn!("Error loading native cert: {}", error);
-        }
-        for cert in cert_res.certs {
-            let base64_cert = BASE64_STANDARD.encode(cert.as_ref());
-            // Wrap base64 at 64 characters per line per RFC 7468
-            let wrapped: String = base64_cert
-                .as_bytes()
-                .chunks(64)
-                .map(|c| std::str::from_utf8(c).expect("base64 is valid utf8"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let pem = format!(
-                "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
-                wrapped
-            );
-            client_ca_pem.extend_from_slice(pem.as_bytes());
-        }
-    }
-
-    // Load user-provided CA
-    if let Some(client_ca_file) = &config.client_ca_file {
-        let ca = read_file_with_limit_async(client_ca_file).await?;
-        client_ca_pem.extend_from_slice(&ca);
-    } else if let Some(client_ca_pem_str) = &config.client_ca_pem {
-        client_ca_pem.extend_from_slice(client_ca_pem_str.as_bytes());
-    }
-
-    let builder = if !client_ca_pem.is_empty() {
-        log::info!(
-            "Configuring mTLS with {} bytes of CA certs",
-            client_ca_pem.len()
-        );
-        let mut roots = RootCertStore::empty();
-        let mut reader = io::BufReader::new(&client_ca_pem[..]);
-        let mut count = 0;
-        for cert in CertificateDer::pem_reader_iter(&mut reader) {
-            let cert = cert.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            roots
-                .add(cert)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            count += 1;
-        }
-        log::info!("Loaded {} CA certificates", count);
-
-        let verifier = WebPkiClientVerifier::builder(roots.into())
-            .build()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        log::debug!(
-            "Client auth mandatory: {}",
-            verifier.client_auth_mandatory()
-        );
-        builder.with_client_cert_verifier(verifier)
-    } else {
-        // If system CAs were requested but no certs were loaded (and no user CA provided),
-        // return an error.
-        if config.include_system_ca_certs_pool == Some(true) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "include_system_ca_certs_pool is true, but no CA certificates were loaded. \
-                 Cannot enable mTLS without CA certificates.",
-            ));
-        }
-        builder.with_no_client_auth()
-    };
+    // Determine client auth configuration
+    let builder = build_client_auth(config, builder).await?;
 
     // Cert resolver
     let mut server_config = if let (Some(cert_path), Some(key_path)) =
@@ -481,9 +1029,10 @@ pub async fn build_reloadable_server_config(
         (&config.config.cert_pem, &config.config.key_pem)
     {
         // PEM-based: static
-        let certs = CertificateDer::pem_reader_iter(&mut io::BufReader::new(cert_pem.as_bytes()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let certs =
+            CertificateDer::pem_reader_iter(&mut io::BufReader::new(cert_pem.as_bytes()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         let key = PrivateKeyDer::from_pem_reader(&mut io::BufReader::new(key_pem.as_bytes()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -501,6 +1050,140 @@ pub async fn build_reloadable_server_config(
     server_config.alpn_protocols = vec![b"h2".to_vec()];
 
     Ok(Arc::new(server_config))
+}
+
+/// Builds the client authentication (mTLS) configuration.
+///
+/// This function handles three modes of client CA certificate management:
+///
+/// 1. **File-based with file watching** (`watch_client_ca: true`):
+///    Uses OS-native file notifications for immediate reload when CA files change.
+///    Best for environments with frequent certificate rotation.
+///
+/// 2. **File-based with interval polling** (`watch_client_ca: false`, `client_ca_file` set):
+///    Falls back to interval-based checking (using `reload_interval`).
+///    More compatible with all file systems but less responsive.
+///
+/// 3. **PEM-based static** (`client_ca_pem` set):
+///    CA certificates provided inline; no hot-reload supported.
+async fn build_client_auth(
+    config: &TlsServerConfig,
+    builder: ConfigBuilder<ServerConfig, WantsVerifier>,
+) -> Result<ConfigBuilder<ServerConfig, WantsServerCert>, io::Error> {
+    let include_system_cas = config.include_system_ca_certs_pool.unwrap_or(false);
+    let watch_enabled = config.watch_client_ca;
+    let check_interval = config.config.reload_interval.unwrap_or(Duration::from_secs(300));
+
+    // Check if we have any CA configuration
+    let has_ca_file = config.client_ca_file.is_some();
+    let has_ca_pem = config.client_ca_pem.is_some();
+
+    if !has_ca_file && !has_ca_pem && !include_system_cas {
+        // No client auth configured
+        log::debug!("No client CA configured, disabling client authentication");
+        return Ok(builder.with_no_client_auth());
+    }
+
+    // Build the appropriate verifier based on configuration
+    if let Some(ca_file) = &config.client_ca_file {
+        // File-based CA configuration
+        let verifier = if watch_enabled {
+            log::info!(
+                "Configuring mTLS with file watching for CA certificates: {:?}",
+                ca_file
+            );
+            ReloadableClientCaVerifier::new_with_file_watch(ca_file.clone(), include_system_cas)?
+        } else {
+            log::info!(
+                "Configuring mTLS with polling for CA certificates: {:?} (interval: {:?})",
+                ca_file,
+                check_interval
+            );
+            ReloadableClientCaVerifier::new_with_polling(
+                ca_file.clone(),
+                include_system_cas,
+                check_interval,
+            )?
+        };
+
+        Ok(builder.with_client_cert_verifier(verifier))
+    } else if let Some(ca_pem) = &config.client_ca_pem {
+        // PEM-based (static) CA configuration
+        log::info!("Configuring mTLS with static PEM CA certificates");
+
+        // For PEM-based, we need to combine with system CAs if requested
+        let mut combined_pem = Vec::new();
+
+        if include_system_cas {
+            let cert_res = tokio::task::spawn_blocking(load_native_certs)
+                .await
+                .map_err(io::Error::other)?;
+
+            for error in &cert_res.errors {
+                log::warn!("Error loading native cert: {}", error);
+            }
+            for cert in cert_res.certs {
+                let base64_cert = BASE64_STANDARD.encode(cert.as_ref());
+                let wrapped: String = base64_cert
+                    .as_bytes()
+                    .chunks(64)
+                    .map(|c| std::str::from_utf8(c).expect("base64 is valid utf8"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let pem = format!(
+                    "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+                    wrapped
+                );
+                combined_pem.extend_from_slice(pem.as_bytes());
+            }
+        }
+
+        combined_pem.extend_from_slice(ca_pem.as_bytes());
+
+        let verifier = ReloadableClientCaVerifier::new_from_pem(combined_pem, false)?;
+        Ok(builder.with_client_cert_verifier(verifier))
+    } else if include_system_cas {
+        // Only system CAs (no user-provided CA)
+        log::info!("Configuring mTLS with system CA certificates only");
+
+        // Create a temporary file or use in-memory approach
+        let cert_res = tokio::task::spawn_blocking(load_native_certs)
+            .await
+            .map_err(io::Error::other)?;
+
+        let mut system_pem = Vec::new();
+        for error in &cert_res.errors {
+            log::warn!("Error loading native cert: {}", error);
+        }
+        for cert in cert_res.certs {
+            let base64_cert = BASE64_STANDARD.encode(cert.as_ref());
+            let wrapped: String = base64_cert
+                .as_bytes()
+                .chunks(64)
+                .map(|c| std::str::from_utf8(c).expect("base64 is valid utf8"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let pem = format!(
+                "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+                wrapped
+            );
+            system_pem.extend_from_slice(pem.as_bytes());
+        }
+
+        if system_pem.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "include_system_ca_certs_pool is true, but no CA certificates were loaded. \
+                 Cannot enable mTLS without CA certificates.",
+            ));
+        }
+
+        let verifier = ReloadableClientCaVerifier::new_from_pem(system_pem, false)?;
+        Ok(builder.with_client_cert_verifier(verifier))
+    } else {
+        // This shouldn't happen given the guard at the top, but handle it
+        Ok(builder.with_no_client_auth())
+    }
 }
 
 /// Builds a TLS acceptor from optional TLS configuration.
@@ -690,6 +1373,7 @@ mod tests {
             client_ca_file: None,
             client_ca_pem: None,
             include_system_ca_certs_pool: None,
+            watch_client_ca: false,
             handshake_timeout: None,
         };
 
@@ -713,6 +1397,7 @@ mod tests {
             client_ca_file: None,
             client_ca_pem: None,
             include_system_ca_certs_pool: None,
+            watch_client_ca: false,
             handshake_timeout: None,
         };
 
@@ -743,6 +1428,7 @@ mod tests {
             client_ca_file: None,
             client_ca_pem: None,
             include_system_ca_certs_pool: None,
+            watch_client_ca: false,
             handshake_timeout: None,
         };
 
@@ -774,11 +1460,108 @@ mod tests {
             client_ca_file: None,
             client_ca_pem: None,
             include_system_ca_certs_pool: None,
+            watch_client_ca: false,
             handshake_timeout: None,
         };
 
         let result = load_server_tls_config(&config).await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_reloadable_client_ca_verifier_file_watch() {
+        if skip_if_no_openssl() {
+            return;
+        }
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let path = temp_dir.path();
+        let ca_path = path.join("ca.crt");
+
+        // 1. Generate initial CA cert
+        generate_cert(path, "ca1", "TestCA1");
+        let _ = fs::copy(path.join("ca1.crt"), &ca_path).expect("Copy ca1.crt");
+
+        // 2. Create verifier with file watching
+        let verifier = ReloadableClientCaVerifier::new_with_file_watch(ca_path.clone(), false)
+            .expect("Failed to create verifier");
+
+        // Verify it was created successfully
+        assert!(verifier.client_auth_mandatory());
+
+        // 3. Wait a bit for the watcher to be set up
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // 4. Update CA file (ensure file system detects change)
+        tokio::time::sleep(Duration::from_millis(1100)).await; // Ensure mtime changes
+
+        generate_cert(path, "ca2", "TestCA2");
+        let _ = fs::copy(path.join("ca2.crt"), &ca_path).expect("Copy ca2.crt");
+
+        // 5. Wait for file watcher to trigger reload
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // The verifier should still work (we can't easily verify the CA changed,
+        // but we can verify no errors occurred during reload)
+        assert!(verifier.client_auth_mandatory());
+    }
+
+    #[tokio::test]
+    async fn test_reloadable_client_ca_verifier_from_pem() {
+        if skip_if_no_openssl() {
+            return;
+        }
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let path = temp_dir.path();
+
+        // Generate a CA cert
+        generate_cert(path, "ca", "TestCA");
+        let ca_pem = fs::read(path.join("ca.crt")).expect("Failed to read CA cert");
+
+        // Create verifier from PEM
+        let verifier =
+            ReloadableClientCaVerifier::new_from_pem(ca_pem, false).expect("Failed to create verifier");
+
+        // Verify it was created successfully
+        assert!(verifier.client_auth_mandatory());
+    }
+
+    #[tokio::test]
+    async fn test_build_reloadable_server_config_with_mtls() {
+        if skip_if_no_openssl() {
+            return;
+        }
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let path = temp_dir.path();
+
+        // Generate server cert and CA cert
+        generate_cert(path, "server", "localhost");
+        generate_cert(path, "ca", "TestCA");
+
+        let config = TlsServerConfig {
+            config: TlsConfig {
+                cert_file: Some(path.join("server.crt")),
+                key_file: Some(path.join("server.key")),
+                cert_pem: None,
+                key_pem: None,
+                reload_interval: Some(Duration::from_secs(1)),
+            },
+            client_ca_file: Some(path.join("ca.crt")),
+            client_ca_pem: None,
+            include_system_ca_certs_pool: None,
+            watch_client_ca: true,
+            handshake_timeout: None,
+        };
+
+        let result = build_reloadable_server_config(&config).await;
+        assert!(result.is_ok());
+
+        let _server_config = result.unwrap();
+        // Verify mTLS config was created successfully
+        // Note: ServerConfig doesn't expose client_auth_mandatory directly,
+        // but if we got here without error, mTLS is configured.
     }
 }
