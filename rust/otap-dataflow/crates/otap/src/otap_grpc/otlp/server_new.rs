@@ -16,24 +16,19 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use crate::accessory::slots::{Key as SlotKey, State as SlotsState};
+use crate::otlp_common::{create_otlp_pdata, precomputed_response};
 use crate::otlp_receiver::OtlpReceiverMetrics;
-use crate::pdata::{Context, OtapPdata};
-use bytes::{BufMut, Bytes};
+use crate::pdata::OtapPdata;
+use bytes::BufMut;
 use futures::future::BoxFuture;
 use http::{Request, Response};
 use otap_df_config::SignalType;
 use otap_df_engine::control::{CallData, NackMsg};
 use otap_df_engine::shared::receiver::EffectHandler;
 use otap_df_engine::{Interests, ProducerEffectHandlerExtension};
-use otap_df_pdata::OtlpProtoBytes;
-use otap_df_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceResponse;
-use otap_df_pdata::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceResponse;
-use otap_df_pdata::proto::opentelemetry::collector::trace::v1::ExportTraceServiceResponse;
 use otap_df_telemetry::metrics::MetricSet;
 use parking_lot::Mutex;
-use prost::Message;
 use prost::bytes::Buf;
-use std::sync::OnceLock;
 use tokio::sync::oneshot;
 use tonic::Status;
 use tonic::body::Body;
@@ -112,32 +107,6 @@ pub struct OtlpServerSettings {
     pub request_compression_encodings: EnabledCompressionEncodings,
     /// Response compression used
     pub response_compression_encodings: EnabledCompressionEncodings,
-}
-
-/// Encodes a default response for repeated use.
-fn encode_response<T: Message + Default>() -> Bytes {
-    let mut buf = Vec::with_capacity(T::default().encoded_len());
-    T::default().encode(&mut buf).expect("encode response");
-    Bytes::from(buf)
-}
-
-/// Precomputed empty responses per signal to avoid per-call prost encoding.
-fn precomputed_response(signal: SignalType) -> &'static [u8] {
-    static LOGS: OnceLock<Bytes> = OnceLock::new();
-    static METRICS: OnceLock<Bytes> = OnceLock::new();
-    static TRACES: OnceLock<Bytes> = OnceLock::new();
-
-    match signal {
-        SignalType::Logs => LOGS
-            .get_or_init(encode_response::<ExportLogsServiceResponse>)
-            .as_ref(),
-        SignalType::Metrics => METRICS
-            .get_or_init(encode_response::<ExportMetricsServiceResponse>)
-            .as_ref(),
-        SignalType::Traces => TRACES
-            .get_or_init(encode_response::<ExportTraceServiceResponse>)
-            .as_ref(),
-    }
 }
 
 fn pipeline_send_status<E: Display>(err: E) -> Status {
@@ -249,18 +218,12 @@ impl Decoder for OtlpBytesDecoder {
         let bytes = src.copy_to_bytes(len);
         let mut guard = self.metrics.lock();
         guard.request_bytes.add(len as u64);
-        let result = match self.signal {
-            SignalType::Logs => OtlpProtoBytes::ExportLogsRequest(bytes),
-            SignalType::Metrics => OtlpProtoBytes::ExportMetricsRequest(bytes),
-            SignalType::Traces => OtlpProtoBytes::ExportTracesRequest(bytes),
-        };
-        let context = if self.preallocate_frame {
-            // Pre-reserve a single frame since wait_for_result uses one slot.
-            Context::with_capacity(1)
-        } else {
-            Context::default()
-        };
-        Ok(Some(OtapPdata::new(context, result.into())))
+        // Use the shared utility to create OtapPdata from bytes
+        Ok(Some(create_otlp_pdata(
+            self.signal,
+            bytes,
+            self.preallocate_frame,
+        )))
     }
 }
 

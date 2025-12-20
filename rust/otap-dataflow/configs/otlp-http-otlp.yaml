@@ -1,0 +1,64 @@
+settings:
+  default_pipeline_ctrl_msg_channel_size: 100
+  default_node_ctrl_msg_channel_size: 100
+  default_pdata_channel_size: 100
+
+nodes:
+  receiver:
+    kind: receiver
+    plugin_urn: "urn:otel:otlp_http:receiver"
+    out_ports:
+      out_port:
+        destinations:
+          - exporter
+        dispatch_strategy: round_robin
+    config:
+      listening_addr: "127.0.0.1:4318"
+      # max_request_body_size: 4194304  # 4 MiB (default)
+      # max_concurrent_requests: 1000   # default
+      # timeout: "30s"                  # Optional: timeout for requests
+
+      # Compression support: gzip, zstd, deflate are automatically handled
+      # No explicit configuration needed - requests with Content-Encoding
+      # header will be automatically decompressed
+
+      # TLS / mTLS (receiver-side)
+      # tls:
+      #   # Server identity (required for TLS)
+      #   cert_file: "/path/to/server.crt"   # or `cert_pem: | ...`
+      #   key_file: "/path/to/server.key"    # or `key_pem: | ...`
+      #
+      #   # Client certificate verification for mTLS (optional)
+      #   client_ca_file: "/path/to/client-ca.crt"  # or `client_ca_pem: | ...`
+      #   include_system_ca_certs_pool: false       # default is false
+      #
+      #   # Advanced settings
+      #   handshake_timeout: "10s"           # default is 10s
+      #   reload_interval: "5m"              # default is 5m
+
+  exporter:
+    kind: exporter
+    plugin_urn: "urn:otel:otlp:exporter"
+    config:
+      grpc_endpoint: "http://127.0.0.1:4317"
+      # timeout: "15s"  # Optional: timeout for RPC requests
+
+# Usage:
+# The OTLP HTTP receiver listens for HTTP POST requests on these endpoints:
+# - POST /v1/traces   - for trace data
+# - POST /v1/metrics  - for metrics data  
+# - POST /v1/logs     - for log data
+#
+# Content-Type supported:
+# - application/x-protobuf (preferred, binary protobuf)
+# - application/json (JSON encoding - not yet implemented)
+#
+# Content-Encoding supported:
+# - gzip
+# - zstd
+# - deflate
+#
+# Example with curl:
+# curl -X POST http://localhost:4318/v1/traces \
+#   -H "Content-Type: application/x-protobuf" \
+#   --data-binary @traces.pb

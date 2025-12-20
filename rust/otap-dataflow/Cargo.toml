@@ -179,6 +179,11 @@ reqwest = { version = "0.12.24", default-features = false }
 time = "0.3.44"
 wiremock = "0.6.5"
 
+# HTTP dependencies for OTLP HTTP receiver
+zstd = "0.13"
+hyper = { version = "1.6", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
+
 [features]
 # ToDo When jemalloc is enabled, we could use jemalloc_pprof to profile where memory is allocated. See https://crates.io/crates/jemalloc_pprof
 default = ["jemalloc"]

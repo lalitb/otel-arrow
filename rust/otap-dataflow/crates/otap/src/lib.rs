@@ -18,6 +18,13 @@ pub mod otap_receiver;
 /// produce for the pipeline OTAP PData
 pub mod otlp_receiver;
 
+/// This receiver receives OTLP bytes from HTTP requests and
+/// produces for the pipeline OTAP PData
+pub mod otlp_http_receiver;
+
+/// Common utilities shared between OTLP/gRPC and OTLP/HTTP receivers
+pub mod otlp_common;
+
 /// Implementation of OTLP exporter that implements the exporter trait
 pub mod otlp_exporter;
 
