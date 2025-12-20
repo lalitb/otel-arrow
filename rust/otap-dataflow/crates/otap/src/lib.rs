@@ -20,6 +20,7 @@ pub mod otlp_receiver;
 
 /// This receiver receives OTLP bytes from HTTP requests and
 /// produces for the pipeline OTAP PData
+#[cfg(feature = "otlp-http-receiver")]
 pub mod otlp_http_receiver;
 
 /// Common utilities shared between OTLP/gRPC and OTLP/HTTP receivers
