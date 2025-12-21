@@ -36,7 +36,8 @@ use crate::control::{NodeControlMsg, PipelineCtrlMsgSender};
 use crate::effect_handler::{EffectHandlerCore, TelemetryTimerCancelHandle, TimerCancelHandle};
 use crate::error::{Error, ReceiverErrorKind, TypedError};
 use crate::node::NodeId;
-use crate::shared::message::{SharedReceiver, SharedSender};
+use crate::message::{ReadonlyMarkable, Sender};
+use crate::shared::message::SharedReceiver;
 use crate::terminal_state::TerminalState;
 use async_trait::async_trait;
 use otap_df_channel::error::RecvError;
@@ -95,13 +96,13 @@ pub struct EffectHandler<PData> {
 
     /// A sender used to forward messages from the receiver.
     /// Supports multiple named output ports.
-    msg_senders: HashMap<PortName, SharedSender<PData>>,
+    msg_senders: HashMap<PortName, Sender<PData>>,
     /// Cached default sender for fast access in the hot path
-    default_sender: Option<SharedSender<PData>>,
+    default_sender: Option<Sender<PData>>,
 }
 
 /// Implementation for the `Send` effect handler.
-impl<PData> EffectHandler<PData> {
+impl<PData: Clone + ReadonlyMarkable> EffectHandler<PData> {
     /// Creates a new sendable effect handler with the given receiver name.
     ///
     /// Use this constructor when your receiver do need to be sent across threads or
@@ -109,7 +110,7 @@ impl<PData> EffectHandler<PData> {
     #[must_use]
     pub fn new(
         node_id: NodeId,
-        msg_senders: HashMap<PortName, SharedSender<PData>>,
+        msg_senders: HashMap<PortName, Sender<PData>>,
         default_port: Option<PortName>,
         pipeline_ctrl_msg_sender: PipelineCtrlMsgSender<PData>,
         metrics_reporter: MetricsReporter,

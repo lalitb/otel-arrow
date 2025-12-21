@@ -273,7 +273,7 @@ When you read about FanoutSender optimizations like "smart cloning" and "readonl
 
 ## Channel Types: Local vs Shared
 
-FanoutSender can use two types of channels based on component requirements:
+FanoutSender is materialized as either a `LocalFanoutSender` or `SharedFanoutSender` depending on the connected nodes, and each variant drives different channel primitives:
 
 ### Default: Local Channels (!Send) - Optimal
 

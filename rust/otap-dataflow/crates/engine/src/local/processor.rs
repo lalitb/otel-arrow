@@ -35,8 +35,7 @@
 use crate::control::{AckMsg, NackMsg};
 use crate::effect_handler::{EffectHandlerCore, TelemetryTimerCancelHandle, TimerCancelHandle};
 use crate::error::{Error, ProcessorErrorKind, TypedError};
-use crate::local::message::LocalSender;
-use crate::message::Message;
+use crate::message::{Message, ReadonlyMarkable, Sender};
 use crate::node::NodeId;
 use async_trait::async_trait;
 use otap_df_config::PortName;
@@ -115,18 +114,18 @@ pub struct EffectHandler<PData> {
 
     /// A sender used to forward messages from the processor.
     /// Supports multiple named output ports.
-    msg_senders: HashMap<PortName, LocalSender<PData>>,
+    msg_senders: HashMap<PortName, Sender<PData>>,
     /// Cached default sender for fast access in the hot path
-    default_sender: Option<LocalSender<PData>>,
+    default_sender: Option<Sender<PData>>,
 }
 
 /// Implementation for the `!Send` effect handler.
-impl<PData> EffectHandler<PData> {
+impl<PData: Clone + ReadonlyMarkable> EffectHandler<PData> {
     /// Creates a new local (!Send) `EffectHandler` with the given processor name.
     #[must_use]
     pub fn new(
         node_id: NodeId,
-        msg_senders: HashMap<PortName, LocalSender<PData>>,
+        msg_senders: HashMap<PortName, Sender<PData>>,
         default_port: Option<PortName>,
         metrics_reporter: MetricsReporter,
     ) -> Self {
@@ -281,7 +280,7 @@ mod tests {
     #![allow(missing_docs)]
     use super::*;
     use crate::local::message::LocalSender;
-    use crate::testing::test_node;
+    use crate::testing::{test_node, TestMsg};
     use otap_df_channel::mpsc;
     use std::borrow::Cow;
     use std::collections::{HashMap, HashSet};
@@ -297,8 +296,8 @@ mod tests {
         let (b_tx, b_rx) = channel::<u64>(10);
 
         let mut senders = HashMap::new();
-        let _ = senders.insert("a".into(), LocalSender::MpscSender(a_tx));
-        let _ = senders.insert("b".into(), LocalSender::MpscSender(b_tx));
+        let _ = senders.insert("a".into(), Sender::Local(LocalSender::MpscSender(a_tx)));
+        let _ = senders.insert("b".into(), Sender::Local(LocalSender::MpscSender(b_tx)));
 
         let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
         let eh = EffectHandler::new(test_node("proc"), senders, None, metrics_reporter);
@@ -317,7 +316,7 @@ mod tests {
     async fn effect_handler_send_message_single_port_fallback() {
         let (tx, rx) = channel::<u64>(10);
         let mut senders = HashMap::new();
-        let _ = senders.insert("only".into(), LocalSender::MpscSender(tx));
+        let _ = senders.insert("only".into(), Sender::Local(LocalSender::MpscSender(tx)));
 
         let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
         let eh = EffectHandler::new(test_node("proc"), senders, None, metrics_reporter);
@@ -332,8 +331,8 @@ mod tests {
         let (b_tx, b_rx) = channel::<u64>(10);
 
         let mut senders = HashMap::new();
-        let _ = senders.insert("a".into(), LocalSender::MpscSender(a_tx));
-        let _ = senders.insert("b".into(), LocalSender::MpscSender(b_tx));
+        let _ = senders.insert("a".into(), Sender::Local(LocalSender::MpscSender(a_tx)));
+        let _ = senders.insert("b".into(), Sender::Local(LocalSender::MpscSender(b_tx)));
 
         let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
         let eh = EffectHandler::new(
@@ -355,17 +354,17 @@ mod tests {
 
     #[tokio::test]
     async fn effect_handler_send_message_ambiguous_without_default() {
-        let (a_tx, a_rx) = channel::<u64>(10);
-        let (b_tx, b_rx) = channel::<u64>(10);
+        let (a_tx, a_rx) = channel::<TestMsg>(10);
+        let (b_tx, b_rx) = channel::<TestMsg>(10);
 
         let mut senders = HashMap::new();
-        let _ = senders.insert("a".into(), LocalSender::MpscSender(a_tx));
-        let _ = senders.insert("b".into(), LocalSender::MpscSender(b_tx));
+        let _ = senders.insert("a".into(), Sender::Local(LocalSender::MpscSender(a_tx)));
+        let _ = senders.insert("b".into(), Sender::Local(LocalSender::MpscSender(b_tx)));
 
         let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
         let eh = EffectHandler::new(test_node("proc"), senders, None, metrics_reporter);
 
-        let res = eh.send_message(5).await;
+        let res = eh.send_message(TestMsg("5".into())).await;
         assert!(res.is_err());
 
         // Nothing should be received on either port
@@ -383,12 +382,12 @@ mod tests {
 
     #[tokio::test]
     async fn effect_handler_connected_ports_lists_all() {
-        let (a_tx, _a_rx) = channel::<u64>(1);
-        let (b_tx, _b_rx) = channel::<u64>(1);
+        let (a_tx, _a_rx) = channel::<TestMsg>(1);
+        let (b_tx, _b_rx) = channel::<TestMsg>(1);
 
         let mut senders = HashMap::new();
-        let _ = senders.insert("a".into(), LocalSender::MpscSender(a_tx));
-        let _ = senders.insert("b".into(), LocalSender::MpscSender(b_tx));
+        let _ = senders.insert("a".into(), Sender::Local(LocalSender::MpscSender(a_tx)));
+        let _ = senders.insert("b".into(), Sender::Local(LocalSender::MpscSender(b_tx)));
 
         let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
         let eh = EffectHandler::new(test_node("proc"), senders, None, metrics_reporter);

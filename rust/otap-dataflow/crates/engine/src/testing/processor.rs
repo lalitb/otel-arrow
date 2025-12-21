@@ -253,7 +253,7 @@ impl<PData: Clone + Debug + 'static> TestRuntime<PData> {
     }
 }
 
-impl<PData: Debug + 'static> TestPhase<PData> {
+impl<PData: Debug + 'static + Clone + crate::message::ReadonlyMarkable> TestPhase<PData> {
     /// Starts the test scenario by executing the provided function with the test context.
     pub fn run_test<F, Fut>(self, f: F) -> ValidationPhase
     where

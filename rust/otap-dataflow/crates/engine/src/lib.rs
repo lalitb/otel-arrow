@@ -9,7 +9,7 @@ use crate::{
     error::Error,
     exporter::ExporterWrapper,
     local::message::{LocalReceiver, LocalSender},
-    message::{Receiver, Sender},
+    message::{LocalFanoutSender, Receiver, Sender, SharedFanoutSender},
     node::{Node, NodeDefs, NodeId, NodeName, NodeType},
     processor::ProcessorWrapper,
     receiver::ReceiverWrapper,
@@ -474,12 +474,16 @@ impl<PData: 'static + Clone + Debug + message::ReadonlyMarkable> PipelineFactory
     ) -> Result<(Sender<PData>, Vec<Receiver<PData>>), Error> {
         let source_is_shared = src_node.is_shared();
         let any_dest_is_shared = dest_nodes.iter().any(|dest| dest.is_shared());
+        // Use shared channels (including SharedFanout) if EITHER the source OR any destination is Shared.
+        // This ensures Send safety:
+        // - If source is Shared: it needs SharedSender to send from Send context
+        // - If any dest is Shared: it needs SharedReceiver to receive in Send context
+        // The sender type must match what the source can produce (Shared source -> SharedSender)
         let use_shared_channels = source_is_shared || any_dest_is_shared;
         let num_destinations = dest_nodes.len();
 
         // Handle FanoutSequential strategy with smart cloning
         if matches!(dispatch_strategy, DispatchStrategy::FanoutSequential) && num_destinations > 1 {
-            // Query capabilities of all destinations
             let mut mutable_indices = Vec::new();
             let mut readonly_indices = Vec::new();
 
@@ -491,27 +495,35 @@ impl<PData: 'static + Clone + Debug + message::ReadonlyMarkable> PipelineFactory
                 }
             }
 
-            // Create separate channels for each destination
-            let mut senders = Vec::new();
-            let mut receivers = Vec::new();
+            if use_shared_channels {
+                let mut fanout_senders = Vec::with_capacity(num_destinations);
+                let mut receivers = Vec::with_capacity(num_destinations);
 
-            for _ in 0..num_destinations {
-                if use_shared_channels {
+                for _ in 0..num_destinations {
                     let (tx, rx) = tokio::sync::mpsc::channel::<PData>(buffer_size.get());
-                    senders.push(Sender::Shared(SharedSender::MpscSender(tx)));
+                    fanout_senders.push(SharedSender::MpscSender(tx));
                     receivers.push(Receiver::Shared(SharedReceiver::MpscReceiver(rx)));
-                } else {
+                }
+
+                let fanout_sender =
+                    SharedFanoutSender::new(fanout_senders, mutable_indices, readonly_indices);
+
+                return Ok((Sender::SharedFanout(fanout_sender), receivers));
+            } else {
+                let mut fanout_senders = Vec::with_capacity(num_destinations);
+                let mut receivers = Vec::with_capacity(num_destinations);
+
+                for _ in 0..num_destinations {
                     let (tx, rx) = otap_df_channel::mpsc::Channel::new(buffer_size.get());
-                    senders.push(Sender::Local(LocalSender::MpscSender(tx)));
+                    fanout_senders.push(LocalSender::MpscSender(tx));
                     receivers.push(Receiver::Local(LocalReceiver::MpscReceiver(rx)));
                 }
+
+                let fanout_sender =
+                    LocalFanoutSender::new(fanout_senders, mutable_indices, readonly_indices);
+
+                return Ok((Sender::LocalFanout(fanout_sender), receivers));
             }
-
-            // Create FanoutSender with smart cloning logic
-            use crate::message::FanoutSender;
-            let fanout_sender = FanoutSender::new(senders, mutable_indices, readonly_indices);
-
-            return Ok((Sender::Fanout(fanout_sender), receivers));
         }
 
         if use_shared_channels {

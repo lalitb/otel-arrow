@@ -58,7 +58,7 @@ impl PipeNode {
     }
 }
 
-impl<PData: 'static + Debug + Clone> RuntimePipeline<PData> {
+impl<PData: 'static + Debug + Clone + crate::message::ReadonlyMarkable> RuntimePipeline<PData> {
     /// Creates a new `RuntimePipeline` from the given pipeline configuration and nodes.
     #[must_use]
     pub(crate) fn new(

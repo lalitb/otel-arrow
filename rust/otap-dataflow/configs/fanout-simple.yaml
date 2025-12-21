@@ -48,9 +48,7 @@ nodes:
     config:
       verbosity: basic
       mode: signal
-      output:
-        destination: stdout
-        format: text
+      output: console
 
   debug2:
     kind: processor
@@ -63,9 +61,7 @@ nodes:
     config:
       verbosity: basic
       mode: signal
-      output:
-        destination: stdout
-        format: text
+      output: console
 
   noop:
     kind: exporter

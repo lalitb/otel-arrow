@@ -80,9 +80,7 @@ nodes:
     config:
       verbosity: basic          # Less verbose
       mode: signal              # Log per signal
-      output:
-        destination: stdout
-        format: json
+      output: console
 
   # READONLY PROCESSOR 2 - Gets clone (marked readonly)
   debug2:
@@ -96,9 +94,7 @@ nodes:
     config:
       verbosity: detailed       # More verbose than debug1
       mode: batch               # Log per batch
-      output:
-        destination: stdout
-        format: text
+      output: console
 
   # READONLY EXPORTER - Gets ORIGINAL (last consumer, zero-copy!)
   noop:

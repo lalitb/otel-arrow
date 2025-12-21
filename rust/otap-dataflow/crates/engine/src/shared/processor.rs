@@ -34,9 +34,8 @@
 use crate::control::{AckMsg, NackMsg};
 use crate::effect_handler::{EffectHandlerCore, TelemetryTimerCancelHandle, TimerCancelHandle};
 use crate::error::{Error, ProcessorErrorKind, TypedError};
-use crate::message::Message;
+use crate::message::{Message, ReadonlyMarkable, Sender};
 use crate::node::NodeId;
-use crate::shared::message::SharedSender;
 use async_trait::async_trait;
 use otap_df_config::PortName;
 use otap_df_telemetry::error::Error as TelemetryError;
@@ -114,18 +113,18 @@ pub struct EffectHandler<PData> {
 
     /// A sender used to forward messages from the processor.
     /// Supports multiple named output ports.
-    msg_senders: HashMap<PortName, SharedSender<PData>>,
+    msg_senders: HashMap<PortName, Sender<PData>>,
     /// Cached default sender for fast access in the hot path
-    default_sender: Option<SharedSender<PData>>,
+    default_sender: Option<Sender<PData>>,
 }
 
 /// Implementation for the `Send` effect handler.
-impl<PData> EffectHandler<PData> {
+impl<PData: Clone + ReadonlyMarkable> EffectHandler<PData> {
     /// Creates a new shared (Send) `EffectHandler` with the given processor name and pdata sender.
     #[must_use]
     pub fn new(
         node_id: NodeId,
-        msg_senders: HashMap<PortName, SharedSender<PData>>,
+        msg_senders: HashMap<PortName, Sender<PData>>,
         default_port: Option<PortName>,
         metrics_reporter: MetricsReporter,
     ) -> Self {
