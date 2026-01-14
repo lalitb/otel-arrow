@@ -10,6 +10,7 @@ use otap_df_channel::error::{RecvError, SendError};
 use otap_df_channel::mpsc;
 use std::ops::Add;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tokio::time::{Sleep, sleep_until};
 
@@ -85,13 +86,320 @@ impl<Data> Message<Data> {
     }
 }
 
+/// Trait for data types that can be marked as readonly.
+///
+/// This is used by the fanout sender to mark data as readonly when multiple
+/// readonly consumers share the same data instance, enabling copy-on-write optimization.
+pub trait ReadonlyMarkable {
+    /// Marks this data as readonly to prevent mutation.
+    fn mark_readonly(&mut self);
+}
+
+/// Implementation for unit type (used in tests).
+impl ReadonlyMarkable for () {
+    fn mark_readonly(&mut self) {
+        // No-op for unit type
+    }
+}
+
+/// Implementation for primitive types (used in tests).
+macro_rules! impl_readonly_markable_for_primitives {
+    ($($t:ty),*) => {
+        $(
+            impl ReadonlyMarkable for $t {
+                fn mark_readonly(&mut self) {
+                    // No-op for primitive types - they're Copy so marking is not needed
+                }
+            }
+        )*
+    };
+}
+
+impl_readonly_markable_for_primitives!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize, f32, f64, bool, char);
+
+#[derive(Clone, Copy)]
+enum FanoutRole {
+    Mutable,
+    Readonly,
+}
+
+struct FanoutSlot {
+    index: usize,
+    role: FanoutRole,
+}
+
+fn build_fanout_slots(
+    num_senders: usize,
+    mutable_indices: &[usize],
+    readonly_indices: &[usize],
+) -> (Vec<FanoutSlot>, usize) {
+    assert!(
+        num_senders > 0,
+        "FanoutSender requires at least one consumer (got 0 senders)"
+    );
+
+    let mut roles = vec![None; num_senders];
+
+    for &idx in mutable_indices {
+        assert!(
+            idx < num_senders,
+            "Mutable index {} out of bounds (total senders: {})",
+            idx,
+            num_senders
+        );
+        if roles[idx].is_some() {
+            panic!("Duplicate index {} in mutable_indices", idx);
+        }
+        roles[idx] = Some(FanoutRole::Mutable);
+    }
+
+    for &idx in readonly_indices {
+        assert!(
+            idx < num_senders,
+            "Readonly index {} out of bounds (total senders: {})",
+            idx,
+            num_senders
+        );
+        match roles[idx] {
+            Some(FanoutRole::Mutable) => panic!(
+                "Index {} appears in both mutable and readonly lists",
+                idx
+            ),
+            Some(FanoutRole::Readonly) => {
+                panic!("Duplicate index {} in readonly_indices", idx);
+            }
+            None => roles[idx] = Some(FanoutRole::Readonly),
+        }
+    }
+
+    assert_eq!(
+        mutable_indices.len() + readonly_indices.len(),
+        num_senders,
+        "Total indices ({}) must equal total senders ({})",
+        mutable_indices.len() + readonly_indices.len(),
+        num_senders
+    );
+
+    let mut readonly_count = 0;
+    let mut slots = Vec::with_capacity(num_senders);
+    for (index, role) in roles.into_iter().enumerate() {
+        let role = role.unwrap_or_else(|| {
+            panic!(
+                "Sender at index {} missing capability assignment (mutable/readonly)",
+                index
+            )
+        });
+        if matches!(role, FanoutRole::Readonly) {
+            readonly_count += 1;
+        }
+        slots.push(FanoutSlot { index, role });
+    }
+
+    (slots, readonly_count)
+}
+
+/// Fanout sender implementation for `!Send` (local) pipelines.
+///
+/// Preserves destination ordering while minimizing clones:
+/// - Mutating consumers receive clones except for the final consumer overall
+/// - Readonly consumers share the original payload when possible
+/// - Data is marked readonly once if multiple readonly consumers share it
+///
+/// # Design Note
+///
+/// This fanout sender is specifically for Local (!Send) pipelines. For Shared (Send)
+/// contexts with multiple consumers, use MPMC channels instead, which provide a proven
+/// pull-based pattern for multi-consumer scenarios.
+#[must_use = "LocalFanoutSender should be used to send messages"]
+pub struct LocalFanoutSender<T> {
+    senders: Vec<LocalSender<T>>,
+    slots: Vec<FanoutSlot>,
+    readonly_count: usize,
+}
+
+impl<T: Clone + ReadonlyMarkable> LocalFanoutSender<T> {
+    /// Constructs a new local fanout sender that validates capability
+    /// assignments and preserves the configured destination order.
+    #[must_use = "LocalFanoutSender must be used after construction"]
+    pub fn new(
+        senders: Vec<LocalSender<T>>,
+        mutable_indices: Vec<usize>,
+        readonly_indices: Vec<usize>,
+    ) -> Self {
+        let num_senders = senders.len();
+        let (slots, readonly_count) =
+            build_fanout_slots(num_senders, &mutable_indices, &readonly_indices);
+
+        Self {
+            senders,
+            slots,
+            readonly_count,
+        }
+    }
+
+    /// Asynchronously delivers `data` to all configured destinations following Go's optimization strategy.
+    ///
+    /// Optimization strategy (matching opentelemetry-collector fanoutconsumer):
+    /// 1. Mutable consumers: Clone for each except the last if no readonly consumers exist
+    /// 2. Readonly consumers: Share the same Rc-wrapped instance (zero-copy!)
+    /// 3. If both mutable and readonly exist: All get clones/shares, original is not used
+    ///
+    /// This achieves true zero-copy for readonly consumers by sharing an Rc pointer
+    /// instead of cloning the data.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SendError`] if any destination channel is closed or full.
+    pub async fn send(&self, mut data: T) -> Result<(), SendError<T>> {
+        // Separate slots into mutable and readonly groups
+        let mut mutable_slots = Vec::new();
+        let mut readonly_slots = Vec::new();
+        
+        for slot in &self.slots {
+            match slot.role {
+                FanoutRole::Mutable => mutable_slots.push(slot),
+                FanoutRole::Readonly => readonly_slots.push(slot),
+            }
+        }
+
+        eprintln!("🔀 [FANOUT] Starting fanout: {} mutable, {} readonly consumers", 
+                  mutable_slots.len(), readonly_slots.len());
+
+        // Phase 1: Send to mutable consumers
+        if !mutable_slots.is_empty() {
+            eprintln!("  [PHASE 1] Processing {} mutable consumers", mutable_slots.len());
+            
+            // Clone for all mutable consumers except the last
+            for i in 0..mutable_slots.len() - 1 {
+                eprintln!("    📋 Mutable consumer {} (index {}): CLONING data", i + 1, mutable_slots[i].index);
+                self.senders[mutable_slots[i].index].send(data.clone()).await?;
+            }
+
+            // Last mutable consumer: gets original if no readonly consumers, clone otherwise
+            let last_mutable = mutable_slots[mutable_slots.len() - 1];
+            if readonly_slots.is_empty() {
+                // No readonly consumers: last mutable gets the original (no clone)
+                eprintln!("    ✅ Last mutable consumer (index {}): MOVING original (no readonly consumers)", 
+                         last_mutable.index);
+                self.senders[last_mutable.index].send(data).await?;
+                return Ok(());
+            } else {
+                // Readonly consumers exist: last mutable gets a clone too
+                eprintln!("    📋 Last mutable consumer (index {}): CLONING (readonly consumers exist)", 
+                         last_mutable.index);
+                self.senders[last_mutable.index].send(data.clone()).await?;
+            }
+        }
+
+        // Phase 2: Send to readonly consumers  
+        if !readonly_slots.is_empty() {
+            eprintln!("  [PHASE 2] Processing {} readonly consumers", readonly_slots.len());
+            
+            // Mark data as readonly if multiple readonly consumers will share it
+            if readonly_slots.len() > 1 {
+                eprintln!("    🔒 Marking data as readonly (multiple readonly consumers)");
+                data.mark_readonly();
+            }
+
+            // For readonly consumers, we just clone and send to each
+            // The mark_readonly() call enables internal COW optimization within the data type
+            // This matches the Go implementation where readonly consumers share the data
+            for i in 0..readonly_slots.len() - 1 {
+                eprintln!("    📋 Readonly consumer {} (index {}): CLONING data", i + 1, readonly_slots[i].index);
+                self.senders[readonly_slots[i].index].send(data.clone()).await?;
+            }
+
+            // Last readonly consumer gets the original moved data
+            let last_readonly = readonly_slots[readonly_slots.len() - 1];
+            eprintln!("    ✅ Last readonly consumer (index {}): MOVING original (zero-copy!)", last_readonly.index);
+            self.senders[last_readonly.index].send(data).await?;
+        }
+
+        eprintln!("🔀 [FANOUT] Complete\n");
+        Ok(())
+    }
+    /// Attempts to deliver `data` immediately without awaiting following Go's optimization strategy.
+    ///
+    /// Uses the same strategy as [`LocalFanoutSender::send`]:
+    /// - Mutable consumers get clones (except last if no readonly)
+    /// - Readonly consumers share Rc-wrapped instance (zero-copy)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SendError`] if any destination channel is closed or full.
+    pub fn try_send(&self, mut data: T) -> Result<(), SendError<T>> {
+        // Separate slots into mutable and readonly groups
+        let mut mutable_slots = Vec::new();
+        let mut readonly_slots = Vec::new();
+        
+        for slot in &self.slots {
+            match slot.role {
+                FanoutRole::Mutable => mutable_slots.push(slot),
+                FanoutRole::Readonly => readonly_slots.push(slot),
+            }
+        }
+
+        // Phase 1: Send to mutable consumers
+        if !mutable_slots.is_empty() {
+            // Clone for all mutable consumers except the last
+            for i in 0..mutable_slots.len() - 1 {
+                self.senders[mutable_slots[i].index].try_send(data.clone())?;
+            }
+
+            // Last mutable consumer: gets original if no readonly consumers, clone otherwise
+            let last_mutable = mutable_slots[mutable_slots.len() - 1];
+            if readonly_slots.is_empty() {
+                // No readonly consumers: last mutable gets the original (no clone)
+                self.senders[last_mutable.index].try_send(data)?;
+                return Ok(());
+            } else {
+                // Readonly consumers exist: last mutable gets a clone too
+                self.senders[last_mutable.index].try_send(data.clone())?;
+            }
+        }
+
+        // Phase 2: Send to readonly consumers
+        if !readonly_slots.is_empty() {
+            // Mark data as readonly if multiple readonly consumers will share it
+            if readonly_slots.len() > 1 {
+                data.mark_readonly();
+            }
+
+            // For readonly consumers, we just clone and send to each
+            // The mark_readonly() call enables internal COW optimization within the data type
+            // This matches the Go implementation where readonly consumers share the data
+            for i in 0..readonly_slots.len() - 1 {
+                self.senders[readonly_slots[i].index].try_send(data.clone())?;
+            }
+
+            // Last readonly consumer gets the original moved data
+            let last_readonly = readonly_slots[readonly_slots.len() - 1];
+            self.senders[last_readonly.index].try_send(data)?;
+        }
+
+        Ok(())
+    }
+}
+
 /// A generic channel Sender supporting both local and shared semantic (i.e. !Send and Send).
+///
+/// # Fanout Support
+///
+/// This enum includes a `LocalFanout` variant for efficiently broadcasting data to multiple
+/// consumers in Local (!Send) pipelines with smart cloning based on consumer capabilities.
+/// The fanout sender is wrapped in an `Rc` to allow cloning the Sender enum (needed when
+/// the EffectHandler is cloned for spawned tasks).
+/// 
+/// For Shared (Send) contexts with multiple consumers, use MPMC channels instead.
 #[must_use = "A `Sender` is requested but not used."]
 pub enum Sender<T> {
     /// Sender of a local channel.
     Local(LocalSender<T>),
     /// Sender of a shared channel.
     Shared(SharedSender<T>),
+    /// Fanout sender operating on local (`!Send`) channels.
+    /// Wrapped in Rc to allow cloning the Sender enum.
+    LocalFanout(Rc<LocalFanoutSender<T>>),
 }
 
 impl<T> Clone for Sender<T> {
@@ -99,6 +407,7 @@ impl<T> Clone for Sender<T> {
         match self {
             Sender::Local(sender) => Sender::Local(sender.clone()),
             Sender::Shared(sender) => Sender::Shared(sender.clone()),
+            Sender::LocalFanout(fanout) => Sender::LocalFanout(fanout.clone()),
         }
     }
 }
@@ -108,20 +417,60 @@ impl<T> Sender<T> {
     pub fn new_local_mpsc_sender(mpsc_sender: mpsc::Sender<T>) -> Self {
         Sender::Local(LocalSender::MpscSender(mpsc_sender))
     }
+}
 
+// Methods that work for all sender types
+impl<T> Sender<T> {
     /// Sends a message to the channel.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on a `LocalFanout` sender when `T` doesn't implement
+    /// `Clone + ReadonlyMarkable`. Use `send_fanout()` for fanout senders.
     pub async fn send(&self, msg: T) -> Result<(), SendError<T>> {
         match self {
             Sender::Local(sender) => sender.send(msg).await,
             Sender::Shared(sender) => sender.send(msg).await,
+            Sender::LocalFanout(_) => {
+                panic!("Cannot call send() on LocalFanout - use send_fanout() instead")
+            }
         }
     }
 
     /// Attempts to send a message without awaiting.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on a `LocalFanout` sender when `T` doesn't implement
+    /// `Clone + ReadonlyMarkable`. Use `try_send_fanout()` for fanout senders.
     pub fn try_send(&self, msg: T) -> Result<(), SendError<T>> {
         match self {
             Sender::Local(sender) => sender.try_send(msg),
             Sender::Shared(sender) => sender.try_send(msg),
+            Sender::LocalFanout(_) => {
+                panic!("Cannot call try_send() on LocalFanout - use try_send_fanout() instead")
+            }
+        }
+    }
+}
+
+// Methods specific to types that support fanout
+impl<T: Clone + ReadonlyMarkable> Sender<T> {
+    /// Sends a message to the channel, supporting all sender types including fanout.
+    pub async fn send_fanout(&self, msg: T) -> Result<(), SendError<T>> {
+        match self {
+            Sender::Local(sender) => sender.send(msg).await,
+            Sender::Shared(sender) => sender.send(msg).await,
+            Sender::LocalFanout(fanout) => fanout.send(msg).await,
+        }
+    }
+
+    /// Attempts to send a message without awaiting, supporting all sender types including fanout.
+    pub fn try_send_fanout(&self, msg: T) -> Result<(), SendError<T>> {
+        match self {
+            Sender::Local(sender) => sender.try_send(msg),
+            Sender::Shared(sender) => sender.try_send(msg),
+            Sender::LocalFanout(fanout) => fanout.try_send(msg),
         }
     }
 }

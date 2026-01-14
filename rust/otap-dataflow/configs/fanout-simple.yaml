@@ -1,0 +1,47 @@
+# Simple Fanout Example
+# Demonstrates basic fanout: one receiver sends to multiple exporters
+# This will automatically use LocalFanoutSender with COW optimization
+
+settings:
+  default_pipeline_ctrl_msg_channel_size: 100
+  default_node_ctrl_msg_channel_size: 100
+  default_pdata_channel_size: 100
+
+nodes:
+  # Single data source
+  fake_receiver:
+    kind: receiver
+    plugin_urn: "urn:otel:otap:fake_data_generator:receiver"
+    out_ports:
+      out_port:
+        # Multiple destinations - triggers fanout!
+        destinations:
+          - noop_1
+          - noop_2
+          - noop_3
+        dispatch_strategy: round_robin
+    config:
+      traffic_config:
+        max_signal_count: 1000
+        max_batch_size: 100
+        signals_per_second: 100
+        log_weight: 100
+      registry_path: https://github.com/open-telemetry/semantic-conventions.git[model]
+
+  # First consumer - gets COW clone
+  noop_1:
+    kind: exporter
+    plugin_urn: "urn:otel:noop:exporter"
+    config:
+
+  # Second consumer - gets COW clone
+  noop_2:
+    kind: exporter
+    plugin_urn: "urn:otel:noop:exporter"
+    config:
+
+  # Third consumer - gets moved data (no clone!)
+  noop_3:
+    kind: exporter
+    plugin_urn: "urn:otel:noop:exporter"
+    config:

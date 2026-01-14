@@ -230,7 +230,7 @@ pub struct PipelineFactory<PData: 'static + Clone> {
     exporter_factories: &'static [ExporterFactory<PData>],
 }
 
-impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
+impl<PData: 'static + Clone + Debug + message::ReadonlyMarkable> PipelineFactory<PData> {
     /// Creates a new factory registry with the given factory slices.
     #[must_use]
     pub const fn new(
@@ -428,12 +428,20 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
     /// This function returns a tuple containing the selected sender and one receiver per
     /// destination.
     ///
+    /// Channel Selection Strategy:
+    /// - Local + Multiple Destinations + Clone + ReadonlyMarkable → LocalFanoutSender (push-based, optimized cloning)
+    /// - Shared + Multiple Destinations → MPMC (pull-based, thread-safe)
+    /// - Single Destination → MPSC (point-to-point)
+    ///
     /// ToDo (LQ): Support dispatch strategies.
     fn select_channel_type(
         src_node: &dyn Node<PData>,
         dest_nodes: &Vec<&dyn Node<PData>>,
         buffer_size: NonZeroUsize,
-    ) -> Result<(Sender<PData>, Vec<Receiver<PData>>), Error> {
+    ) -> Result<(Sender<PData>, Vec<Receiver<PData>>), Error>
+    where
+        PData: message::ReadonlyMarkable,
+    {
         let source_is_shared = src_node.is_shared();
         let any_dest_is_shared = dest_nodes.iter().any(|dest| dest.is_shared());
         let use_shared_channels = source_is_shared || any_dest_is_shared;
@@ -463,18 +471,35 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         } else {
             // Local channels
             if num_destinations > 1 {
-                // ToDo(LQ): Use a local SPMC channel when available.
-                let (pdata_sender, pdata_receiver) =
-                    otap_df_channel::mpmc::Channel::new(buffer_size);
-                let pdata_receivers = (0..num_destinations)
-                    .map(|_| Receiver::Local(LocalReceiver::MpmcReceiver(pdata_receiver.clone())))
-                    .collect::<Vec<_>>();
+                // Use LocalFanoutSender for local multi-consumer scenarios
+                // This provides push-based fanout with optimized cloning
+                
+                // Create individual MPSC channels for each destination
+                let mut local_senders = Vec::with_capacity(num_destinations);
+                let mut pdata_receivers = Vec::with_capacity(num_destinations);
+                
+                for _ in 0..num_destinations {
+                    let (sender, receiver) = otap_df_channel::mpsc::Channel::new(buffer_size.get());
+                    local_senders.push(LocalSender::MpscSender(sender));
+                    pdata_receivers.push(Receiver::Local(LocalReceiver::MpscReceiver(receiver)));
+                }
+                
+                // TODO: Determine mutable vs readonly based on node capabilities
+                // For now, assume all destinations are readonly for conservative behavior
+                let mutable_indices = Vec::new();
+                let readonly_indices = (0..num_destinations).collect::<Vec<_>>();
+                
+                let fanout = message::LocalFanoutSender::new(
+                    local_senders,
+                    mutable_indices,
+                    readonly_indices,
+                );
+                
                 Ok((
-                    Sender::Local(LocalSender::MpmcSender(pdata_sender)),
+                    Sender::LocalFanout(std::rc::Rc::new(fanout)),
                     pdata_receivers,
                 ))
             } else {
-                // ToDo(LQ): Use a local SPSC channel when available.
                 let (pdata_sender, pdata_receiver) =
                     otap_df_channel::mpsc::Channel::new(buffer_size.get());
                 Ok((

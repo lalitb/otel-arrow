@@ -51,12 +51,12 @@ pub mod thread_task;
 /// This struct is designed to be used in multi-threaded contexts. Each pipeline is run on a
 /// dedicated thread pinned to a CPU core.
 /// Intended for use as a long-lived process controller.
-pub struct Controller<PData: 'static + Clone + Send + Sync + std::fmt::Debug> {
+pub struct Controller<PData: 'static + Clone + Send + Sync + std::fmt::Debug + otap_df_engine::message::ReadonlyMarkable> {
     /// The pipeline factory used to build runtime pipelines.
     pipeline_factory: &'static PipelineFactory<PData>,
 }
 
-impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug> Controller<PData> {
+impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + otap_df_engine::message::ReadonlyMarkable> Controller<PData> {
     /// Creates a new controller with the given pipeline factory.
     pub fn new(pipeline_factory: &'static PipelineFactory<PData>) -> Self {
         Self { pipeline_factory }

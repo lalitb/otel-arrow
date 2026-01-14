@@ -87,6 +87,13 @@ pub trait Processor<PData> {
 }
 
 /// A `Send` implementation of the EffectHandler.
+///
+/// # Design Note
+///
+/// This uses `SharedSender` directly rather than the `Sender` enum because:
+/// - Shared processors must be `Send` to work across threads
+/// - The `Sender` enum contains `!Send` variants (Local, LocalFanout)
+/// - For multi-consumer scenarios in Shared context, use MPMC channels instead of fanout
 #[derive(Clone)]
 pub struct EffectHandler<PData> {
     pub(crate) core: EffectHandlerCore<PData>,

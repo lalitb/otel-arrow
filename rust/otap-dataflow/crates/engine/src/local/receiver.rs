@@ -127,9 +127,10 @@ pub struct EffectHandler<PData> {
 
     /// A sender used to forward messages from the receiver.
     /// Supports multiple named output ports.
-    msg_senders: HashMap<PortName, LocalSender<PData>>,
+    /// Now stores the full Sender enum to support fanout.
+    msg_senders: HashMap<PortName, crate::message::Sender<PData>>,
     /// Cached default sender for fast access in the hot path
-    default_sender: Option<LocalSender<PData>>,
+    default_sender: Option<crate::message::Sender<PData>>,
 }
 
 /// Implementation for the `!Send` effect handler.
@@ -138,7 +139,7 @@ impl<PData> EffectHandler<PData> {
     #[must_use]
     pub fn new(
         node_id: NodeId,
-        msg_senders: HashMap<PortName, LocalSender<PData>>,
+        msg_senders: HashMap<PortName, crate::message::Sender<PData>>,
         default_port: Option<PortName>,
         node_request_sender: PipelineCtrlMsgSender<PData>,
         metrics_reporter: MetricsReporter,
@@ -184,10 +185,13 @@ impl<PData> EffectHandler<PData> {
     /// Returns an [`TypedError::ChannelSendError`] if the message could not be sent or
     /// [`TypedError::Error::ReceiverError`] if the default port is not configured.
     #[inline]
-    pub async fn send_message(&self, data: PData) -> Result<(), TypedError<PData>> {
+    pub async fn send_message(&self, data: PData) -> Result<(), TypedError<PData>>
+    where
+        PData: Clone + crate::message::ReadonlyMarkable,
+    {
         match &self.default_sender {
             Some(sender) => sender
-                .send(data)
+                .send_fanout(data)
                 .await
                 .map_err(TypedError::ChannelSendError),
             None => Err(TypedError::Error(Error::ReceiverError {
@@ -211,11 +215,12 @@ impl<PData> EffectHandler<PData> {
     pub async fn send_message_to<P>(&self, port: P, data: PData) -> Result<(), TypedError<PData>>
     where
         P: Into<PortName>,
+        PData: Clone + crate::message::ReadonlyMarkable,
     {
         let port_name: PortName = port.into();
         match self.msg_senders.get(&port_name) {
             Some(sender) => sender
-                .send(data)
+                .send_fanout(data)
                 .await
                 .map_err(TypedError::ChannelSendError),
             None => Err(TypedError::Error(Error::ReceiverError {
@@ -313,8 +318,8 @@ mod tests {
         let (b_tx, b_rx) = channel::<u64>(10);
 
         let mut senders = HashMap::new();
-        let _ = senders.insert("a".into(), LocalSender::MpscSender(a_tx));
-        let _ = senders.insert("b".into(), LocalSender::MpscSender(b_tx));
+        let _ = senders.insert("a".into(), crate::message::Sender::Local(LocalSender::MpscSender(a_tx)));
+        let _ = senders.insert("b".into(), crate::message::Sender::Local(LocalSender::MpscSender(b_tx)));
 
         let (ctrl_tx, _ctrl_rx) = pipeline_ctrl_msg_channel(4);
         let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
@@ -335,7 +340,7 @@ mod tests {
     async fn effect_handler_send_message_single_port_fallback() {
         let (tx, rx) = channel::<u64>(10);
         let mut senders = HashMap::new();
-        let _ = senders.insert("only".into(), LocalSender::MpscSender(tx));
+        let _ = senders.insert("only".into(), crate::message::Sender::Local(LocalSender::MpscSender(tx)));
 
         let (ctrl_tx, _ctrl_rx) = pipeline_ctrl_msg_channel(4);
         let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
@@ -351,8 +356,8 @@ mod tests {
         let (b_tx, b_rx) = channel::<u64>(10);
 
         let mut senders = HashMap::new();
-        let _ = senders.insert("a".into(), LocalSender::MpscSender(a_tx));
-        let _ = senders.insert("b".into(), LocalSender::MpscSender(b_tx));
+        let _ = senders.insert("a".into(), crate::message::Sender::Local(LocalSender::MpscSender(a_tx)));
+        let _ = senders.insert("b".into(), crate::message::Sender::Local(LocalSender::MpscSender(b_tx)));
 
         let (ctrl_tx, _ctrl_rx) = pipeline_ctrl_msg_channel(4);
         let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
@@ -380,8 +385,8 @@ mod tests {
         let (b_tx, b_rx) = channel::<u64>(10);
 
         let mut senders = HashMap::new();
-        let _ = senders.insert("a".into(), LocalSender::MpscSender(a_tx));
-        let _ = senders.insert("b".into(), LocalSender::MpscSender(b_tx));
+        let _ = senders.insert("a".into(), crate::message::Sender::Local(LocalSender::MpscSender(a_tx)));
+        let _ = senders.insert("b".into(), crate::message::Sender::Local(LocalSender::MpscSender(b_tx)));
 
         let (ctrl_tx, _ctrl_rx) = pipeline_ctrl_msg_channel(4);
         let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
@@ -409,8 +414,8 @@ mod tests {
         let (b_tx, _b_rx) = channel::<u64>(1);
 
         let mut senders = HashMap::new();
-        let _ = senders.insert("a".into(), LocalSender::MpscSender(a_tx));
-        let _ = senders.insert("b".into(), LocalSender::MpscSender(b_tx));
+        let _ = senders.insert("a".into(), crate::message::Sender::Local(LocalSender::MpscSender(a_tx)));
+        let _ = senders.insert("b".into(), crate::message::Sender::Local(LocalSender::MpscSender(b_tx)));
 
         let (ctrl_tx, _ctrl_rx) = pipeline_ctrl_msg_channel(4);
         let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);

@@ -251,6 +251,14 @@ pub struct OtapPdata {
     payload: OtapPayload,
 }
 
+impl otap_df_engine::message::ReadonlyMarkable for OtapPdata {
+    fn mark_readonly(&mut self) {
+        // OtapPdata uses Arc-based sharing internally in OtapArrowRecords,
+        // so marking as readonly is a no-op. The clone operation is already
+        // efficient for shared data structures.
+    }
+}
+
 /* -------- Signal type -------- */
 
 impl OtapPdata {

@@ -94,9 +94,10 @@ pub struct EffectHandler<PData> {
 
     /// A sender used to forward messages from the processor.
     /// Supports multiple named output ports.
-    msg_senders: HashMap<PortName, LocalSender<PData>>,
+    /// Now stores the full Sender enum to support fanout.
+    msg_senders: HashMap<PortName, crate::message::Sender<PData>>,
     /// Cached default sender for fast access in the hot path
-    default_sender: Option<LocalSender<PData>>,
+    default_sender: Option<crate::message::Sender<PData>>,
 }
 
 /// Implementation for the `!Send` effect handler.
@@ -105,7 +106,7 @@ impl<PData> EffectHandler<PData> {
     #[must_use]
     pub fn new(
         node_id: NodeId,
-        msg_senders: HashMap<PortName, LocalSender<PData>>,
+        msg_senders: HashMap<PortName, crate::message::Sender<PData>>,
         default_port: Option<PortName>,
         metrics_reporter: MetricsReporter,
     ) -> Self {
@@ -146,13 +147,16 @@ impl<PData> EffectHandler<PData> {
     ///
     /// # Errors
     ///
-    /// Returns an [`Error::ChannelSendError`] if the message could not be sent or [`Error::ProcessorError`]
-    /// if the default port is not configured.
+    /// Returns an [`TypedError::ChannelSendError`] if the message could not be sent or
+    /// [`TypedError::Error::ProcessorError`] if the default port is not configured.
     #[inline]
-    pub async fn send_message(&self, data: PData) -> Result<(), TypedError<PData>> {
+    pub async fn send_message(&self, data: PData) -> Result<(), TypedError<PData>>
+    where
+        PData: Clone + crate::message::ReadonlyMarkable,
+    {
         match &self.default_sender {
             Some(sender) => sender
-                .send(data)
+                .send_fanout(data)
                 .await
                 .map_err(TypedError::ChannelSendError),
             None => Err(TypedError::Error(Error::ProcessorError {
@@ -170,17 +174,18 @@ impl<PData> EffectHandler<PData> {
     ///
     /// # Errors
     ///
-    /// Returns an [`Error::ChannelSendError`] if the message could not be sent, or
+    /// Returns a [`Error::ChannelSendError`] if the message could not be sent, or
     /// [`Error::ProcessorError`] if the port does not exist.
     #[inline]
     pub async fn send_message_to<P>(&self, port: P, data: PData) -> Result<(), TypedError<PData>>
     where
         P: Into<PortName>,
+        PData: Clone + crate::message::ReadonlyMarkable,
     {
         let port_name: PortName = port.into();
         match self.msg_senders.get(&port_name) {
             Some(sender) => sender
-                .send(data)
+                .send_fanout(data)
                 .await
                 .map_err(TypedError::ChannelSendError),
             None => Err(TypedError::Error(Error::ProcessorError {
@@ -276,8 +281,8 @@ mod tests {
         let (b_tx, b_rx) = channel::<u64>(10);
 
         let mut senders = HashMap::new();
-        let _ = senders.insert("a".into(), LocalSender::MpscSender(a_tx));
-        let _ = senders.insert("b".into(), LocalSender::MpscSender(b_tx));
+        let _ = senders.insert("a".into(), crate::message::Sender::Local(LocalSender::MpscSender(a_tx)));
+        let _ = senders.insert("b".into(), crate::message::Sender::Local(LocalSender::MpscSender(b_tx)));
 
         let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
         let eh = EffectHandler::new(test_node("proc"), senders, None, metrics_reporter);
@@ -296,7 +301,7 @@ mod tests {
     async fn effect_handler_send_message_single_port_fallback() {
         let (tx, rx) = channel::<u64>(10);
         let mut senders = HashMap::new();
-        let _ = senders.insert("only".into(), LocalSender::MpscSender(tx));
+        let _ = senders.insert("only".into(), crate::message::Sender::Local(LocalSender::MpscSender(tx)));
 
         let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
         let eh = EffectHandler::new(test_node("proc"), senders, None, metrics_reporter);
@@ -311,8 +316,8 @@ mod tests {
         let (b_tx, b_rx) = channel::<u64>(10);
 
         let mut senders = HashMap::new();
-        let _ = senders.insert("a".into(), LocalSender::MpscSender(a_tx));
-        let _ = senders.insert("b".into(), LocalSender::MpscSender(b_tx));
+        let _ = senders.insert("a".into(), crate::message::Sender::Local(LocalSender::MpscSender(a_tx)));
+        let _ = senders.insert("b".into(), crate::message::Sender::Local(LocalSender::MpscSender(b_tx)));
 
         let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
         let eh = EffectHandler::new(
@@ -338,8 +343,8 @@ mod tests {
         let (b_tx, b_rx) = channel::<u64>(10);
 
         let mut senders = HashMap::new();
-        let _ = senders.insert("a".into(), LocalSender::MpscSender(a_tx));
-        let _ = senders.insert("b".into(), LocalSender::MpscSender(b_tx));
+        let _ = senders.insert("a".into(), crate::message::Sender::Local(LocalSender::MpscSender(a_tx)));
+        let _ = senders.insert("b".into(), crate::message::Sender::Local(LocalSender::MpscSender(b_tx)));
 
         let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
         let eh = EffectHandler::new(test_node("proc"), senders, None, metrics_reporter);
@@ -366,8 +371,8 @@ mod tests {
         let (b_tx, _b_rx) = channel::<u64>(1);
 
         let mut senders = HashMap::new();
-        let _ = senders.insert("a".into(), LocalSender::MpscSender(a_tx));
-        let _ = senders.insert("b".into(), LocalSender::MpscSender(b_tx));
+        let _ = senders.insert("a".into(), crate::message::Sender::Local(LocalSender::MpscSender(a_tx)));
+        let _ = senders.insert("b".into(), crate::message::Sender::Local(LocalSender::MpscSender(b_tx)));
 
         let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
         let eh = EffectHandler::new(test_node("proc"), senders, None, metrics_reporter);

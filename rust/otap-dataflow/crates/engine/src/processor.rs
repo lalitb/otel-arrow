@@ -46,7 +46,8 @@ pub enum ProcessorWrapper<PData> {
         /// A receiver for control messages.
         control_receiver: LocalReceiver<NodeControlMsg<PData>>,
         /// Senders for PData messages per out port.
-        pdata_senders: HashMap<PortName, LocalSender<PData>>,
+        /// Now stores full Sender enum to support fanout.
+        pdata_senders: HashMap<PortName, Sender<PData>>,
         /// A receiver for pdata messages.
         pdata_receiver: Option<Receiver<PData>>,
     },
@@ -65,6 +66,7 @@ pub enum ProcessorWrapper<PData> {
         /// A receiver for control messages.
         control_receiver: SharedReceiver<NodeControlMsg<PData>>,
         /// Senders for PData messages per out port.
+        /// Uses SharedSender directly (not Sender enum) to maintain Send safety.
         pdata_senders: HashMap<PortName, SharedSender<PData>>,
         /// A receiver for pdata messages.
         pdata_receiver: Option<SharedReceiver<PData>>,
@@ -364,24 +366,27 @@ impl<PData> NodeWithPDataSender<PData> for ProcessorWrapper<PData> {
         sender: Sender<PData>,
     ) -> Result<(), Error> {
         match (self, sender) {
-            (ProcessorWrapper::Local { pdata_senders, .. }, Sender::Local(sender)) => {
+            // Local wrapper accepts Local and LocalFanout senders
+            (ProcessorWrapper::Local { pdata_senders, .. }, sender @ (Sender::Local(_) | Sender::LocalFanout(_))) => {
                 let _ = pdata_senders.insert(port, sender);
                 Ok(())
             }
-            (ProcessorWrapper::Shared { pdata_senders, .. }, Sender::Shared(sender)) => {
-                let _ = pdata_senders.insert(port, sender);
+            // Shared wrapper accepts only Shared senders - extract the SharedSender
+            (ProcessorWrapper::Shared { pdata_senders, .. }, Sender::Shared(shared_sender)) => {
+                let _ = pdata_senders.insert(port, shared_sender);
                 Ok(())
             }
-            (ProcessorWrapper::Local { .. }, _) => Err(Error::ProcessorError {
+            // Mismatched sender types
+            (ProcessorWrapper::Local { .. }, Sender::Shared(_)) => Err(Error::ProcessorError {
                 processor: node_id,
                 kind: ProcessorErrorKind::Configuration,
-                error: "Expected a local sender for PData".to_owned(),
+                error: "Expected a local or local-fanout sender for Local ProcessorWrapper, got Shared".to_owned(),
                 source_detail: String::new(),
             }),
-            (ProcessorWrapper::Shared { .. }, _) => Err(Error::ProcessorError {
+            (ProcessorWrapper::Shared { .. }, Sender::Local(_) | Sender::LocalFanout(_)) => Err(Error::ProcessorError {
                 processor: node_id,
                 kind: ProcessorErrorKind::Configuration,
-                error: "Expected a shared sender for PData".to_owned(),
+                error: "Expected a shared sender for Shared ProcessorWrapper, got Local/LocalFanout".to_owned(),
                 source_detail: String::new(),
             }),
         }

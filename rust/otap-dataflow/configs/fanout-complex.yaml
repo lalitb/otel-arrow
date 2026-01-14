@@ -1,0 +1,77 @@
+# Complex Fanout Example
+# Demonstrates multi-stage fanout with processors
+# Shows how data flows through multiple fanout points
+
+settings:
+  default_pipeline_ctrl_msg_channel_size: 100
+  default_node_ctrl_msg_channel_size: 100
+  default_pdata_channel_size: 100
+
+nodes:
+  # Data source
+  fake_receiver:
+    kind: receiver
+    plugin_urn: "urn:otel:otap:fake_data_generator:receiver"
+    out_ports:
+      out_port:
+        # First fanout - receiver to two processors
+        destinations:
+          - debug_processor
+          - filter_processor
+        dispatch_strategy: round_robin
+    config:
+      traffic_config:
+        max_signal_count: 1000
+        max_batch_size: 100
+        signals_per_second: 100
+        log_weight: 100
+      registry_path: https://github.com/open-telemetry/semantic-conventions.git[model]
+
+  # Debug processor - passes through with logging
+  debug_processor:
+    kind: processor
+    plugin_urn: "urn:otel:debug:processor"
+    out_ports:
+      out_port:
+        # Second fanout - processor to multiple exporters
+        destinations:
+          - noop_exporter_1
+          - noop_exporter_2
+        dispatch_strategy: round_robin
+    config:
+      verbosity: basic
+
+  # Filter processor - demonstrates conditional processing
+  filter_processor:
+    kind: processor
+    plugin_urn: "urn:otel:debug:processor"
+    out_ports:
+      out_port:
+        # Third fanout - another branch with multiple outputs
+        destinations:
+          - noop_exporter_3
+          - noop_exporter_4
+        dispatch_strategy: round_robin
+    config:
+      verbosity: basic
+
+  # Multiple exporters to demonstrate fanout benefits
+  noop_exporter_1:
+    kind: exporter
+    plugin_urn: "urn:otel:noop:exporter"
+    config:
+
+  noop_exporter_2:
+    kind: exporter
+    plugin_urn: "urn:otel:noop:exporter"
+    config:
+
+  noop_exporter_3:
+    kind: exporter
+    plugin_urn: "urn:otel:noop:exporter"
+    config:
+
+  noop_exporter_4:
+    kind: exporter
+    plugin_urn: "urn:otel:noop:exporter"
+    config:
