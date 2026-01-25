@@ -289,7 +289,7 @@ excess requests are refused at `poll_ready` rather than queued.
 
 ## TLS Support
 
-TLS is available via the `experimental-tls` feature flag:
+TLS is enabled by default. Configure TLS for both gRPC and HTTP endpoints:
 
 ```yaml
 config:

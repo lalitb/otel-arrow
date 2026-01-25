@@ -45,9 +45,9 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use zstd::stream::read::Decoder as ZstdDecoder;
 
-#[cfg(feature = "experimental-tls")]
+
 use crate::tls_utils::build_tls_acceptor;
-#[cfg(feature = "experimental-tls")]
+
 use otap_df_config::tls::TlsServerConfig;
 
 /// OTLP protobuf content type
@@ -119,9 +119,6 @@ pub struct HttpServerSettings {
     pub accept_compressed_requests: bool,
 
     /// Optional TLS configuration.
-    ///
-    /// This is only available when the `experimental-tls` feature is enabled.
-    #[cfg(feature = "experimental-tls")]
     #[serde(default)]
     pub tls: Option<TlsServerConfig>,
 }
@@ -139,7 +136,7 @@ impl Default for HttpServerSettings {
             wait_for_result: default_wait_for_result(),
             timeout: default_http_timeout(),
             accept_compressed_requests: default_accept_compressed_requests(),
-            #[cfg(feature = "experimental-tls")]
+            
             tls: None,
         }
     }
@@ -739,7 +736,7 @@ pub async fn serve(
 
     let tracker = TaskTracker::new();
 
-    #[cfg(feature = "experimental-tls")]
+    
     let maybe_tls_acceptor = build_tls_acceptor(settings.tls.as_ref()).await?;
 
     loop {
@@ -779,7 +776,7 @@ pub async fn serve(
                     semaphore: semaphore.clone(),
                 };
 
-                #[cfg(feature = "experimental-tls")]
+                
                 {
                     if let Some(acceptor) = maybe_tls_acceptor.clone() {
                         let shutdown = shutdown.clone();

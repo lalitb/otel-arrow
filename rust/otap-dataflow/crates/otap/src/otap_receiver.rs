@@ -17,9 +17,9 @@ use crate::otap_grpc::{
     ArrowLogsServiceImpl, ArrowMetricsServiceImpl, ArrowTracesServiceImpl, Settings,
 };
 use crate::pdata::OtapPdata;
-#[cfg(feature = "experimental-tls")]
+
 use crate::tls_utils::{build_tls_acceptor, create_tls_stream};
-#[cfg(feature = "experimental-tls")]
+
 use otap_df_config::tls::TlsServerConfig;
 
 use async_trait::async_trait;
@@ -89,7 +89,7 @@ pub struct Config {
     pub timeout: Option<Duration>,
 
     /// TLS configuration
-    #[cfg(feature = "experimental-tls")]
+    
     pub tls: Option<TlsServerConfig>,
 }
 
@@ -286,7 +286,7 @@ impl shared::Receiver<OtapPdata> for OTAPReceiver {
             server_builder = server_builder.timeout(timeout);
         }
 
-        #[cfg(feature = "experimental-tls")]
+        
         let maybe_tls_acceptor =
             build_tls_acceptor(self.config.tls.as_ref())
                 .await
@@ -297,7 +297,7 @@ impl shared::Receiver<OtapPdata> for OTAPReceiver {
                     source_detail: format_error_sources(&e),
                 })?;
 
-        #[cfg(feature = "experimental-tls")]
+        
         let handshake_timeout = self.config.tls.as_ref().and_then(|t| t.handshake_timeout);
 
         let server = server_builder
@@ -350,17 +350,12 @@ impl shared::Receiver<OtapPdata> for OTAPReceiver {
             // has a middleware layer applied which changes the Router type, making it
             // incompatible with a shared helper function without complex generic bounds.
             result = async {
-                #[cfg(feature = "experimental-tls")]
                 match maybe_tls_acceptor {
                     Some(tls_acceptor) => {
                         let tls_stream = create_tls_stream(listener_stream, tls_acceptor, handshake_timeout);
                         server.serve_with_incoming(tls_stream).await
                     }
                     None => server.serve_with_incoming(listener_stream).await,
-                }
-                #[cfg(not(feature = "experimental-tls"))]
-                {
-                    server.serve_with_incoming(listener_stream).await
                 }
             } => {
                 if let Err(error) = result {

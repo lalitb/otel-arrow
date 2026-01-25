@@ -22,9 +22,9 @@ use crate::otap_grpc::otlp::server_new::{
     LogsServiceServer, MetricsServiceServer, OtlpServerSettings, TraceServiceServer,
 };
 use crate::pdata::OtapPdata;
-#[cfg(feature = "experimental-tls")]
+
 use crate::tls_utils::{build_tls_acceptor, create_tls_stream};
-#[cfg(feature = "experimental-tls")]
+
 use otap_df_config::tls::TlsServerConfig;
 
 use crate::otap_grpc::common;
@@ -83,7 +83,7 @@ pub struct Config {
     pub http: Option<HttpServerSettings>,
 
     /// TLS configuration
-    #[cfg(feature = "experimental-tls")]
+    
     pub tls: Option<TlsServerConfig>,
 }
 
@@ -384,7 +384,7 @@ impl shared::Receiver<OtapPdata> for OTLPReceiver {
             .add_service(metrics_server)
             .add_service(traces_server);
 
-        #[cfg(feature = "experimental-tls")]
+        
         let maybe_tls_acceptor =
             build_tls_acceptor(self.config.tls.as_ref())
                 .await
@@ -395,7 +395,7 @@ impl shared::Receiver<OtapPdata> for OTLPReceiver {
                     source_detail: format_error_sources(&e),
                 })?;
 
-        #[cfg(feature = "experimental-tls")]
+        
         let handshake_timeout = self.config.tls.as_ref().and_then(|t| t.handshake_timeout);
 
         let mut telemetry_cancel_handle = Some(
@@ -407,20 +407,13 @@ impl shared::Receiver<OtapPdata> for OTLPReceiver {
         let mut server_task: Pin<
             Box<dyn Future<Output = Result<(), tonic::transport::Error>> + Send>,
         > = {
-            #[cfg(feature = "experimental-tls")]
-            {
-                match maybe_tls_acceptor {
-                    Some(tls_acceptor) => {
-                        let tls_stream =
-                            create_tls_stream(incoming, tls_acceptor, handshake_timeout);
-                        Box::pin(server.serve_with_incoming(tls_stream))
-                    }
-                    None => Box::pin(server.serve_with_incoming(incoming)),
+            match maybe_tls_acceptor {
+                Some(tls_acceptor) => {
+                    let tls_stream =
+                        create_tls_stream(incoming, tls_acceptor, handshake_timeout);
+                    Box::pin(server.serve_with_incoming(tls_stream))
                 }
-            }
-            #[cfg(not(feature = "experimental-tls"))]
-            {
-                Box::pin(server.serve_with_incoming(incoming))
+                None => Box::pin(server.serve_with_incoming(incoming)),
             }
         };
 
@@ -577,7 +570,7 @@ mod tests {
         Config {
             grpc,
             http: None,
-            #[cfg(feature = "experimental-tls")]
+            
             tls: None,
         }
     }

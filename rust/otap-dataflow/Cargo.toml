@@ -38,7 +38,7 @@ quiver = { workspace = true, optional = true }
 serde_json.workspace = true
 clap.workspace = true
 mimalloc = { workspace = true, optional = true }
-rustls = { workspace = true, optional = true }
+rustls.workspace = true
 sysinfo.workspace = true
 
 [target.'cfg(not(windows))'.dependencies]
@@ -206,8 +206,6 @@ unchecked-index = []
 unchecked-arithmetic = []
 # Experimental persistence prototype (opt-in)
 quiver-persistence = ["quiver"]
-# Experimental features
-experimental-tls = ["otap-df-otap/experimental-tls", "dep:rustls"]
 # Experimental exporters (opt-in)
 experimental-exporters = ["otap-df-otap/experimental-exporters"]
 geneva-exporter = ["otap-df-otap/geneva-exporter"]

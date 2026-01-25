@@ -108,8 +108,8 @@ pub mod internal_telemetry_receiver;
 /// Object storage utilities including integrations for different cloud
 /// providers
 pub mod object_store;
+
 /// TLS utilities
-#[cfg(feature = "experimental-tls")]
 pub mod tls_utils;
 
 /// Console exporter similar using built-in OTLP-bytes formatting.
