@@ -369,6 +369,62 @@ async fn add_system_trust_anchors_if_enabled(
     Ok(tls.trust_anchors(store.roots))
 }
 
+/// Downcasts an `io::Error` to the underlying `rustls::Error`, if present.
+fn rustls_error_source(err: &io::Error) -> Option<&rustls::Error> {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = err.get_ref().map(|e| e as _);
+    while let Some(e) = cur {
+        if let Some(r) = e.downcast_ref::<rustls::Error>() {
+            return Some(r);
+        }
+        cur = e.source();
+    }
+    None
+}
+
+/// Classifies TLS handshake failures into coarse buckets for logging/triage.
+pub fn classify_tls_handshake(err: &io::Error) -> &'static str {
+    if err.kind() == io::ErrorKind::TimedOut {
+        return "timeout";
+    }
+    if err.kind() == io::ErrorKind::UnexpectedEof {
+        return "peer_closed";
+    }
+
+    if let Some(rustls_err) = rustls_error_source(err) {
+        use rustls::AlertDescription;
+        use rustls::Error as RustlsError;
+
+        return match rustls_err {
+            RustlsError::NoCertificatesPresented => "client_cert_missing",
+            RustlsError::AlertReceived(alert) => match alert {
+                AlertDescription::UnknownCA
+                | AlertDescription::BadCertificate
+                | AlertDescription::CertificateExpired
+                | AlertDescription::CertificateRevoked => "client_rejected_cert",
+                AlertDescription::NoApplicationProtocol => "alpn_mismatch",
+                AlertDescription::HandshakeFailure => "handshake_failure",
+                _ => "alert",
+            },
+            RustlsError::NoApplicationProtocol => "alpn_mismatch",
+            RustlsError::PeerIncompatible(_) => "protocol_version_or_cipher",
+            RustlsError::PeerMisbehaved(_) => "protocol_error",
+            RustlsError::InvalidMessage(_) => "plaintext_or_garbled",
+            _ => "other",
+        };
+    }
+
+    "io_error"
+}
+
+/// Returns true if the classified handshake error is expected/benign (probe/timeout/plaintext).
+pub fn is_benign_handshake_class(class: &str) -> bool {
+    matches!(class, "peer_closed" | "timeout" | "plaintext_or_garbled")
+}
+
+fn alpn_to_string(alpn: Option<&[u8]>) -> Option<String> {
+    alpn.map(|proto| String::from_utf8_lossy(proto).to_string())
+}
+
 /// Creates a TLS stream from a TCP listener stream and a TLS acceptor.
 ///
 /// This function handles the TLS handshake for each incoming connection.
@@ -404,14 +460,28 @@ where
                         let timeout_duration = handshake_timeout.unwrap_or(Duration::from_secs(10));
 
                         match tokio::time::timeout(timeout_duration, handshake_future).await {
-                            Ok(Ok(stream)) => Some(Ok::<_, io::Error>(stream)),
+                            Ok(Ok(stream)) => {
+                                let (_, conn) = stream.get_ref();
+                                otel_debug!(
+                                    "tls.handshake.success",
+                                    sni = ?conn.server_name(),
+                                    alpn = ?alpn_to_string(conn.alpn_protocol()),
+                                    protocol_version = ?conn.protocol_version(),
+                                    cipher_suite = ?conn.negotiated_cipher_suite().map(|c| c.suite().as_str()),
+                                );
+                                Some(Ok::<_, io::Error>(stream))
+                            }
                             Ok(Err(e)) => {
-                                // TLS handshake failed - log and continue
-                                otel_warn!("TLS handshake failed", error = ?e);
+                                let class = classify_tls_handshake(&e);
+                                if is_benign_handshake_class(class) {
+                                    otel_debug!("tls.handshake.failed", error_kind = class, error = %e);
+                                } else {
+                                    otel_warn!("tls.handshake.failed", error_kind = class, error = %e);
+                                }
                                 None
                             }
                             Err(_) => {
-                                otel_warn!("TLS handshake timed out");
+                                otel_debug!("tls.handshake.timeout");
                                 None
                             }
                         }

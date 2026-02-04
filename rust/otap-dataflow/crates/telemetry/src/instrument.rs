@@ -279,7 +279,9 @@ impl UpDownCounter<u64> {
         }
         #[cfg(not(feature = "unchecked-arithmetic"))]
         {
-            self.0 -= 1;
+            // Avoid panicking on underflow when dec is called at zero; telemetry counters
+            // should saturate instead of crashing the pipeline.
+            self.0 = self.0.saturating_sub(1);
         }
     }
 }

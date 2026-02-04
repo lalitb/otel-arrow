@@ -32,7 +32,10 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[cfg(feature = "experimental-tls")]
-use crate::tls_utils::{accept_tls_connection, build_tls_acceptor};
+use crate::tls_utils::{
+    accept_tls_connection, build_tls_acceptor, classify_tls_handshake,
+    is_benign_handshake_class,
+};
 #[cfg(feature = "experimental-tls")]
 use otap_df_config::tls::TlsServerConfig;
 #[cfg(feature = "experimental-tls")]
@@ -242,20 +245,34 @@ impl local::Receiver<OtapPdata> for SyslogCefReceiver {
                                                 .unwrap_or(Duration::from_secs(10));
                                             match accept_tls_connection(socket, &acceptor, timeout).await {
                                                 Ok(tls_stream) => {
+                                                    let (_, conn) = tls_stream.get_ref();
                                                     otel_debug!(
                                                         "tls.handshake.success",
                                                         peer = %peer_addr,
-                                                        message = "TLS handshake completed"
+                                                        sni = ?conn.server_name(),
+                                                        alpn = ?conn.alpn_protocol().map(|p| String::from_utf8_lossy(p).to_string())
                                                     );
                                                     Box::new(BufReader::new(tls_stream))
                                                 }
                                                 Err(e) => {
-                                                    otel_warn!(
-                                                        "tls.handshake.failed",
-                                                        peer = %peer_addr,
-                                                        error = %e,
-                                                        message = "TLS handshake failed, closing connection"
-                                                    );
+                                                    let class = classify_tls_handshake(&e);
+                                                    if is_benign_handshake_class(class) {
+                                                        otel_debug!(
+                                                            "tls.handshake.failed",
+                                                            peer = %peer_addr,
+                                                            error_kind = class,
+                                                            error = %e,
+                                                            message = "TLS handshake failed, closing connection"
+                                                        );
+                                                    } else {
+                                                        otel_warn!(
+                                                            "tls.handshake.failed",
+                                                            peer = %peer_addr,
+                                                            error_kind = class,
+                                                            error = %e,
+                                                            message = "TLS handshake failed, closing connection"
+                                                        );
+                                                    }
                                                     metrics.borrow_mut().tcp_connections_active.dec();
                                                     metrics.borrow_mut().tls_handshake_failures.inc();
                                                     return;
