@@ -302,6 +302,45 @@ pub async fn start_tonic_tls_server(
     (addr, rx, handle)
 }
 
+/// Start a gRPC LogsService server using `build_reloadable_server_config` +
+/// `create_tls_stream` — the real receiver TLS code path. This exercises
+/// file-based cert loading and the reloadable cert resolver.
+pub async fn start_grpc_server_with_reloadable_tls(
+    tls_config: TlsServerConfig,
+) -> (
+    SocketAddr,
+    mpsc::Receiver<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let handshake_timeout = tls_config.handshake_timeout;
+    let server_config = build_reloadable_server_config(&tls_config)
+        .await
+        .expect("build server TLS config");
+    let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+
+    let (tx, rx) = mpsc::channel::<()>(16);
+    let logs_service = LogsServiceServer::new(LogsServiceMock { sender: tx });
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+    let tls_incoming =
+        otap_df_otap::tls_utils::create_tls_stream(incoming, acceptor, handshake_timeout);
+
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(logs_service)
+            .serve_with_incoming(tls_incoming)
+            .await
+            .expect("server");
+    });
+
+    (addr, rx, handle)
+}
+
 /// Start a raw TLS echo-server using `build_reloadable_server_config`.
 /// Returns `(addr, JoinHandle)`.  Useful for low-level TLS handshake tests.
 pub async fn start_raw_tls_server(

@@ -46,7 +46,7 @@ mod tls_handshake {
         handle.abort();
     }
 
-    /// Same as above but with certs loaded from files.
+    /// Same as above but with certs loaded from files via build_reloadable_server_config.
     #[tokio::test]
     async fn tls_server_only_file_succeeds() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -55,11 +55,12 @@ mod tls_handshake {
         write_certs_to_dir(&bundle, dir.path());
 
         let tls_config = make_server_tls_config_file(dir.path());
-        let (addr, handle) = start_raw_tls_server(tls_config).await;
+        let (addr, mut rx, handle) = start_grpc_server_with_reloadable_tls(tls_config).await;
 
-        let connector = make_rustls_connector(&bundle.ca_pem, None, None);
-        let result = try_tls_handshake(addr, &connector, "localhost").await;
-        assert!(result.is_ok(), "TLS handshake with file-based certs should succeed");
+        let channel = make_tls_client_channel(addr, &bundle.ca_pem, "localhost")
+            .await
+            .expect("connect with file-based TLS");
+        assert_logs_export_succeeds(channel, &mut rx).await;
         handle.abort();
     }
 
@@ -184,15 +185,18 @@ mod mtls {
         write_certs_to_dir(&bundle, dir.path());
 
         let tls_config = make_server_mtls_config_file(dir.path());
-        let (addr, handle) = start_raw_tls_server(tls_config).await;
+        let (addr, mut rx, handle) = start_grpc_server_with_reloadable_tls(tls_config).await;
 
-        let connector = make_rustls_connector(
+        let channel = make_mtls_client_channel(
+            addr,
             &bundle.ca_pem,
-            Some(&bundle.client_cert_pem),
-            Some(&bundle.client_key_pem),
-        );
-        let result = try_tls_handshake(addr, &connector, "localhost").await;
-        assert!(result.is_ok(), "file-based mTLS should succeed");
+            &bundle.client_cert_pem,
+            &bundle.client_key_pem,
+            "localhost",
+        )
+        .await
+        .expect("connect with file-based mTLS");
+        assert_logs_export_succeeds(channel, &mut rx).await;
         handle.abort();
     }
 
