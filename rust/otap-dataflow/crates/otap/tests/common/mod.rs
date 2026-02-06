@@ -5,3 +5,5 @@
 
 pub mod counting_exporter;
 pub mod flaky_exporter;
+#[cfg(feature = "experimental-tls")]
+pub mod tls_helpers;
