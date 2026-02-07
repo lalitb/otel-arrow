@@ -6,123 +6,25 @@
 #![cfg(feature = "experimental-tls")]
 #![allow(missing_docs)]
 
+mod common;
+
+use common::tls_helpers::{
+    assert_logs_export_succeeds, generate_test_certs, start_tonic_tls_server,
+};
 use otap_df_config::tls::{TlsClientConfig, TlsConfig};
 use otap_df_otap::otap_grpc::client_settings::GrpcClientSettings;
-use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
-    Issuer, KeyPair, KeyUsagePurpose,
-};
-use std::net::SocketAddr;
-use tokio::sync::mpsc;
-use tonic::transport::{Identity, Server, ServerTlsConfig};
-
-use bytes::Bytes;
-use otap_df_otap::otap_grpc::otlp::client::LogsServiceClient;
-use otap_df_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest;
-use otap_df_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceResponse;
-use otap_df_pdata::proto::opentelemetry::collector::logs::v1::logs_service_server::{
-    LogsService, LogsServiceServer,
-};
-use prost::Message;
-use tokio::sync::mpsc::Sender;
-use tonic::{Request, Response, Status};
-
-struct LogsServiceMock {
-    sender: Sender<()>,
-}
-
-#[tonic::async_trait]
-impl LogsService for LogsServiceMock {
-    async fn export(
-        &self,
-        _request: Request<ExportLogsServiceRequest>,
-    ) -> Result<Response<ExportLogsServiceResponse>, Status> {
-        self.sender
-            .send(())
-            .await
-            .map_err(|_| Status::internal("send failed"))?;
-        Ok(Response::new(ExportLogsServiceResponse {
-            partial_success: None,
-        }))
-    }
-}
-
-fn new_ca() -> (Certificate, Issuer<'static, KeyPair>) {
-    let mut params = CertificateParams::new(Vec::default()).expect("empty SAN");
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params
-        .distinguished_name
-        .push(DnType::CommonName, "Test CA");
-    params.key_usages.push(KeyUsagePurpose::DigitalSignature);
-    params.key_usages.push(KeyUsagePurpose::KeyCertSign);
-    params.key_usages.push(KeyUsagePurpose::CrlSign);
-    let key_pair = KeyPair::generate().expect("ca key");
-    let ca = params.self_signed(&key_pair).expect("ca cert");
-    let issuer = Issuer::new(params, key_pair);
-    (ca, issuer)
-}
-
-fn new_leaf(
-    cn: &str,
-    san: &str,
-    eku: ExtendedKeyUsagePurpose,
-    issuer: &Issuer<'_, KeyPair>,
-) -> (String, String) {
-    let mut params = CertificateParams::new(vec![san.to_string()]).expect("SAN");
-    params.distinguished_name.push(DnType::CommonName, cn);
-    params.use_authority_key_identifier_extension = true;
-    params.key_usages.push(KeyUsagePurpose::DigitalSignature);
-    params.extended_key_usages.push(eku);
-    let key_pair = KeyPair::generate().expect("leaf key");
-    let cert = params.signed_by(&key_pair, issuer).expect("leaf cert");
-    (cert.pem(), key_pair.serialize_pem())
-}
 
 #[tokio::test]
 async fn otlp_exporter_connects_with_mtls() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // Generate CA, server cert, client cert.
-    let (ca, ca_issuer) = new_ca();
-    let ca_pem = ca.pem();
-    let (server_cert_pem, server_key_pem) = new_leaf(
-        "localhost",
-        "localhost",
-        ExtendedKeyUsagePurpose::ServerAuth,
-        &ca_issuer,
-    );
-    let (client_cert_pem, client_key_pem) = new_leaf(
-        "client",
-        "client",
-        ExtendedKeyUsagePurpose::ClientAuth,
-        &ca_issuer,
-    );
-
-    // gRPC service mock.
-    let (tx, mut rx) = mpsc::channel::<()>(8);
-    let logs_service = LogsServiceServer::new(LogsServiceMock { sender: tx });
-
-    let server_identity = Identity::from_pem(server_cert_pem.as_bytes(), server_key_pem.as_bytes());
-    let client_ca_root = tonic::transport::Certificate::from_pem(ca_pem.as_bytes());
-
-    let tls = ServerTlsConfig::new()
-        .identity(server_identity)
-        .client_ca_root(client_ca_root);
-
-    // Bind to ephemeral port.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr: SocketAddr = listener.local_addr().unwrap();
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-
-    let server = tokio::spawn(async move {
-        Server::builder()
-            .tls_config(tls)
-            .unwrap()
-            .add_service(logs_service)
-            .serve_with_incoming(incoming)
-            .await
-            .unwrap();
-    });
+    let bundle = generate_test_certs();
+    let (addr, mut rx, server) = start_tonic_tls_server(
+        &bundle.server_cert_pem,
+        &bundle.server_key_pem,
+        Some(&bundle.ca_pem),
+    )
+    .await;
 
     // Build client endpoint with exporter-style TLS config.
     let settings = GrpcClientSettings {
@@ -130,13 +32,13 @@ async fn otlp_exporter_connects_with_mtls() {
         tls: Some(TlsClientConfig {
             config: TlsConfig {
                 cert_file: None,
-                cert_pem: Some(client_cert_pem),
+                cert_pem: Some(bundle.client_cert_pem),
                 key_file: None,
-                key_pem: Some(client_key_pem),
+                key_pem: Some(bundle.client_key_pem),
                 reload_interval: None,
             },
             ca_file: None,
-            ca_pem: Some(ca_pem),
+            ca_pem: Some(bundle.ca_pem),
             include_system_ca_certs_pool: Some(false),
             server_name: Some("localhost".to_string()),
             ..TlsClientConfig::default()
@@ -146,23 +48,7 @@ async fn otlp_exporter_connects_with_mtls() {
 
     let endpoint = settings.build_endpoint_with_tls().await.unwrap();
     let channel = endpoint.connect().await.unwrap();
-
-    // Send a tiny export request to prove the connection works.
-    // We only assert that server received at least one request.
-    let mut client = LogsServiceClient::new(channel);
-    let req = ExportLogsServiceRequest {
-        resource_logs: Vec::new(),
-    };
-
-    let mut buf = Vec::new();
-    req.encode(&mut buf).unwrap();
-    let _ = client.export(Bytes::from(buf)).await.unwrap();
-
-    // Server should observe a message.
-    let observed = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-        .await
-        .unwrap();
-    assert!(observed.is_some());
+    assert_logs_export_succeeds(channel, &mut rx).await;
 
     server.abort();
 }
@@ -171,36 +57,9 @@ async fn otlp_exporter_connects_with_mtls() {
 async fn otlp_exporter_fails_with_invalid_ca_pem() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // Generate CA and server cert.
-    let (_ca, ca_issuer) = new_ca();
-    let (server_cert_pem, server_key_pem) = new_leaf(
-        "localhost",
-        "localhost",
-        ExtendedKeyUsagePurpose::ServerAuth,
-        &ca_issuer,
-    );
-
-    // gRPC service mock.
-    let (tx, _rx) = mpsc::channel::<()>(8);
-    let logs_service = LogsServiceServer::new(LogsServiceMock { sender: tx });
-
-    let server_identity = Identity::from_pem(server_cert_pem.as_bytes(), server_key_pem.as_bytes());
-    let tls = ServerTlsConfig::new().identity(server_identity);
-
-    // Bind to ephemeral port.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr: SocketAddr = listener.local_addr().unwrap();
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-
-    let server = tokio::spawn(async move {
-        Server::builder()
-            .tls_config(tls)
-            .unwrap()
-            .add_service(logs_service)
-            .serve_with_incoming(incoming)
-            .await
-            .unwrap();
-    });
+    let bundle = generate_test_certs();
+    let (addr, _rx, server) =
+        start_tonic_tls_server(&bundle.server_cert_pem, &bundle.server_key_pem, None).await;
 
     // Invalid CA PEM should prevent a successful TLS connection.
     let settings = GrpcClientSettings {
@@ -274,38 +133,9 @@ async fn otlp_exporter_fails_partial_mtls() {
 async fn otlp_exporter_connects_with_tls_only() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // Generate CA and server cert (no client cert needed for TLS-only).
-    let (ca, ca_issuer) = new_ca();
-    let ca_pem = ca.pem();
-    let (server_cert_pem, server_key_pem) = new_leaf(
-        "localhost",
-        "localhost",
-        ExtendedKeyUsagePurpose::ServerAuth,
-        &ca_issuer,
-    );
-
-    // gRPC service mock.
-    let (tx, mut rx) = mpsc::channel::<()>(8);
-    let logs_service = LogsServiceServer::new(LogsServiceMock { sender: tx });
-
-    let server_identity = Identity::from_pem(server_cert_pem.as_bytes(), server_key_pem.as_bytes());
-    // No client_ca_root - server doesn't require client certificates (TLS-only, not mTLS).
-    let tls = ServerTlsConfig::new().identity(server_identity);
-
-    // Bind to ephemeral port.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr: SocketAddr = listener.local_addr().unwrap();
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-
-    let server = tokio::spawn(async move {
-        Server::builder()
-            .tls_config(tls)
-            .unwrap()
-            .add_service(logs_service)
-            .serve_with_incoming(incoming)
-            .await
-            .unwrap();
-    });
+    let bundle = generate_test_certs();
+    let (addr, mut rx, server) =
+        start_tonic_tls_server(&bundle.server_cert_pem, &bundle.server_key_pem, None).await;
 
     // Build client endpoint with TLS but no client identity (TLS-only).
     let settings = GrpcClientSettings {
@@ -313,7 +143,7 @@ async fn otlp_exporter_connects_with_tls_only() {
         tls: Some(TlsClientConfig {
             config: TlsConfig::default(), // No client cert/key
             ca_file: None,
-            ca_pem: Some(ca_pem),
+            ca_pem: Some(bundle.ca_pem),
             include_system_ca_certs_pool: Some(false),
             server_name: Some("localhost".to_string()),
             ..TlsClientConfig::default()
@@ -323,22 +153,7 @@ async fn otlp_exporter_connects_with_tls_only() {
 
     let endpoint = settings.build_endpoint_with_tls().await.unwrap();
     let channel = endpoint.connect().await.unwrap();
-
-    // Send a request to prove the TLS connection works.
-    let mut client = LogsServiceClient::new(channel);
-    let req = ExportLogsServiceRequest {
-        resource_logs: Vec::new(),
-    };
-
-    let mut buf = Vec::new();
-    req.encode(&mut buf).unwrap();
-    let _ = client.export(Bytes::from(buf)).await.unwrap();
-
-    // Server should observe a message.
-    let observed = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-        .await
-        .unwrap();
-    assert!(observed.is_some());
+    assert_logs_export_succeeds(channel, &mut rx).await;
 
     server.abort();
 }

@@ -220,16 +220,16 @@ mod tests {
                     Ok(stream) => stream,
                     Err(_) => return false,
                 };
-                connector2
-                    .connect(domain.clone(), stream)
-                    .await
-                    .is_ok()
+                connector2.connect(domain.clone(), stream).await.is_ok()
             },
             Duration::from_millis(200),
             Duration::from_secs(10),
         )
         .await;
-        assert!(ca2_ready, "Handshake with CA2 failed (reload did not happen)");
+        assert!(
+            ca2_ready,
+            "Handshake with CA2 failed (reload did not happen)"
+        );
 
         // 7. Verify Client trusting CA1 now fails
         let ca1_rejected = poll_until(

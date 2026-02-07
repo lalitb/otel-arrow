@@ -7,7 +7,7 @@
 
 mod common;
 
-use common::tls_helpers::poll_until;
+use common::tls_helpers::{attempt_raw_tls_connection, poll_until};
 use otap_df_config::tls::{TlsConfig, TlsServerConfig};
 use otap_df_otap::tls_utils::build_reloadable_server_config;
 use otap_df_telemetry::{otel_debug, otel_info};
@@ -487,88 +487,32 @@ async fn test_mtls_ca_hot_reload() {
         .expect("Failed to build server config");
     let tls_acceptor = Arc::new(tokio_rustls::TlsAcceptor::from(server_config));
 
-    // Helper to create client config that trusts the server
-    let server_cert_path_clone = server_cert_path.clone();
-    let create_client_config =
-        move |client_cert_path: &std::path::Path, client_key_path: &std::path::Path| {
-            let mut root_store = rustls::RootCertStore::empty();
-            let server_cert_pem =
-                fs::read_to_string(&server_cert_path_clone).expect("Read server cert");
-            for cert in CertificateDer::pem_slice_iter(server_cert_pem.as_bytes()) {
-                root_store.add(cert.expect("Parse cert")).expect("Add cert");
-            }
-
-            let client_cert_pem = fs::read_to_string(client_cert_path).expect("Read client cert");
-            let client_certs: Vec<_> = CertificateDer::pem_slice_iter(client_cert_pem.as_bytes())
-                .map(|c| c.expect("Parse client cert"))
-                .collect();
-
-            let client_key_pem = fs::read_to_string(client_key_path).expect("Read client key");
-            let client_key =
-                PrivateKeyDer::from_pem_slice(client_key_pem.as_bytes()).expect("Parse client key");
-
-            Arc::new(
-                rustls::ClientConfig::builder()
-                    .with_root_certificates(root_store)
-                    .with_client_auth_cert(client_certs, client_key)
-                    .expect("Build client config"),
-            )
-        };
-
     // Test 1: Client1 should be ACCEPTED (server trusts client1's cert)
     {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("Failed to bind");
-        let addr = listener.local_addr().expect("Failed to get addr");
-
-        let acceptor_clone = Arc::clone(&tls_acceptor);
-        let server_handle = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("Accept");
-            acceptor_clone.accept(stream).await.is_ok()
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        let client_config = create_client_config(&client1_cert_path, &client1_key_path);
-        let connector = tokio_rustls::TlsConnector::from(client_config);
-        let stream = tokio::net::TcpStream::connect(addr).await.expect("Connect");
-        let server_name: rustls::pki_types::ServerName<'_> =
-            "localhost".try_into().expect("Invalid DNS name");
-        let result = connector.connect(server_name, stream).await;
-
-        let server_accepted = server_handle.await.expect("Server task");
+        let (server_accepted, client_failed_or_disconnected) = attempt_raw_tls_connection(
+            &tls_acceptor,
+            &server_cert.cert_pem,
+            Some(&client1.cert_pem),
+            Some(&client1.key_pem),
+        )
+        .await;
         assert!(
-            result.is_ok() && server_accepted,
+            !client_failed_or_disconnected && server_accepted,
             "Client1 should be accepted (trusted by initial CA)"
         );
     }
 
     // Test 2: Client2 should be REJECTED (not yet trusted)
     {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("Failed to bind");
-        let addr = listener.local_addr().expect("Failed to get addr");
-
-        let acceptor_clone = Arc::clone(&tls_acceptor);
-        let server_handle = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("Accept");
-            acceptor_clone.accept(stream).await.is_ok()
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        let client_config = create_client_config(&client2_cert_path, &client2_key_path);
-        let connector = tokio_rustls::TlsConnector::from(client_config);
-        let stream = tokio::net::TcpStream::connect(addr).await.expect("Connect");
-        let server_name: rustls::pki_types::ServerName<'_> =
-            "localhost".try_into().expect("Invalid DNS name");
-        let result = connector.connect(server_name, stream).await;
-
-        let server_accepted = server_handle.await.expect("Server task");
+        let (server_accepted, client_failed_or_disconnected) = attempt_raw_tls_connection(
+            &tls_acceptor,
+            &server_cert.cert_pem,
+            Some(&client2.cert_pem),
+            Some(&client2.key_pem),
+        )
+        .await;
         assert!(
-            result.is_err() || !server_accepted,
+            client_failed_or_disconnected || !server_accepted,
             "Client2 should be rejected (not trusted by current CA)"
         );
     }
@@ -583,37 +527,14 @@ async fn test_mtls_ca_hot_reload() {
 
     let client2_after_reload_accepted = poll_until(
         || async {
-            let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
-                Ok(listener) => listener,
-                Err(_) => return false,
-            };
-            let addr = match listener.local_addr() {
-                Ok(addr) => addr,
-                Err(_) => return false,
-            };
-
-            let acceptor_clone = Arc::clone(&tls_acceptor);
-            let server_handle = tokio::spawn(async move {
-                let (stream, _) = match listener.accept().await {
-                    Ok(v) => v,
-                    Err(_) => return false,
-                };
-                acceptor_clone.accept(stream).await.is_ok()
-            });
-
-            let client_config = create_client_config(&client2_cert_path, &client2_key_path);
-            let connector = tokio_rustls::TlsConnector::from(client_config);
-            let stream = match tokio::net::TcpStream::connect(addr).await {
-                Ok(stream) => stream,
-                Err(_) => return false,
-            };
-            let server_name: rustls::pki_types::ServerName<'_> = match "localhost".try_into() {
-                Ok(name) => name,
-                Err(_) => return false,
-            };
-            let client_ok = connector.connect(server_name, stream).await.is_ok();
-            let server_accepted = server_handle.await.unwrap_or(false);
-            client_ok && server_accepted
+            let (server_accepted, client_failed_or_disconnected) = attempt_raw_tls_connection(
+                &tls_acceptor,
+                &server_cert.cert_pem,
+                Some(&client2.cert_pem),
+                Some(&client2.key_pem),
+            )
+            .await;
+            server_accepted && !client_failed_or_disconnected
         },
         std::time::Duration::from_millis(200),
         std::time::Duration::from_secs(10),
@@ -626,29 +547,15 @@ async fn test_mtls_ca_hot_reload() {
 
     // Test 4: After hot-reload, Client1 should now be REJECTED
     {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("Failed to bind");
-        let addr = listener.local_addr().expect("Failed to get addr");
-
-        let acceptor_clone = Arc::clone(&tls_acceptor);
-        let server_handle = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("Accept");
-            acceptor_clone.accept(stream).await.is_ok()
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        let client_config = create_client_config(&client1_cert_path, &client1_key_path);
-        let connector = tokio_rustls::TlsConnector::from(client_config);
-        let stream = tokio::net::TcpStream::connect(addr).await.expect("Connect");
-        let server_name: rustls::pki_types::ServerName<'_> =
-            "localhost".try_into().expect("Invalid DNS name");
-        let result = connector.connect(server_name, stream).await;
-
-        let server_accepted = server_handle.await.expect("Server task");
+        let (server_accepted, client_failed_or_disconnected) = attempt_raw_tls_connection(
+            &tls_acceptor,
+            &server_cert.cert_pem,
+            Some(&client1.cert_pem),
+            Some(&client1.key_pem),
+        )
+        .await;
         assert!(
-            result.is_err() || !server_accepted,
+            client_failed_or_disconnected || !server_accepted,
             "Client1 should be rejected after CA hot-reload (no longer trusted)"
         );
     }
@@ -709,54 +616,17 @@ async fn test_mtls_ca_reload_with_corrupted_file() {
         .expect("Failed to build server config");
     let tls_acceptor = Arc::new(tokio_rustls::TlsAcceptor::from(server_config));
 
-    // Helper to create client config
-    let server_pem = server_cert.cert_pem.clone();
-    let create_client_config = move || {
-        let mut root_store = rustls::RootCertStore::empty();
-        for cert in CertificateDer::pem_slice_iter(server_pem.as_bytes()) {
-            root_store.add(cert.expect("Parse cert")).expect("Add cert");
-        }
-
-        let client_certs: Vec<_> = CertificateDer::pem_slice_iter(client_cert.cert_pem.as_bytes())
-            .map(|c| c.expect("Parse client cert"))
-            .collect();
-
-        let client_key = PrivateKeyDer::from_pem_slice(client_cert.key_pem.as_bytes())
-            .expect("Parse client key");
-
-        Arc::new(
-            rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_client_auth_cert(client_certs, client_key)
-                .expect("Build client config"),
-        )
-    };
-
     // Test 1: Client should be accepted initially
     {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("Failed to bind");
-        let addr = listener.local_addr().expect("Failed to get addr");
-
-        let acceptor_clone = Arc::clone(&tls_acceptor);
-        let server_handle = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("Accept");
-            acceptor_clone.accept(stream).await.is_ok()
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        let client_config = create_client_config();
-        let connector = tokio_rustls::TlsConnector::from(client_config);
-        let stream = tokio::net::TcpStream::connect(addr).await.expect("Connect");
-        let server_name: rustls::pki_types::ServerName<'_> =
-            "localhost".try_into().expect("Invalid DNS name");
-        let result = connector.connect(server_name, stream).await;
-
-        let server_accepted = server_handle.await.expect("Server task");
+        let (server_accepted, client_failed_or_disconnected) = attempt_raw_tls_connection(
+            &tls_acceptor,
+            &server_cert.cert_pem,
+            Some(&client_cert.cert_pem),
+            Some(&client_cert.key_pem),
+        )
+        .await;
         assert!(
-            result.is_ok() && server_accepted,
+            !client_failed_or_disconnected && server_accepted,
             "Client should be accepted initially"
         );
     }
@@ -766,37 +636,14 @@ async fn test_mtls_ca_reload_with_corrupted_file() {
 
     let still_accepted_after_corruption = poll_until(
         || async {
-            let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
-                Ok(listener) => listener,
-                Err(_) => return false,
-            };
-            let addr = match listener.local_addr() {
-                Ok(addr) => addr,
-                Err(_) => return false,
-            };
-
-            let acceptor_clone = Arc::clone(&tls_acceptor);
-            let server_handle = tokio::spawn(async move {
-                let (stream, _) = match listener.accept().await {
-                    Ok(v) => v,
-                    Err(_) => return false,
-                };
-                acceptor_clone.accept(stream).await.is_ok()
-            });
-
-            let client_config = create_client_config();
-            let connector = tokio_rustls::TlsConnector::from(client_config);
-            let stream = match tokio::net::TcpStream::connect(addr).await {
-                Ok(stream) => stream,
-                Err(_) => return false,
-            };
-            let server_name: rustls::pki_types::ServerName<'_> = match "localhost".try_into() {
-                Ok(name) => name,
-                Err(_) => return false,
-            };
-            let client_ok = connector.connect(server_name, stream).await.is_ok();
-            let server_accepted = server_handle.await.unwrap_or(false);
-            client_ok && server_accepted
+            let (server_accepted, client_failed_or_disconnected) = attempt_raw_tls_connection(
+                &tls_acceptor,
+                &server_cert.cert_pem,
+                Some(&client_cert.cert_pem),
+                Some(&client_cert.key_pem),
+            )
+            .await;
+            server_accepted && !client_failed_or_disconnected
         },
         std::time::Duration::from_millis(200),
         std::time::Duration::from_secs(5),
@@ -857,54 +704,17 @@ async fn test_mtls_ca_reload_file_deleted() {
         .expect("Failed to build server config");
     let tls_acceptor = Arc::new(tokio_rustls::TlsAcceptor::from(server_config));
 
-    // Helper to create client config
-    let server_pem = server_cert.cert_pem.clone();
-    let create_client_config = move || {
-        let mut root_store = rustls::RootCertStore::empty();
-        for cert in CertificateDer::pem_slice_iter(server_pem.as_bytes()) {
-            root_store.add(cert.expect("Parse cert")).expect("Add cert");
-        }
-
-        let client_certs: Vec<_> = CertificateDer::pem_slice_iter(client_cert.cert_pem.as_bytes())
-            .map(|c| c.expect("Parse client cert"))
-            .collect();
-
-        let client_key = PrivateKeyDer::from_pem_slice(client_cert.key_pem.as_bytes())
-            .expect("Parse client key");
-
-        Arc::new(
-            rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_client_auth_cert(client_certs, client_key)
-                .expect("Build client config"),
-        )
-    };
-
     // Test 1: Client should be accepted initially
     {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("Failed to bind");
-        let addr = listener.local_addr().expect("Failed to get addr");
-
-        let acceptor_clone = Arc::clone(&tls_acceptor);
-        let server_handle = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("Accept");
-            acceptor_clone.accept(stream).await.is_ok()
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        let client_config = create_client_config();
-        let connector = tokio_rustls::TlsConnector::from(client_config);
-        let stream = tokio::net::TcpStream::connect(addr).await.expect("Connect");
-        let server_name: rustls::pki_types::ServerName<'_> =
-            "localhost".try_into().expect("Invalid DNS name");
-        let result = connector.connect(server_name, stream).await;
-
-        let server_accepted = server_handle.await.expect("Server task");
+        let (server_accepted, client_failed_or_disconnected) = attempt_raw_tls_connection(
+            &tls_acceptor,
+            &server_cert.cert_pem,
+            Some(&client_cert.cert_pem),
+            Some(&client_cert.key_pem),
+        )
+        .await;
         assert!(
-            result.is_ok() && server_accepted,
+            !client_failed_or_disconnected && server_accepted,
             "Client should be accepted initially"
         );
     }
@@ -914,37 +724,14 @@ async fn test_mtls_ca_reload_file_deleted() {
 
     let still_accepted_after_deletion = poll_until(
         || async {
-            let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
-                Ok(listener) => listener,
-                Err(_) => return false,
-            };
-            let addr = match listener.local_addr() {
-                Ok(addr) => addr,
-                Err(_) => return false,
-            };
-
-            let acceptor_clone = Arc::clone(&tls_acceptor);
-            let server_handle = tokio::spawn(async move {
-                let (stream, _) = match listener.accept().await {
-                    Ok(v) => v,
-                    Err(_) => return false,
-                };
-                acceptor_clone.accept(stream).await.is_ok()
-            });
-
-            let client_config = create_client_config();
-            let connector = tokio_rustls::TlsConnector::from(client_config);
-            let stream = match tokio::net::TcpStream::connect(addr).await {
-                Ok(stream) => stream,
-                Err(_) => return false,
-            };
-            let server_name: rustls::pki_types::ServerName<'_> = match "localhost".try_into() {
-                Ok(name) => name,
-                Err(_) => return false,
-            };
-            let client_ok = connector.connect(server_name, stream).await.is_ok();
-            let server_accepted = server_handle.await.unwrap_or(false);
-            client_ok && server_accepted
+            let (server_accepted, client_failed_or_disconnected) = attempt_raw_tls_connection(
+                &tls_acceptor,
+                &server_cert.cert_pem,
+                Some(&client_cert.cert_pem),
+                Some(&client_cert.key_pem),
+            )
+            .await;
+            server_accepted && !client_failed_or_disconnected
         },
         std::time::Duration::from_millis(200),
         std::time::Duration::from_secs(5),

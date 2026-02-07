@@ -6,7 +6,10 @@
 #![cfg(feature = "experimental-tls")]
 #![allow(missing_docs)]
 
+mod common;
+
 use bytes::Bytes;
+use common::tls_helpers::{generate_test_certs, start_tonic_tls_server};
 use otap_df_config::tls::{TlsClientConfig, TlsConfig};
 use otap_df_otap::otap_grpc::client_settings::GrpcClientSettings;
 use otap_df_otap::otap_grpc::otlp::client::LogsServiceClient;
@@ -16,12 +19,7 @@ use otap_df_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceR
 use otap_df_pdata::proto::opentelemetry::collector::logs::v1::logs_service_server::{
     LogsService, LogsServiceServer,
 };
-use otap_df_telemetry::otel_debug;
 use prost::Message;
-use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
-    Issuer, KeyPair, KeyUsagePurpose,
-};
 use std::net::SocketAddr;
 use std::sync::{
     Arc,
@@ -30,15 +28,15 @@ use std::sync::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tonic::transport::{Identity, Server, ServerTlsConfig};
+use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
-struct LogsServiceMock {
+struct PlainLogsServiceMock {
     sender: mpsc::Sender<()>,
 }
 
 #[tonic::async_trait]
-impl LogsService for LogsServiceMock {
+impl LogsService for PlainLogsServiceMock {
     async fn export(
         &self,
         _request: Request<ExportLogsServiceRequest>,
@@ -51,37 +49,6 @@ impl LogsService for LogsServiceMock {
             partial_success: None,
         }))
     }
-}
-
-fn new_ca() -> (Certificate, Issuer<'static, KeyPair>) {
-    let mut params = CertificateParams::new(Vec::default()).expect("empty SAN");
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params
-        .distinguished_name
-        .push(DnType::CommonName, "Test CA");
-    params.key_usages.push(KeyUsagePurpose::DigitalSignature);
-    params.key_usages.push(KeyUsagePurpose::KeyCertSign);
-    params.key_usages.push(KeyUsagePurpose::CrlSign);
-    let key_pair = KeyPair::generate().expect("ca key");
-    let ca = params.self_signed(&key_pair).expect("ca cert");
-    let issuer = Issuer::new(params, key_pair);
-    (ca, issuer)
-}
-
-fn new_leaf(
-    cn: &str,
-    san: &str,
-    eku: ExtendedKeyUsagePurpose,
-    issuer: &Issuer<'_, KeyPair>,
-) -> (String, String) {
-    let mut params = CertificateParams::new(vec![san.to_string()]).expect("SAN");
-    params.distinguished_name.push(DnType::CommonName, cn);
-    params.use_authority_key_identifier_extension = true;
-    params.key_usages.push(KeyUsagePurpose::DigitalSignature);
-    params.extended_key_usages.push(eku);
-    let key_pair = KeyPair::generate().expect("leaf key");
-    let cert = params.signed_by(&key_pair, issuer).expect("leaf cert");
-    (cert.pem(), key_pair.serialize_pem())
 }
 
 async fn start_connect_proxy(target_hits: Arc<AtomicUsize>) -> SocketAddr {
@@ -191,51 +158,22 @@ async fn start_tls_logs_server() -> (
     tokio::task::JoinHandle<()>,
     mpsc::Receiver<()>,
 ) {
-    if let Err(err) = rustls::crypto::ring::default_provider().install_default() {
-        // It's fine if the provider is already installed (e.g. by another test)
-        otel_debug!("rustls default provider installation failed in test", error = ?err);
-    }
-
-    let (ca, ca_issuer) = new_ca();
-    let ca_pem = ca.pem();
-    let (server_cert_pem, server_key_pem) = new_leaf(
-        "localhost",
-        "localhost",
-        ExtendedKeyUsagePurpose::ServerAuth,
-        &ca_issuer,
-    );
-    let (client_cert_pem, client_key_pem) = new_leaf(
-        "client",
-        "client",
-        ExtendedKeyUsagePurpose::ClientAuth,
-        &ca_issuer,
-    );
-
-    let (tx, rx) = mpsc::channel::<()>(8);
-    let logs_service = LogsServiceServer::new(LogsServiceMock { sender: tx });
-
-    let server_identity = Identity::from_pem(server_cert_pem.as_bytes(), server_key_pem.as_bytes());
-    let client_ca_root = tonic::transport::Certificate::from_pem(ca_pem.as_bytes());
-
-    let tls = ServerTlsConfig::new()
-        .identity(server_identity)
-        .client_ca_root(client_ca_root);
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
-    let addr: SocketAddr = listener.local_addr().expect("local_addr failed");
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-
-    let handle = tokio::spawn(async move {
-        Server::builder()
-            .tls_config(tls)
-            .expect("tls_config failed")
-            .add_service(logs_service)
-            .serve_with_incoming(incoming)
-            .await
-            .expect("serve failed");
-    });
-
-    (addr, ca_pem, client_cert_pem, client_key_pem, handle, rx)
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let bundle = generate_test_certs();
+    let (addr, rx, handle) = start_tonic_tls_server(
+        &bundle.server_cert_pem,
+        &bundle.server_key_pem,
+        Some(&bundle.ca_pem),
+    )
+    .await;
+    (
+        addr,
+        bundle.ca_pem,
+        bundle.client_cert_pem,
+        bundle.client_key_pem,
+        handle,
+        rx,
+    )
 }
 
 async fn send_one_request(channel: tonic::transport::Channel) {
@@ -343,7 +281,7 @@ async fn otlp_exporter_connects_through_connect_proxy_lazy() {
 async fn start_plain_logs_server() -> (SocketAddr, tokio::task::JoinHandle<()>, mpsc::Receiver<()>)
 {
     let (tx, rx) = mpsc::channel::<()>(8);
-    let logs_service = LogsServiceServer::new(LogsServiceMock { sender: tx });
+    let logs_service = LogsServiceServer::new(PlainLogsServiceMock { sender: tx });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
     let addr: SocketAddr = listener.local_addr().expect("local_addr failed");

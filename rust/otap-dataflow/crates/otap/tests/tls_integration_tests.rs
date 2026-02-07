@@ -106,7 +106,7 @@ mod tls_handshake {
     #[tokio::test]
     async fn tls_expired_server_cert_rejected() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let (_ca, ca_issuer) = create_ca("Test CA");
+        let (ca, ca_issuer) = create_ca("Test CA");
 
         // Build a server leaf with not_after = not_before (immediately expired)
         let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("SAN");
@@ -131,7 +131,7 @@ mod tls_handshake {
         let (addr, _rx, handle) =
             start_tonic_tls_server(&cert.pem(), &key_pair.serialize_pem(), None).await;
 
-        let ca_pem = _ca.pem();
+        let ca_pem = ca.pem();
         let result = make_tls_client_channel(addr, &ca_pem, "localhost").await;
         assert!(result.is_err(), "expired server cert should fail");
         handle.abort();
@@ -430,18 +430,23 @@ mod cert_lifecycle {
 
         let connector_b = make_rustls_connector(&bundle_b.ca_pem, None, None);
         let ca_b_reloaded = poll_until(
-            || async { try_tls_handshake(addr, &connector_b, "localhost").await.is_ok() },
+            || async {
+                try_tls_handshake(addr, &connector_b, "localhost")
+                    .await
+                    .is_ok()
+            },
             Duration::from_millis(200),
             Duration::from_secs(10),
         )
         .await;
-        assert!(
-            ca_b_reloaded,
-            "CA-B client should succeed after reload"
-        );
+        assert!(ca_b_reloaded, "CA-B client should succeed after reload");
 
         let ca_a_rejected = poll_until(
-            || async { try_tls_handshake(addr, &connector_a, "localhost").await.is_err() },
+            || async {
+                try_tls_handshake(addr, &connector_a, "localhost")
+                    .await
+                    .is_err()
+            },
             Duration::from_millis(200),
             Duration::from_secs(10),
         )
@@ -539,35 +544,39 @@ mod cert_lifecycle {
 
         let ca_b_reloaded = poll_until(
             || async {
-                let server_accepted = accept_client(
+                accept_client(
                     acceptor.clone(),
                     &bundle_b.client_cert_pem,
                     &bundle_b.client_key_pem,
                 )
-                .await;
-                server_accepted
+                .await
             },
             Duration::from_millis(200),
             Duration::from_secs(20),
         )
         .await;
-        assert!(ca_b_reloaded, "server should accept CA-B client after reload");
+        assert!(
+            ca_b_reloaded,
+            "server should accept CA-B client after reload"
+        );
 
         let ca_a_rejected = poll_until(
             || async {
-                let server_accepted = accept_client(
+                !accept_client(
                     acceptor.clone(),
                     &bundle_a.client_cert_pem,
                     &bundle_a.client_key_pem,
                 )
-                .await;
-                !server_accepted
+                .await
             },
             Duration::from_millis(200),
             Duration::from_secs(20),
         )
         .await;
-        assert!(ca_a_rejected, "server should reject CA-A client after reload");
+        assert!(
+            ca_a_rejected,
+            "server should reject CA-A client after reload"
+        );
     }
 
     /// Client CA hot-reload with polling (watch_client_ca=false).
@@ -657,35 +666,39 @@ mod cert_lifecycle {
 
         let ca_b_reloaded = poll_until(
             || async {
-                let server_accepted = accept_client(
+                accept_client(
                     acceptor.clone(),
                     &bundle_b.client_cert_pem,
                     &bundle_b.client_key_pem,
                 )
-                .await;
-                server_accepted
+                .await
             },
             Duration::from_millis(200),
             Duration::from_secs(20),
         )
         .await;
-        assert!(ca_b_reloaded, "server should accept CA-B client after polling reload");
+        assert!(
+            ca_b_reloaded,
+            "server should accept CA-B client after polling reload"
+        );
 
         let ca_a_rejected = poll_until(
             || async {
-                let server_accepted = accept_client(
+                !accept_client(
                     acceptor.clone(),
                     &bundle_a.client_cert_pem,
                     &bundle_a.client_key_pem,
                 )
-                .await;
-                !server_accepted
+                .await
             },
             Duration::from_millis(200),
             Duration::from_secs(20),
         )
         .await;
-        assert!(ca_a_rejected, "server should reject CA-A client after polling reload");
+        assert!(
+            ca_a_rejected,
+            "server should reject CA-A client after polling reload"
+        );
     }
 }
 
