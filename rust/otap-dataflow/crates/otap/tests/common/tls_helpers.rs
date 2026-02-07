@@ -122,17 +122,6 @@ pub fn new_leaf(
     (cert.pem(), key_pair.serialize_pem())
 }
 
-/// Generate a leaf certificate with a custom SAN (for hostname-mismatch tests).
-#[allow(dead_code)]
-pub fn new_leaf_with_san(
-    cn: &str,
-    san: &str,
-    eku: ExtendedKeyUsagePurpose,
-    issuer: &Issuer<'_, KeyPair>,
-) -> (String, String) {
-    new_leaf(cn, san, eku, issuer)
-}
-
 /// Expose `new_ca` for tests that need to build custom PKI hierarchies.
 pub fn create_ca(cn: &str) -> (rcgen::Certificate, Issuer<'static, KeyPair>) {
     new_ca(cn)
@@ -150,19 +139,6 @@ pub fn write_certs_to_dir(bundle: &TlsCertBundle, dir: &Path) {
 }
 
 // ── Server TLS config builders ──────────────────────────────────────────────
-
-/// TLS-only server config using inline PEM (no client auth).
-#[allow(dead_code)]
-pub fn make_server_tls_config_pem(bundle: &TlsCertBundle) -> TlsServerConfig {
-    TlsServerConfig {
-        config: TlsConfig {
-            cert_pem: Some(bundle.server_cert_pem.clone()),
-            key_pem: Some(bundle.server_key_pem.clone()),
-            ..TlsConfig::default()
-        },
-        ..TlsServerConfig::default()
-    }
-}
 
 /// mTLS server config using inline PEM.
 pub fn make_server_mtls_config_pem(bundle: &TlsCertBundle) -> TlsServerConfig {
@@ -269,11 +245,7 @@ pub async fn start_tonic_tls_server(
     server_cert_pem: &str,
     server_key_pem: &str,
     client_ca_pem: Option<&str>,
-) -> (
-    SocketAddr,
-    mpsc::Receiver<()>,
-    tokio::task::JoinHandle<()>,
-) {
+) -> (SocketAddr, mpsc::Receiver<()>, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<()>(16);
     let logs_service = LogsServiceServer::new(LogsServiceMock { sender: tx });
 
@@ -299,6 +271,11 @@ pub async fn start_tonic_tls_server(
             .expect("server");
     });
 
+    // Yield to let the server task start polling the listener.
+    // The OS socket is already bound and listening, so TCP connections won't be
+    // refused, but this gives the tonic server a chance to set up its state.
+    tokio::task::yield_now().await;
+
     (addr, rx, handle)
 }
 
@@ -307,11 +284,7 @@ pub async fn start_tonic_tls_server(
 /// file-based cert loading and the reloadable cert resolver.
 pub async fn start_grpc_server_with_reloadable_tls(
     tls_config: TlsServerConfig,
-) -> (
-    SocketAddr,
-    mpsc::Receiver<()>,
-    tokio::task::JoinHandle<()>,
-) {
+) -> (SocketAddr, mpsc::Receiver<()>, tokio::task::JoinHandle<()>) {
     let handshake_timeout = tls_config.handshake_timeout;
     let server_config = build_reloadable_server_config(&tls_config)
         .await
@@ -338,6 +311,8 @@ pub async fn start_grpc_server_with_reloadable_tls(
             .expect("server");
     });
 
+    tokio::task::yield_now().await;
+
     (addr, rx, handle)
 }
 
@@ -362,20 +337,60 @@ pub async fn start_raw_tls_server(
                 Ok(s) => s,
                 Err(_) => break,
             };
-            let acceptor = acceptor.clone();
-            tokio::spawn(async move {
-                if let Ok(mut tls) = acceptor.accept(stream).await {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    if let Ok(n) = tls.read(&mut buf).await {
-                        let _ = tls.write_all(&buf[..n]).await;
-                    }
+            if let Ok(mut tls) = acceptor.accept(stream).await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                if let Ok(n) = tls.read(&mut buf).await {
+                    let _ = tls.write_all(&buf[..n]).await;
                 }
-            });
+            }
         }
     });
 
     (addr, handle)
+}
+
+/// Attempt one raw TLS/mTLS connection and capture both server and client outcomes.
+///
+/// Returns `(server_accepted, client_failed_or_disconnected)`.
+pub async fn attempt_raw_tls_connection(
+    acceptor: &Arc<tokio_rustls::TlsAcceptor>,
+    ca_pem: &str,
+    client_cert_pem: Option<&str>,
+    client_key_pem: Option<&str>,
+) -> (bool, bool) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let server_acceptor = acceptor.clone();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        server_acceptor.accept(stream).await.is_ok()
+    });
+
+    let connector = make_rustls_connector(ca_pem, client_cert_pem, client_key_pem);
+    let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let domain = rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+
+    let client_failed_or_disconnected = match connector.connect(domain, stream).await {
+        Err(_) => true,
+        Ok(mut tls_stream) => {
+            let write_result = tls_stream.write_all(b"test").await;
+            if write_result.is_err() {
+                true
+            } else {
+                let mut buf = [0u8; 1];
+                matches!(tls_stream.read(&mut buf).await, Err(_) | Ok(0))
+            }
+        }
+    };
+
+    let server_accepted = server.await.expect("server task");
+    (server_accepted, client_failed_or_disconnected)
 }
 
 // ── Export helper ────────────────────────────────────────────────────────────

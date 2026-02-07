@@ -32,12 +32,8 @@ mod tls_handshake {
     async fn tls_server_only_pem_succeeds() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let bundle = generate_test_certs();
-        let (addr, mut rx, handle) = start_tonic_tls_server(
-            &bundle.server_cert_pem,
-            &bundle.server_key_pem,
-            None,
-        )
-        .await;
+        let (addr, mut rx, handle) =
+            start_tonic_tls_server(&bundle.server_cert_pem, &bundle.server_key_pem, None).await;
 
         let channel = make_tls_client_channel(addr, &bundle.ca_pem, "localhost")
             .await
@@ -71,12 +67,8 @@ mod tls_handshake {
         let (bundle_a, bundle_b) = generate_separate_ca_certs();
 
         // Server uses CA-A certs, client trusts CA-B
-        let (addr, _rx, handle) = start_tonic_tls_server(
-            &bundle_a.server_cert_pem,
-            &bundle_a.server_key_pem,
-            None,
-        )
-        .await;
+        let (addr, _rx, handle) =
+            start_tonic_tls_server(&bundle_a.server_cert_pem, &bundle_a.server_key_pem, None).await;
 
         let result = make_tls_client_channel(addr, &bundle_b.ca_pem, "localhost").await;
         assert!(result.is_err(), "client trusting wrong CA should fail");
@@ -112,8 +104,7 @@ mod tls_handshake {
         let (_ca, ca_issuer) = create_ca("Test CA");
 
         // Build a server leaf with not_after = not_before (immediately expired)
-        let mut params =
-            rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("SAN");
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("SAN");
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "localhost");
@@ -210,41 +201,16 @@ mod mtls {
         let server_config = build_reloadable_server_config(&tls_config)
             .await
             .expect("build config");
-        let tls_acceptor = tokio_rustls::TlsAcceptor::from(server_config);
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let server_task = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            tls_acceptor.accept(stream).await.is_ok()
-        });
-
-        // Client with NO client cert
-        let connector = make_rustls_connector(&bundle.ca_pem, None, None);
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let domain = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-
-        let handshake_failed = match connector.connect(domain, stream).await {
-            Err(_) => true,
-            Ok(mut tls_stream) => {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let write_result = tls_stream.write_all(b"test").await;
-                if write_result.is_err() {
-                    true
-                } else {
-                    let mut buf = [0u8; 1];
-                    matches!(tls_stream.read(&mut buf).await, Err(_) | Ok(0))
-                }
-            }
-        };
-
-        let server_rejected = !server_task.await.unwrap();
+        let tls_acceptor = std::sync::Arc::new(tokio_rustls::TlsAcceptor::from(server_config));
+        let (server_accepted, client_failed_or_disconnected) =
+            attempt_raw_tls_connection(&tls_acceptor, &bundle.ca_pem, None, None).await;
         assert!(
-            server_rejected || handshake_failed,
-            "missing client cert should be rejected by server or cause I/O failure"
+            !server_accepted,
+            "server must reject connection without client certificate"
+        );
+        assert!(
+            client_failed_or_disconnected,
+            "client should observe handshake failure or disconnect after server rejection"
         );
     }
 
@@ -259,45 +225,21 @@ mod mtls {
         let server_config = build_reloadable_server_config(&tls_config)
             .await
             .expect("build config");
-        let tls_acceptor = tokio_rustls::TlsAcceptor::from(server_config);
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let server_task = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            tls_acceptor.accept(stream).await.is_ok()
-        });
-
-        // Client presents cert from CA-B (server trusts CA-A)
-        let connector = make_rustls_connector(
+        let tls_acceptor = std::sync::Arc::new(tokio_rustls::TlsAcceptor::from(server_config));
+        let (server_accepted, client_failed_or_disconnected) = attempt_raw_tls_connection(
+            &tls_acceptor,
             &bundle_a.ca_pem,
             Some(&bundle_b.client_cert_pem),
             Some(&bundle_b.client_key_pem),
-        );
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let domain = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-
-        let handshake_failed = match connector.connect(domain, stream).await {
-            Err(_) => true,
-            Ok(mut tls_stream) => {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let write_result = tls_stream.write_all(b"test").await;
-                if write_result.is_err() {
-                    true
-                } else {
-                    let mut buf = [0u8; 1];
-                    matches!(tls_stream.read(&mut buf).await, Err(_) | Ok(0))
-                }
-            }
-        };
-
-        let server_rejected = !server_task.await.unwrap();
+        )
+        .await;
         assert!(
-            server_rejected || handshake_failed,
-            "client cert from wrong CA should be rejected"
+            !server_accepted,
+            "server must reject a client certificate from the wrong CA"
+        );
+        assert!(
+            client_failed_or_disconnected,
+            "client should observe handshake failure or disconnect after server rejection"
         );
     }
 
@@ -383,12 +325,8 @@ mod protocol_variants {
     async fn tls_otlp_grpc_succeeds() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let bundle = generate_test_certs();
-        let (addr, mut rx, handle) = start_tonic_tls_server(
-            &bundle.server_cert_pem,
-            &bundle.server_key_pem,
-            None,
-        )
-        .await;
+        let (addr, mut rx, handle) =
+            start_tonic_tls_server(&bundle.server_cert_pem, &bundle.server_key_pem, None).await;
 
         let channel = make_tls_client_channel(addr, &bundle.ca_pem, "localhost")
             .await
@@ -467,7 +405,9 @@ mod cert_lifecycle {
         // 1. Verify client trusting CA-A can connect
         let connector_a = make_rustls_connector(&bundle_a.ca_pem, None, None);
         assert!(
-            try_tls_handshake(addr, &connector_a, "localhost").await.is_ok(),
+            try_tls_handshake(addr, &connector_a, "localhost")
+                .await
+                .is_ok(),
             "CA-A client should succeed initially"
         );
 
@@ -532,56 +472,55 @@ mod cert_lifecycle {
         let acceptor = std::sync::Arc::new(tokio_rustls::TlsAcceptor::from(server_config));
 
         // Helpers
-        let server_cert_pem = bundle_a.server_cert_pem.clone();
-        let accept_client =
-            |acceptor: std::sync::Arc<tokio_rustls::TlsAcceptor>,
-             client_cert: &str,
-             client_key: &str| {
-                let connector = make_rustls_connector(
-                    &server_cert_pem,
-                    Some(client_cert),
-                    Some(client_key),
-                );
-                async move {
-                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                        .await
-                        .unwrap();
-                    let addr = listener.local_addr().unwrap();
-                    let acc = acceptor.clone();
-                    let server = tokio::spawn(async move {
-                        let (stream, _) = listener.accept().await.unwrap();
-                        acc.accept(stream).await.is_ok()
-                    });
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-                    let domain =
-                        rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
-                    let client_ok = connector.connect(domain, stream).await.is_ok();
-                    let server_ok = server.await.unwrap();
-                    client_ok && server_ok
-                }
-            };
+        let server_ca_pem = bundle_a.ca_pem.clone();
+        let accept_client = |acceptor: std::sync::Arc<tokio_rustls::TlsAcceptor>,
+                             client_cert: &str,
+                             client_key: &str| {
+            let server_ca_pem = server_ca_pem.clone();
+            let client_cert = client_cert.to_string();
+            let client_key = client_key.to_string();
+            async move {
+                let (server_accepted, client_failed_or_disconnected) = attempt_raw_tls_connection(
+                    &acceptor,
+                    &server_ca_pem,
+                    Some(&client_cert),
+                    Some(&client_key),
+                )
+                .await;
+                (server_accepted, !client_failed_or_disconnected)
+            }
+        };
 
         // 1. CA-A client accepted
+        let (server_accepted, client_ok) = accept_client(
+            acceptor.clone(),
+            &bundle_a.client_cert_pem,
+            &bundle_a.client_key_pem,
+        )
+        .await;
         assert!(
-            accept_client(
-                acceptor.clone(),
-                &bundle_a.client_cert_pem,
-                &bundle_a.client_key_pem
-            )
-            .await,
-            "CA-A client should be accepted initially"
+            server_accepted,
+            "server should accept CA-A client initially"
+        );
+        assert!(
+            client_ok,
+            "client should complete I/O for accepted CA-A cert"
         );
 
         // 2. CA-B client rejected
+        let (server_accepted, client_ok) = accept_client(
+            acceptor.clone(),
+            &bundle_b.client_cert_pem,
+            &bundle_b.client_key_pem,
+        )
+        .await;
         assert!(
-            !accept_client(
-                acceptor.clone(),
-                &bundle_b.client_cert_pem,
-                &bundle_b.client_key_pem
-            )
-            .await,
-            "CA-B client should be rejected initially"
+            !server_accepted,
+            "server should reject CA-B client initially"
+        );
+        assert!(
+            !client_ok,
+            "client should observe failure/disconnect when CA-B cert is rejected"
         );
 
         // 3. Hot-reload: swap client CA to CA-B
@@ -592,25 +531,35 @@ mod cert_lifecycle {
         tokio::time::sleep(Duration::from_millis(2000)).await;
 
         // 4. CA-B client accepted after reload
+        let (server_accepted, client_ok) = accept_client(
+            acceptor.clone(),
+            &bundle_b.client_cert_pem,
+            &bundle_b.client_key_pem,
+        )
+        .await;
         assert!(
-            accept_client(
-                acceptor.clone(),
-                &bundle_b.client_cert_pem,
-                &bundle_b.client_key_pem
-            )
-            .await,
-            "CA-B client should be accepted after reload"
+            server_accepted,
+            "server should accept CA-B client after reload"
+        );
+        assert!(
+            client_ok,
+            "client should complete I/O for accepted CA-B cert"
         );
 
         // 5. CA-A client rejected after reload
+        let (server_accepted, client_ok) = accept_client(
+            acceptor.clone(),
+            &bundle_a.client_cert_pem,
+            &bundle_a.client_key_pem,
+        )
+        .await;
         assert!(
-            !accept_client(
-                acceptor.clone(),
-                &bundle_a.client_cert_pem,
-                &bundle_a.client_key_pem
-            )
-            .await,
-            "CA-A client should be rejected after reload"
+            !server_accepted,
+            "server should reject CA-A client after reload"
+        );
+        assert!(
+            !client_ok,
+            "client should observe failure/disconnect when old CA-A cert is rejected"
         );
     }
 
@@ -646,61 +595,93 @@ mod cert_lifecycle {
         let server_config = build_reloadable_server_config(&config).await.unwrap();
         let acceptor = std::sync::Arc::new(tokio_rustls::TlsAcceptor::from(server_config));
 
-        let server_cert_pem = bundle_a.server_cert_pem.clone();
-        let accept_client =
-            |acceptor: std::sync::Arc<tokio_rustls::TlsAcceptor>,
-             client_cert: &str,
-             client_key: &str| {
-                let connector = make_rustls_connector(
-                    &server_cert_pem,
-                    Some(client_cert),
-                    Some(client_key),
-                );
-                async move {
-                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                        .await
-                        .unwrap();
-                    let addr = listener.local_addr().unwrap();
-                    let acc = acceptor.clone();
-                    let server = tokio::spawn(async move {
-                        let (stream, _) = listener.accept().await.unwrap();
-                        acc.accept(stream).await.is_ok()
-                    });
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-                    let domain =
-                        rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
-                    let client_ok = connector.connect(domain, stream).await.is_ok();
-                    let server_ok = server.await.unwrap();
-                    client_ok && server_ok
-                }
-            };
+        let server_ca_pem = bundle_a.ca_pem.clone();
+        let accept_client = |acceptor: std::sync::Arc<tokio_rustls::TlsAcceptor>,
+                             client_cert: &str,
+                             client_key: &str| {
+            let server_ca_pem = server_ca_pem.clone();
+            let client_cert = client_cert.to_string();
+            let client_key = client_key.to_string();
+            async move {
+                let (server_accepted, client_failed_or_disconnected) = attempt_raw_tls_connection(
+                    &acceptor,
+                    &server_ca_pem,
+                    Some(&client_cert),
+                    Some(&client_key),
+                )
+                .await;
+                (server_accepted, !client_failed_or_disconnected)
+            }
+        };
 
         // 1. CA-A client accepted
+        let (server_accepted, client_ok) = accept_client(
+            acceptor.clone(),
+            &bundle_a.client_cert_pem,
+            &bundle_a.client_key_pem,
+        )
+        .await;
         assert!(
-            accept_client(
-                acceptor.clone(),
-                &bundle_a.client_cert_pem,
-                &bundle_a.client_key_pem
-            )
-            .await,
+            server_accepted,
+            "server should accept CA-A client initially"
+        );
+        assert!(
+            client_ok,
+            "client should complete I/O for accepted CA-A cert"
         );
 
-        // 2. Swap client CA to CA-B and wait for polling to pick it up
+        // 2. CA-B client rejected initially
+        let (server_accepted, client_ok) = accept_client(
+            acceptor.clone(),
+            &bundle_b.client_cert_pem,
+            &bundle_b.client_key_pem,
+        )
+        .await;
+        assert!(
+            !server_accepted,
+            "server should reject CA-B client initially"
+        );
+        assert!(
+            !client_ok,
+            "client should observe failure/disconnect when CA-B cert is rejected"
+        );
+
+        // 3. Swap client CA to CA-B and wait for polling to pick it up
         tokio::time::sleep(Duration::from_millis(500)).await;
         std::fs::write(path.join("client_ca.crt"), &bundle_b.ca_pem).unwrap();
         // Polling interval is 1s, wait long enough
         tokio::time::sleep(Duration::from_secs(3)).await;
 
-        // 3. CA-B client accepted after reload
+        // 4. CA-B client accepted after reload
+        let (server_accepted, client_ok) = accept_client(
+            acceptor.clone(),
+            &bundle_b.client_cert_pem,
+            &bundle_b.client_key_pem,
+        )
+        .await;
         assert!(
-            accept_client(
-                acceptor.clone(),
-                &bundle_b.client_cert_pem,
-                &bundle_b.client_key_pem
-            )
-            .await,
-            "CA-B client should be accepted after polling reload"
+            server_accepted,
+            "server should accept CA-B client after polling reload"
+        );
+        assert!(
+            client_ok,
+            "client should complete I/O for accepted CA-B cert"
+        );
+
+        // 5. CA-A client rejected after reload
+        let (server_accepted, client_ok) = accept_client(
+            acceptor.clone(),
+            &bundle_a.client_cert_pem,
+            &bundle_a.client_key_pem,
+        )
+        .await;
+        assert!(
+            !server_accepted,
+            "server should reject CA-A client after polling reload"
+        );
+        assert!(
+            !client_ok,
+            "client should observe failure/disconnect when old CA-A cert is rejected"
         );
     }
 }
@@ -728,9 +709,7 @@ mod edge_cases {
         let server_config = build_reloadable_server_config(&tls_config).await.unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let listener_stream = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
@@ -786,10 +765,12 @@ mod edge_cases {
 
         let result = settings.build_endpoint_with_tls().await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("insecure_skip_verify"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("insecure_skip_verify")
+        );
     }
 
     /// http:// endpoint with TLS config → TLS is not used (no error, plaintext).
@@ -831,10 +812,7 @@ mod edge_cases {
 
         let result = load_server_tls_config(&config).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("is too large"));
+        assert!(result.unwrap_err().to_string().contains("is too large"));
     }
 
     /// Empty string cert_pem → error.
@@ -863,18 +841,16 @@ mod edge_cases {
     async fn concurrent_tls_handshakes() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let bundle = generate_test_certs();
-        let (addr, _rx, handle) = start_tonic_tls_server(
-            &bundle.server_cert_pem,
-            &bundle.server_key_pem,
-            None,
-        )
-        .await;
+        let (addr, _rx, handle) =
+            start_tonic_tls_server(&bundle.server_cert_pem, &bundle.server_key_pem, None).await;
 
         let mut tasks = Vec::new();
         for _ in 0..10 {
             let ca = bundle.ca_pem.clone();
             tasks.push(tokio::spawn(async move {
-                make_tls_client_channel(addr, &ca, "localhost").await.is_ok()
+                make_tls_client_channel(addr, &ca, "localhost")
+                    .await
+                    .is_ok()
             }));
         }
 
@@ -905,10 +881,7 @@ mod config_validation {
         let config = TlsServerConfig::default();
         let result = load_server_tls_config(&config).await;
         assert!(result.is_ok());
-        assert!(
-            result.unwrap().is_none(),
-            "empty config should return None"
-        );
+        assert!(result.unwrap().is_none(), "empty config should return None");
     }
 
     /// cert_pem set without key_pem → error.
@@ -925,10 +898,12 @@ mod config_validation {
 
         let result = load_server_tls_config(&config).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("both certificate and key must be provided"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("both certificate and key must be provided")
+        );
     }
 
     /// key_pem set without cert_pem → error.
@@ -945,10 +920,12 @@ mod config_validation {
 
         let result = load_server_tls_config(&config).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("both certificate and key must be provided"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("both certificate and key must be provided")
+        );
     }
 
     /// Partial mTLS client config (cert without key) → clear error message.
