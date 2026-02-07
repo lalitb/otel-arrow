@@ -3,7 +3,7 @@
 
 // This module is compiled into every test binary that includes `mod common;`.
 // Not every test binary uses every helper, so allow unused items.
-#![allow(dead_code, unused_imports)]
+#![allow(unused_imports)]
 
 //! A test exporter that NACKs until switched to ACK mode.
 //!
