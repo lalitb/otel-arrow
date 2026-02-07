@@ -199,9 +199,14 @@ mod tests {
         // 4. Rotate to Server2 (signed by CA2)
         generate_ca(path, "ca2", "Test CA 2");
         generate_server_cert(path, "server2", "ca2", "localhost");
-
-        fs::copy(path.join("server2.crt"), &cert_path).expect("copy cert failed");
-        fs::copy(path.join("server2.key"), &key_path).expect("copy key failed");
+        // Ensure mtime changes are visible on coarse-granularity filesystems.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let cert_tmp = path.join("server.crt.tmp");
+        let key_tmp = path.join("server.key.tmp");
+        fs::copy(path.join("server2.crt"), &cert_tmp).expect("copy cert tmp failed");
+        fs::copy(path.join("server2.key"), &key_tmp).expect("copy key tmp failed");
+        fs::rename(&cert_tmp, &cert_path).expect("rename cert failed");
+        fs::rename(&key_tmp, &key_path).expect("rename key failed");
 
         // 6. Connect with Client trusting CA2 (Should Succeed)
         let mut root_store2 = rustls::RootCertStore::empty();

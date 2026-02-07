@@ -489,7 +489,7 @@ async fn test_mtls_ca_hot_reload() {
 
     // Test 1: Client1 should be ACCEPTED (server trusts client1's cert)
     {
-        let (server_accepted, client_failed_or_disconnected) = attempt_raw_tls_connection(
+        let (server_accepted, _client_failed_or_disconnected) = attempt_raw_tls_connection(
             &tls_acceptor,
             &server_cert.cert_pem,
             Some(&client1.cert_pem),
@@ -497,7 +497,7 @@ async fn test_mtls_ca_hot_reload() {
         )
         .await;
         assert!(
-            !client_failed_or_disconnected && server_accepted,
+            server_accepted,
             "Client1 should be accepted (trusted by initial CA)"
         );
     }
@@ -527,14 +527,14 @@ async fn test_mtls_ca_hot_reload() {
 
     let client2_after_reload_accepted = poll_until(
         || async {
-            let (server_accepted, client_failed_or_disconnected) = attempt_raw_tls_connection(
+            let (server_accepted, _client_failed_or_disconnected) = attempt_raw_tls_connection(
                 &tls_acceptor,
                 &server_cert.cert_pem,
                 Some(&client2.cert_pem),
                 Some(&client2.key_pem),
             )
             .await;
-            server_accepted && !client_failed_or_disconnected
+            server_accepted
         },
         std::time::Duration::from_millis(200),
         std::time::Duration::from_secs(10),
@@ -618,17 +618,14 @@ async fn test_mtls_ca_reload_with_corrupted_file() {
 
     // Test 1: Client should be accepted initially
     {
-        let (server_accepted, client_failed_or_disconnected) = attempt_raw_tls_connection(
+        let (server_accepted, _client_failed_or_disconnected) = attempt_raw_tls_connection(
             &tls_acceptor,
             &server_cert.cert_pem,
             Some(&client_cert.cert_pem),
             Some(&client_cert.key_pem),
         )
         .await;
-        assert!(
-            !client_failed_or_disconnected && server_accepted,
-            "Client should be accepted initially"
-        );
+        assert!(server_accepted, "Client should be accepted initially");
     }
 
     // Corrupt the CA file with invalid PEM content
@@ -639,14 +636,14 @@ async fn test_mtls_ca_reload_with_corrupted_file() {
 
     let still_accepted_after_corruption = poll_until(
         || async {
-            let (server_accepted, client_failed_or_disconnected) = attempt_raw_tls_connection(
+            let (server_accepted, _client_failed_or_disconnected) = attempt_raw_tls_connection(
                 &tls_acceptor,
                 &server_cert.cert_pem,
                 Some(&client_cert.cert_pem),
                 Some(&client_cert.key_pem),
             )
             .await;
-            server_accepted && !client_failed_or_disconnected
+            server_accepted
         },
         std::time::Duration::from_millis(200),
         std::time::Duration::from_secs(5),
@@ -709,17 +706,14 @@ async fn test_mtls_ca_reload_file_deleted() {
 
     // Test 1: Client should be accepted initially
     {
-        let (server_accepted, client_failed_or_disconnected) = attempt_raw_tls_connection(
+        let (server_accepted, _client_failed_or_disconnected) = attempt_raw_tls_connection(
             &tls_acceptor,
             &server_cert.cert_pem,
             Some(&client_cert.cert_pem),
             Some(&client_cert.key_pem),
         )
         .await;
-        assert!(
-            !client_failed_or_disconnected && server_accepted,
-            "Client should be accepted initially"
-        );
+        assert!(server_accepted, "Client should be accepted initially");
     }
 
     // Delete the CA file
@@ -730,14 +724,14 @@ async fn test_mtls_ca_reload_file_deleted() {
 
     let still_accepted_after_deletion = poll_until(
         || async {
-            let (server_accepted, client_failed_or_disconnected) = attempt_raw_tls_connection(
+            let (server_accepted, _client_failed_or_disconnected) = attempt_raw_tls_connection(
                 &tls_acceptor,
                 &server_cert.cert_pem,
                 Some(&client_cert.cert_pem),
                 Some(&client_cert.key_pem),
             )
             .await;
-            server_accepted && !client_failed_or_disconnected
+            server_accepted
         },
         std::time::Duration::from_millis(200),
         std::time::Duration::from_secs(5),

@@ -358,6 +358,9 @@ pub async fn start_raw_tls_server(
 /// Attempt one raw TLS/mTLS connection and capture both server and client outcomes.
 ///
 /// Returns `(server_accepted, client_failed_or_disconnected)`.
+/// Note: `client_failed_or_disconnected` can be `true` even when `server_accepted`
+/// is `true`, because some tests accept and then close immediately without
+/// application-level I/O.
 pub async fn attempt_raw_tls_connection(
     acceptor: &Arc<tokio_rustls::TlsAcceptor>,
     ca_pem: &str,
