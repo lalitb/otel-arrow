@@ -5,6 +5,9 @@
 
 #![cfg(feature = "experimental-tls")]
 
+mod common;
+
+use common::tls_helpers::poll_until;
 use otap_df_config::tls::{TlsConfig, TlsServerConfig};
 use otap_df_otap::tls_utils::build_reloadable_server_config;
 use otap_df_telemetry::{otel_debug, otel_info};
@@ -574,57 +577,52 @@ async fn test_mtls_ca_hot_reload() {
     // Use atomic rename to ensure proper file modification event
     let client2_pem = fs::read_to_string(&client2_cert_path).expect("Read client2 cert");
 
-    // Give the watcher a moment and ensure any pending events are processed
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
     let temp_ca_path = path.join("active_ca.tmp");
     fs::write(&temp_ca_path, &client2_pem).expect("Write temp CA");
     fs::rename(&temp_ca_path, &active_ca_path).expect("Hot-reload CA to client2 (atomic rename)");
 
-    // Wait for file watcher to detect change and reload
-    // kqueue/inotify should trigger quickly, but give it time
-    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+    let client2_after_reload_accepted = poll_until(
+        || async {
+            let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+                Ok(listener) => listener,
+                Err(_) => return false,
+            };
+            let addr = match listener.local_addr() {
+                Ok(addr) => addr,
+                Err(_) => return false,
+            };
 
-    // Test 3: After hot-reload, Client2 should now be ACCEPTED
-    {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("Failed to bind");
-        let addr = listener.local_addr().expect("Failed to get addr");
+            let acceptor_clone = Arc::clone(&tls_acceptor);
+            let server_handle = tokio::spawn(async move {
+                let (stream, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                acceptor_clone.accept(stream).await.is_ok()
+            });
 
-        let acceptor_clone = Arc::clone(&tls_acceptor);
-        let server_handle = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("Accept");
-            match acceptor_clone.accept(stream).await {
-                Ok(_) => true,
-                Err(e) => {
-                    println!("DEBUG: Server accept error (Test 3): {}", e);
-                    false
-                }
-            }
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        let client_config = create_client_config(&client2_cert_path, &client2_key_path);
-        let connector = tokio_rustls::TlsConnector::from(client_config);
-        let stream = tokio::net::TcpStream::connect(addr).await.expect("Connect");
-        let server_name: rustls::pki_types::ServerName<'_> =
-            "localhost".try_into().expect("Invalid DNS name");
-        let result = connector.connect(server_name, stream).await;
-
-        let server_accepted = server_handle.await.expect("Server task");
-        if result.is_err() || !server_accepted {
-            println!(
-                "DEBUG: Client2 connection failed. Result: {:?}, Server accepted: {}",
-                result, server_accepted
-            );
-        }
-        assert!(
-            result.is_ok() && server_accepted,
-            "Client2 should be accepted after CA hot-reload"
-        );
-    }
+            let client_config = create_client_config(&client2_cert_path, &client2_key_path);
+            let connector = tokio_rustls::TlsConnector::from(client_config);
+            let stream = match tokio::net::TcpStream::connect(addr).await {
+                Ok(stream) => stream,
+                Err(_) => return false,
+            };
+            let server_name: rustls::pki_types::ServerName<'_> = match "localhost".try_into() {
+                Ok(name) => name,
+                Err(_) => return false,
+            };
+            let client_ok = connector.connect(server_name, stream).await.is_ok();
+            let server_accepted = server_handle.await.unwrap_or(false);
+            client_ok && server_accepted
+        },
+        std::time::Duration::from_millis(200),
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        client2_after_reload_accepted,
+        "Client2 should be accepted after CA hot-reload"
+    );
 
     // Test 4: After hot-reload, Client1 should now be REJECTED
     {
@@ -766,37 +764,48 @@ async fn test_mtls_ca_reload_with_corrupted_file() {
     // Corrupt the CA file with invalid PEM content
     fs::write(&active_ca_path, "not a valid PEM certificate").expect("Corrupt CA file");
 
-    // Wait for file watcher to detect change and attempt reload
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let still_accepted_after_corruption = poll_until(
+        || async {
+            let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+                Ok(listener) => listener,
+                Err(_) => return false,
+            };
+            let addr = match listener.local_addr() {
+                Ok(addr) => addr,
+                Err(_) => return false,
+            };
 
-    // Test 2: Client should STILL be accepted (server keeps previous valid CA)
-    {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("Failed to bind");
-        let addr = listener.local_addr().expect("Failed to get addr");
+            let acceptor_clone = Arc::clone(&tls_acceptor);
+            let server_handle = tokio::spawn(async move {
+                let (stream, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                acceptor_clone.accept(stream).await.is_ok()
+            });
 
-        let acceptor_clone = Arc::clone(&tls_acceptor);
-        let server_handle = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("Accept");
-            acceptor_clone.accept(stream).await.is_ok()
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        let client_config = create_client_config();
-        let connector = tokio_rustls::TlsConnector::from(client_config);
-        let stream = tokio::net::TcpStream::connect(addr).await.expect("Connect");
-        let server_name: rustls::pki_types::ServerName<'_> =
-            "localhost".try_into().expect("Invalid DNS name");
-        let result = connector.connect(server_name, stream).await;
-
-        let server_accepted = server_handle.await.expect("Server task");
-        assert!(
-            result.is_ok() && server_accepted,
-            "Client should still be accepted after corrupted CA reload (graceful degradation)"
-        );
-    }
+            let client_config = create_client_config();
+            let connector = tokio_rustls::TlsConnector::from(client_config);
+            let stream = match tokio::net::TcpStream::connect(addr).await {
+                Ok(stream) => stream,
+                Err(_) => return false,
+            };
+            let server_name: rustls::pki_types::ServerName<'_> = match "localhost".try_into() {
+                Ok(name) => name,
+                Err(_) => return false,
+            };
+            let client_ok = connector.connect(server_name, stream).await.is_ok();
+            let server_accepted = server_handle.await.unwrap_or(false);
+            client_ok && server_accepted
+        },
+        std::time::Duration::from_millis(200),
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        still_accepted_after_corruption,
+        "Client should still be accepted after corrupted CA reload (graceful degradation)"
+    );
 }
 
 /// Test that server keeps working when CA file is deleted during operation.
@@ -903,35 +912,46 @@ async fn test_mtls_ca_reload_file_deleted() {
     // Delete the CA file
     fs::remove_file(&active_ca_path).expect("Delete CA file");
 
-    // Wait a bit for any watcher events
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let still_accepted_after_deletion = poll_until(
+        || async {
+            let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+                Ok(listener) => listener,
+                Err(_) => return false,
+            };
+            let addr = match listener.local_addr() {
+                Ok(addr) => addr,
+                Err(_) => return false,
+            };
 
-    // Test 2: Client should STILL be accepted (server keeps last known good CA)
-    {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("Failed to bind");
-        let addr = listener.local_addr().expect("Failed to get addr");
+            let acceptor_clone = Arc::clone(&tls_acceptor);
+            let server_handle = tokio::spawn(async move {
+                let (stream, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                acceptor_clone.accept(stream).await.is_ok()
+            });
 
-        let acceptor_clone = Arc::clone(&tls_acceptor);
-        let server_handle = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("Accept");
-            acceptor_clone.accept(stream).await.is_ok()
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        let client_config = create_client_config();
-        let connector = tokio_rustls::TlsConnector::from(client_config);
-        let stream = tokio::net::TcpStream::connect(addr).await.expect("Connect");
-        let server_name: rustls::pki_types::ServerName<'_> =
-            "localhost".try_into().expect("Invalid DNS name");
-        let result = connector.connect(server_name, stream).await;
-
-        let server_accepted = server_handle.await.expect("Server task");
-        assert!(
-            result.is_ok() && server_accepted,
-            "Client should still be accepted after CA file deleted (keeps last known good)"
-        );
-    }
+            let client_config = create_client_config();
+            let connector = tokio_rustls::TlsConnector::from(client_config);
+            let stream = match tokio::net::TcpStream::connect(addr).await {
+                Ok(stream) => stream,
+                Err(_) => return false,
+            };
+            let server_name: rustls::pki_types::ServerName<'_> = match "localhost".try_into() {
+                Ok(name) => name,
+                Err(_) => return false,
+            };
+            let client_ok = connector.connect(server_name, stream).await.is_ok();
+            let server_accepted = server_handle.await.unwrap_or(false);
+            client_ok && server_accepted
+        },
+        std::time::Duration::from_millis(200),
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        still_accepted_after_deletion,
+        "Client should still be accepted after CA file deleted (keeps last known good)"
+    );
 }

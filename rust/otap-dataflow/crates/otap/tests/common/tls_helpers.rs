@@ -23,6 +23,7 @@ use rcgen::{
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::future::Future;
 use tokio::sync::mpsc;
 use tonic::transport::{Channel, Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
@@ -391,6 +392,30 @@ pub async fn attempt_raw_tls_connection(
 
     let server_accepted = server.await.expect("server task");
     (server_accepted, client_failed_or_disconnected)
+}
+
+/// Poll an async predicate until it returns true or the timeout elapses.
+///
+/// Returns true when the predicate succeeds within the timeout, false otherwise.
+pub async fn poll_until<F, Fut>(
+    mut predicate: F,
+    interval: std::time::Duration,
+    timeout: std::time::Duration,
+) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let start = std::time::Instant::now();
+    loop {
+        if predicate().await {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        tokio::time::sleep(interval).await;
+    }
 }
 
 // ── Export helper ────────────────────────────────────────────────────────────

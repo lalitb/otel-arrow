@@ -5,7 +5,11 @@
 #![allow(unused_results)]
 
 #[cfg(feature = "experimental-tls")]
+mod common;
+
+#[cfg(feature = "experimental-tls")]
 mod tests {
+    use crate::common::tls_helpers::poll_until;
     use otap_df_config::tls::{TlsConfig, TlsServerConfig};
     use otap_df_otap::tls_utils::build_reloadable_server_config;
     use rustls_pki_types::CertificateDer;
@@ -193,25 +197,11 @@ mod tests {
             .expect("Handshake with CA1 failed");
 
         // 4. Rotate to Server2 (signed by CA2)
-        tokio::time::sleep(Duration::from_secs(3)).await; // Wait for reload interval
-
-        // Generate CA2 and Server2 now to ensure mtime is different
         generate_ca(path, "ca2", "Test CA 2");
         generate_server_cert(path, "server2", "ca2", "localhost");
 
         fs::copy(path.join("server2.crt"), &cert_path).expect("copy cert failed");
         fs::copy(path.join("server2.key"), &key_path).expect("copy key failed");
-
-        // 5. Trigger Reload by making a connection (async reload happens in background)
-        tokio::time::sleep(Duration::from_secs(3)).await;
-
-        // Make a dummy connection to trigger the reload check
-        // This connection will use the old cert but spawn async reload
-        let stream = TcpStream::connect(local_addr).await.unwrap();
-        let _ = connector1.connect(domain.clone(), stream).await; // May succeed or fail, doesn't matter
-
-        // Wait for async reload to complete - increased to reduce flakiness
-        tokio::time::sleep(Duration::from_secs(2)).await;
 
         // 6. Connect with Client trusting CA2 (Should Succeed)
         let mut root_store2 = rustls::RootCertStore::empty();
@@ -224,20 +214,37 @@ mod tests {
             .with_root_certificates(root_store2)
             .with_no_client_auth();
         let connector2 = TlsConnector::from(Arc::new(client_config2));
-
-        let stream = TcpStream::connect(local_addr).await.unwrap();
-        let _stream = connector2
-            .connect(domain.clone(), stream)
-            .await
-            .expect("Handshake with CA2 failed (Reload didn't happen?)");
+        let ca2_ready = poll_until(
+            || async {
+                let stream = match TcpStream::connect(local_addr).await {
+                    Ok(stream) => stream,
+                    Err(_) => return false,
+                };
+                connector2
+                    .connect(domain.clone(), stream)
+                    .await
+                    .is_ok()
+            },
+            Duration::from_millis(200),
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(ca2_ready, "Handshake with CA2 failed (reload did not happen)");
 
         // 7. Verify Client trusting CA1 now fails
-        let stream = TcpStream::connect(local_addr).await.unwrap();
-        let result = connector1.connect(domain, stream).await;
-        assert!(
-            result.is_err(),
-            "Handshake with CA1 should fail after reload"
-        );
+        let ca1_rejected = poll_until(
+            || async {
+                let stream = match TcpStream::connect(local_addr).await {
+                    Ok(stream) => stream,
+                    Err(_) => return false,
+                };
+                connector1.connect(domain.clone(), stream).await.is_err()
+            },
+            Duration::from_millis(200),
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(ca1_rejected, "Handshake with CA1 should fail after reload");
 
         // Cleanup
         server_handle.abort();
