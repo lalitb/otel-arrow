@@ -8,7 +8,7 @@
 
 // This module is compiled into every test binary that includes `mod common;`.
 // Not every test binary uses every helper, so allow unused items.
-#![allow(dead_code, unused_imports)]
+#![allow(unused_imports)]
 
 use bytes::Bytes;
 use otap_df_config::tls::{TlsConfig, TlsServerConfig};
