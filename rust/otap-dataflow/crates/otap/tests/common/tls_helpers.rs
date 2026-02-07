@@ -6,6 +6,10 @@
 //! Provides cert generation (via rcgen), config builders, and server/client
 //! scaffolding so that individual test bodies stay short and focused.
 
+// This module is compiled into every test binary that includes `mod common;`.
+// Not every test binary uses every helper, so allow unused items.
+#![allow(dead_code, unused_imports)]
+
 use bytes::Bytes;
 use otap_df_config::tls::{TlsConfig, TlsServerConfig};
 use otap_df_otap::otap_grpc::otlp::client::LogsServiceClient;
