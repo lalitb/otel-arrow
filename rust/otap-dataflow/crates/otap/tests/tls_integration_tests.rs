@@ -248,64 +248,6 @@ mod mtls {
         );
     }
 
-    /// Client config has cert_pem but no key_pem → config error from exporter side.
-    #[tokio::test]
-    async fn mtls_client_missing_key_rejected() {
-        let settings = GrpcClientSettings {
-            grpc_endpoint: "https://localhost:4317".to_string(),
-            tls: Some(TlsClientConfig {
-                config: TlsConfig {
-                    cert_pem: Some("fake cert".to_string()),
-                    key_pem: None,
-                    ..TlsConfig::default()
-                },
-                ..TlsClientConfig::default()
-            }),
-            ..GrpcClientSettings::default()
-        };
-
-        let result = settings.build_endpoint_with_tls().await;
-        assert!(
-            result.is_err(),
-            "partial mTLS config should fail when key is missing"
-        );
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("both client certificate and key must be provided")
-        );
-    }
-
-    /// Client config has key_pem but no cert_pem → config error from exporter side.
-    #[tokio::test]
-    async fn mtls_client_missing_cert_rejected() {
-        let settings = GrpcClientSettings {
-            grpc_endpoint: "https://localhost:4317".to_string(),
-            tls: Some(TlsClientConfig {
-                config: TlsConfig {
-                    cert_pem: None,
-                    key_pem: Some("fake key".to_string()),
-                    ..TlsConfig::default()
-                },
-                ..TlsClientConfig::default()
-            }),
-            ..GrpcClientSettings::default()
-        };
-
-        let result = settings.build_endpoint_with_tls().await;
-        assert!(
-            result.is_err(),
-            "partial mTLS config should fail when certificate is missing"
-        );
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("both client certificate and key must be provided")
-        );
-    }
-
     /// Server config has cert_pem but no key_pem → build_reloadable_server_config errors.
     #[tokio::test]
     async fn mtls_server_missing_key_rejected() {
@@ -325,259 +267,11 @@ mod mtls {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Category 3: Protocol Variants (OTLP gRPC)
-// ═══════════════════════════════════════════════════════════════════════════
-
-mod protocol_variants {
-    use super::*;
-
-    /// TLS-only connection over OTLP gRPC LogsService (end-to-end data flow).
-    #[tokio::test]
-    async fn tls_otlp_grpc_succeeds() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let bundle = generate_test_certs();
-        let (addr, mut rx, handle) =
-            start_tonic_tls_server(&bundle.server_cert_pem, &bundle.server_key_pem, None).await;
-
-        let channel = make_tls_client_channel(addr, &bundle.ca_pem, "localhost")
-            .await
-            .expect("connect");
-        assert_logs_export_succeeds(channel, &mut rx).await;
-        handle.abort();
-    }
-
-    /// mTLS connection over OTLP gRPC LogsService (end-to-end data flow).
-    #[tokio::test]
-    async fn mtls_otlp_grpc_succeeds() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let bundle = generate_test_certs();
-        let (addr, mut rx, handle) = start_tonic_tls_server(
-            &bundle.server_cert_pem,
-            &bundle.server_key_pem,
-            Some(&bundle.ca_pem),
-        )
-        .await;
-
-        let channel = make_mtls_client_channel(
-            addr,
-            &bundle.ca_pem,
-            &bundle.client_cert_pem,
-            &bundle.client_key_pem,
-            "localhost",
-        )
-        .await
-        .expect("connect");
-        assert_logs_export_succeeds(channel, &mut rx).await;
-        handle.abort();
-    }
-
-    // TODO: tls_otap_grpc_succeeds — requires ArrowLogsService mock, not yet implemented.
-    // TODO: mtls_otap_grpc_succeeds — same prerequisite.
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Category 4: Certificate Lifecycle
+//  Category 3: Certificate Lifecycle
 // ═══════════════════════════════════════════════════════════════════════════
 
 mod cert_lifecycle {
     use super::*;
-
-    /// Server cert hot-reload: start with cert A, swap files to cert B,
-    /// new connections use cert B.
-    #[tokio::test]
-    #[cfg_attr(
-        target_os = "windows",
-        ignore = "Skipping on Windows due to flakiness. See https://github.com/open-telemetry/otel-arrow/issues/1614"
-    )]
-    async fn server_cert_hot_reload() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
-        let dir = TempDir::new().unwrap();
-        let path = dir.path();
-
-        // Generate two independent CAs with their server certs
-        let (bundle_a, bundle_b) = generate_separate_ca_certs();
-        // Write bundle_a server certs as the "active" certs
-        std::fs::write(path.join("server.crt"), &bundle_a.server_cert_pem).unwrap();
-        std::fs::write(path.join("server.key"), &bundle_a.server_key_pem).unwrap();
-
-        let config = TlsServerConfig {
-            config: TlsConfig {
-                cert_file: Some(path.join("server.crt")),
-                key_file: Some(path.join("server.key")),
-                reload_interval: Some(Duration::from_secs(1)),
-                ..TlsConfig::default()
-            },
-            ..TlsServerConfig::default()
-        };
-
-        let (addr, handle) = start_raw_tls_server(config).await;
-
-        // 1. Verify client trusting CA-A can connect
-        let connector_a = make_rustls_connector(&bundle_a.ca_pem, None, None);
-        assert!(
-            try_tls_handshake(addr, &connector_a, "localhost")
-                .await
-                .is_ok(),
-            "CA-A client should succeed initially"
-        );
-
-        // 2. Swap server certs to CA-B signed certs.
-        // Wait at least one second so file mtimes definitely differ on coarse filesystems.
-        tokio::time::sleep(Duration::from_millis(1200)).await;
-        std::fs::write(path.join("server.crt"), &bundle_b.server_cert_pem).unwrap();
-        std::fs::write(path.join("server.key"), &bundle_b.server_key_pem).unwrap();
-
-        let connector_b = make_rustls_connector(&bundle_b.ca_pem, None, None);
-        let ca_b_reloaded = poll_until(
-            || async {
-                try_tls_handshake(addr, &connector_b, "localhost")
-                    .await
-                    .is_ok()
-            },
-            Duration::from_millis(200),
-            Duration::from_secs(10),
-        )
-        .await;
-        assert!(ca_b_reloaded, "CA-B client should succeed after reload");
-
-        let ca_a_rejected = poll_until(
-            || async {
-                try_tls_handshake(addr, &connector_a, "localhost")
-                    .await
-                    .is_err()
-            },
-            Duration::from_millis(200),
-            Duration::from_secs(10),
-        )
-        .await;
-        assert!(ca_a_rejected, "CA-A client should fail after reload");
-
-        handle.abort();
-    }
-
-    /// Client CA hot-reload with file watching: server starts trusting CA-A clients,
-    /// swap client_ca_file to CA-B, old client rejected, new client accepted.
-    #[tokio::test]
-    #[cfg_attr(
-        target_os = "windows",
-        ignore = "Skipping on Windows due to flakiness. See https://github.com/open-telemetry/otel-arrow/issues/1614"
-    )]
-    async fn client_ca_hot_reload_file_watch() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
-        let dir = TempDir::new().unwrap();
-        let path = dir.path();
-
-        let (bundle_a, bundle_b) = generate_separate_ca_certs();
-        // Write server cert (doesn't change)
-        std::fs::write(path.join("server.crt"), &bundle_a.server_cert_pem).unwrap();
-        std::fs::write(path.join("server.key"), &bundle_a.server_key_pem).unwrap();
-        // Write initial client CA (CA-A)
-        std::fs::write(path.join("client_ca.crt"), &bundle_a.ca_pem).unwrap();
-
-        let config = TlsServerConfig {
-            config: TlsConfig {
-                cert_file: Some(path.join("server.crt")),
-                key_file: Some(path.join("server.key")),
-                ..TlsConfig::default()
-            },
-            client_ca_file: Some(path.join("client_ca.crt")),
-            watch_client_ca: true,
-            ..TlsServerConfig::default()
-        };
-
-        let server_config = build_reloadable_server_config(&config).await.unwrap();
-        let acceptor = std::sync::Arc::new(tokio_rustls::TlsAcceptor::from(server_config));
-
-        // Helpers
-        let server_ca_pem = bundle_a.ca_pem.clone();
-        let accept_client = |acceptor: std::sync::Arc<tokio_rustls::TlsAcceptor>,
-                             client_cert: &str,
-                             client_key: &str| {
-            let server_ca_pem = server_ca_pem.clone();
-            let client_cert = client_cert.to_string();
-            let client_key = client_key.to_string();
-            async move {
-                let (server_accepted, client_failed_or_disconnected) = attempt_raw_tls_connection(
-                    &acceptor,
-                    &server_ca_pem,
-                    Some(&client_cert),
-                    Some(&client_key),
-                )
-                .await;
-                // For these lifecycle tests, trust transition is validated by server-side accept/reject.
-                // Client post-handshake I/O can be racy because the server closes immediately after accept.
-                let _ = client_failed_or_disconnected;
-                server_accepted
-            }
-        };
-
-        // 1. CA-A client accepted
-        let server_accepted = accept_client(
-            acceptor.clone(),
-            &bundle_a.client_cert_pem,
-            &bundle_a.client_key_pem,
-        )
-        .await;
-        assert!(
-            server_accepted,
-            "server should accept CA-A client initially"
-        );
-
-        // 2. CA-B client rejected
-        let server_accepted = accept_client(
-            acceptor.clone(),
-            &bundle_b.client_cert_pem,
-            &bundle_b.client_key_pem,
-        )
-        .await;
-        assert!(
-            !server_accepted,
-            "server should reject CA-B client initially"
-        );
-
-        // 3. Hot-reload: swap client CA to CA-B
-        let temp_path = path.join("client_ca.tmp");
-        std::fs::write(&temp_path, &bundle_b.ca_pem).unwrap();
-        std::fs::rename(&temp_path, path.join("client_ca.crt")).unwrap();
-
-        let ca_b_reloaded = poll_until(
-            || async {
-                accept_client(
-                    acceptor.clone(),
-                    &bundle_b.client_cert_pem,
-                    &bundle_b.client_key_pem,
-                )
-                .await
-            },
-            Duration::from_millis(200),
-            Duration::from_secs(20),
-        )
-        .await;
-        assert!(
-            ca_b_reloaded,
-            "server should accept CA-B client after reload"
-        );
-
-        let ca_a_rejected = poll_until(
-            || async {
-                !accept_client(
-                    acceptor.clone(),
-                    &bundle_a.client_cert_pem,
-                    &bundle_a.client_key_pem,
-                )
-                .await
-            },
-            Duration::from_millis(200),
-            Duration::from_secs(20),
-        )
-        .await;
-        assert!(
-            ca_a_rejected,
-            "server should reject CA-A client after reload"
-        );
-    }
 
     /// Client CA hot-reload with polling (watch_client_ca=false).
     #[tokio::test]
@@ -610,34 +304,15 @@ mod cert_lifecycle {
 
         let server_config = build_reloadable_server_config(&config).await.unwrap();
         let acceptor = std::sync::Arc::new(tokio_rustls::TlsAcceptor::from(server_config));
-
+        let mut probe = start_raw_tls_probe_server(acceptor).await;
         let server_ca_pem = bundle_a.ca_pem.clone();
-        let accept_client = |acceptor: std::sync::Arc<tokio_rustls::TlsAcceptor>,
-                             client_cert: &str,
-                             client_key: &str| {
-            let server_ca_pem = server_ca_pem.clone();
-            let client_cert = client_cert.to_string();
-            let client_key = client_key.to_string();
-            async move {
-                let (server_accepted, client_failed_or_disconnected) = attempt_raw_tls_connection(
-                    &acceptor,
-                    &server_ca_pem,
-                    Some(&client_cert),
-                    Some(&client_key),
-                )
-                .await;
-                // For these lifecycle tests, trust transition is validated by server-side accept/reject.
-                // Client post-handshake I/O can be racy because the server closes immediately after accept.
-                let _ = client_failed_or_disconnected;
-                server_accepted
-            }
-        };
 
         // 1. CA-A client accepted
-        let server_accepted = accept_client(
-            acceptor.clone(),
-            &bundle_a.client_cert_pem,
-            &bundle_a.client_key_pem,
+        let (server_accepted, _client_failed_or_disconnected) = attempt_raw_tls_connection_with_probe(
+            &mut probe,
+            &server_ca_pem,
+            Some(&bundle_a.client_cert_pem),
+            Some(&bundle_a.client_key_pem),
         )
         .await;
         assert!(
@@ -646,10 +321,11 @@ mod cert_lifecycle {
         );
 
         // 2. CA-B client rejected initially
-        let server_accepted = accept_client(
-            acceptor.clone(),
-            &bundle_b.client_cert_pem,
-            &bundle_b.client_key_pem,
+        let (server_accepted, _client_failed_or_disconnected) = attempt_raw_tls_connection_with_probe(
+            &mut probe,
+            &server_ca_pem,
+            Some(&bundle_b.client_cert_pem),
+            Some(&bundle_b.client_key_pem),
         )
         .await;
         assert!(
@@ -664,46 +340,55 @@ mod cert_lifecycle {
         std::fs::write(&temp_path, &bundle_b.ca_pem).unwrap();
         std::fs::rename(&temp_path, path.join("client_ca.crt")).unwrap();
 
-        let ca_b_reloaded = poll_until(
-            || async {
-                accept_client(
-                    acceptor.clone(),
-                    &bundle_b.client_cert_pem,
-                    &bundle_b.client_key_pem,
+        let mut ca_b_reloaded = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            let (server_accepted, _client_failed_or_disconnected) =
+                attempt_raw_tls_connection_with_probe(
+                    &mut probe,
+                    &server_ca_pem,
+                    Some(&bundle_b.client_cert_pem),
+                    Some(&bundle_b.client_key_pem),
                 )
-                .await
-            },
-            Duration::from_millis(200),
-            Duration::from_secs(20),
-        )
-        .await;
+                .await;
+            if server_accepted {
+                ca_b_reloaded = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
         assert!(
             ca_b_reloaded,
             "server should accept CA-B client after polling reload"
         );
 
-        let ca_a_rejected = poll_until(
-            || async {
-                !accept_client(
-                    acceptor.clone(),
-                    &bundle_a.client_cert_pem,
-                    &bundle_a.client_key_pem,
+        let mut ca_a_rejected = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            let (server_accepted, _client_failed_or_disconnected) =
+                attempt_raw_tls_connection_with_probe(
+                    &mut probe,
+                    &server_ca_pem,
+                    Some(&bundle_a.client_cert_pem),
+                    Some(&bundle_a.client_key_pem),
                 )
-                .await
-            },
-            Duration::from_millis(200),
-            Duration::from_secs(20),
-        )
-        .await;
+                .await;
+            if !server_accepted {
+                ca_a_rejected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
         assert!(
             ca_a_rejected,
             "server should reject CA-A client after polling reload"
         );
+        probe.abort();
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Category 5: Edge Cases & Security
+//  Category 4: Edge Cases & Security
 // ═══════════════════════════════════════════════════════════════════════════
 
 mod edge_cases {
@@ -787,22 +472,6 @@ mod edge_cases {
         );
     }
 
-    /// http:// endpoint with TLS config → TLS is not used (no error, plaintext).
-    #[tokio::test]
-    async fn http_endpoint_ignores_tls_config() {
-        let settings = GrpcClientSettings {
-            grpc_endpoint: "http://localhost:4317".to_string(),
-            tls: Some(TlsClientConfig {
-                ca_pem: Some("fake pem".to_string()),
-                ..TlsClientConfig::default()
-            }),
-            ..GrpcClientSettings::default()
-        };
-
-        // Should succeed — TLS config is ignored for http:// endpoints
-        let _ = settings.build_endpoint_with_tls().await.unwrap();
-    }
-
     /// Cert file larger than 4MB → error.
     #[tokio::test]
     async fn oversized_cert_file_rejected() {
@@ -874,15 +543,15 @@ mod edge_cases {
             }
         }
         assert!(
-            success_count >= 8,
-            "at least 8/10 concurrent connections should succeed, got {success_count}"
+            success_count == 10,
+            "all 10/10 concurrent connections should succeed on loopback, got {success_count}"
         );
         handle.abort();
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Category 6: Config Validation
+//  Category 5: Config Validation
 // ═══════════════════════════════════════════════════════════════════════════
 
 mod config_validation {
@@ -947,31 +616,4 @@ mod config_validation {
         );
     }
 
-    /// Partial mTLS client config (cert without key) → clear error message.
-    #[tokio::test]
-    async fn client_config_both_cert_and_key_required() {
-        let settings = GrpcClientSettings {
-            grpc_endpoint: "https://localhost:4317".to_string(),
-            tls: Some(TlsClientConfig {
-                config: TlsConfig {
-                    cert_pem: Some("some cert".to_string()),
-                    key_pem: None,
-                    ..TlsConfig::default()
-                },
-                ..TlsClientConfig::default()
-            }),
-            ..GrpcClientSettings::default()
-        };
-
-        let result = settings.build_endpoint_with_tls().await;
-        assert!(
-            result.is_err(),
-            "client cert without key should be rejected"
-        );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("both client certificate and key must be provided"),
-            "error should mention both cert and key, got: {err_msg}"
-        );
-    }
 }

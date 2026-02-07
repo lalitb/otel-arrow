@@ -376,6 +376,102 @@ pub async fn start_raw_tls_server(
     (addr, handle)
 }
 
+/// Reusable raw TLS probe server for repeated connection attempts in polling tests.
+/// Keeps a single listener alive and reports server-side accept/reject per attempt.
+pub struct RawTlsProbeServer {
+    pub addr: SocketAddr,
+    accepted_rx: mpsc::Receiver<bool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl RawTlsProbeServer {
+    pub fn abort(&self) {
+        self.handle.abort();
+    }
+}
+
+/// Start a reusable raw TLS probe server.
+pub async fn start_raw_tls_probe_server(
+    acceptor: Arc<tokio_rustls::TlsAcceptor>,
+) -> RawTlsProbeServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let (accepted_tx, accepted_rx) = mpsc::channel::<bool>(128);
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            let accepted = match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                acceptor.accept(stream),
+            )
+            .await
+            {
+                Ok(Ok(mut tls_stream)) => {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2];
+                    let _ = tls_stream.read_exact(&mut buf).await;
+                    let _ = tls_stream.write_all(b"ok").await;
+                    true
+                }
+                _ => false,
+            };
+            if accepted_tx.send(accepted).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    RawTlsProbeServer {
+        addr,
+        accepted_rx,
+        handle,
+    }
+}
+
+/// Attempt one TLS connection against a reusable probe server.
+pub async fn attempt_raw_tls_connection_with_probe(
+    probe: &mut RawTlsProbeServer,
+    ca_pem: &str,
+    client_cert_pem: Option<&str>,
+    client_key_pem: Option<&str>,
+) -> (bool, bool) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let connector = make_rustls_connector(ca_pem, client_cert_pem, client_key_pem);
+    let stream = tokio::net::TcpStream::connect(probe.addr)
+        .await
+        .expect("connect");
+    let domain = rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+
+    let client_failed_or_disconnected = match connector.connect(domain, stream).await {
+        Err(_) => true,
+        Ok(mut tls_stream) => {
+            if tls_stream.write_all(b"hi").await.is_err() {
+                true
+            } else {
+                let mut buf = [0u8; 2];
+                tls_stream.read_exact(&mut buf).await.is_err() || &buf != b"ok"
+            }
+        }
+    };
+
+    let server_accepted = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        probe.accepted_rx.recv(),
+    )
+    .await
+    .expect("timed out waiting for server acceptance result")
+    .expect("probe server closed acceptance channel");
+
+    (server_accepted, client_failed_or_disconnected)
+}
+
 /// Attempt one raw TLS/mTLS connection and capture both server and client outcomes.
 ///
 /// Returns `(server_accepted, client_failed_or_disconnected)`.
@@ -388,38 +484,12 @@ pub async fn attempt_raw_tls_connection(
     client_cert_pem: Option<&str>,
     client_key_pem: Option<&str>,
 ) -> (bool, bool) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("local addr");
-    let server_acceptor = acceptor.clone();
-
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept");
-        server_acceptor.accept(stream).await.is_ok()
-    });
-
-    let connector = make_rustls_connector(ca_pem, client_cert_pem, client_key_pem);
-    let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
-    let domain = rustls::pki_types::ServerName::try_from("localhost").expect("server name");
-
-    let client_failed_or_disconnected = match connector.connect(domain, stream).await {
-        Err(_) => true,
-        Ok(mut tls_stream) => {
-            let write_result = tls_stream.write_all(b"test").await;
-            if write_result.is_err() {
-                true
-            } else {
-                let mut buf = [0u8; 1];
-                matches!(tls_stream.read(&mut buf).await, Err(_) | Ok(0))
-            }
-        }
-    };
-
-    let server_accepted = server.await.expect("server task");
-    (server_accepted, client_failed_or_disconnected)
+    let mut probe = start_raw_tls_probe_server(acceptor.clone()).await;
+    let result =
+        attempt_raw_tls_connection_with_probe(&mut probe, ca_pem, client_cert_pem, client_key_pem)
+            .await;
+    probe.abort();
+    result
 }
 
 /// Poll an async predicate until it returns true or the timeout elapses.

@@ -7,7 +7,9 @@
 
 mod common;
 
-use common::tls_helpers::{attempt_raw_tls_connection, generate_self_signed_cert, poll_until};
+use common::tls_helpers::{
+    attempt_raw_tls_connection_with_probe, generate_self_signed_cert, start_raw_tls_probe_server,
+};
 use otap_df_config::tls::{TlsConfig, TlsServerConfig};
 use otap_df_otap::tls_utils::build_reloadable_server_config;
 use otap_df_telemetry::{otel_debug, otel_info};
@@ -465,11 +467,12 @@ async fn test_mtls_ca_hot_reload() {
         .await
         .expect("Failed to build server config");
     let tls_acceptor = Arc::new(tokio_rustls::TlsAcceptor::from(server_config));
+    let mut probe = start_raw_tls_probe_server(tls_acceptor.clone()).await;
 
     // Test 1: Client1 should be ACCEPTED (server trusts client1's cert)
     {
-        let (server_accepted, _client_failed_or_disconnected) = attempt_raw_tls_connection(
-            &tls_acceptor,
+        let (server_accepted, _client_failed_or_disconnected) = attempt_raw_tls_connection_with_probe(
+            &mut probe,
             &server_cert.cert_pem,
             Some(&client1.cert_pem),
             Some(&client1.key_pem),
@@ -483,8 +486,8 @@ async fn test_mtls_ca_hot_reload() {
 
     // Test 2: Client2 should be REJECTED (not yet trusted)
     {
-        let (server_accepted, client_failed_or_disconnected) = attempt_raw_tls_connection(
-            &tls_acceptor,
+        let (server_accepted, client_failed_or_disconnected) = attempt_raw_tls_connection_with_probe(
+            &mut probe,
             &server_cert.cert_pem,
             Some(&client2.cert_pem),
             Some(&client2.key_pem),
@@ -504,21 +507,23 @@ async fn test_mtls_ca_hot_reload() {
     fs::write(&temp_ca_path, &client2_pem).expect("Write temp CA");
     fs::rename(&temp_ca_path, &active_ca_path).expect("Hot-reload CA to client2 (atomic rename)");
 
-    let client2_after_reload_accepted = poll_until(
-        || async {
-            let (server_accepted, _client_failed_or_disconnected) = attempt_raw_tls_connection(
-                &tls_acceptor,
+    let mut client2_after_reload_accepted = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let (server_accepted, _client_failed_or_disconnected) =
+            attempt_raw_tls_connection_with_probe(
+                &mut probe,
                 &server_cert.cert_pem,
                 Some(&client2.cert_pem),
                 Some(&client2.key_pem),
             )
             .await;
-            server_accepted
-        },
-        std::time::Duration::from_millis(200),
-        std::time::Duration::from_secs(10),
-    )
-    .await;
+        if server_accepted {
+            client2_after_reload_accepted = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
     assert!(
         client2_after_reload_accepted,
         "Client2 should be accepted after CA hot-reload"
@@ -526,8 +531,8 @@ async fn test_mtls_ca_hot_reload() {
 
     // Test 4: After hot-reload, Client1 should now be REJECTED
     {
-        let (server_accepted, client_failed_or_disconnected) = attempt_raw_tls_connection(
-            &tls_acceptor,
+        let (server_accepted, client_failed_or_disconnected) = attempt_raw_tls_connection_with_probe(
+            &mut probe,
             &server_cert.cert_pem,
             Some(&client1.cert_pem),
             Some(&client1.key_pem),
@@ -540,6 +545,7 @@ async fn test_mtls_ca_hot_reload() {
     }
 
     otel_info!("mTLS CA hot-reload test completed successfully");
+    probe.abort();
 }
 
 /// Test that server keeps accepting clients when CA file is replaced with invalid/corrupted content.
@@ -594,11 +600,12 @@ async fn test_mtls_ca_reload_with_corrupted_file() {
         .await
         .expect("Failed to build server config");
     let tls_acceptor = Arc::new(tokio_rustls::TlsAcceptor::from(server_config));
+    let mut probe = start_raw_tls_probe_server(tls_acceptor.clone()).await;
 
     // Test 1: Client should be accepted initially
     {
-        let (server_accepted, _client_failed_or_disconnected) = attempt_raw_tls_connection(
-            &tls_acceptor,
+        let (server_accepted, _client_failed_or_disconnected) = attempt_raw_tls_connection_with_probe(
+            &mut probe,
             &server_cert.cert_pem,
             Some(&client_cert.cert_pem),
             Some(&client_cert.key_pem),
@@ -613,25 +620,28 @@ async fn test_mtls_ca_reload_with_corrupted_file() {
     // graceful degradation with the last-known-good CA.
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    let still_accepted_after_corruption = poll_until(
-        || async {
-            let (server_accepted, _client_failed_or_disconnected) = attempt_raw_tls_connection(
-                &tls_acceptor,
+    let mut still_accepted_after_corruption = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let (server_accepted, _client_failed_or_disconnected) =
+            attempt_raw_tls_connection_with_probe(
+                &mut probe,
                 &server_cert.cert_pem,
                 Some(&client_cert.cert_pem),
                 Some(&client_cert.key_pem),
             )
             .await;
-            server_accepted
-        },
-        std::time::Duration::from_millis(200),
-        std::time::Duration::from_secs(5),
-    )
-    .await;
+        if server_accepted {
+            still_accepted_after_corruption = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
     assert!(
         still_accepted_after_corruption,
         "Client should still be accepted after corrupted CA reload (graceful degradation)"
     );
+    probe.abort();
 }
 
 /// Test that server keeps working when CA file is deleted during operation.
@@ -682,11 +692,12 @@ async fn test_mtls_ca_reload_file_deleted() {
         .await
         .expect("Failed to build server config");
     let tls_acceptor = Arc::new(tokio_rustls::TlsAcceptor::from(server_config));
+    let mut probe = start_raw_tls_probe_server(tls_acceptor.clone()).await;
 
     // Test 1: Client should be accepted initially
     {
-        let (server_accepted, _client_failed_or_disconnected) = attempt_raw_tls_connection(
-            &tls_acceptor,
+        let (server_accepted, _client_failed_or_disconnected) = attempt_raw_tls_connection_with_probe(
+            &mut probe,
             &server_cert.cert_pem,
             Some(&client_cert.cert_pem),
             Some(&client_cert.key_pem),
@@ -701,23 +712,26 @@ async fn test_mtls_ca_reload_file_deleted() {
     // graceful degradation with the last-known-good CA.
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    let still_accepted_after_deletion = poll_until(
-        || async {
-            let (server_accepted, _client_failed_or_disconnected) = attempt_raw_tls_connection(
-                &tls_acceptor,
+    let mut still_accepted_after_deletion = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let (server_accepted, _client_failed_or_disconnected) =
+            attempt_raw_tls_connection_with_probe(
+                &mut probe,
                 &server_cert.cert_pem,
                 Some(&client_cert.cert_pem),
                 Some(&client_cert.key_pem),
             )
             .await;
-            server_accepted
-        },
-        std::time::Duration::from_millis(200),
-        std::time::Duration::from_secs(5),
-    )
-    .await;
+        if server_accepted {
+            still_accepted_after_deletion = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
     assert!(
         still_accepted_after_deletion,
         "Client should still be accepted after CA file deleted (keeps last known good)"
     );
+    probe.abort();
 }

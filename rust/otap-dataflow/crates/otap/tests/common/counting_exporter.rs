@@ -1,10 +1,6 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-// This module is compiled into every test binary that includes `mod common;`.
-// Not every test binary uses every helper, so allow unused items.
-#![allow(unused_imports)]
-
 //! A test exporter that counts received items.
 //!
 //! Each exporter instance is identified by a unique ID passed in the node config.
