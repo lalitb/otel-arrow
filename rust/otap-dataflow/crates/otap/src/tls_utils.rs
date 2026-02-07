@@ -1578,11 +1578,7 @@ mod tests {
         let key_pair = KeyPair::generate().expect("key pair");
         let cert = params.self_signed(&key_pair).expect("self-signed cert");
         fs::write(dir.join(format!("{}.crt", name)), cert.pem()).expect("write cert");
-        fs::write(
-            dir.join(format!("{}.key", name)),
-            key_pair.serialize_pem(),
-        )
-        .expect("write key");
+        fs::write(dir.join(format!("{}.key", name)), key_pair.serialize_pem()).expect("write key");
     }
 
     /// Generate an end-entity (leaf) certificate signed by a CA using rcgen.
@@ -1867,7 +1863,10 @@ mod tests {
         };
 
         let result = load_client_tls_config(Some(&config), "https://localhost:4317").await;
-        assert!(result.is_ok(), "file-based client cert+key should be accepted");
+        assert!(
+            result.is_ok(),
+            "file-based client cert+key should be accepted"
+        );
         assert!(result.expect("result").is_some());
     }
 

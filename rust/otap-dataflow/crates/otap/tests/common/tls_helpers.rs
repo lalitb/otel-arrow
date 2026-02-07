@@ -461,13 +461,11 @@ pub async fn attempt_raw_tls_connection_with_probe(
         }
     };
 
-    let server_accepted = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        probe.accepted_rx.recv(),
-    )
-    .await
-    .expect("timed out waiting for server acceptance result")
-    .expect("probe server closed acceptance channel");
+    let server_accepted =
+        tokio::time::timeout(std::time::Duration::from_secs(2), probe.accepted_rx.recv())
+            .await
+            .expect("timed out waiting for server acceptance result")
+            .expect("probe server closed acceptance channel");
 
     (server_accepted, client_failed_or_disconnected)
 }

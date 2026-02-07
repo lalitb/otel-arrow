@@ -471,13 +471,14 @@ async fn test_mtls_ca_hot_reload() {
 
     // Test 1: Client1 should be ACCEPTED (server trusts client1's cert)
     {
-        let (server_accepted, _client_failed_or_disconnected) = attempt_raw_tls_connection_with_probe(
-            &mut probe,
-            &server_cert.cert_pem,
-            Some(&client1.cert_pem),
-            Some(&client1.key_pem),
-        )
-        .await;
+        let (server_accepted, _client_failed_or_disconnected) =
+            attempt_raw_tls_connection_with_probe(
+                &mut probe,
+                &server_cert.cert_pem,
+                Some(&client1.cert_pem),
+                Some(&client1.key_pem),
+            )
+            .await;
         assert!(
             server_accepted,
             "Client1 should be accepted (trusted by initial CA)"
@@ -486,13 +487,14 @@ async fn test_mtls_ca_hot_reload() {
 
     // Test 2: Client2 should be REJECTED (not yet trusted)
     {
-        let (server_accepted, client_failed_or_disconnected) = attempt_raw_tls_connection_with_probe(
-            &mut probe,
-            &server_cert.cert_pem,
-            Some(&client2.cert_pem),
-            Some(&client2.key_pem),
-        )
-        .await;
+        let (server_accepted, client_failed_or_disconnected) =
+            attempt_raw_tls_connection_with_probe(
+                &mut probe,
+                &server_cert.cert_pem,
+                Some(&client2.cert_pem),
+                Some(&client2.key_pem),
+            )
+            .await;
         assert!(
             client_failed_or_disconnected || !server_accepted,
             "Client2 should be rejected (not trusted by current CA)"
@@ -531,13 +533,14 @@ async fn test_mtls_ca_hot_reload() {
 
     // Test 4: After hot-reload, Client1 should now be REJECTED
     {
-        let (server_accepted, client_failed_or_disconnected) = attempt_raw_tls_connection_with_probe(
-            &mut probe,
-            &server_cert.cert_pem,
-            Some(&client1.cert_pem),
-            Some(&client1.key_pem),
-        )
-        .await;
+        let (server_accepted, client_failed_or_disconnected) =
+            attempt_raw_tls_connection_with_probe(
+                &mut probe,
+                &server_cert.cert_pem,
+                Some(&client1.cert_pem),
+                Some(&client1.key_pem),
+            )
+            .await;
         assert!(
             client_failed_or_disconnected || !server_accepted,
             "Client1 should be rejected after CA hot-reload (no longer trusted)"
@@ -604,13 +607,14 @@ async fn test_mtls_ca_reload_with_corrupted_file() {
 
     // Test 1: Client should be accepted initially
     {
-        let (server_accepted, _client_failed_or_disconnected) = attempt_raw_tls_connection_with_probe(
-            &mut probe,
-            &server_cert.cert_pem,
-            Some(&client_cert.cert_pem),
-            Some(&client_cert.key_pem),
-        )
-        .await;
+        let (server_accepted, _client_failed_or_disconnected) =
+            attempt_raw_tls_connection_with_probe(
+                &mut probe,
+                &server_cert.cert_pem,
+                Some(&client_cert.cert_pem),
+                Some(&client_cert.key_pem),
+            )
+            .await;
         assert!(server_accepted, "Client should be accepted initially");
     }
 
@@ -696,13 +700,14 @@ async fn test_mtls_ca_reload_file_deleted() {
 
     // Test 1: Client should be accepted initially
     {
-        let (server_accepted, _client_failed_or_disconnected) = attempt_raw_tls_connection_with_probe(
-            &mut probe,
-            &server_cert.cert_pem,
-            Some(&client_cert.cert_pem),
-            Some(&client_cert.key_pem),
-        )
-        .await;
+        let (server_accepted, _client_failed_or_disconnected) =
+            attempt_raw_tls_connection_with_probe(
+                &mut probe,
+                &server_cert.cert_pem,
+                Some(&client_cert.cert_pem),
+                Some(&client_cert.key_pem),
+            )
+            .await;
         assert!(server_accepted, "Client should be accepted initially");
     }
 

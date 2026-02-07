@@ -50,6 +50,29 @@ mod tests {
         })
     }
 
+    fn make_connector(ca_pem: &str) -> TlsConnector {
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in CertificateDer::pem_reader_iter(&mut BufReader::new(ca_pem.as_bytes())) {
+            root_store.add(cert.expect("parse cert")).expect("add cert");
+        }
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        TlsConnector::from(Arc::new(client_config))
+    }
+
+    async fn handshake_succeeds(
+        addr: SocketAddr,
+        connector: &TlsConnector,
+        server_name: &rustls::pki_types::ServerName<'static>,
+    ) -> bool {
+        let stream = match TcpStream::connect(addr).await {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        connector.connect(server_name.clone(), stream).await.is_ok()
+    }
+
     #[tokio::test]
     #[cfg_attr(
         target_os = "windows",
@@ -164,6 +187,162 @@ mod tests {
         assert!(ca1_rejected, "Handshake with CA1 should fail after reload");
 
         // Cleanup
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "Skipping on Windows due to flakiness. See https://github.com/open-telemetry/otel-arrow/issues/1614"
+    )]
+    async fn test_tls_reload_with_corrupted_cert_keeps_last_good() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path();
+        let cert_path = path.join("server.crt");
+        let key_path = path.join("server.key");
+
+        let (bundle_a, bundle_b) = generate_separate_ca_certs();
+        fs::write(&cert_path, &bundle_a.server_cert_pem).expect("write cert");
+        fs::write(&key_path, &bundle_a.server_key_pem).expect("write key");
+
+        let config = TlsServerConfig {
+            config: TlsConfig {
+                cert_file: Some(cert_path.clone()),
+                key_file: Some(key_path.clone()),
+                reload_interval: Some(Duration::from_secs(1)),
+                cert_pem: None,
+                key_pem: None,
+            },
+            client_ca_file: None,
+            client_ca_pem: None,
+            include_system_ca_certs_pool: None,
+            handshake_timeout: None,
+            watch_client_ca: false,
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let server_handle = start_server(config, listener).await;
+
+        let connector_a = make_connector(&bundle_a.ca_pem);
+        let connector_b = make_connector(&bundle_b.ca_pem);
+        let domain = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+
+        assert!(
+            handshake_succeeds(local_addr, &connector_a, &domain).await,
+            "CA-A handshake should succeed before corruption"
+        );
+        assert!(
+            !handshake_succeeds(local_addr, &connector_b, &domain).await,
+            "CA-B handshake should fail before corruption"
+        );
+
+        // Corrupt certificate file and allow polling/reload attempt window to pass.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        fs::write(&cert_path, "not a valid cert pem").expect("corrupt cert");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let still_accepts_a = poll_until(
+            || async { handshake_succeeds(local_addr, &connector_a, &domain).await },
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            still_accepts_a,
+            "Server should keep using last known good certificate after corrupted cert reload"
+        );
+
+        let still_rejects_b = poll_until(
+            || async { !handshake_succeeds(local_addr, &connector_b, &domain).await },
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            still_rejects_b,
+            "Server should keep presenting CA-A cert after corrupted cert reload"
+        );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "Skipping on Windows due to flakiness. See https://github.com/open-telemetry/otel-arrow/issues/1614"
+    )]
+    async fn test_tls_reload_with_deleted_cert_keeps_last_good() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path();
+        let cert_path = path.join("server.crt");
+        let key_path = path.join("server.key");
+
+        let (bundle_a, bundle_b) = generate_separate_ca_certs();
+        fs::write(&cert_path, &bundle_a.server_cert_pem).expect("write cert");
+        fs::write(&key_path, &bundle_a.server_key_pem).expect("write key");
+
+        let config = TlsServerConfig {
+            config: TlsConfig {
+                cert_file: Some(cert_path.clone()),
+                key_file: Some(key_path.clone()),
+                reload_interval: Some(Duration::from_secs(1)),
+                cert_pem: None,
+                key_pem: None,
+            },
+            client_ca_file: None,
+            client_ca_pem: None,
+            include_system_ca_certs_pool: None,
+            handshake_timeout: None,
+            watch_client_ca: false,
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let server_handle = start_server(config, listener).await;
+
+        let connector_a = make_connector(&bundle_a.ca_pem);
+        let connector_b = make_connector(&bundle_b.ca_pem);
+        let domain = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+
+        assert!(
+            handshake_succeeds(local_addr, &connector_a, &domain).await,
+            "CA-A handshake should succeed before deletion"
+        );
+        assert!(
+            !handshake_succeeds(local_addr, &connector_b, &domain).await,
+            "CA-B handshake should fail before deletion"
+        );
+
+        // Delete cert file and allow polling/check window to pass.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        fs::remove_file(&cert_path).expect("delete cert");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let still_accepts_a = poll_until(
+            || async { handshake_succeeds(local_addr, &connector_a, &domain).await },
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            still_accepts_a,
+            "Server should keep using last known good certificate after cert file deletion"
+        );
+
+        let still_rejects_b = poll_until(
+            || async { !handshake_succeeds(local_addr, &connector_b, &domain).await },
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            still_rejects_b,
+            "Server should keep presenting CA-A cert after cert file deletion"
+        );
+
         server_handle.abort();
     }
 }

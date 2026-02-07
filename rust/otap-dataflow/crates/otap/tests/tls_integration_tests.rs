@@ -308,26 +308,28 @@ mod cert_lifecycle {
         let server_ca_pem = bundle_a.ca_pem.clone();
 
         // 1. CA-A client accepted
-        let (server_accepted, _client_failed_or_disconnected) = attempt_raw_tls_connection_with_probe(
-            &mut probe,
-            &server_ca_pem,
-            Some(&bundle_a.client_cert_pem),
-            Some(&bundle_a.client_key_pem),
-        )
-        .await;
+        let (server_accepted, _client_failed_or_disconnected) =
+            attempt_raw_tls_connection_with_probe(
+                &mut probe,
+                &server_ca_pem,
+                Some(&bundle_a.client_cert_pem),
+                Some(&bundle_a.client_key_pem),
+            )
+            .await;
         assert!(
             server_accepted,
             "server should accept CA-A client initially"
         );
 
         // 2. CA-B client rejected initially
-        let (server_accepted, _client_failed_or_disconnected) = attempt_raw_tls_connection_with_probe(
-            &mut probe,
-            &server_ca_pem,
-            Some(&bundle_b.client_cert_pem),
-            Some(&bundle_b.client_key_pem),
-        )
-        .await;
+        let (server_accepted, _client_failed_or_disconnected) =
+            attempt_raw_tls_connection_with_probe(
+                &mut probe,
+                &server_ca_pem,
+                Some(&bundle_b.client_cert_pem),
+                Some(&bundle_b.client_key_pem),
+            )
+            .await;
         assert!(
             !server_accepted,
             "server should reject CA-B client initially"
@@ -615,5 +617,4 @@ mod config_validation {
                 .contains("both certificate and key must be provided")
         );
     }
-
 }
