@@ -1262,3 +1262,371 @@ mod telemetry_tests {
         }));
     }
 }
+
+#[cfg(all(test, feature = "experimental-tls"))]
+mod tls_integration_tests {
+    use super::*;
+    use otap_df_config::node::NodeUserConfig;
+    use otap_df_config::tls::{TlsConfig, TlsServerConfig};
+    use otap_df_engine::receiver::ReceiverWrapper;
+    use otap_df_engine::testing::{
+        receiver::{NotSendValidateContext, TestContext, TestRuntime},
+        test_node,
+    };
+    use otap_df_pdata::OtapPayload;
+    use otap_df_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+    };
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::io::BufReader;
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tempfile::TempDir;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+    use tokio::time::{Duration, timeout};
+    use tokio_rustls::TlsConnector;
+
+    struct TlsMaterial {
+        _temp_dir: TempDir,
+        ca_path: PathBuf,
+        server_cert_path: PathBuf,
+        server_key_path: PathBuf,
+        ca_pem: String,
+        client_cert_pem: String,
+        client_key_pem: String,
+    }
+
+    fn new_receiver_for_tests(config: Config) -> SyslogCefReceiver {
+        let telemetry_registry = otap_df_telemetry::registry::TelemetryRegistryHandle::new();
+        let metric_set = telemetry_registry.register_metric_set::<SyslogCefReceiverMetrics>(
+            otap_df_telemetry::testing::EmptyAttributes(),
+        );
+        SyslogCefReceiver {
+            config,
+            metrics: Rc::new(RefCell::new(metric_set)),
+        }
+    }
+
+    fn generate_tls_material() -> TlsMaterial {
+        generate_tls_material_with_ca_name("Syslog Test CA")
+    }
+
+    // Note: this module is compiled under src/#[cfg(test)] and cannot import
+    // helpers from tests/common/tls_helpers.rs (separate test crate boundary).
+    fn generate_tls_material_with_ca_name(ca_cn: &str) -> TlsMaterial {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let path = temp_dir.path();
+
+        let mut ca_params = CertificateParams::default();
+        ca_params.distinguished_name.push(DnType::CommonName, ca_cn);
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_key = KeyPair::generate().expect("ca key");
+        let ca_cert = ca_params.self_signed(&ca_key).expect("ca cert");
+        let ca_issuer = Issuer::from_params(&ca_params, &ca_key);
+
+        let mut server_params =
+            CertificateParams::new(vec!["localhost".to_string()]).expect("server params");
+        server_params
+            .distinguished_name
+            .push(DnType::CommonName, "localhost");
+        server_params.is_ca = IsCa::ExplicitNoCa;
+        server_params
+            .extended_key_usages
+            .push(ExtendedKeyUsagePurpose::ServerAuth);
+        let server_key = KeyPair::generate().expect("server key");
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_issuer)
+            .expect("server cert");
+
+        let mut client_params =
+            CertificateParams::new(vec!["client".to_string()]).expect("client params");
+        client_params
+            .distinguished_name
+            .push(DnType::CommonName, "client");
+        client_params.is_ca = IsCa::ExplicitNoCa;
+        client_params
+            .extended_key_usages
+            .push(ExtendedKeyUsagePurpose::ClientAuth);
+        let client_key = KeyPair::generate().expect("client key");
+        let client_cert = client_params
+            .signed_by(&client_key, &ca_issuer)
+            .expect("client cert");
+
+        let ca_path = path.join("ca.crt");
+        let server_cert_path = path.join("server.crt");
+        let server_key_path = path.join("server.key");
+        std::fs::write(&ca_path, ca_cert.pem()).expect("write ca");
+        std::fs::write(&server_cert_path, server_cert.pem()).expect("write server cert");
+        std::fs::write(&server_key_path, server_key.serialize_pem()).expect("write server key");
+
+        TlsMaterial {
+            _temp_dir: temp_dir,
+            ca_path,
+            server_cert_path,
+            server_key_path,
+            ca_pem: ca_cert.pem(),
+            client_cert_pem: client_cert.pem(),
+            client_key_pem: client_key.serialize_pem(),
+        }
+    }
+
+    fn make_tls_connector(
+        ca_pem: &str,
+        client_cert_pem: Option<&str>,
+        client_key_pem: Option<&str>,
+    ) -> TlsConnector {
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in CertificateDer::pem_reader_iter(&mut BufReader::new(ca_pem.as_bytes())) {
+            root_store
+                .add(cert.expect("parse CA cert"))
+                .expect("add CA cert");
+        }
+
+        let config = if let (Some(cert_pem), Some(key_pem)) = (client_cert_pem, client_key_pem) {
+            let client_certs: Vec<_> =
+                CertificateDer::pem_reader_iter(&mut BufReader::new(cert_pem.as_bytes()))
+                    .collect::<Result<_, _>>()
+                    .expect("parse client cert");
+            let client_key =
+                PrivateKeyDer::from_pem_reader(&mut BufReader::new(key_pem.as_bytes()))
+                    .expect("parse client key");
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_client_auth_cert(client_certs, client_key)
+                .expect("client auth config")
+        } else {
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        };
+        TlsConnector::from(Arc::new(config))
+    }
+
+    fn tls_tcp_scenario(
+        listening_addr: SocketAddr,
+        connector: TlsConnector,
+        send_payload_on_success: bool,
+    ) -> impl FnOnce(TestContext<OtapPdata>) -> Pin<Box<dyn Future<Output = ()>>> {
+        move |ctx| {
+            Box::pin(async move {
+                let stream = TcpStream::connect(listening_addr)
+                    .await
+                    .expect("connect TCP");
+                let domain =
+                    rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+
+                match connector.connect(domain, stream).await {
+                    Ok(mut tls_stream) => {
+                        if send_payload_on_success {
+                            let test_message = b"<34>1 2024-01-15T10:30:45.123Z tls.example.com syslog - ID47 - tls test message\n";
+                            let _ = tls_stream.write_all(test_message).await;
+                            let _ = tls_stream.flush().await;
+                        }
+                    }
+                    Err(_) => {
+                        // For rejection tests, handshake failure is expected.
+                    }
+                }
+
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                ctx.send_shutdown(Instant::now(), "TLS Test")
+                    .await
+                    .expect("shutdown");
+            })
+        }
+    }
+
+    fn validation_one_message()
+    -> impl FnOnce(NotSendValidateContext<OtapPdata>) -> Pin<Box<dyn Future<Output = ()>>> {
+        |mut ctx| {
+            Box::pin(async move {
+                let message = timeout(Duration::from_secs(3), ctx.recv())
+                    .await
+                    .expect("timed out waiting for message")
+                    .expect("no message received")
+                    .payload();
+                let OtapPayload::OtapArrowRecords(arrow_records) = message else {
+                    panic!("Expected OtapArrowRecords payload")
+                };
+                let logs_record_batch = arrow_records
+                    .get(ArrowPayloadType::Logs)
+                    .expect("logs batch");
+                assert_eq!(
+                    logs_record_batch.num_rows(),
+                    1,
+                    "expected exactly one log row"
+                );
+            })
+        }
+    }
+
+    fn validation_no_messages()
+    -> impl FnOnce(NotSendValidateContext<OtapPdata>) -> Pin<Box<dyn Future<Output = ()>>> {
+        |mut ctx| {
+            Box::pin(async move {
+                match timeout(Duration::from_millis(700), ctx.recv()).await {
+                    Err(_) => {}
+                    Ok(Err(_)) => {}
+                    Ok(Ok(_)) => {
+                        panic!("Did not expect any payload for rejected mTLS client")
+                    }
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn test_syslog_cef_receiver_tcp_tls_e2e() {
+        let test_runtime = TestRuntime::new();
+        let listening_port = portpicker::pick_unused_port().expect("No free ports");
+        let listening_addr: SocketAddr = format!("127.0.0.1:{listening_port}").parse().unwrap();
+
+        let certs = generate_tls_material();
+        let mut config = Config::new(listening_addr, Protocol::Tcp);
+        config.tls = Some(TlsServerConfig {
+            config: TlsConfig {
+                cert_file: Some(certs.server_cert_path.clone()),
+                key_file: Some(certs.server_key_path.clone()),
+                ..TlsConfig::default()
+            },
+            ..TlsServerConfig::default()
+        });
+
+        let receiver = new_receiver_for_tests(config);
+        let node_config = Arc::new(NodeUserConfig::new_exporter_config(SYSLOG_CEF_RECEIVER_URN));
+        let receiver_wrapper = ReceiverWrapper::local(
+            receiver,
+            test_node(test_runtime.config().name.clone()),
+            node_config,
+            test_runtime.config(),
+        );
+
+        let connector = make_tls_connector(&certs.ca_pem, None, None);
+        test_runtime
+            .set_receiver(receiver_wrapper)
+            .run_test(tls_tcp_scenario(listening_addr, connector, true))
+            .run_validation(validation_one_message());
+    }
+
+    #[test]
+    fn test_syslog_cef_receiver_tcp_mtls_e2e() {
+        let test_runtime = TestRuntime::new();
+        let listening_port = portpicker::pick_unused_port().expect("No free ports");
+        let listening_addr: SocketAddr = format!("127.0.0.1:{listening_port}").parse().unwrap();
+
+        let certs = generate_tls_material();
+        let mut config = Config::new(listening_addr, Protocol::Tcp);
+        config.tls = Some(TlsServerConfig {
+            config: TlsConfig {
+                cert_file: Some(certs.server_cert_path.clone()),
+                key_file: Some(certs.server_key_path.clone()),
+                ..TlsConfig::default()
+            },
+            client_ca_file: Some(certs.ca_path.clone()),
+            ..TlsServerConfig::default()
+        });
+
+        let receiver = new_receiver_for_tests(config);
+        let node_config = Arc::new(NodeUserConfig::new_exporter_config(SYSLOG_CEF_RECEIVER_URN));
+        let receiver_wrapper = ReceiverWrapper::local(
+            receiver,
+            test_node(test_runtime.config().name.clone()),
+            node_config,
+            test_runtime.config(),
+        );
+
+        let connector = make_tls_connector(
+            &certs.ca_pem,
+            Some(&certs.client_cert_pem),
+            Some(&certs.client_key_pem),
+        );
+        test_runtime
+            .set_receiver(receiver_wrapper)
+            .run_test(tls_tcp_scenario(listening_addr, connector, true))
+            .run_validation(validation_one_message());
+    }
+
+    #[test]
+    fn test_syslog_cef_receiver_tcp_mtls_rejects_missing_client_cert() {
+        let test_runtime = TestRuntime::new();
+        let listening_port = portpicker::pick_unused_port().expect("No free ports");
+        let listening_addr: SocketAddr = format!("127.0.0.1:{listening_port}").parse().unwrap();
+
+        let certs = generate_tls_material();
+        let mut config = Config::new(listening_addr, Protocol::Tcp);
+        config.tls = Some(TlsServerConfig {
+            config: TlsConfig {
+                cert_file: Some(certs.server_cert_path.clone()),
+                key_file: Some(certs.server_key_path.clone()),
+                ..TlsConfig::default()
+            },
+            client_ca_file: Some(certs.ca_path.clone()),
+            ..TlsServerConfig::default()
+        });
+
+        let receiver = new_receiver_for_tests(config);
+        let node_config = Arc::new(NodeUserConfig::new_exporter_config(SYSLOG_CEF_RECEIVER_URN));
+        let receiver_wrapper = ReceiverWrapper::local(
+            receiver,
+            test_node(test_runtime.config().name.clone()),
+            node_config,
+            test_runtime.config(),
+        );
+
+        let connector = make_tls_connector(&certs.ca_pem, None, None);
+        test_runtime
+            .set_receiver(receiver_wrapper)
+            .run_test(tls_tcp_scenario(listening_addr, connector, true))
+            .run_validation(validation_no_messages());
+    }
+
+    #[test]
+    fn test_syslog_cef_receiver_tcp_mtls_rejects_wrong_client_ca() {
+        let test_runtime = TestRuntime::new();
+        let listening_port = portpicker::pick_unused_port().expect("No free ports");
+        let listening_addr: SocketAddr = format!("127.0.0.1:{listening_port}").parse().unwrap();
+
+        let trusted = generate_tls_material_with_ca_name("Trusted Syslog CA");
+        let untrusted = generate_tls_material_with_ca_name("Untrusted Syslog CA");
+
+        let mut config = Config::new(listening_addr, Protocol::Tcp);
+        config.tls = Some(TlsServerConfig {
+            config: TlsConfig {
+                cert_file: Some(trusted.server_cert_path.clone()),
+                key_file: Some(trusted.server_key_path.clone()),
+                ..TlsConfig::default()
+            },
+            client_ca_file: Some(trusted.ca_path.clone()),
+            ..TlsServerConfig::default()
+        });
+
+        let receiver = new_receiver_for_tests(config);
+        let node_config = Arc::new(NodeUserConfig::new_exporter_config(SYSLOG_CEF_RECEIVER_URN));
+        let receiver_wrapper = ReceiverWrapper::local(
+            receiver,
+            test_node(test_runtime.config().name.clone()),
+            node_config,
+            test_runtime.config(),
+        );
+
+        // Trust server cert chain, but present client cert signed by a different CA.
+        let connector = make_tls_connector(
+            &trusted.ca_pem,
+            Some(&untrusted.client_cert_pem),
+            Some(&untrusted.client_key_pem),
+        );
+        test_runtime
+            .set_receiver(receiver_wrapper)
+            .run_test(tls_tcp_scenario(listening_addr, connector, true))
+            .run_validation(validation_no_messages());
+    }
+}
