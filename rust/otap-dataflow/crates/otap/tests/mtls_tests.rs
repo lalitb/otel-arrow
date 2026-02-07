@@ -633,6 +633,9 @@ async fn test_mtls_ca_reload_with_corrupted_file() {
 
     // Corrupt the CA file with invalid PEM content
     fs::write(&active_ca_path, "not a valid PEM certificate").expect("Corrupt CA file");
+    // Ensure the watcher has a chance to observe and attempt reload before we validate
+    // graceful degradation with the last-known-good CA.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     let still_accepted_after_corruption = poll_until(
         || async {
@@ -721,6 +724,9 @@ async fn test_mtls_ca_reload_file_deleted() {
 
     // Delete the CA file
     fs::remove_file(&active_ca_path).expect("Delete CA file");
+    // Ensure the watcher has a chance to observe and attempt reload before we validate
+    // graceful degradation with the last-known-good CA.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     let still_accepted_after_deletion = poll_until(
         || async {

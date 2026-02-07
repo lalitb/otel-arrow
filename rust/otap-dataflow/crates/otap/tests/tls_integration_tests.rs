@@ -757,8 +757,7 @@ mod edge_cases {
 
         use tokio::io::AsyncReadExt;
         let mut buf = [0u8; 2];
-        let n = stream.read_exact(&mut buf).await.expect("read");
-        assert_eq!(n, 2);
+        stream.read_exact(&mut buf).await.expect("read");
         assert_eq!(&buf, b"ok");
         assert!(server_handle.await.unwrap());
     }
