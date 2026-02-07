@@ -1560,73 +1560,29 @@ fn read_file_with_limit_sync(path: &Path) -> Result<Vec<u8>, io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use otap_df_config::tls::TlsClientConfig;
     use otap_df_config::tls::TlsConfig;
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
     use std::fs;
-    use std::process::Command;
     use tempfile::TempDir;
 
-    /// Check if OpenSSL CLI is available on the system.
-    /// Returns `true` if `openssl version` succeeds, `false` otherwise.
-    fn is_openssl_available() -> bool {
-        Command::new("openssl")
-            .arg("version")
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
-    }
-
-    /// Skips the test if OpenSSL is not available, printing a clear message.
-    /// Returns `true` if the test should be skipped.
-    fn skip_if_no_openssl() -> bool {
-        if !is_openssl_available() {
-            eprintln!(
-                "SKIPPED: OpenSSL CLI not found. Install OpenSSL to run this test. \
-                 On macOS: `brew install openssl`, on Ubuntu: `apt-get install openssl`"
-            );
-            true
+    /// Generate a self-signed certificate and key using rcgen.
+    fn generate_cert(dir: &Path, name: &str, cn: &str, is_ca: bool) {
+        let mut params = CertificateParams::new(vec![cn.to_string()]).expect("cert params");
+        params.distinguished_name.push(DnType::CommonName, cn);
+        params.is_ca = if is_ca {
+            IsCa::Ca(BasicConstraints::Unconstrained)
         } else {
-            false
-        }
-    }
-
-    /// Generate a self-signed certificate using OpenSSL CLI.
-    ///
-    /// # Panics
-    /// Panics if OpenSSL is not installed or if cert generation fails.
-    /// Tests using this should call `skip_if_no_openssl()` first for graceful handling.
-    fn generate_cert(dir: &Path, name: &str, cn: &str) {
-        // Generate Key and Cert in one go (self-signed)
-        let output = Command::new("openssl")
-            .args([
-                "req",
-                "-x509",
-                "-newkey",
-                "rsa:2048",
-                "-keyout",
-                &format!("{}.key", name),
-                "-out",
-                &format!("{}.crt", name),
-                "-days",
-                "1",
-                "-nodes",
-                "-subj",
-                &format!("/CN={}", cn),
-                "-addext",
-                "basicConstraints=critical,CA:TRUE",
-            ])
-            .current_dir(dir)
-            .output()
-            .expect(
-                "Failed to execute openssl. Ensure OpenSSL CLI is installed: \
-                 macOS: `brew install openssl`, Ubuntu: `apt-get install openssl`",
-            );
-
-        if !output.status.success() {
-            panic!(
-                "Certificate generation failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
+            IsCa::ExplicitNoCa
+        };
+        let key_pair = KeyPair::generate().expect("key pair");
+        let cert = params.self_signed(&key_pair).expect("self-signed cert");
+        fs::write(dir.join(format!("{}.crt", name)), cert.pem()).expect("write cert");
+        fs::write(
+            dir.join(format!("{}.key", name)),
+            key_pair.serialize_pem(),
+        )
+        .expect("write key");
     }
 
     /// Generate an end-entity (leaf) certificate signed by a CA using rcgen.
@@ -1645,8 +1601,6 @@ mod tests {
     /// * `cert_name` - Base name for end-entity cert files
     /// * `cn` - Common Name for the end-entity cert (also used as SAN for hostname verification)
     fn generate_ca_signed_cert(dir: &Path, ca_name: &str, cert_name: &str, cn: &str) {
-        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
-
         // Step 1: Generate CA certificate
         let mut ca_params = CertificateParams::default();
         ca_params
@@ -1694,9 +1648,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_lazy_reload_resolver() {
-        if skip_if_no_openssl() {
-            return;
-        }
         let _ = rustls::crypto::ring::default_provider().install_default();
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let path = temp_dir.path();
@@ -1704,7 +1655,7 @@ mod tests {
         let key_path = path.join("server.key");
 
         // 1. Generate initial cert
-        generate_cert(path, "cert1", "localhost");
+        generate_cert(path, "cert1", "localhost", false);
         let _ = fs::copy(path.join("cert1.crt"), &cert_path).expect("Copy cert1.crt");
         let _ = fs::copy(path.join("cert1.key"), &key_path).expect("Copy cert1.key");
 
@@ -1726,7 +1677,7 @@ mod tests {
         // Sleep a bit to ensure FS mtime granularity (some systems are 1s)
         tokio::time::sleep(Duration::from_millis(1100)).await;
 
-        generate_cert(path, "cert2", "otherhost");
+        generate_cert(path, "cert2", "otherhost", false);
         let _ = fs::copy(path.join("cert2.crt"), &cert_path).expect("Copy cert2.crt");
         let _ = fs::copy(path.join("cert2.key"), &key_path).expect("Copy cert2.key");
 
@@ -1792,12 +1743,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_server_tls_config_success_pem() {
-        if skip_if_no_openssl() {
-            return;
-        }
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let path = temp_dir.path();
-        generate_cert(path, "server", "localhost");
+        generate_cert(path, "server", "localhost", false);
 
         let cert_pem = fs::read_to_string(path.join("server.crt")).expect("Failed to read cert");
         let key_pem = fs::read_to_string(path.join("server.key")).expect("Failed to read key");
@@ -1824,12 +1772,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_server_tls_config_success_file() {
-        if skip_if_no_openssl() {
-            return;
-        }
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let path = temp_dir.path();
-        generate_cert(path, "server", "localhost");
+        generate_cert(path, "server", "localhost", false);
 
         let cert_path = path.join("server.crt");
         let key_path = path.join("server.key");
@@ -1854,20 +1799,89 @@ mod tests {
         assert!(result.unwrap().is_some());
     }
 
+    #[tokio::test]
+    async fn test_load_client_tls_config_insecure_without_custom_ca_returns_none() {
+        let config = TlsClientConfig {
+            insecure: Some(true),
+            ca_file: None,
+            ca_pem: None,
+            ..TlsClientConfig::default()
+        };
+
+        let result = load_client_tls_config(Some(&config), "https://localhost:4317")
+            .await
+            .expect("load client tls config");
+        assert!(
+            result.is_none(),
+            "insecure=true without custom CA should return None"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_client_tls_config_no_trust_anchors_errors() {
+        let config = TlsClientConfig {
+            include_system_ca_certs_pool: Some(false),
+            ca_file: None,
+            ca_pem: None,
+            ..TlsClientConfig::default()
+        };
+
+        let err = load_client_tls_config(Some(&config), "https://localhost:4317")
+            .await
+            .expect_err("missing trust anchors should error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("no trust anchors configured"));
+    }
+
+    #[tokio::test]
+    async fn test_load_client_tls_config_empty_ca_pem_errors() {
+        let config = TlsClientConfig {
+            include_system_ca_certs_pool: Some(false),
+            ca_pem: Some("   ".to_string()),
+            ..TlsClientConfig::default()
+        };
+
+        let err = load_client_tls_config(Some(&config), "https://localhost:4317")
+            .await
+            .expect_err("empty ca_pem should error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("ca_pem is set but empty"));
+    }
+
+    #[tokio::test]
+    async fn test_load_client_tls_config_mtls_file_paths_success() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let path = temp_dir.path();
+        generate_ca_signed_cert(path, "server_ca", "server", "localhost");
+        generate_ca_signed_cert(path, "client_ca", "client", "client");
+
+        let config = TlsClientConfig {
+            ca_file: Some(path.join("server_ca.crt")),
+            include_system_ca_certs_pool: Some(false),
+            config: TlsConfig {
+                cert_file: Some(path.join("client.crt")),
+                key_file: Some(path.join("client.key")),
+                ..TlsConfig::default()
+            },
+            ..TlsClientConfig::default()
+        };
+
+        let result = load_client_tls_config(Some(&config), "https://localhost:4317").await;
+        assert!(result.is_ok(), "file-based client cert+key should be accepted");
+        assert!(result.expect("result").is_some());
+    }
+
     // Skipping on macOS due to flakiness: https://github.com/open-telemetry/otel-arrow/issues/1614
     #[tokio::test]
     #[cfg_attr(target_os = "macos", ignore = "Skipping on macOS due to flakiness")]
     async fn test_reloadable_client_ca_verifier_file_watch() {
-        if skip_if_no_openssl() {
-            return;
-        }
         let _ = rustls::crypto::ring::default_provider().install_default();
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let path = temp_dir.path();
         let ca_path = path.join("ca.crt");
 
         // 1. Generate initial CA cert
-        generate_cert(path, "ca1", "TestCA1");
+        generate_cert(path, "ca1", "TestCA1", true);
         let _ = fs::copy(path.join("ca1.crt"), &ca_path).expect("Copy ca1.crt");
 
         // 2. Create verifier with file watching
@@ -1883,7 +1897,7 @@ mod tests {
         // 4. Update CA file (ensure file system detects change)
         tokio::time::sleep(Duration::from_millis(1100)).await; // Ensure mtime changes
 
-        generate_cert(path, "ca2", "TestCA2");
+        generate_cert(path, "ca2", "TestCA2", true);
         let _ = fs::copy(path.join("ca2.crt"), &ca_path).expect("Copy ca2.crt");
 
         // 5. Wait for file watcher to trigger reload
@@ -1901,15 +1915,12 @@ mod tests {
         ignore = "Skipping on Windows and macOS due to flakiness"
     )]
     async fn test_reloadable_client_ca_verifier_from_pem() {
-        if skip_if_no_openssl() {
-            return;
-        }
         let _ = rustls::crypto::ring::default_provider().install_default();
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let path = temp_dir.path();
 
         // Generate a CA cert
-        generate_cert(path, "ca", "TestCA");
+        generate_cert(path, "ca", "TestCA", true);
         let ca_pem = fs::read(path.join("ca.crt")).expect("Failed to read CA cert");
 
         // Create verifier from PEM
@@ -1927,16 +1938,13 @@ mod tests {
         ignore = "Skipping on Windows and macOS due to flakiness"
     )]
     async fn test_build_reloadable_server_config_with_mtls() {
-        if skip_if_no_openssl() {
-            return;
-        }
         let _ = rustls::crypto::ring::default_provider().install_default();
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let path = temp_dir.path();
 
         // Generate server cert and CA cert
-        generate_cert(path, "server", "localhost");
-        generate_cert(path, "ca", "TestCA");
+        generate_ca_signed_cert(path, "server_ca", "server", "localhost");
+        generate_cert(path, "ca", "TestCA", true);
 
         let config = TlsServerConfig {
             config: TlsConfig {
@@ -1960,6 +1968,39 @@ mod tests {
         // Verify mTLS config was created successfully
         // Note: ServerConfig doesn't expose client_auth_mandatory directly,
         // but if we got here without error, mTLS is configured.
+    }
+
+    #[tokio::test]
+    async fn test_build_reloadable_server_config_with_static_client_ca_pem() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let path = temp_dir.path();
+        generate_ca_signed_cert(path, "server_ca", "server", "localhost");
+        generate_ca_signed_cert(path, "client_ca", "client", "client");
+
+        let client_ca_pem = fs::read_to_string(path.join("client_ca.crt")).expect("read client CA");
+
+        let config = TlsServerConfig {
+            config: TlsConfig {
+                cert_file: Some(path.join("server.crt")),
+                key_file: Some(path.join("server.key")),
+                ..TlsConfig::default()
+            },
+            client_ca_file: None,
+            client_ca_pem: Some(client_ca_pem),
+            include_system_ca_certs_pool: Some(false),
+            watch_client_ca: false,
+            handshake_timeout: None,
+        };
+
+        let result = build_reloadable_server_config(&config).await;
+        assert!(result.is_ok(), "static client_ca_pem should configure mTLS");
+    }
+
+    #[tokio::test]
+    async fn test_build_tls_acceptor_none_returns_none() {
+        let result = build_tls_acceptor(None).await.expect("build acceptor");
+        assert!(result.is_none(), "None config should disable TLS acceptor");
     }
 
     /// Test accept_tls_connection with server-side TLS only (no client cert required).
