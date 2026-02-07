@@ -7,11 +7,10 @@
 
 mod common;
 
-use common::tls_helpers::{attempt_raw_tls_connection, poll_until};
+use common::tls_helpers::{attempt_raw_tls_connection, generate_self_signed_cert, poll_until};
 use otap_df_config::tls::{TlsConfig, TlsServerConfig};
 use otap_df_otap::tls_utils::build_reloadable_server_config;
 use otap_df_telemetry::{otel_debug, otel_info};
-use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use std::fs;
@@ -32,29 +31,9 @@ struct GeneratedCert {
 /// * `san` - Optional Subject Alternative Name (DNS name)
 /// * `is_ca` - Whether this is a CA certificate
 fn generate_cert(cn: &str, san: Option<&str>, is_ca: bool) -> GeneratedCert {
-    let mut params = if let Some(san_name) = san {
-        CertificateParams::new(vec![san_name.to_string()]).expect("Invalid SAN")
-    } else {
-        CertificateParams::default()
-    };
+    let (cert_pem, key_pem) = generate_self_signed_cert(cn, san, is_ca);
 
-    params.distinguished_name.push(DnType::CommonName, cn);
-
-    if is_ca {
-        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    } else {
-        params.is_ca = IsCa::ExplicitNoCa;
-    }
-
-    let key_pair = KeyPair::generate().expect("Failed to generate key pair");
-    let cert = params
-        .self_signed(&key_pair)
-        .expect("Failed to self-sign certificate");
-
-    GeneratedCert {
-        cert_pem: cert.pem(),
-        key_pem: key_pair.serialize_pem(),
-    }
+    GeneratedCert { cert_pem, key_pem }
 }
 
 #[tokio::test]

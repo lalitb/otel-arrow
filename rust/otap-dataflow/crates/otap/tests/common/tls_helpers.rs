@@ -43,6 +43,27 @@ pub struct TlsCertBundle {
     pub client_key_pem: String,
 }
 
+/// Minimal self-signed cert/key generator for tests that need ad-hoc certs.
+///
+/// This intentionally does not set EKU, to match older test behavior that only
+/// validated chain trust and mTLS wiring.
+pub fn generate_self_signed_cert(cn: &str, san: Option<&str>, is_ca: bool) -> (String, String) {
+    let mut params = if let Some(san_name) = san {
+        CertificateParams::new(vec![san_name.to_string()]).expect("invalid SAN")
+    } else {
+        CertificateParams::default()
+    };
+    params.distinguished_name.push(DnType::CommonName, cn);
+    params.is_ca = if is_ca {
+        IsCa::Ca(BasicConstraints::Unconstrained)
+    } else {
+        IsCa::ExplicitNoCa
+    };
+    let key_pair = KeyPair::generate().expect("key pair");
+    let cert = params.self_signed(&key_pair).expect("self-signed cert");
+    (cert.pem(), key_pair.serialize_pem())
+}
+
 /// Generate a complete PKI: 1 CA → 1 server leaf (ServerAuth, SAN=localhost)
 /// + 1 client leaf (ClientAuth).
 pub fn generate_test_certs() -> TlsCertBundle {

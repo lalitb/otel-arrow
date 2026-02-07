@@ -9,7 +9,7 @@ mod common;
 
 #[cfg(feature = "experimental-tls")]
 mod tests {
-    use crate::common::tls_helpers::poll_until;
+    use crate::common::tls_helpers::{generate_separate_ca_certs, poll_until};
     use otap_df_config::tls::{TlsConfig, TlsServerConfig};
     use otap_df_otap::tls_utils::build_reloadable_server_config;
     use rustls_pki_types::CertificateDer;
@@ -17,96 +17,12 @@ mod tests {
     use std::fs;
     use std::io::BufReader;
     use std::net::SocketAddr;
-    use std::process::Command;
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
     use tokio_rustls::TlsConnector;
-
-    fn generate_ca(dir: &std::path::Path, name: &str, cn: &str) {
-        let status = Command::new("openssl")
-            .args([
-                "req",
-                "-x509",
-                "-newkey",
-                "rsa:2048",
-                "-keyout",
-                &format!("{}.key", name),
-                "-out",
-                &format!("{}.crt", name),
-                "-days",
-                "1",
-                "-nodes",
-                "-subj",
-                &format!("/CN={}", cn),
-                "-addext",
-                "basicConstraints=critical,CA:TRUE",
-                "-addext",
-                "keyUsage=critical,keyCertSign,cRLSign",
-            ])
-            .current_dir(dir)
-            .output()
-            .expect("Failed to generate CA");
-        if !status.status.success() {
-            panic!("CA gen failed: {}", String::from_utf8_lossy(&status.stderr));
-        }
-    }
-
-    fn generate_server_cert(dir: &std::path::Path, name: &str, ca_name: &str, cn: &str) {
-        let status = Command::new("openssl")
-            .args([
-                "req",
-                "-newkey",
-                "rsa:2048",
-                "-keyout",
-                &format!("{}.key", name),
-                "-out",
-                &format!("{}.csr", name),
-                "-nodes",
-                "-subj",
-                &format!("/CN={}", cn),
-            ])
-            .current_dir(dir)
-            .output()
-            .expect("Failed to generate CSR");
-        if !status.status.success() {
-            panic!(
-                "CSR gen failed: {}",
-                String::from_utf8_lossy(&status.stderr)
-            );
-        }
-
-        let ext_file = dir.join(format!("{}.ext", name));
-        fs::write(&ext_file, "subjectAltName=DNS:localhost,IP:127.0.0.1")
-            .expect("Failed to write extension file");
-
-        let status = Command::new("openssl")
-            .args([
-                "x509",
-                "-req",
-                "-in",
-                &format!("{}.csr", name),
-                "-CA",
-                &format!("{}.crt", ca_name),
-                "-CAkey",
-                &format!("{}.key", ca_name),
-                "-CAcreateserial",
-                "-out",
-                &format!("{}.crt", name),
-                "-days",
-                "1",
-                "-extfile",
-                ext_file.to_str().expect("Invalid UTF-8 path"),
-            ])
-            .current_dir(dir)
-            .output()
-            .expect("Failed to sign cert");
-        if !status.status.success() {
-            panic!("Sign failed: {}", String::from_utf8_lossy(&status.stderr));
-        }
-    }
 
     async fn start_server(
         config: TlsServerConfig,
@@ -136,8 +52,8 @@ mod tests {
 
     #[tokio::test]
     #[cfg_attr(
-        any(target_os = "windows", target_os = "macos"),
-        ignore = "Skipping on Windows and macOS due to flakiness. See https://github.com/open-telemetry/otel-arrow/issues/1614"
+        target_os = "windows",
+        ignore = "Skipping on Windows due to flakiness. See https://github.com/open-telemetry/otel-arrow/issues/1614"
     )]
     async fn test_tls_reload_integration() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -146,13 +62,11 @@ mod tests {
         let cert_path = path.join("server.crt");
         let key_path = path.join("server.key");
 
-        // 1. Generate CA1 and Server1
-        generate_ca(path, "ca1", "Test CA 1");
-        generate_server_cert(path, "server1", "ca1", "localhost");
-
-        // 2. Start Server with Server1
-        fs::copy(path.join("server1.crt"), &cert_path).expect("copy cert failed");
-        fs::copy(path.join("server1.key"), &key_path).expect("copy key failed");
+        // 1. Generate two independent CA/server chains.
+        let (bundle_a, bundle_b) = generate_separate_ca_certs();
+        // 2. Start Server with CA1-signed server cert.
+        fs::write(&cert_path, &bundle_a.server_cert_pem).expect("write cert failed");
+        fs::write(&key_path, &bundle_a.server_key_pem).expect("write key failed");
 
         let config = TlsServerConfig {
             config: TlsConfig {
@@ -179,8 +93,8 @@ mod tests {
 
         // 3. Connect with Client trusting CA1 (Should Succeed)
         let mut root_store1 = rustls::RootCertStore::empty();
-        let ca1_pem = fs::read(path.join("ca1.crt")).unwrap();
-        for cert in CertificateDer::pem_reader_iter(&mut BufReader::new(&ca1_pem[..])) {
+        for cert in CertificateDer::pem_reader_iter(&mut BufReader::new(bundle_a.ca_pem.as_bytes()))
+        {
             root_store1.add(cert.unwrap()).unwrap();
         }
 
@@ -196,22 +110,20 @@ mod tests {
             .await
             .expect("Handshake with CA1 failed");
 
-        // 4. Rotate to Server2 (signed by CA2)
-        generate_ca(path, "ca2", "Test CA 2");
-        generate_server_cert(path, "server2", "ca2", "localhost");
+        // 4. Rotate to CA2-signed server cert.
         // Ensure mtime changes are visible on coarse-granularity filesystems.
         tokio::time::sleep(Duration::from_millis(1200)).await;
         let cert_tmp = path.join("server.crt.tmp");
         let key_tmp = path.join("server.key.tmp");
-        fs::copy(path.join("server2.crt"), &cert_tmp).expect("copy cert tmp failed");
-        fs::copy(path.join("server2.key"), &key_tmp).expect("copy key tmp failed");
+        fs::write(&cert_tmp, &bundle_b.server_cert_pem).expect("write cert tmp failed");
+        fs::write(&key_tmp, &bundle_b.server_key_pem).expect("write key tmp failed");
         fs::rename(&cert_tmp, &cert_path).expect("rename cert failed");
         fs::rename(&key_tmp, &key_path).expect("rename key failed");
 
         // 6. Connect with Client trusting CA2 (Should Succeed)
         let mut root_store2 = rustls::RootCertStore::empty();
-        let ca2_pem = fs::read(path.join("ca2.crt")).unwrap();
-        for cert in CertificateDer::pem_reader_iter(&mut BufReader::new(&ca2_pem[..])) {
+        for cert in CertificateDer::pem_reader_iter(&mut BufReader::new(bundle_b.ca_pem.as_bytes()))
+        {
             root_store2.add(cert.unwrap()).unwrap();
         }
 
