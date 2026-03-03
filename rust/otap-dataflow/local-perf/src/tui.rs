@@ -2,18 +2,20 @@
 //
 // Layout:
 //
-//   ┌────────────────────────────────────────────────────────────────────┐
-//   │ df_engine local-perf  │  Scenario: <name>  │  Cores: N  │  HH:MM:SS │
-//   ├─────────────────────────────────┬──────────────────────────────────┤
-//   │  Throughput (msg/s)             │  Heap Memory                     │
-//   │  ▁▂▃▄▅▆▇█ sparkline            │  allocated / resident sparkline   │
-//   ├─────────────────────────────────┴──────────────────────────────────┤
-//   │  Latency Percentiles                                               │
-//   │  P50   P90   P99   P99.9   Max                                     │
-//   ├────────────────────────────────────────────────────────────────────┤
-//   │  Stats: Generated | Received | Dropped | Efficiency%              │
-//   │  Leak:  slope | verdict                                            │
-//   └────────────────────────────────────────────────────────────────────┘
+//   ┌──────────────────────────────────────────────────────────────────────┐
+//   │ ⚙ df_engine local-perf  │  Scenario: <name>  │  Cores: N  │ HH:MM:SS │
+//   ├───────────────────────────────────┬────────────────────────────────  ┤
+//   │  Throughput (msg/s)               │  Heap — alloc X  resident Y      │
+//   │  ▁▂▃▄▅▆▇█  sparkline             │  ██████ allocated sparkline       │
+//   │                                   ├──────────────────────────────────┤
+//   │                                   │  RSS Z  (rate ±N KB/s)           │
+//   │                                   │  ██████ rss sparkline            │
+//   ├───────────────────────────────────┴──────────────────────────────────┤
+//   │  Latency Percentiles:  P50   P90   P99   P99.9   Max                 │
+//   ├──────────────────────────────────────────────────────────────────────┤
+//   │  Generated | Received | Dropped | Efficiency%                        │
+//   │  Leak: verdict  slope  R²  │  retained: X  │  alloc rate: ±Y KB/s   │
+//   └──────────────────────────────────────────────────────────────────────┘
 
 use crate::memory::{LeakAnalysis, MemoryTracker, format_bytes, format_bytes_per_sec};
 use crate::metrics::{MetricsSnapshot, ThroughputHistory};
@@ -77,19 +79,35 @@ impl Tui {
             }
         }
 
-        // Prepare sparkline data (u64 values — ratatui Sparkline uses u64)
-        let tp_data: Vec<u64> = throughput_history
-            .samples
-            .iter()
-            .map(|&v| v as u64)
-            .collect();
+        // ── Prepare sparkline data ──────────────────────────────────────────
+        let tp_data: Vec<u64> = throughput_history.samples.iter().map(|&v| v as u64).collect();
 
-        let alloc_data = memory_tracker.allocated_history();
+        let alloc_data   = memory_tracker.allocated_history();
         let resident_data = memory_tracker.resident_history();
-        let mem_scale = alloc_data.iter().chain(resident_data.iter()).copied().max().unwrap_or(1);
+        let rss_data     = memory_tracker.rss_history();
+
+        // Scale allocated sparkline against both allocated and resident
+        let heap_scale = alloc_data.iter().chain(resident_data.iter()).copied().max().unwrap_or(1);
+        let rss_scale  = rss_data.iter().copied().max().unwrap_or(1);
+
+        // Live instantaneous alloc rate and retained
+        let alloc_rate   = memory_tracker.alloc_rate_bytes_per_sec();
+        let retained     = memory_tracker.latest_retained();
 
         let elapsed_secs = snap.elapsed.as_secs();
-        let hms = format!("{:02}:{:02}:{:02}", elapsed_secs / 3600, (elapsed_secs % 3600) / 60, elapsed_secs % 60);
+        let hms = format!(
+            "{:02}:{:02}:{:02}",
+            elapsed_secs / 3600,
+            (elapsed_secs % 3600) / 60,
+            elapsed_secs % 60
+        );
+
+        // Verdict color (used in multiple widgets)
+        let verdict_color = match leak {
+            Some(la) if la.verdict == crate::memory::LeakVerdict::Likely     => Color::Red,
+            Some(la) if la.verdict == crate::memory::LeakVerdict::Suspicious => Color::Yellow,
+            _ => Color::Green,
+        };
 
         self.terminal.draw(|frame| {
             let area = frame.area();
@@ -99,18 +117,18 @@ impl Tui {
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(3),   // header
-                    Constraint::Min(8),      // charts (throughput + memory)
+                    Constraint::Min(10),     // charts row
                     Constraint::Length(5),   // latency table
                     Constraint::Length(4),   // stats + leak
                 ])
                 .split(area);
 
             // ── Header ─────────────────────────────────────────────────────
-            let header_text = vec![
-                Line::from(vec![
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
                     Span::styled("⚙ df_engine local-perf", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                     Span::raw("  │  "),
-                    Span::styled(format!("Scenario: {}", scenario), Style::default().fg(Color::Yellow)),
+                    Span::styled(format!("Scenario: {scenario}"), Style::default().fg(Color::Yellow)),
                     Span::raw("  │  "),
                     Span::styled(format!("Cores: {}", snap.num_cores), Style::default().fg(Color::Green)),
                     Span::raw("  │  "),
@@ -118,16 +136,13 @@ impl Tui {
                     Span::raw("  │  Press "),
                     Span::styled("q", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
                     Span::raw(" to quit"),
-                ]),
-            ];
-            frame.render_widget(
-                Paragraph::new(header_text)
-                    .block(Block::default().borders(Borders::ALL))
-                    .alignment(Alignment::Left),
+                ]))
+                .block(Block::default().borders(Borders::ALL))
+                .alignment(Alignment::Left),
                 root[0],
             );
 
-            // ── Chart area: throughput (left) + memory (right) ─────────────
+            // ── Charts: throughput (left 55%) + memory panel (right 45%) ──
             let charts = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
@@ -135,54 +150,57 @@ impl Tui {
 
             // Throughput sparkline
             let tp_max = throughput_history.max().max(1.0) as u64;
-            let tp_label = format!(
-                "{:.2}M msg/s  (peak: {:.2}M)",
-                snap.throughput / 1_000_000.0,
-                tp_max as f64 / 1_000_000.0
-            );
             frame.render_widget(
                 Sparkline::default()
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(format!(" Throughput — {} ", tp_label)),
-                    )
+                    .block(Block::default().borders(Borders::ALL).title(format!(
+                        " Throughput — {:.2}M msg/s  (peak {:.2}M) ",
+                        snap.throughput / 1_000_000.0,
+                        tp_max as f64 / 1_000_000.0,
+                    )))
                     .data(&tp_data)
                     .max(tp_max)
                     .style(Style::default().fg(Color::Green)),
                 charts[0],
             );
 
-            // Memory sparkline (allocated vs resident — overlay via color)
-            let mem_label = if let Some(last) = alloc_data.last() {
-                format!(
-                    "alloc: {}  resident: {}",
-                    format_bytes(*last as usize),
-                    format_bytes(*resident_data.last().unwrap_or(&0) as usize)
-                )
+            // Memory panel: split vertically — allocated (top) + RSS (bottom)
+            let mem_panel = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .split(charts[1]);
+
+            // Allocated sparkline
+            let heap_title = if alloc_data.is_empty() {
+                " Heap — no jemalloc data ".to_string()
             } else {
-                "no jemalloc data".to_string()
+                format!(
+                    " Heap — alloc {}  resident {} ",
+                    format_bytes(*alloc_data.last().unwrap_or(&0) as usize),
+                    format_bytes(*resident_data.last().unwrap_or(&0) as usize),
+                )
             };
-            // Show allocated bytes sparkline
-            let alloc_display = alloc_data.clone();
             frame.render_widget(
                 Sparkline::default()
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(format!(" Heap Memory — {} ", mem_label)),
-                    )
-                    .data(&alloc_display)
-                    .max(mem_scale.max(1))
-                    .style(Style::default().fg(
-                        // Color based on leak verdict
-                        match leak {
-                            Some(la) if la.verdict == crate::memory::LeakVerdict::Likely => Color::Red,
-                            Some(la) if la.verdict == crate::memory::LeakVerdict::Suspicious => Color::Yellow,
-                            _ => Color::Blue,
-                        },
-                    )),
-                charts[1],
+                    .block(Block::default().borders(Borders::ALL).title(heap_title))
+                    .data(&alloc_data)
+                    .max(heap_scale.max(1))
+                    .style(Style::default().fg(verdict_color)),
+                mem_panel[0],
+            );
+
+            // RSS sparkline
+            let rss_title = format!(
+                " RSS — {}  ({}) ",
+                format_bytes(*rss_data.last().unwrap_or(&0) as usize),
+                format_bytes_per_sec(alloc_rate),
+            );
+            frame.render_widget(
+                Sparkline::default()
+                    .block(Block::default().borders(Borders::ALL).title(rss_title))
+                    .data(&rss_data)
+                    .max(rss_scale.max(1))
+                    .style(Style::default().fg(Color::Cyan)),
+                mem_panel[1],
             );
 
             // ── Latency table ──────────────────────────────────────────────
@@ -220,39 +238,36 @@ impl Tui {
 
             let leak_line = if let Some(la) = leak {
                 format!(
-                    "Memory leak: {} | slope {} | R²={:.3} | growth {}",
+                    "Leak: {}  slope {}  R²={:.3}  growth {}  │  retained {}  │  alloc rate {}",
                     la.verdict,
                     format_bytes_per_sec(la.slope_bytes_per_sec),
                     la.r_squared,
-                    format_bytes(la.net_growth_bytes)
+                    format_bytes(la.net_growth_bytes),
+                    format_bytes(retained),
+                    format_bytes_per_sec(alloc_rate),
                 )
             } else {
-                "Memory leak: insufficient data (need jemalloc feature)".to_string()
+                format!(
+                    "Leak: no heap data (enable jemalloc)  │  RSS alloc rate {}",
+                    format_bytes_per_sec(alloc_rate),
+                )
             };
 
-            let stats_text = vec![
-                Line::from(vec![
-                    Span::raw("Generated: "),
-                    Span::styled(format!("{}", snap.generated), Style::default().fg(Color::Cyan)),
-                    Span::raw("  Received: "),
-                    Span::styled(format!("{}", snap.received), Style::default().fg(Color::Green)),
-                    Span::raw("  Dropped: "),
-                    Span::styled(format!("{}", snap.dropped), Style::default().fg(Color::Red)),
-                    Span::raw(format!("  Efficiency: {}%", efficiency)),
-                ]),
-                Line::from(Span::styled(
-                    leak_line,
-                    Style::default().fg(match leak {
-                        Some(la) if la.verdict == crate::memory::LeakVerdict::Likely => Color::Red,
-                        Some(la) if la.verdict == crate::memory::LeakVerdict::Suspicious => Color::Yellow,
-                        _ => Color::Green,
-                    }),
-                )),
-            ];
             frame.render_widget(
-                Paragraph::new(stats_text)
-                    .block(Block::default().borders(Borders::ALL).title(" Stats "))
-                    .wrap(Wrap { trim: true }),
+                Paragraph::new(vec![
+                    Line::from(vec![
+                        Span::raw("Generated: "),
+                        Span::styled(format!("{}", snap.generated), Style::default().fg(Color::Cyan)),
+                        Span::raw("  Received: "),
+                        Span::styled(format!("{}", snap.received), Style::default().fg(Color::Green)),
+                        Span::raw("  Dropped: "),
+                        Span::styled(format!("{}", snap.dropped), Style::default().fg(Color::Red)),
+                        Span::raw(format!("  Efficiency: {efficiency}%")),
+                    ]),
+                    Line::from(Span::styled(leak_line, Style::default().fg(verdict_color))),
+                ])
+                .block(Block::default().borders(Borders::ALL).title(" Stats "))
+                .wrap(Wrap { trim: true }),
                 root[3],
             );
         })?;

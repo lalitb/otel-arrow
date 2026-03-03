@@ -179,6 +179,7 @@ fn run_scenario(cfg: RunConfig) -> Result<ScenarioResult> {
                 secs_since_start: start.elapsed().as_secs_f64(),
                 allocated: heap.allocated,
                 resident: heap.resident,
+                retained: heap.retained,
                 rss_bytes: rss_now,
             });
             (heap.allocated, heap.resident)

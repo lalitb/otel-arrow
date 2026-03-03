@@ -70,8 +70,10 @@ pub struct MemorySample {
     pub secs_since_start: f64,
     /// jemalloc allocated bytes (None when jemalloc feature not active).
     pub allocated: usize,
-    /// jemalloc resident bytes.
+    /// jemalloc resident bytes (active pages mapped by the allocator).
     pub resident: usize,
+    /// jemalloc retained bytes (unmapped memory held for reuse).
+    pub retained: usize,
     /// OS-level RSS in bytes (always available; via sysinfo).
     pub rss_bytes: usize,
 }
@@ -139,6 +141,31 @@ impl MemoryTracker {
 
     pub fn resident_history(&self) -> Vec<u64> {
         self.samples.iter().map(|s| s.resident as u64).collect()
+    }
+
+    pub fn rss_history(&self) -> Vec<u64> {
+        self.samples.iter().map(|s| s.rss_bytes as u64).collect()
+    }
+
+    /// Instantaneous allocation rate: bytes/sec between the last two samples.
+    /// Returns 0.0 if fewer than 2 samples exist.
+    pub fn alloc_rate_bytes_per_sec(&self) -> f64 {
+        let n = self.samples.len();
+        if n < 2 {
+            return 0.0;
+        }
+        let prev = &self.samples[n - 2];
+        let last = &self.samples[n - 1];
+        let dt = last.secs_since_start - prev.secs_since_start;
+        if dt <= 0.0 {
+            return 0.0;
+        }
+        (last.allocated as f64 - prev.allocated as f64) / dt
+    }
+
+    /// Latest retained bytes (jemalloc unmapped memory held for reuse).
+    pub fn latest_retained(&self) -> usize {
+        self.samples.last().map(|s| s.retained).unwrap_or(0)
     }
 }
 
