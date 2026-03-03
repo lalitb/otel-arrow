@@ -35,8 +35,8 @@
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-// ── jemalloc (default on Unix; off on Windows) ────────────────────────────────
-#[cfg(all(feature = "jemalloc", not(windows)))]
+// ── jemalloc (default on Unix; off on Windows; disabled when dhat-heap is active) ──
+#[cfg(all(feature = "jemalloc", not(windows), not(feature = "dhat-heap")))]
 #[global_allocator]
 static ALLOC_JEMALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -48,7 +48,6 @@ mod tui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::num::NonZeroU32;
 
 // ---------------------------------------------------------------------------
 // CLI
