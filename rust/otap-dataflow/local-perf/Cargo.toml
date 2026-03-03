@@ -1,0 +1,65 @@
+# Exclude from the parent workspace so this crate does not inherit
+# workspace lints, members, or CI targets.
+[workspace]
+
+[package]
+name = "df-local-perf"
+version = "0.1.0"
+edition = "2021"
+description = "Local-only df_engine performance and memory analysis harness (not for CI)"
+
+# NOT a workspace member — kept outside workspace to avoid lint enforcement
+# Add `/local-perf/` to the root .gitignore to keep this off remote.
+
+[features]
+default = ["jemalloc"]
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+# Enable dhat heap profiling: cargo run --features dhat-heap -- ...
+# Output: dhat-heap.json — view at https://nnethercote.github.io/dh_view/dh_view.html
+dhat-heap = ["dep:dhat"]
+
+[dependencies]
+# ── Async runtime (mirrors the engine's LocalSet pattern) ─────────────────────
+tokio = { version = "1", features = ["full"] }
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+clap = { version = "4", features = ["derive"] }
+
+# ── Rate limiting (token-bucket, for controlled-load latency tests) ───────────
+governor = "0.7"
+nonzero_ext = "0.3"
+
+# ── Latency histograms ────────────────────────────────────────────────────────
+hdrhistogram = "7"
+
+# ── Live TUI ──────────────────────────────────────────────────────────────────
+ratatui = "0.29"
+crossterm = "0.28"
+
+# ── Memory profiling ──────────────────────────────────────────────────────────
+tikv-jemallocator = { version = "0.6", optional = true }
+tikv-jemalloc-ctl = { version = "0.6", optional = true, features = ["stats"] }
+dhat = { version = "0.3", optional = true }
+
+# ── CPU affinity (mirrors core_affinity in the engine workspace) ──────────────
+core_affinity = "0.8"
+
+# ── Engine channel crate — tests the actual lock-free channel primitives ──────
+# (path relative to this Cargo.toml, one level up into the workspace)
+otap-df-channel = { path = "../crates/channel" }
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+bytes = "1"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Linear regression for memory-leak slope detection
+linreg = "0.2"
+# Precise CPU-time measurement (per-thread, unlike wall time)
+cpu-time = "1"
+# Pretty-printed tables in non-TUI mode
+comfy-table = "7"
+# Sparkline data for throughput history
+circular-buffer = "0.1"
+# RSS / process memory (mirrors what df_engine_scale_lab.sh reads via `ps -o rss=`)
+sysinfo = "0.38"
