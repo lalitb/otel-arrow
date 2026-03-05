@@ -1,0 +1,26 @@
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  perses:
+    image: persesdev/perses:latest
+    ports:
+      - "8081:8080"
+    volumes:
+      - perses-data:/perses
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus-data:
+  perses-data:

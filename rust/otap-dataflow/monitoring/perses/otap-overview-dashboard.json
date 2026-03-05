@@ -1,0 +1,275 @@
+{
+  "kind": "Dashboard",
+  "metadata": {
+    "name": "otap-engine-overview",
+    "project": "otap-dataflow"
+  },
+  "spec": {
+    "display": { "name": "OTAP Engine Overview" },
+    "duration": "30m",
+    "refreshInterval": "15s",
+    "layouts": [
+      {
+        "kind": "Grid",
+        "spec": {
+          "display": { "title": "Engine Health", "collapse": { "open": true } },
+          "items": [
+            { "x": 0,  "y": 0, "width": 6, "height": 6, "content": { "$ref": "#/spec/panels/rss_memory" } },
+            { "x": 6,  "y": 0, "width": 6, "height": 6, "content": { "$ref": "#/spec/panels/cpu_engine" } },
+            { "x": 12, "y": 0, "width": 6, "height": 6, "content": { "$ref": "#/spec/panels/cpu_per_group" } },
+            { "x": 18, "y": 0, "width": 6, "height": 6, "content": { "$ref": "#/spec/panels/memory_per_group" } }
+          ]
+        }
+      },
+      {
+        "kind": "Grid",
+        "spec": {
+          "display": { "title": "Data Flow", "collapse": { "open": true } },
+          "items": [
+            { "x": 0,  "y": 0, "width": 8, "height": 6, "content": { "$ref": "#/spec/panels/channel_throughput" } },
+            { "x": 8,  "y": 0, "width": 8, "height": 6, "content": { "$ref": "#/spec/panels/backpressure" } },
+            { "x": 16, "y": 0, "width": 8, "height": 6, "content": { "$ref": "#/spec/panels/exporter_signals" } }
+          ]
+        }
+      },
+      {
+        "kind": "Grid",
+        "spec": {
+          "display": { "title": "Runtime", "collapse": { "open": true } },
+          "items": [
+            { "x": 0,  "y": 0, "width": 8, "height": 6, "content": { "$ref": "#/spec/panels/tokio_tasks" } },
+            { "x": 8,  "y": 0, "width": 8, "height": 6, "content": { "$ref": "#/spec/panels/context_switches" } },
+            { "x": 16, "y": 0, "width": 8, "height": 6, "content": { "$ref": "#/spec/panels/heap_memory" } }
+          ]
+        }
+      }
+    ],
+    "panels": {
+      "rss_memory": {
+        "kind": "Panel",
+        "spec": {
+          "display": { "name": "RSS Memory" },
+          "plugin": { "kind": "TimeSeriesChart", "spec": {} },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": { "query": "memory_rss" }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "cpu_engine": {
+        "kind": "Panel",
+        "spec": {
+          "display": { "name": "Engine CPU %" },
+          "plugin": { "kind": "TimeSeriesChart", "spec": {} },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": { "query": "cpu_utilization{set=\"engine.metrics\"} * 100" }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "cpu_per_group": {
+        "kind": "Panel",
+        "spec": {
+          "display": { "name": "CPU by Pipeline Group" },
+          "plugin": { "kind": "TimeSeriesChart", "spec": {} },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum by (pipeline_group_id) (cpu_utilization{set=\"pipeline.metrics\"}) * 100",
+                    "seriesNameFormat": "{{pipeline_group_id}}"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "memory_per_group": {
+        "kind": "Panel",
+        "spec": {
+          "display": { "name": "Memory by Pipeline Group" },
+          "plugin": { "kind": "TimeSeriesChart", "spec": {} },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum by (pipeline_group_id) (memory_usage{set=\"pipeline.metrics\"})",
+                    "seriesNameFormat": "{{pipeline_group_id}}"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "channel_throughput": {
+        "kind": "Panel",
+        "spec": {
+          "display": { "name": "Channel Throughput (msg/s)" },
+          "plugin": { "kind": "TimeSeriesChart", "spec": {} },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum by (channel_id) (rate(send_count{set=\"channel.sender\"}[1m]))",
+                    "seriesNameFormat": "{{channel_id}}"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "backpressure": {
+        "kind": "Panel",
+        "spec": {
+          "display": { "name": "Backpressure (send errors/s)" },
+          "plugin": { "kind": "TimeSeriesChart", "spec": {} },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum by (channel_id) (rate(send_error_full{set=\"channel.sender\"}[1m]))",
+                    "seriesNameFormat": "{{channel_id}}"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "exporter_signals": {
+        "kind": "Panel",
+        "spec": {
+          "display": { "name": "Exporter Throughput (signals/s)" },
+          "plugin": { "kind": "TimeSeriesChart", "spec": {} },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum by (node_id) (rate(logs_consumed{set=\"exporter.pdata\"}[1m]))",
+                    "seriesNameFormat": "consumed {{node_id}}"
+                  }
+                }
+              }
+            },
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum by (node_id) (rate(logs_failed{set=\"exporter.pdata\"}[1m]))",
+                    "seriesNameFormat": "failed {{node_id}}"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "tokio_tasks": {
+        "kind": "Panel",
+        "spec": {
+          "display": { "name": "Tokio Active Tasks" },
+          "plugin": { "kind": "TimeSeriesChart", "spec": {} },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": { "query": "sum(task_active_count{set=\"tokio.runtime\"})" }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "context_switches": {
+        "kind": "Panel",
+        "spec": {
+          "display": { "name": "Context Switches (rate/s)" },
+          "plugin": { "kind": "TimeSeriesChart", "spec": {} },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum(rate(context_switches_voluntary{set=\"pipeline.metrics\"}[1m]))",
+                    "seriesNameFormat": "voluntary"
+                  }
+                }
+              }
+            },
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum(rate(context_switches_involuntary{set=\"pipeline.metrics\"}[1m]))",
+                    "seriesNameFormat": "involuntary"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "heap_memory": {
+        "kind": "Panel",
+        "spec": {
+          "display": { "name": "Heap Memory (jemalloc)" },
+          "plugin": { "kind": "TimeSeriesChart", "spec": {} },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum by (pipeline_group_id) (memory_usage{set=\"pipeline.metrics\"})",
+                    "seriesNameFormat": "{{pipeline_group_id}}"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}
