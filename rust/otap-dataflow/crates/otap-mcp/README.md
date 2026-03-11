@@ -12,6 +12,7 @@ Provides AI-assisted **component discovery**, **configuration validation**, **ex
 |---|---|
 | `list_components` | Discover registered receivers, processors, and exporters |
 | `validate_config` | Validate OTAP YAML pipeline configurations |
+| `validate_component` | Validate a JSON config against a specific component |
 | `generate_config` | Generate valid YAML from structured input (auto-wires DAG) |
 | `get_component_schema` | Get JSON Schema for a component's configuration fields |
 | `list_examples` | Browse example pipeline configurations |
