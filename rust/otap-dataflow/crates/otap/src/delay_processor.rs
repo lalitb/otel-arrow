@@ -55,6 +55,7 @@ pub static DELAY_PROCESSOR_FACTORY: ProcessorFactory<OtapPdata> = ProcessorFacto
     create: create_delay_processor,
     wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
     validate_config: otap_df_config::validation::validate_typed_config::<DelayConfig>,
+    config_schema: None,
 };
 
 /// Factory function to create a DelayProcessor.

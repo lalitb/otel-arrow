@@ -1,0 +1,53 @@
+[package]
+name = "otap-df-mcp"
+description = "MCP (Model Context Protocol) server for the OTAP dataflow engine"
+version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "otap-mcp"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Internal workspace crates
+otap-df-config = { path = "../config" }
+otap-df-engine = { path = "../engine" }
+otap-df-otap = { path = "../otap" }
+# Side-effect import for contrib component registration via linkme
+otap-df-contrib-nodes = { path = "../contrib-nodes" }
+
+# Workspace dependencies
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+clap = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+
+# MCP SDK (official Rust SDK)
+rmcp = { version = "1.1", features = ["server", "macros", "schemars", "transport-io", "transport-streamable-http-server"] }
+
+# HTTP server for streamable HTTP transport
+axum = { workspace = true }
+tower = { workspace = true }
+
+# HTTP client for admin API
+reqwest = { workspace = true, features = ["json"] }
+
+# Async utilities
+futures = { workspace = true }
+
+# Schema generation
+schemars = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

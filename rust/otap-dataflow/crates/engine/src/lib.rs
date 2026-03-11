@@ -102,6 +102,12 @@ pub struct ReceiverFactory<PData> {
     /// typed `Config` struct, or [`otap_df_config::validation::no_config`] for components
     /// that accept no user configuration.
     pub validate_config: fn(config: &serde_json::Value) -> Result<(), otap_df_config::error::Error>,
+    /// Returns the JSON Schema for this component's configuration, if available.
+    ///
+    /// Use [`otap_df_config::validation::typed_config_schema`] for components whose
+    /// config type implements `schemars::JsonSchema`. Set to `None` for components
+    /// without schema support.
+    pub config_schema: Option<fn() -> serde_json::Value>,
 }
 
 // Note: We don't use `#[derive(Clone)]` here to avoid forcing the `PData` type to implement `Clone`.
@@ -112,6 +118,7 @@ impl<PData> Clone for ReceiverFactory<PData> {
             create: self.create,
             wiring_contract: self.wiring_contract,
             validate_config: self.validate_config,
+            config_schema: self.config_schema,
         }
     }
 }
@@ -141,6 +148,12 @@ pub struct ProcessorFactory<PData> {
     /// typed `Config` struct, or [`otap_df_config::validation::no_config`] for components
     /// that accept no user configuration.
     pub validate_config: fn(config: &serde_json::Value) -> Result<(), otap_df_config::error::Error>,
+    /// Returns the JSON Schema for this component's configuration, if available.
+    ///
+    /// Use [`otap_df_config::validation::typed_config_schema`] for components whose
+    /// config type implements `schemars::JsonSchema`. Set to `None` for components
+    /// without schema support.
+    pub config_schema: Option<fn() -> serde_json::Value>,
 }
 
 // Note: We don't use `#[derive(Clone)]` here to avoid forcing the `PData` type to implement `Clone`.
@@ -151,6 +164,7 @@ impl<PData> Clone for ProcessorFactory<PData> {
             create: self.create,
             wiring_contract: self.wiring_contract,
             validate_config: self.validate_config,
+            config_schema: self.config_schema,
         }
     }
 }
@@ -180,6 +194,12 @@ pub struct ExporterFactory<PData> {
     /// typed `Config` struct, or [`otap_df_config::validation::no_config`] for components
     /// that accept no user configuration.
     pub validate_config: fn(config: &serde_json::Value) -> Result<(), otap_df_config::error::Error>,
+    /// Returns the JSON Schema for this component's configuration, if available.
+    ///
+    /// Use [`otap_df_config::validation::typed_config_schema`] for components whose
+    /// config type implements `schemars::JsonSchema`. Set to `None` for components
+    /// without schema support.
+    pub config_schema: Option<fn() -> serde_json::Value>,
 }
 
 // Note: We don't use `#[derive(Clone)]` here to avoid forcing the `PData` type to implement `Clone`.
@@ -190,6 +210,7 @@ impl<PData> Clone for ExporterFactory<PData> {
             create: self.create,
             wiring_contract: self.wiring_contract,
             validate_config: self.validate_config,
+            config_schema: self.config_schema,
         }
     }
 }

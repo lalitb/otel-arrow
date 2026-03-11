@@ -82,6 +82,7 @@ static COUNTING_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
     },
     wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
     validate_config: |_| Ok(()),
+    config_schema: None,
 };
 
 #[async_trait(?Send)]

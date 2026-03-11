@@ -57,6 +57,7 @@ pub static FANOUT_PROCESSOR_FACTORY: ProcessorFactory<OtapPdata> = ProcessorFact
         output_fanout: otap_df_engine::wiring_contract::OutputFanoutRule::AtMostPerOutput(1),
     },
     validate_config: otap_df_config::validation::no_config,
+    config_schema: None,
 };
 
 #[async_trait(?Send)]

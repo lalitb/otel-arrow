@@ -57,6 +57,7 @@ otap-df-otap = { path = "crates/otap" }
 otap-test-tls-certs = { package = "otap-df-test-tls-certs", path = "crates/otap-test-tls-certs" }
 otap-df-pdata = { path = "crates/pdata" }
 otap-df-pdata-views = { path = "crates/pdata-views" }
+otap-df-mcp = { path = "crates/otap-mcp" }
 otap-df-telemetry = { path = "crates/telemetry" }
 quiver = { package = "otap-df-quiver", path = "crates/quiver" }
 data_engine_expressions = { path = "../experimental/query_engine/expressions" }

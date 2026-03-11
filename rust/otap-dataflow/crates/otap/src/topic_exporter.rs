@@ -143,6 +143,7 @@ pub static TOPIC_EXPORTER: ExporterFactory<OtapPdata> =
         },
         wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
         validate_config: |config| TopicExporter::parse_config(config).map(|_| ()),
+        config_schema: None,
     };
 
 impl TopicExporter {

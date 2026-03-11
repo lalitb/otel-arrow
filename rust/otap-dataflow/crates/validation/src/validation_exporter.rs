@@ -89,6 +89,7 @@ pub static VALIDATION_EXPORTER_FACTORY: ExporterFactory<OtapPdata> = ExporterFac
     },
     wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
     validate_config: otap_df_config::validation::validate_typed_config::<ValidationExporterConfig>,
+    config_schema: None,
 };
 
 impl ValidationExporter {

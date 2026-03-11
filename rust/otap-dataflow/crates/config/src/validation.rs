@@ -56,3 +56,19 @@ pub fn no_config(config: &serde_json::Value) -> Result<(), Error> {
         }),
     }
 }
+
+/// Returns the JSON Schema for a component's configuration type `T`.
+///
+/// This is intended for use with the `config_schema` field on factory structs.
+/// Pass it as a monomorphised function pointer to provide schema introspection
+/// for components whose config type implements [`schemars::JsonSchema`].
+///
+/// # Example
+/// ```ignore
+/// config_schema: Some(typed_config_schema::<MyComponentConfig>),
+/// ```
+#[must_use]
+pub fn typed_config_schema<T: schemars::JsonSchema>() -> serde_json::Value {
+    let schema = schemars::schema_for!(T);
+    serde_json::to_value(schema).unwrap_or(serde_json::Value::Null)
+}
