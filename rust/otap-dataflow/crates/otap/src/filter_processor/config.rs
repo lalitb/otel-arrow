@@ -8,12 +8,14 @@ use otap_df_pdata::otap::filter::{logs::LogFilter, traces::TraceFilter};
 
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct Config {
     // ToDo: add metrics
     #[serde(default = "default_log_filter")]
+    #[schemars(skip)]
     logs: LogFilter,
     #[serde(default = "default_trace_filter")]
+    #[schemars(skip)]
     traces: TraceFilter,
 }
 

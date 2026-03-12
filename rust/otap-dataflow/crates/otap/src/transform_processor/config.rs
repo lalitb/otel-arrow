@@ -6,7 +6,7 @@ use std::num::NonZeroUsize;
 use serde::Deserialize;
 
 /// Configuration for the [`TransformProcessor`](super::TransformProcessor)
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct Config {
     #[serde(flatten)]
     pub query: Query,
@@ -18,7 +18,7 @@ pub struct Config {
     pub outbound_request_limit: NonZeroUsize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Query {
     KqlQuery(String),

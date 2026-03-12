@@ -14,7 +14,7 @@ use weaver_semconv::registry::SemConvRegistry;
 use weaver_semconv::registry_repo::RegistryRepo;
 
 /// Source of telemetry data schema and attributes
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DataSource {
     /// Use OpenTelemetry semantic conventions registry via weaver
@@ -31,7 +31,7 @@ pub enum DataSource {
 }
 
 /// Strategy for generating telemetry batches
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GenerationStrategy {
     /// Generate fresh signals for every batch
@@ -57,7 +57,7 @@ pub enum GenerationStrategy {
 }
 
 /// Configuration should take a scenario to play out
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Configuration of the traffic to generate
@@ -69,6 +69,7 @@ pub struct Config {
 
     /// Path to the semantic conventions registry (only used when data_source = semantic_conventions)
     #[serde(default = "default_registry_path")]
+    #[schemars(skip)]
     registry_path: VirtualDirectoryPath,
 
     /// Strategy for generating telemetry batches
@@ -83,7 +84,7 @@ pub struct Config {
 }
 
 /// Configuration to describe the traffic being sent
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TrafficConfig {
     #[serde(default = "default_signals_per_second")]

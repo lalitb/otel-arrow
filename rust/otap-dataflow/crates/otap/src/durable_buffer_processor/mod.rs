@@ -1979,7 +1979,7 @@ pub static DURABLE_BUFFER_FACTORY: ProcessorFactory<OtapPdata> = ProcessorFactor
     create: create_durable_buffer,
     wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
     validate_config: otap_df_config::validation::validate_typed_config::<DurableBufferConfig>,
-    config_schema: None,
+    config_schema: Some(otap_df_config::validation::typed_config_schema::<DurableBufferConfig>),
 };
 
 #[cfg(test)]

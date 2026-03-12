@@ -56,11 +56,12 @@ use tonic_middleware::MiddlewareLayer;
 const OTAP_RECEIVER_URN: &str = "urn:otel:receiver:otap";
 
 /// Configuration for the OTAP Receiver
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     listening_addr: SocketAddr,
 
+    #[schemars(skip)]
     compression_method: Option<CompressionMethod>,
 
     /// Size of the channel used to buffer outgoing responses to the client.
@@ -86,10 +87,12 @@ pub struct Config {
     /// Timeout for RPC requests. If not specified, no timeout is applied.
     /// Format: humantime format (e.g., "30s", "5m", "1h", "500ms")
     #[serde(default, with = "humantime_serde")]
+    #[schemars(with = "Option<String>")]
     pub timeout: Option<Duration>,
 
     /// TLS configuration
     #[cfg(feature = "experimental-tls")]
+    #[schemars(skip)]
     pub tls: Option<TlsServerConfig>,
 }
 
@@ -130,7 +133,7 @@ pub static OTAP_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFactory {
     },
     wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
     validate_config: otap_df_config::validation::validate_typed_config::<Config>,
-    config_schema: None,
+    config_schema: Some(otap_df_config::validation::typed_config_schema::<Config>),
 };
 
 impl OTAPReceiver {

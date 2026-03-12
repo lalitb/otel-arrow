@@ -56,7 +56,7 @@ const DEFAULT_MAX_BATCH_SIZE: u16 = 100;
 const MAX_TASK_DRAIN_WAIT: Duration = Duration::from_secs(1);
 
 /// TCP-specific settings for the syslog CEF receiver.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct TcpConfig {
     /// The address to listen on for TCP connections.
@@ -65,11 +65,12 @@ struct TcpConfig {
     ///
     /// When configured, TCP connections will require TLS.
     #[cfg(feature = "experimental-tls")]
+    #[schemars(skip)]
     tls: Option<TlsServerConfig>,
 }
 
 /// UDP-specific settings for the syslog CEF receiver.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct UdpConfig {
     /// The address to listen on for UDP datagrams.
@@ -79,7 +80,7 @@ struct UdpConfig {
 /// Protocol configuration for the syslog CEF receiver.
 ///
 /// Exactly one protocol variant must be specified.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)] // This enum is only used for configuration, so the size is not a concern.
 enum Protocol {
@@ -95,7 +96,7 @@ enum Protocol {
 /// before being forwarded downstream. Reducing these values can limit
 /// the scope of data loss for in-memory records that have not yet been
 /// sent to the next node.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct BatchConfig {
     /// Maximum time in milliseconds to wait before flushing an Arrow batch.
@@ -109,7 +110,7 @@ struct BatchConfig {
 }
 
 /// Config for a syslog cef receiver
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct Config {
     /// Protocol-specific configuration.
@@ -214,7 +215,7 @@ pub static SYSLOG_CEF_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFactory {
     },
     wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
     validate_config: otap_df_config::validation::validate_typed_config::<Config>,
-    config_schema: None,
+    config_schema: Some(otap_df_config::validation::typed_config_schema::<Config>),
 };
 
 #[async_trait(?Send)]

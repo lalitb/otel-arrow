@@ -6,10 +6,11 @@ use std::time::Duration;
 use serde::Deserialize;
 
 /// Configuration of parquet exporter
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// The base URI for where the parquet files should be written
+    #[schemars(skip)]
     pub storage: crate::object_store::StorageType,
 
     /// Configuration for how to compute partitions from the dataset
@@ -19,7 +20,7 @@ pub struct Config {
     pub writer_options: Option<WriterOptions>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, schemars::JsonSchema)]
 pub struct WriterOptions {
     /// Target number of rows in one parquet file. The writer will flush automatically any files
     /// that attain greater than this number of rows. If this is `None`, the writer won't flush
@@ -42,6 +43,7 @@ pub struct WriterOptions {
     /// details see [`Self::flush_age_check_interval`]
     #[serde(default)]
     #[serde(with = "humantime_serde")]
+    #[schemars(with = "Option<String>")]
     pub flush_when_older_than: Option<Duration>,
 }
 
@@ -55,7 +57,7 @@ impl Default for WriterOptions {
 }
 
 /// Configuration options for how the parquet files should be partitioned
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Deserialize, PartialEq, schemars::JsonSchema)]
 pub enum PartitioningStrategy {
     /// compute partition values from schema metadata keys
     #[serde(alias = "schema_metadata")]

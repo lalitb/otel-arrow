@@ -66,7 +66,7 @@ const fn default_max_in_flight() -> usize {
 }
 
 /// How to handle incoming OTLP data.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OtlpHandling {
     /// Store OTLP bytes as opaque binary (default).
@@ -80,7 +80,7 @@ pub enum OtlpHandling {
 }
 
 /// Size cap policy when retention limit is reached.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SizeCapPolicy {
     /// Apply backpressure when at capacity (default, no data loss).
@@ -100,7 +100,7 @@ impl From<SizeCapPolicy> for RetentionPolicy {
 }
 
 /// Configuration for the durable buffer.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct DurableBufferConfig {
     /// Directory path for persistent storage.
     pub path: PathBuf,
@@ -112,6 +112,7 @@ pub struct DurableBufferConfig {
     /// divides this across all cores (each core gets `retention_size_cap / num_cores`).
     /// For example, with a 10 GiB cap on a 4-core pipeline, each core gets ~2.5 GiB.
     #[serde(default = "default_retention_size_cap")]
+    #[schemars(skip)]
     pub retention_size_cap: Byte,
 
     /// Maximum age of data to retain (e.g., "24h", "7d").
@@ -127,6 +128,7 @@ pub struct DurableBufferConfig {
     /// To survive extended downstream outages without data loss,
     /// set `max_age` longer than the maximum outage duration you need to tolerate.
     #[serde(with = "humantime_serde", default)]
+    #[schemars(with = "Option<String>")]
     pub max_age: Option<Duration>,
 
     /// Policy when size cap is reached.
@@ -135,6 +137,7 @@ pub struct DurableBufferConfig {
 
     /// Interval for polling for available bundles.
     #[serde(with = "humantime_serde", default = "default_poll_interval")]
+    #[schemars(with = "String")]
     pub poll_interval: Duration,
 
     /// How to handle incoming OTLP data.
@@ -150,6 +153,7 @@ pub struct DurableBufferConfig {
         with = "humantime_serde",
         default = "default_max_segment_open_duration"
     )]
+    #[schemars(with = "String")]
     pub max_segment_open_duration: Duration,
 
     // ─── Retry Configuration ────────────────────────────────────────────────
@@ -157,12 +161,14 @@ pub struct DurableBufferConfig {
     ///
     /// Used as the base for exponential backoff calculation.
     #[serde(with = "humantime_serde", default = "default_initial_retry_interval")]
+    #[schemars(with = "String")]
     pub initial_retry_interval: Duration,
 
     /// Maximum retry delay (default: 30s).
     ///
     /// Caps the exponential backoff to prevent excessively long waits.
     #[serde(with = "humantime_serde", default = "default_max_retry_interval")]
+    #[schemars(with = "String")]
     pub max_retry_interval: Duration,
 
     /// Multiplier for exponential backoff (default: 2.0).

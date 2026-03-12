@@ -48,7 +48,9 @@ use crate::{OTAP_PROCESSOR_FACTORIES, pdata::OtapPdata};
 /// URN for the fan-out processor.
 pub const FANOUT_PROCESSOR_URN: &str = "urn:otel:processor:fanout";
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 enum DeliveryMode {
     /// Send to all active destinations immediately.
@@ -58,7 +60,9 @@ enum DeliveryMode {
     Sequential,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 enum AwaitAck {
     /// Wait for the primary (or its fallback) only.
@@ -70,7 +74,7 @@ enum AwaitAck {
     None,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 struct DestinationConfig {
     /// Out port name used to reach the destination.
     pub port: PortName,
@@ -79,13 +83,14 @@ struct DestinationConfig {
     pub primary: bool,
     /// Timeout before treating the destination as failed.
     #[serde(with = "humantime_serde", default)]
+    #[schemars(with = "Option<String>")]
     pub timeout: Option<Duration>,
     /// Optional port name this destination will act as a fallback for.
     #[serde(default)]
     pub fallback_for: Option<PortName>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, schemars::JsonSchema)]
 struct FanoutConfig {
     /// Delivery pattern.
     #[serde(default)]
@@ -101,6 +106,7 @@ struct FanoutConfig {
         with = "humantime_serde",
         default = "FanoutConfig::default_timeout_interval"
     )]
+    #[schemars(with = "String")]
     pub timeout_check_interval: Duration,
     /// Maximum number of in-flight messages tracked by the processor.
     /// When exceeded, new messages are nacked to apply backpressure.
@@ -1163,7 +1169,7 @@ pub static FANOUT_PROCESSOR_FACTORY: ProcessorFactory<OtapPdata> = ProcessorFact
         output_fanout: otap_df_engine::wiring_contract::OutputFanoutRule::AtMostPerOutput(1),
     },
     validate_config: otap_df_config::validation::validate_typed_config::<FanoutConfig>,
-    config_schema: None,
+    config_schema: Some(otap_df_config::validation::typed_config_schema::<FanoutConfig>),
 };
 
 #[cfg(test)]

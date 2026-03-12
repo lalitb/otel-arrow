@@ -9,9 +9,10 @@ use crate::otlp_grpc_exporter::default_max_in_flight;
 use crate::otlp_http::client_settings::HttpClientSettings;
 
 /// Configuration for OTLP HTTP Exporter
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct Config {
     /// Configuration for the HTTP client that will be used by this exporter
+    #[schemars(skip)]
     pub http: HttpClientSettings,
 
     /// The endpoint to which the exporter will send OTLP HTTP requests. This should include the

@@ -9,11 +9,12 @@ use serde::{Deserialize, Deserializer};
 use std::time::Duration;
 
 /// Configuration for the OTAP Exporter
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Shared gRPC client settings reused across OTAP exports.
     #[serde(flatten)]
+    #[schemars(skip)]
     pub grpc: GrpcClientSettings,
 
     /// The type of compression to use for the gRPC messages. default = zstd.
@@ -22,15 +23,18 @@ pub struct Config {
         default = "default_compression_method",
         deserialize_with = "deserialize_compression_method"
     )]
+    #[schemars(skip)]
     pub compression_method: Option<CompressionMethod>,
 
     /// Configuration for the arrow payloads
     #[serde(default)]
+    #[schemars(skip)]
     pub arrow: ArrowConfig,
 
     /// Timeout for RPC requests. If not specified, no timeout is applied.
     /// Format: humantime format (e.g., "30s", "5m", "1h", "500ms")
     #[serde(default, with = "humantime_serde")]
+    #[schemars(with = "Option<String>")]
     pub timeout: Option<Duration>,
 }
 

@@ -66,7 +66,7 @@ use self::metrics::AttributesProcessorMetrics;
 /// URN for the AttributesProcessor
 pub const ATTRIBUTES_PROCESSOR_URN: &str = "urn:otel:processor:attribute";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 /// Actions that can be performed on attributes.
 #[serde(tag = "action", rename_all = "lowercase")]
 pub enum Action {
@@ -98,7 +98,7 @@ pub enum Action {
     Unsupported,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, schemars::JsonSchema)]
 /// Configuration for the AttributesProcessor.
 ///
 /// Accepts configuration in the same format as the OpenTelemetry Collector's attributes processor.
@@ -454,7 +454,7 @@ pub static ATTRIBUTES_PROCESSOR_FACTORY: otap_df_engine::ProcessorFactory<OtapPd
         },
         wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
         validate_config: otap_df_config::validation::validate_typed_config::<Config>,
-        config_schema: None,
+        config_schema: Some(otap_df_config::validation::typed_config_schema::<Config>),
     };
 
 // Pre-computed arrays for all domain combinations
