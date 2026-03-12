@@ -163,6 +163,46 @@ impl EngineObservabilityPolicies {
     }
 }
 
+/// Configuration for the embedded MCP server.
+///
+/// The MCP (Model Context Protocol) server provides AI-assisted component
+/// discovery, configuration validation, and runtime pipeline management.
+///
+/// # Security
+///
+/// When enabled, the MCP server exposes tools including `shutdown_collector`
+/// (destructive). The admin port must not be publicly exposed. MCP adds a
+/// sessionful, AI-oriented interface — ensure any LLM tooling connected to
+/// this endpoint is trusted and authorized.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct McpSettings {
+    /// Whether the embedded MCP server is enabled.
+    ///
+    /// Defaults to `false`. Must be explicitly set to `true` to activate MCP.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Optional separate bind address for the MCP HTTP server.
+    ///
+    /// When `None` (default), the MCP server is mounted on the admin HTTP
+    /// server at `/mcp` (e.g., `http://localhost:8080/mcp`).
+    ///
+    /// When `Some`, a separate TCP listener is bound at the given address,
+    /// allowing independent firewall or network-policy control over MCP traffic
+    /// (e.g., `"0.0.0.0:8090"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_address: Option<String>,
+
+    /// Optional directory from which to load example pipeline configurations.
+    ///
+    /// When `None` (default), the MCP server exposes no example configs.
+    /// In container deployments, mount a configs directory and set this path
+    /// (e.g., `/etc/otap/configs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub example_dir: Option<std::path::PathBuf>,
+}
+
 /// Configuration for the HTTP admin endpoints.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -170,12 +210,20 @@ pub struct HttpAdminSettings {
     /// The address to bind the HTTP server to (e.g., "127.0.0.1:8080").
     #[serde(default = "default_bind_address")]
     pub bind_address: String,
+
+    /// Optional embedded MCP server configuration.
+    ///
+    /// When `None` (default), the MCP server is not started even if the binary
+    /// was compiled with `--features mcp`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<McpSettings>,
 }
 
 impl Default for HttpAdminSettings {
     fn default() -> Self {
         Self {
             bind_address: default_bind_address(),
+            mcp: None,
         }
     }
 }
@@ -227,6 +275,173 @@ groups:
         ));
         fs::write(&path, contents).expect("failed to write temporary test file");
         path
+    }
+
+    #[test]
+    fn http_admin_mcp_defaults_to_none() {
+        let yaml = r#"
+version: otel_dataflow/v1
+engine:
+  http_admin:
+    bind_address: "127.0.0.1:8080"
+groups:
+  default:
+    pipelines:
+      main:
+        nodes:
+          receiver:
+            type: "urn:test:receiver:example"
+            config: null
+          exporter:
+            type: "urn:test:exporter:example"
+            config: null
+        connections:
+          - from: receiver
+            to: exporter
+"#;
+        let config = OtelDataflowSpec::from_yaml(yaml).expect("should parse");
+        assert!(config.engine.http_admin.as_ref().unwrap().mcp.is_none());
+    }
+
+    #[test]
+    fn http_admin_mcp_parses_enabled() {
+        let yaml = r#"
+version: otel_dataflow/v1
+engine:
+  http_admin:
+    bind_address: "127.0.0.1:8080"
+    mcp:
+      enabled: true
+groups:
+  default:
+    pipelines:
+      main:
+        nodes:
+          receiver:
+            type: "urn:test:receiver:example"
+            config: null
+          exporter:
+            type: "urn:test:exporter:example"
+            config: null
+        connections:
+          - from: receiver
+            to: exporter
+"#;
+        let config = OtelDataflowSpec::from_yaml(yaml).expect("should parse");
+        let mcp = config
+            .engine
+            .http_admin
+            .as_ref()
+            .unwrap()
+            .mcp
+            .as_ref()
+            .unwrap();
+        assert!(mcp.enabled);
+        assert!(mcp.bind_address.is_none());
+        assert!(mcp.example_dir.is_none());
+    }
+
+    #[test]
+    fn http_admin_mcp_parses_separate_bind_and_example_dir() {
+        let yaml = r#"
+version: otel_dataflow/v1
+engine:
+  http_admin:
+    bind_address: "127.0.0.1:8080"
+    mcp:
+      enabled: true
+      bind_address: "0.0.0.0:8090"
+      example_dir: "/etc/otap/configs"
+groups:
+  default:
+    pipelines:
+      main:
+        nodes:
+          receiver:
+            type: "urn:test:receiver:example"
+            config: null
+          exporter:
+            type: "urn:test:exporter:example"
+            config: null
+        connections:
+          - from: receiver
+            to: exporter
+"#;
+        let config = OtelDataflowSpec::from_yaml(yaml).expect("should parse");
+        let mcp = config
+            .engine
+            .http_admin
+            .as_ref()
+            .unwrap()
+            .mcp
+            .as_ref()
+            .unwrap();
+        assert!(mcp.enabled);
+        assert_eq!(mcp.bind_address.as_deref(), Some("0.0.0.0:8090"));
+        assert_eq!(
+            mcp.example_dir.as_deref(),
+            Some(std::path::Path::new("/etc/otap/configs"))
+        );
+    }
+
+    #[test]
+    fn http_admin_mcp_validation_rejects_bind_address_when_disabled() {
+        let yaml = r#"
+version: otel_dataflow/v1
+engine:
+  http_admin:
+    bind_address: "127.0.0.1:8080"
+    mcp:
+      enabled: false
+      bind_address: "0.0.0.0:8090"
+groups:
+  default:
+    pipelines:
+      main:
+        nodes:
+          receiver:
+            type: "urn:test:receiver:example"
+            config: null
+          exporter:
+            type: "urn:test:exporter:example"
+            config: null
+        connections:
+          - from: receiver
+            to: exporter
+"#;
+        let err = OtelDataflowSpec::from_yaml(yaml).expect_err("should reject");
+        assert!(err.to_string().contains("mcp.bind_address"));
+        assert!(err.to_string().contains("enabled is false"));
+    }
+
+    #[test]
+    fn http_admin_mcp_validation_rejects_example_dir_when_disabled() {
+        let yaml = r#"
+version: otel_dataflow/v1
+engine:
+  http_admin:
+    bind_address: "127.0.0.1:8080"
+    mcp:
+      enabled: false
+      example_dir: "/etc/otap/configs"
+groups:
+  default:
+    pipelines:
+      main:
+        nodes:
+          receiver:
+            type: "urn:test:receiver:example"
+            config: null
+          exporter:
+            type: "urn:test:exporter:example"
+            config: null
+        connections:
+          - from: receiver
+            to: exporter
+"#;
+        let err = OtelDataflowSpec::from_yaml(yaml).expect_err("should reject");
+        assert!(err.to_string().contains("mcp.example_dir"));
+        assert!(err.to_string().contains("enabled is false"));
     }
 
     #[test]

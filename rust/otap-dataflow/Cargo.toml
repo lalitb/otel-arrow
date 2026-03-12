@@ -153,6 +153,7 @@ serde_json = { version = "1.0.145" }
 serde_yaml = "0.9.34-deprecated"        # Deprecated, but no good alternative yet
 crc32fast = "1.4.2"
 replace_with = "0.1.8"
+rmcp = { version = "1.1", features = ["server", "transport-streamable-http-server"] }
 simdutf8 = "0.1.5"
 slotmap = "1.0.7"
 smallvec = { version = "1.15" , features = ["union"] }
@@ -218,6 +219,10 @@ unchecked-arithmetic = []
 
 # Experimental features
 experimental-tls = ["otap-df-otap/experimental-tls", "dep:rustls"]
+
+# MCP (Model Context Protocol) server embedded in df_engine (opt-in)
+# Requires runtime opt-in via engine.http_admin.mcp.enabled: true in config.
+mcp = ["otap-df-controller/mcp"]
 
 # Contrib exporters (opt-in) - now in contrib-nodes
 contrib-exporters = ["otap-df-contrib-nodes/contrib-exporters"]

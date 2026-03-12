@@ -80,6 +80,30 @@ impl OtelDataflowSpec {
             }
         }
 
+        // Validate MCP settings: reject conflicting config when MCP is disabled.
+        if let Some(http_admin) = &self.engine.http_admin {
+            if let Some(mcp) = &http_admin.mcp {
+                if !mcp.enabled {
+                    if mcp.bind_address.is_some() {
+                        errors.push(Error::InvalidUserConfig {
+                            error: "engine.http_admin.mcp.bind_address is set but \
+                                    engine.http_admin.mcp.enabled is false; \
+                                    remove bind_address or set enabled: true"
+                                .to_owned(),
+                        });
+                    }
+                    if mcp.example_dir.is_some() {
+                        errors.push(Error::InvalidUserConfig {
+                            error: "engine.http_admin.mcp.example_dir is set but \
+                                    engine.http_admin.mcp.enabled is false; \
+                                    remove example_dir or set enabled: true"
+                                .to_owned(),
+                        });
+                    }
+                }
+            }
+        }
+
         if !errors.is_empty() {
             Err(Error::InvalidConfiguration { errors })
         } else {

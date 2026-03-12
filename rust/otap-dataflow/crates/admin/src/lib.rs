@@ -6,6 +6,8 @@
 mod dashboard;
 pub mod error;
 mod health;
+#[cfg(feature = "mcp")]
+mod mcp;
 mod pipeline;
 mod pipeline_group;
 mod telemetry;
@@ -61,6 +63,31 @@ pub async fn run(
         .layer(ServiceBuilder::new())
         .with_state(app_state);
 
+    // Conditionally wire the MCP server when compiled with --features mcp.
+    //
+    // When mcp.bind_address is None: mount /mcp on the admin router (same port).
+    // When mcp.bind_address is Some: leave admin router unchanged; a separate
+    // listener is spawned below after the admin listener is bound.
+    #[cfg(feature = "mcp")]
+    let admin_url = admin_loopback_url(&config.bind_address);
+
+    #[cfg(feature = "mcp")]
+    let app = if let Some(mcp_cfg) = config.mcp.as_ref().filter(|m| m.enabled && m.bind_address.is_none()) {
+        mcp::mount(app, mcp_cfg, &admin_url)
+    } else {
+        app
+    };
+
+    // Warn if MCP is enabled in config but the binary lacks the mcp feature.
+    #[cfg(not(feature = "mcp"))]
+    if config.mcp.as_ref().is_some_and(|m| m.enabled) {
+        otel_warn!(
+            "admin.mcp_not_compiled",
+            message = "engine.http_admin.mcp.enabled is true but this binary was not compiled \
+                       with --features mcp; the MCP server will not start"
+        );
+    }
+
     // Parse the configured bind address.
     let addr = config.bind_address.parse::<SocketAddr>().map_err(|e| {
         let details = format!("{e}");
@@ -99,6 +126,14 @@ pub async fn run(
         message = "Admin HTTP server listening"
     );
 
+    // Spawn the MCP server on a separate port if configured.
+    #[cfg(feature = "mcp")]
+    if let Some(mcp_cfg) = config.mcp.as_ref().filter(|m| m.enabled) {
+        if let Some(ref mcp_bind) = mcp_cfg.bind_address {
+            mcp::spawn_separate(mcp_cfg, mcp_bind, &admin_url, cancel.clone()).await?;
+        }
+    }
+
     // Start serving requests, with graceful shutdown on signal.
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -109,4 +144,64 @@ pub async fn run(
             addr: addr.to_string(),
             details: format!("{e}"),
         })
+}
+
+#[cfg(feature = "mcp")]
+/// Construct a loopback URL from the admin bind address.
+///
+/// Normalizes wildcard addresses (`0.0.0.0`, `::`) to `127.0.0.1` / `[::1]`
+/// so the embedded MCP client can connect back to the admin API.
+fn admin_loopback_url(bind_address: &str) -> String {
+    match bind_address.parse::<SocketAddr>() {
+        Ok(addr) => {
+            let port = addr.port();
+            if addr.ip().is_unspecified() {
+                // Wildcard address: pick the matching loopback interface.
+                // IPv4 (0.0.0.0) → 127.0.0.1; IPv6 (::) → [::1].
+                match addr {
+                    SocketAddr::V4(_) => format!("http://127.0.0.1:{port}"),
+                    SocketAddr::V6(_) => format!("http://[::1]:{port}"),
+                }
+            } else {
+                format!("http://{addr}")
+            }
+        }
+        Err(_) => format!("http://{bind_address}"),
+    }
+}
+
+#[cfg(all(test, feature = "mcp"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_url_ipv4_wildcard() {
+        assert_eq!(admin_loopback_url("0.0.0.0:8080"), "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn loopback_url_ipv6_wildcard() {
+        assert_eq!(admin_loopback_url("[::]:8080"), "http://[::1]:8080");
+    }
+
+    #[test]
+    fn loopback_url_explicit_ipv4() {
+        assert_eq!(
+            admin_loopback_url("127.0.0.1:8080"),
+            "http://127.0.0.1:8080"
+        );
+    }
+
+    #[test]
+    fn loopback_url_explicit_ipv6() {
+        assert_eq!(admin_loopback_url("[::1]:8080"), "http://[::1]:8080");
+    }
+
+    #[test]
+    fn loopback_url_non_loopback_ip() {
+        assert_eq!(
+            admin_loopback_url("192.168.1.10:8080"),
+            "http://192.168.1.10:8080"
+        );
+    }
 }
