@@ -72,7 +72,11 @@ pub async fn run(
     let admin_url = admin_loopback_url(&config.bind_address);
 
     #[cfg(feature = "mcp")]
-    let app = if let Some(mcp_cfg) = config.mcp.as_ref().filter(|m| m.enabled && m.bind_address.is_none()) {
+    let app = if let Some(mcp_cfg) = config
+        .mcp
+        .as_ref()
+        .filter(|m| m.enabled && m.bind_address.is_none())
+    {
         mcp::mount(app, mcp_cfg, &admin_url)
     } else {
         app

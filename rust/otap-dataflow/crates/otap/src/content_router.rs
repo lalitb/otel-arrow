@@ -84,7 +84,7 @@ pub const CONTENT_ROUTER_URN: &str = "urn:otel:processor:content_router";
 /// Using an explicit source type makes the configuration unambiguous and allows
 /// future variants (e.g. scope attributes, metric names) to be added without
 /// breaking existing configs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutingKeyExpr {
     /// Extract the routing value from a resource attribute with the given key.
@@ -137,7 +137,7 @@ pub struct ContentRouterMetrics {
 ///       "backend": "backend_pipeline"
 ///     default_output: "fallback"
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ContentRouterConfig {
     /// The source and key used to extract the routing value from a telemetry message.
     pub routing_key: RoutingKeyExpr,
@@ -668,7 +668,7 @@ pub static CONTENT_ROUTER_FACTORY: ProcessorFactory<OtapPdata> = ProcessorFactor
 
         Ok(ProcessorWrapper::local(router, node, node_config, proc_cfg))
     },
-    config_schema: None,
+    config_schema: Some(otap_df_config::validation::typed_config_schema::<ContentRouterConfig>),
 };
 
 #[cfg(test)]

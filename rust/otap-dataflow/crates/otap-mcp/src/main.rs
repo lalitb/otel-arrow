@@ -88,22 +88,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 session::local::LocalSessionManager,
             };
 
-            let bind_addr: std::net::SocketAddr = args.http_bind.parse().map_err(|e| {
-                format!("Invalid --http-bind address '{}': {e}", args.http_bind)
-            })?;
+            let bind_addr: std::net::SocketAddr = args
+                .http_bind
+                .parse()
+                .map_err(|e| format!("Invalid --http-bind address '{}': {e}", args.http_bind))?;
 
             // Note: The MCP protocol runs over HTTP at http://{bind_addr}/mcp
             let session_manager = std::sync::Arc::new(LocalSessionManager::default());
             let config = StreamableHttpServerConfig::default();
 
-            let service = StreamableHttpService::new(
-                move || Ok(server.clone()),
-                session_manager,
-                config,
-            );
+            let service =
+                StreamableHttpService::new(move || Ok(server.clone()), session_manager, config);
 
-            let app = axum::Router::new()
-                .route("/mcp", axum::routing::any_service(service));
+            let app = axum::Router::new().route("/mcp", axum::routing::any_service(service));
 
             let listener = tokio::net::TcpListener::bind(bind_addr).await?;
             axum::serve(listener, app).await?;

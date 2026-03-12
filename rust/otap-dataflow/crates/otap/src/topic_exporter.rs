@@ -76,7 +76,7 @@ pub struct TopicExporterMetrics {
 }
 
 /// Topic exporter configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TopicExporterConfig {
     /// Topic name to publish to.
@@ -143,7 +143,7 @@ pub static TOPIC_EXPORTER: ExporterFactory<OtapPdata> =
         },
         wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
         validate_config: |config| TopicExporter::parse_config(config).map(|_| ()),
-        config_schema: None,
+        config_schema: Some(otap_df_config::validation::typed_config_schema::<TopicExporterConfig>),
     };
 
 impl TopicExporter {

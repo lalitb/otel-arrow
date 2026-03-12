@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 pub struct NodeSpec {
     /// Node ID in the pipeline (e.g., "receiver", "batch", "exporter").
     /// Auto-generated if not provided.
+    #[serde(default)]
     pub id: Option<String>,
     /// Component URN (e.g., "receiver:otlp", "processor:batch", "exporter:otlp_grpc").
     pub r#type: String,

@@ -28,7 +28,7 @@ struct ErrorExporter {
 }
 
 /// Configuration for the error exporter.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 struct ErrorExporterConfig {
     /// The error message.
     pub message: String,
@@ -41,7 +41,7 @@ static ERROR_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
     create: ErrorExporter::create_exporter,
     wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
     validate_config: otap_df_config::validation::validate_typed_config::<ErrorExporterConfig>,
-    config_schema: None,
+    config_schema: Some(otap_df_config::validation::typed_config_schema::<ErrorExporterConfig>),
 };
 
 impl ErrorExporter {

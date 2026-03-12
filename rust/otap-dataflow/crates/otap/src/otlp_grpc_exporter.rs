@@ -51,11 +51,12 @@ use tonic::transport::Channel;
 pub const OTLP_EXPORTER_URN: &str = "urn:otel:exporter:otlp_grpc";
 
 /// Configuration for the OTLP Exporter
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Shared gRPC client settings reused across OTLP exports.
     #[serde(flatten)]
+    #[schemars(skip)]
     pub grpc: GrpcClientSettings,
     /// Maximum number of concurrent in-flight export RPCs.
     #[serde(default = "default_max_in_flight")]
@@ -90,7 +91,7 @@ pub static OTLP_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
     },
     wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
     validate_config: otap_df_config::validation::validate_typed_config::<Config>,
-    config_schema: None,
+    config_schema: Some(otap_df_config::validation::typed_config_schema::<Config>),
 };
 
 impl OTLPExporter {

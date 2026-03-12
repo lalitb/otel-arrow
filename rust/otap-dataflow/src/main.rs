@@ -144,7 +144,10 @@ fn core_allocation_override(
 }
 
 fn http_admin_bind_override(http_admin_bind: Option<String>) -> Option<HttpAdminSettings> {
-    http_admin_bind.map(|bind_address| HttpAdminSettings { bind_address, mcp: None })
+    http_admin_bind.map(|bind_address| HttpAdminSettings {
+        bind_address,
+        mcp: None,
+    })
 }
 
 fn apply_cli_overrides(

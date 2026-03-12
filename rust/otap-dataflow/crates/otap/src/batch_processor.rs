@@ -83,7 +83,7 @@ const LOG_MSG_BATCHING_FAILED_SUFFIX: &str = "; dropping";
 /// Note: these are not always supported. In the present code, the only
 /// supported Sizer value is Items. We expect future support for bytes and
 /// requests sizers.
-#[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Sizer {
     /// Count requests. This metric counts one per OtapPdata message.
@@ -109,7 +109,7 @@ impl Sizer {
 }
 
 /// Min/max size for a specific format
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct FormatConfig {
     /// Flush current batch when this count is reached, as a
     /// minimum. Measures the quantity indicated by `sizer`. When
@@ -128,7 +128,7 @@ pub struct FormatConfig {
 }
 
 /// Batching format option.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum BatchingFormat {
     /// Force to OTAP (default).
@@ -156,7 +156,7 @@ trait Batcher<T: OtapPayloadHelpers> {
 }
 
 /// Batch processor configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct Config {
     /// The OTAP configuration.
     #[serde(default = "default_otap")]
@@ -169,6 +169,7 @@ pub struct Config {
     /// Flush non-empty batches on this interval, which may be 0 for
     /// immediate flush or None for no timeout.
     #[serde(with = "humantime_serde", default = "default_flush_timeout")]
+    #[schemars(with = "String")]
     pub flush_timeout: Duration,
 
     /// Limits the number of pending requests for ack/nack tracking.
@@ -1322,7 +1323,7 @@ pub static OTAP_BATCH_PROCESSOR_FACTORY: otap_df_engine::ProcessorFactory<OtapPd
         },
         wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
         validate_config: otap_df_config::validation::validate_typed_config::<Config>,
-        config_schema: None,
+        config_schema: Some(otap_df_config::validation::typed_config_schema::<Config>),
     };
 
 #[cfg(test)]

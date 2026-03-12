@@ -92,7 +92,7 @@ pub struct TopicReceiverMetrics {
 }
 
 /// Topic receiver configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TopicReceiverConfig {
     /// Topic name to subscribe to.
@@ -103,7 +103,7 @@ pub struct TopicReceiverConfig {
 }
 
 /// Subscription mode for a topic receiver.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TopicSubscriptionConfig {
     /// Each subscriber receives all messages.
@@ -191,7 +191,7 @@ pub static TOPIC_RECEIVER: ReceiverFactory<OtapPdata> =
         },
         wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
         validate_config: |config| TopicReceiver::parse_config(config).map(|_| ()),
-        config_schema: None,
+        config_schema: Some(otap_df_config::validation::typed_config_schema::<TopicReceiverConfig>),
     };
 
 impl TopicReceiver {

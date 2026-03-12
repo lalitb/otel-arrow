@@ -26,8 +26,7 @@ use otap_df_mcp::resources::examples::ExampleStore;
 use otap_df_mcp::server::OtapMcpServer;
 use otap_df_telemetry::{otel_info, otel_warn};
 use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService,
-    session::local::LocalSessionManager,
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -126,8 +125,9 @@ fn build_server(config: &McpSettings, admin_url: &str) -> OtapMcpServer {
 }
 
 /// Wrap an `OtapMcpServer` in a `StreamableHttpService` for axum routing.
-fn build_service(server: OtapMcpServer) -> StreamableHttpService<OtapMcpServer, LocalSessionManager>
-{
+fn build_service(
+    server: OtapMcpServer,
+) -> StreamableHttpService<OtapMcpServer, LocalSessionManager> {
     let session_manager = Arc::new(LocalSessionManager::default());
     let mcp_config = StreamableHttpServerConfig::default();
     StreamableHttpService::new(move || Ok(server.clone()), session_manager, mcp_config)
@@ -145,7 +145,8 @@ fn load_example_store(config: &McpSettings) -> ExampleStore {
                     "admin.mcp.example_dir_failed",
                     dir = dir_str.as_str(),
                     error = err_str.as_str(),
-                    message = "Failed to load MCP example configs from directory; using empty store"
+                    message =
+                        "Failed to load MCP example configs from directory; using empty store"
                 );
                 ExampleStore::empty()
             }

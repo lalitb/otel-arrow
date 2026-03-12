@@ -39,11 +39,12 @@ use std::time::Duration;
 pub const DELAY_PROCESSOR_URN: &str = "urn:otel:processor:delay";
 
 /// Configuration for the delay processor.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DelayConfig {
     /// How long to sleep before forwarding each message.
     /// Format: humantime (e.g., "500ms", "1s", "2s").
     #[serde(with = "humantime_serde")]
+    #[schemars(with = "String")]
     pub delay: Duration,
 }
 
@@ -55,7 +56,7 @@ pub static DELAY_PROCESSOR_FACTORY: ProcessorFactory<OtapPdata> = ProcessorFacto
     create: create_delay_processor,
     wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
     validate_config: otap_df_config::validation::validate_typed_config::<DelayConfig>,
-    config_schema: None,
+    config_schema: Some(otap_df_config::validation::typed_config_schema::<DelayConfig>),
 };
 
 /// Factory function to create a DelayProcessor.

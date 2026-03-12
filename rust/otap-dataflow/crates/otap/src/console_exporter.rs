@@ -38,7 +38,7 @@ use std::time::{Duration, SystemTime};
 pub const CONSOLE_EXPORTER_URN: &str = "urn:otel:exporter:console";
 
 /// Configuration for the console exporter
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, schemars::JsonSchema)]
 pub struct ConsoleExporterConfig {
     /// Whether to use ANSI colors in output (default: true)
     #[serde(default = "default_color")]
@@ -93,7 +93,7 @@ pub static CONSOLE_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
     },
     wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
     validate_config: otap_df_config::validation::validate_typed_config::<ConsoleExporterConfig>,
-    config_schema: None,
+    config_schema: Some(otap_df_config::validation::typed_config_schema::<ConsoleExporterConfig>),
 };
 
 #[async_trait(?Send)]

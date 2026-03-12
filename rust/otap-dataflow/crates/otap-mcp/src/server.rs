@@ -60,7 +60,9 @@ impl OtapMcpServer {
 
     /// Returns the dashboard URL if an admin URL is configured.
     fn dashboard_url(&self) -> Option<String> {
-        self.admin_url.as_ref().map(|url| format!("{url}/dashboard"))
+        self.admin_url
+            .as_ref()
+            .map(|url| format!("{url}/dashboard"))
     }
 }
 
@@ -177,7 +179,28 @@ impl OtapMcpServer {
 
     /// Validate an OTAP dataflow engine YAML configuration.
     #[tool(
-        description = "Validate an OTAP dataflow engine YAML config. Returns errors, warnings, and summary."
+        description = "Validate an OTAP dataflow engine YAML config. Returns errors, warnings, and summary. \
+        \n\nThe YAML must use OTAP format (NOT standard OpenTelemetry Collector format). \
+        OTAP configs start with 'version: otel_dataflow/v1' and use groups/pipelines/nodes/connections structure. \
+        \nExample minimal YAML:\n\
+        version: otel_dataflow/v1\n\
+        engine: {}\n\
+        groups:\n\
+          default:\n\
+            pipelines:\n\
+              main:\n\
+                policies:\n\
+                  channel_capacity:\n\
+                    control: { node: 256, pipeline: 256 }\n\
+                    pdata: 128\n\
+                nodes:\n\
+                  receiver:\n\
+                    type: receiver:otlp\n\
+                  exporter:\n\
+                    type: exporter:console\n\
+                connections:\n\
+                  - from: receiver\n\
+                    to: exporter"
     )]
     fn validate_config(
         &self,
@@ -223,7 +246,23 @@ impl OtapMcpServer {
     /// Specify receiver, processors, and exporter with their configs.
     /// The tool wires the DAG connections and validates the output automatically.
     #[tool(
-        description = "Generate a valid OTAP pipeline YAML config from structured input. Specify receiver, processors (in order), and exporter with their configs. Auto-wires DAG connections."
+        description = "Generate a valid OTAP pipeline YAML config from structured input. \
+        \n\nRequired parameters:\n\
+        - receiver: object with 'type' field (component URN), optional 'id' and 'config' (JSON string)\n\
+        - exporter: object with 'type' field (component URN), optional 'id' and 'config' (JSON string)\n\
+        \nOptional parameters:\n\
+        - processors: array of objects, each with 'type' field, optional 'id' and 'config'\n\
+        - group_id: string (default 'default')\n\
+        - pipeline_id: string (default 'main')\n\
+        - enable_admin: boolean (default false)\n\
+        \nExample input:\n\
+        {\n\
+          \"receiver\": {\"type\": \"receiver:otlp\", \"config\": \"{\\\"protocols\\\":{\\\"grpc\\\":{\\\"listening_addr\\\":\\\"0.0.0.0:4317\\\"}}}\"},\n\
+          \"processors\": [{\"type\": \"processor:batch\"}],\n\
+          \"exporter\": {\"type\": \"exporter:otlp_grpc\", \"config\": \"{\\\"grpc_endpoint\\\":\\\"http://backend:4317\\\"}\"}\n\
+        }\n\
+        \nMinimal example (no config, no processors):\n\
+        {\"receiver\": {\"type\": \"receiver:otlp\"}, \"exporter\": {\"type\": \"exporter:console\"}}"
     )]
     fn generate_config(
         &self,
@@ -534,14 +573,12 @@ impl ServerHandler for OtapMcpServer {
                         )
                     })?
             }
-            "dashboard://url" => {
-                self.dashboard_url().ok_or_else(|| {
-                    ErrorData::internal_error(
-                        "No admin URL configured. Start with --admin-url to enable the dashboard.",
-                        None,
-                    )
-                })?
-            }
+            "dashboard://url" => self.dashboard_url().ok_or_else(|| {
+                ErrorData::internal_error(
+                    "No admin URL configured. Start with --admin-url to enable the dashboard.",
+                    None,
+                )
+            })?,
             _ => {
                 return Err(ErrorData::resource_not_found(
                     format!("Unknown resource: {uri}"),

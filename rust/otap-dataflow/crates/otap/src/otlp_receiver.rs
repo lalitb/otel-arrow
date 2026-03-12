@@ -116,13 +116,14 @@ const TELEMETRY_INTERVAL: Duration = Duration::from_secs(1);
 ///         cert_file: "/path/to/server.crt"
 ///         key_file: "/path/to/server.key"
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Protocol configurations.
     ///
     /// At least one protocol (gRPC or HTTP) must be configured.
     /// Each protocol can have its own TLS configuration.
+    #[schemars(skip)]
     pub protocols: Protocols,
 }
 
@@ -209,7 +210,7 @@ pub static OTLP_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFactory {
     },
     wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
     validate_config: otap_df_config::validation::validate_typed_config::<Config>,
-    config_schema: None,
+    config_schema: Some(otap_df_config::validation::typed_config_schema::<Config>),
 };
 
 impl OTLPReceiver {

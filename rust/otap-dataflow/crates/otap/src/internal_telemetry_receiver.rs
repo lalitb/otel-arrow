@@ -34,7 +34,7 @@ use std::sync::Arc;
 pub use otap_df_telemetry::INTERNAL_TELEMETRY_RECEIVER_URN;
 
 /// Configuration for the internal telemetry receiver.
-#[derive(Clone, Deserialize, Serialize, Default)]
+#[derive(Clone, Deserialize, Serialize, Default, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Config {}
 
@@ -75,7 +75,7 @@ pub static INTERNAL_TELEMETRY_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFac
     },
     wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
     validate_config: otap_df_config::validation::validate_typed_config::<Config>,
-    config_schema: None,
+    config_schema: Some(otap_df_config::validation::typed_config_schema::<Config>),
 };
 
 impl InternalTelemetryReceiver {

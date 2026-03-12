@@ -51,13 +51,14 @@ pub const RETRY_PROCESSOR_URN: &str = "urn:otel:processor:retry";
 ///
 /// Retries will be attempted until max_elapsed_time has passed
 /// from the initial attempt.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RetryConfig {
     /// Initial retry interval in seconds. This is how long the
     /// first delay will be following the first NACK response.
     /// This interval is multiplied by the multiplier on subsequent
     /// retries, until it exceeds max_interval.
     #[serde(with = "humantime_serde", default = "default_initial_interval")]
+    #[schemars(with = "String")]
     pub initial_interval: Duration,
 
     /// Maximum retry interval in seconds. This is a limit on
@@ -66,6 +67,7 @@ pub struct RetryConfig {
     /// interval times the exponentiated multiplier reaches this
     /// value.
     #[serde(with = "humantime_serde", default = "default_max_interval")]
+    #[schemars(with = "String")]
     pub max_interval: Duration,
 
     /// Maximum elapsed time in seconds.  This is the maximum elapsed
@@ -73,6 +75,7 @@ pub struct RetryConfig {
     /// processor first sees it. Retries will not be scheduled if they
     /// would begin after this many seconds from the start.
     #[serde(with = "humantime_serde", default = "default_max_elapsed_time")]
+    #[schemars(with = "String")]
     pub max_elapsed_time: Duration,
 
     /// Multiplier for the retry interval.
@@ -325,7 +328,7 @@ pub static RETRY_PROCESSOR_FACTORY: ProcessorFactory<OtapPdata> = ProcessorFacto
     create: create_retry_processor,
     wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
     validate_config: otap_df_config::validation::validate_typed_config::<RetryConfig>,
-    config_schema: None,
+    config_schema: Some(otap_df_config::validation::typed_config_schema::<RetryConfig>),
 };
 
 /// A processor that handles message retries with exponential backoff

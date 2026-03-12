@@ -25,6 +25,7 @@ object_store = {workspace = true, features = ["fs"]}
 parquet.workspace = true
 thiserror = { workspace = true }
 serde_json = { workspace = true }
+schemars = { workspace = true }
 slotmap = { workspace = true }
 tokio = { workspace = true }
 linkme = { workspace = true }
