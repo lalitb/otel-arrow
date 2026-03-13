@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 /// Configuration for the Azure Monitor Exporter matching the Collector's schema.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// API configuration for Azure Monitor
@@ -19,7 +19,7 @@ pub struct Config {
 }
 
 /// Authentication method for Azure
-#[derive(Debug, Deserialize, Clone, PartialEq, Default)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Default, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AuthMethod {
     /// Use Managed Identity (system or user-assigned with client_id)
@@ -33,7 +33,7 @@ pub enum AuthMethod {
 }
 
 /// Authentication configuration for Azure
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, schemars::JsonSchema)]
 pub struct AuthConfig {
     /// Authentication method to use
     #[serde(default)]
@@ -80,7 +80,7 @@ fn default_scope() -> String {
 }
 
 /// API configuration for connecting to Azure Monitor
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, schemars::JsonSchema)]
 pub struct ApiConfig {
     /// Data Collection Rule endpoint
     pub dcr_endpoint: String,
@@ -97,7 +97,7 @@ pub struct ApiConfig {
 }
 
 /// Schema mapping configuration
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone, Default, schemars::JsonSchema)]
 pub struct SchemaConfig {
     /// Resource attribute mappings
     #[serde(default)]

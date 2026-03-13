@@ -113,37 +113,83 @@ pub fn list_all_components() -> Vec<ComponentInfo> {
     all
 }
 
+/// Resolves a component URN from a type and name/URN input.
+///
+/// Accepts:
+/// - A full URN passed as `component_name` (e.g., `urn:microsoft:exporter:geneva`)
+/// - A shortcut name (e.g., `geneva`) — tries `urn:otel:<type>:<name>` first,
+///   then searches all registered URNs whose last segment matches the name.
+///
+/// On failure, returns a helpful error listing similar URNs from the registry.
+fn resolve_urn(
+    component_type: &str,
+    component_name: &str,
+) -> Result<String, String> {
+    // If it already looks like a full URN, use it directly.
+    if component_name.starts_with("urn:") {
+        return Ok(component_name.to_string());
+    }
+
+    // Otherwise build the default otel URN.
+    Ok(format!("urn:otel:{component_type}:{component_name}"))
+}
+
+/// Builds a "not found" error message with suggestions from the registry.
+fn not_found_error(kind: &str, urn: &str, registered: Vec<String>) -> String {
+    let suggestions: Vec<String> = registered
+        .iter()
+        .filter(|u| {
+            u.contains(urn.rsplit(':').next().unwrap_or(""))
+                || urn.contains(u.rsplit(':').next().unwrap_or(""))
+        })
+        .cloned()
+        .collect();
+
+    if suggestions.is_empty() {
+        format!(
+            "Unknown {kind}: {urn}. Available {kind}s: {}",
+            registered.join(", ")
+        )
+    } else {
+        format!(
+            "Unknown {kind}: {urn}. Did you mean: {}",
+            suggestions.join(", ")
+        )
+    }
+}
+
 /// Validates a component config against its registered validator.
 ///
-/// Accepts both shortcut (`receiver:otlp`) and canonical (`urn:otel:receiver:otlp`) URN forms.
+/// Accepts full URNs (e.g., `urn:microsoft:exporter:geneva`) or shortcut names
+/// (e.g., `geneva`). On failure, suggests the closest matching registered URN.
 /// Returns `Ok(())` if the config is valid, or an error message.
 pub fn validate_component_config(
     component_type: &str,
     component_name: &str,
     config: &serde_json::Value,
 ) -> Result<(), String> {
-    let canonical_urn = format!("urn:otel:{component_type}:{component_name}");
+    let urn = resolve_urn(component_type, component_name)?;
 
     match component_type {
         "receiver" => {
             let map = OTAP_PIPELINE_FACTORY.get_receiver_factory_map();
-            let factory = map
-                .get(canonical_urn.as_str())
-                .ok_or_else(|| format!("Unknown receiver: {canonical_urn}"))?;
+            let factory = map.get(urn.as_str()).ok_or_else(|| {
+                not_found_error("receiver", &urn, map.keys().map(|k| k.to_string()).collect())
+            })?;
             (factory.validate_config)(config).map_err(|e| format!("{e}"))
         }
         "processor" => {
             let map = OTAP_PIPELINE_FACTORY.get_processor_factory_map();
-            let factory = map
-                .get(canonical_urn.as_str())
-                .ok_or_else(|| format!("Unknown processor: {canonical_urn}"))?;
+            let factory = map.get(urn.as_str()).ok_or_else(|| {
+                not_found_error("processor", &urn, map.keys().map(|k| k.to_string()).collect())
+            })?;
             (factory.validate_config)(config).map_err(|e| format!("{e}"))
         }
         "exporter" => {
             let map = OTAP_PIPELINE_FACTORY.get_exporter_factory_map();
-            let factory = map
-                .get(canonical_urn.as_str())
-                .ok_or_else(|| format!("Unknown exporter: {canonical_urn}"))?;
+            let factory = map.get(urn.as_str()).ok_or_else(|| {
+                not_found_error("exporter", &urn, map.keys().map(|k| k.to_string()).collect())
+            })?;
             (factory.validate_config)(config).map_err(|e| format!("{e}"))
         }
         other => Err(format!(
@@ -154,33 +200,34 @@ pub fn validate_component_config(
 
 /// Returns the JSON Schema for a component's configuration, if available.
 ///
-/// Accepts both shortcut (`receiver:otlp`) and canonical (`urn:otel:receiver:otlp`) URN forms.
+/// Accepts full URNs (e.g., `urn:microsoft:exporter:geneva`) or shortcut names
+/// (e.g., `geneva`). On failure, suggests the closest matching registered URN.
 pub fn get_component_schema(
     component_type: &str,
     component_name: &str,
 ) -> Result<Option<serde_json::Value>, String> {
-    let canonical_urn = format!("urn:otel:{component_type}:{component_name}");
+    let urn = resolve_urn(component_type, component_name)?;
 
     let schema_fn = match component_type {
         "receiver" => {
             let map = OTAP_PIPELINE_FACTORY.get_receiver_factory_map();
-            let factory = map
-                .get(canonical_urn.as_str())
-                .ok_or_else(|| format!("Unknown receiver: {canonical_urn}"))?;
+            let factory = map.get(urn.as_str()).ok_or_else(|| {
+                not_found_error("receiver", &urn, map.keys().map(|k| k.to_string()).collect())
+            })?;
             factory.config_schema
         }
         "processor" => {
             let map = OTAP_PIPELINE_FACTORY.get_processor_factory_map();
-            let factory = map
-                .get(canonical_urn.as_str())
-                .ok_or_else(|| format!("Unknown processor: {canonical_urn}"))?;
+            let factory = map.get(urn.as_str()).ok_or_else(|| {
+                not_found_error("processor", &urn, map.keys().map(|k| k.to_string()).collect())
+            })?;
             factory.config_schema
         }
         "exporter" => {
             let map = OTAP_PIPELINE_FACTORY.get_exporter_factory_map();
-            let factory = map
-                .get(canonical_urn.as_str())
-                .ok_or_else(|| format!("Unknown exporter: {canonical_urn}"))?;
+            let factory = map.get(urn.as_str()).ok_or_else(|| {
+                not_found_error("exporter", &urn, map.keys().map(|k| k.to_string()).collect())
+            })?;
             factory.config_schema
         }
         other => {

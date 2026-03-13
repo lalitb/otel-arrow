@@ -70,7 +70,7 @@ use otap_df_otap::pdata::OtapPdata;
 pub const GENEVA_EXPORTER_URN: &str = "urn:microsoft:exporter:geneva";
 
 /// Configuration for the Geneva Exporter
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Geneva endpoint URL
@@ -112,7 +112,7 @@ const fn default_max_concurrent() -> usize {
 
 /// Authentication configuration
 /// TODO - see if we directly use AuthMethod from geneva-uploader crate
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum AuthConfig {
     /// Certificate-based authentication (PKCS#12 format)
@@ -493,7 +493,7 @@ pub static GENEVA_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
     },
     wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
     validate_config: otap_df_config::validation::validate_typed_config::<Config>,
-    config_schema: None,
+    config_schema: Some(otap_df_config::validation::typed_config_schema::<Config>),
 };
 
 #[async_trait(?Send)]
