@@ -3,7 +3,9 @@
 
 //! Errors for the controller crate.
 
+use crate::deployment::GenerationId;
 use miette::Diagnostic;
+use otap_df_config::PipelineGroupId;
 use otap_df_config::TopicName;
 use otap_df_config::policy::CoreAllocation;
 use otap_df_config::topic::TopicBackendKind;
@@ -141,5 +143,20 @@ pub enum Error {
         thread_name: String,
         /// Panic message.
         panic_message: String,
+    },
+
+    /// An illegal state machine transition was attempted on a group generation.
+    #[error(
+        "Illegal generation transition for group '{group_id}' {generation}: {from} -> {to}"
+    )]
+    IllegalGenerationTransition {
+        /// The pipeline group where the illegal transition occurred.
+        group_id: PipelineGroupId,
+        /// The generation number.
+        generation: GenerationId,
+        /// The current phase as a debug string.
+        from: String,
+        /// The requested next phase as a debug string.
+        to: String,
     },
 }

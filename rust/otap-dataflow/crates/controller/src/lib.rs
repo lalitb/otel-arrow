@@ -89,6 +89,8 @@ use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 
+/// Deployment registry and group generation state machine.
+pub mod deployment;
 /// Error types and helpers for the controller module.
 pub mod error;
 /// Utilities to spawn async tasks on dedicated threads with graceful shutdown.
