@@ -42,6 +42,10 @@
 //! - TODO: Live pipeline updates
 //! - TODO: Better resource control
 
+use crate::deployment::{
+    DeploymentRegistry, GenerationId, GroupGeneration, PipelineThreadHandle, RollbackReason,
+    RolloutDeadline, RolloutPhase,
+};
 use crate::error::Error;
 use crate::thread_task::spawn_thread_local_task;
 use core_affinity::CoreId;
@@ -50,6 +54,7 @@ use otap_df_config::engine::{
     SYSTEM_OBSERVABILITY_PIPELINE_ID, SYSTEM_PIPELINE_GROUP_ID,
 };
 use otap_df_config::node::{NodeKind, NodeUserConfig};
+use otap_df_engine::control::PipelineAdminSender;
 use otap_df_config::policy::{ChannelCapacityPolicy, CoreAllocation, TelemetryPolicy};
 use otap_df_config::topic::{
     TopicAckPropagationMode, TopicBackendKind, TopicBroadcastOnLagPolicy, TopicImplSelectionPolicy,
@@ -88,6 +93,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
+use std::time::Duration;
 
 /// Deployment registry and group generation state machine.
 pub mod deployment;
@@ -95,6 +101,40 @@ pub mod deployment;
 pub mod error;
 /// Utilities to spawn async tasks on dedicated threads with graceful shutdown.
 pub mod thread_task;
+
+/// Request to replace a pipeline group with a new configuration.
+///
+/// Send this to the channel returned by [`Controller::replace_group_sender`] to trigger a
+/// live group replacement on the controller's reconcile loop.
+pub struct ReplaceGroupRequest<PData: 'static + Clone + Send + Sync + std::fmt::Debug> {
+    /// The group to replace.
+    pub group_id: PipelineGroupId,
+    /// Full new engine spec.  The changed group must be present in `groups`.
+    pub new_spec: OtelDataflowSpec,
+    /// How long to wait for the new generation to reach `Live` before rolling back.
+    pub readiness_timeout: Duration,
+    /// One-shot channel for the outcome.  `Ok(GenerationId)` on successful cutover.
+    pub result_tx: std_mpsc::SyncSender<Result<GenerationId, Error>>,
+    #[doc(hidden)]
+    pub _phantom: std::marker::PhantomData<PData>,
+}
+
+/// Long-lived process-level context kept alive across group replacement operations.
+///
+/// Created once during [`Controller::run_forever`] and borrowed by every call to
+/// `spawn_group_generation` and `execute_replace_group`.
+struct RunningContext<PData: 'static + Clone + Send + Sync + std::fmt::Debug> {
+    engine_config: OtelDataflowSpec,
+    declared_topics: DeclaredTopics<PData>,
+    controller_ctx: ControllerContext,
+    engine_evt_reporter: ObservedEventReporter,
+    metrics_reporter: MetricsReporter,
+    telemetry_reporting_interval: Duration,
+    engine_tracing_setup: TracingSetup,
+    available_core_ids: Vec<CoreId>,
+    /// Monotonic thread-id counter shared across initial deployment and replacements.
+    next_thread_id: usize,
+}
 
 /// Controller for managing pipelines in a thread-per-core model.
 ///
@@ -105,6 +145,11 @@ pub mod thread_task;
 pub struct Controller<PData: 'static + Clone + Send + Sync + std::fmt::Debug> {
     /// The pipeline factory used to build runtime pipelines.
     pipeline_factory: &'static PipelineFactory<PData>,
+    /// Sender end of the replacement request channel.
+    /// Callers obtain a clone via [`replace_group_sender`](Self::replace_group_sender).
+    replace_tx: std_mpsc::SyncSender<ReplaceGroupRequest<PData>>,
+    /// Receiver end.  Wrapped in `Mutex` so `run_forever` (which takes `&self`) can consume it.
+    replace_rx: std::sync::Mutex<std_mpsc::Receiver<ReplaceGroupRequest<PData>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,8 +305,22 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
     Controller<PData>
 {
     /// Creates a new controller with the given pipeline factory.
-    pub const fn new(pipeline_factory: &'static PipelineFactory<PData>) -> Self {
-        Self { pipeline_factory }
+    pub fn new(pipeline_factory: &'static PipelineFactory<PData>) -> Self {
+        let (tx, rx) = std_mpsc::sync_channel(16);
+        Self {
+            pipeline_factory,
+            replace_tx: tx,
+            replace_rx: std::sync::Mutex::new(rx),
+        }
+    }
+
+    /// Returns a sender that can be used to submit live group replacement requests.
+    ///
+    /// The returned sender may be cloned and sent to any thread.  Requests are processed
+    /// serially on the controller's reconcile loop (the main thread inside `run_forever`).
+    #[must_use]
+    pub fn replace_group_sender(&self) -> std_mpsc::SyncSender<ReplaceGroupRequest<PData>> {
+        self.replace_tx.clone()
     }
 
     /// Starts the controller with the given engine configurations.
@@ -959,6 +1018,346 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
         Ok(set)
     }
 
+    /// Spawns all pipeline threads for a single pipeline group and returns a
+    /// populated [`GroupGeneration`] in the `Starting` phase.
+    ///
+    /// Threads are pinned to `core_assignments` in order.  Each thread receives an
+    /// optional `startup_tx` so the caller can gate on readiness.
+    ///
+    /// Returns both the generation and a matching list of readiness receivers, one
+    /// per spawned thread.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_group_generation(
+        group_id: &PipelineGroupId,
+        generation: GenerationId,
+        pipelines: &[ResolvedPipelineConfig],
+        core_assignments: &[Vec<CoreId>],
+        ctx: &RunningContext<PData>,
+        pipeline_factory: &'static PipelineFactory<PData>,
+        with_readiness: bool,
+    ) -> Result<
+        (
+            GroupGeneration<PData>,
+            Vec<std_mpsc::Receiver<Result<(), EngineError>>>,
+        ),
+        Error,
+    > {
+        let mut group_gen = GroupGeneration::new(group_id.clone(), generation);
+        group_gen.transition(RolloutPhase::Starting)?;
+
+        let mut readiness_rxs = Vec::new();
+
+        for (pipeline_entry, requested_cores) in pipelines.iter().zip(core_assignments.iter()) {
+            let channel_capacity_policy = pipeline_entry.policies.channel_capacity.clone();
+            let telemetry_policy = pipeline_entry.policies.telemetry.clone();
+            let pipeline_id = pipeline_entry.pipeline_id.clone();
+            let pipeline_config = pipeline_entry.pipeline.clone();
+            let num_cores = requested_cores.len();
+
+            for &core_id in requested_cores {
+                let pipeline_key = DeployedPipelineKey {
+                    pipeline_group_id: group_id.clone(),
+                    pipeline_id: pipeline_id.clone(),
+                    core_id: core_id.id,
+                };
+
+                let (runtime_ctrl_msg_tx, runtime_ctrl_msg_rx) = runtime_ctrl_msg_channel(
+                    channel_capacity_policy.control.pipeline,
+                );
+                let (pipeline_completion_msg_tx, pipeline_completion_msg_rx) =
+                    pipeline_completion_msg_channel(channel_capacity_policy.control.completion);
+
+                let thread_id = ctx.next_thread_id;
+                // NOTE: next_thread_id is incremented by the caller after this returns
+                // because RunningContext is borrowed immutably here. We use the generation
+                // base to build a unique id instead.
+                let _ = thread_id; // will be used in thread name below
+
+                let mut pipeline_handle = ctx.controller_ctx.pipeline_context_with(
+                    group_id.clone(),
+                    pipeline_id.clone(),
+                    core_id.id,
+                    num_cores,
+                    generation.0 as usize,
+                );
+                let topic_set = Self::build_pipeline_topic_set(
+                    &ctx.engine_config,
+                    &ctx.declared_topics,
+                    group_id,
+                    &pipeline_id,
+                    core_id.id,
+                )?;
+                pipeline_handle.set_topic_set(topic_set);
+
+                let (startup_tx, startup_rx) = if with_readiness {
+                    let (tx, rx) = std_mpsc::sync_channel::<Result<(), EngineError>>(1);
+                    (Some(tx), Some(rx))
+                } else {
+                    (None, None)
+                };
+                if let Some(rx) = startup_rx {
+                    readiness_rxs.push(rx);
+                }
+
+                let thread_name = format!(
+                    "pipeline-{}-{}-core-{}-gen{}",
+                    group_id.as_ref(),
+                    pipeline_id.as_ref(),
+                    core_id.id,
+                    generation.0,
+                );
+
+                let run_key = pipeline_key.clone();
+                let engine_tracing_setup = ctx.engine_tracing_setup.clone();
+                let engine_evt_reporter = ctx.engine_evt_reporter.clone();
+                let metrics_reporter = ctx.metrics_reporter.clone();
+                let telemetry_reporting_interval = ctx.telemetry_reporting_interval;
+                let effective_cc = channel_capacity_policy.clone();
+                let effective_tp = telemetry_policy.clone();
+                let pipeline_config_clone = pipeline_config.clone();
+                let ctrl_sender_clone = runtime_ctrl_msg_tx.clone();
+
+                let join_handle = thread::Builder::new()
+                    .name(thread_name.clone())
+                    .spawn(move || {
+                        // Pin to core.
+                        let core = CoreId { id: core_id.id };
+                        Self::run_pipeline_thread(
+                            run_key,
+                            core,
+                            pipeline_config_clone,
+                            effective_cc,
+                            effective_tp,
+                            telemetry_reporting_interval,
+                            pipeline_factory,
+                            pipeline_handle,
+                            engine_evt_reporter,
+                            metrics_reporter,
+                            ctrl_sender_clone,
+                            runtime_ctrl_msg_rx,
+                            pipeline_completion_msg_tx,
+                            pipeline_completion_msg_rx,
+                            engine_tracing_setup,
+                            None,
+                            startup_tx,
+                        )
+                    })
+                    .map_err(|e| Error::ThreadSpawnError {
+                        thread_name: thread_name.clone(),
+                        source: e,
+                    })?;
+
+                group_gen.pipeline_threads.push(PipelineThreadHandle {
+                    ctrl_sender: runtime_ctrl_msg_tx,
+                    join_handle,
+                    core_id: core_id.id,
+                    pipeline_id: pipeline_id.clone(),
+                });
+            }
+        }
+
+        Ok((group_gen, readiness_rxs))
+    }
+
+    /// Executes a live group replacement:
+    ///
+    /// 1. Shut down old generation threads (drain → stop).
+    /// 2. Spawn new generation threads on the same cores.
+    /// 3. Wait for readiness within `request.readiness_timeout`.
+    /// 4. On success: commit new generation, retire old.
+    ///    On failure: mark new generation rolled back, return error.
+    ///
+    /// # Notes
+    /// - Topic bindings are not re-declared in Phase 1A.  Only group-local topology changes
+    ///   are supported.  If the change touches shared topics the caller should replace the
+    ///   full cohort by issuing multiple requests.
+    /// - The admin HTTP server's sender list is NOT updated here.  New pipelines in the
+    ///   replaced group will not be accessible through the HTTP admin API until that
+    ///   integration is added in a later phase.
+    fn execute_replace_group(
+        &self,
+        request: ReplaceGroupRequest<PData>,
+        registry: &mut DeploymentRegistry<PData>,
+        ctx: &mut RunningContext<PData>,
+    ) {
+        let group_id = &request.group_id;
+        let result = self.do_replace_group(request.group_id.clone(), request.new_spec, request.readiness_timeout, registry, ctx);
+        let _ = request.result_tx.send(result);
+        let _ = group_id; // suppress warning
+    }
+
+    fn do_replace_group(
+        &self,
+        group_id: PipelineGroupId,
+        new_spec: OtelDataflowSpec,
+        readiness_timeout: Duration,
+        registry: &mut DeploymentRegistry<PData>,
+        ctx: &mut RunningContext<PData>,
+    ) -> Result<GenerationId, Error> {
+        // ---- 1. Validate the new spec ----
+        new_spec.validate().map_err(|e| match e {
+            otap_df_config::error::Error::InvalidConfiguration { errors } => {
+                Error::InvalidConfiguration { errors }
+            }
+            other => Error::InvalidConfiguration {
+                errors: vec![other],
+            },
+        })?;
+
+        // ---- 2. Resolve new group pipelines ----
+        let resolved = new_spec.resolve();
+        let (_, new_pipelines, _) = resolved.into_parts();
+        let group_pipelines: Vec<ResolvedPipelineConfig> = new_pipelines
+            .into_iter()
+            .filter(|p| p.pipeline_group_id == group_id)
+            .collect();
+
+        // ---- 3. Find the current live generation to get core assignments ----
+        let live_gen_id = registry
+            .live_generation(&group_id)
+            .ok_or_else(|| Error::GroupNotFound {
+                group_id: group_id.clone(),
+            })?;
+
+        let core_assignments: Vec<Vec<CoreId>> = {
+            let live = registry
+                .get_mut(&group_id, live_gen_id)
+                .expect("live generation must be in registry");
+            // Reconstruct per-pipeline core assignment from stored thread handles.
+            // For each pipeline_id, collect the cores in order.
+            let mut by_pipeline: HashMap<PipelineId, Vec<CoreId>> = HashMap::new();
+            for handle in &live.pipeline_threads {
+                by_pipeline
+                    .entry(handle.pipeline_id.clone())
+                    .or_default()
+                    .push(CoreId { id: handle.core_id });
+            }
+            // Preserve pipeline ordering from the new resolved list.
+            group_pipelines
+                .iter()
+                .map(|p| {
+                    by_pipeline
+                        .remove(&p.pipeline_id)
+                        .unwrap_or_else(|| {
+                            // New pipeline with no prior assignment — allocate from available cores.
+                            Self::select_cores_for_allocation(
+                                ctx.available_core_ids.clone(),
+                                &p.policies.resources.core_allocation,
+                            )
+                            .unwrap_or_default()
+                        })
+                })
+                .collect()
+        };
+
+        // ---- 4. Drain + stop old generation ----
+        let drain_deadline =
+            std::time::Instant::now() + Duration::from_secs(30);
+        {
+            let live = registry
+                .get_mut(&group_id, live_gen_id)
+                .expect("live generation must be in registry");
+            live.transition(RolloutPhase::Draining)?;
+            for handle in &live.pipeline_threads {
+                let _ = handle.ctrl_sender.try_send_shutdown(
+                    drain_deadline,
+                    format!("group_replacement: {}", group_id.as_ref()),
+                );
+            }
+        }
+
+        // Join old threads (blocking).
+        let old_handles: Vec<_> = {
+            let live = registry
+                .get_mut(&group_id, live_gen_id)
+                .expect("live generation must be in registry");
+            live.transition(RolloutPhase::Stopped)?;
+            std::mem::take(&mut live.pipeline_threads)
+        };
+        for handle in old_handles {
+            let _ = handle.join_handle.join(); // ignore errors — old gen is gone
+        }
+        registry.retire(&group_id, live_gen_id);
+
+        // ---- 5. Update engine_config with the new group spec ----
+        let new_group_cfg = new_spec
+            .groups
+            .get(&group_id)
+            .cloned()
+            .unwrap_or_default();
+        _ = ctx.engine_config
+            .groups
+            .insert(group_id.clone(), new_group_cfg);
+
+        // ---- 6. Spawn new generation ----
+        let new_gen_id = GenerationId(live_gen_id.0 + 1);
+        let readiness_deadline = RolloutDeadline::from_now(readiness_timeout);
+        let (mut new_gen, readiness_rxs) = Self::spawn_group_generation(
+            &group_id,
+            new_gen_id,
+            &group_pipelines,
+            &core_assignments,
+            ctx,
+            self.pipeline_factory,
+            true, // with_readiness = true
+        )?;
+        new_gen.deadline = Some(readiness_deadline);
+        new_gen.transition(RolloutPhase::AwaitingReady)?;
+        registry.insert(new_gen);
+
+        // ---- 7. Wait for all threads to signal readiness ----
+        for rx in &readiness_rxs {
+            match rx.recv_timeout(readiness_timeout) {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    // A pipeline failed to build.
+                    let entry = registry.get_mut(&group_id, new_gen_id)
+                        .expect("new generation must be in registry");
+                    let _ = entry.transition(RolloutPhase::RolledBack {
+                        reason: RollbackReason::AdmissionFailed,
+                    });
+                    // Tear down remaining threads.
+                    for h in std::mem::take(&mut entry.pipeline_threads) {
+                        let _ = h.join_handle.join();
+                    }
+                    registry.retire(&group_id, new_gen_id);
+                    return Err(Error::PipelineRuntimeError { source: Box::new(e) });
+                }
+                Err(_timeout) => {
+                    let entry = registry.get_mut(&group_id, new_gen_id)
+                        .expect("new generation must be in registry");
+                    let _ = entry.transition(RolloutPhase::RolledBack {
+                        reason: RollbackReason::ReadinessTimeout,
+                    });
+                    for h in std::mem::take(&mut entry.pipeline_threads) {
+                        let _ = h.join_handle.join();
+                    }
+                    registry.retire(&group_id, new_gen_id);
+                    return Err(Error::RolloutTimeout {
+                        group_id,
+                        generation: new_gen_id,
+                        timeout_secs: readiness_timeout.as_secs_f64(),
+                    });
+                }
+            }
+        }
+
+        // ---- 8. Commit ----
+        let entry = registry.get_mut(&group_id, new_gen_id)
+            .expect("new generation must be in registry");
+        entry.transition(RolloutPhase::Live)?;
+        registry.commit(&group_id, new_gen_id);
+
+        otel_info!(
+            "controller.group_replaced",
+            group_id = group_id.as_ref(),
+            new_generation = new_gen_id.0,
+            message = "Pipeline group replaced successfully"
+        );
+
+        Ok(new_gen_id)
+    }
+
     fn run_with_mode(
         &self,
         engine_config: OtelDataflowSpec,
@@ -1155,11 +1554,32 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
             },
         )?;
 
-        let mut threads = Vec::new();
+        // Build the per-thread state we need to track in the deployment registry and
+        // to pass to spawn_group_generation during live replacement.
+        let engine_tracing_setup = telemetry_system.engine_tracing_setup();
+        let mut running_ctx = RunningContext {
+            engine_config,
+            declared_topics,
+            controller_ctx: controller_ctx.clone(),
+            engine_evt_reporter: engine_evt_reporter.clone(),
+            metrics_reporter: metrics_reporter.clone(),
+            telemetry_reporting_interval,
+            engine_tracing_setup,
+            available_core_ids: available_core_ids.clone(),
+            next_thread_id: 1,
+        };
+
+        // For `ParkMainThread` (live-update mode): join handles go into the registry so
+        // the reconcile loop can drain/stop groups on replacement.
+        // For `ShutdownWhenDone` (test/one-shot mode): join handles stay in `threads` so
+        // we can join them at the end of this function as before.
+        let mut threads: Vec<(String, usize, DeployedPipelineKey, thread::JoinHandle<Result<Vec<()>, Error>>)> = Vec::new();
         let mut ctrl_msg_senders = Vec::new();
+        let mut registry = DeploymentRegistry::<PData>::new();
+        // Per-group generation builders (gen 0) — used only in ParkMainThread mode.
+        let mut group_gens: HashMap<PipelineGroupId, GroupGeneration<PData>> = HashMap::new();
 
         // TODO: We do not have proper thread::current().id assignment.
-        let mut next_thread_id: usize = 1;
         let its_thread_id: usize = 0;
 
         // Add internal pipeline to threads list if present
@@ -1202,8 +1622,8 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
 
                 let pipeline_config = pipeline.clone();
                 let pipeline_factory = self.pipeline_factory;
-                let thread_id = next_thread_id;
-                next_thread_id += 1;
+                let thread_id = running_ctx.next_thread_id;
+                running_ctx.next_thread_id += 1;
                 let mut pipeline_handle = controller_ctx.pipeline_context_with(
                     pipeline_group_id.clone(),
                     pipeline_id.clone(),
@@ -1212,14 +1632,14 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
                     thread_id,
                 );
                 let topic_set = Self::build_pipeline_topic_set(
-                    &engine_config,
-                    &declared_topics,
+                    &running_ctx.engine_config,
+                    &running_ctx.declared_topics,
                     &pipeline_group_id,
                     &pipeline_id,
                     core_id.id,
                 )?;
                 pipeline_handle.set_topic_set(topic_set);
-                let metrics_reporter = metrics_reporter.clone();
+                let metrics_reporter_clone = metrics_reporter.clone();
 
                 let thread_name = format!(
                     "pipeline-{}-{}-core-{}",
@@ -1229,11 +1649,13 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
                 );
 
                 let run_key = pipeline_key.clone();
-                let engine_tracing_setup = telemetry_system.engine_tracing_setup();
-                let engine_evt_reporter = engine_evt_reporter.clone();
+                let engine_tracing_setup = running_ctx.engine_tracing_setup.clone();
+                let engine_evt_reporter_thread = engine_evt_reporter.clone();
                 let effective_channel_capacity_policy = channel_capacity_policy.clone();
                 let effective_telemetry_policy = telemetry_policy.clone();
-                let handle = thread::Builder::new()
+                // Clone ctrl sender for registry before moving into the thread closure.
+                let registry_ctrl_sender = runtime_ctrl_msg_tx.clone();
+                let join_handle = thread::Builder::new()
                     .name(thread_name.clone())
                     .spawn(move || {
                         Self::run_pipeline_thread(
@@ -1245,14 +1667,15 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
                             telemetry_reporting_interval,
                             pipeline_factory,
                             pipeline_handle,
-                            engine_evt_reporter,
-                            metrics_reporter,
+                            engine_evt_reporter_thread,
+                            metrics_reporter_clone,
                             runtime_ctrl_msg_tx,
                             runtime_ctrl_msg_rx,
                             pipeline_completion_msg_tx,
                             pipeline_completion_msg_rx,
                             engine_tracing_setup,
-                            None,
+                            None, // not the internal telemetry pipeline
+                            None, // no readiness gate at initial startup
                         )
                     })
                     .map_err(|e| Error::ThreadSpawnError {
@@ -1260,26 +1683,52 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
                         source: e,
                     })?;
 
-                threads.push((thread_name, thread_id, pipeline_key, handle));
+                if run_mode == RunMode::ParkMainThread {
+                    // In live-update mode, the registry owns the join handle.
+                    let gen0 = group_gens
+                        .entry(pipeline_group_id.clone())
+                        .or_insert_with(|| {
+                            let mut g = GroupGeneration::new(pipeline_group_id.clone(), GenerationId(0));
+                            let _ = g.transition(RolloutPhase::Starting);
+                            g
+                        });
+                    gen0.pipeline_threads.push(PipelineThreadHandle {
+                        ctrl_sender: registry_ctrl_sender,
+                        join_handle,
+                        core_id: core_id.id,
+                        pipeline_id: pipeline_id.clone(),
+                    });
+                } else {
+                    // In one-shot mode, keep join handles in `threads` for later joining.
+                    threads.push((thread_name, thread_id, pipeline_key, join_handle));
+                }
             }
         }
 
-        // Drop the original metrics sender so only pipeline threads hold references
+        // Commit gen-0 registry entries (ParkMainThread only).
+        for (gid, mut group_gen) in group_gens {
+            let _ = group_gen.transition(RolloutPhase::Live);
+            registry.insert(group_gen);
+            registry.commit(&gid, GenerationId(0));
+        }
+
+        // Drop the original metrics sender so only pipeline threads + running_ctx hold references.
         drop(metrics_reporter);
 
-        // Start the admin HTTP server
+        // Start the admin HTTP server.
+        // NOTE: Phase 1A limitation — the admin sender list is a snapshot of the initial
+        // deployment.  After a group replacement, replaced pipelines will not be accessible
+        // through the HTTP admin shutdown/config endpoints.  Dynamic sender registration
+        // is tracked as a follow-on task.
         let admin_server_handle = spawn_thread_local_task(
             "http-admin",
             admin_tracing_setup,
             move |cancellation_token| {
                 // Convert the concrete senders to trait objects for the admin crate
-                let admin_senders: Vec<Arc<dyn otap_df_engine::control::PipelineAdminSender>> =
+                let admin_senders: Vec<Arc<dyn PipelineAdminSender>> =
                     ctrl_msg_senders
                         .into_iter()
-                        .map(|sender| {
-                            Arc::new(sender)
-                                as Arc<dyn otap_df_engine::control::PipelineAdminSender>
-                        })
+                        .map(|sender| Arc::new(sender) as Arc<dyn PipelineAdminSender>)
                         .collect();
 
                 otap_df_admin::run(
@@ -1291,6 +1740,42 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
                 )
             },
         )?;
+
+        // In `ParkMainThread` mode, run the Phase 1A reconcile loop.
+        // The main thread processes replacement requests while initial pipeline
+        // threads run in the background.
+        if run_mode == RunMode::ParkMainThread {
+            let replace_rx = self
+                .replace_rx
+                .lock()
+                .expect("replace_rx mutex not poisoned");
+            loop {
+                match replace_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(req) => {
+                        self.execute_replace_group(req, &mut registry, &mut running_ctx);
+                    }
+                    Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            // Drop running_ctx first so its metrics_reporter ref is gone before we
+            // shut down the telemetry system.
+            drop(running_ctx);
+            drop(registry);
+            engine_metrics_handle.shutdown_and_join()?;
+            admin_server_handle.shutdown_and_join()?;
+            metrics_agg_handle.shutdown_and_join()?;
+            if let Some(handle) = metrics_dispatcher_handle {
+                handle.shutdown_and_join()?;
+            }
+            obs_state_join_handle.shutdown_and_join()?;
+            telemetry_system.shutdown_otel()?;
+            return Ok(());
+        }
+
+        // ShutdownWhenDone path: join threads, then shut down.
+        drop(running_ctx);
+        drop(registry);
 
         // Wait for all pipeline threads to finish and collect their results
         let mut results: Vec<Result<(), Error>> = Vec::with_capacity(threads.len());
@@ -1334,11 +1819,6 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
         // Check if any pipeline threads returned an error
         if let Some(err) = results.into_iter().find_map(Result::err) {
             return Err(err);
-        }
-
-        // In standard engine mode we keep the main thread parked after startup.
-        if run_mode == RunMode::ParkMainThread {
-            thread::park();
         }
 
         // All pipelines have finished; shut down the admin HTTP server and metric aggregator gracefully.
@@ -1504,7 +1984,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
         controller_ctx: &ControllerContext,
         engine_evt_reporter: &ObservedEventReporter,
         metrics_reporter: &MetricsReporter,
-        telemetry_reporting_interval: std::time::Duration,
+        telemetry_reporting_interval: Duration,
         tracing_setup: TracingSetup,
     ) -> Result<Option<(String, thread::JoinHandle<Result<Vec<()>, Error>>)>, Error> {
         let (internal_config, channel_capacity_policy, telemetry_policy): (
@@ -1588,7 +2068,8 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
                     internal_return_tx,
                     internal_return_rx,
                     tracing_setup,
-                    Some((its_settings, startup_tx)),
+                    Some(its_settings),
+                    Some(startup_tx),
                 )
             })
             .map_err(|e| Error::ThreadSpawnError {
@@ -1628,7 +2109,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
         pipeline_config: PipelineConfig,
         channel_capacity_policy: ChannelCapacityPolicy,
         telemetry_policy: TelemetryPolicy,
-        telemetry_reporting_interval: std::time::Duration,
+        telemetry_reporting_interval: Duration,
         pipeline_factory: &'static PipelineFactory<PData>,
         pipeline_context: PipelineContext,
         obs_evt_reporter: ObservedEventReporter,
@@ -1638,10 +2119,11 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
         pipeline_completion_msg_tx: PipelineCompletionMsgSender<PData>,
         pipeline_completion_msg_rx: PipelineCompletionMsgReceiver<PData>,
         tracing_setup: TracingSetup,
-        internal_telemetry: Option<(
-            InternalTelemetrySettings,
-            std_mpsc::SyncSender<Result<(), EngineError>>,
-        )>,
+        // Optional ITS settings, only for the internal observability pipeline.
+        internal_telemetry: Option<InternalTelemetrySettings>,
+        // Optional one-shot channel to signal successful readiness.  Used by both the
+        // internal pipeline and regular pipelines during live group replacement.
+        startup_tx: Option<std_mpsc::SyncSender<Result<(), EngineError>>>,
     ) -> Result<Vec<()>, Error> {
         // Pin thread to specific core. As much as possible, we pin
         // before allocating memory.
@@ -1674,18 +2156,17 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
             ));
 
             // Build the runtime pipeline from the configuration
-            let its_settings = internal_telemetry.as_ref().map(|(s, _)| s).cloned();
             let runtime_pipeline = pipeline_factory
                 .build(
                     pipeline_context.clone(),
                     pipeline_config.clone(),
                     channel_capacity_policy,
                     telemetry_policy,
-                    its_settings,
+                    internal_telemetry.clone(),
                 )
                 .map_err(|e| {
-                    if let Some((_, startup_tx)) = internal_telemetry.as_ref() {
-                        let _ = startup_tx.send(Err(EngineError::InternalError {
+                    if let Some(ref tx) = startup_tx {
+                        let _ = tx.send(Err(EngineError::InternalError {
                             message: e.to_string(),
                         }));
                     }
@@ -1707,8 +2188,8 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
                 Some("Pipeline initialization successful.".to_owned()),
             ));
 
-            if let Some((_, startup_tx)) = internal_telemetry.as_ref() {
-                let _ = startup_tx.send(Ok(()));
+            if let Some(ref tx) = startup_tx {
+                let _ = tx.send(Ok(()));
             }
 
             // Start the pipeline (this will use the current thread's Tokio runtime)

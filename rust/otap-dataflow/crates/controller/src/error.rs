@@ -159,4 +159,39 @@ pub enum Error {
         /// The requested next phase as a debug string.
         to: String,
     },
+
+    /// The requested group was not found in the deployment registry.
+    #[error("Group '{group_id}' not found in deployment registry")]
+    GroupNotFound {
+        /// The group id that was not found.
+        group_id: PipelineGroupId,
+    },
+
+    /// The new generation did not reach the `Live` state within the readiness deadline.
+    #[error(
+        "Rollout of group '{group_id}' {generation} timed out after {timeout_secs:.1}s"
+    )]
+    RolloutTimeout {
+        /// The group being replaced.
+        group_id: PipelineGroupId,
+        /// The incoming generation that failed to become ready.
+        generation: GenerationId,
+        /// How long we waited, in seconds.
+        timeout_secs: f64,
+    },
+
+    /// A pipeline thread panicked during the readiness wait for a replacement generation.
+    #[error(
+        "Thread '{thread_name}' in group '{group_id}' {generation} panicked during startup: {panic_message}"
+    )]
+    ReplacementPanic {
+        /// The thread name that panicked.
+        thread_name: String,
+        /// The group being replaced.
+        group_id: PipelineGroupId,
+        /// The generation that was starting.
+        generation: GenerationId,
+        /// Panic message.
+        panic_message: String,
+    },
 }

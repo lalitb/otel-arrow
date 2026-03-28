@@ -28,7 +28,7 @@
 //! driven to `Live` before the old entry is retired.
 
 use crate::error::Error;
-use otap_df_config::PipelineGroupId;
+use otap_df_config::{PipelineGroupId, PipelineId};
 use otap_df_engine::control::RuntimeCtrlMsgSender;
 use std::collections::HashMap;
 use std::thread::JoinHandle;
@@ -164,9 +164,11 @@ pub struct PipelineThreadHandle<PData: 'static + Clone + Send + Sync + std::fmt:
     /// Sends control messages (e.g. shutdown, drain) to the pipeline.
     pub ctrl_sender: RuntimeCtrlMsgSender<PData>,
     /// OS thread handle; joined during stop.
-    pub join_handle: JoinHandle<()>,
+    pub join_handle: JoinHandle<Result<Vec<()>, Error>>,
     /// The CPU core this thread is pinned to.
     pub core_id: usize,
+    /// The pipeline id this thread runs.
+    pub pipeline_id: PipelineId,
 }
 
 impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug> std::fmt::Debug
