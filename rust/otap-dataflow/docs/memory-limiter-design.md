@@ -1,30 +1,157 @@
 # Memory Limiter Design for the Rust OTAP Collector
 
-## Summary
+## What Reviewers Are Asked to Approve
 
-The memory limiter should not be a single periodic "check RSS and reject"
-feature. That is too slow, too coarse, and too reactive for OTAP workloads.
+This review is asking for approval of the **direction** and the **Phase 1
+implementation shape**, not every later-phase mechanism in full detail.
 
-The proposed design is a **hierarchical, lease-based memory budget** with a
-**feedback controller**:
+- **Problem being solved**: bounded queues and existing backpressure protect
+  individual subsystems, but they do not impose a single process-wide RAM
+  ceiling for OTLP, OTAP, topics, retained state, and allocator overhead
+  together.
+- **Proposed Phase 1 design**: a process-wide observed-memory limiter, run as
+  an engine service, that samples RSS / cgroup memory, updates a shared
+  pressure state, and sheds ingress at receivers under hard pressure.
+- **Explicit non-goals for Phase 1**: no full ticketed byte accounting, no
+  per-pipeline budgets, no reclaim-hook framework, no OTAP stream recycling,
+  and no dynamic runtime retuning beyond actions already supported by the
+  current runtime.
+- **Key tradeoffs**: Phase 1 is simpler and easier to ship, but it is reactive
+  and process-wide. Later phases improve precision by adding hierarchical
+  accounting and OTAP-specific controls at the cost of more runtime machinery.
+- **Open questions for later phases**: local leases and overshoot sizing,
+  ticket carrier / ownership shape, queue/topic byte accounting, reclaim hooks,
+  and OTAP stream-state control.
 
-- **Hot path**: exact-or-estimated byte accounting for memory we create or
-  queue.
-- **Cold path**: periodic RSS / cgroup reconciliation for memory we do not
-  directly account.
-- **Control path**: progressive reclaim and backpressure actions before the
-  process reaches OOM territory.
+## Review Map
 
-This keeps the existing thread-per-core model intact, preserves bounded queues
-and explicit backpressure, and fits the current architecture better than a
-standalone "memory_limiter processor" copied from the Go collector.
+<!-- markdownlint-disable MD013 -->
+| Topic | Review now | Why |
+| --- | --- | --- |
+| Problem statement | Yes | Need agreement that current bounded mechanisms are insufficient as a process-wide memory policy |
+| Phase 1 observed-memory limiter | Yes | This is the near-term implementation path |
+| Placement as engine service, not processor | Yes | This is a foundational architecture choice |
+| Receiver overload behavior by protocol | Yes | This determines admission and failure semantics |
+| Hierarchical budgets, leases, tickets, reclaim hooks | Direction only | Important target architecture, but not part of Phase 1 approval |
+| OTAP stream recycling and richer policy controls | Later | Valuable, but deferred by design |
+| Full telemetry/admin breakdown | Later | Useful reference, not central to immediate approval |
+<!-- markdownlint-enable MD013 -->
 
-The limiter should be hierarchical in both **budgeting** and **control**:
+## At A Glance
 
-- the engine owns a global ceiling
-- each pipeline owns its own pressure state derived from its budget share
-- global pressure acts as an override ceiling, not the default throttle for all
-  pipelines
+<!-- markdownlint-disable MD013 -->
+| Item | Summary |
+| --- | --- |
+| Problem | Existing bounded channels and topic controls do not enforce one shared RAM budget |
+| Why current mechanisms are insufficient | They protect local queues, not total process memory or retained protocol state |
+| Proposed Phase 1 behavior | Sample observed process memory, maintain shared pressure state, reject/shed ingress under hard pressure |
+| Deferred work | Per-pipeline budgets, local leases, tickets, queue/topic accounting, reclaim hooks, OTAP stream-state control |
+| Main risks / tradeoffs | Phase 1 is reactive and coarse, but much simpler and lower-risk than full accounting on the first release |
+<!-- markdownlint-enable MD013 -->
+
+## Why The Collector Needs This
+
+The current OTAP collector already has useful controls:
+
+- receiver-side admission and `poll_ready` backpressure
+- bounded pdata channels
+- topic-level bounded publish tracking
+- durable buffering with a watermark-style `DiskBudget`
+- engine-wide RSS metrics
+
+Those mechanisms are complementary, but they do not share a common **RAM
+budget**. Each one protects one queue or subsystem, but nothing protects total
+process memory as a first-class resource.
+
+For OTAP specifically, memory pressure also comes from:
+
+- queued pdata in channels and topics
+- in-flight exporter payloads
+- batch processor accumulation
+- retry backlogs
+- Arrow dictionaries and stream-local state
+- transient decode / transform expansions
+- allocator fragmentation and other untracked process memory
+
+## Proposed Phase 1
+
+Phase 1 should be a **process-wide observed-memory limiter** implemented as an
+engine service.
+
+Behavior:
+
+- sample RSS / cgroup memory on a fixed interval
+- derive a shared process-wide pressure state
+- keep `Soft` informational
+- shed ingress under `Hard`
+- fail readiness under `Hard` if configured
+- emit process-level limiter metrics and events
+
+This matches the simplest useful protection already proven in the current
+branch: receiver-side gating plus a process-wide safety ceiling.
+
+The overload policy should follow protocol-native semantics:
+
+- request / response protocols should reject explicitly with protocol-native
+  overload signals such as HTTP 503 or gRPC `resource_exhausted`
+- streaming protocols with application-level batch or status responses should
+  prefer explicit per-batch refusal over indefinite transport stalling
+- raw TCP push protocols without refusal semantics should close connections
+  under sustained pressure
+- UDP or other datagram protocols should drop input under pressure
+
+## Non-Goals For Phase 1
+
+- perfect byte accounting of every retained allocation
+- per-pipeline budget isolation
+- dynamic runtime reconfiguration of semaphores or exporter parallelism
+- OTAP stream recycling
+- a reclaim-hook framework for every stateful processor
+- a GC-like stop-the-world recovery mechanism
+
+## Key Tradeoffs
+
+- Phase 1 is cheaper to implement and operate, but more reactive than the later
+  accounting-based design.
+- A process-wide limiter is enough to prevent OOM earlier, but it cannot yet
+  explain or constrain memory ownership per pipeline.
+- Explicit rejection / close / drop is preferred over indefinite transport
+  stalling because it is bounded, observable, and operationally easier to
+  reason about in a collector handling many concurrent connections.
+
+## Expected Overhead
+
+The full design is not free. Its overhead comes from:
+
+- **hot path**: lease checks, ticket creation / transfer, and retained
+  metadata attached to in-flight pdata
+- **cold path**: observed-memory sampling, reconciliation, and pressure-state
+  evaluation
+
+Phase 1 is cheaper than the full design because it mainly pays the cold-path
+cost plus a small amount of receiver-side admission logic.
+
+Operationally:
+
+- `disabled` should keep hot-path overhead near zero
+- `observe_only` adds measurement and simulated decisions without enforcement
+- `enforce` adds the full admission, pressure, and reclaim behavior
+
+## Open Questions
+
+- Should Phase 1 add an explicit `observe_only` mode before wider rollout?
+- How should later phases size local leases relative to pipeline share and
+  overshoot headroom?
+- What concrete carrier should hold `MemoryTicket` on in-flight pdata?
+- Which stateful processors should get reclaim hooks first after receiver
+  gating and queue/topic accounting?
+
+## Later-Phase Design Notes
+
+The rest of this document describes the **target architecture** beyond Phase 1.
+It is included as design context and to avoid re-litigating direction later,
+but most of it is **not** required for immediate approval of the Phase 1
+implementation.
 
 ```mermaid
 flowchart LR
@@ -44,71 +171,6 @@ flowchart LR
 
     F --> G
 ```
-
-## Why the collector needs a different design
-
-The current OTAP collector already has pieces that matter:
-
-- receiver-side admission and `poll_ready` backpressure
-- bounded pdata channels
-- topic-level bounded publish tracking
-- durable buffering with a watermark-style `DiskBudget`
-- engine-wide RSS metrics
-
-The missing piece is that these mechanisms do not share a common **RAM budget**.
-Each one protects one queue or subsystem, but nothing protects total process
-memory as a first-class resource.
-
-For OTAP specifically, the risk is not only queued request bodies. Memory also
-comes from:
-
-- queued pdata in channels and topics
-- in-flight exporter payloads
-- batch processor accumulation
-- retry backlogs
-- Arrow dictionaries and stream-local state
-- transient decode / transform expansions
-- allocator fragmentation and other untracked process memory
-
-If we only sample RSS every few seconds, we detect overload late. If we only
-count requests, we misprice different payload sizes. The limiter therefore has
-to combine **accounting** and **measurement**.
-
-## Design goals
-
-- Prevent OOM and severe swap / reclaim thrash.
-- Apply backpressure early, preferably before large bodies are fully accepted.
-- Preserve thread-per-core and share-nothing hot paths.
-- Keep overhead low enough for high-throughput ingest.
-- Work for OTLP and OTAP, not only one receiver.
-- Support progressive degradation before hard refusal.
-- Expose stable telemetry for tuning and incident response.
-
-## Expected overhead
-
-The memory limiter is not free. Its overhead comes from two places:
-
-- **hot path**: lease checks, ticket creation / transfer, and any retained
-  metadata attached to in-flight pdata
-- **cold path**: the arbiter's periodic observed-memory sampling,
-  reconciliation, and pressure-state evaluation
-
-The design keeps this overhead bounded by using per-core local leases instead
-of global coordination on every message, and by keeping observed-memory
-reconciliation in one controller-owned background task.
-
-Operationally:
-
-- `disabled` should keep hot-path overhead near zero
-- `observe_only` adds measurement and simulated decisions without enforcement
-- `enforce` adds the full admission, pressure, and reclaim behavior
-
-## Non-goals
-
-- Perfect byte accounting of every allocator call.
-- Dynamic work stealing or hidden cross-core scheduling.
-- A first release that solves every processor-specific memory spike.
-- Using a GC-like stop-the-world reclamation model.
 
 ## Core idea
 
