@@ -113,10 +113,9 @@ The ratio is not fixed and must not be assumed to be `1 -> N` everywhere.
 
 ```mermaid
 graph LR
-    K["Linux Kernel<br/>(SO_REUSEPORT)"]
-    K -->|"distributes"| P0["CPU 0<br/>full pipeline"]
-    K -->|"distributes"| P1["CPU 1<br/>full pipeline"]
-    K -->|"distributes"| P2["CPU N<br/>full pipeline"]
+    I0["Ingress shard 0<br/>(listener/socket 0)"] --> P0["CPU 0<br/>full pipeline"]
+    I1["Ingress shard 1<br/>(listener/socket 1)"] --> P1["CPU 1<br/>full pipeline"]
+    IN["Ingress shard N<br/>(listener/socket N)"] --> PN["CPU N<br/>full pipeline"]
 ```
 
 `socket_handoff` (`1 -> N`):
@@ -140,6 +139,37 @@ graph LR
     H -->|"RawBatch"| D1["Decode Worker 1<br/>decode→Arrow→export"]
     H -->|"RawBatch"| D2["Decode Worker M<br/>decode→Arrow→export"]
 ```
+
+## Locality Tradeoff
+
+`raw_batch_handoff` preserves core-locality only up to the handoff boundary.
+
+For Linux `user_events`, the per-CPU ingress worker still owns:
+
+- perf session setup
+- perf ring draining
+- raw batch construction
+
+After handoff, however, decode and downstream processing may run on any decode
+worker selected by the handoff mechanism. This means `raw_batch_handoff` does
+not preserve strict end-to-end core affinity from a CPU-specific ring buffer to
+a fixed CPU-specific pipeline.
+
+This is an intentional tradeoff. The current per-CPU design maximizes locality
+but preserves CPU skew. `raw_batch_handoff` relaxes end-to-end core affinity in
+order to absorb skew before the expensive decode and export stages.
+
+`socket_handoff` has a similar characteristic: a one-time cross-core transfer
+at connection accept time. After handoff, the connection's full lifecycle is
+core-local, so the locality cost is bounded to connection establishment.
+
+Future refinements may reduce this tradeoff, for example:
+
+- NUMA-local handoff groups
+- sticky handoff by source CPU
+- bounded worker subsets per ingress shard
+
+These are optimizations, not requirements for v1.
 
 ## Strategy Matrix
 
