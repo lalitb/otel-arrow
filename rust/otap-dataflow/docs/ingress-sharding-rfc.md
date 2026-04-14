@@ -107,7 +107,9 @@ The controller/runtime must support multiple topologies:
   Example: Linux `user_events`, where `N` per-CPU readers feed `M` decode
   workers
 
-The ratio is not fixed and must not be assumed to be `1 -> N` everywhere.
+Different strategies use different topologies. Some start with one ingress
+source, some start with many, and the number of processing workers does not
+always match the number of ingress shards.
 
 `kernel_sharded` (`N -> N`):
 
