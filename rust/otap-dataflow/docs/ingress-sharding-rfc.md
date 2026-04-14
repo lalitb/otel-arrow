@@ -202,6 +202,12 @@ property of the source implementation rather than a topological wiring rule.
 This will be confirmed as the first design decision in the engine placement
 sub-task of v1.
 
+Even if strategy metadata is surfaced through receiver registration, strategy
+resolution may still be platform-dependent. For example, a network receiver may
+use `kernel_sharded` on Linux and `socket_handoff` on macOS or Windows. The
+controller therefore needs enough information to resolve strategy at pipeline
+startup rather than assuming one fixed runtime mode across all platforms.
+
 Illustrative shape only:
 
 ```rust
@@ -333,6 +339,24 @@ Metrics should distinguish:
 - downstream saturation
 - decode/transform failures
 
+## Failure, Recovery, and Shutdown
+
+These strategies should fit within the engine's existing task lifecycle and
+control-channel model rather than introducing a separate failure domain.
+
+- If an ingress task or decode worker fails, the runtime should report failure
+  using the existing engine supervision path and fail the affected pipeline in
+  the same way as other receivers/processors.
+- `raw_batch_handoff` should treat in-flight handoff batches as transient
+  pipeline state. A worker failure may lose in-flight batches unless a future
+  durability mechanism is introduced.
+- `socket_handoff` should stop accepting new connections during shutdown and
+  let in-flight handoff channels and per-core workers drain according to normal
+  pipeline shutdown behavior.
+- `raw_batch_handoff` should stop admitting new batches during shutdown and
+  flush or drop any remaining handoff-queue contents according to the configured
+  shutdown/drain policy.
+
 ## V1 Concrete Scope
 
 1. Define the ingress sharding model and engine placement
@@ -341,6 +365,24 @@ Metrics should distinguish:
 4. Defer UDP on non-Linux platforms
 5. Keep initial controller/config behavior conservative rather than promising
    full platform transparency
+
+Illustrative configuration shape:
+
+```yaml
+receivers:
+  userevents:
+    ingress_sharding:
+      strategy: raw_batch_handoff
+      decode_workers: 4
+      handoff_queue_depth: 1024
+
+  otlp_grpc:
+    ingress_sharding:
+      strategy: auto
+```
+
+This is illustrative only. The final config surface may be explicit,
+platform-resolved, controller-derived, or a mix of those approaches.
 
 ## V1 Deliverable A: Linux `user_events`
 
@@ -393,10 +435,12 @@ let (channels, receivers): (
 tokio::spawn(async move {
     let listener = TcpListener::bind(addr).await?;
     let mut next = 0;
-    loop {
+loop {
         let (stream, _) = listener.accept().await?;
         // One-time ownership transfer; core takes over from here.
-        let _ = channels[next].try_send(stream);
+        // A full handoff queue should apply backpressure to the acceptor
+        // rather than silently dropping accepted connections.
+        channels[next].send(stream).await?;
         next = (next + 1) % channels.len();
     }
 });
