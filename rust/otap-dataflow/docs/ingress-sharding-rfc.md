@@ -236,6 +236,12 @@ pub static USEREVENTS_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFactory {
 This enum is conceptual. Exact placement in engine types is an explicit design
 item for v1.
 
+The engine/controller abstraction should stop at generic sharding strategy,
+topology, and handoff semantics. Receiver-specific handoff payloads remain
+owned by the receiver implementation and should not be elevated into
+engine-level or controller-level enums unless later experience shows that a
+generic strategy model is insufficient.
+
 ## Handoff Units
 
 The engine should transfer the earliest safe ownership unit for each strategy.
@@ -248,11 +254,11 @@ The engine should transfer the earliest safe ownership unit for each strategy.
 For `user_events`, the handoff unit should reuse the existing raw record shape
 rather than inventing an untyped blob. The existing `RawUsereventsRecord` in
 `crates/core-nodes/src/receivers/userevents_receiver/session.rs` already
-carries the needed decode fields. The batch handoff should therefore be a batch
-wrapper around those records, or a zero-copy equivalent, with any required
-batch-level metadata.
+carries the needed decode fields. The batch handoff should therefore be a
+receiver-local batch wrapper around those records, or a zero-copy equivalent,
+with any required batch-level metadata.
 
-Illustrative shape:
+Illustrative receiver-local handoff payload:
 
 ```rust
 /// Batch of raw perf samples for cross-core handoff.
@@ -418,8 +424,9 @@ while let Some(stream) = rx.recv().await {
   - existing balanced topic as interim
 - How is decode worker count `M` configured or derived for
   `raw_batch_handoff`?
-- Should future handoff kinds remain an engine-owned closed set, or become
-  extensible later?
+- Should receiver-specific handoff payloads remain receiver-owned, with the
+  engine only modeling generic sharding strategies, or is a broader engine
+  registration model needed later?
 - How much platform transparency should the controller provide in v1 versus
   later?
 
