@@ -30,11 +30,25 @@ primitive.
 
 ## Background
 
-For Linux `user_events`, there is prior art in the existing C++ implementation
-used by AMA/mdsd: a single-threaded all-CPU reader with inline decode. That
-validates consolidated ring reading as a workable ingestion model, but it does
-not address the scaling needs of a high-throughput export pipeline where decode
-and downstream work are materially more expensive than ring draining.
+For Linux `user_events`, there is prior art in existing single-threaded C++
+implementations that use one all-CPU reader with inline decode. That validates
+consolidated ring reading as a workable ingestion model, but it does not
+address the scaling needs of a high-throughput export pipeline where decode and
+downstream work are materially more expensive than ring draining.
+
+In the OTAP Dataflow engine, each worker thread runs a single-threaded async
+pipeline pinned to one CPU core. For network receivers, the engine uses
+`SO_REUSEPORT` on Linux so the kernel distributes incoming connections or
+datagrams across per-core listeners with no user-space coordination. This is
+the `kernel_sharded` baseline: each core owns its full ingress-to-export
+lifecycle independently.
+
+The problem arises when a source does not have a `SO_REUSEPORT` equivalent. On
+Windows and macOS, `SO_REUSEPORT` either does not exist or does not
+load-balance. For Linux `user_events`, perf ring buffers are per-CPU kernel
+structures and there is no mechanism for the kernel to redistribute events
+across cores. Both cases break the shared-nothing property and require an
+explicit user-space handoff strategy.
 
 ## Goals
 
@@ -42,7 +56,8 @@ and downstream work are materially more expensive than ring draining.
 - Preserve core-local processing after the handoff boundary
 - Use the earliest safe handoff unit for each source
 - Make backpressure and drop semantics explicit
-- Give the controller enough metadata to wire the correct strategy
+- Expose enough metadata for the engine controller to select and wire the
+  correct strategy at pipeline startup
 - Allow incremental implementation per source/platform
 
 ## Non-Goals
@@ -58,6 +73,12 @@ and downstream work are materially more expensive than ring draining.
 All strategies fit the same shape:
 
 `ingress -> handoff/rebalance boundary -> core-local processing`
+
+```mermaid
+graph LR
+    A["Ingress Source<br/>(thin)"] --> B["Handoff Boundary<br/>(typed unit)"]
+    B --> C["Core-local Processing<br/>(decode → batch → export)"]
+```
 
 The engine supports multiple ingress sharding strategies:
 
@@ -88,32 +109,48 @@ The controller/runtime must support multiple topologies:
 
 The ratio is not fixed and must not be assumed to be `1 -> N` everywhere.
 
-```text
-kernel_sharded (N->N)
-CPU0 -> Pipeline 0
-CPU1 -> Pipeline 1
-CPU2 -> Pipeline 2
+`kernel_sharded` (`N -> N`):
 
-socket_handoff (1->N)
-Listener -> dispatch -> Core 0 pipeline
-                    -> Core 1 pipeline
-                    -> Core 2 pipeline
+```mermaid
+graph LR
+    K["Linux Kernel<br/>(SO_REUSEPORT)"]
+    K -->|"distributes"| P0["CPU 0<br/>full pipeline"]
+    K -->|"distributes"| P1["CPU 1<br/>full pipeline"]
+    K -->|"distributes"| P2["CPU N<br/>full pipeline"]
+```
 
-raw_batch_handoff (N->M)
-CPU0 ring --\
-CPU1 ring ---+-> handoff -> Decode 0 -> downstream
-CPU2 ring ---+            -> Decode 1 -> downstream
-CPU3 ring --/
+`socket_handoff` (`1 -> N`):
+
+```mermaid
+graph LR
+    L["Shared Listener<br/>(one acceptor)"] -->|"TcpStream"| D["Dispatcher<br/>(round-robin)"]
+    D -->|"TcpStream"| C0["Core 0<br/>read→decode→export"]
+    D -->|"TcpStream"| C1["Core 1<br/>read→decode→export"]
+    D -->|"TcpStream"| C2["Core N<br/>read→decode→export"]
+```
+
+`raw_batch_handoff` (`N -> M`):
+
+```mermaid
+graph LR
+    R0["CPU 0<br/>perf ring"] --> H["Handoff Queue<br/>(bounded)"]
+    R1["CPU 1<br/>perf ring"] --> H
+    R2["CPU N<br/>perf ring"] --> H
+    H -->|"RawBatch"| D0["Decode Worker 0<br/>decode→Arrow→export"]
+    H -->|"RawBatch"| D1["Decode Worker 1<br/>decode→Arrow→export"]
+    H -->|"RawBatch"| D2["Decode Worker M<br/>decode→Arrow→export"]
 ```
 
 ## Strategy Matrix
 
+<!-- markdownlint-disable MD013 -->
 | Source | Strategy | Handoff unit | Core-local phase |
 | --- | --- | --- | --- |
-| Linux TCP/UDP (`SO_REUSEPORT`) | `kernel_sharded` | none | full socket lifecycle |
-| Windows/macOS TCP | `socket_handoff` | accepted socket / connection ownership | read -> decode -> process -> export |
-| Linux `user_events` | `raw_batch_handoff` | typed batch of raw userevents records | decode -> Arrow encode -> process -> export |
+| Linux TCP/UDP | `kernel_sharded` | kernel distribution | full socket lifecycle |
+| Windows/macOS TCP | `socket_handoff` | accepted socket | connection lifecycle after handoff |
+| Linux `user_events` | `raw_batch_handoff` | `RawUsereventsRecord` batch | decode -> Arrow -> process -> export |
 | UDP on non-Linux platforms | deferred | — | — |
+<!-- markdownlint-enable MD013 -->
 
 macOS is included here because although it exposes `SO_REUSEPORT`
 syntactically, it does not distribute connections across listeners in the way
@@ -138,11 +175,32 @@ sub-task of v1.
 Illustrative shape only:
 
 ```rust
+/// Current ReceiverFactory (illustrative, simplified).
+/// The new `ingress_sharding` field is the only addition.
+pub struct ReceiverFactory<P> {
+    pub name: &'static str,
+    pub create: fn(...) -> Result<ReceiverWrapper<P>, ...>,
+    pub wiring_contract: WiringContract,
+    pub validate_config: fn(...) -> Result<(), ...>,
+    /// NEW: declares how this receiver participates in ingress sharding.
+    /// The controller reads this at pipeline-wiring time to select the
+    /// appropriate handoff mechanism.
+    pub ingress_sharding: IngressShardingStrategy,
+}
+
 enum IngressShardingStrategy {
     KernelSharded,
     SocketHandoff,
     RawBatchHandoff,
 }
+
+pub static USEREVENTS_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFactory {
+    name: USEREVENTS_RECEIVER_URN,
+    create: |...| { ... },
+    wiring_contract: WiringContract::UNRESTRICTED,
+    validate_config: ...,
+    ingress_sharding: IngressShardingStrategy::RawBatchHandoff,
+};
 ```
 
 This enum is conceptual. Exact placement in engine types is an explicit design
@@ -163,6 +221,21 @@ rather than inventing an untyped blob. The existing `RawUsereventsRecord` in
 carries the needed decode fields. The batch handoff should therefore be a batch
 wrapper around those records, or a zero-copy equivalent, with any required
 batch-level metadata.
+
+Illustrative shape:
+
+```rust
+/// Batch of raw perf samples for cross-core handoff.
+/// Wraps the existing RawUsereventsRecord without re-encoding.
+/// The ingress worker fills this; the decode worker consumes it.
+pub struct UsereventsRawBatch {
+    /// Records drained from one CPU's perf ring in a single turn.
+    pub records: Vec<RawUsereventsRecord>,
+    /// Sum of payload bytes across all records.
+    /// Used for byte-aware queue accounting if the handoff queue supports it.
+    pub total_payload_bytes: usize,
+}
+```
 
 Do not use:
 
@@ -214,8 +287,8 @@ Different strategies fail differently and must expose distinct telemetry.
   Full handoff queues stall the acceptor and push pressure back toward OS
   socket backlog
 - `raw_batch_handoff`
-  Full handoff queues usually cause drop, because upstream sources like perf
-  rings are not meaningfully backpressurable
+  Full handoff queues cause drop, because perf ring producers in the Linux
+  kernel cannot be paused or slowed by the reader
 
 Metrics should distinguish:
 
@@ -248,11 +321,57 @@ shared queue, a dispatcher, or per-worker channels.
 This preserves the existing ownership model for session setup and retry
 behavior while moving the skewed CPU work later in the pipeline.
 
+```mermaid
+graph LR
+    subgraph I["Ingress Pipeline (per CPU, thin)"]
+        R["perf ring drain"] --> B["UsereventsRawBatch"]
+    end
+    B -->|"handoff"| Q["Handoff Queue"]
+    subgraph D["Decode Pipeline (M workers)"]
+        Q --> DC["decode + Arrow encode"]
+        DC --> EX["batch → export"]
+    end
+```
+
 ## V1 Deliverable B: Windows/macOS TCP
 
 - one shared listener
 - accepted sockets handed off once to per-core runtimes
 - post-handoff lifecycle remains core-local
+
+Illustrative shape:
+
+```rust
+// Engine startup: one bounded channel per core worker.
+let (channels, receivers): (
+    Vec<Sender<TcpStream>>,
+    Vec<Receiver<TcpStream>>,
+) = cores
+    .iter()
+    .map(|_| tokio::sync::mpsc::channel::<TcpStream>(256))
+    .unzip();
+
+// `receivers` are passed to their respective per-core runtimes.
+
+// Single acceptor task.
+tokio::spawn(async move {
+    let listener = TcpListener::bind(addr).await?;
+    let mut next = 0;
+    loop {
+        let (stream, _) = listener.accept().await?;
+        // One-time ownership transfer; core takes over from here.
+        let _ = channels[next].try_send(stream);
+        next = (next + 1) % channels.len();
+    }
+});
+
+// Per-core worker: receives and owns the connection fully.
+while let Some(stream) = rx.recv().await {
+    tokio::task::spawn_local(async move {
+        handle_connection(stream).await; // read -> decode -> process -> export
+    });
+}
+```
 
 ## Open Questions
 
