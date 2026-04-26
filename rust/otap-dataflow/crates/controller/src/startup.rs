@@ -27,6 +27,7 @@ use otap_df_config::pipeline::PipelineConfig;
 use otap_df_config::policy::{CoreAllocation, ResourcesPolicy};
 use otap_df_config::{PipelineGroupId, PipelineId};
 use otap_df_engine::PipelineFactory;
+use otap_df_engine::runtime_registry::RuntimeComponentRegistry;
 use std::fmt::Debug;
 use sysinfo::System;
 
@@ -266,6 +267,132 @@ Example configuration files can be found in the configs/ directory.{}",
         processors_sorted.join(", "),
         exporters_sorted.join(", "),
         debug_warning
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Overlay-aware variants (phase-1 dynamic plugin support).
+//
+// These accept a `RuntimeComponentRegistry`, which checks the static
+// `PipelineFactory` first and then the dynamic registry layered on top of it.
+// Static built-ins are still authoritative; dynamic entries are additive.
+// ---------------------------------------------------------------------------
+
+/// Validate a single pipeline's nodes against a [`RuntimeComponentRegistry`].
+///
+/// Mirrors [`validate_pipeline_components`] but resolves each node URN
+/// through the overlay (static-first, dynamic-second) and uses the
+/// `ConfigValidator` abstraction so plugin-backed nodes can plug their own
+/// validation in.
+pub fn validate_pipeline_components_overlay<PData: 'static + Clone + Debug>(
+    pipeline_group_id: &PipelineGroupId,
+    pipeline_id: &PipelineId,
+    pipeline_cfg: &PipelineConfig,
+    registry: &RuntimeComponentRegistry<PData>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (node_id, node_cfg) in pipeline_cfg.node_iter() {
+        let kind = node_cfg.kind();
+        let urn_str = node_cfg.r#type.as_str();
+
+        let validator = match kind {
+            NodeKind::Receiver => registry.receiver_validator(urn_str),
+            NodeKind::Processor | NodeKind::ProcessorChain => registry.processor_validator(urn_str),
+            NodeKind::Exporter => registry.exporter_validator(urn_str),
+            NodeKind::Extension => continue,
+        };
+
+        match validator {
+            None => {
+                let kind_name = match kind {
+                    NodeKind::Receiver => "receiver",
+                    NodeKind::Processor | NodeKind::ProcessorChain => "processor",
+                    NodeKind::Exporter => "exporter",
+                    NodeKind::Extension => unreachable!("handled above"),
+                };
+                return Err(std::io::Error::other(format!(
+                    "Unknown {} component `{}` in pipeline_group={} pipeline={} node={}",
+                    kind_name,
+                    urn_str,
+                    pipeline_group_id.as_ref(),
+                    pipeline_id.as_ref(),
+                    node_id.as_ref()
+                ))
+                .into());
+            }
+            Some(v) => {
+                v.validate(&node_cfg.config).map_err(|e| {
+                    std::io::Error::other(format!(
+                        "Invalid config for component `{}` in pipeline_group={} pipeline={} node={}: {}",
+                        urn_str,
+                        pipeline_group_id.as_ref(),
+                        pipeline_id.as_ref(),
+                        node_id.as_ref(),
+                        e
+                    ))
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate every pipeline (and observability pipeline) against the overlay.
+pub fn validate_engine_components_overlay<PData: 'static + Clone + Debug>(
+    engine_cfg: &OtelDataflowSpec,
+    registry: &RuntimeComponentRegistry<PData>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (pipeline_group_id, pipeline_group) in &engine_cfg.groups {
+        for (pipeline_id, pipeline_cfg) in &pipeline_group.pipelines {
+            validate_pipeline_components_overlay(
+                pipeline_group_id,
+                pipeline_id,
+                pipeline_cfg,
+                registry,
+            )?;
+        }
+    }
+
+    if let Some(obs_pipeline) = &engine_cfg.engine.observability.pipeline {
+        let obs_group_id: PipelineGroupId = SYSTEM_PIPELINE_GROUP_ID.into();
+        let obs_pipeline_id: PipelineId = SYSTEM_OBSERVABILITY_PIPELINE_ID.into();
+        let obs_pipeline_config = obs_pipeline.clone().into_pipeline_config();
+        validate_pipeline_components_overlay(
+            &obs_group_id,
+            &obs_pipeline_id,
+            &obs_pipeline_config,
+            registry,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Like [`system_info`] but lists static and dynamic component URNs separately.
+#[must_use]
+pub fn system_info_overlay<PData: 'static + Clone + Debug>(
+    registry: &RuntimeComponentRegistry<PData>,
+    memory_allocator: &str,
+) -> String {
+    let base = system_info(registry.static_factory(), memory_allocator);
+
+    let dyn_reg = registry.dynamic();
+    if dyn_reg.is_empty() {
+        return base;
+    }
+
+    let mut dyn_processors: Vec<&str> = dyn_reg.processors().map(|e| e.urn.as_ref()).collect();
+    let mut dyn_exporters: Vec<&str> = dyn_reg.exporters().map(|e| e.urn.as_ref()).collect();
+    dyn_processors.sort();
+    dyn_exporters.sort();
+
+    format!(
+        "{base}
+
+Dynamically Registered Plugin Components:
+  Processors: {}
+  Exporters: {}",
+        dyn_processors.join(", "),
+        dyn_exporters.join(", "),
     )
 }
 

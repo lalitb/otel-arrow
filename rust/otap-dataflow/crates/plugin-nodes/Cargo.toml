@@ -1,0 +1,27 @@
+[package]
+name = "otap-df-plugin-nodes"
+description = "Dynamic plugin adapters: WasmProcessorAdapter and WasmExporterAdapter bridge into the engine runtime registry."
+version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+otap-df-config = { workspace = true }
+otap-df-engine = { workspace = true }
+otap-df-otap = { workspace = true }
+otap-df-pdata = { workspace = true }
+otap-df-plugin-api = { workspace = true }
+otap-df-plugin-host = { workspace = true }
+otap-df-plugin-manifest = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }

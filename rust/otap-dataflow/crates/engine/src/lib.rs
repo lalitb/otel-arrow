@@ -82,6 +82,10 @@ mod pipeline_metrics;
 pub mod process_duration;
 mod route_admission;
 pub mod runtime_pipeline;
+/// Phase-1 dynamic plugin scaffolding: overlay registry combining the static
+/// `PipelineFactory` with an owned, runtime-loaded set of processor/exporter
+/// entries. See `docs/dynamic-processor-exporter-plugins-phase1.md`.
+pub mod runtime_registry;
 pub mod shared;
 pub mod terminal_state;
 pub mod testing;
@@ -641,6 +645,36 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
 
     /// Builds a runtime pipeline from the given pipeline configuration.
     ///
+    /// Compatibility wrapper around [`Self::build_with_dynamic`] that
+    /// passes `None` for the dynamic plugin registry — equivalent to the
+    /// historical static-only behavior. New callers should prefer
+    /// [`Self::build_with_dynamic`].
+    pub fn build(
+        self: &PipelineFactory<PData>,
+        pipeline_ctx: PipelineContext,
+        config: PipelineConfig,
+        channel_capacity_policy: ChannelCapacityPolicy,
+        telemetry_policy: TelemetryPolicy,
+        transport_headers_policy: Option<TransportHeadersPolicy>,
+        internal_telemetry: Option<InternalTelemetrySettings>,
+    ) -> Result<RuntimePipeline<PData>, Error> {
+        self.build_with_dynamic(
+            pipeline_ctx,
+            config,
+            channel_capacity_policy,
+            telemetry_policy,
+            transport_headers_policy,
+            internal_telemetry,
+            None,
+        )
+    }
+
+    /// Like [`Self::build`] but accepts a dynamic plugin registry.
+    ///
+    /// The static factory map is consulted first; if a node URN is not
+    /// present statically, the engine falls back to the dynamic registry.
+    /// Phase-1 dynamic entries cover processors and exporters only.
+    ///
     /// Main phases:
     /// 1) Create runtime nodes and register telemetry.
     /// 2) Plan hyper edge wiring: resolve destinations, pick channel type (shared/local,
@@ -653,7 +687,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
     /// The `internal_telemetry` settings are injected into any receiver with the
     /// `INTERNAL_TELEMETRY_RECEIVER_URN` plugin URN, enabling it to consume logs
     /// from the Internal Telemetry System.
-    pub fn build(
+    pub fn build_with_dynamic(
         self: &PipelineFactory<PData>,
         mut pipeline_ctx: PipelineContext,
         mut config: PipelineConfig,
@@ -661,7 +695,11 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         telemetry_policy: TelemetryPolicy,
         transport_headers_policy: Option<TransportHeadersPolicy>,
         internal_telemetry: Option<InternalTelemetrySettings>,
-    ) -> Result<RuntimePipeline<PData>, Error> {
+        dynamic_registry: Option<&runtime_registry::DynamicComponentRegistry<PData>>,
+    ) -> Result<RuntimePipeline<PData>, Error>
+    where
+        PData: Clone,
+    {
         let mut receivers = Vec::new();
         let mut processors = Vec::new();
         let mut exporters = Vec::new();
@@ -711,7 +749,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             return Err(Error::EmptyPipeline);
         }
 
-        self.validate_connection_wiring_contracts(&config)?;
+        self.validate_connection_wiring_contracts(&config, dynamic_registry)?;
 
         let channel_metrics_enabled = telemetry_policy.runtime_metrics >= MetricLevel::Basic;
 
@@ -816,6 +854,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
                                 node_config.clone(),
                                 channel_capacity_policy.control.node,
                                 channel_capacity_policy.pdata,
+                                dynamic_registry,
                             )
                         },
                     )?;
@@ -836,6 +875,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
                                 channel_capacity_policy.control.node,
                                 channel_capacity_policy.pdata,
                                 &transport_headers_policy,
+                                dynamic_registry,
                             )
                         },
                     )?;
@@ -890,7 +930,11 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         Ok(pipeline)
     }
 
-    fn validate_connection_wiring_contracts(&self, config: &PipelineConfig) -> Result<(), Error> {
+    fn validate_connection_wiring_contracts(
+        &self,
+        config: &PipelineConfig,
+        dynamic_registry: Option<&runtime_registry::DynamicComponentRegistry<PData>>,
+    ) -> Result<(), Error> {
         let mut contracts_by_node: HashMap<NodeName, wiring_contract::WiringContract> =
             HashMap::new();
 
@@ -915,12 +959,19 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
                         otap_df_config::node::NodeKind::Processor,
                     )
                     .map_err(|e| Error::ConfigError(Box::new(e)))?;
-                    self.get_processor_factory_map()
-                        .get(normalized.as_str())
-                        .ok_or(Error::UnknownProcessor {
+                    // Static-first: dynamic plugins are an additive overlay
+                    // and cannot shadow built-in URNs.
+                    if let Some(f) = self.get_processor_factory_map().get(normalized.as_str()) {
+                        f.wiring_contract
+                    } else if let Some(entry) =
+                        dynamic_registry.and_then(|d| d.processor(normalized.as_str()))
+                    {
+                        entry.wiring_contract
+                    } else {
+                        return Err(Error::UnknownProcessor {
                             plugin_urn: normalized,
-                        })?
-                        .wiring_contract
+                        });
+                    }
                 }
                 otap_df_config::node::NodeKind::Exporter => {
                     let normalized = otap_df_config::node_urn::validate_plugin_urn(
@@ -928,12 +979,17 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
                         otap_df_config::node::NodeKind::Exporter,
                     )
                     .map_err(|e| Error::ConfigError(Box::new(e)))?;
-                    self.get_exporter_factory_map()
-                        .get(normalized.as_str())
-                        .ok_or(Error::UnknownExporter {
+                    if let Some(f) = self.get_exporter_factory_map().get(normalized.as_str()) {
+                        f.wiring_contract
+                    } else if let Some(entry) =
+                        dynamic_registry.and_then(|d| d.exporter(normalized.as_str()))
+                    {
+                        entry.wiring_contract
+                    } else {
+                        return Err(Error::UnknownExporter {
                             plugin_urn: normalized,
-                        })?
-                        .wiring_contract
+                        });
+                    }
                 }
                 otap_df_config::node::NodeKind::ProcessorChain => {
                     return Err(Error::UnsupportedNodeKind {
@@ -1546,6 +1602,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         node_config: Arc<NodeUserConfig>,
         control_channel_capacity: usize,
         pdata_channel_capacity: usize,
+        dynamic_registry: Option<&runtime_registry::DynamicComponentRegistry<PData>>,
     ) -> Result<ProcessorWrapper<PData>, Error> {
         let pipeline_group_id = pipeline_ctx.pipeline_group_id();
         let pipeline_id = pipeline_ctx.pipeline_id();
@@ -1567,26 +1624,47 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         )
         .map_err(|e| Error::ConfigError(Box::new(e)))?;
 
-        let factory = self
-            .get_processor_factory_map()
-            .get(normalized.as_str())
-            .ok_or(Error::UnknownProcessor {
-                plugin_urn: normalized,
-            })?;
         let processor_config = ProcessorConfig::with_channel_capacities(
             name.clone(),
             control_channel_capacity,
             pdata_channel_capacity,
         );
-        let create = factory.create;
 
-        let processor = create(
-            (*pipeline_ctx).clone(),
-            node_id.clone(),
-            node_config.clone(),
-            &processor_config,
-        )
-        .map_err(|e| Error::ConfigError(Box::new(e)))?;
+        // Static-first lookup; fall back to dynamic plugin overlay.
+        let processor = if let Some(factory) =
+            self.get_processor_factory_map().get(normalized.as_str())
+        {
+            let create = factory.create;
+            create(
+                (*pipeline_ctx).clone(),
+                node_id.clone(),
+                node_config.clone(),
+                &processor_config,
+            )
+            .map_err(|e| Error::ConfigError(Box::new(e)))?
+        } else if let Some(entry) = dynamic_registry.and_then(|d| d.processor(normalized.as_str()))
+        {
+            let factory = entry.factory.as_ref().ok_or_else(|| {
+                Error::ConfigError(Box::new(otap_df_config::error::Error::InvalidUserConfig {
+                    error: format!(
+                        "Plugin processor '{}' is registered but has no runtime factory \
+                         (Wasmtime backend likely not enabled)",
+                        normalized
+                    ),
+                }))
+            })?;
+            factory(
+                (*pipeline_ctx).clone(),
+                node_id.clone(),
+                node_config.clone(),
+                &processor_config,
+            )
+            .map_err(|e| Error::ConfigError(Box::new(e)))?
+        } else {
+            return Err(Error::UnknownProcessor {
+                plugin_urn: normalized,
+            });
+        };
 
         validate_local_wakeup_requirements(&node_id, processor.runtime_requirements())?;
 
@@ -1610,6 +1688,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         control_channel_capacity: usize,
         pdata_channel_capacity: usize,
         transport_headers_policy: &Option<TransportHeadersPolicy>,
+        dynamic_registry: Option<&runtime_registry::DynamicComponentRegistry<PData>>,
     ) -> Result<ExporterWrapper<PData>, Error> {
         let pipeline_group_id = pipeline_ctx.pipeline_group_id();
         let pipeline_id = pipeline_ctx.pipeline_id();
@@ -1631,29 +1710,49 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         )
         .map_err(|e| Error::ConfigError(Box::new(e)))?;
 
-        let factory = self
-            .get_exporter_factory_map()
-            .get(normalized.as_str())
-            .ok_or(Error::UnknownExporter {
-                plugin_urn: normalized,
-            })?;
         let exporter_config = ExporterConfig::with_channel_capacities(
             name.clone(),
             control_channel_capacity,
             pdata_channel_capacity,
         );
-        let create = factory.create;
 
         let propagation_policy = resolve_propagation_policy(&node_config, transport_headers_policy);
 
-        let exporter = create(
-            (*pipeline_ctx).clone(),
-            node_id.clone(),
-            node_config,
-            &exporter_config,
-        )
-        .map_err(|e| Error::ConfigError(Box::new(e)))?
-        .with_propagation_policy(propagation_policy);
+        let exporter = if let Some(factory) =
+            self.get_exporter_factory_map().get(normalized.as_str())
+        {
+            let create = factory.create;
+            create(
+                (*pipeline_ctx).clone(),
+                node_id.clone(),
+                node_config,
+                &exporter_config,
+            )
+            .map_err(|e| Error::ConfigError(Box::new(e)))?
+            .with_propagation_policy(propagation_policy)
+        } else if let Some(entry) = dynamic_registry.and_then(|d| d.exporter(normalized.as_str())) {
+            let factory = entry.factory.as_ref().ok_or_else(|| {
+                Error::ConfigError(Box::new(otap_df_config::error::Error::InvalidUserConfig {
+                    error: format!(
+                        "Plugin exporter '{}' is registered but has no runtime factory \
+                         (Wasmtime backend likely not enabled)",
+                        normalized
+                    ),
+                }))
+            })?;
+            factory(
+                (*pipeline_ctx).clone(),
+                node_id.clone(),
+                node_config,
+                &exporter_config,
+            )
+            .map_err(|e| Error::ConfigError(Box::new(e)))?
+            .with_propagation_policy(propagation_policy)
+        } else {
+            return Err(Error::UnknownExporter {
+                plugin_urn: normalized,
+            });
+        };
 
         otel_debug!(
             "exporter.create.complete",

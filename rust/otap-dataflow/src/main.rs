@@ -18,7 +18,9 @@ use otap_df_controller::startup;
 // distributed-slice registrations (core nodes) are visible
 // in `OTAP_PIPELINE_FACTORY` at runtime.
 use otap_df_core_nodes as _;
+use otap_df_engine::runtime_registry::RuntimeComponentRegistry;
 use otap_df_otap::OTAP_PIPELINE_FACTORY;
+use otap_df_plugin_host::PluginHost;
 /// Project license text (Apache-2.0), embedded at compile time.
 const LICENSE_TEXT: &str = include_str!("../LICENSE");
 
@@ -191,6 +193,34 @@ struct Args {
     /// Print the project license (Apache-2.0) and third-party notices, then exit.
     #[arg(long)]
     license: bool,
+
+    /// Directory to scan for plugin manifests (`*.yaml`). May be passed
+    /// multiple times. Discovered plugins are validated, descriptor-
+    /// loaded through the Wasmtime backend (when compiled in), and
+    /// registered into the dynamic component registry so pipelines can
+    /// reference plugin URNs as receivers/processors/exporters.
+    #[arg(long = "plugin-dir", value_name = "DIR")]
+    plugin_dirs: Vec<std::path::PathBuf>,
+
+    /// Disk cache directory for precompiled plugin components.  Defaults
+    /// to no caching.
+    #[arg(long, value_name = "DIR")]
+    plugin_cache_dir: Option<std::path::PathBuf>,
+
+    /// Require all plugins to be signed (minisign).  Phase-1 alpha: when
+    /// any plugin manifest declares a signing key, this flag forces
+    /// verification; otherwise unsigned plugins are accepted with a
+    /// warning.  Becomes the default before stable release.
+    #[arg(long)]
+    plugin_require_signed: bool,
+
+    /// Maximum concurrent plugin exporter blocking-pool dispatches across
+    /// all dynamic exporter instances.  When the cap is reached, exporter
+    /// loops await a permit (back-pressure), which slows draining of the
+    /// exporter inbox without dropping data.  Per-instance serialization
+    /// is unaffected.  Must be > 0.
+    #[arg(long, value_name = "N", default_value_t = otap_df_plugin_host::DEFAULT_EXPORTER_BLOCKING_CONCURRENCY)]
+    plugin_exporter_blocking_concurrency: usize,
 }
 
 fn parse_core_id_allocation(s: &str) -> Result<CoreAllocation, String> {
@@ -251,6 +281,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         http_admin_bind,
         validate_and_exit,
         license,
+        plugin_dirs,
+        plugin_cache_dir,
+        plugin_require_signed,
+        plugin_exporter_blocking_concurrency,
     } = Args::parse();
 
     if license {
@@ -260,9 +294,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(0);
     }
 
+    let exporter_blocking_concurrency =
+        std::num::NonZeroUsize::new(plugin_exporter_blocking_concurrency).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--plugin-exporter-blocking-concurrency must be > 0",
+            )
+        })?;
+
+    // Built early so the startup banner reflects any dynamically registered
+    // plugin components in addition to the static `linkme` factories.
+    let plugin_host = PluginHost::new(otap_df_plugin_host::PluginHostConfig {
+        plugin_dirs,
+        cache_dir: plugin_cache_dir,
+        require_signed: plugin_require_signed,
+        exporter_blocking_concurrency,
+    });
+    let loaded_plugins = plugin_host.load_all()?;
+    let dynamic_registry = otap_df_plugin_nodes::build_dynamic_registry(
+        &loaded_plugins,
+        plugin_host.exporter_blocking_permits(),
+    )
+    .map_err(|e| std::io::Error::other(format!("duplicate plugin URN: {}", e.0)))?;
+    let runtime_registry = RuntimeComponentRegistry::new(&OTAP_PIPELINE_FACTORY, dynamic_registry);
+
     println!(
         "{}",
-        startup::system_info(&OTAP_PIPELINE_FACTORY, memory_allocator_name())
+        startup::system_info_overlay(&runtime_registry, memory_allocator_name())
     );
 
     let resolved = resolve_config(config.as_deref())?;
@@ -272,14 +330,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     startup::apply_cli_overrides(&mut engine_cfg, num_cores, core_id_range, http_admin_bind);
 
-    startup::validate_engine_components(&engine_cfg, &OTAP_PIPELINE_FACTORY)?;
+    startup::validate_engine_components_overlay(&engine_cfg, &runtime_registry)?;
 
     if validate_and_exit {
         println!("Configuration '{}' is valid.", resolved.source);
         std::process::exit(0);
     }
 
-    let controller = Controller::new(&OTAP_PIPELINE_FACTORY);
+    let controller = Controller::with_runtime_registry(runtime_registry);
     let result = controller.run_forever(engine_cfg);
     #[cfg(all(not(tarpaulin_include), feature = "dhat-heap"))]
     {

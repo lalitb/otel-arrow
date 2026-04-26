@@ -1,0 +1,26 @@
+[package]
+name = "otap-df-plugin-manifest"
+description = "Dynamic plugin manifest parsing, SHA-256 integrity verification, and minisign signature verification."
+version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+otap-df-plugin-api = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = { workspace = true }
+data-encoding = { workspace = true }
+thiserror = { workspace = true }
+minisign-verify = { workspace = true }
+
+[dev-dependencies]
+minisign = { workspace = true }
+tempfile = { workspace = true }

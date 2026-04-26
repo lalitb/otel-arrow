@@ -80,6 +80,9 @@ use otap_df_engine::memory_limiter::{
     EffectiveMemoryLimiter, MemoryLimiterTick, MemoryPressureBehaviorConfig, MemoryPressureChanged,
     MemoryPressureLevel,
 };
+use otap_df_engine::runtime_registry::{
+    ConfigValidator, DynamicComponentRegistry, DynamicNodeFingerprint, RuntimeComponentRegistry,
+};
 use otap_df_engine::topic::{
     InMemoryBackend, PipelineTopicBinding, TopicBroker, TopicOptions, TopicPublishOutcomeConfig,
     TopicSet,
@@ -120,8 +123,14 @@ use live_control::{
 /// dedicated thread pinned to a CPU core.
 /// Intended for use as a long-lived process controller.
 pub struct Controller<PData: 'static + Clone + Send + Sync + std::fmt::Debug> {
-    /// The pipeline factory used to build runtime pipelines.
+    /// The pipeline factory used to build runtime pipelines (static linkme path).
     pipeline_factory: &'static PipelineFactory<PData>,
+    /// Overlay registry that adds dynamic plugin entries on top of the static
+    /// factory. Lookup is static-first, dynamic-second. Phase-1: dynamic
+    /// entries currently carry `factory: None`, so any pipeline that
+    /// references a plugin URN is rejected with a clear error during
+    /// pre-flight validation rather than blowing up inside `pipeline_factory.build`.
+    runtime_registry: RuntimeComponentRegistry<PData>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,20 +285,115 @@ fn engine_context() -> LogContext {
 impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + Unwindable>
     Controller<PData>
 {
-    /// Creates a new controller with the given pipeline factory.
-    pub const fn new(pipeline_factory: &'static PipelineFactory<PData>) -> Self {
-        Self { pipeline_factory }
+    /// Creates a new controller with the given static pipeline factory.
+    /// No dynamic plugins are registered. Equivalent to
+    /// [`Self::with_runtime_registry`] with an empty dynamic overlay.
+    pub fn new(pipeline_factory: &'static PipelineFactory<PData>) -> Self {
+        Self::with_runtime_registry(RuntimeComponentRegistry::static_only(pipeline_factory))
+    }
+
+    /// Creates a new controller with both the static pipeline factory and an
+    /// owned dynamic component registry layered on top. The static factory
+    /// inside `runtime_registry` must be the same `&'static` reference as
+    /// `pipeline_factory`.
+    pub fn with_registry(
+        pipeline_factory: &'static PipelineFactory<PData>,
+        dynamic: DynamicComponentRegistry<PData>,
+    ) -> Self {
+        Self::with_runtime_registry(RuntimeComponentRegistry::new(pipeline_factory, dynamic))
+    }
+
+    /// Creates a new controller from a pre-built [`RuntimeComponentRegistry`].
+    /// This is the primary constructor when callers already need the registry
+    /// for early validation (`startup::validate_engine_components_overlay`)
+    /// and want to reuse the same overlay rather than re-build it.
+    #[must_use]
+    pub fn with_runtime_registry(runtime_registry: RuntimeComponentRegistry<PData>) -> Self {
+        Self {
+            pipeline_factory: runtime_registry.static_factory(),
+            runtime_registry,
+        }
+    }
+
+    /// Returns the runtime registry overlay.
+    #[must_use]
+    pub fn runtime_registry(&self) -> &RuntimeComponentRegistry<PData> {
+        &self.runtime_registry
     }
 
     /// Validates component-specific configuration for one pipeline before startup or reconfigure.
     fn validate_pipeline_components_with_factory(
         pipeline_factory: &'static PipelineFactory<PData>,
+        dynamic_registry: &DynamicComponentRegistry<PData>,
         pipeline_group_id: &PipelineGroupId,
         pipeline_id: &PipelineId,
         pipeline_cfg: &PipelineConfig,
     ) -> Result<(), String> {
         for (node_id, node_cfg) in pipeline_cfg.node_iter() {
             let urn_str = node_cfg.r#type.as_str();
+
+            // Plugin path: a dynamic entry can be in one of two states:
+            //   * `factory: Some(_)` — fully wired, validate via the
+            //     plugin's own `validate-config` and proceed.
+            //   * `factory: None`    — descriptor loaded but no runtime
+            //     backend (e.g. the `wasmtime-backend` feature is not
+            //     compiled in). Reject early with an actionable error.
+            let static_has = match node_cfg.kind() {
+                NodeKind::Receiver => pipeline_factory
+                    .get_receiver_factory_map()
+                    .contains_key(urn_str),
+                NodeKind::Processor | NodeKind::ProcessorChain => pipeline_factory
+                    .get_processor_factory_map()
+                    .contains_key(urn_str),
+                NodeKind::Exporter => pipeline_factory
+                    .get_exporter_factory_map()
+                    .contains_key(urn_str),
+                NodeKind::Extension => true, // skipped below
+            };
+            if !static_has {
+                let dynamic_entry: Option<(&'static str, bool, ConfigValidator)> =
+                    match node_cfg.kind() {
+                        NodeKind::Processor | NodeKind::ProcessorChain => dynamic_registry
+                            .processor(urn_str)
+                            .map(|e| ("processor", e.factory.is_some(), e.validator.clone())),
+                        NodeKind::Exporter => dynamic_registry
+                            .exporter(urn_str)
+                            .map(|e| ("exporter", e.factory.is_some(), e.validator.clone())),
+                        _ => None,
+                    };
+                if let Some((kind_label, has_factory, validator)) = dynamic_entry {
+                    if !has_factory {
+                        return Err(format!(
+                            "Plugin-backed {} `{}` cannot be instantiated: \
+                             the Wasmtime backend is not available in this \
+                             build (pipeline_group={} pipeline={} node={})",
+                            kind_label,
+                            urn_str,
+                            pipeline_group_id.as_ref(),
+                            pipeline_id.as_ref(),
+                            node_id.as_ref()
+                        ));
+                    }
+                    // Plugin-backed and runtime-instantiable: route the
+                    // user-supplied config through the plugin's own
+                    // validator and skip the static-factory validation
+                    // path below.
+                    validator.validate(&node_cfg.config).map_err(|err| {
+                        format!(
+                            "Invalid config for plugin-backed {} `{}` in \
+                             pipeline_group={} pipeline={} node={}: {}",
+                            kind_label,
+                            urn_str,
+                            pipeline_group_id.as_ref(),
+                            pipeline_id.as_ref(),
+                            node_id.as_ref(),
+                            err
+                        )
+                    })?;
+                    continue;
+                }
+            }
+
             let validate_config_fn = match node_cfg.kind() {
                 NodeKind::Receiver => pipeline_factory
                     .get_receiver_factory_map()
@@ -344,12 +448,14 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
     /// Validates every configured pipeline and observability pipeline against registered components.
     fn validate_engine_components_with_factory(
         pipeline_factory: &'static PipelineFactory<PData>,
+        dynamic_registry: &DynamicComponentRegistry<PData>,
         engine_cfg: &OtelDataflowSpec,
     ) -> Result<(), String> {
         for (pipeline_group_id, pipeline_group) in &engine_cfg.groups {
             for (pipeline_id, pipeline_cfg) in &pipeline_group.pipelines {
                 Self::validate_pipeline_components_with_factory(
                     pipeline_factory,
+                    dynamic_registry,
                     pipeline_group_id,
                     pipeline_id,
                     pipeline_cfg,
@@ -363,6 +469,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
             let obs_pipeline_config = obs_pipeline.clone().into_pipeline_config();
             Self::validate_pipeline_components_with_factory(
                 pipeline_factory,
+                dynamic_registry,
                 &obs_group_id,
                 &obs_pipeline_id,
                 &obs_pipeline_config,
@@ -375,7 +482,11 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
     /// Validates that every configured node resolves to a registered component and that the
     /// static component-specific configuration validates.
     pub fn validate_engine_components(&self, engine_cfg: &OtelDataflowSpec) -> Result<(), String> {
-        Self::validate_engine_components_with_factory(self.pipeline_factory, engine_cfg)
+        Self::validate_engine_components_with_factory(
+            self.pipeline_factory,
+            self.runtime_registry.dynamic(),
+            engine_cfg,
+        )
     }
 
     /// Starts the controller with the given engine configurations.
@@ -1324,6 +1435,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
 
         let runtime = Arc::new(ControllerRuntime::new(
             self.pipeline_factory,
+            Arc::clone(self.runtime_registry.dynamic_arc()),
             controller_ctx.clone(),
             obs_state_store.clone(),
             obs_state_handle.clone(),
@@ -1348,6 +1460,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
             &engine_config,
             &telemetry_system,
             self.pipeline_factory,
+            self.runtime_registry.dynamic_arc().clone(),
             &controller_ctx,
             &engine_evt_reporter,
             &metrics_reporter,
@@ -1482,6 +1595,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
                 // that late report if shutdown has already dropped the runtime.
                 let launched = Self::launch_pipeline_thread(
                     self.pipeline_factory,
+                    self.runtime_registry.dynamic_arc().clone(),
                     DeployedPipelineKey {
                         pipeline_group_id: pipeline_entry.pipeline_group_id.clone(),
                         pipeline_id: pipeline_entry.pipeline_id.clone(),
@@ -1775,6 +1889,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
     #[allow(clippy::too_many_arguments)]
     fn launch_pipeline_thread(
         pipeline_factory: &'static PipelineFactory<PData>,
+        dynamic_registry: Arc<DynamicComponentRegistry<PData>>,
         pipeline_key: DeployedPipelineKey,
         core_id: CoreId,
         num_cores: usize,
@@ -1842,6 +1957,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
                         transport_headers_policy,
                         telemetry_reporting_interval,
                         pipeline_factory,
+                        dynamic_registry,
                         pipeline_ctx,
                         engine_evt_reporter,
                         metrics_reporter,
@@ -1899,6 +2015,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
         config: &OtelDataflowSpec,
         telemetry_system: &InternalTelemetrySystem,
         pipeline_factory: &'static PipelineFactory<PData>,
+        dynamic_registry: Arc<DynamicComponentRegistry<PData>>,
         controller_ctx: &ControllerContext,
         engine_evt_reporter: &ObservedEventReporter,
         metrics_reporter: &MetricsReporter,
@@ -1941,6 +2058,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
         let (startup_tx, startup_rx) = std_mpsc::sync_channel::<Result<(), EngineError>>(1);
         let launched = Self::launch_pipeline_thread(
             pipeline_factory,
+            dynamic_registry,
             its_key,
             its_core,
             1,
@@ -1990,6 +2108,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
     }
 
     /// Runs a single pipeline in the current thread.
+    #[allow(clippy::too_many_arguments)]
     fn run_pipeline_thread(
         pipeline_key: DeployedPipelineKey,
         core_id: CoreId,
@@ -1999,6 +2118,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
         transport_headers_policy: Option<TransportHeadersPolicy>,
         telemetry_reporting_interval: Duration,
         pipeline_factory: &'static PipelineFactory<PData>,
+        dynamic_registry: Arc<DynamicComponentRegistry<PData>>,
         pipeline_context: PipelineContext,
         obs_evt_reporter: ObservedEventReporter,
         metrics_reporter: MetricsReporter,
@@ -2046,13 +2166,14 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
             // Build the runtime pipeline from the configuration
             let its_settings = internal_telemetry.as_ref().map(|(s, _)| s).cloned();
             let runtime_pipeline = pipeline_factory
-                .build(
+                .build_with_dynamic(
                     pipeline_context.clone(),
                     pipeline_config.clone(),
                     channel_capacity_policy,
                     telemetry_policy,
                     transport_headers_policy,
                     its_settings,
+                    Some(dynamic_registry.as_ref()),
                 )
                 .map_err(|e| {
                     if let Some((_, startup_tx)) = internal_telemetry.as_ref() {

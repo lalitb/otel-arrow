@@ -46,6 +46,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
         };
         let launched = Controller::<PData>::launch_pipeline_thread(
             self.pipeline_factory,
+            self.dynamic_registry.clone(),
             deployed_key.clone(),
             CoreId { id: core_id },
             num_cores,

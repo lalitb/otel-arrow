@@ -1,0 +1,37 @@
+[package]
+name = "otap-df-plugin-host"
+description = "Wasmtime-backed dynamic plugin host: descriptor and validate-config loading, precompiled component cache, and runner construction."
+version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# The wasmtime-backend feature gates the actual Wasmtime runtime
+# integration. Enabling this feature pulls in wasmtime and unlocks
+# descriptor loading, `validate-config`, and processor/exporter
+# `process` execution. Without it, dynamic factories are not wired and
+# plugin-backed URNs are rejected during pre-flight validation.
+default = []
+wasmtime-backend = ["dep:wasmtime"]
+
+[dependencies]
+otap-df-plugin-api = { workspace = true }
+otap-df-plugin-manifest = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+wasmtime = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+wat = "1"
+sha2 = { workspace = true }
+serde_yaml = { workspace = true }
+minisign = { workspace = true }

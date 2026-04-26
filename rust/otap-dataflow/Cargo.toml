@@ -36,6 +36,8 @@ otap-df-controller.workspace = true
 otap-df-core-nodes.workspace = true
 otap-df-engine.workspace = true
 otap-df-otap.workspace = true
+otap-df-plugin-host = { workspace = true, features = ["wasmtime-backend"] }
+otap-df-plugin-nodes.workspace = true
 thiserror.workspace = true
 serde_json.workspace = true
 clap.workspace = true
@@ -59,6 +61,10 @@ otap-df-controller = { path = "crates/controller" }
 otap-df-core-nodes = { path = "crates/core-nodes" }
 otap-df-engine = { path = "crates/engine" }
 otap-df-otap = { path = "crates/otap" }
+otap-df-plugin-api = { path = "crates/plugin-api" }
+otap-df-plugin-host = { path = "crates/plugin-host" }
+otap-df-plugin-manifest = { path = "crates/plugin-manifest" }
+otap-df-plugin-nodes = { path = "crates/plugin-nodes" }
 otap-test-tls-certs = { package = "otap-df-test-tls-certs", path = "crates/otap-test-tls-certs" }
 otap-df-pdata = { path = "crates/pdata" }
 otap-df-pdata-views = { path = "crates/pdata-views" }
@@ -124,6 +130,8 @@ tikv-jemalloc-sys = "0.6.1"
 memchr = "2.8.0"
 memmap2 = "0.9"
 memory-stats = "1"
+minisign = "0.9"
+minisign-verify = "0.2"
 nix = { version = "0.31.0", features = ["process", "signal", "fs", "mman"] }
 notify = "8.0"  # Uses platform-native backend: inotify (Linux), kqueue (macOS), ReadDirectoryChanges (Windows)
 num_enum = "0.7"
@@ -170,6 +178,7 @@ serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_cbor = "0.11.2"
 serde_json = { version = "1.0.149" }
 serde_yaml = "0.9.34-deprecated"        # Deprecated, but no good alternative yet
+sha2 = "0.10"
 crc32fast = "1.4.2"
 replace_with = "0.1.8"
 simdutf8 = "0.1.5"
@@ -208,6 +217,7 @@ trybuild = "1.0"
 unsync = "0.1.2"
 url = "2.5.7"
 uuid = { version = "1.17.0", features = ["v4", "v7"] }
+wasmtime = { version = "30", default-features = false, features = ["component-model", "cranelift", "runtime"] }
 weaver_common = { git = "https://github.com/open-telemetry/weaver.git", tag = "v0.21.2"}
 weaver_forge = { git = "https://github.com/open-telemetry/weaver.git", tag = "v0.21.2" }
 weaver_resolved_schema = { git = "https://github.com/open-telemetry/weaver.git", tag = "v0.21.2"}

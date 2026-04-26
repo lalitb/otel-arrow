@@ -433,6 +433,12 @@ pub(crate) enum RuntimeInstanceExit {
 pub(super) struct LogicalPipelineRecord {
     pub(super) resolved: ResolvedPipelineConfig,
     pub(super) active_generation: u64,
+    /// Snapshot of plugin fingerprints for every dynamic node referenced
+    /// by `resolved`, taken at commit time. Used by the rollout planner
+    /// to force `Replace` when any plugin's URN/version/sha/api-version
+    /// changes between rollouts (RFC §7 live-reconfig identity).
+    /// Sorted for deterministic equality comparisons.
+    pub(super) plugin_fingerprints: Vec<DynamicNodeFingerprint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

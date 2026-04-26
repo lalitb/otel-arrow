@@ -208,6 +208,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
             })?;
         Controller::<PData>::validate_engine_components_with_factory(
             self.pipeline_factory,
+            &self.dynamic_registry,
             &candidate_config,
         )
         .map_err(|message| ControlPlaneError::InvalidRequest { message })?;
@@ -278,16 +279,22 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
             .copied()
             .filter(|core_id| !target_core_set.contains(core_id))
             .collect();
+        let candidate_plugin_fingerprints =
+            collect_plugin_fingerprints(&self.dynamic_registry, &resolved_pipeline);
         let action = if let Some(record) = current_record.as_ref() {
+            let plugin_fingerprints_match =
+                record.plugin_fingerprints == candidate_plugin_fingerprints;
             let identical_update = current_assigned_cores == target_assigned_cores
                 && active_runtime_state.current_generation_cores == target_assigned_cores
                 && !active_runtime_state.has_foreign_active_generations
-                && record.resolved.runtime_matches(&resolved_pipeline);
+                && record.resolved.runtime_matches(&resolved_pipeline)
+                && plugin_fingerprints_match;
             let resize_only = current_assigned_cores != target_assigned_cores
                 && !active_runtime_state.has_foreign_active_generations
                 && record
                     .resolved
-                    .runtime_shape_matches_ignoring_resources(&resolved_pipeline);
+                    .runtime_shape_matches_ignoring_resources(&resolved_pipeline)
+                && plugin_fingerprints_match;
             if identical_update {
                 RolloutAction::NoOp
             } else if resize_only {
@@ -569,6 +576,10 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
                 LogicalPipelineRecord {
                     resolved: plan.resolved_pipeline.clone(),
                     active_generation,
+                    plugin_fingerprints: collect_plugin_fingerprints(
+                        &self.dynamic_registry,
+                        &plan.resolved_pipeline,
+                    ),
                 },
             );
         }
@@ -879,5 +890,131 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
                 }
             })?;
         Ok(initial_status)
+    }
+}
+
+/// Snapshot the plugin fingerprints for every dynamic node referenced by
+/// `resolved`. Returned vector is sorted for deterministic equality.
+///
+/// A node URN that is not present in the dynamic registry is silently
+/// skipped — that's the static-built-in case (or a configuration error
+/// caught elsewhere) and produces no fingerprint contribution.
+pub(super) fn collect_plugin_fingerprints<PData: 'static + Clone>(
+    dynamic: &DynamicComponentRegistry<PData>,
+    resolved: &ResolvedPipelineConfig,
+) -> Vec<DynamicNodeFingerprint> {
+    let mut out = Vec::new();
+    for (_node_id, node_cfg) in resolved.pipeline.node_iter() {
+        let urn = node_cfg.r#type.as_ref();
+        if let Some(p) = dynamic.processor(urn) {
+            out.push(p.fingerprint.clone());
+        } else if let Some(e) = dynamic.exporter(urn) {
+            out.push(e.fingerprint.clone());
+        }
+    }
+    out.sort_by(|a, b| {
+        (
+            &a.component_urn,
+            &a.plugin_version,
+            &a.artifact_sha256,
+            &a.plugin_api_version,
+        )
+            .cmp(&(
+                &b.component_urn,
+                &b.plugin_version,
+                &b.artifact_sha256,
+                &b.plugin_api_version,
+            ))
+    });
+    out
+}
+
+#[cfg(test)]
+mod plugin_fingerprint_tests {
+    use super::*;
+    use otap_df_config::engine::{ResolvedPipelineConfig, ResolvedPipelineRole};
+    use otap_df_config::pipeline::PipelineConfig;
+    use otap_df_config::policy::ResolvedPolicies;
+    use otap_df_engine::runtime_registry::{
+        ComponentUrn, ConfigValidator, DynamicComponentRegistry, DynamicNodeFingerprint,
+        DynamicProcessorEntry,
+    };
+    use otap_df_engine::wiring_contract::WiringContract;
+
+    fn fingerprint(version: &str) -> DynamicNodeFingerprint {
+        DynamicNodeFingerprint {
+            component_urn: "urn:test:processor:fp".to_owned(),
+            plugin_version: version.to_owned(),
+            artifact_sha256: "sha".to_owned(),
+            plugin_api_version: "0.1.0".to_owned(),
+        }
+    }
+
+    fn registry_with(version: &str) -> DynamicComponentRegistry<()> {
+        let mut reg = DynamicComponentRegistry::<()>::empty();
+        reg.register_processor(DynamicProcessorEntry::<()> {
+            urn: ComponentUrn::from("urn:test:processor:fp"),
+            validator: ConfigValidator::Static(|_| Ok(())),
+            fingerprint: fingerprint(version),
+            wiring_contract: WiringContract::default(),
+            factory: None,
+        })
+        .expect("register");
+        reg
+    }
+
+    fn resolved_with_processor() -> ResolvedPipelineConfig {
+        ResolvedPipelineConfig {
+            pipeline_group_id: "g1".into(),
+            pipeline_id: "p1".into(),
+            pipeline: PipelineConfig::from_yaml(
+                "g1".into(),
+                "p1".into(),
+                r#"
+policies:
+  resources:
+    core_allocation:
+      type: core_count
+      count: 1
+nodes:
+  proc:
+    type: "urn:test:processor:fp"
+    config: null
+  exp:
+    type: "urn:test:exporter:builtin"
+    config: null
+connections:
+  - from: proc
+    to: exp
+"#,
+            )
+            .expect("pipeline parse"),
+            policies: ResolvedPolicies::default(),
+            role: ResolvedPipelineRole::Regular,
+        }
+    }
+
+    #[test]
+    fn collects_only_dynamic_referenced_urns() {
+        let reg = registry_with("1.0.0");
+        let resolved = resolved_with_processor();
+        let fps = collect_plugin_fingerprints(&reg, &resolved);
+        assert_eq!(fps.len(), 1, "only the dynamic processor should appear");
+        assert_eq!(fps[0].plugin_version, "1.0.0");
+    }
+
+    #[test]
+    fn version_change_is_detected() {
+        let resolved = resolved_with_processor();
+        let before = collect_plugin_fingerprints(&registry_with("1.0.0"), &resolved);
+        let after = collect_plugin_fingerprints(&registry_with("2.0.0"), &resolved);
+        assert_ne!(before, after, "fingerprint must reflect plugin version");
+    }
+
+    #[test]
+    fn empty_registry_yields_no_fingerprints() {
+        let reg = DynamicComponentRegistry::<()>::empty();
+        let resolved = resolved_with_processor();
+        assert!(collect_plugin_fingerprints(&reg, &resolved).is_empty());
     }
 }

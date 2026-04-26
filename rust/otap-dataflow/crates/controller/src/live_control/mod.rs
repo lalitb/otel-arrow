@@ -60,6 +60,12 @@ pub(crate) use self::state::{PanicReport, RuntimeInstanceError, RuntimeInstanceE
 pub(super) struct ControllerRuntime<PData: 'static + Clone + Send + Sync + std::fmt::Debug> {
     /// Factory used to build runtime pipelines for new instances.
     pipeline_factory: &'static PipelineFactory<PData>,
+    /// Dynamic plugin registry layered on top of the static factory. Used
+    /// by pre-flight validation during candidate rollouts to (a) accept
+    /// plugin-backed URNs that have a real factory wired up, (b) route
+    /// configs through plugin `validate-config`, and (c) snapshot plugin
+    /// fingerprints so the rollout planner can detect artifact changes.
+    dynamic_registry: Arc<DynamicComponentRegistry<PData>>,
     /// Static controller context cloned into launched pipeline threads.
     controller_context: ControllerContext,
     /// Mutable observed-state store used for compaction and status updates.
@@ -112,6 +118,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
     /// Builds the resident controller runtime used by live reconfiguration.
     pub(super) fn new(
         pipeline_factory: &'static PipelineFactory<PData>,
+        dynamic_registry: Arc<DynamicComponentRegistry<PData>>,
         controller_context: ControllerContext,
         observed_state_store: ObservedStateStore,
         observed_state_handle: ObservedStateHandle,
@@ -126,6 +133,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
     ) -> Self {
         Self {
             pipeline_factory,
+            dynamic_registry,
             controller_context,
             observed_state_store,
             observed_state_handle,
@@ -185,6 +193,10 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
         _ = state.logical_pipelines.insert(
             pipeline_key,
             LogicalPipelineRecord {
+                plugin_fingerprints: planning::collect_plugin_fingerprints(
+                    &self.dynamic_registry,
+                    &resolved,
+                ),
                 resolved,
                 active_generation: generation,
             },

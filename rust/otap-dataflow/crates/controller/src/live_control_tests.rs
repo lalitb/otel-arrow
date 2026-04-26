@@ -90,6 +90,18 @@ static TEST_PIPELINE_FACTORY: PipelineFactory<()> =
     PipelineFactory::new(TEST_RECEIVER_FACTORIES, &[], TEST_EXPORTER_FACTORIES, &[]);
 
 fn test_runtime(config: &OtelDataflowSpec) -> Arc<ControllerRuntime<()>> {
+    test_runtime_with_dynamic_registry(config, DynamicComponentRegistry::empty())
+}
+
+/// Build a controller runtime backed by a custom dynamic component registry.
+///
+/// Used by mixed static + dynamic rollout tests so they can register
+/// dynamic processor/exporter URNs (with explicit fingerprints) and then
+/// drive `prepare_rollout_plan` without standing up a real plugin host.
+fn test_runtime_with_dynamic_registry(
+    config: &OtelDataflowSpec,
+    dynamic: DynamicComponentRegistry<()>,
+) -> Arc<ControllerRuntime<()>> {
     let registry = TelemetryRegistryHandle::new();
     let observed_state_store =
         ObservedStateStore::new(&ObservedStateSettings::default(), registry.clone());
@@ -103,6 +115,7 @@ fn test_runtime(config: &OtelDataflowSpec) -> Arc<ControllerRuntime<()>> {
 
     Arc::new(ControllerRuntime::new(
         &TEST_PIPELINE_FACTORY,
+        Arc::new(dynamic),
         ControllerContext::new(registry),
         observed_state_store,
         observed_state_handle,
@@ -2704,4 +2717,525 @@ fn runtime_thread_panic_populates_error_source_in_observed_status() {
     assert!(source.contains("thread_id=11"));
     assert!(source.contains("core_id=0"));
     assert!(source.contains("backtrace:"));
+}
+
+// ---------------------------------------------------------------------------
+// Mixed static + dynamic pipeline rollout coverage (RFC §7 live-reconfig
+// identity). These tests pin the planner's behavior against plugin
+// fingerprint changes and exercise the action selection matrix
+// (`NoOp` / `Resize` / `Replace`) in a single place.
+// ---------------------------------------------------------------------------
+
+use otap_df_engine::runtime_registry::{
+    ComponentUrn, ConfigValidator, DynamicExporterEntry, DynamicProcessorEntry,
+};
+
+/// Static-only mixed-pipeline counterpart YAML: receiver -> exporter
+/// with an explicit `core_count` policy so the resource axis can be
+/// varied symmetrically with [`mixed_pipeline_yaml`].
+fn static_pipeline_yaml(core_count: usize) -> String {
+    format!(
+        r#"
+        policies:
+          resources:
+            core_allocation:
+              type: core_count
+              count: {core_count}
+        nodes:
+          receiver:
+            type: "urn:test:receiver:example"
+            config: null
+          exporter:
+            type: "urn:test:exporter:example"
+            config: null
+        connections:
+          - from: receiver
+            to: exporter
+"#
+    )
+}
+
+fn static_replacement_yaml(core_count: usize) -> String {
+    format!(
+        r#"
+policies:
+  resources:
+    core_allocation:
+      type: core_count
+      count: {core_count}
+nodes:
+  receiver:
+    type: "urn:test:receiver:example"
+    config: null
+  exporter:
+    type: "urn:test:exporter:example"
+    config: null
+connections:
+  - from: receiver
+    to: exporter
+"#
+    )
+}
+
+const DYN_PROCESSOR_URN: &str = "urn:test:processor:dyn";
+const DYN_EXPORTER_URN: &str = "urn:test:exporter:dyn";
+
+fn make_fingerprint(
+    urn: &str,
+    plugin_version: &str,
+    artifact_sha256: &str,
+    plugin_api_version: &str,
+) -> DynamicNodeFingerprint {
+    DynamicNodeFingerprint {
+        component_urn: urn.to_owned(),
+        plugin_version: plugin_version.to_owned(),
+        artifact_sha256: artifact_sha256.to_owned(),
+        plugin_api_version: plugin_api_version.to_owned(),
+    }
+}
+
+/// Build a registry containing one dynamic processor and one dynamic
+/// exporter with the given fingerprints. Validators always succeed; we
+/// install no-op factory closures so the controller's
+/// `validate_pipeline_components_with_factory` accepts these URNs as
+/// runtime-instantiable (matches the post-Patch-4 reality where dynamic
+/// entries do have real factories).
+fn build_dynamic_registry(
+    processor_fp: DynamicNodeFingerprint,
+    exporter_fp: DynamicNodeFingerprint,
+) -> DynamicComponentRegistry<()> {
+    use otap_df_engine::runtime_registry::{DynamicExporterFactory, DynamicProcessorFactory};
+    use std::sync::Arc as StdArc;
+
+    let proc_factory: DynamicProcessorFactory<()> = StdArc::new(|_, _, _, _| {
+        panic!("dynamic processor factory should not be invoked in planning-only tests")
+    });
+    let exp_factory: DynamicExporterFactory<()> = StdArc::new(|_, _, _, _| {
+        panic!("dynamic exporter factory should not be invoked in planning-only tests")
+    });
+
+    let mut reg = DynamicComponentRegistry::<()>::empty();
+    reg.register_processor(DynamicProcessorEntry::<()> {
+        urn: ComponentUrn::from(DYN_PROCESSOR_URN),
+        validator: ConfigValidator::Static(test_validate_config),
+        fingerprint: processor_fp,
+        wiring_contract: WiringContract::UNRESTRICTED,
+        factory: Some(proc_factory),
+    })
+    .expect("processor entry");
+    reg.register_exporter(DynamicExporterEntry::<()> {
+        urn: ComponentUrn::from(DYN_EXPORTER_URN),
+        validator: ConfigValidator::Static(test_validate_config),
+        fingerprint: exporter_fp,
+        wiring_contract: WiringContract::UNRESTRICTED,
+        factory: Some(exp_factory),
+    })
+    .expect("exporter entry");
+    reg
+}
+
+/// Mixed pipeline YAML: static receiver -> dynamic processor -> dynamic
+/// exporter. Used by all mixed-pipeline rollout tests below.
+fn mixed_pipeline_yaml(core_count: usize) -> String {
+    format!(
+        r#"
+        policies:
+          resources:
+            core_allocation:
+              type: core_count
+              count: {core_count}
+        nodes:
+          receiver:
+            type: "urn:test:receiver:example"
+            config: null
+          processor:
+            type: "{DYN_PROCESSOR_URN}"
+            config: null
+          exporter:
+            type: "{DYN_EXPORTER_URN}"
+            config: null
+        connections:
+          - from: receiver
+            to: processor
+          - from: processor
+            to: exporter
+"#
+    )
+}
+
+fn mixed_replacement_yaml(core_count: usize) -> String {
+    // Strip the leading `pipelines:` indentation used inside
+    // `engine_config_with_pipeline`.
+    format!(
+        r#"
+policies:
+  resources:
+    core_allocation:
+      type: core_count
+      count: {core_count}
+nodes:
+  receiver:
+    type: "urn:test:receiver:example"
+    config: null
+  processor:
+    type: "{DYN_PROCESSOR_URN}"
+    config: null
+  exporter:
+    type: "{DYN_EXPORTER_URN}"
+    config: null
+connections:
+  - from: receiver
+    to: processor
+  - from: processor
+    to: exporter
+"#
+    )
+}
+
+/// Override the plugin-fingerprint snapshot stored on the committed
+/// logical pipeline record. Used to simulate the case where the dynamic
+/// registry has rotated artifact identity between commit and replan
+/// without rebuilding the whole controller runtime.
+fn override_committed_fingerprints(
+    runtime: &ControllerRuntime<()>,
+    pipeline_group_id: &str,
+    pipeline_id: &str,
+    new_fingerprints: Vec<DynamicNodeFingerprint>,
+) {
+    let key = PipelineKey::new(
+        pipeline_group_id.to_owned().into(),
+        pipeline_id.to_owned().into(),
+    );
+    let mut state = runtime
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state
+        .logical_pipelines
+        .get_mut(&key)
+        .expect("committed pipeline record")
+        .plugin_fingerprints = new_fingerprints;
+}
+
+fn run_plan(runtime: &ControllerRuntime<()>, replacement_yaml: &str) -> CandidateRolloutPlan {
+    let replacement = PipelineConfig::from_yaml("g1".into(), "p1".into(), replacement_yaml)
+        .expect("replacement should parse");
+    runtime
+        .prepare_rollout_plan(
+            "g1",
+            "p1",
+            &ReconfigureRequest {
+                pipeline: replacement,
+                step_timeout_secs: 60,
+                drain_timeout_secs: 60,
+            },
+        )
+        .expect("plan should succeed")
+}
+
+/// Scenario: mixed static + dynamic pipeline replanned with identical
+/// pipeline shape, identical core allocation, and an identical dynamic
+/// registry.
+/// Guarantees: the planner classifies the rollout as `NoOp`, the
+/// committed snapshot includes both dynamic fingerprints, and the
+/// snapshot is sorted for deterministic equality.
+#[test]
+fn mixed_pipeline_returns_noop_when_plugin_fingerprint_unchanged() {
+    let config = engine_config_with_pipeline(&mixed_pipeline_yaml(1));
+    let processor_fp = make_fingerprint(DYN_PROCESSOR_URN, "1.0.0", "sha-p", "0.1.0");
+    let exporter_fp = make_fingerprint(DYN_EXPORTER_URN, "1.0.0", "sha-e", "0.1.0");
+    let runtime = test_runtime_with_dynamic_registry(
+        &config,
+        build_dynamic_registry(processor_fp.clone(), exporter_fp.clone()),
+    );
+    register_existing_pipeline(&runtime, &config);
+    let _receiver =
+        register_runtime_instance(&runtime, "g1", "p1", 0, 0, RuntimeInstanceLifecycle::Active);
+
+    // Sanity: the committed snapshot captured both dynamic fingerprints
+    // and is sorted by (urn, version, sha, api_version).
+    {
+        let key = PipelineKey::new("g1".to_owned().into(), "p1".to_owned().into());
+        let state = runtime
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let record = state.logical_pipelines.get(&key).expect("committed record");
+        assert_eq!(record.plugin_fingerprints.len(), 2);
+        let mut sorted = record.plugin_fingerprints.clone();
+        sorted.sort_by(|a, b| {
+            (
+                &a.component_urn,
+                &a.plugin_version,
+                &a.artifact_sha256,
+                &a.plugin_api_version,
+            )
+                .cmp(&(
+                    &b.component_urn,
+                    &b.plugin_version,
+                    &b.artifact_sha256,
+                    &b.plugin_api_version,
+                ))
+        });
+        assert_eq!(
+            record.plugin_fingerprints, sorted,
+            "snapshot must be sorted"
+        );
+    }
+
+    let plan = run_plan(&runtime, &mixed_replacement_yaml(1));
+    assert_eq!(plan.action, RolloutAction::NoOp);
+    assert_eq!(plan.target_generation, 0);
+    assert!(plan.resize_start_cores.is_empty());
+    assert!(plan.resize_stop_cores.is_empty());
+}
+
+/// Scenario: mixed pipeline replanned with the same dynamic registry but
+/// a different core allocation.
+/// Guarantees: the planner classifies the rollout as `Resize` (not
+/// `Replace`) because plugin fingerprints are unchanged and only
+/// resources changed.
+#[test]
+fn mixed_pipeline_returns_resize_when_only_resources_change() {
+    let config = engine_config_with_pipeline(&mixed_pipeline_yaml(1));
+    let processor_fp = make_fingerprint(DYN_PROCESSOR_URN, "1.0.0", "sha-p", "0.1.0");
+    let exporter_fp = make_fingerprint(DYN_EXPORTER_URN, "1.0.0", "sha-e", "0.1.0");
+    let runtime = test_runtime_with_dynamic_registry(
+        &config,
+        build_dynamic_registry(processor_fp, exporter_fp),
+    );
+    register_existing_pipeline(&runtime, &config);
+    let _receiver =
+        register_runtime_instance(&runtime, "g1", "p1", 0, 0, RuntimeInstanceLifecycle::Active);
+
+    let plan = run_plan(&runtime, &mixed_replacement_yaml(2));
+    assert_eq!(plan.action, RolloutAction::Resize);
+    assert_eq!(plan.added_assigned_cores, vec![1]);
+    assert_eq!(plan.resize_start_cores, vec![1]);
+    assert!(plan.resize_stop_cores.is_empty());
+    assert_eq!(plan.target_generation, 0);
+}
+
+/// Scenario: mixed pipeline whose dynamic processor's plugin_version
+/// changed between commit and replan (simulating a rolled artifact).
+/// Guarantees: the planner classifies the rollout as `Replace`, even
+/// though config and resources are identical.
+#[test]
+fn mixed_pipeline_returns_replace_when_plugin_version_changes() {
+    let config = engine_config_with_pipeline(&mixed_pipeline_yaml(1));
+    let processor_fp = make_fingerprint(DYN_PROCESSOR_URN, "1.0.0", "sha-p", "0.1.0");
+    let exporter_fp = make_fingerprint(DYN_EXPORTER_URN, "1.0.0", "sha-e", "0.1.0");
+    let runtime = test_runtime_with_dynamic_registry(
+        &config,
+        build_dynamic_registry(processor_fp, exporter_fp.clone()),
+    );
+    register_existing_pipeline(&runtime, &config);
+    let _receiver =
+        register_runtime_instance(&runtime, "g1", "p1", 0, 0, RuntimeInstanceLifecycle::Active);
+
+    // Simulate the dynamic registry rotating the processor's
+    // plugin_version after commit. We rewrite the committed snapshot to
+    // an older version so that the live registry's current value (1.0.0)
+    // diverges from `record.plugin_fingerprints` at replan time.
+    let stale_processor_fp = make_fingerprint(DYN_PROCESSOR_URN, "0.9.0", "sha-p", "0.1.0");
+    override_committed_fingerprints(&runtime, "g1", "p1", vec![stale_processor_fp, exporter_fp]);
+
+    let plan = run_plan(&runtime, &mixed_replacement_yaml(1));
+    assert_eq!(plan.action, RolloutAction::Replace);
+    assert_eq!(plan.target_generation, 1);
+    assert!(plan.resize_start_cores.is_empty());
+    assert!(plan.resize_stop_cores.is_empty());
+}
+
+/// Scenario: same as above but the changing field is `artifact_sha256`.
+/// Guarantees: an artifact-bytes change forces `Replace` even when the
+/// declared plugin version is unchanged.
+#[test]
+fn mixed_pipeline_returns_replace_when_artifact_sha_changes() {
+    let config = engine_config_with_pipeline(&mixed_pipeline_yaml(1));
+    let processor_fp = make_fingerprint(DYN_PROCESSOR_URN, "1.0.0", "sha-p", "0.1.0");
+    let exporter_fp = make_fingerprint(DYN_EXPORTER_URN, "1.0.0", "sha-e", "0.1.0");
+    let runtime = test_runtime_with_dynamic_registry(
+        &config,
+        build_dynamic_registry(processor_fp.clone(), exporter_fp),
+    );
+    register_existing_pipeline(&runtime, &config);
+    let _receiver =
+        register_runtime_instance(&runtime, "g1", "p1", 0, 0, RuntimeInstanceLifecycle::Active);
+
+    // Snapshot has a different artifact sha for the exporter; live
+    // registry still says "sha-e".
+    let stale_exporter_fp = make_fingerprint(DYN_EXPORTER_URN, "1.0.0", "sha-e-old", "0.1.0");
+    override_committed_fingerprints(&runtime, "g1", "p1", vec![processor_fp, stale_exporter_fp]);
+
+    let plan = run_plan(&runtime, &mixed_replacement_yaml(1));
+    assert_eq!(plan.action, RolloutAction::Replace);
+}
+
+/// Scenario: same as above but the changing field is `plugin_api_version`.
+/// Guarantees: an API-contract version change also forces `Replace`.
+#[test]
+fn mixed_pipeline_returns_replace_when_plugin_api_version_changes() {
+    let config = engine_config_with_pipeline(&mixed_pipeline_yaml(1));
+    let processor_fp = make_fingerprint(DYN_PROCESSOR_URN, "1.0.0", "sha-p", "0.1.0");
+    let exporter_fp = make_fingerprint(DYN_EXPORTER_URN, "1.0.0", "sha-e", "0.1.0");
+    let runtime = test_runtime_with_dynamic_registry(
+        &config,
+        build_dynamic_registry(processor_fp.clone(), exporter_fp),
+    );
+    register_existing_pipeline(&runtime, &config);
+    let _receiver =
+        register_runtime_instance(&runtime, "g1", "p1", 0, 0, RuntimeInstanceLifecycle::Active);
+
+    let stale_exporter_fp = make_fingerprint(DYN_EXPORTER_URN, "1.0.0", "sha-e", "0.0.9");
+    override_committed_fingerprints(&runtime, "g1", "p1", vec![processor_fp, stale_exporter_fp]);
+
+    let plan = run_plan(&runtime, &mixed_replacement_yaml(1));
+    assert_eq!(plan.action, RolloutAction::Replace);
+}
+
+/// Scenario: mixed pipeline whose dynamic registry contains two dynamic
+/// nodes (processor + exporter) referenced by the pipeline.
+/// Guarantees: the committed plugin-fingerprint snapshot is sorted in a
+/// deterministic, stable order regardless of registry iteration order
+/// (HashMap ordering is unspecified).
+#[test]
+fn multiple_dynamic_components_produce_sorted_stable_snapshot() {
+    let config = engine_config_with_pipeline(&mixed_pipeline_yaml(1));
+    // Pick fingerprints whose URNs do not match the order they are
+    // inserted into the registry, so a missing sort would be visible.
+    let processor_fp = make_fingerprint(DYN_PROCESSOR_URN, "9.9.9", "z-sha", "0.1.0");
+    let exporter_fp = make_fingerprint(DYN_EXPORTER_URN, "0.0.1", "a-sha", "0.1.0");
+    let runtime = test_runtime_with_dynamic_registry(
+        &config,
+        build_dynamic_registry(processor_fp.clone(), exporter_fp.clone()),
+    );
+    register_existing_pipeline(&runtime, &config);
+
+    let key = PipelineKey::new("g1".to_owned().into(), "p1".to_owned().into());
+    let state = runtime
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let record = state.logical_pipelines.get(&key).expect("committed record");
+
+    assert_eq!(record.plugin_fingerprints.len(), 2);
+    // Sort key starts with `component_urn`; "urn:test:exporter:dyn" <
+    // "urn:test:processor:dyn" lexically, so the exporter fingerprint
+    // must appear first.
+    assert_eq!(record.plugin_fingerprints[0], exporter_fp);
+    assert_eq!(record.plugin_fingerprints[1], processor_fp);
+}
+
+/// Table-driven coverage of the `(static-only|mixed) × (cores
+/// unchanged|changed) × (fingerprint unchanged|changed)` action matrix.
+///
+/// Verifies that:
+///   * static-only pipelines: cores unchanged -> `NoOp`, cores changed
+///     -> `Resize` (fingerprint axis is N/A).
+///   * mixed pipelines: fingerprint changed -> `Replace` (regardless of
+///     cores); fingerprint unchanged + cores changed -> `Resize`;
+///     everything unchanged -> `NoOp`.
+#[test]
+fn rollout_action_matrix_covers_static_and_mixed_pipelines() {
+    #[derive(Debug, Clone, Copy)]
+    enum Shape {
+        StaticOnly,
+        Mixed,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct Case {
+        shape: Shape,
+        change_cores: bool,
+        change_fingerprint: bool,
+        expected: RolloutAction,
+    }
+
+    let cases = [
+        // Static-only baseline (fingerprint axis ignored).
+        Case {
+            shape: Shape::StaticOnly,
+            change_cores: false,
+            change_fingerprint: false,
+            expected: RolloutAction::NoOp,
+        },
+        Case {
+            shape: Shape::StaticOnly,
+            change_cores: true,
+            change_fingerprint: false,
+            expected: RolloutAction::Resize,
+        },
+        // Mixed pipelines.
+        Case {
+            shape: Shape::Mixed,
+            change_cores: false,
+            change_fingerprint: false,
+            expected: RolloutAction::NoOp,
+        },
+        Case {
+            shape: Shape::Mixed,
+            change_cores: true,
+            change_fingerprint: false,
+            expected: RolloutAction::Resize,
+        },
+        Case {
+            shape: Shape::Mixed,
+            change_cores: false,
+            change_fingerprint: true,
+            expected: RolloutAction::Replace,
+        },
+        Case {
+            shape: Shape::Mixed,
+            change_cores: true,
+            change_fingerprint: true,
+            expected: RolloutAction::Replace,
+        },
+    ];
+
+    for case in cases {
+        let processor_fp = make_fingerprint(DYN_PROCESSOR_URN, "1.0.0", "sha-p", "0.1.0");
+        let exporter_fp = make_fingerprint(DYN_EXPORTER_URN, "1.0.0", "sha-e", "0.1.0");
+
+        let (config_yaml, replacement_yaml, runtime) = match case.shape {
+            Shape::StaticOnly => {
+                let cfg = engine_config_with_pipeline(&static_pipeline_yaml(1));
+                let rt = test_runtime(&cfg);
+                let repl_cores = if case.change_cores { 2 } else { 1 };
+                (cfg, static_replacement_yaml(repl_cores), rt)
+            }
+            Shape::Mixed => {
+                let cfg = engine_config_with_pipeline(&mixed_pipeline_yaml(1));
+                let rt = test_runtime_with_dynamic_registry(
+                    &cfg,
+                    build_dynamic_registry(processor_fp.clone(), exporter_fp.clone()),
+                );
+                let repl_cores = if case.change_cores { 2 } else { 1 };
+                (cfg, mixed_replacement_yaml(repl_cores), rt)
+            }
+        };
+
+        register_existing_pipeline(&runtime, &config_yaml);
+        let _receiver =
+            register_runtime_instance(&runtime, "g1", "p1", 0, 0, RuntimeInstanceLifecycle::Active);
+
+        if case.change_fingerprint {
+            // Only meaningful for `Shape::Mixed`; the static-only cases
+            // never set this flag.
+            let stale_processor_fp = make_fingerprint(DYN_PROCESSOR_URN, "0.9.0", "sha-p", "0.1.0");
+            override_committed_fingerprints(
+                &runtime,
+                "g1",
+                "p1",
+                vec![stale_processor_fp, exporter_fp.clone()],
+            );
+        }
+
+        let plan = run_plan(&runtime, &replacement_yaml);
+        assert_eq!(
+            plan.action, case.expected,
+            "case {case:?} produced unexpected action {:?}",
+            plan.action
+        );
+    }
 }

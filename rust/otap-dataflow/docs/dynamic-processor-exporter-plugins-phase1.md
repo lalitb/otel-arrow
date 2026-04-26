@@ -2,7 +2,61 @@
 
 ## Status
 
-Draft for internal review.
+**Phase 1 implemented.** The design below was the original RFC; the
+"Implementation Status" section immediately following lists what
+currently ships on the `wasm` branch. Subsequent sections describe
+both the design and (where applicable) the as-built behavior.
+
+## Implementation Status (phase 1, current)
+
+The following capabilities are implemented end-to-end and exercised by
+unit and integration tests on the `wasm` branch:
+
+- Plugin discovery from `--plugin-dir <DIR>` (repeatable) at startup.
+- Manifest parsing (`apiVersion: otap.plugin/v1alpha1`,
+  `kind: WasmPlugin`) with mandatory `runtime.path` + `runtime.sha256`.
+- SHA-256 artifact integrity verification (always required).
+- Real **minisign** signature verification with two host policies:
+  default (verify when a public key is configured) and
+  `--plugin-require-signed` (reject any plugin without a verified
+  signature).
+- Wasmtime Component Model loading, behind the
+  `wasmtime-backend` feature flag on `crates/plugin-host`.
+- Disk-backed precompiled component cache keyed by artifact SHA-256,
+  Wasmtime version, target triple, engine-config fingerprint, and
+  plugin API version (`--plugin-cache-dir <DIR>`).
+- `descriptor()` and `validate-config()` plugin exports invoked at
+  startup; descriptor is authoritative for component URNs / kinds /
+  payload-format support.
+- `WasmProcessorAdapter`: real runtime path with host-enforced
+  Wasmtime epoch-interruption deadline and OTLP-bytes payload
+  conversion. Preserves `OtapPdata` context across the plugin call.
+- `WasmExporterAdapter`: real runtime path dispatched through
+  `tokio::spawn_blocking`, with an explicit cross-instance concurrency
+  cap (`--plugin-exporter-blocking-concurrency`, default 32) backed by
+  a shared `tokio::sync::Semaphore`. Per-instance serialization is
+  preserved by the engine's sequential dispatch model.
+- Plugin fingerprint
+  `(component_urn, plugin_version, artifact_sha256, plugin_api_version)`
+  participates in live-reconfig rollout planning: a change to any
+  component referenced by a pipeline forces `RolloutAction::Replace`.
+- Phase-1 invariants enforced at descriptor-load time:
+  processors/exporters only; `otlp-proto-bytes` payload only;
+  single/default-output only. `otap-arrow-ipc` is reserved in the WIT
+  variant but rejected.
+- Static `linkme` registration is unchanged and remains the default
+  path; pipelines may freely mix static and plugin-backed nodes.
+
+What is **not** implemented in phase 1 (deferred):
+
+- Receiver and extension plugins.
+- Arrow IPC (`otap-arrow-ipc`) execution; reserved in the ABI, rejected
+  at load time.
+- Remote plugin fetch / auto-update.
+- In-place code unload/reload at runtime.
+- Replacement of built-in static nodes by plugins of the same URN
+  (static-first precedence).
+- Metrics import API for plugins (logs only in v1).
 
 ## Problem Statement
 
@@ -164,6 +218,7 @@ telemetry:
   logLevel: info
 signing:
   minisignPublicKeyPath: ./trusted_plugins.pub
+  # minisignSignaturePath: ./plugin.wasm.minisig  # optional; default: <artifact>.minisig
 ```
 
 Manifest purpose:
@@ -250,11 +305,11 @@ Rules:
 A plugin component is instantiated once per `(plugin, node, generation, core)` tuple.
 
 - The compiled Wasm `Component` is cached globally.
-- The `Store`/instance is per runtime node instance and lives on that core’s execution context.
+- The `Store`/instance is per runtime node instance and lives on that core's execution context.
 
 Operational note:
 
-- memory floor is roughly `cores × plugin-nodes × memoryMaxBytes`
+- memory floor is roughly `cores * plugin-nodes * memoryMaxBytes`
 - operators must size `memoryMaxBytes` conservatively
 
 ### Steady State
@@ -273,7 +328,17 @@ Exporter adapter:
 
 - receives host payload
 - converts to OTLP bytes
-- dispatches plugin call via bounded blocking worker
+- dispatches plugin call via bounded blocking worker pool
+- pool concurrency is capped by an explicit configuration knob
+  (`PluginHostConfig::exporter_blocking_concurrency`, surfaced on the CLI
+  as `--plugin-exporter-blocking-concurrency`, default 32). The cap is
+  enforced by a shared `tokio::sync::Semaphore` owned by `PluginHost`
+  and threaded into every `WasmExporterAdapter`; a permit is acquired
+  before each `spawn_blocking` dispatch and released on completion.
+- when the cap is saturated, dispatches **back-pressure** (await a
+  permit) rather than failing fast; this preserves existing exporter
+  no-data-loss semantics and naturally slows inbox drain. A closed
+  semaphore is treated as a transient runtime error.
 - does not allow concurrent calls into the same Wasm instance
 - maps result back to exporter semantics
 
@@ -424,16 +489,23 @@ Deferred, but reserved in the ABI now to avoid a future ABI break.
 
 ## Migration Plan
 
-1. Land runtime registry overlay with zero static behavior change.
-2. Add validator abstraction.
-3. Thread owned runtime registry into startup/controller.
-4. Add manifest loading and precompiled Wasmtime cache.
-5. Add processor adapter.
-6. Add exporter adapter.
-7. Add sample plugins and docs.
-8. Keep feature gated initially.
+All steps below are landed on the `wasm` branch:
+
+1. Runtime registry overlay with zero static behavior change. *(done)*
+2. Validator abstraction (`ConfigValidator::Static` / `Dynamic`). *(done)*
+3. Owned runtime registry threaded through startup/controller. *(done)*
+4. Manifest loading + precompiled Wasmtime cache + minisign signature
+   verification. *(done)*
+5. `WasmProcessorAdapter` with epoch-deadline enforcement. *(done)*
+6. `WasmExporterAdapter` with bounded blocking dispatch. *(done)*
+7. Identity-plugin fixture + Wasmtime-backed integration tests. *(done)*
+8. Feature-gating via the `wasmtime-backend` Cargo feature on
+   `crates/plugin-host`. *(done)*
 
 Static `linkme` nodes remain unchanged and fully supported throughout.
+
+For an operator-facing walkthrough of the implemented surface, see
+[`dynamic-plugins-usage.md`](./dynamic-plugins-usage.md).
 
 ## Open Questions
 
