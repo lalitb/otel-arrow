@@ -21,6 +21,7 @@ use otap_df_core_nodes as _;
 use otap_df_engine::runtime_registry::RuntimeComponentRegistry;
 use otap_df_otap::OTAP_PIPELINE_FACTORY;
 use otap_df_plugin_host::PluginHost;
+use otap_df_plugin_native_host::{NativePluginHost, NativePluginHostConfig};
 /// Project license text (Apache-2.0), embedded at compile time.
 const LICENSE_TEXT: &str = include_str!("../LICENSE");
 
@@ -207,10 +208,11 @@ struct Args {
     #[arg(long, value_name = "DIR")]
     plugin_cache_dir: Option<std::path::PathBuf>,
 
-    /// Require all plugins to be signed (minisign).  Phase-1 alpha: when
-    /// any plugin manifest declares a signing key, this flag forces
-    /// verification; otherwise unsigned plugins are accepted with a
-    /// warning.  Becomes the default before stable release.
+    /// Reject plugin manifests that do not configure a minisign public
+    /// key. Plugins that configure a key are always verified
+    /// (regardless of this flag); this flag controls only whether
+    /// *unsigned* manifests are accepted. Becomes the default before
+    /// stable release.
     #[arg(long)]
     plugin_require_signed: bool,
 
@@ -304,18 +306,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Built early so the startup banner reflects any dynamically registered
     // plugin components in addition to the static `linkme` factories.
-    let plugin_host = PluginHost::new(otap_df_plugin_host::PluginHostConfig {
-        plugin_dirs,
+    // The wasm and native hosts share the `--plugin-dir` flag and each
+    // filter the directory contents to manifests they recognize:
+    //   * wasm   → `kind: WasmPlugin`   + `runtime: wasmtime-component`
+    //   * native → `kind: NativePlugin` + `runtime: native-cdylib`
+    // Both contribute to a single dynamic overlay layered on top of the
+    // static `OTAP_PIPELINE_FACTORY`. Static built-ins still take
+    // precedence at lookup time (RuntimeComponentRegistry semantics).
+    let wasm_host = PluginHost::new(otap_df_plugin_host::PluginHostConfig {
+        plugin_dirs: plugin_dirs.clone(),
         cache_dir: plugin_cache_dir,
         require_signed: plugin_require_signed,
         exporter_blocking_concurrency,
     });
-    let loaded_plugins = plugin_host.load_all()?;
-    let dynamic_registry = otap_df_plugin_nodes::build_dynamic_registry(
-        &loaded_plugins,
-        plugin_host.exporter_blocking_permits(),
+    let loaded_wasm_plugins = wasm_host.load_all()?;
+    let mut dynamic_registry = otap_df_plugin_nodes::build_dynamic_registry(
+        &loaded_wasm_plugins,
+        wasm_host.exporter_blocking_permits(),
     )
     .map_err(|e| std::io::Error::other(format!("duplicate plugin URN: {}", e.0)))?;
+
+    let native_host = NativePluginHost::new(NativePluginHostConfig {
+        plugin_dirs,
+        require_signed: plugin_require_signed,
+    });
+    let loaded_native_plugins = native_host.load_all()?;
+    otap_df_plugin_native_nodes::extend_native_registry(
+        &mut dynamic_registry,
+        &loaded_native_plugins,
+    )
+    .map_err(|e| {
+        std::io::Error::other(format!(
+            "duplicate plugin URN across wasm and native backends: {}",
+            e.0
+        ))
+    })?;
+
     let runtime_registry = RuntimeComponentRegistry::new(&OTAP_PIPELINE_FACTORY, dynamic_registry);
 
     println!(

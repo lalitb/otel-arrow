@@ -2,6 +2,23 @@
 
 ## Status
 
+**Superseded for the hot path by native cdylib plugins.**
+
+> The Wasmtime-component implementation described below remains in the
+> tree (under `crates/plugin-{api,manifest,host,nodes}`) but is **parked
+> for hot-path use**: its `process(list<u8>) → list<u8>` ABI copies and
+> re-encodes payloads, which is incompatible with the OTAP/Arrow
+> zero-copy requirement. See [`crates/plugin-native-host`] and
+> [`crates/plugin-native-nodes`] for the supported phase-1 zero-copy
+> path: native cdylib processor plugins receiving an opaque
+> `OtapPdataHandle` and returning `ForwardSame` / `Drop` / `Error`.
+>
+> The wasm scaffolding (manifest discovery, SHA-256 + minisign,
+> descriptor / `validate-config`, `PluginFingerprint`, runtime registry
+> overlay) is shared between the two backends and is not deprecated. A
+> future revision may revive a wasm path with a resource-handle ABI for
+> sandboxed scripting plugins, where data never crosses linear memory.
+
 **Phase 1 implemented.** The design below was the original RFC; the
 "Implementation Status" section immediately following lists what
 currently ships on the `wasm` branch. Subsequent sections describe

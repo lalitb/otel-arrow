@@ -347,6 +347,13 @@ pub struct OtapPdata {
     payload: OtapPayload,
 }
 
+/// Free-function form of [`OtapPdata::payload_view`] for callers that
+/// prefer a path-based import (see plugin-native-host).
+#[must_use]
+pub fn payload_view(p: &OtapPdata) -> &OtapPayload {
+    p.payload_view()
+}
+
 /* -------- Signal type -------- */
 
 impl OtapPdata {
@@ -375,6 +382,18 @@ impl OtapPdata {
     #[must_use]
     pub const fn new(context: Context, payload: OtapPayload) -> Self {
         Self { context, payload }
+    }
+
+    /// Borrow the underlying payload without consuming the pdata.
+    ///
+    /// Used by the native plugin host to expose payload-aware accessors
+    /// (e.g. resource attribute lookups) to plugins through an opaque
+    /// handle. The borrow is short-lived: the plugin host scopes it to
+    /// one `process` call and discards the wrapping handle when the
+    /// call returns.
+    #[must_use]
+    pub fn payload_view(&self) -> &OtapPayload {
+        &self.payload
     }
 
     /// Returns the type of signal represented by this `OtapPdata` instance.

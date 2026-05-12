@@ -26,7 +26,8 @@ pub struct PluginManifest {
     /// API version of the manifest schema itself, e.g. `otap.plugin/v1alpha1`.
     #[serde(rename = "apiVersion")]
     pub api_version: String,
-    /// Manifest kind. Phase 1 only accepts `WasmPlugin`.
+    /// Manifest kind. Phase 1 accepts `WasmPlugin` (legacy/experimental) and
+    /// `NativePlugin` (the supported zero-copy hot-path).
     pub kind: ManifestKind,
     /// Plugin metadata.
     pub metadata: Metadata,
@@ -50,8 +51,11 @@ pub struct PluginManifest {
 /// Manifest kind.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ManifestKind {
-    /// A Wasmtime-component-based plugin.
+    /// A Wasmtime-component-based plugin (experimental, parked for the
+    /// hot path — see docs/dynamic-processor-exporter-plugins-phase1.md).
     WasmPlugin,
+    /// A native cdylib plugin (phase-1 supported zero-copy path).
+    NativePlugin,
 }
 
 /// Plugin metadata.
@@ -70,6 +74,14 @@ pub enum RuntimeSpec {
     /// Wasmtime-component backend.
     WasmtimeComponent {
         /// Path to the `.wasm` artifact, relative to the manifest file.
+        path: PathBuf,
+        /// Hex-encoded SHA-256 of the artifact (required, always checked).
+        sha256: String,
+    },
+    /// Native cdylib backend (phase-1 supported zero-copy path).
+    NativeCdylib {
+        /// Path to the cdylib (`.so` / `.dylib` / `.dll`) artifact,
+        /// relative to the manifest file.
         path: PathBuf,
         /// Hex-encoded SHA-256 of the artifact (required, always checked).
         sha256: String,
@@ -154,11 +166,16 @@ pub fn load_manifest(manifest_path: &Path) -> Result<LoadedManifest, PluginError
     let manifest: PluginManifest =
         serde_yaml::from_slice(&bytes).map_err(|e| PluginError::ManifestParse(format!("{e}")))?;
 
-    if !matches!(manifest.kind, ManifestKind::WasmPlugin) {
-        return Err(PluginError::ManifestParse(format!(
-            "unsupported manifest kind: {:?}",
-            manifest.kind
-        )));
+    // Cross-validate kind vs runtime: WasmPlugin must carry
+    // WasmtimeComponent runtime; NativePlugin must carry NativeCdylib.
+    match (&manifest.kind, &manifest.runtime) {
+        (ManifestKind::WasmPlugin, RuntimeSpec::WasmtimeComponent { .. }) => {}
+        (ManifestKind::NativePlugin, RuntimeSpec::NativeCdylib { .. }) => {}
+        (k, r) => {
+            return Err(PluginError::ManifestParse(format!(
+                "manifest kind {k:?} does not match runtime {r:?}"
+            )));
+        }
     }
 
     let manifest_dir = manifest_path
@@ -167,7 +184,7 @@ pub fn load_manifest(manifest_path: &Path) -> Result<LoadedManifest, PluginError
         .unwrap_or_else(|| PathBuf::from("."));
 
     let artifact_path = match &manifest.runtime {
-        RuntimeSpec::WasmtimeComponent { path, .. } => {
+        RuntimeSpec::WasmtimeComponent { path, .. } | RuntimeSpec::NativeCdylib { path, .. } => {
             if path.is_absolute() {
                 path.clone()
             } else {
@@ -191,7 +208,8 @@ pub fn verify_artifact_sha256(loaded: &LoadedManifest) -> Result<(), PluginError
     use sha2::{Digest, Sha256};
 
     let expected_hex = match &loaded.manifest.runtime {
-        RuntimeSpec::WasmtimeComponent { sha256, .. } => sha256,
+        RuntimeSpec::WasmtimeComponent { sha256, .. }
+        | RuntimeSpec::NativeCdylib { sha256, .. } => sha256,
     };
     let bytes = std::fs::read(&loaded.artifact_path)?;
     let mut hasher = Sha256::new();

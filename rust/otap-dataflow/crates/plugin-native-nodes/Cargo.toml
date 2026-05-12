@@ -1,0 +1,32 @@
+[package]
+name = "otap-df-plugin-native-nodes"
+description = "Engine adapters and registry bridge for native cdylib plugins (phase 1: processor only, ForwardSame/Drop/Error verbs, opaque OtapPdataHandle)."
+version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+otap-df-config = { workspace = true }
+otap-df-engine = { workspace = true }
+otap-df-otap = { workspace = true, features = ["crypto-ring"] }
+otap-df-pdata = { workspace = true }
+otap-df-plugin-abi = { workspace = true }
+otap-df-plugin-api = { workspace = true }
+otap-df-plugin-manifest = { workspace = true }
+otap-df-plugin-native-host = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }
+prost = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+otap-df-pdata = { workspace = true }

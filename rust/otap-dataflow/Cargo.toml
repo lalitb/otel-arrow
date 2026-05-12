@@ -37,6 +37,8 @@ otap-df-core-nodes.workspace = true
 otap-df-engine.workspace = true
 otap-df-otap.workspace = true
 otap-df-plugin-host = { workspace = true, features = ["wasmtime-backend"] }
+otap-df-plugin-native-host.workspace = true
+otap-df-plugin-native-nodes.workspace = true
 otap-df-plugin-nodes.workspace = true
 thiserror.workspace = true
 serde_json.workspace = true
@@ -61,10 +63,13 @@ otap-df-controller = { path = "crates/controller" }
 otap-df-core-nodes = { path = "crates/core-nodes" }
 otap-df-engine = { path = "crates/engine" }
 otap-df-otap = { path = "crates/otap" }
+otap-df-plugin-abi = { path = "crates/plugin-abi" }
 otap-df-plugin-api = { path = "crates/plugin-api" }
 otap-df-plugin-host = { path = "crates/plugin-host" }
 otap-df-plugin-manifest = { path = "crates/plugin-manifest" }
 otap-df-plugin-nodes = { path = "crates/plugin-nodes" }
+otap-df-plugin-native-host = { path = "crates/plugin-native-host" }
+otap-df-plugin-native-nodes = { path = "crates/plugin-native-nodes" }
 otap-test-tls-certs = { package = "otap-df-test-tls-certs", path = "crates/otap-test-tls-certs" }
 otap-df-pdata = { path = "crates/pdata" }
 otap-df-pdata-views = { path = "crates/pdata-views" }
@@ -118,6 +123,7 @@ iso8601 = "0.6.3"
 itoa = "1"
 itertools = "0.14.0"
 k8s-openapi = { version = "0.27.0", features = ["latest"] }
+libloading = "0.8"
 kube = {version = "3.0.1", features = ["derive"] }
 linkme = "0.3.35"
 local-sync = "0.1.1"

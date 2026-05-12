@@ -162,6 +162,17 @@ impl PluginHost {
                         .map(|e| e == "yaml" || e == "yml")
                         .unwrap_or(false)
                 {
+                    // Pre-parse the manifest to skip artifacts owned by
+                    // a different backend (e.g. native cdylib plugins).
+                    // The native plugin host scans the same `--plugin-dir`
+                    // and loads those itself.
+                    let parsed = load_manifest(&path)?;
+                    if !matches!(
+                        &parsed.manifest.runtime,
+                        RuntimeSpec::WasmtimeComponent { .. }
+                    ) {
+                        continue;
+                    }
                     let l = self.load_one(&path)?;
                     loaded.push(l);
                 }
@@ -173,6 +184,17 @@ impl PluginHost {
     /// Load a single manifest path.
     pub fn load_one(&self, manifest_path: &std::path::Path) -> Result<LoadedPlugin, PluginError> {
         let manifest = load_manifest(manifest_path)?;
+        // Wasm host only handles WasmtimeComponent artifacts. Native cdylib
+        // manifests are routed through `otap-df-plugin-native-host`.
+        if !matches!(
+            &manifest.manifest.runtime,
+            RuntimeSpec::WasmtimeComponent { .. }
+        ) {
+            return Err(PluginError::ManifestParse(format!(
+                "wasm plugin host received non-wasm manifest: {}",
+                manifest_path.display()
+            )));
+        }
         verify_artifact_sha256(&manifest)?;
         verify_artifact_signature(&manifest, self.config.require_signed)?;
 
@@ -215,6 +237,8 @@ impl PluginHost {
 
         let sha = match &manifest.manifest.runtime {
             RuntimeSpec::WasmtimeComponent { sha256, .. } => sha256.to_lowercase(),
+            // Unreachable: native manifests are filtered above.
+            RuntimeSpec::NativeCdylib { .. } => unreachable!("guarded above"),
         };
 
         let cache_key = ComponentCacheKey {
