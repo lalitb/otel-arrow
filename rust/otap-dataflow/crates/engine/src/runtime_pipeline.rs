@@ -401,6 +401,26 @@ impl<PData: 'static + Debug + Clone + ReceivedAtNode + Unwindable + FlowMetricHo
             let pipeline_completion_msg_tx = pipeline_completion_msg_tx.clone();
             let effect_metrics_reporter = metrics_reporter.clone();
             let final_metrics_reporter = metrics_reporter.clone();
+            // Build the optional listener-group handle for this
+            // (pipeline_group, receiver_node, core) instance. When
+            // coordinated reuseport is disabled, or no plan covers the
+            // receiver, the handle is harmless: the manager returns
+            // `NoPlan` and the EffectHandler falls back to its
+            // existing per-receiver bind path. Built via
+            // `ListenerGroupHandle::for_receiver` so the runtime key
+            // shares the same stringification as
+            // `ListenerGroupKey::tcp_for_receiver` (controller side).
+            let listener_group_handle =
+                u32::try_from(pipeline_context.core_id())
+                    .ok()
+                    .map(|core_id| {
+                        crate::listener_group::ListenerGroupHandle::for_receiver(
+                            pipeline_context.listener_group_manager().clone(),
+                            pipeline_context.pipeline_group_id().to_string(),
+                            &node_id.name,
+                            core_id,
+                        )
+                    });
             let fut = async move {
                 let result = receiver
                     .start(
@@ -408,6 +428,7 @@ impl<PData: 'static + Debug + Clone + ReceivedAtNode + Unwindable + FlowMetricHo
                         pipeline_completion_msg_tx,
                         effect_metrics_reporter,
                         node_interests,
+                        listener_group_handle,
                     )
                     .await
                     .map(|terminal_state| {

@@ -1,0 +1,275 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+//! Plan extraction for the listener-group manager.
+//!
+//! Walks a resolved pipeline configuration and produces
+//! [`ListenerGroupPlan`]s for the set of known receiver URNs that
+//! expose a TCP `listening_addr` field. Used by the controller during
+//! Phase 2.5 startup to register plans before launching pipeline
+//! threads.
+//!
+//! The helper is intentionally conservative: it only matches the
+//! production receiver URNs that already use
+//! `EffectHandler::tcp_listener` (verified by the Phase 2.5 audit).
+//! Unknown URNs are silently skipped so a configuration with a
+//! third-party receiver is not rejected.
+//!
+//! Because the controller crate cannot depend on receiver crates
+//! (circular), we deserialise just the `listening_addr` field as a
+//! free-form `{ listening_addr: SocketAddr }` shape rather than
+//! pulling in each receiver's typed `Config`.
+
+use crate::listener_group::{ListenerGroupKey, ListenerGroupMember, ListenerGroupPlan};
+use crate::topology::CpuTopology;
+use otap_df_config::engine::ResolvedPipelineConfig;
+use std::net::SocketAddr;
+use std::str::FromStr;
+
+/// Receiver URNs that the helper recognises. Each one has a
+/// `listening_addr: SocketAddr` field at the top level of its node
+/// config that the seam can bind via `EffectHandler::tcp_listener`.
+///
+/// HTTP and gRPC server settings used by the OTLP receiver are nested
+/// under the `grpc` / `http` keys in its config; the conservative
+/// extractor below tries the top level first and then those two
+/// nested keys, which is enough for the current OTLP receiver shape.
+const KNOWN_RECEIVER_URNS: &[&str] = &[
+    "urn:otel:receiver:otlp",
+    "urn:otel:receiver:otap",
+    "urn:otel:receiver:syslog_cef",
+];
+
+/// Extracts every `listening_addr: SocketAddr` value present in
+/// `config`, looking at the top level and at the OTLP-style
+/// `{grpc, http}` nesting. Returns an empty vector if no recognised
+/// shape applies. Uses raw `serde_json::Value` access so the engine
+/// crate does not need a direct `serde` derive dependency.
+fn extract_tcp_addresses(config: &serde_json::Value) -> Vec<SocketAddr> {
+    let mut out = Vec::new();
+    if let Some(addr) = config
+        .get("listening_addr")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| SocketAddr::from_str(s).ok())
+    {
+        out.push(addr);
+    }
+    for sub in ["grpc", "http"] {
+        if let Some(addr) = config
+            .get(sub)
+            .and_then(|v| v.get("listening_addr"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| SocketAddr::from_str(s).ok())
+        {
+            out.push(addr);
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Returns one [`ListenerGroupPlan`] per recognised receiver in the
+/// pipeline that exposes a TCP `listening_addr`. Members are
+/// constructed from `cores`, with `numa_node` looked up via
+/// [`CpuTopology::numa_node_or_zero`] and `listener_id` assigned
+/// stably as the position of the core within `cores`.
+#[must_use]
+pub fn extract_plans_for_pipeline(
+    pipeline: &ResolvedPipelineConfig,
+    cores: &[u32],
+    topology: &CpuTopology,
+) -> Vec<ListenerGroupPlan> {
+    let mut plans = Vec::new();
+    if cores.is_empty() {
+        return plans;
+    }
+
+    let pipeline_group_id = pipeline.pipeline_group_id.as_ref().to_string();
+
+    for (node_id, node_cfg) in pipeline.pipeline.nodes().iter() {
+        let urn_str = node_cfg.r#type.as_str();
+        if !KNOWN_RECEIVER_URNS.contains(&urn_str) {
+            continue;
+        }
+        // Try addresses (one receiver may yield 0..N: e.g. OTLP can
+        // expose grpc and/or http simultaneously). The receiver_node_id
+        // in the key MUST match what `runtime_pipeline.rs` builds when
+        // constructing the per-receiver `ListenerGroupHandle` (plain
+        // `node_id.name.to_string()`) -- otherwise the runtime's
+        // `acquire(...)` returns `NoPlan` and silently falls through
+        // to the independent bind path. The bind address is already
+        // part of `ListenerGroupKey`, so it does not need to appear
+        // in the receiver_node_id; multiple addresses on the same
+        // receiver simply produce multiple keyed plans.
+        for addr in extract_tcp_addresses(&node_cfg.config) {
+            let members = cores
+                .iter()
+                .enumerate()
+                .map(|(idx, core_id)| ListenerGroupMember {
+                    listener_id: idx as u32,
+                    core_id: *core_id,
+                    numa_node: topology.numa_node_or_zero(*core_id),
+                })
+                .collect::<Vec<_>>();
+            let key = ListenerGroupKey::tcp_for_receiver(pipeline_group_id.clone(), node_id, addr);
+            plans.push(ListenerGroupPlan {
+                key,
+                expected_members: members,
+            });
+        }
+    }
+    plans
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn extract_top_level_listening_addr() {
+        let cfg = json!({"listening_addr": "0.0.0.0:4317"});
+        let addrs = extract_tcp_addresses(&cfg);
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0].port(), 4317);
+    }
+
+    #[test]
+    fn extract_otlp_grpc_and_http() {
+        let cfg = json!({
+            "grpc": {"listening_addr": "0.0.0.0:4317"},
+            "http": {"listening_addr": "0.0.0.0:4318"}
+        });
+        let addrs = extract_tcp_addresses(&cfg);
+        assert_eq!(addrs.len(), 2);
+        let ports: Vec<u16> = addrs.iter().map(|a| a.port()).collect();
+        assert!(ports.contains(&4317));
+        assert!(ports.contains(&4318));
+    }
+
+    #[test]
+    fn extract_returns_empty_for_unrecognised_shape() {
+        let cfg = json!({"some_other_field": 42});
+        assert!(extract_tcp_addresses(&cfg).is_empty());
+    }
+
+    /// Regression: the key the controller registers must equal the
+    /// key the runtime later builds for the same receiver. The
+    /// runtime constructs a `ListenerGroupHandle` with
+    /// `receiver_node_id = node_id.name.to_string()` and then calls
+    /// `handle.tcp_key(addr)`. Extraction must produce the same key,
+    /// otherwise `acquire(...)` returns `NoPlan` and silently falls
+    /// back to independent bind.
+    #[test]
+    fn extracted_plan_key_matches_runtime_handle_key() {
+        use crate::listener_group::{ListenerGroupHandle, ListenerGroupManager};
+        use otap_df_config::engine::{ResolvedPipelineConfig, ResolvedPipelineRole};
+        use otap_df_config::pipeline::PipelineConfig;
+        use otap_df_config::policy::ResolvedPolicies;
+
+        let yaml = r#"
+            nodes:
+              otlp_receiver:
+                type: "urn:otel:receiver:otlp"
+                config:
+                  listening_addr: "127.0.0.1:18011"
+        "#;
+        let pipeline = PipelineConfig::from_yaml("pg".into(), "pipe".into(), yaml).unwrap();
+        let resolved = ResolvedPipelineConfig {
+            pipeline_group_id: "pg".into(),
+            pipeline_id: "pipe".into(),
+            pipeline,
+            policies: ResolvedPolicies::default(),
+            role: ResolvedPipelineRole::Regular,
+        };
+
+        let topo = CpuTopology::empty();
+        let cores = vec![0u32, 1];
+        let plans = extract_plans_for_pipeline(&resolved, &cores, &topo);
+        assert_eq!(plans.len(), 1, "expected one plan for the OTLP receiver");
+        let plan = &plans[0];
+
+        // Build the runtime-style handle the same way
+        // `runtime_pipeline.rs` does, then compare keys.
+        let manager = ListenerGroupManager::new();
+        let addr = plan.key.addr;
+        let handle = ListenerGroupHandle::new(manager.clone(), "pg", "otlp_receiver", 0);
+        assert_eq!(handle.tcp_key(addr), plan.key);
+    }
+
+    /// End-to-end-ready: prove that the controller's extracted plan,
+    /// once registered, can actually be acquired by two runtime-style
+    /// handles concurrently and yield two distinct listeners on the
+    /// same bound address. Does not require root, eBPF, or any
+    /// receiver code path.
+    #[test]
+    fn extracted_plan_can_be_acquired_by_runtime_handles() {
+        use crate::listener_group::{AcquireOutcome, ListenerGroupHandle, ListenerGroupManager};
+        use otap_df_config::engine::{ResolvedPipelineConfig, ResolvedPipelineRole};
+        use otap_df_config::pipeline::PipelineConfig;
+        use otap_df_config::policy::ResolvedPolicies;
+        use std::net::TcpListener as StdTcpListener;
+        use std::os::fd::AsRawFd;
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+        use std::time::Duration;
+
+        // Discover an unused ephemeral port.
+        let probe = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let yaml = format!(
+            r#"
+            nodes:
+              otlp_receiver:
+                type: "urn:otel:receiver:otlp"
+                config:
+                  listening_addr: "{addr}"
+            "#
+        );
+        let pipeline = PipelineConfig::from_yaml("pg".into(), "pipe".into(), &yaml).unwrap();
+        let resolved = ResolvedPipelineConfig {
+            pipeline_group_id: "pg".into(),
+            pipeline_id: "pipe".into(),
+            pipeline,
+            policies: ResolvedPolicies::default(),
+            role: ResolvedPipelineRole::Regular,
+        };
+
+        let topo = CpuTopology::empty();
+        let cores = vec![0u32, 1u32];
+        let plans = extract_plans_for_pipeline(&resolved, &cores, &topo);
+        assert_eq!(plans.len(), 1);
+
+        let manager = ListenerGroupManager::new();
+        manager
+            .register_plan(plans.into_iter().next().unwrap())
+            .unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for core in cores.iter().copied() {
+            let mgr = manager.clone();
+            let bar = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                let _ = bar.wait();
+                let h = ListenerGroupHandle::new(mgr.clone(), "pg", "otlp_receiver", core);
+                mgr.acquire(&h.tcp_key(addr), core, Duration::from_secs(2))
+            }));
+        }
+        let mut listeners = Vec::new();
+        for h in handles {
+            match h.join().unwrap() {
+                AcquireOutcome::Listener(l) => listeners.push(l),
+                other => panic!("expected Listener, got {other:?}"),
+            }
+        }
+        assert_eq!(listeners.len(), 2);
+        assert_eq!(listeners[0].local_addr().unwrap(), addr);
+        assert_eq!(listeners[1].local_addr().unwrap(), addr);
+        assert_ne!(listeners[0].as_raw_fd(), listeners[1].as_raw_fd());
+    }
+}

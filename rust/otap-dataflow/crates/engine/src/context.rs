@@ -9,8 +9,10 @@ use crate::attributes::{
     PipelineAttributeSet, config_map_to_telemetry,
 };
 use crate::entity_context::{current_node_telemetry_handle, node_entity_key};
+use crate::listener_group::ListenerGroupManager;
 use crate::memory_limiter::MemoryPressureState;
 use crate::node::NodeId as EngineNodeId;
+use crate::topology::CpuTopology;
 use otap_df_config::node::NodeKind;
 use otap_df_config::pipeline::telemetry::TelemetryAttribute;
 use otap_df_config::{NodeId as ConfigNodeId, NodeUrn, PipelineGroupId, PipelineId};
@@ -101,7 +103,16 @@ pub struct ControllerContext {
     process_instance_id: Cow<'static, str>,
     host_id: Cow<'static, str>,
     container_id: Cow<'static, str>,
-    numa_node_id: usize,
+    /// CPU id -> NUMA node id mapping discovered from sysfs.
+    /// Empty on non-Linux or unreadable sysfs; lookups for unknown CPUs
+    /// fall back to NUMA node `0` to preserve pre-Phase-1 behaviour.
+    topology: CpuTopology,
+    /// Coordinated listener-group manager (Phase 2 scaffolding).
+    /// Default state has no plans registered, so the manager is inert
+    /// and existing per-receiver bind behaviour is preserved. The
+    /// controller / pipeline-assembly layer is responsible for
+    /// registering plans before launching pipelines (Phase 2.5).
+    listener_group_manager: ListenerGroupManager,
     memory_pressure_state: MemoryPressureState,
 }
 
@@ -154,9 +165,49 @@ impl ControllerContext {
             process_instance_id: PROCESS_INSTANCE_ID.clone(),
             host_id: HOST_ID.clone(),
             container_id: CONTAINER_ID.clone(),
-            numa_node_id: 0, // ToDo(LQ): Set NUMA node ID if available
+            // Detect NUMA topology from sysfs once at startup. Non-Linux
+            // and unreadable-sysfs hosts get an empty mapping; callers
+            // that need a concrete value fall back to node 0 below.
+            topology: CpuTopology::detect(),
+            listener_group_manager: ListenerGroupManager::new(),
             memory_pressure_state: MemoryPressureState::default(),
         }
+    }
+
+    /// Creates a new `ControllerContext` with an explicit topology.
+    ///
+    /// Useful for tests that want to inject a synthetic NUMA layout
+    /// without relying on the host's sysfs.
+    #[must_use]
+    pub fn with_topology(
+        telemetry_registry_handle: TelemetryRegistryHandle,
+        topology: CpuTopology,
+    ) -> Self {
+        Self {
+            telemetry_registry_handle,
+            process_instance_id: PROCESS_INSTANCE_ID.clone(),
+            host_id: HOST_ID.clone(),
+            container_id: CONTAINER_ID.clone(),
+            topology,
+            listener_group_manager: ListenerGroupManager::new(),
+            memory_pressure_state: MemoryPressureState::default(),
+        }
+    }
+
+    /// Returns the discovered CPU/NUMA topology.
+    #[must_use]
+    pub fn topology(&self) -> &CpuTopology {
+        &self.topology
+    }
+
+    /// Returns the listener-group manager.
+    ///
+    /// In the current phase the manager is scaffolding only and is not
+    /// consulted by `EffectHandler::tcp_listener`. The controller can
+    /// pre-register plans here in preparation for Phase 2.5 wiring.
+    #[must_use]
+    pub fn listener_group_manager(&self) -> &ListenerGroupManager {
+        &self.listener_group_manager
     }
 
     /// Returns a new pipeline context with the given identifiers and the current controller context
@@ -280,6 +331,16 @@ impl PipelineContext {
     #[must_use]
     pub const fn core_id(&self) -> usize {
         self.pipeline_context_params.core_id
+    }
+
+    /// Returns the listener-group manager from the parent
+    /// [`ControllerContext`]. Useful for the engine pipeline-thread
+    /// launcher to build a per-receiver
+    /// [`crate::listener_group::ListenerGroupHandle`] when Phase 2.5
+    /// coordinated reuseport is enabled.
+    #[must_use]
+    pub fn listener_group_manager(&self) -> &ListenerGroupManager {
+        self.controller_context.listener_group_manager()
     }
 
     /// Returns the deployment generation associated with this pipeline runtime.
@@ -473,14 +534,22 @@ impl PipelineContext {
     fn engine_attribute_set(&self) -> EngineAttributeSet {
         use crate::attributes::ResourceAttributeSet;
 
+        let core_id = self.pipeline_context_params.core_id;
+        // Look up NUMA node from the topology cache; fall back to 0 to
+        // preserve pre-Phase-1 telemetry behaviour for unknown CPUs.
+        let numa_node_id = u32::try_from(core_id)
+            .ok()
+            .map(|cpu| self.controller_context.topology.numa_node_or_zero(cpu) as usize)
+            .unwrap_or(0);
+
         EngineAttributeSet {
             resource_attrs: ResourceAttributeSet {
                 process_instance_id: self.controller_context.process_instance_id.clone(),
                 host_id: self.controller_context.host_id.clone(),
                 container_id: self.controller_context.container_id.clone(),
             },
-            core_id: self.pipeline_context_params.core_id,
-            numa_node_id: self.controller_context.numa_node_id,
+            core_id,
+            numa_node_id,
         }
     }
 

@@ -298,6 +298,7 @@ impl<PData: Debug + 'static> TestPhase<PData> {
                     pipeline_completion_msg_tx,
                     metrics_reporter,
                     Interests::empty(),
+                    None,
                 )
                 .await
                 .expect("Receiver event loop failed");

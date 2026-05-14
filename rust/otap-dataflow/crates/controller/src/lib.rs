@@ -1202,6 +1202,23 @@ impl<
         let metrics_dispatcher = telemetry_system.dispatcher();
         let metrics_reporter = telemetry_system.reporter();
         let controller_ctx = ControllerContext::new(telemetry_system.registry());
+
+        // Phase 3: install the optional eBPF NUMA-reuseport selector
+        // hook on the listener-group manager when the operator has
+        // set `OTAP_DF_REUSEPORT_EBPF=1`. The engine's
+        // `ebpf_attach_hook` returns a no-op on non-Linux or when the
+        // `reuseport-ebpf` feature is not compiled in, so the controller
+        // can call this unconditionally. The hook fires exactly once
+        // per listener group, after materialisation, and before any
+        // acquirer receives its listener.
+        if otap_df_engine::listener_group::reuseport_ebpf_enabled() {
+            let strict = otap_df_engine::listener_group::reuseport_ebpf_strict();
+            controller_ctx.listener_group_manager().set_attach_hook(
+                otap_df_engine::listener_group::ebpf_attach_hook(false, strict),
+            );
+            otel_info!("listener_group.ebpf_hook.installed", strict = strict,);
+        }
+
         let memory_pressure_state = controller_ctx.memory_pressure_state();
         let (memory_pressure_tx, _memory_pressure_rx) =
             tokio::sync::watch::channel(MemoryPressureChanged::initial());
@@ -1478,6 +1495,50 @@ impl<
                 num_cores = num_cores,
                 core_allocation = core_allocation
             );
+
+            // Phase 2.5: when coordinated reuseport is enabled via
+            // `OTAP_DF_REUSEPORT_EBPF=1`, register one
+            // `ListenerGroupPlan` per recognised receiver
+            // (`urn:otel:receiver:{otlp,otap,syslog_cef}`) in this
+            // pipeline before launching its threads. With no plans
+            // registered the manager stays inert and the receiver
+            // path falls back to today's independent bind.
+            // Plan registration (and the runtime acquire) activate
+            // when either `OTAP_DF_REUSEPORT_EBPF=1` (the single
+            // user-facing switch) or the test-only
+            // `OTAP_DF_REUSEPORT_MANAGER_ONLY=1` is set.
+            if otap_df_engine::listener_group::manager_active() {
+                let plan_cores: Vec<u32> = requested_cores
+                    .iter()
+                    .filter_map(|c| u32::try_from(c.id).ok())
+                    .collect();
+                let plans = otap_df_engine::listener_group::extraction::extract_plans_for_pipeline(
+                    pipeline_entry,
+                    &plan_cores,
+                    controller_ctx.topology(),
+                );
+                for plan in plans {
+                    let key = plan.key.clone();
+                    if let Err(error) = controller_ctx.listener_group_manager().register_plan(plan)
+                    {
+                        otel_warn!(
+                            "listener_group.plan.register_failed",
+                            pipeline_group_id = key.pipeline_group_id.as_str(),
+                            receiver_node_id = key.receiver_node_id.as_str(),
+                            bind_addr = key.addr.to_string().as_str(),
+                            error = error.to_string().as_str(),
+                        );
+                    } else {
+                        otel_info!(
+                            "listener_group.plan.registered",
+                            pipeline_group_id = key.pipeline_group_id.as_str(),
+                            receiver_node_id = key.receiver_node_id.as_str(),
+                            bind_addr = key.addr.to_string().as_str(),
+                            members = plan_cores.len() as i64,
+                        );
+                    }
+                }
+            }
 
             for core_id in &requested_cores {
                 // Pass a Weak runtime handle into each pipeline thread. The thread upgrades it

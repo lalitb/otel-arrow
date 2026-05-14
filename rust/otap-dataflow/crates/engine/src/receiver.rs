@@ -315,6 +315,11 @@ impl<PData> ReceiverWrapper<PData> {
     }
 
     /// Starts the receiver and begins receiver incoming data.
+    ///
+    /// `listener_group_handle` (Phase 2.5) lets the engine plumb a
+    /// coordinated reuseport handle into the receiver's effect
+    /// handler. `None` preserves the pre-Phase-2.5 independent-bind
+    /// behaviour.
     #[doc(hidden)]
     pub async fn start(
         self,
@@ -322,6 +327,7 @@ impl<PData> ReceiverWrapper<PData> {
         pipeline_completion_msg_tx: PipelineCompletionMsgSender<PData>,
         metrics_reporter: MetricsReporter,
         node_interests: Interests,
+        listener_group_handle: Option<crate::listener_group::ListenerGroupHandle>,
     ) -> Result<TerminalState, Error> {
         match (self, metrics_reporter) {
             (
@@ -362,6 +368,9 @@ impl<PData> ReceiverWrapper<PData> {
                     .core
                     .set_pipeline_completion_msg_sender(pipeline_completion_msg_tx);
                 effect_handler.core.set_node_interests(node_interests);
+                if let Some(h) = listener_group_handle.clone() {
+                    effect_handler.core.set_listener_group_handle(h);
+                }
                 receiver.start(ctrl_msg_chan, effect_handler).await
             }
             (
@@ -402,6 +411,9 @@ impl<PData> ReceiverWrapper<PData> {
                     .core
                     .set_pipeline_completion_msg_sender(pipeline_completion_msg_tx);
                 effect_handler.core.set_node_interests(node_interests);
+                if let Some(h) = listener_group_handle {
+                    effect_handler.core.set_listener_group_handle(h);
+                }
                 receiver.start(ctrl_msg_chan, effect_handler).await
             }
         }

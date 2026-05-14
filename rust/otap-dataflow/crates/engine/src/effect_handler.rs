@@ -12,6 +12,7 @@ use crate::control::{
     RuntimeCtrlMsgSender, WakeupSlot,
 };
 use crate::error::Error;
+use crate::listener_group::{AcquireOutcome, ListenerGroupHandle, QUORUM_TIMEOUT, manager_active};
 use crate::node::NodeId;
 use crate::node_local_scheduler::NodeLocalSchedulerHandle;
 use crate::{WakeupError, WakeupSetOutcome};
@@ -64,6 +65,11 @@ pub(crate) struct EffectHandlerCore<PData> {
     node_interests: Interests,
     /// Optional processor-local delayed-resume and wakeup scheduler.
     pub(crate) local_scheduler: Option<NodeLocalSchedulerHandle<PData>>,
+    /// Optional handle into the controller's listener-group manager.
+    /// When set, [`Self::tcp_listener`] consults the manager so the
+    /// receiver receives a coordinated reuseport listener instead of
+    /// independently binding. `None` preserves today's behaviour.
+    pub(crate) listener_group_handle: Option<ListenerGroupHandle>,
 }
 
 impl<PData> EffectHandlerCore<PData> {
@@ -78,6 +84,7 @@ impl<PData> EffectHandlerCore<PData> {
             source_tag: SourceTagging::Disabled,
             node_interests: Interests::empty(),
             local_scheduler: None,
+            listener_group_handle: None,
         }
     }
 
@@ -113,6 +120,15 @@ impl<PData> EffectHandlerCore<PData> {
     /// Sets the processor-local wakeup scheduler for this effect handler.
     pub(crate) fn set_local_scheduler(&mut self, local_scheduler: NodeLocalSchedulerHandle<PData>) {
         self.local_scheduler = Some(local_scheduler);
+    }
+
+    /// Sets the optional listener-group handle so [`Self::tcp_listener`]
+    /// can consult the controller's coordinated reuseport manager.
+    /// Phase 2.5 plumbing: receiver wrappers populate this from the
+    /// `PipelineContext` before the receiver's `start()` runs. `None`
+    /// means independent bind, identical to the pre-Phase-2.5 behaviour.
+    pub(crate) fn set_listener_group_handle(&mut self, handle: ListenerGroupHandle) {
+        self.listener_group_handle = Some(handle);
     }
 
     /// Returns outgoing messages source tagging mode.
@@ -161,6 +177,14 @@ impl<PData> EffectHandlerCore<PData> {
     /// pipeline engine implementation. It's important for receiver implementer to create TCP
     /// listeners via this method to ensure the scalability and the serviceability of the pipeline.
     ///
+    /// When the controller has registered a coordinated reuseport
+    /// plan covering this receiver and `OTAP_DF_REUSEPORT_EBPF=1`
+    /// is set, this method consults
+    /// [`crate::listener_group::ListenerGroupManager`] to obtain a
+    /// listener that is part of a pre-materialised reuseport group.
+    /// On `NoPlan`, `FallbackToIndependent`, or when coordination is
+    /// disabled, the existing per-receiver bind path is used.
+    ///
     /// # Errors
     ///
     /// Returns an [`Error::IoError`] if any step in the process fails.
@@ -176,6 +200,53 @@ impl<PData> EffectHandlerCore<PData> {
             node: receiver_id.clone(),
             error,
         };
+
+        // Coordinated reuseport path: only active when the single
+        // user-facing env switch (`OTAP_DF_REUSEPORT_EBPF=1`) is on
+        // and the controller wired a handle on this effect handler.
+        // Falls through silently otherwise so production behaviour
+        // matches `main`.
+        if manager_active() {
+            if let Some(handle) = self.listener_group_handle.as_ref() {
+                let key = handle.tcp_key(addr);
+                let outcome = handle
+                    .manager()
+                    .acquire(&key, handle.core_id(), QUORUM_TIMEOUT);
+                match outcome {
+                    AcquireOutcome::Listener(std_listener) => {
+                        // The acquiring receiver must register the fd
+                        // with its own current-thread runtime; doing
+                        // so here keeps the seam sync.
+                        return TcpListener::from_std(std_listener).map_err(into_engine_error);
+                    }
+                    AcquireOutcome::MaterialisationFailed(error) => {
+                        return Err(into_engine_error(error));
+                    }
+                    AcquireOutcome::AlreadyAcquired => {
+                        // H1: refuse to silently rebind a fresh
+                        // independent listener -- doing so would
+                        // defeat the coordinated-reuseport guarantee
+                        // and silently mask a caller bug. The
+                        // receiver must call tcp_listener at most
+                        // once per (addr, core) within a startup.
+                        return Err(into_engine_error(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!(
+                                "listener for {addr} on core {} was already \
+                                 acquired from the coordinated reuseport \
+                                 manager; tcp_listener must not be called \
+                                 more than once for the same (addr, core)",
+                                handle.core_id()
+                            ),
+                        )));
+                    }
+                    AcquireOutcome::NoPlan | AcquireOutcome::FallbackToIndependent => {
+                        // Fall through to the independent-bind path
+                        // below.
+                    }
+                }
+            }
+        }
 
         // Create a SO_REUSEADDR + SO_REUSEPORT listener.
         let sock = socket2::Socket::new(

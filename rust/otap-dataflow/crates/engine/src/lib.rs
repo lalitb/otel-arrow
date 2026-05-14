@@ -60,9 +60,12 @@ pub mod clock;
 pub mod error;
 pub mod exporter;
 pub mod extension;
+pub mod listener_group;
 pub mod message;
 pub mod processor;
 pub mod receiver;
+pub mod reuseport_ebpf;
+pub mod topology;
 
 mod attributes;
 mod channel_metrics;
