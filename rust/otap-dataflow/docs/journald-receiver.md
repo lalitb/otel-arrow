@@ -74,9 +74,10 @@ read, Ack, or checkpoint model.
 
 ## Startup and Instance Model
 
-`namespace` is the stable OTAP source identifier. In v1, `system` means the
-default local system journal; later, named systemd journal namespaces can use
-their namespace name.
+`namespace` is the stable OTAP source identifier. In v1, only `system` is
+accepted and it means the default local system journal. Named systemd journal
+namespaces require `sd_journal_open_namespace` wiring and are rejected until
+that support lands.
 
 A single journal source is not sharded across per-core receiver instances. The
 factory rejects `pipeline_ctx.num_cores() > 1` with a clear error directing
@@ -94,9 +95,11 @@ A process-local startup lease keyed by `journald:<namespace>` prevents duplicate
 readers in the same process, even across different pipelines. Cross-process
 duplication is not prevented in v1.
 
-Multiple journald receivers in the *same* engine are still supported, as long
-as each targets a distinct namespace. With a future assignment extension,
-non-owner instances stay Ready but idle until assigned a namespace.
+Multiple journald receivers in the *same* engine are not useful in v1 because
+only the `system` namespace is supported and the process-local lease rejects
+duplicate readers. With named-namespace support or a future assignment
+extension, non-owner instances can stay Ready but idle until assigned a
+namespace.
 
 ## Execution Model
 
@@ -109,8 +112,13 @@ The receiver uses one long-lived blocking worker thread per assigned namespace:
 - worker owns the `sd_journal*` handle
 - async task owns the engine `EffectHandler`, lifecycle state, and Ack tracker
 - bounded worker-to-async channel carries completed batches
-- bounded async-to-worker channel carries pause/resume/shutdown/commit commands
+- bounded async-to-worker `sync_channel` carries commit, rewind, and shutdown
+  commands
 - no per-record shared lock is required on the hot path
+
+The async-to-worker command channel is a bounded `sync_channel` with small
+fixed capacity. With `max_in_flight_batches = 1`, at most one commit or rewind
+plus a terminal shutdown should be outstanding; the bound is defense-in-depth.
 
 This follows the existing `host_metrics_receiver` pattern for blocking system
 calls: use a dedicated worker to cap the blast radius instead of using Tokio's
@@ -132,11 +140,10 @@ flowchart TD
     Send -->|full| Hold["Hold batch<br/>do not read more"]
     Hold --> Control["Drain control channel"]
     Control -->|commit| Commit["write / fsync / rename"]
-    Control -->|pause| Wait
-    Control -->|resume| Send
+    Control -->|rewind| Init
     Control -->|shutdown| Drain["drain and close"]
     Control -->|none| Send
-    Commit --> Send
+    Commit --> Next
     Drain --> Done([Exit])
 ```
 
@@ -145,8 +152,12 @@ batch in memory and does not call `sd_journal_next()` again until the batch is
 accepted or shutdown begins. A held batch counts against the namespace's
 in-flight budget.
 
-Pause and shutdown responsiveness is bounded by `wait_timeout`. The configured
-`drain_timeout` should be larger than `wait_timeout`.
+Pause and shutdown responsiveness is bounded by `wait_timeout` while the worker
+is inside `sd_journal_wait`. The implementation caps `wait_timeout` at 5s until
+the worker uses an interruptible `sd_journal_get_fd`/poll path. During
+downstream backpressure, the async task races the blocked send against lifecycle
+control messages and the worker polls its command channel while holding a full
+handoff batch.
 
 ## Ack and Checkpoint Model
 
@@ -166,30 +177,29 @@ Each emitted batch carries:
 - `batch_id`
 - `first_cursor`
 - `last_cursor`
-- an epoch used to ignore stale completions after rewinds
 
-The async task tracks pending ranges per namespace and advances the durable
-cursor only through contiguous Acked ranges.
+The v1 receiver allows one in-flight batch per namespace. The async task marks
+the first Ack or Nack for a `batch_id` as terminal and ignores duplicate or late
+opposite completions for that batch.
 
 ```text
-emit range R1, R2, R3
-Ack R2 first  -> R2 waits; checkpoint does not move
-Ack R1 next   -> commit R1, then R2
-Nack R3       -> checkpoint does not move past R2; rewind from committed cursor
+emit range R1
+Ack R1        -> worker commits R1.last_cursor, then reads the next batch
+Nack R1       -> checkpoint does not move; worker rewinds from committed cursor
+Ack then Nack -> first completion wins; late opposite completion is ignored
 ```
 
 Checkpoint commit ownership is split deliberately:
 
-- async task decides which cursor should be committed and owns retry/failure
-  state
+- async task decides which cursor should be committed and owns checkpoint
+  failure state
 - worker only executes blocking checkpoint I/O and returns success or failure
 - in-memory `committed_cursor` advances only after the worker confirms the
   on-disk write succeeded
 
-If there is no committed cursor yet, the receiver rewinds to a frozen initial
-anchor captured at namespace open. For `start_at: end` on an empty journal,
-the first arriving entry becomes the first emitted record; a rewind may
-duplicate it, which is acceptable under at-least-once delivery.
+If there is no committed cursor yet, `on_nack: rewind` fails closed instead of
+seeking to the live tail and silently skipping the Nacked batch. Operators can
+use `on_nack: fail` for the same terminal behavior explicitly.
 
 ## Checkpoints
 
@@ -204,7 +214,8 @@ only from inputs that are stable across restart and across instance churn:
 - pipeline group id (operator-defined, stable)
 - pipeline id (operator-defined, stable)
 - receiver node name (operator-defined, stable)
-- journal namespace identifier (e.g. `system`, or a named namespace; stable)
+- journal namespace identifier (`system` in v1; a named namespace in a future
+  implementation)
 
 It MUST NOT include per-run inputs:
 
@@ -222,16 +233,15 @@ Recommended on-disk layout:
 ${engine.state_dir}/journald/<pipeline_group>/<pipeline_id>/<receiver_name>/<namespace>.cursor
 ```
 
-The `<namespace>` segment is `system` for the default local journal and the
-namespace name for named namespaces. There is no `instance_id` or `core_id`
-segment.
+The `<namespace>` segment is `system` for the default local journal. Future
+named namespace support can use the namespace name in the same segment. There
+is no `instance_id` or `core_id` segment.
 
 A single cursor file must not be written by two processes concurrently. In
-v1, cross-process duplication is prevented operationally (operators run one
-engine per host against a given namespace, or use distinct namespaces). The
-process-local lease covers in-process duplication. A future enhancement may
-add a file lock alongside the cursor file; that addition does not change the
-checkpoint key shape above.
+v1, cross-process duplication is prevented operationally by running one engine
+per host against the `system` namespace. The process-local lease covers
+in-process duplication. A future enhancement may add a file lock alongside the
+cursor file; that addition does not change the checkpoint key shape above.
 
 The cursor file is a small versioned envelope (cursor string + version +
 checksum). Corrupt or unknown-version envelopes fail closed; see [Failure
@@ -277,12 +287,6 @@ groups:
 
               wait_timeout: 1s
               drain_timeout: 5s
-
-              transient_error:
-                max_retries: 3
-                backoff: 100ms
-                max_backoff: 5s
-                jitter: true
 ```
 
 `priorities` is an exact-match set. `max_priority` is shorthand expanded by the
@@ -331,13 +335,14 @@ base64 and mark the encoding explicitly; do not lossy-decode.
 | `sd_journal_open` / permission failure | startup failure; not treated as an empty stream |
 | checkpoint missing | apply `start_at` |
 | checkpoint corrupt / unknown version | fail closed; operator must remove or migrate it |
-| cursor vacuumed | emit `journald.cursor_lost`; apply `start_at` |
-| checkpoint commit I/O failure | do not advance in-memory cursor; retry with backoff; fail the receiver source after threshold |
-| `sd_journal_get_cursor` failure | discard un-emitted partial batch, reopen, and reseek from committed cursor or initial anchor |
+| cursor vacuumed / stale | fail closed; operator must remove the checkpoint or choose an explicit recovery action |
+| checkpoint commit I/O failure | do not advance in-memory cursor; fail the receiver source after the configured consecutive failure threshold |
+| `sd_journal_get_cursor` failure | fail the receiver source |
 | Nack | do not advance checkpoint; rewind or fail according to config |
-| shutdown deadline | abandon pending completions without advancing checkpoint; late completions are ignored and counted |
+| drain deadline | stop ingress and wait for the pending Ack/Nack until the earlier of engine deadline or `drain_timeout`; uncommitted pending data may replay on restart |
+| shutdown deadline | stop ingress immediately without advancing uncommitted checkpoints |
 | duplicate namespace in same process | process-local lease rejects the second receiver |
-| duplicate across processes | not prevented in v1; operators must avoid this or use distinct namespaces |
+| duplicate across processes | not prevented in v1; operators must run one engine per host against `system` |
 | `pipeline_ctx.num_cores() > 1` | factory rejects with "journald must run in a one-core source pipeline" |
 
 Worker thread panic fails the receiver source, releases its process-local lease, and
@@ -370,7 +375,7 @@ First PR:
 
 - `crates/core-nodes/src/receivers/journald_receiver/`
 - `urn:otel:receiver:journald`
-- Linux gated behind a `journald` Cargo feature
+- Linux runtime path gated behind `cfg(target_os = "linux")`
 - real `SdJournalReader` plus fake reader for tests
 - single-namespace per receiver instance, configured by `namespace` (default
   `system`); factory rejects `pipeline_ctx.num_cores() > 1`
@@ -379,7 +384,7 @@ First PR:
   `${engine.state_dir}/journald/<pipeline_group>/<pipeline_id>/<receiver_name>/<namespace>.cursor`
 - dedicated worker thread and bounded channels
 - unconditional subscription to `Interests::ACKS | Interests::NACKS`
-- contiguous-Ack tracker with default `max_in_flight_batches = 1`
+- one in-flight batch with idempotent Ack/Nack handling
 
 Not in first PR:
 

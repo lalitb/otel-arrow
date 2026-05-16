@@ -20,6 +20,8 @@ const DEFAULT_BATCH_MAX_RECORDS: usize = 1024;
 const DEFAULT_BATCH_MAX_FLUSH_PERIOD: Duration = Duration::from_millis(200);
 /// Default `sd_journal_wait` timeout. Bounds shutdown / pause responsiveness.
 const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
+/// Upper bound for `sd_journal_wait` while shutdown is command-channel based.
+const MAX_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default drain deadline budget; must exceed `wait_timeout`.
 const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default in-flight bound; v1 uses 1 to keep checkpoint advancement simple.
@@ -171,56 +173,6 @@ impl Default for CheckpointConfig {
     }
 }
 
-/// Backoff policy applied to transient `sd-journal` and checkpoint errors.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct TransientErrorConfig {
-    /// Maximum number of retries for a single transient failure.
-    #[serde(default = "TransientErrorConfig::default_max_retries")]
-    pub max_retries: u32,
-    /// Initial backoff between retries.
-    #[serde(
-        default = "TransientErrorConfig::default_backoff",
-        with = "humantime_serde"
-    )]
-    pub backoff: Duration,
-    /// Upper bound for exponential backoff.
-    #[serde(
-        default = "TransientErrorConfig::default_max_backoff",
-        with = "humantime_serde"
-    )]
-    pub max_backoff: Duration,
-    /// Whether to apply jitter to the backoff.
-    #[serde(default = "TransientErrorConfig::default_jitter")]
-    pub jitter: bool,
-}
-
-impl TransientErrorConfig {
-    const fn default_max_retries() -> u32 {
-        3
-    }
-    const fn default_backoff() -> Duration {
-        Duration::from_millis(100)
-    }
-    const fn default_max_backoff() -> Duration {
-        Duration::from_secs(5)
-    }
-    const fn default_jitter() -> bool {
-        true
-    }
-}
-
-impl Default for TransientErrorConfig {
-    fn default() -> Self {
-        Self {
-            max_retries: Self::default_max_retries(),
-            backoff: Self::default_backoff(),
-            max_backoff: Self::default_max_backoff(),
-            jitter: Self::default_jitter(),
-        }
-    }
-}
-
 /// User-facing journald receiver configuration.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -266,10 +218,6 @@ pub struct Config {
     /// Drain deadline budget. Must be greater than `wait_timeout`.
     #[serde(default = "Config::default_drain_timeout", with = "humantime_serde")]
     pub drain_timeout: Duration,
-
-    /// Transient error backoff policy.
-    #[serde(default)]
-    pub transient_error: TransientErrorConfig,
 }
 
 impl Config {
@@ -294,7 +242,6 @@ impl Default for Config {
             checkpoint: CheckpointConfig::default(),
             wait_timeout: Self::default_wait_timeout(),
             drain_timeout: Self::default_drain_timeout(),
-            transient_error: TransientErrorConfig::default(),
         }
     }
 }
@@ -323,8 +270,6 @@ pub struct RuntimeConfig {
     pub wait_timeout: Duration,
     /// Drain deadline budget.
     pub drain_timeout: Duration,
-    /// Transient error backoff policy.
-    pub transient_error: TransientErrorConfig,
 }
 
 impl TryFrom<Config> for RuntimeConfig {
@@ -342,7 +287,6 @@ impl TryFrom<Config> for RuntimeConfig {
             checkpoint,
             wait_timeout,
             drain_timeout,
-            transient_error,
         } = config;
 
         let namespace = validate_namespace(namespace)?;
@@ -353,12 +297,20 @@ impl TryFrom<Config> for RuntimeConfig {
         if batch.max_records == 0 {
             return Err(invalid("batch.max_records must be greater than zero"));
         }
+        if batch.max_records > u16::MAX as usize {
+            return Err(invalid("batch.max_records must be <= u16::MAX"));
+        }
         if batch.max_flush_period.is_zero() {
             return Err(invalid("batch.max_flush_period must be greater than zero"));
         }
         if checkpoint.max_in_flight_batches == 0 {
             return Err(invalid(
                 "checkpoint.max_in_flight_batches must be greater than zero",
+            ));
+        }
+        if checkpoint.max_in_flight_batches != DEFAULT_MAX_IN_FLIGHT_BATCHES {
+            return Err(invalid(
+                "checkpoint.max_in_flight_batches must be 1 for journald v1",
             ));
         }
         if checkpoint.max_consecutive_failures == 0 {
@@ -369,18 +321,12 @@ impl TryFrom<Config> for RuntimeConfig {
         if wait_timeout.is_zero() {
             return Err(invalid("wait_timeout must be greater than zero"));
         }
+        if wait_timeout > MAX_WAIT_TIMEOUT {
+            return Err(invalid("wait_timeout must be <= 5s"));
+        }
         if drain_timeout <= wait_timeout {
             return Err(invalid("drain_timeout must be greater than wait_timeout"));
         }
-        if transient_error.backoff.is_zero() {
-            return Err(invalid("transient_error.backoff must be greater than zero"));
-        }
-        if transient_error.max_backoff < transient_error.backoff {
-            return Err(invalid(
-                "transient_error.max_backoff must be >= transient_error.backoff",
-            ));
-        }
-
         Ok(Self {
             namespace,
             units,
@@ -391,7 +337,6 @@ impl TryFrom<Config> for RuntimeConfig {
             checkpoint,
             wait_timeout,
             drain_timeout,
-            transient_error,
         })
     }
 }
@@ -414,6 +359,11 @@ fn validate_namespace(namespace: String) -> Result<String, otap_df_config::error
     {
         return Err(invalid(
             "namespace must contain only ASCII alphanumerics, '_', '-', or '.'",
+        ));
+    }
+    if namespace != DEFAULT_NAMESPACE {
+        return Err(invalid(
+            "journald namespace support is not implemented; use namespace `system`",
         ));
     }
     Ok(namespace)
@@ -519,6 +469,15 @@ mod tests {
     }
 
     #[test]
+    fn rejects_named_namespace_until_systemd_namespace_open_is_supported() {
+        let cfg = Config {
+            namespace: "audit".to_owned(),
+            ..base()
+        };
+        assert!(RuntimeConfig::try_from(cfg).is_err());
+    }
+
+    #[test]
     fn rejects_priorities_out_of_range() {
         let cfg = Config {
             priorities: vec![0, 8],
@@ -583,6 +542,40 @@ mod tests {
             batch: BatchConfig {
                 max_records: 0,
                 ..BatchConfig::default()
+            },
+            ..base()
+        };
+        assert!(RuntimeConfig::try_from(cfg).is_err());
+    }
+
+    #[test]
+    fn rejects_batch_records_above_log_id_capacity() {
+        let cfg = Config {
+            batch: BatchConfig {
+                max_records: u16::MAX as usize + 1,
+                ..BatchConfig::default()
+            },
+            ..base()
+        };
+        assert!(RuntimeConfig::try_from(cfg).is_err());
+    }
+
+    #[test]
+    fn rejects_wait_timeout_above_shutdown_responsiveness_ceiling() {
+        let cfg = Config {
+            wait_timeout: Duration::from_secs(6),
+            drain_timeout: Duration::from_secs(7),
+            ..base()
+        };
+        assert!(RuntimeConfig::try_from(cfg).is_err());
+    }
+
+    #[test]
+    fn rejects_multiple_in_flight_batches_for_v1() {
+        let cfg = Config {
+            checkpoint: CheckpointConfig {
+                max_in_flight_batches: 2,
+                ..CheckpointConfig::default()
             },
             ..base()
         };
