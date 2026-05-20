@@ -28,6 +28,8 @@ pub(crate) struct JournalEntry {
     pub(crate) cursor: String,
     pub(crate) realtime_unix_nano: u64,
     pub(crate) fields: Vec<JournalField>,
+    pub(crate) dropped_fields: usize,
+    pub(crate) dropped_large_fields: usize,
 }
 
 impl JournalEntry {
@@ -86,18 +88,16 @@ impl JournaldArrowRecordsBuilder {
             None => self.logs.body.append_null(),
         }
 
-        for field in &entry.fields {
-            if field.name == "MESSAGE" || field.name == "__CURSOR" {
+        for (name, values) in grouped_fields(entry) {
+            if name == "__CURSOR" {
                 continue;
             }
             self.log_attrs.append_parent_id(&self.curr_log_id);
-            self.log_attrs.append_key(&field.name);
-            if let Ok(value) = std::str::from_utf8(&field.value) {
-                self.log_attrs
-                    .any_values_builder
-                    .append_str(value.as_bytes());
+            self.log_attrs.append_key(name);
+            if values.len() == 1 {
+                append_field_value(&mut self.log_attrs, values[0]);
             } else {
-                self.log_attrs.any_values_builder.append_bytes(&field.value);
+                append_repeated_field_value(&mut self.log_attrs, &values);
             }
         }
 
@@ -151,6 +151,43 @@ impl JournaldArrowRecordsBuilder {
     }
 }
 
+fn grouped_fields(entry: &JournalEntry) -> Vec<(&str, Vec<&[u8]>)> {
+    let mut groups: Vec<(&str, Vec<&[u8]>)> = Vec::new();
+    for field in &entry.fields {
+        if let Some((_, values)) = groups.iter_mut().find(|(name, _)| *name == field.name) {
+            values.push(field.value.as_slice());
+        } else {
+            groups.push((field.name.as_str(), vec![field.value.as_slice()]));
+        }
+    }
+    groups
+}
+
+fn append_field_value(builder: &mut StrKeysAttributesRecordBatchBuilder<u16>, value: &[u8]) {
+    if let Ok(value) = std::str::from_utf8(value) {
+        builder.any_values_builder.append_str(value.as_bytes());
+    } else {
+        builder.any_values_builder.append_bytes(value);
+    }
+}
+
+fn append_repeated_field_value(
+    builder: &mut StrKeysAttributesRecordBatchBuilder<u16>,
+    values: &[&[u8]],
+) {
+    let cbor_values: Vec<serde_cbor::Value> = values
+        .iter()
+        .map(|value| match std::str::from_utf8(value) {
+            Ok(value) => serde_cbor::Value::Text(value.to_owned()),
+            Err(_) => serde_cbor::Value::Bytes((*value).to_vec()),
+        })
+        .collect();
+    match serde_cbor::to_vec(&cbor_values) {
+        Ok(bytes) => builder.any_values_builder.append_slice(&bytes),
+        Err(_) => builder.any_values_builder.append_empty(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +218,8 @@ mod tests {
                     value: b"sshd.service".to_vec(),
                 },
             ],
+            dropped_fields: 0,
+            dropped_large_fields: 0,
         };
 
         let mut builder = JournaldArrowRecordsBuilder::new();
@@ -197,7 +236,7 @@ mod tests {
             log.body.as_ref().and_then(|v| v.value.as_ref()),
             Some(Value::StringValue(v)) if v == "hello"
         ));
-        assert_eq!(log.attributes.len(), 2);
+        assert_eq!(log.attributes.len(), 3);
         assert!(matches!(
             log.attributes
                 .iter()
@@ -206,5 +245,39 @@ mod tests {
                 .and_then(|v| v.value.as_ref()),
             Some(Value::StringValue(v)) if v == "4"
         ));
+    }
+
+    #[test]
+    fn preserves_repeated_message_as_body_and_attribute() {
+        let entry = JournalEntry {
+            cursor: "s=1".to_owned(),
+            realtime_unix_nano: 123,
+            fields: vec![
+                JournalField {
+                    name: "MESSAGE".to_owned(),
+                    value: b"first".to_vec(),
+                },
+                JournalField {
+                    name: "MESSAGE".to_owned(),
+                    value: b"second".to_vec(),
+                },
+            ],
+            dropped_fields: 0,
+            dropped_large_fields: 0,
+        };
+
+        let mut builder = JournaldArrowRecordsBuilder::new();
+        builder.append(&entry);
+        let mut records = builder.build().unwrap();
+        let mut encoder = LogsProtoBytesEncoder::new();
+        let mut buffer = ProtoBuffer::default();
+        encoder.encode(&mut records, &mut buffer).unwrap();
+        let req = ExportLogsServiceRequest::decode(buffer.as_ref()).unwrap();
+        let log = &req.resource_logs[0].scope_logs[0].log_records[0];
+        assert!(matches!(
+            log.body.as_ref().and_then(|v| v.value.as_ref()),
+            Some(Value::StringValue(v)) if v == "first"
+        ));
+        assert!(log.attributes.iter().any(|kv| kv.key == "MESSAGE"));
     }
 }

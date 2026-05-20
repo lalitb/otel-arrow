@@ -12,13 +12,16 @@ mod imp {
 
     use libc::{RTLD_NOW, c_char, c_int, c_void, size_t};
     use std::ffi::{CStr, CString};
+    use std::path::Path;
     use std::ptr::NonNull;
     use std::time::Duration;
 
     const SD_JOURNAL_LOCAL_ONLY: c_int = 1;
+    const SD_JOURNAL_OS_ROOT: c_int = 1 << 4;
 
     type SdJournal = c_void;
     type OpenFn = unsafe extern "C" fn(*mut *mut SdJournal, c_int) -> c_int;
+    type OpenDirectoryFn = unsafe extern "C" fn(*mut *mut SdJournal, *const c_char, c_int) -> c_int;
     type CloseFn = unsafe extern "C" fn(*mut SdJournal);
     type NextFn = unsafe extern "C" fn(*mut SdJournal) -> c_int;
     type WaitFn = unsafe extern "C" fn(*mut SdJournal, u64) -> c_int;
@@ -39,6 +42,7 @@ mod imp {
     struct LibSystemd {
         _handle: NonNull<c_void>,
         open: OpenFn,
+        open_directory: OpenDirectoryFn,
         close: CloseFn,
         next: NextFn,
         wait: WaitFn,
@@ -89,6 +93,7 @@ mod imp {
             Ok(Self {
                 _handle: handle,
                 open: sym!("sd_journal_open", OpenFn),
+                open_directory: sym!("sd_journal_open_directory", OpenDirectoryFn),
                 close: sym!("sd_journal_close", CloseFn),
                 next: sym!("sd_journal_next", NextFn),
                 wait: sym!("sd_journal_wait", WaitFn),
@@ -112,6 +117,13 @@ mod imp {
         lib: &'static LibSystemd,
         journal: NonNull<SdJournal>,
         wait_timeout: Duration,
+        max_entry_bytes: usize,
+        max_field_bytes: usize,
+        max_fields_per_entry: usize,
+    }
+
+    pub(crate) trait JournalSource {
+        fn next_entry(&mut self) -> Result<Option<JournalEntry>, String>;
     }
 
     impl SdJournalReader {
@@ -121,16 +133,33 @@ mod imp {
         ) -> Result<Self, String> {
             let lib = LibSystemd::load()?;
             let mut raw = std::ptr::null_mut();
-            check(
-                unsafe { (lib.open)(&mut raw, SD_JOURNAL_LOCAL_ONLY) },
-                "sd_journal_open",
-            )?;
+            if config.journal.root_path == Path::new("/") {
+                check(
+                    unsafe { (lib.open)(&mut raw, SD_JOURNAL_LOCAL_ONLY) },
+                    "sd_journal_open",
+                )?;
+            } else {
+                let root = path_to_cstring(&config.journal.root_path)?;
+                check(
+                    unsafe {
+                        (lib.open_directory)(
+                            &mut raw,
+                            root.as_ptr(),
+                            SD_JOURNAL_LOCAL_ONLY | SD_JOURNAL_OS_ROOT,
+                        )
+                    },
+                    "sd_journal_open_directory",
+                )?;
+            }
             let journal =
                 NonNull::new(raw).ok_or_else(|| "sd_journal_open returned null".to_owned())?;
             let mut reader = Self {
                 lib,
                 journal,
                 wait_timeout: config.wait_timeout,
+                max_entry_bytes: config.extraction.max_entry_bytes,
+                max_field_bytes: config.extraction.max_field_bytes,
+                max_fields_per_entry: config.extraction.max_fields_per_entry,
             };
             if let Err(err) = reader.configure(config, checkpoint) {
                 unsafe { (reader.lib.close)(reader.journal.as_ptr()) };
@@ -166,26 +195,7 @@ mod imp {
             )?;
 
             if let Some(cursor) = checkpoint {
-                let c = CString::new(cursor)
-                    .map_err(|_| "checkpoint cursor contains NUL".to_owned())?;
-                check(
-                    unsafe { (self.lib.seek_cursor)(self.journal.as_ptr(), c.as_ptr()) },
-                    "sd_journal_seek_cursor",
-                )?;
-                let next = unsafe { (self.lib.next)(self.journal.as_ptr()) };
-                if next < 0 {
-                    return Err(format!("sd_journal_next failed with {next}"));
-                }
-                if next == 0 {
-                    return Err("checkpoint cursor is no longer present in journal".to_owned());
-                }
-                let matches = unsafe { (self.lib.test_cursor)(self.journal.as_ptr(), c.as_ptr()) };
-                if matches < 0 {
-                    return Err(format!("sd_journal_test_cursor failed with {matches}"));
-                }
-                if matches == 0 {
-                    return Err("checkpoint cursor is no longer present in journal".to_owned());
-                }
+                self.seek_after_committed_cursor(cursor)?;
                 return Ok(());
             }
 
@@ -207,6 +217,30 @@ mod imp {
                     }
                 }
             }
+        }
+
+        fn seek_after_committed_cursor(&mut self, cursor: &str) -> Result<(), String> {
+            let c =
+                CString::new(cursor).map_err(|_| "checkpoint cursor contains NUL".to_owned())?;
+            check(
+                unsafe { (self.lib.seek_cursor)(self.journal.as_ptr(), c.as_ptr()) },
+                "sd_journal_seek_cursor",
+            )?;
+            let next = unsafe { (self.lib.next)(self.journal.as_ptr()) };
+            if next < 0 {
+                return Err(format!("sd_journal_next failed with {next}"));
+            }
+            if next == 0 {
+                return Err("checkpoint cursor is invalid or stale".to_owned());
+            }
+            let matches = unsafe { (self.lib.test_cursor)(self.journal.as_ptr(), c.as_ptr()) };
+            if matches < 0 {
+                return Err(format!("sd_journal_test_cursor failed with {matches}"));
+            }
+            if matches == 0 {
+                return Err("checkpoint cursor is invalid or stale".to_owned());
+            }
+            Ok(())
         }
 
         fn add_match_group<I, V>(&mut self, field: &str, values: I) -> Result<bool, String>
@@ -249,7 +283,7 @@ mod imp {
             )
         }
 
-        pub(crate) fn next_entry(&mut self) -> Result<Option<JournalEntry>, String> {
+        fn read_next_entry(&mut self) -> Result<Option<JournalEntry>, String> {
             loop {
                 let next = unsafe { (self.lib.next)(self.journal.as_ptr()) };
                 if next < 0 {
@@ -288,6 +322,9 @@ mod imp {
 
             unsafe { (self.lib.restart_data)(self.journal.as_ptr()) };
             let mut fields = Vec::new();
+            let mut entry_bytes = 0usize;
+            let mut dropped_fields = 0usize;
+            let mut dropped_large_fields = 0usize;
             loop {
                 let mut data: *const c_void = std::ptr::null();
                 let mut len: size_t = 0;
@@ -300,10 +337,23 @@ mod imp {
                 if rc == 0 {
                     break;
                 }
+                if fields.len() >= self.max_fields_per_entry {
+                    dropped_fields = dropped_fields.saturating_add(1);
+                    continue;
+                }
                 let bytes = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), len) };
                 if let Some(eq) = bytes.iter().position(|b| *b == b'=') {
+                    let value_len = bytes.len().saturating_sub(eq + 1);
+                    if value_len > self.max_field_bytes
+                        || entry_bytes.saturating_add(value_len) > self.max_entry_bytes
+                    {
+                        dropped_fields = dropped_fields.saturating_add(1);
+                        dropped_large_fields = dropped_large_fields.saturating_add(1);
+                        continue;
+                    }
                     let name = String::from_utf8_lossy(&bytes[..eq]).into_owned();
                     let value = bytes[eq + 1..].to_vec();
+                    entry_bytes = entry_bytes.saturating_add(value.len());
                     fields.push(JournalField { name, value });
                 }
             }
@@ -312,7 +362,15 @@ mod imp {
                 cursor,
                 realtime_unix_nano: realtime_usec.saturating_mul(1000),
                 fields,
+                dropped_fields,
+                dropped_large_fields,
             })
+        }
+    }
+
+    impl JournalSource for SdJournalReader {
+        fn next_entry(&mut self) -> Result<Option<JournalEntry>, String> {
+            self.read_next_entry()
         }
     }
 
@@ -329,7 +387,21 @@ mod imp {
             Ok(())
         }
     }
+
+    fn path_to_cstring(path: &Path) -> Result<CString, String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            CString::new(path.as_os_str().as_bytes())
+                .map_err(|_| format!("journal.root_path contains NUL: {}", path.display()))
+        }
+        #[cfg(not(unix))]
+        {
+            CString::new(path.to_string_lossy().as_bytes())
+                .map_err(|_| format!("journal.root_path contains NUL: {}", path.display()))
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) use imp::SdJournalReader;
+pub(crate) use imp::{JournalSource, SdJournalReader};

@@ -21,13 +21,13 @@ pub(crate) fn checkpoint_path(
     pipeline_group_id: &str,
     pipeline_id: &str,
     receiver_name: &str,
-    namespace: &str,
+    source_id: &str,
 ) -> PathBuf {
     let mut path = expand_state_dir(root);
     path.push(sanitize_segment(pipeline_group_id));
     path.push(sanitize_segment(pipeline_id));
     path.push(sanitize_segment(receiver_name));
-    path.push(format!("{}.cursor", sanitize_segment(namespace)));
+    path.push(format!("{}.cursor", sanitize_segment(source_id)));
     path
 }
 

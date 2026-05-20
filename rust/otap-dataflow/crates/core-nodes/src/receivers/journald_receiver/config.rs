@@ -6,13 +6,14 @@
 //! See [`docs/journald-receiver.md`](../../../../../../docs/journald-receiver.md)
 //! for the design document this implementation follows.
 
-use serde::{Deserialize, Serialize};
+use serde::de::Error as DeError;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-/// Default stable namespace identifier for the local system journal.
-pub const DEFAULT_NAMESPACE: &str = "system";
+/// Default stable OTAP source identifier for the local system journal.
+pub const DEFAULT_SOURCE_ID: &str = "system";
 
 /// Default per-batch record limit handed off from the worker to the async task.
 const DEFAULT_BATCH_MAX_RECORDS: usize = 1024;
@@ -30,9 +31,17 @@ const DEFAULT_MAX_IN_FLIGHT_BATCHES: usize = 1;
 const DEFAULT_MAX_CONSECUTIVE_FAILURES: u32 = 5;
 /// Default checkpoint root directory; the receiver appends a stable suffix.
 const DEFAULT_CHECKPOINT_DIR: &str = "${engine.state_dir}/journald";
+/// Default host root used by libsystemd for local journal access.
+const DEFAULT_JOURNAL_ROOT_PATH: &str = "/";
+/// Default maximum copied bytes per journal entry.
+const DEFAULT_MAX_ENTRY_BYTES: usize = 1024 * 1024;
+/// Default maximum copied bytes per journal field value.
+const DEFAULT_MAX_FIELD_BYTES: usize = 256 * 1024;
+/// Default maximum field count per journal entry.
+const DEFAULT_MAX_FIELDS_PER_ENTRY: usize = 256;
 
-fn default_namespace() -> String {
-    DEFAULT_NAMESPACE.to_owned()
+fn default_source_id() -> String {
+    DEFAULT_SOURCE_ID.to_owned()
 }
 
 fn default_priorities() -> Vec<u8> {
@@ -136,7 +145,7 @@ impl Default for BatchConfig {
 #[serde(deny_unknown_fields)]
 pub struct CheckpointConfig {
     /// Root directory for checkpoint files. The receiver appends
-    /// `<pipeline_group>/<pipeline_id>/<receiver_name>/<namespace>.cursor`.
+    /// `<pipeline_group>/<pipeline_id>/<receiver_name>/<source_id>.cursor`.
     #[serde(default = "CheckpointConfig::default_directory")]
     pub directory: PathBuf,
     /// Maximum number of in-flight (un-Acked) batches.
@@ -173,13 +182,104 @@ impl Default for CheckpointConfig {
     }
 }
 
+/// Concrete systemd journal source selection.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct JournalConfig {
+    /// Optional named systemd journal namespace. `None` selects the default
+    /// namespace by passing NULL to systemd APIs. Named namespaces are rejected
+    /// in v1 until `sd_journal_open_namespace` is wired.
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// OS root for host journal access. `/` opens the local root;
+    /// containerized host access can set this to a mounted host root such as
+    /// `/host`.
+    #[serde(default = "JournalConfig::default_root_path")]
+    pub root_path: PathBuf,
+}
+
+impl JournalConfig {
+    fn default_root_path() -> PathBuf {
+        PathBuf::from(DEFAULT_JOURNAL_ROOT_PATH)
+    }
+}
+
+impl Default for JournalConfig {
+    fn default() -> Self {
+        Self {
+            namespace: None,
+            root_path: Self::default_root_path(),
+        }
+    }
+}
+
+/// Policy applied when extraction limits are exceeded.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LargeFieldPolicy {
+    /// Omit the field and count the drop.
+    #[default]
+    DropAndCount,
+}
+
+/// Hard limits for copying data out of a journald entry.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtractionConfig {
+    /// Maximum total copied journal field value bytes per entry.
+    #[serde(
+        default = "ExtractionConfig::default_max_entry_bytes",
+        deserialize_with = "deserialize_usize_bytes"
+    )]
+    pub max_entry_bytes: usize,
+    /// Maximum copied bytes for one journal field value.
+    #[serde(
+        default = "ExtractionConfig::default_max_field_bytes",
+        deserialize_with = "deserialize_usize_bytes"
+    )]
+    pub max_field_bytes: usize,
+    /// Maximum number of journal fields copied from one entry.
+    #[serde(default = "ExtractionConfig::default_max_fields_per_entry")]
+    pub max_fields_per_entry: usize,
+    /// Policy used when any extraction limit is exceeded.
+    #[serde(default)]
+    pub large_field_policy: LargeFieldPolicy,
+}
+
+impl ExtractionConfig {
+    const fn default_max_entry_bytes() -> usize {
+        DEFAULT_MAX_ENTRY_BYTES
+    }
+    const fn default_max_field_bytes() -> usize {
+        DEFAULT_MAX_FIELD_BYTES
+    }
+    const fn default_max_fields_per_entry() -> usize {
+        DEFAULT_MAX_FIELDS_PER_ENTRY
+    }
+}
+
+impl Default for ExtractionConfig {
+    fn default() -> Self {
+        Self {
+            max_entry_bytes: Self::default_max_entry_bytes(),
+            max_field_bytes: Self::default_max_field_bytes(),
+            max_fields_per_entry: Self::default_max_fields_per_entry(),
+            large_field_policy: LargeFieldPolicy::default(),
+        }
+    }
+}
+
 /// User-facing journald receiver configuration.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Stable OTAP source identifier. `system` selects the default local journal.
-    #[serde(default = "default_namespace")]
-    pub namespace: String,
+    /// Stable OTAP source identifier used for telemetry and checkpoints.
+    #[serde(default = "default_source_id")]
+    pub source_id: String,
+
+    /// Concrete systemd journal selection.
+    #[serde(default)]
+    pub journal: JournalConfig,
 
     /// Optional list of `_SYSTEMD_UNIT` matches.
     #[serde(default)]
@@ -189,9 +289,9 @@ pub struct Config {
     #[serde(default)]
     pub identifiers: Vec<String>,
 
-    /// Exact-match priority set. Defaults to all levels (0..=7).
-    #[serde(default = "default_priorities")]
-    pub priorities: Vec<u8>,
+    /// Exact-match priority set. Defaults to all levels (0..=7) when omitted.
+    #[serde(default)]
+    pub priorities: Option<Vec<u8>>,
 
     /// Shorthand for "include all priorities <= max_priority". Expanded into
     /// `priorities` during validation. Mutually exclusive with an explicit
@@ -210,6 +310,10 @@ pub struct Config {
     /// Checkpoint configuration.
     #[serde(default)]
     pub checkpoint: CheckpointConfig,
+
+    /// Hard limits for entry/field extraction.
+    #[serde(default)]
+    pub extraction: ExtractionConfig,
 
     /// `sd_journal_wait` timeout; bounds pause/shutdown responsiveness.
     #[serde(default = "Config::default_wait_timeout", with = "humantime_serde")]
@@ -232,14 +336,16 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            namespace: default_namespace(),
+            source_id: default_source_id(),
+            journal: JournalConfig::default(),
             units: Vec::new(),
             identifiers: Vec::new(),
-            priorities: default_priorities(),
+            priorities: None,
             max_priority: None,
             start_at: StartAt::default(),
             batch: BatchConfig::default(),
             checkpoint: CheckpointConfig::default(),
+            extraction: ExtractionConfig::default(),
             wait_timeout: Self::default_wait_timeout(),
             drain_timeout: Self::default_drain_timeout(),
         }
@@ -251,25 +357,29 @@ impl Default for Config {
 /// Parsing produces this from `Config` once and the receiver hot path consumes
 /// it without re-validating.
 #[derive(Clone, Debug)]
-pub struct RuntimeConfig {
-    /// Stable namespace identifier (`system` or a named systemd namespace).
-    pub namespace: String,
+pub(crate) struct RuntimeConfig {
+    /// Stable OTAP source identifier.
+    pub(crate) source_id: String,
+    /// Concrete systemd journal selection.
+    pub(crate) journal: JournalConfig,
     /// Optional `_SYSTEMD_UNIT` matches (deduplicated, order preserved).
-    pub units: Vec<String>,
+    pub(crate) units: Vec<String>,
     /// Optional `SYSLOG_IDENTIFIER` matches (deduplicated, order preserved).
-    pub identifiers: Vec<String>,
+    pub(crate) identifiers: Vec<String>,
     /// Sorted, deduplicated set of accepted journald `PRIORITY` levels.
-    pub priorities: Vec<u8>,
+    pub(crate) priorities: Vec<u8>,
     /// Where to start when there is no committed cursor.
-    pub start_at: StartAt,
+    pub(crate) start_at: StartAt,
     /// Batch shaping.
-    pub batch: BatchConfig,
+    pub(crate) batch: BatchConfig,
     /// Checkpoint configuration.
-    pub checkpoint: CheckpointConfig,
+    pub(crate) checkpoint: CheckpointConfig,
+    /// Hard extraction limits.
+    pub(crate) extraction: ExtractionConfig,
     /// `sd_journal_wait` timeout.
-    pub wait_timeout: Duration,
+    pub(crate) wait_timeout: Duration,
     /// Drain deadline budget.
-    pub drain_timeout: Duration,
+    pub(crate) drain_timeout: Duration,
 }
 
 impl TryFrom<Config> for RuntimeConfig {
@@ -277,7 +387,8 @@ impl TryFrom<Config> for RuntimeConfig {
 
     fn try_from(config: Config) -> Result<Self, Self::Error> {
         let Config {
-            namespace,
+            source_id,
+            journal,
             units,
             identifiers,
             priorities,
@@ -285,11 +396,13 @@ impl TryFrom<Config> for RuntimeConfig {
             start_at,
             batch,
             checkpoint,
+            extraction,
             wait_timeout,
             drain_timeout,
         } = config;
 
-        let namespace = validate_namespace(namespace)?;
+        let source_id = validate_source_id(source_id)?;
+        let journal = validate_journal(journal)?;
         let units = dedup_non_empty(units, "units")?;
         let identifiers = dedup_non_empty(identifiers, "identifiers")?;
         let priorities = resolve_priorities(priorities, max_priority)?;
@@ -318,6 +431,7 @@ impl TryFrom<Config> for RuntimeConfig {
                 "checkpoint.max_consecutive_failures must be greater than zero",
             ));
         }
+        validate_extraction(&extraction)?;
         if wait_timeout.is_zero() {
             return Err(invalid("wait_timeout must be greater than zero"));
         }
@@ -328,13 +442,15 @@ impl TryFrom<Config> for RuntimeConfig {
             return Err(invalid("drain_timeout must be greater than wait_timeout"));
         }
         Ok(Self {
-            namespace,
+            source_id,
+            journal,
             units,
             identifiers,
             priorities,
             start_at,
             batch,
             checkpoint,
+            extraction,
             wait_timeout,
             drain_timeout,
         })
@@ -347,26 +463,142 @@ fn invalid(msg: &str) -> otap_df_config::error::Error {
     }
 }
 
-fn validate_namespace(namespace: String) -> Result<String, otap_df_config::error::Error> {
-    if namespace.is_empty() {
-        return Err(invalid("namespace must not be empty"));
+fn deserialize_usize_bytes<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = otap_df_config::byte_units::deserialize_u64(deserializer)?
+        .ok_or_else(|| D::Error::custom("byte size value must not be null"))?;
+    usize::try_from(value)
+        .map_err(|_| D::Error::custom(format!("byte size {value} exceeds usize::MAX")))
+}
+
+fn validate_source_id(source_id: String) -> Result<String, otap_df_config::error::Error> {
+    if source_id.is_empty() {
+        return Err(invalid("source_id must not be empty"));
     }
     // Stable identifier requirements: ASCII, no path separators or whitespace,
     // so the on-disk checkpoint path stays trivially safe.
-    if !namespace
+    if !source_id
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
     {
         return Err(invalid(
-            "namespace must contain only ASCII alphanumerics, '_', '-', or '.'",
+            "source_id must contain only ASCII alphanumerics, '_', '-', or '.'",
         ));
     }
-    if namespace != DEFAULT_NAMESPACE {
+    Ok(source_id)
+}
+
+fn validate_journal(
+    mut journal: JournalConfig,
+) -> Result<JournalConfig, otap_df_config::error::Error> {
+    if let Some(namespace) = &journal.namespace {
+        if namespace.is_empty() {
+            return Err(invalid("journal.namespace must not be empty when set"));
+        }
         return Err(invalid(
-            "journald namespace support is not implemented; use namespace `system`",
+            "journal.namespace support is not implemented for journald v1; use null",
         ));
     }
-    Ok(namespace)
+    if journal.root_path.as_os_str().is_empty() {
+        return Err(invalid("journal.root_path must not be empty"));
+    }
+    if journal.root_path.as_os_str().to_str().is_none() {
+        return Err(invalid("journal.root_path must be valid UTF-8"));
+    }
+    let root_path_text = journal
+        .root_path
+        .as_os_str()
+        .to_str()
+        .expect("journal.root_path UTF-8 checked above");
+    if !journal.root_path.is_absolute() && !root_path_text.starts_with('/') {
+        return Err(invalid(&format!(
+            "journal.root_path must be absolute: {}",
+            journal.root_path.display()
+        )));
+    }
+    if journal
+        .root_path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(invalid("journal.root_path must not contain '..'"));
+    }
+    journal.root_path = normalize_path(&journal.root_path);
+    Ok(journal)
+}
+
+pub(crate) fn journal_source_lease_key(journal: &JournalConfig) -> String {
+    format!(
+        "journald:root={}:namespace={}",
+        stable_path_key(&journal.root_path),
+        journal.namespace.as_deref().unwrap_or("<default>")
+    )
+}
+
+fn stable_path_key(path: &Path) -> String {
+    let normalized = normalize_path(path);
+    let mut parts = Vec::new();
+    let mut absolute = false;
+    for component in normalized.components() {
+        match component {
+            Component::RootDir => absolute = true,
+            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            _ => {}
+        }
+    }
+    let joined = parts.join("/");
+    if absolute {
+        if joined.is_empty() {
+            "/".to_owned()
+        } else {
+            format!("/{joined}")
+        }
+    } else if joined.is_empty() {
+        ".".to_owned()
+    } else {
+        joined
+    }
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        normalized
+    }
+}
+
+fn validate_extraction(extraction: &ExtractionConfig) -> Result<(), otap_df_config::error::Error> {
+    if extraction.max_entry_bytes == 0 {
+        return Err(invalid(
+            "extraction.max_entry_bytes must be greater than zero",
+        ));
+    }
+    if extraction.max_field_bytes == 0 {
+        return Err(invalid(
+            "extraction.max_field_bytes must be greater than zero",
+        ));
+    }
+    if extraction.max_fields_per_entry == 0 {
+        return Err(invalid(
+            "extraction.max_fields_per_entry must be greater than zero",
+        ));
+    }
+    if extraction.max_field_bytes > extraction.max_entry_bytes {
+        return Err(invalid(
+            "extraction.max_field_bytes must be <= extraction.max_entry_bytes",
+        ));
+    }
+    Ok(())
 }
 
 fn dedup_non_empty(
@@ -387,13 +619,11 @@ fn dedup_non_empty(
 }
 
 fn resolve_priorities(
-    priorities: Vec<u8>,
+    priorities: Option<Vec<u8>>,
     max_priority: Option<MaxPriority>,
 ) -> Result<Vec<u8>, otap_df_config::error::Error> {
-    let priorities_is_default = priorities == default_priorities();
-
     if let Some(max) = max_priority {
-        if !priorities_is_default {
+        if priorities.is_some() {
             return Err(invalid(
                 "priorities and max_priority are mutually exclusive; specify one",
             ));
@@ -401,6 +631,7 @@ fn resolve_priorities(
         return Ok((0..=max.level()).collect());
     }
 
+    let priorities = priorities.unwrap_or_else(default_priorities);
     for p in &priorities {
         if *p > 7 {
             return Err(invalid("priorities entries must be in the range 0..=7"));
@@ -444,25 +675,27 @@ mod tests {
     #[test]
     fn defaults_round_trip_into_runtime_config() {
         let runtime = RuntimeConfig::try_from(base()).expect("default config must validate");
-        assert_eq!(runtime.namespace, DEFAULT_NAMESPACE);
+        assert_eq!(runtime.source_id, DEFAULT_SOURCE_ID);
+        assert_eq!(runtime.journal.namespace, None);
+        assert_eq!(runtime.journal.root_path, PathBuf::from("/"));
         assert_eq!(runtime.priorities, (0..=7).collect::<Vec<u8>>());
         assert_eq!(runtime.start_at, StartAt::End);
         assert_eq!(runtime.batch.max_records, DEFAULT_BATCH_MAX_RECORDS);
     }
 
     #[test]
-    fn rejects_empty_namespace() {
+    fn rejects_empty_source_id() {
         let cfg = Config {
-            namespace: String::new(),
+            source_id: String::new(),
             ..base()
         };
         assert!(RuntimeConfig::try_from(cfg).is_err());
     }
 
     #[test]
-    fn rejects_namespace_with_path_separator() {
+    fn rejects_source_id_with_path_separator() {
         let cfg = Config {
-            namespace: "system/etc".to_owned(),
+            source_id: "system/etc".to_owned(),
             ..base()
         };
         assert!(RuntimeConfig::try_from(cfg).is_err());
@@ -471,7 +704,10 @@ mod tests {
     #[test]
     fn rejects_named_namespace_until_systemd_namespace_open_is_supported() {
         let cfg = Config {
-            namespace: "audit".to_owned(),
+            journal: JournalConfig {
+                namespace: Some("audit".to_owned()),
+                ..JournalConfig::default()
+            },
             ..base()
         };
         assert!(RuntimeConfig::try_from(cfg).is_err());
@@ -480,7 +716,7 @@ mod tests {
     #[test]
     fn rejects_priorities_out_of_range() {
         let cfg = Config {
-            priorities: vec![0, 8],
+            priorities: Some(vec![0, 8]),
             ..base()
         };
         assert!(RuntimeConfig::try_from(cfg).is_err());
@@ -489,7 +725,7 @@ mod tests {
     #[test]
     fn rejects_empty_explicit_priorities() {
         let cfg = Config {
-            priorities: vec![],
+            priorities: Some(vec![]),
             ..base()
         };
         assert!(RuntimeConfig::try_from(cfg).is_err());
@@ -498,7 +734,7 @@ mod tests {
     #[test]
     fn dedups_and_sorts_priorities() {
         let cfg = Config {
-            priorities: vec![3, 1, 3, 0],
+            priorities: Some(vec![3, 1, 3, 0]),
             ..base()
         };
         let runtime = RuntimeConfig::try_from(cfg).expect("must validate");
@@ -508,7 +744,6 @@ mod tests {
     #[test]
     fn max_priority_expands_to_inclusive_range() {
         let cfg = Config {
-            priorities: default_priorities(), // unchanged so max_priority can apply
             max_priority: Some(MaxPriority::Warning),
             ..base()
         };
@@ -519,8 +754,61 @@ mod tests {
     #[test]
     fn max_priority_conflicts_with_explicit_priorities() {
         let cfg = Config {
-            priorities: vec![3],
+            priorities: Some(default_priorities()),
             max_priority: Some(MaxPriority::Warning),
+            ..base()
+        };
+        assert!(RuntimeConfig::try_from(cfg).is_err());
+    }
+
+    #[test]
+    fn accepts_and_normalizes_journal_root_path() {
+        let cfg = Config {
+            journal: JournalConfig {
+                root_path: PathBuf::from("/host/./"),
+                ..JournalConfig::default()
+            },
+            ..base()
+        };
+        let runtime = RuntimeConfig::try_from(cfg).expect("must validate");
+        assert_eq!(runtime.journal.root_path, PathBuf::from("/host"));
+        assert_eq!(
+            journal_source_lease_key(&runtime.journal),
+            "journald:root=/host:namespace=<default>"
+        );
+    }
+
+    #[test]
+    fn lease_key_uses_stable_path_separators() {
+        let journal = JournalConfig {
+            root_path: PathBuf::from("/host/journal"),
+            ..JournalConfig::default()
+        };
+        assert_eq!(
+            journal_source_lease_key(&journal),
+            "journald:root=/host/journal:namespace=<default>"
+        );
+    }
+
+    #[test]
+    fn rejects_relative_journal_root_path() {
+        let cfg = Config {
+            journal: JournalConfig {
+                root_path: PathBuf::from("host"),
+                ..JournalConfig::default()
+            },
+            ..base()
+        };
+        assert!(RuntimeConfig::try_from(cfg).is_err());
+    }
+
+    #[test]
+    fn rejects_parent_dir_in_journal_root_path() {
+        let cfg = Config {
+            journal: JournalConfig {
+                root_path: PathBuf::from("../host"),
+                ..JournalConfig::default()
+            },
             ..base()
         };
         assert!(RuntimeConfig::try_from(cfg).is_err());
@@ -606,6 +894,33 @@ mod tests {
             runtime.units,
             vec!["nginx.service".to_owned(), "ssh.service".to_owned()]
         );
+    }
+
+    #[test]
+    fn rejects_invalid_extraction_limits() {
+        let cfg = Config {
+            extraction: ExtractionConfig {
+                max_entry_bytes: 10,
+                max_field_bytes: 11,
+                ..ExtractionConfig::default()
+            },
+            ..base()
+        };
+        assert!(RuntimeConfig::try_from(cfg).is_err());
+    }
+
+    #[test]
+    fn parses_extraction_byte_units() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "extraction": {
+                "max_entry_bytes": "1 MiB",
+                "max_field_bytes": "256 KiB"
+            }
+        }))
+        .expect("byte units must parse");
+        let runtime = RuntimeConfig::try_from(cfg).expect("config must validate");
+        assert_eq!(runtime.extraction.max_entry_bytes, 1024 * 1024);
+        assert_eq!(runtime.extraction.max_field_bytes, 256 * 1024);
     }
 
     #[test]

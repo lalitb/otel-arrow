@@ -39,7 +39,7 @@ use otap_df_otap::pdata::Context;
 use otap_df_otap::pdata::OtapPdata;
 #[cfg(target_os = "linux")]
 use otap_df_pdata::OtapPayload;
-use otap_df_telemetry::instrument::Counter;
+use otap_df_telemetry::instrument::{Counter, Gauge};
 use otap_df_telemetry::metrics::MetricSet;
 #[cfg(target_os = "linux")]
 use otap_df_telemetry::metrics::MetricSetSnapshot;
@@ -62,9 +62,13 @@ mod checkpoint;
 mod config;
 mod journal;
 
+#[cfg(target_os = "linux")]
+use journal::JournalSource;
+
+use config::RuntimeConfig;
 pub use config::{
-    BatchConfig, CheckpointConfig, Config, DEFAULT_NAMESPACE, MaxPriority, OnNack, RuntimeConfig,
-    StartAt, severity_number_from_priority,
+    BatchConfig, CheckpointConfig, Config, DEFAULT_SOURCE_ID, ExtractionConfig, JournalConfig,
+    LargeFieldPolicy, MaxPriority, OnNack, StartAt, severity_number_from_priority,
 };
 
 /// URN for the journald receiver.
@@ -108,6 +112,21 @@ pub struct JournaldReceiverMetrics {
     /// Number of source read failures reported by the worker.
     #[metric(unit = "{failure}")]
     pub source_failures: Counter<u64>,
+    /// Number of invalid or stale checkpoint cursors observed at startup/rewind.
+    #[metric(unit = "{cursor}")]
+    pub invalid_stale_cursors: Counter<u64>,
+    /// Number of journal fields dropped by hard extraction limits.
+    #[metric(unit = "{field}")]
+    pub field_drops: Counter<u64>,
+    /// Number of journal fields dropped for exceeding field or entry byte limits.
+    #[metric(unit = "{field}")]
+    pub large_field_drops: Counter<u64>,
+    /// Most recent entry timestamp emitted by the worker.
+    #[metric(unit = "ns")]
+    pub last_entry_timestamp_unix_nano: Gauge<u64>,
+    /// Total time spent waiting for downstream backpressure.
+    #[metric(unit = "ns")]
+    pub downstream_backpressure_duration_ns: Counter<u64>,
     /// Number of times the worker was asked to rewind after a Nack.
     #[metric(unit = "{rewind}")]
     pub rewinds: Counter<u64>,
@@ -119,7 +138,7 @@ pub struct JournaldReceiver {
     config: RuntimeConfig,
     #[cfg(target_os = "linux")]
     checkpoint_path: PathBuf,
-    _lease: NamespaceLease,
+    _lease: JournalSourceLease,
     metrics: Option<MetricSet<JournaldReceiverMetrics>>,
 }
 
@@ -153,7 +172,7 @@ fn create_journald_receiver(
         pipeline.pipeline_group_id().as_ref(),
         pipeline.pipeline_id().as_ref(),
         receiver_config.name.as_ref(),
-        &receiver.config.namespace,
+        &receiver.config.source_id,
     );
     receiver.metrics = Some(pipeline.register_metrics::<JournaldReceiverMetrics>());
     Ok(ReceiverWrapper::local(
@@ -204,7 +223,7 @@ impl JournaldReceiver {
     /// Builds a receiver from an already-deserialized `Config`.
     fn new(config: Config) -> Result<Self, otap_df_config::error::Error> {
         let runtime = RuntimeConfig::try_from(config)?;
-        let lease = NamespaceLease::acquire(&runtime.namespace)?;
+        let lease = JournalSourceLease::acquire(&runtime.journal)?;
         Ok(Self {
             config: runtime,
             #[cfg(target_os = "linux")]
@@ -234,6 +253,9 @@ struct WorkerBatch {
     last_cursor: String,
     records: otap_df_pdata::otap::OtapArrowRecords,
     record_count: usize,
+    field_drops: u64,
+    large_field_drops: u64,
+    last_entry_timestamp_unix_nano: u64,
 }
 
 #[cfg(target_os = "linux")]
@@ -281,10 +303,6 @@ const WORKER_COMMAND_CHANNEL_CAPACITY: usize = 8;
 #[cfg(target_os = "linux")]
 const WORKER_EVENT_CONTROL_SLOTS: usize = 4;
 #[cfg(target_os = "linux")]
-const WORKER_COMMAND_RETRY_LIMIT: usize = 200;
-#[cfg(target_os = "linux")]
-const WORKER_COMMAND_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
-
 #[cfg(target_os = "linux")]
 fn batch_id_from_call_data(call_data: &CallData) -> Option<u64> {
     call_data.first().copied().map(u64::from)
@@ -314,26 +332,17 @@ async fn send_worker_command(
     cmd: WorkerCommand,
     effect_handler: &local::EffectHandler<OtapPdata>,
 ) -> Result<(), Error> {
-    let mut cmd = Some(cmd);
-    for _ in 0..WORKER_COMMAND_RETRY_LIMIT {
-        match tx.try_send(cmd.take().expect("command must be present")) {
-            Ok(()) => return Ok(()),
-            Err(std::sync::mpsc::TrySendError::Full(returned)) => {
-                cmd = Some(returned);
-                tokio::time::sleep(WORKER_COMMAND_RETRY_DELAY).await;
-            }
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                return Err(terminal_error(
-                    effect_handler,
-                    "journald worker command channel disconnected",
-                ));
-            }
-        }
+    match tx.try_send(cmd) {
+        Ok(()) => Ok(()),
+        Err(std::sync::mpsc::TrySendError::Full(_)) => Err(terminal_error(
+            effect_handler,
+            "journald worker command channel saturated",
+        )),
+        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(terminal_error(
+            effect_handler,
+            "journald worker command channel disconnected",
+        )),
     }
-    Err(terminal_error(
-        effect_handler,
-        "journald worker command channel saturated",
-    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -344,7 +353,7 @@ fn spawn_worker(
 ) -> Result<WorkerHandle, String> {
     let (cmd_tx, cmd_rx) = std::sync::mpsc::sync_channel(WORKER_COMMAND_CHANNEL_CAPACITY);
     let join = std::thread::Builder::new()
-        .name(format!("otap-journald-{}", config.namespace))
+        .name(format!("otap-journald-{}", config.source_id))
         .spawn(move || worker_loop(config, checkpoint_path, event_tx, cmd_rx))
         .map_err(|err| format!("failed to spawn journald worker thread: {err}"))?;
     Ok(WorkerHandle { cmd_tx, join })
@@ -397,6 +406,9 @@ fn worker_loop_inner(
     let mut last_cursor = String::new();
     let mut first_record_at = StdInstant::now();
     let mut in_flight = false;
+    let mut batch_field_drops = 0u64;
+    let mut batch_large_field_drops = 0u64;
+    let mut last_entry_timestamp_unix_nano = 0u64;
 
     loop {
         if in_flight {
@@ -423,6 +435,9 @@ fn worker_loop_inner(
                     builder = arrow_records_encoder::JournaldArrowRecordsBuilder::new();
                     first_cursor.clear();
                     last_cursor.clear();
+                    batch_field_drops = 0;
+                    batch_large_field_drops = 0;
+                    last_entry_timestamp_unix_nano = 0;
                     reader = journal::SdJournalReader::open(&config, committed_cursor.as_deref())?;
                     in_flight = false;
                 }
@@ -454,6 +469,9 @@ fn worker_loop_inner(
                     builder = arrow_records_encoder::JournaldArrowRecordsBuilder::new();
                     first_cursor.clear();
                     last_cursor.clear();
+                    batch_field_drops = 0;
+                    batch_large_field_drops = 0;
+                    last_entry_timestamp_unix_nano = 0;
                     reader = journal::SdJournalReader::open(&config, committed_cursor.as_deref())?;
                 }
                 WorkerCommand::Shutdown => return Ok(()),
@@ -466,6 +484,10 @@ fn worker_loop_inner(
                 first_record_at = StdInstant::now();
             }
             last_cursor = entry.cursor.clone();
+            batch_field_drops = batch_field_drops.saturating_add(entry.dropped_fields as u64);
+            batch_large_field_drops =
+                batch_large_field_drops.saturating_add(entry.dropped_large_fields as u64);
+            last_entry_timestamp_unix_nano = entry.realtime_unix_nano;
             builder.append(&entry);
         }
 
@@ -485,6 +507,9 @@ fn worker_loop_inner(
                 last_cursor: std::mem::take(&mut last_cursor),
                 records,
                 record_count,
+                field_drops: std::mem::take(&mut batch_field_drops),
+                large_field_drops: std::mem::take(&mut batch_large_field_drops),
+                last_entry_timestamp_unix_nano: std::mem::take(&mut last_entry_timestamp_unix_nano),
             };
             next_batch_id = next_batch_id.saturating_add(1);
             if !send_batch_or_observe_shutdown(event_tx, cmd_rx, batch)? {
@@ -549,7 +574,7 @@ impl local::Receiver<OtapPdata> for JournaldReceiver {
 
         otel_info!(
             "journald_receiver.start",
-            namespace = config.namespace.as_str()
+            source_id = config.source_id.as_str()
         );
 
         // Periodic telemetry collection mirrors host_metrics_receiver.
@@ -655,7 +680,7 @@ impl local::Receiver<OtapPdata> for JournaldReceiver {
                             }
                             otel_info!(
                                 "journald_receiver.drain_ingress",
-                                namespace = config.namespace.as_str()
+                                source_id = config.source_id.as_str()
                             );
                             let local_deadline = StdInstant::now()
                                 .checked_add(config.drain_timeout)
@@ -677,7 +702,7 @@ impl local::Receiver<OtapPdata> for JournaldReceiver {
                             }
                             otel_info!(
                                 "journald_receiver.shutdown",
-                                namespace = config.namespace.as_str()
+                                source_id = config.source_id.as_str()
                             );
                             let _ =
                                 send_worker_command(&worker.cmd_tx, WorkerCommand::Shutdown, &effect_handler).await;
@@ -720,6 +745,7 @@ impl local::Receiver<OtapPdata> for JournaldReceiver {
                             let send_result = match effect_handler.try_send_message_with_source_node(pdata) {
                                 Ok(()) => Ok(()),
                                 Err(TypedError::ChannelSendError(SendError::Full(pdata))) => {
+                                    let backpressure_started = StdInstant::now();
                                     let mut send = Box::pin(effect_handler.send_message_with_source_node(pdata));
                                     loop {
                                         let result = tokio::select! {
@@ -767,6 +793,12 @@ impl local::Receiver<OtapPdata> for JournaldReceiver {
 
                                             result = send.as_mut() => result,
                                         };
+                                        if let Some(metrics) = metrics.as_mut() {
+                                            metrics.downstream_backpressure_duration_ns.add(
+                                                backpressure_started.elapsed().as_nanos().min(u64::MAX as u128)
+                                                    as u64,
+                                            );
+                                        }
                                         break result;
                                     }
                                 }
@@ -784,10 +816,15 @@ impl local::Receiver<OtapPdata> for JournaldReceiver {
                                     if let Some(metrics) = metrics.as_mut() {
                                         metrics.batches_sent.add(1);
                                         metrics.records_sent.add(record_count as u64);
+                                        metrics.field_drops.add(batch.field_drops);
+                                        metrics.large_field_drops.add(batch.large_field_drops);
+                                        metrics.last_entry_timestamp_unix_nano.set(
+                                            batch.last_entry_timestamp_unix_nano,
+                                        );
                                     }
                                     otel_info!(
                                         "journald_receiver.batch_sent",
-                                        namespace = config.namespace.as_str(),
+                                        source_id = config.source_id.as_str(),
                                         batch_id = batch_id,
                                         first_cursor = batch.first_cursor.as_str(),
                                         last_cursor = batch.last_cursor.as_str(),
@@ -818,7 +855,7 @@ impl local::Receiver<OtapPdata> for JournaldReceiver {
                                     }
                                     otel_info!(
                                         "journald_receiver.cursor_committed",
-                                        namespace = config.namespace.as_str(),
+                                        source_id = config.source_id.as_str(),
                                         batch_id = batch_id,
                                         cursor = cursor.as_str()
                                     );
@@ -838,7 +875,7 @@ impl local::Receiver<OtapPdata> for JournaldReceiver {
                                     }
                                     otel_warn!(
                                         "journald_receiver.checkpoint_failed",
-                                        namespace = config.namespace.as_str(),
+                                        source_id = config.source_id.as_str(),
                                         batch_id = batch_id,
                                         error = err.as_str()
                                     );
@@ -858,6 +895,9 @@ impl local::Receiver<OtapPdata> for JournaldReceiver {
                         Some(WorkerEvent::Failed(err)) => {
                             if let Some(metrics) = metrics.as_mut() {
                                 metrics.source_failures.add(1);
+                                if err.contains("checkpoint cursor is invalid or stale") {
+                                    metrics.invalid_stale_cursors.add(1);
+                                }
                             }
                             drop(event_rx);
                             join_worker(worker, &effect_handler).await?;
@@ -875,23 +915,24 @@ impl local::Receiver<OtapPdata> for JournaldReceiver {
     }
 }
 
-// --- Per-namespace process-local lease ---------------------------------------
+// --- Per-journal-source process-local lease ----------------------------------
 //
 // The receiver design (see `docs/journald-receiver.md`) requires that, within
-// a single process, no two journald receivers target the same namespace. The
-// lease key intentionally uses only the stable namespace identifier; cross-
-// process duplication is left to operators in v1.
+// a single process, no two journald receivers target the same concrete journal
+// source. The lease key intentionally uses the systemd journal selection, not
+// the stable OTAP source id; cross-process duplication is left to operators in
+// v1.
 
 static JOURNALD_LEASES: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
-struct NamespaceLease {
+struct JournalSourceLease {
     key: String,
 }
 
-impl NamespaceLease {
-    fn acquire(namespace: &str) -> Result<Self, otap_df_config::error::Error> {
-        let key = lease_key(namespace);
+impl JournalSourceLease {
+    fn acquire(journal: &JournalConfig) -> Result<Self, otap_df_config::error::Error> {
+        let key = lease_key(journal);
         let mut leases = JOURNALD_LEASES.lock().map_err(|_| {
             otap_df_config::error::Error::InvalidUserConfig {
                 error: "journald lease registry is unavailable".to_owned(),
@@ -899,14 +940,14 @@ impl NamespaceLease {
         })?;
         if !leases.insert(key.clone()) {
             return Err(otap_df_config::error::Error::InvalidUserConfig {
-                error: format!("another journald receiver already targets namespace `{namespace}`"),
+                error: format!("another journald receiver already targets journal source `{key}`"),
             });
         }
         Ok(Self { key })
     }
 }
 
-impl Drop for NamespaceLease {
+impl Drop for JournalSourceLease {
     fn drop(&mut self) {
         if let Ok(mut leases) = JOURNALD_LEASES.lock() {
             let _ = leases.remove(&self.key);
@@ -914,18 +955,19 @@ impl Drop for NamespaceLease {
     }
 }
 
-fn lease_key(namespace: &str) -> String {
-    format!("journald:{namespace}")
+fn lease_key(journal: &JournalConfig) -> String {
+    config::journal_source_lease_key(journal)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn rejects_unknown_config_field() {
         let json = serde_json::json!({
-            "namespace": "system",
+            "source_id": "system",
             "unknown_field": true,
         });
         assert!(validate_journald_config(&json).is_err());
@@ -938,26 +980,61 @@ mod tests {
     }
 
     #[test]
-    fn lease_blocks_duplicate_namespace_in_process() {
-        // Use a namespace name not used elsewhere in tests to avoid races.
-        let ns = "test-lease-duplicate";
-        let lease1 = NamespaceLease::acquire(ns).expect("first lease must succeed");
-        let lease2 = NamespaceLease::acquire(ns);
+    fn lease_blocks_duplicate_journal_source_in_process() {
+        let journal = JournalConfig::default();
+        let lease1 = JournalSourceLease::acquire(&journal).expect("first lease must succeed");
+        let lease2 = JournalSourceLease::acquire(&journal);
         assert!(
             lease2.is_err(),
-            "duplicate namespace lease must be rejected"
+            "duplicate journal source lease must be rejected"
         );
         drop(lease1);
         // Lease must be released on drop.
-        let lease3 = NamespaceLease::acquire(ns).expect("lease must be reacquirable after drop");
+        let lease3 =
+            JournalSourceLease::acquire(&journal).expect("lease must be reacquirable after drop");
         drop(lease3);
     }
 
     #[test]
-    fn distinct_namespaces_can_coexist() {
-        let a = NamespaceLease::acquire("test-lease-a").expect("a");
-        let b = NamespaceLease::acquire("test-lease-b").expect("b");
+    fn distinct_journal_roots_can_coexist() {
+        let a = JournalConfig {
+            root_path: PathBuf::from("/a"),
+            ..JournalConfig::default()
+        };
+        let b = JournalConfig {
+            root_path: PathBuf::from("/b"),
+            ..JournalConfig::default()
+        };
+        let a = JournalSourceLease::acquire(&a).expect("a");
+        let b = JournalSourceLease::acquire(&b).expect("b");
         drop(a);
         drop(b);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn factory_rejects_multi_core_pipeline() {
+        let registry = otap_df_telemetry::registry::TelemetryRegistryHandle::new();
+        let controller = otap_df_engine::context::ControllerContext::new(registry);
+        let pipeline =
+            controller.pipeline_context_with("test-group".into(), "test-pipeline".into(), 0, 2, 0);
+        let node_config = Arc::new(NodeUserConfig::new_receiver_config(JOURNALD_RECEIVER_URN));
+        let receiver_config = ReceiverConfig::new("journald");
+        let result = create_journald_receiver(
+            pipeline,
+            NodeId {
+                index: 0,
+                name: "journald".into(),
+            },
+            node_config,
+            &receiver_config,
+        );
+        match result {
+            Err(otap_df_config::error::Error::InvalidUserConfig { error }) => {
+                assert!(error.contains("one-core"));
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+            Ok(_) => panic!("multi-core journald receiver must be rejected"),
+        }
     }
 }
