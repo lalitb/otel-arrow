@@ -264,6 +264,7 @@ otap-df-pdata-views = { path = "crates/pdata-views" }
 default = ["jemalloc", "crypto-ring", "dev-tools", "admin-live-logs-ws"]
 jemalloc = ["dep:tikv-jemallocator", "otap-df-engine/jemalloc"]
 mimalloc = ["dep:mimalloc"]
+reuseport-ebpf = ["otap-df-engine/reuseport-ebpf"]
 azure = ["otap-df-otap/azure"]
 aws = ["otap-df-otap/aws"]
 unsafe-optimizations = ["unchecked-index", "unchecked-arithmetic"]

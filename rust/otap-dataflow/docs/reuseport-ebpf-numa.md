@@ -17,20 +17,20 @@ This feature is Linux-only and experimental.
 Build with the optional eBPF loader:
 
 ```bash
-cargo build --features reuseport-ebpf
+cargo build --features reuseport-ebpf --bin df_engine
 ```
 
 Run with coordinated reuseport and eBPF attach enabled:
 
 ```bash
-OTAP_DF_REUSEPORT_EBPF=1 ./df_engine
+OTAP_DF_REUSEPORT_EBPF=1 ./target/debug/df_engine
 ```
 
 By default, eBPF attach failures log a warning and continue with coordinated
 plain `SO_REUSEPORT`. To fail startup instead:
 
 ```bash
-OTAP_DF_REUSEPORT_EBPF=1 OTAP_DF_REUSEPORT_EBPF_STRICT=1 ./df_engine
+OTAP_DF_REUSEPORT_EBPF=1 OTAP_DF_REUSEPORT_EBPF_STRICT=1 ./target/debug/df_engine
 ```
 
 The eBPF build path needs clang, libbpf headers, and `vmlinux.h`. Runtime eBPF

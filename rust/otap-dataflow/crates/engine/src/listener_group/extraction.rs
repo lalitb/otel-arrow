@@ -47,7 +47,6 @@ fn parse_listening_addr(value: &serde_json::Value) -> Option<SocketAddr> {
 
 /// Extracts every listener address present in `config`, looking at the
 /// top level, OTLP's actual `{protocols: {grpc|http}}` TCP nesting,
-/// the older direct `{grpc|http}` TCP nesting accepted by early tests,
 /// and syslog CEF's `{protocol: {tcp|udp}}` shape. Returns an empty
 /// vector if no recognised shape applies. Uses raw `serde_json::Value`
 /// access so the engine crate does not need a direct `serde` derive
@@ -58,8 +57,7 @@ fn extract_listener_addresses(config: &serde_json::Value) -> Vec<(ListenerProtoc
         out.push((ListenerProtocol::Tcp, addr));
     }
 
-    let protocol_parents = [Some(config), config.get("protocols")];
-    for parent in protocol_parents.into_iter().flatten() {
+    if let Some(parent) = config.get("protocols") {
         for sub in ["grpc", "http"] {
             if let Some(addr) = parent.get(sub).and_then(parse_listening_addr) {
                 out.push((ListenerProtocol::Tcp, addr));
@@ -167,16 +165,13 @@ mod tests {
     }
 
     #[test]
-    fn extract_otlp_grpc_and_http() {
+    fn extract_ignores_non_production_otlp_grpc_and_http_shape() {
         let cfg = json!({
             "grpc": {"listening_addr": "0.0.0.0:4317"},
             "http": {"listening_addr": "0.0.0.0:4318"}
         });
         let addrs = extract_listener_addresses(&cfg);
-        assert_eq!(addrs.len(), 2);
-        let ports: Vec<u16> = addrs.iter().map(|(_, a)| a.port()).collect();
-        assert!(ports.contains(&4317));
-        assert!(ports.contains(&4318));
+        assert!(addrs.is_empty());
     }
 
     #[test]

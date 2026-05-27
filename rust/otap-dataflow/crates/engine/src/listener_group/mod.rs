@@ -33,6 +33,7 @@ use std::any::Any;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::os::fd::RawFd;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -718,9 +719,17 @@ impl ListenerGroupManager {
         plan: ListenerGroupPlan,
         hook: Option<AttachHook>,
     ) -> std::io::Result<()> {
-        let result = materialise_group(&plan).and_then(|listeners| {
-            invoke_attach_hook(&plan, &listeners, hook.as_ref()).map(|attach| (listeners, attach))
-        });
+        let result = match catch_unwind(AssertUnwindSafe(|| {
+            materialise_group(&plan).and_then(|listeners| {
+                invoke_attach_hook(&plan, &listeners, hook.as_ref())
+                    .map(|attach| (listeners, attach))
+            })
+        })) {
+            Ok(result) => result,
+            Err(_) => Err(std::io::Error::other(
+                "listener-group materialisation or attach panicked",
+            )),
+        };
 
         let mut state = self.inner.state.lock().expect("listener-group state mutex");
         let Some(slot) = state.get_mut(key) else {
@@ -926,12 +935,12 @@ pub fn reuseport_ebpf_strict() -> bool {
 }
 
 /// Internal/debug-only switch to activate the coordinated listener
-/// manager *without* the eBPF attach hook. Production users should
-/// set [`reuseport_ebpf_enabled`] instead; this exists to let
-/// integration tests exercise the manager-only path on hosts where
-/// loading eBPF is not possible. Not documented in
-/// `docs/reuseport-ebpf-numa.md`.
+/// manager *without* the eBPF attach hook. Production users should set
+/// [`reuseport_ebpf_enabled`] instead. This exists to let tests
+/// exercise the manager-only path on hosts where loading eBPF is not
+/// possible, and is compiled out of normal production builds.
 #[must_use]
+#[cfg(any(test, feature = "test-utils"))]
 pub fn manager_only_debug_enabled() -> bool {
     env_flag_enabled(
         std::env::var("OTAP_DF_REUSEPORT_MANAGER_ONLY")
@@ -940,9 +949,16 @@ pub fn manager_only_debug_enabled() -> bool {
     )
 }
 
+/// Production builds do not honor the internal manager-only switch.
+#[must_use]
+#[cfg(not(any(test, feature = "test-utils")))]
+pub fn manager_only_debug_enabled() -> bool {
+    false
+}
+
 /// Returns `true` when any path in the engine should consult the
-/// listener-group manager: either the user-facing eBPF env switch is
-/// on, or the test-only manager-only debug switch is on.
+/// listener-group manager: the user-facing eBPF env switch is on, or a
+/// test build has enabled the manager-only debug switch.
 #[must_use]
 pub fn manager_active() -> bool {
     cfg!(unix) && (reuseport_ebpf_enabled() || manager_only_debug_enabled())
@@ -1630,6 +1646,38 @@ mod tests {
             matches!(outcome, AcquireOutcome::MaterialisationFailed(_)),
             "got {outcome:?}"
         );
+    }
+
+    #[test]
+    fn attach_hook_panic_surfaces_as_materialisation_failed_for_all_waiters() {
+        let mgr = ListenerGroupManager::new();
+        let addr = ephemeral_addr();
+        mgr.register_plan(loopback_plan(addr, &[(0, 0, 0), (1, 1, 0)]))
+            .unwrap();
+        mgr.set_attach_hook(Arc::new(|_, _| {
+            panic!("simulated attach panic");
+        }));
+
+        let key = ListenerGroupKey::tcp("pg", "pipe", "recv", addr);
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for core in [0_u32, 1] {
+            let mgr = mgr.clone();
+            let key = key.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                let _ = barrier.wait();
+                mgr.acquire(&key, core, Duration::from_secs(2))
+            }));
+        }
+
+        for handle in handles {
+            let outcome = handle.join().unwrap();
+            assert!(
+                matches!(outcome, AcquireOutcome::MaterialisationFailed(_)),
+                "got {outcome:?}"
+            );
+        }
     }
 
     #[test]

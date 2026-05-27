@@ -1529,9 +1529,9 @@ impl<
             // registered the manager stays inert and the receiver
             // path falls back to today's independent bind.
             // Plan registration (and the runtime acquire) activate
-            // when either `OTAP_DF_REUSEPORT_EBPF=1` (the single
-            // user-facing switch) or the test-only
-            // `OTAP_DF_REUSEPORT_MANAGER_ONLY=1` is set.
+            // when `OTAP_DF_REUSEPORT_EBPF=1` is set. Test builds can
+            // additionally exercise the manager-only path without the
+            // eBPF hook.
             if otap_df_engine::listener_group::manager_active() {
                 let plan_cores: Vec<u32> = requested_cores
                     .iter()
