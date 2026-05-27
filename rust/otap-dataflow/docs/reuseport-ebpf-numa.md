@@ -2,9 +2,42 @@
 
 This document describes the experimental NUMA-local reuseport stack in the
 engine. It is split across three phases. Phase 1 (NUMA topology discovery)
-and Phase 2 (coordinated listener manager scaffolding) are implemented in
-the engine today. Phase 3 (eBPF selector attach) ships as an opt-in
-prototype loader, but no production code path enables it yet.
+and Phase 2 (coordinated listener manager scaffolding) are implemented in the
+engine today. Phase 2.5 wires TCP listeners and UDP sockets into the production
+receiver path. Phase 3 ships an optional eBPF selector attach path for Linux.
+
+The default behaviour is unchanged. The stack is inactive unless
+`OTAP_DF_REUSEPORT_EBPF=1` is set at runtime. The eBPF loader is also compiled
+only when the `reuseport-ebpf` Cargo feature is enabled.
+
+## Quick Enable
+
+This feature is Linux-only and experimental.
+
+Build with the optional eBPF loader:
+
+```bash
+cargo build --features reuseport-ebpf
+```
+
+Run with coordinated reuseport and eBPF attach enabled:
+
+```bash
+OTAP_DF_REUSEPORT_EBPF=1 ./df_engine
+```
+
+By default, eBPF attach failures log a warning and continue with coordinated
+plain `SO_REUSEPORT`. To fail startup instead:
+
+```bash
+OTAP_DF_REUSEPORT_EBPF=1 OTAP_DF_REUSEPORT_EBPF_STRICT=1 ./df_engine
+```
+
+The eBPF build path needs clang, libbpf headers, and `vmlinux.h`. Runtime eBPF
+attach needs `CAP_BPF` plus `CAP_NET_ADMIN` on newer kernels, or `CAP_SYS_ADMIN`
+on older kernels. Without the `reuseport-ebpf` feature, setting
+`OTAP_DF_REUSEPORT_EBPF=1` still activates the coordinated manager, but the
+attach hook is a logged no-op and sockets use plain `SO_REUSEPORT`.
 
 ## Phases
 

@@ -833,7 +833,8 @@ pub fn env_flag_enabled(value: Option<&str>) -> bool {
 ///   continues to work.
 ///
 /// Unset means the engine behaves identically to `main`: each
-/// receiver binds independently in `EffectHandler::tcp_listener`.
+/// receiver binds independently in `EffectHandler::tcp_listener` or
+/// `EffectHandler::udp_socket`.
 #[must_use]
 pub fn reuseport_ebpf_enabled() -> bool {
     env_flag_enabled(std::env::var("OTAP_DF_REUSEPORT_EBPF").ok().as_deref())
