@@ -49,18 +49,17 @@ Lifecycle:
 2. Each receiver pipeline calls `manager.acquire(key, core_id, timeout)`
    during startup. Acquires block on a per-group condition variable
    until the *last* expected member arrives.
-3. On the last arrival, the manager eagerly creates one
-   `std::net::TcpListener` per expected member with the same
+3. On the last arrival, the manager eagerly creates one standard-library
+   TCP listener or UDP socket per expected member with the same
    `SO_REUSEADDR + SO_REUSEPORT` settings as
-   `EffectHandlerCore::tcp_listener`. Sockets are built into a local
+   `EffectHandlerCore::{tcp_listener,udp_socket}`. Sockets are built into a local
    `Vec` first and only swapped into the group state when all N have
    succeeded; partial materialisation is dropped to avoid leaking
    half-bound ports.
-4. Each acquirer wakes up and receives the `TcpListener` mapped to its
-   own `core_id`. The acquiring receiver converts to a Tokio listener
-   on its own current-thread runtime via
-   `tokio::net::TcpListener::from_std(...)` -- this avoids
-   cross-runtime reactor-affinity issues.
+4. Each acquirer wakes up and receives the TCP listener or UDP socket mapped to
+   its own `core_id`. The acquiring receiver converts to a Tokio socket on its
+   own current-thread runtime via `tokio::net::{TcpListener,UdpSocket}::from_std(...)`
+   -- this avoids cross-runtime reactor-affinity issues.
 5. If quorum is not reached within `timeout`, the group transitions to
    `Fallback` and every acquirer (current and future) receives
    `AcquireOutcome::FallbackToIndependent`. The receiver should then
@@ -71,7 +70,7 @@ Materialisation `io::Error`s (e.g. address already bound by an
 unrelated process without `SO_REUSEPORT`) are surfaced as a hard
 `AcquireOutcome::MaterialisationFailed` to the first acquirer and
 replayed for any later acquirer, matching the existing
-`EffectHandler::tcp_listener` failure semantics.
+`EffectHandler::{tcp_listener,udp_socket}` failure semantics.
 
 The manager never stores long-lived `RawFd`s. Listeners are owned by the
 manager only between materialisation and acquire; once distributed they
@@ -82,23 +81,23 @@ are owned by the receiving pipeline.
 `fallback_timeout`, and `materialisation_failed` counters, plus a
 `ListenerGroupAttributeSet`. **These metric types are prepared but
 not yet emitted**: nothing in `ListenerGroupManager` increments them.
-Counter wiring is deferred to the same Phase 2.5 patch that integrates
-the manager into `EffectHandler::tcp_listener`, so the counters reflect
-a real production code path.
+Counter wiring is deferred to the same follow-up that emits manager lifecycle
+metrics from the production TCP/UDP paths.
 
 ### Phase 2.5 -- Production wiring (implemented)
 
-`EffectHandler::tcp_listener(addr)` consults the manager when:
+`EffectHandler::tcp_listener(addr)` and `EffectHandler::udp_socket(addr)` consult
+the manager when:
 
 1. `OTAP_DF_REUSEPORT_EBPF=1` is set in the engine process
    environment (the **single user-facing switch** -- see
    "Environment variables" below), **and**
 2. the controller has registered a [`ListenerGroupPlan`] covering
-   `(pipeline_group_id, receiver_node_id, addr, Tcp)`.
+   `(pipeline_group_id, receiver_node_id, addr, protocol)`.
 
-If either condition is unmet, `tcp_listener` falls through to the
-existing per-receiver bind path with byte-identical behaviour. With
-the env var unset, the code path is dead. The handle is plumbed by:
+If either condition is unmet, the receiver falls through to the existing
+per-receiver bind path with byte-identical behaviour. With the env var unset,
+the code path is dead. The handle is plumbed by:
 
 - `EffectHandlerCore` carrying an optional `ListenerGroupHandle`
   (`pipeline_group_id`, `receiver_node_id`, `core_id`, manager Arc),
@@ -183,13 +182,17 @@ attachment lives as long as the manager owns the group.
 
 ### Environment variables
 
-| Variable | Default | Effect |
-| --- | --- | --- |
-| `OTAP_DF_REUSEPORT_EBPF` | unset | **Single user-facing switch.** When `1`, activates coordinated listener planning + manager acquire end-to-end and installs the eBPF attach hook. On non-Linux / no-feature, the hook is a no-op and the engine continues with coordinated plain `SO_REUSEPORT`. |
-| `OTAP_DF_REUSEPORT_EBPF_STRICT` | unset | Modifier. When `1`, eBPF attach failures abort startup. Default is log-and-continue. Meaningful only when `OTAP_DF_REUSEPORT_EBPF=1`. |
+- `OTAP_DF_REUSEPORT_EBPF` (default: unset): single user-facing switch.
+  When `1`, activates coordinated listener planning + manager acquire
+  end-to-end and installs the eBPF attach hook. On non-Linux / no-feature, the
+  hook is a no-op and the engine continues with coordinated plain
+  `SO_REUSEPORT`.
+- `OTAP_DF_REUSEPORT_EBPF_STRICT` (default: unset): when `1`, eBPF attach
+  failures abort startup. Default is log-and-continue. Meaningful only when
+  `OTAP_DF_REUSEPORT_EBPF=1`.
 
 Default (env unset): the engine behaves identically to `main`. Each
-receiver binds independently in `EffectHandler::tcp_listener`; no
+receiver binds independently in `EffectHandler::{tcp_listener,udp_socket}`; no
 manager acquire, no plan registration, no eBPF attach.
 
 ### Note on OTLP / gRPC connection fanout
@@ -315,10 +318,9 @@ cat /proc/irq/<irq>/smp_affinity_list
 
 ## Current Limitation
 
-`EffectHandler::tcp_listener` does not yet consult the listener-group
-manager, so until Phase 2.5 wires the seam, every receiver still creates
-its listener independently. The Phase 2 scaffolding above documents the
-follow-up work needed to close this gap.
+The selector influences kernel socket choice for TCP connections and UDP
+datagrams, but it does not rebalance work already multiplexed above the socket
+layer, such as HTTP/2 streams inside one long-lived gRPC TCP connection.
 
 ## Alternatives
 

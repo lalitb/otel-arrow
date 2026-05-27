@@ -5,13 +5,13 @@
 //!
 //! Walks a resolved pipeline configuration and produces
 //! [`ListenerGroupPlan`]s for the set of known receiver URNs that
-//! expose a TCP `listening_addr` field. Used by the controller during
+//! expose a TCP or UDP `listening_addr` field. Used by the controller during
 //! Phase 2.5 startup to register plans before launching pipeline
 //! threads.
 //!
 //! The helper is intentionally conservative: it only matches the
 //! production receiver URNs that already use
-//! `EffectHandler::tcp_listener` (verified by the Phase 2.5 audit).
+//! `EffectHandler::tcp_listener` or `EffectHandler::udp_socket`.
 //! Unknown URNs are silently skipped so a configuration with a
 //! third-party receiver is not rejected.
 //!
@@ -20,7 +20,9 @@
 //! free-form `{ listening_addr: SocketAddr }` shape rather than
 //! pulling in each receiver's typed `Config`.
 
-use crate::listener_group::{ListenerGroupKey, ListenerGroupMember, ListenerGroupPlan};
+use crate::listener_group::{
+    ListenerGroupKey, ListenerGroupMember, ListenerGroupPlan, Protocol as ListenerProtocol,
+};
 use crate::topology::CpuTopology;
 use otap_df_config::engine::ResolvedPipelineConfig;
 use std::net::SocketAddr;
@@ -28,7 +30,8 @@ use std::str::FromStr;
 
 /// Receiver URNs that the helper recognises. Each one has a
 /// `listening_addr: SocketAddr` field at the top level of its node
-/// config that the seam can bind via `EffectHandler::tcp_listener`.
+/// config that the seam can bind via `EffectHandler::tcp_listener` or
+/// `EffectHandler::udp_socket`.
 ///
 /// HTTP and gRPC server settings used by the OTLP receiver are nested
 /// under the `grpc` / `http` keys in its config; the conservative
@@ -40,19 +43,19 @@ const KNOWN_RECEIVER_URNS: &[&str] = &[
     "urn:otel:receiver:syslog_cef",
 ];
 
-/// Extracts every `listening_addr: SocketAddr` value present in
-/// `config`, looking at the top level and at the OTLP-style
-/// `{grpc, http}` nesting. Returns an empty vector if no recognised
-/// shape applies. Uses raw `serde_json::Value` access so the engine
-/// crate does not need a direct `serde` derive dependency.
-fn extract_tcp_addresses(config: &serde_json::Value) -> Vec<SocketAddr> {
+/// Extracts every listener address present in `config`, looking at the
+/// top level, OTLP-style `{grpc, http}` TCP nesting, and syslog CEF's
+/// `{protocol: {tcp|udp}}` shape. Returns an empty vector if no
+/// recognised shape applies. Uses raw `serde_json::Value` access so the
+/// engine crate does not need a direct `serde` derive dependency.
+fn extract_listener_addresses(config: &serde_json::Value) -> Vec<(ListenerProtocol, SocketAddr)> {
     let mut out = Vec::new();
     if let Some(addr) = config
         .get("listening_addr")
         .and_then(serde_json::Value::as_str)
         .and_then(|s| SocketAddr::from_str(s).ok())
     {
-        out.push(addr);
+        out.push((ListenerProtocol::Tcp, addr));
     }
     for sub in ["grpc", "http"] {
         if let Some(addr) = config
@@ -61,7 +64,22 @@ fn extract_tcp_addresses(config: &serde_json::Value) -> Vec<SocketAddr> {
             .and_then(serde_json::Value::as_str)
             .and_then(|s| SocketAddr::from_str(s).ok())
         {
-            out.push(addr);
+            out.push((ListenerProtocol::Tcp, addr));
+        }
+    }
+    if let Some(protocol) = config.get("protocol") {
+        for (key, listener_protocol) in [
+            ("tcp", ListenerProtocol::Tcp),
+            ("udp", ListenerProtocol::Udp),
+        ] {
+            if let Some(addr) = protocol
+                .get(key)
+                .and_then(|v| v.get("listening_addr"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|s| SocketAddr::from_str(s).ok())
+            {
+                out.push((listener_protocol, addr));
+            }
         }
     }
     out.sort();
@@ -70,7 +88,7 @@ fn extract_tcp_addresses(config: &serde_json::Value) -> Vec<SocketAddr> {
 }
 
 /// Returns one [`ListenerGroupPlan`] per recognised receiver in the
-/// pipeline that exposes a TCP `listening_addr`. Members are
+/// pipeline that exposes a TCP or UDP `listening_addr`. Members are
 /// constructed from `cores`, with `numa_node` looked up via
 /// [`CpuTopology::numa_node_or_zero`] and `listener_id` assigned
 /// stably as the position of the core within `cores`.
@@ -102,7 +120,7 @@ pub fn extract_plans_for_pipeline(
         // part of `ListenerGroupKey`, so it does not need to appear
         // in the receiver_node_id; multiple addresses on the same
         // receiver simply produce multiple keyed plans.
-        for addr in extract_tcp_addresses(&node_cfg.config) {
+        for (protocol, addr) in extract_listener_addresses(&node_cfg.config) {
             let members = cores
                 .iter()
                 .enumerate()
@@ -112,7 +130,14 @@ pub fn extract_plans_for_pipeline(
                     numa_node: topology.numa_node_or_zero(*core_id),
                 })
                 .collect::<Vec<_>>();
-            let key = ListenerGroupKey::tcp_for_receiver(pipeline_group_id.clone(), node_id, addr);
+            let key = match protocol {
+                ListenerProtocol::Tcp => {
+                    ListenerGroupKey::tcp_for_receiver(pipeline_group_id.clone(), node_id, addr)
+                }
+                ListenerProtocol::Udp => {
+                    ListenerGroupKey::udp_for_receiver(pipeline_group_id.clone(), node_id, addr)
+                }
+            };
             plans.push(ListenerGroupPlan {
                 key,
                 expected_members: members,
@@ -131,9 +156,12 @@ mod tests {
     #[test]
     fn extract_top_level_listening_addr() {
         let cfg = json!({"listening_addr": "0.0.0.0:4317"});
-        let addrs = extract_tcp_addresses(&cfg);
+        let addrs = extract_listener_addresses(&cfg);
         assert_eq!(addrs.len(), 1);
-        assert_eq!(addrs[0].port(), 4317);
+        assert_eq!(
+            addrs[0],
+            (ListenerProtocol::Tcp, "0.0.0.0:4317".parse().unwrap())
+        );
     }
 
     #[test]
@@ -142,17 +170,32 @@ mod tests {
             "grpc": {"listening_addr": "0.0.0.0:4317"},
             "http": {"listening_addr": "0.0.0.0:4318"}
         });
-        let addrs = extract_tcp_addresses(&cfg);
+        let addrs = extract_listener_addresses(&cfg);
         assert_eq!(addrs.len(), 2);
-        let ports: Vec<u16> = addrs.iter().map(|a| a.port()).collect();
+        let ports: Vec<u16> = addrs.iter().map(|(_, a)| a.port()).collect();
         assert!(ports.contains(&4317));
         assert!(ports.contains(&4318));
     }
 
     #[test]
+    fn extract_syslog_udp_protocol_addr() {
+        let cfg = json!({
+            "protocol": {
+                "udp": {"listening_addr": "0.0.0.0:5140"}
+            }
+        });
+        let addrs = extract_listener_addresses(&cfg);
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(
+            addrs[0],
+            (ListenerProtocol::Udp, "0.0.0.0:5140".parse().unwrap())
+        );
+    }
+
+    #[test]
     fn extract_returns_empty_for_unrecognised_shape() {
         let cfg = json!({"some_other_field": 42});
-        assert!(extract_tcp_addresses(&cfg).is_empty());
+        assert!(extract_listener_addresses(&cfg).is_empty());
     }
 
     /// Regression: the key the controller registers must equal the

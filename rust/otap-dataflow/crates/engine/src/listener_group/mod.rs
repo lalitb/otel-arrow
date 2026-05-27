@@ -12,19 +12,14 @@
 //! reuseport group exists in the kernel atomically before any of them
 //! starts accepting connections.
 //!
-//! The manager intentionally hands back `std::net::TcpListener` rather
-//! than a Tokio listener so the acquiring receiver can register the fd
+//! The manager intentionally hands back standard-library TCP/UDP sockets
+//! rather than Tokio sockets so the acquiring receiver can register the fd
 //! with its own per-core current-thread runtime (avoiding the
 //! cross-runtime reactor-affinity issue that would arise if we created
-//! tokio listeners on the materialising thread).
+//! tokio sockets on the materialising thread).
 //!
-//! **Phase 2 is engine scaffolding only.** No production code path
-//! registers plans or consults the manager. Specifically,
-//! `EffectHandler::tcp_listener` does **not** call into the manager;
-//! that wiring is deferred to Phase 2.5 (see
-//! `docs/reuseport-ebpf-numa.md`). With no plans registered, the
-//! manager is inert and existing per-receiver bind behaviour is
-//! preserved exactly.
+//! With no plans registered, the manager is inert and existing
+//! per-receiver bind behaviour is preserved exactly.
 //!
 //! The lifecycle metrics in [`metrics`] are likewise prepared types,
 //! not yet emitted; counter increments will land with the Phase 2.5
@@ -36,7 +31,7 @@ pub mod metrics;
 use crate::topology::CpuTopology;
 use std::any::Any;
 use std::collections::{BTreeSet, HashMap};
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::os::fd::RawFd;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -46,9 +41,7 @@ use std::time::{Duration, Instant};
 pub enum Protocol {
     /// TCP listener (`SO_REUSEPORT` reuseport group).
     Tcp,
-    /// UDP socket (reserved for future use; manager currently rejects
-    /// UDP plans because the rest of this scaffolding only materialises
-    /// TCP listeners).
+    /// UDP socket (`SO_REUSEPORT` reuseport group).
     Udp,
 }
 
@@ -122,6 +115,32 @@ impl ListenerGroupKey {
     {
         Self::tcp(pipeline_group_id, node_id.to_string(), addr)
     }
+
+    /// Builds a UDP key with no bind-device pin.
+    #[must_use]
+    pub fn udp(
+        pipeline_group_id: impl Into<String>,
+        receiver_node_id: impl Into<String>,
+        addr: SocketAddr,
+    ) -> Self {
+        Self {
+            pipeline_group_id: pipeline_group_id.into(),
+            receiver_node_id: receiver_node_id.into(),
+            addr,
+            protocol: Protocol::Udp,
+            bind_device: None,
+        }
+    }
+
+    /// Canonical UDP constructor matching [`Self::tcp_for_receiver`].
+    #[must_use]
+    pub fn udp_for_receiver<P, N>(pipeline_group_id: P, node_id: &N, addr: SocketAddr) -> Self
+    where
+        P: Into<String>,
+        N: std::fmt::Display + ?Sized,
+    {
+        Self::udp(pipeline_group_id, node_id.to_string(), addr)
+    }
 }
 
 /// One expected member of a listener group.
@@ -159,9 +178,6 @@ pub enum PlanError {
     DuplicateListenerId(u32),
     /// Two members shared the same `core_id`.
     DuplicateCoreId(u32),
-    /// Plan declares a UDP group, which the current scaffolding does
-    /// not materialise.
-    UnsupportedUdp,
     /// Coordinated groups cannot bind to port 0 because every bind
     /// would get a different ephemeral port.
     EphemeralPortUnsupported,
@@ -176,10 +192,6 @@ impl std::fmt::Display for PlanError {
                 write!(f, "listener_id {id} appears more than once in plan")
             }
             Self::DuplicateCoreId(id) => write!(f, "core_id {id} appears more than once in plan"),
-            Self::UnsupportedUdp => write!(
-                f,
-                "UDP listener groups are not yet materialised by the manager"
-            ),
             Self::EphemeralPortUnsupported => write!(
                 f,
                 "listener group plans cannot use port 0; bind a concrete port or use the independent bind path"
@@ -195,6 +207,8 @@ impl std::error::Error for PlanError {}
 pub enum AcquireOutcome {
     /// Quorum was reached and this caller's listener is handed back.
     Listener(AcquiredListener),
+    /// Quorum was reached and this caller's UDP socket is handed back.
+    DatagramSocket(AcquiredDatagramSocket),
     /// No plan covers this group, or the plan does not list this
     /// `core_id`. The caller should bind a listener independently
     /// (today's behaviour).
@@ -224,6 +238,25 @@ pub enum AcquireOutcome {
 pub struct AcquiredListener {
     listener: TcpListener,
     lease: Option<ListenerGroupLease>,
+}
+
+/// UDP socket acquired from a coordinated listener group.
+#[derive(Debug)]
+pub struct AcquiredDatagramSocket {
+    socket: UdpSocket,
+    lease: Option<ListenerGroupLease>,
+}
+
+impl AcquiredDatagramSocket {
+    fn new(socket: UdpSocket, lease: Option<ListenerGroupLease>) -> Self {
+        Self { socket, lease }
+    }
+
+    /// Splits the standard UDP socket from its optional lifecycle lease.
+    #[must_use]
+    pub fn into_parts(self) -> (UdpSocket, Option<ListenerGroupLease>) {
+        (self.socket, self.lease)
+    }
 }
 
 impl AcquiredListener {
@@ -355,7 +388,7 @@ enum GroupState {
     /// All members arrived and listeners were materialised. Listeners
     /// are distributed to acquirers as they wake up.
     Ready {
-        listeners: HashMap<u32, TcpListener>,
+        sockets: HashMap<u32, GroupSocket>,
         listener_leases: HashMap<u32, ListenerGroupLease>,
         distributed: BTreeSet<u32>,
     },
@@ -368,6 +401,12 @@ enum GroupState {
     /// Group timed out waiting for quorum; subsequent acquires get
     /// `FallbackToIndependent`.
     Fallback,
+}
+
+#[derive(Debug)]
+enum GroupSocket {
+    Tcp(TcpListener),
+    Udp(UdpSocket),
 }
 
 impl ListenerGroupManager {
@@ -386,14 +425,10 @@ impl ListenerGroupManager {
     /// # Errors
     ///
     /// Returns [`PlanError`] for duplicate keys, empty member lists,
-    /// duplicate `listener_id` or `core_id`, or UDP plans (currently
-    /// unsupported).
+    /// duplicate `listener_id` or `core_id`.
     pub fn register_plan(&self, plan: ListenerGroupPlan) -> Result<(), PlanError> {
         if plan.expected_members.is_empty() {
             return Err(PlanError::NoMembers);
-        }
-        if plan.key.protocol == Protocol::Udp {
-            return Err(PlanError::UnsupportedUdp);
         }
         if plan.key.addr.port() == 0 {
             return Err(PlanError::EphemeralPortUnsupported);
@@ -564,7 +599,7 @@ impl ListenerGroupManager {
                     continue;
                 }
                 GroupState::Ready {
-                    listeners,
+                    sockets,
                     listener_leases,
                     distributed,
                 } => {
@@ -575,10 +610,17 @@ impl ListenerGroupManager {
                         // guarantee.
                         return AcquireOutcome::AlreadyAcquired;
                     }
-                    if let Some(listener) = listeners.remove(&core_id) {
+                    if let Some(socket) = sockets.remove(&core_id) {
                         let lease = listener_leases.remove(&core_id);
                         let _ = distributed.insert(core_id);
-                        return AcquireOutcome::Listener(AcquiredListener::new(listener, lease));
+                        return match socket {
+                            GroupSocket::Tcp(listener) => {
+                                AcquireOutcome::Listener(AcquiredListener::new(listener, lease))
+                            }
+                            GroupSocket::Udp(socket) => AcquireOutcome::DatagramSocket(
+                                AcquiredDatagramSocket::new(socket, lease),
+                            ),
+                        };
                     }
                     return AcquireOutcome::NoPlan;
                 }
@@ -614,10 +656,10 @@ impl ListenerGroupManager {
         };
 
         match result {
-            Ok((listeners, attach)) => {
+            Ok((sockets, attach)) => {
                 slot.attach_keepalive = attach.keepalive;
                 slot.state = GroupState::Ready {
-                    listeners,
+                    sockets,
                     listener_leases: attach.listener_leases,
                     distributed: BTreeSet::new(),
                 };
@@ -835,7 +877,7 @@ pub fn manager_active() -> bool {
 
 /// Lightweight per-receiver handle into the controller's listener
 /// group manager. Carried in `EffectHandlerCore` so
-/// `tcp_listener(addr)` can build a full [`ListenerGroupKey`] and call
+/// `tcp_listener(addr)` and `udp_socket(addr)` can build a full [`ListenerGroupKey`] and call
 /// [`ListenerGroupManager::acquire`] without changing its signature.
 #[derive(Clone, Debug)]
 pub struct ListenerGroupHandle {
@@ -901,6 +943,17 @@ impl ListenerGroupHandle {
         )
     }
 
+    /// Builds the canonical key for `(pipeline_group, receiver_node,
+    /// addr, Udp)` with no bind device.
+    #[must_use]
+    pub fn udp_key(&self, addr: SocketAddr) -> ListenerGroupKey {
+        ListenerGroupKey::udp(
+            self.pipeline_group_id.clone(),
+            self.receiver_node_id.clone(),
+            addr,
+        )
+    }
+
     /// CPU id of the receiver pipeline thread that owns this handle.
     #[must_use]
     pub fn core_id(&self) -> u32 {
@@ -911,10 +964,9 @@ impl ListenerGroupHandle {
 /// Eagerly creates one listener per expected member, returning a map
 /// keyed by `core_id`. All sockets are created with the same
 /// `SO_REUSEADDR + SO_REUSEPORT` settings used by
-/// `EffectHandlerCore::tcp_listener`. The returned listeners are
-/// `std::net::TcpListener`s in **non-blocking** mode so the acquiring
-/// receiver can hand them to its own runtime via
-/// `tokio::net::TcpListener::from_std(...)`.
+/// `EffectHandlerCore::tcp_listener` / `udp_socket`. The returned sockets are
+/// in **non-blocking** mode so the acquiring receiver can hand them to its own
+/// runtime via `tokio::net::{TcpListener,UdpSocket}::from_std(...)`.
 ///
 /// `plan.key.bind_device` is **not** applied: this function does not
 /// call `SO_BINDTODEVICE`. The field participates in the lookup key
@@ -923,13 +975,16 @@ impl ListenerGroupHandle {
 ///
 /// Failure of any individual bind drops every previously-created
 /// socket before returning the error, leaving no leaked partial state.
-fn materialise_group(plan: &ListenerGroupPlan) -> std::io::Result<HashMap<u32, TcpListener>> {
-    let mut listeners: Vec<(u32, TcpListener)> = Vec::with_capacity(plan.expected_members.len());
+fn materialise_group(plan: &ListenerGroupPlan) -> std::io::Result<HashMap<u32, GroupSocket>> {
+    let mut sockets: Vec<(u32, GroupSocket)> = Vec::with_capacity(plan.expected_members.len());
     for member in &plan.expected_members {
-        let listener = build_listener(plan.key.addr)?;
-        listeners.push((member.core_id, listener));
+        let socket = match plan.key.protocol {
+            Protocol::Tcp => GroupSocket::Tcp(build_listener(plan.key.addr)?),
+            Protocol::Udp => GroupSocket::Udp(build_udp_socket(plan.key.addr)?),
+        };
+        sockets.push((member.core_id, socket));
     }
-    Ok(listeners.into_iter().collect())
+    Ok(sockets.into_iter().collect())
 }
 
 /// Builds the deterministic `(listener_id, raw_fd, core_id, numa_node)`
@@ -937,7 +992,7 @@ fn materialise_group(plan: &ListenerGroupPlan) -> std::io::Result<HashMap<u32, T
 /// by `listener_id` so eBPF map population is order-independent.
 fn invoke_attach_hook(
     plan: &ListenerGroupPlan,
-    listeners: &HashMap<u32, TcpListener>,
+    sockets: &HashMap<u32, GroupSocket>,
     hook: Option<&AttachHook>,
 ) -> std::io::Result<AttachOutcome> {
     use std::os::fd::AsRawFd;
@@ -948,8 +1003,12 @@ fn invoke_attach_hook(
     members.sort_by_key(|m| m.listener_id);
     let mut handles: Vec<(u32, RawFd, u32, u32)> = Vec::with_capacity(members.len());
     for m in &members {
-        if let Some(listener) = listeners.get(&m.core_id) {
-            handles.push((m.listener_id, listener.as_raw_fd(), m.core_id, m.numa_node));
+        if let Some(socket) = sockets.get(&m.core_id) {
+            let fd = match socket {
+                GroupSocket::Tcp(listener) => listener.as_raw_fd(),
+                GroupSocket::Udp(socket) => socket.as_raw_fd(),
+            };
+            handles.push((m.listener_id, fd, m.core_id, m.numa_node));
         }
     }
     hook(plan, &handles)
@@ -969,6 +1028,22 @@ fn build_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
     sock.set_nonblocking(true)?;
     sock.bind(&addr.into())?;
     sock.listen(8192)?;
+    Ok(sock.into())
+}
+
+fn build_udp_socket(addr: SocketAddr) -> std::io::Result<UdpSocket> {
+    let domain = match addr {
+        SocketAddr::V4(_) => socket2::Domain::IPV4,
+        SocketAddr::V6(_) => socket2::Domain::IPV6,
+    };
+    let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
+    sock.set_reuse_address(true)?;
+    #[cfg(unix)]
+    {
+        sock.set_reuse_port(true)?;
+    }
+    sock.set_nonblocking(true)?;
+    sock.bind(&addr.into())?;
     Ok(sock.into())
 }
 
@@ -1092,11 +1167,6 @@ mod tests {
         let plan = plan_with_ids("pg", "r3", addr, &[(0, 7, 0), (1, 7, 0)]);
         assert_eq!(mgr.register_plan(plan), Err(PlanError::DuplicateCoreId(7)));
 
-        // UDP not supported.
-        let mut plan = plan_with_ids("pg", "r4", addr, &[(0, 0, 0)]);
-        plan.key.protocol = Protocol::Udp;
-        assert_eq!(mgr.register_plan(plan), Err(PlanError::UnsupportedUdp));
-
         // Ephemeral port 0 cannot form one coordinated group because
         // each socket bind would pick a different concrete port.
         let plan = plan_with_ids("pg", "r4b", "127.0.0.1:0".parse().unwrap(), &[(0, 0, 0)]);
@@ -1183,6 +1253,45 @@ mod tests {
         assert_eq!(l_a.local_addr().unwrap().port(), addr.port());
         assert_eq!(l_b.local_addr().unwrap().port(), addr.port());
         assert_ne!(l_a.as_raw_fd(), l_b.as_raw_fd());
+    }
+
+    #[test]
+    fn quorum_two_udp_members_get_distinct_sockets() {
+        let mgr = ListenerGroupManager::new();
+        let addr = ephemeral_addr();
+        let mut plan = loopback_plan(addr, &[(0, 0, 0), (1, 1, 0)]);
+        plan.key.protocol = Protocol::Udp;
+        mgr.register_plan(plan).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let key = {
+            let mut key = ListenerGroupKey::tcp("pg", "recv", addr);
+            key.protocol = Protocol::Udp;
+            key
+        };
+        let mut handles = Vec::new();
+        for core in [0_u32, 1] {
+            let mgr = mgr.clone();
+            let bar = Arc::clone(&barrier);
+            let key = key.clone();
+            handles.push(thread::spawn(move || {
+                let _ = bar.wait();
+                mgr.acquire(&key, core, Duration::from_secs(2))
+            }));
+        }
+
+        let mut sockets = Vec::new();
+        for h in handles {
+            match h.join().unwrap() {
+                AcquireOutcome::DatagramSocket(s) => sockets.push(s.into_parts().0),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(sockets.len(), 2);
+        assert_eq!(sockets[0].local_addr().unwrap().port(), addr.port());
+        assert_eq!(sockets[1].local_addr().unwrap().port(), addr.port());
+        use std::os::fd::AsRawFd;
+        assert_ne!(sockets[0].as_raw_fd(), sockets[1].as_raw_fd());
     }
 
     #[test]

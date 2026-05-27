@@ -235,6 +235,11 @@ impl<PData> EffectHandlerCore<PData> {
                         // so here keeps the seam sync.
                         return TcpListener::from_std(std_listener).map_err(into_engine_error);
                     }
+                    AcquireOutcome::DatagramSocket(_) => {
+                        return Err(into_engine_error(std::io::Error::other(format!(
+                            "coordinated reuseport manager returned a UDP socket for TCP listener {addr}"
+                        ))));
+                    }
                     AcquireOutcome::MaterialisationFailed(error) => {
                         return Err(into_engine_error(error));
                     }
@@ -315,6 +320,50 @@ impl<PData> EffectHandlerCore<PData> {
             node: receiver_id.clone(),
             error,
         };
+
+        if manager_active() {
+            if let Some(handle) = self.listener_group_handle.as_ref() {
+                let key = handle.udp_key(addr);
+                let outcome = handle
+                    .manager()
+                    .acquire(&key, handle.core_id(), QUORUM_TIMEOUT);
+                match outcome {
+                    AcquireOutcome::DatagramSocket(acquired) => {
+                        let (std_socket, lease) = acquired.into_parts();
+                        if let Some(lease) = lease {
+                            self.listener_group_leases
+                                .lock()
+                                .expect("listener-group leases mutex")
+                                .push(lease);
+                        }
+                        return UdpSocket::from_std(std_socket).map_err(into_engine_error);
+                    }
+                    AcquireOutcome::MaterialisationFailed(error) => {
+                        return Err(into_engine_error(error));
+                    }
+                    AcquireOutcome::AlreadyAcquired => {
+                        return Err(into_engine_error(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!(
+                                "UDP socket for {addr} on core {} was already \
+                                 acquired from the coordinated reuseport manager; \
+                                 udp_socket must not be called more than once for \
+                                 the same (addr, core)",
+                                handle.core_id()
+                            ),
+                        )));
+                    }
+                    AcquireOutcome::Listener(_) => {
+                        return Err(into_engine_error(std::io::Error::other(format!(
+                            "coordinated reuseport manager returned a TCP listener for UDP socket {addr}"
+                        ))));
+                    }
+                    AcquireOutcome::NoPlan | AcquireOutcome::FallbackToIndependent => {
+                        // Fall through to the independent-bind path below.
+                    }
+                }
+            }
+        }
 
         // Create a SO_REUSEADDR + SO_REUSEPORT UDP socket.
         let sock = socket2::Socket::new(
