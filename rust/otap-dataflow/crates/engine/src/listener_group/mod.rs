@@ -30,7 +30,7 @@ pub mod metrics;
 
 use crate::topology::CpuTopology;
 use std::any::Any;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::os::fd::RawFd;
 use std::sync::{Arc, Condvar, Mutex};
@@ -65,12 +65,10 @@ impl Protocol {
 /// paths). Keying purely on `{addr, protocol}` would collide in that
 /// case.
 ///
-/// `bind_device` participates in the key for identity only: the
-/// current `materialise_group` path does **not** apply
-/// `SO_BINDTODEVICE`, so the field is reserved for future use. Two
-/// otherwise-identical plans with different `bind_device` values are
-/// still treated as distinct groups so a future patch that does apply
-/// `SO_BINDTODEVICE` does not change keying semantics.
+/// `bind_device` participates in the logical key for future-proofing,
+/// but the current `materialise_group` path does **not** apply
+/// `SO_BINDTODEVICE`; duplicate effective bind identities are therefore
+/// rejected before materialisation.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ListenerGroupKey {
     /// Pipeline group id that owns this listener group.
@@ -160,6 +158,26 @@ impl ListenerGroupKey {
     {
         Self::udp(pipeline_group_id, pipeline_id, node_id.to_string(), addr)
     }
+
+    fn bind_identity(&self) -> BindIdentity {
+        BindIdentity {
+            addr: self.addr,
+            protocol: self.protocol,
+        }
+    }
+}
+
+/// Effective kernel reuseport-group identity used by the current
+/// materialisation path.
+///
+/// This intentionally omits the logical pipeline/receiver identity:
+/// Linux groups all `SO_REUSEPORT` sockets for the same bind address
+/// and protocol together. It also omits `bind_device` because this
+/// manager does not apply `SO_BINDTODEVICE` yet.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct BindIdentity {
+    addr: SocketAddr,
+    protocol: Protocol,
 }
 
 /// One expected member of a listener group.
@@ -191,6 +209,9 @@ pub struct ListenerGroupPlan {
 pub enum PlanError {
     /// A plan with the same key has already been registered.
     DuplicateKey,
+    /// A different logical plan targets the same effective kernel
+    /// reuseport group identity.
+    DuplicateBindIdentity,
     /// `expected_members` was empty.
     NoMembers,
     /// Two members shared the same `listener_id`.
@@ -206,6 +227,10 @@ impl std::fmt::Display for PlanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::DuplicateKey => write!(f, "listener group already registered"),
+            Self::DuplicateBindIdentity => write!(
+                f,
+                "listener group bind identity already used by another plan"
+            ),
             Self::NoMembers => write!(f, "listener group plan has no expected members"),
             Self::DuplicateListenerId(id) => {
                 write!(f, "listener_id {id} appears more than once in plan")
@@ -354,6 +379,7 @@ pub struct ListenerGroupManager {
 #[derive(Default)]
 struct ManagerInner {
     state: Mutex<HashMap<ListenerGroupKey, GroupSlot>>,
+    disabled_bind_identities: Mutex<HashSet<BindIdentity>>,
     attach_hook: Mutex<Option<AttachHook>>,
 }
 
@@ -361,6 +387,7 @@ impl std::fmt::Debug for ManagerInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ManagerInner")
             .field("state", &"<Mutex<HashMap<...>>>")
+            .field("disabled_bind_identities", &"<Mutex<HashSet<...>>>")
             .field(
                 "attach_hook_set",
                 &self.attach_hook.lock().ok().is_some_and(|h| h.is_some()),
@@ -443,8 +470,9 @@ impl ListenerGroupManager {
     ///
     /// # Errors
     ///
-    /// Returns [`PlanError`] for duplicate keys, empty member lists,
-    /// duplicate `listener_id` or `core_id`.
+    /// Returns [`PlanError`] for duplicate keys, duplicate effective
+    /// bind identities, empty member lists, duplicate `listener_id` or
+    /// `core_id`.
     pub fn register_plan(&self, plan: ListenerGroupPlan) -> Result<(), PlanError> {
         if plan.expected_members.is_empty() {
             return Err(PlanError::NoMembers);
@@ -462,9 +490,34 @@ impl ListenerGroupManager {
                 return Err(PlanError::DuplicateCoreId(member.core_id));
             }
         }
+        let bind_identity = plan.key.bind_identity();
+        if self
+            .inner
+            .disabled_bind_identities
+            .lock()
+            .expect("listener-group disabled bind identity mutex")
+            .contains(&bind_identity)
+        {
+            return Err(PlanError::DuplicateBindIdentity);
+        }
+
         let mut state = self.inner.state.lock().expect("listener-group state mutex");
         if state.contains_key(&plan.key) {
             return Err(PlanError::DuplicateKey);
+        }
+        if let Some(existing_key) = state
+            .keys()
+            .find(|key| key.bind_identity() == bind_identity)
+            .cloned()
+        {
+            let _ = state.remove(&existing_key);
+            let _ = self
+                .inner
+                .disabled_bind_identities
+                .lock()
+                .expect("listener-group disabled bind identity mutex")
+                .insert(bind_identity);
+            return Err(PlanError::DuplicateBindIdentity);
         }
         let key = plan.key.clone();
         let _ = state.insert(
@@ -1166,30 +1219,62 @@ mod tests {
     }
 
     #[test]
-    fn plans_with_distinct_identity_but_same_addr_coexist() {
+    fn plans_with_distinct_identity_and_distinct_addr_coexist() {
         let mgr = ListenerGroupManager::new();
         let addr = ephemeral_addr();
-        // Two pipeline groups, same addr/protocol -> distinct keys,
-        // both should register successfully.
+        let other_addr = ephemeral_addr();
+        // Two pipeline groups with distinct bind addresses are
+        // independent kernel reuseport groups and can coexist.
         mgr.register_plan(plan_with_ids("pg-a", "recv", addr, &[(0, 0, 0)]))
             .unwrap();
-        mgr.register_plan(plan_with_ids("pg-b", "recv", addr, &[(0, 0, 0)]))
+        mgr.register_plan(plan_with_ids("pg-b", "recv", other_addr, &[(0, 0, 0)]))
             .unwrap();
         // Same pipeline group, same receiver node, different pipeline
-        // id -> distinct. Node names are only unique within one
-        // pipeline.
+        // id also works when the bind address is distinct.
         mgr.register_plan(plan_with_pipeline_ids(
             "pg-a",
             "pipe-other",
             "recv",
-            addr,
+            ephemeral_addr(),
             &[(0, 0, 0)],
         ))
         .unwrap();
         // Same pipeline group, different receiver nodes -> still distinct.
-        mgr.register_plan(plan_with_ids("pg-a", "recv-other", addr, &[(0, 0, 0)]))
-            .unwrap();
+        mgr.register_plan(plan_with_ids(
+            "pg-a",
+            "recv-other",
+            ephemeral_addr(),
+            &[(0, 0, 0)],
+        ))
+        .unwrap();
         assert_eq!(mgr.plan_count(), 4);
+    }
+
+    #[test]
+    fn duplicate_bind_identity_disables_all_matching_plans() {
+        let mgr = ListenerGroupManager::new();
+        let addr = ephemeral_addr();
+        let first = plan_with_ids("pg-a", "recv", addr, &[(0, 0, 0)]);
+        let first_key = first.key.clone();
+        mgr.register_plan(first).unwrap();
+
+        let second = plan_with_ids("pg-b", "recv", addr, &[(0, 1, 0)]);
+        assert_eq!(
+            mgr.register_plan(second),
+            Err(PlanError::DuplicateBindIdentity)
+        );
+        assert_eq!(mgr.plan_count(), 0);
+        assert!(matches!(
+            mgr.acquire(&first_key, 0, Duration::from_millis(1)),
+            AcquireOutcome::NoPlan
+        ));
+
+        let third = plan_with_pipeline_ids("pg-a", "pipe-other", "recv-other", addr, &[(0, 2, 0)]);
+        assert_eq!(
+            mgr.register_plan(third),
+            Err(PlanError::DuplicateBindIdentity)
+        );
+        assert_eq!(mgr.plan_count(), 0);
     }
 
     #[test]

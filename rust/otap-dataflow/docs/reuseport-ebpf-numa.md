@@ -71,6 +71,11 @@ placeholder.
   inside a pipeline, so `pipeline_id` is part of the identity.
   `bind_device` participates in the key as identity only; the current
   materialisation path does **not** apply `SO_BINDTODEVICE`.
+  Because Linux still places all `SO_REUSEPORT` sockets with the same
+  effective `(addr, protocol)` into one kernel reuseport group, the
+  manager disables coordinated planning for duplicate effective bind
+  identities instead of attaching a partial eBPF sockarray to a shared
+  kernel group.
 - `ListenerGroupMember { listener_id, core_id, numa_node }`
 - `ListenerGroupPlan { key, expected_members }`
 - `ListenerGroupManager` (held in `ControllerContext`)
@@ -182,6 +187,11 @@ on expiry the group transitions to fallback for everyone.
   `tcp_listener` at most once per `(addr, core)` per startup.
 - `acquire` returns `MaterialisationFailed`: same hard `Error::IoError`
   as today's bind would have produced.
+- duplicate effective bind identity at plan-registration time: the
+  manager rejects the duplicate and removes any earlier plan for the
+  same `(addr, protocol)`, so all matching receivers use the
+  independent bind path rather than sharing a kernel reuseport group
+  with a partial eBPF attachment.
 
 ### Phase 3 -- Optional eBPF selector attach (implemented, opt-in)
 
