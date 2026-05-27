@@ -192,6 +192,7 @@ pub mod libbpf {
     use std::mem::size_of_val;
     use std::os::fd::{AsFd, AsRawFd, RawFd};
     use std::path::Path;
+    use std::sync::Arc;
 
     /// Listener socket plus NUMA/core metadata used to populate the BPF maps.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -216,6 +217,8 @@ pub mod libbpf {
     #[derive(Debug)]
     pub struct ReuseportEbpf {
         _object: Object,
+        sockarray_map_fd: RawFd,
+        listener_map_indices: Vec<(u32, u32)>,
     }
 
     impl ReuseportEbpf {
@@ -245,6 +248,26 @@ pub mod libbpf {
             debug: bool,
         ) -> Result<Self, Box<dyn Error + Send + Sync>> {
             load_and_attach(object_path, listeners, debug)
+        }
+
+        /// Builds per-listener cleanup guards for sockarray entries.
+        ///
+        /// Dropping a guard deletes that listener's sockarray entry. The
+        /// delete is best-effort because process shutdown may close BPF
+        /// descriptors before every receiver guard is dropped.
+        #[must_use]
+        pub fn listener_leases(&self) -> Vec<(u32, Arc<dyn std::any::Any + Send + Sync>)> {
+            self.listener_map_indices
+                .iter()
+                .map(|(listener_id, map_index)| {
+                    let lease: Arc<dyn std::any::Any + Send + Sync> =
+                        Arc::new(SockarrayEntryLease {
+                            map_fd: self.sockarray_map_fd,
+                            map_index: *map_index,
+                        });
+                    (*listener_id, lease)
+                })
+                .collect()
         }
     }
 
@@ -311,8 +334,70 @@ pub mod libbpf {
         // selector sees a complete socket array.
         update_sockarray(&mut object, &layout.placements, listeners)?;
         attach_selector(&object, listeners)?;
+        let sockarray_map_fd = find_map_mut(&mut object, SOCKARRAY_MAP)?
+            .as_fd()
+            .as_raw_fd();
+        let listener_map_indices = layout
+            .placements
+            .iter()
+            .map(|placement| (placement.listener_id, placement.map_index))
+            .collect();
 
-        Ok(ReuseportEbpf { _object: object })
+        Ok(ReuseportEbpf {
+            _object: object,
+            sockarray_map_fd,
+            listener_map_indices,
+        })
+    }
+
+    #[derive(Debug)]
+    struct SockarrayEntryLease {
+        map_fd: RawFd,
+        map_index: u32,
+    }
+
+    impl Drop for SockarrayEntryLease {
+        fn drop(&mut self) {
+            let key = self.map_index.to_ne_bytes();
+            let _ = bpf_map_delete_elem(self.map_fd, key.as_ptr().cast());
+        }
+    }
+
+    #[repr(C)]
+    struct BpfMapElemAttr {
+        map_fd: u32,
+        _pad: u32,
+        key: u64,
+        value: u64,
+        flags: u64,
+    }
+
+    #[allow(unsafe_code)]
+    fn bpf_map_delete_elem(map_fd: RawFd, key: *const libc::c_void) -> std::io::Result<()> {
+        const BPF_MAP_DELETE_ELEM: libc::c_uint = 3;
+        let attr = BpfMapElemAttr {
+            map_fd: map_fd as u32,
+            _pad: 0,
+            key: key as u64,
+            value: 0,
+            flags: 0,
+        };
+        // SAFETY: `attr` follows the leading layout of `union bpf_attr`
+        // for BPF_MAP_DELETE_ELEM, and `key` points to the map key bytes
+        // for the duration of the syscall.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_bpf,
+                BPF_MAP_DELETE_ELEM,
+                std::ptr::from_ref(&attr),
+                size_of_val(&attr),
+            )
+        };
+        if rc < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
     }
 
     fn validate_listeners(listeners: &[ListenerFd]) -> Result<(), Box<dyn Error + Send + Sync>> {

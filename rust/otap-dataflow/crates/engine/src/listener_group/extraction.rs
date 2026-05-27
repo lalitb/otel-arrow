@@ -211,7 +211,6 @@ mod tests {
         use otap_df_config::pipeline::PipelineConfig;
         use otap_df_config::policy::ResolvedPolicies;
         use std::net::TcpListener as StdTcpListener;
-        use std::os::fd::AsRawFd;
         use std::sync::{Arc, Barrier};
         use std::thread;
         use std::time::Duration;

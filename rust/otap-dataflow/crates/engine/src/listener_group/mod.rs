@@ -162,6 +162,9 @@ pub enum PlanError {
     /// Plan declares a UDP group, which the current scaffolding does
     /// not materialise.
     UnsupportedUdp,
+    /// Coordinated groups cannot bind to port 0 because every bind
+    /// would get a different ephemeral port.
+    EphemeralPortUnsupported,
 }
 
 impl std::fmt::Display for PlanError {
@@ -177,6 +180,10 @@ impl std::fmt::Display for PlanError {
                 f,
                 "UDP listener groups are not yet materialised by the manager"
             ),
+            Self::EphemeralPortUnsupported => write!(
+                f,
+                "listener group plans cannot use port 0; bind a concrete port or use the independent bind path"
+            ),
         }
     }
 }
@@ -187,7 +194,7 @@ impl std::error::Error for PlanError {}
 #[derive(Debug)]
 pub enum AcquireOutcome {
     /// Quorum was reached and this caller's listener is handed back.
-    Listener(TcpListener),
+    Listener(AcquiredListener),
     /// No plan covers this group, or the plan does not list this
     /// `core_id`. The caller should bind a listener independently
     /// (today's behaviour).
@@ -212,6 +219,59 @@ pub enum AcquireOutcome {
     MaterialisationFailed(std::io::Error),
 }
 
+/// Listener acquired from a coordinated listener group.
+#[derive(Debug)]
+pub struct AcquiredListener {
+    listener: TcpListener,
+    lease: Option<ListenerGroupLease>,
+}
+
+impl AcquiredListener {
+    fn new(listener: TcpListener, lease: Option<ListenerGroupLease>) -> Self {
+        Self { listener, lease }
+    }
+
+    /// Splits the standard listener from its optional lifecycle lease.
+    #[must_use]
+    pub fn into_parts(self) -> (TcpListener, Option<ListenerGroupLease>) {
+        (self.listener, self.lease)
+    }
+
+    #[cfg(test)]
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.listener.local_addr()
+    }
+
+    #[cfg(test)]
+    fn as_raw_fd(&self) -> RawFd {
+        use std::os::fd::AsRawFd;
+        self.listener.as_raw_fd()
+    }
+}
+
+/// Opaque listener lifecycle guard returned by an attach hook.
+#[derive(Debug)]
+pub struct ListenerGroupLease {
+    _guard: Arc<dyn Any + Send + Sync>,
+}
+
+impl ListenerGroupLease {
+    /// Wraps a hook-specific cleanup guard.
+    #[must_use]
+    pub fn new(guard: Arc<dyn Any + Send + Sync>) -> Self {
+        Self { _guard: guard }
+    }
+}
+
+/// Result returned by an attach hook.
+#[derive(Default)]
+pub struct AttachOutcome {
+    /// Group-wide keepalive, such as a loaded BPF object.
+    pub keepalive: Option<Arc<dyn Any + Send + Sync>>,
+    /// Optional per-core cleanup guards handed to acquirers.
+    pub listener_leases: HashMap<u32, ListenerGroupLease>,
+}
+
 /// Optional attach hook invoked by the manager after the listeners
 /// for a group have been materialised, but before any acquirer
 /// receives its listener. Used by Phase 3 to call
@@ -221,16 +281,12 @@ pub enum AcquireOutcome {
 /// The hook receives the plan and a slice of
 /// `(listener_id, raw_fd, core_id, numa_node)` tuples **sorted by
 /// `listener_id`** so the eBPF map population is deterministic.
-/// Returning `Ok(Some(keepalive))` stores the opaque value in the
-/// group state so it lives as long as the manager owns the group;
-/// returning `Ok(None)` indicates no keepalive is needed. Returning
+/// Returning an [`AttachOutcome`] stores any group keepalive in the
+/// group state and hands per-core cleanup guards to acquirers. Returning
 /// `Err(io::Error)` aborts materialisation and surfaces as
 /// `MaterialisationFailed` on the first acquirer.
 pub type AttachHook = Arc<
-    dyn Fn(
-            &ListenerGroupPlan,
-            &[(u32, RawFd, u32, u32)],
-        ) -> std::io::Result<Option<Arc<dyn Any + Send + Sync>>>
+    dyn Fn(&ListenerGroupPlan, &[(u32, RawFd, u32, u32)]) -> std::io::Result<AttachOutcome>
         + Send
         + Sync,
 >;
@@ -300,8 +356,12 @@ enum GroupState {
     /// are distributed to acquirers as they wake up.
     Ready {
         listeners: HashMap<u32, TcpListener>,
+        listener_leases: HashMap<u32, ListenerGroupLease>,
         distributed: BTreeSet<u32>,
     },
+    /// Last arrival is binding sockets and running the attach hook
+    /// outside the manager mutex.
+    Materialising,
     /// Eager materialisation failed; the cached error is replayed for
     /// each acquirer.
     Failed { error: std::io::Error },
@@ -334,6 +394,9 @@ impl ListenerGroupManager {
         }
         if plan.key.protocol == Protocol::Udp {
             return Err(PlanError::UnsupportedUdp);
+        }
+        if plan.key.addr.port() == 0 {
+            return Err(PlanError::EphemeralPortUnsupported);
         }
         let mut seen_listener = BTreeSet::new();
         let mut seen_core = BTreeSet::new();
@@ -450,39 +513,14 @@ impl ListenerGroupManager {
                         // 1-member quorum: materialise immediately.
                         let plan_clone = slot.plan.clone();
                         let hook = self.current_attach_hook();
-                        match materialise_group(&plan_clone) {
-                            Ok(listeners) => {
-                                match invoke_attach_hook(&plan_clone, &listeners, hook.as_ref()) {
-                                    Ok(keepalive) => {
-                                        slot.attach_keepalive = keepalive;
-                                        slot.state = GroupState::Ready {
-                                            listeners,
-                                            distributed: BTreeSet::new(),
-                                        };
-                                        cv.notify_all();
-                                        continue;
-                                    }
-                                    Err(error) => {
-                                        let replay = std::io::Error::new(
-                                            error.kind(),
-                                            format!("listener-group attach hook failed: {error}"),
-                                        );
-                                        slot.state = GroupState::Failed { error: replay };
-                                        cv.notify_all();
-                                        return AcquireOutcome::MaterialisationFailed(error);
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                let replay = std::io::Error::new(
-                                    error.kind(),
-                                    format!("listener-group materialisation failed: {error}"),
-                                );
-                                slot.state = GroupState::Failed { error: replay };
-                                cv.notify_all();
-                                return AcquireOutcome::MaterialisationFailed(error);
-                            }
+                        slot.state = GroupState::Materialising;
+                        drop(guard);
+                        if let Err(error) = self.materialise_and_publish(key, &cv, plan_clone, hook)
+                        {
+                            return AcquireOutcome::MaterialisationFailed(error);
                         }
+                        guard = self.inner.state.lock().expect("listener-group state mutex");
+                        continue;
                     }
                     slot.state = GroupState::Awaiting { arrived, deadline };
                 }
@@ -495,41 +533,13 @@ impl ListenerGroupManager {
                             // Last arrival: materialise + distribute.
                             let plan = slot.plan.clone();
                             let hook = self.current_attach_hook();
-                            match materialise_group(&plan) {
-                                Ok(listeners) => {
-                                    match invoke_attach_hook(&plan, &listeners, hook.as_ref()) {
-                                        Ok(keepalive) => {
-                                            slot.attach_keepalive = keepalive;
-                                            slot.state = GroupState::Ready {
-                                                listeners,
-                                                distributed: BTreeSet::new(),
-                                            };
-                                            cv.notify_all();
-                                            continue;
-                                        }
-                                        Err(error) => {
-                                            let replay = std::io::Error::new(
-                                                error.kind(),
-                                                format!(
-                                                    "listener-group attach hook failed: {error}"
-                                                ),
-                                            );
-                                            slot.state = GroupState::Failed { error: replay };
-                                            cv.notify_all();
-                                            return AcquireOutcome::MaterialisationFailed(error);
-                                        }
-                                    }
-                                }
-                                Err(error) => {
-                                    let replay = std::io::Error::new(
-                                        error.kind(),
-                                        format!("listener-group materialisation failed: {error}"),
-                                    );
-                                    slot.state = GroupState::Failed { error: replay };
-                                    cv.notify_all();
-                                    return AcquireOutcome::MaterialisationFailed(error);
-                                }
+                            slot.state = GroupState::Materialising;
+                            drop(guard);
+                            if let Err(error) = self.materialise_and_publish(key, &cv, plan, hook) {
+                                return AcquireOutcome::MaterialisationFailed(error);
                             }
+                            guard = self.inner.state.lock().expect("listener-group state mutex");
+                            continue;
                         }
                     }
                     // Drop into the wait-or-timeout path below.
@@ -555,6 +565,7 @@ impl ListenerGroupManager {
                 }
                 GroupState::Ready {
                     listeners,
+                    listener_leases,
                     distributed,
                 } => {
                     if distributed.contains(&core_id) {
@@ -565,10 +576,15 @@ impl ListenerGroupManager {
                         return AcquireOutcome::AlreadyAcquired;
                     }
                     if let Some(listener) = listeners.remove(&core_id) {
+                        let lease = listener_leases.remove(&core_id);
                         let _ = distributed.insert(core_id);
-                        return AcquireOutcome::Listener(listener);
+                        return AcquireOutcome::Listener(AcquiredListener::new(listener, lease));
                     }
                     return AcquireOutcome::NoPlan;
+                }
+                GroupState::Materialising => {
+                    guard = cv.wait(guard).expect("listener-group cv wait");
+                    continue;
                 }
                 GroupState::Failed { error } => {
                     let replay = std::io::Error::new(error.kind(), error.to_string());
@@ -577,6 +593,45 @@ impl ListenerGroupManager {
                 GroupState::Fallback => {
                     return AcquireOutcome::FallbackToIndependent;
                 }
+            }
+        }
+    }
+
+    fn materialise_and_publish(
+        &self,
+        key: &ListenerGroupKey,
+        cv: &Condvar,
+        plan: ListenerGroupPlan,
+        hook: Option<AttachHook>,
+    ) -> std::io::Result<()> {
+        let result = materialise_group(&plan).and_then(|listeners| {
+            invoke_attach_hook(&plan, &listeners, hook.as_ref()).map(|attach| (listeners, attach))
+        });
+
+        let mut state = self.inner.state.lock().expect("listener-group state mutex");
+        let Some(slot) = state.get_mut(key) else {
+            return Ok(());
+        };
+
+        match result {
+            Ok((listeners, attach)) => {
+                slot.attach_keepalive = attach.keepalive;
+                slot.state = GroupState::Ready {
+                    listeners,
+                    listener_leases: attach.listener_leases,
+                    distributed: BTreeSet::new(),
+                };
+                cv.notify_all();
+                Ok(())
+            }
+            Err(error) => {
+                let replay = std::io::Error::new(
+                    error.kind(),
+                    format!("listener-group materialisation or attach failed: {error}"),
+                );
+                slot.state = GroupState::Failed { error: replay };
+                cv.notify_all();
+                Err(error)
             }
         }
     }
@@ -608,7 +663,7 @@ impl ListenerGroupManager {
 /// `reuseport_ebpf::libbpf::load_default_and_attach(...)` against the
 /// listeners in a freshly-materialised group. On non-Linux or when
 /// the `reuseport-ebpf` feature is not compiled in, returns a no-op
-/// hook (`Ok(None)`) and emits a one-shot warning so the controller
+/// hook (empty [`AttachOutcome`]) and emits a one-shot warning so the controller
 /// can call this unconditionally without `cfg`-gating.
 ///
 /// `debug` controls libbpf verbosity; `strict` selects fail-startup
@@ -640,8 +695,23 @@ pub fn ebpf_attach_hook(debug: bool, strict: bool) -> AttachHook {
                     .collect();
                 match load_default_and_attach(&listeners, debug) {
                     Ok(handle) => {
+                        let listener_leases = handle
+                            .listener_leases()
+                            .into_iter()
+                            .filter_map(|(listener_id, guard)| {
+                                listeners
+                                    .iter()
+                                    .find(|listener| listener.listener_id == listener_id)
+                                    .map(|listener| {
+                                        (listener.core_id, ListenerGroupLease::new(guard))
+                                    })
+                            })
+                            .collect();
                         let keepalive: Arc<dyn Any + Send + Sync> = Arc::new(handle);
-                        Ok(Some(keepalive))
+                        Ok(AttachOutcome {
+                            keepalive: Some(keepalive),
+                            listener_leases,
+                        })
                     }
                     Err(error) => {
                         if strict {
@@ -652,7 +722,7 @@ pub fn ebpf_attach_hook(debug: bool, strict: bool) -> AttachHook {
                             eprintln!(
                                 "listener_group: eBPF attach failed (continuing without selector): {error}"
                             );
-                            Ok(None)
+                            Ok(AttachOutcome::default())
                         }
                     }
                 }
@@ -665,7 +735,7 @@ pub fn ebpf_attach_hook(debug: bool, strict: bool) -> AttachHook {
             eprintln!(
                 "listener_group: OTAP_DF_REUSEPORT_EBPF requested but reuseport-ebpf feature is not compiled in or target is not Linux; continuing with plain SO_REUSEPORT"
             );
-            Ok(None)
+            Ok(AttachOutcome::default())
         })
     }
 }
@@ -760,7 +830,7 @@ pub fn manager_only_debug_enabled() -> bool {
 /// on, or the test-only manager-only debug switch is on.
 #[must_use]
 pub fn manager_active() -> bool {
-    reuseport_ebpf_enabled() || manager_only_debug_enabled()
+    cfg!(unix) && (reuseport_ebpf_enabled() || manager_only_debug_enabled())
 }
 
 /// Lightweight per-receiver handle into the controller's listener
@@ -869,10 +939,10 @@ fn invoke_attach_hook(
     plan: &ListenerGroupPlan,
     listeners: &HashMap<u32, TcpListener>,
     hook: Option<&AttachHook>,
-) -> std::io::Result<Option<Arc<dyn Any + Send + Sync>>> {
+) -> std::io::Result<AttachOutcome> {
     use std::os::fd::AsRawFd;
     let Some(hook) = hook else {
-        return Ok(None);
+        return Ok(AttachOutcome::default());
     };
     let mut members = plan.expected_members.clone();
     members.sort_by_key(|m| m.listener_id);
@@ -1027,6 +1097,14 @@ mod tests {
         plan.key.protocol = Protocol::Udp;
         assert_eq!(mgr.register_plan(plan), Err(PlanError::UnsupportedUdp));
 
+        // Ephemeral port 0 cannot form one coordinated group because
+        // each socket bind would pick a different concrete port.
+        let plan = plan_with_ids("pg", "r4b", "127.0.0.1:0".parse().unwrap(), &[(0, 0, 0)]);
+        assert_eq!(
+            mgr.register_plan(plan),
+            Err(PlanError::EphemeralPortUnsupported)
+        );
+
         // Successful registration, then duplicate-key rejection.
         let plan = plan_with_ids("pg", "r5", addr, &[(0, 0, 0)]);
         mgr.register_plan(plan).unwrap();
@@ -1104,7 +1182,6 @@ mod tests {
         // Different fds, both bound to the same address.
         assert_eq!(l_a.local_addr().unwrap().port(), addr.port());
         assert_eq!(l_b.local_addr().unwrap().port(), addr.port());
-        use std::os::fd::AsRawFd;
         assert_ne!(l_a.as_raw_fd(), l_b.as_raw_fd());
     }
 
@@ -1230,7 +1307,6 @@ mod tests {
 
     #[test]
     fn attach_hook_invoked_with_listener_id_sorted_handles() {
-        use std::os::fd::AsRawFd;
         use std::sync::atomic::{AtomicBool, Ordering as AOrdering};
 
         let mgr = ListenerGroupManager::new();
@@ -1256,7 +1332,7 @@ mod tests {
                 assert!(*fd >= 0, "expected positive fd");
                 sink.push(*lid);
             }
-            Ok(None)
+            Ok(AttachOutcome::default())
         }));
 
         let key = ListenerGroupKey::tcp("pg", "recv", addr);

@@ -12,7 +12,9 @@ use crate::control::{
     RuntimeCtrlMsgSender, WakeupSlot,
 };
 use crate::error::Error;
-use crate::listener_group::{AcquireOutcome, ListenerGroupHandle, QUORUM_TIMEOUT, manager_active};
+use crate::listener_group::{
+    AcquireOutcome, ListenerGroupHandle, ListenerGroupLease, QUORUM_TIMEOUT, manager_active,
+};
 use crate::node::NodeId;
 use crate::node_local_scheduler::NodeLocalSchedulerHandle;
 use crate::{WakeupError, WakeupSetOutcome};
@@ -21,6 +23,7 @@ use otap_df_telemetry::error::Error as TelemetryError;
 use otap_df_telemetry::metrics::{MetricSet, MetricSetHandler};
 use otap_df_telemetry::reporter::MetricsReporter;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, UdpSocket};
 
@@ -70,11 +73,16 @@ pub(crate) struct EffectHandlerCore<PData> {
     /// receiver receives a coordinated reuseport listener instead of
     /// independently binding. `None` preserves today's behaviour.
     pub(crate) listener_group_handle: Option<ListenerGroupHandle>,
+    /// Lifecycle guards for listeners acquired from the group manager.
+    /// The public receiver API returns plain Tokio listeners, so the
+    /// effect handler retains the cleanup guards for the receiver
+    /// lifetime and drops them when the receiver exits.
+    listener_group_leases: Arc<Mutex<Vec<ListenerGroupLease>>>,
 }
 
 impl<PData> EffectHandlerCore<PData> {
     /// Creates a new EffectHandlerCore with node_id and a metrics reporter.
-    pub(crate) const fn new(node_id: NodeId, metrics_reporter: MetricsReporter) -> Self {
+    pub(crate) fn new(node_id: NodeId, metrics_reporter: MetricsReporter) -> Self {
         Self {
             node_id,
             runtime_ctrl_msg_sender: None,
@@ -85,6 +93,7 @@ impl<PData> EffectHandlerCore<PData> {
             node_interests: Interests::empty(),
             local_scheduler: None,
             listener_group_handle: None,
+            listener_group_leases: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -213,7 +222,14 @@ impl<PData> EffectHandlerCore<PData> {
                     .manager()
                     .acquire(&key, handle.core_id(), QUORUM_TIMEOUT);
                 match outcome {
-                    AcquireOutcome::Listener(std_listener) => {
+                    AcquireOutcome::Listener(acquired) => {
+                        let (std_listener, lease) = acquired.into_parts();
+                        if let Some(lease) = lease {
+                            self.listener_group_leases
+                                .lock()
+                                .expect("listener-group leases mutex")
+                                .push(lease);
+                        }
                         // The acquiring receiver must register the fd
                         // with its own current-thread runtime; doing
                         // so here keeps the seam sync.
