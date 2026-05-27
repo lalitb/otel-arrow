@@ -402,7 +402,7 @@ impl<PData: 'static + Debug + Clone + ReceivedAtNode + Unwindable + FlowMetricHo
             let effect_metrics_reporter = metrics_reporter.clone();
             let final_metrics_reporter = metrics_reporter.clone();
             // Build the optional listener-group handle for this
-            // (pipeline_group, receiver_node, core) instance. When
+            // (pipeline_group, pipeline, receiver_node, core) instance. When
             // coordinated reuseport is disabled, or no plan covers the
             // receiver, the handle is harmless: the manager returns
             // `NoPlan` and the EffectHandler falls back to its
@@ -417,6 +417,7 @@ impl<PData: 'static + Debug + Clone + ReceivedAtNode + Unwindable + FlowMetricHo
                         crate::listener_group::ListenerGroupHandle::for_receiver(
                             pipeline_context.listener_group_manager().clone(),
                             pipeline_context.pipeline_group_id().to_string(),
+                            pipeline_context.pipeline_id().to_string(),
                             &node_id.name,
                             core_id,
                         )

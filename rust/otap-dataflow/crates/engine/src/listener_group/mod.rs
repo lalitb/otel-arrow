@@ -60,9 +60,10 @@ impl Protocol {
 ///
 /// Includes the full identity needed to disambiguate two unrelated
 /// receiver groups that happen to share the same bind address (e.g.
-/// two pipeline groups in the same engine that each plan to bind
-/// `0.0.0.0:4317` for separate ingest paths). Keying purely on
-/// `{addr, protocol}` would collide in that case.
+/// two pipelines in the same group, or two pipeline groups in the same
+/// engine, that each plan to bind `0.0.0.0:4317` for separate ingest
+/// paths). Keying purely on `{addr, protocol}` would collide in that
+/// case.
 ///
 /// `bind_device` participates in the key for identity only: the
 /// current `materialise_group` path does **not** apply
@@ -74,6 +75,8 @@ impl Protocol {
 pub struct ListenerGroupKey {
     /// Pipeline group id that owns this listener group.
     pub pipeline_group_id: String,
+    /// Pipeline id that owns this listener group.
+    pub pipeline_id: String,
     /// Receiver node id (in the controller's plan) that will host the listeners.
     pub receiver_node_id: String,
     /// Bind address shared by every listener in the group.
@@ -90,11 +93,13 @@ impl ListenerGroupKey {
     #[must_use]
     pub fn tcp(
         pipeline_group_id: impl Into<String>,
+        pipeline_id: impl Into<String>,
         receiver_node_id: impl Into<String>,
         addr: SocketAddr,
     ) -> Self {
         Self {
             pipeline_group_id: pipeline_group_id.into(),
+            pipeline_id: pipeline_id.into(),
             receiver_node_id: receiver_node_id.into(),
             addr,
             protocol: Protocol::Tcp,
@@ -108,23 +113,31 @@ impl ListenerGroupKey {
     /// side) cannot drift. Both call sites *must* go through this
     /// helper.
     #[must_use]
-    pub fn tcp_for_receiver<P, N>(pipeline_group_id: P, node_id: &N, addr: SocketAddr) -> Self
+    pub fn tcp_for_receiver<P, I, N>(
+        pipeline_group_id: P,
+        pipeline_id: I,
+        node_id: &N,
+        addr: SocketAddr,
+    ) -> Self
     where
         P: Into<String>,
+        I: Into<String>,
         N: std::fmt::Display + ?Sized,
     {
-        Self::tcp(pipeline_group_id, node_id.to_string(), addr)
+        Self::tcp(pipeline_group_id, pipeline_id, node_id.to_string(), addr)
     }
 
     /// Builds a UDP key with no bind-device pin.
     #[must_use]
     pub fn udp(
         pipeline_group_id: impl Into<String>,
+        pipeline_id: impl Into<String>,
         receiver_node_id: impl Into<String>,
         addr: SocketAddr,
     ) -> Self {
         Self {
             pipeline_group_id: pipeline_group_id.into(),
+            pipeline_id: pipeline_id.into(),
             receiver_node_id: receiver_node_id.into(),
             addr,
             protocol: Protocol::Udp,
@@ -134,12 +147,18 @@ impl ListenerGroupKey {
 
     /// Canonical UDP constructor matching [`Self::tcp_for_receiver`].
     #[must_use]
-    pub fn udp_for_receiver<P, N>(pipeline_group_id: P, node_id: &N, addr: SocketAddr) -> Self
+    pub fn udp_for_receiver<P, I, N>(
+        pipeline_group_id: P,
+        pipeline_id: I,
+        node_id: &N,
+        addr: SocketAddr,
+    ) -> Self
     where
         P: Into<String>,
+        I: Into<String>,
         N: std::fmt::Display + ?Sized,
     {
-        Self::udp(pipeline_group_id, node_id.to_string(), addr)
+        Self::udp(pipeline_group_id, pipeline_id, node_id.to_string(), addr)
     }
 }
 
@@ -884,6 +903,7 @@ pub fn manager_active() -> bool {
 pub struct ListenerGroupHandle {
     manager: ListenerGroupManager,
     pipeline_group_id: String,
+    pipeline_id: String,
     receiver_node_id: String,
     core_id: u32,
 }
@@ -895,12 +915,14 @@ impl ListenerGroupHandle {
     pub fn new(
         manager: ListenerGroupManager,
         pipeline_group_id: impl Into<String>,
+        pipeline_id: impl Into<String>,
         receiver_node_id: impl Into<String>,
         core_id: u32,
     ) -> Self {
         Self {
             manager,
             pipeline_group_id: pipeline_group_id.into(),
+            pipeline_id: pipeline_id.into(),
             receiver_node_id: receiver_node_id.into(),
             core_id,
         }
@@ -916,6 +938,7 @@ impl ListenerGroupHandle {
     pub fn for_receiver<P, N>(
         manager: ListenerGroupManager,
         pipeline_group_id: P,
+        pipeline_id: impl Into<String>,
         node_id: &N,
         core_id: u32,
     ) -> Self
@@ -923,7 +946,13 @@ impl ListenerGroupHandle {
         P: Into<String>,
         N: std::fmt::Display + ?Sized,
     {
-        Self::new(manager, pipeline_group_id, node_id.to_string(), core_id)
+        Self::new(
+            manager,
+            pipeline_group_id,
+            pipeline_id,
+            node_id.to_string(),
+            core_id,
+        )
     }
 
     /// The owning manager, exposed for the small set of code paths
@@ -939,6 +968,7 @@ impl ListenerGroupHandle {
     pub fn tcp_key(&self, addr: SocketAddr) -> ListenerGroupKey {
         ListenerGroupKey::tcp(
             self.pipeline_group_id.clone(),
+            self.pipeline_id.clone(),
             self.receiver_node_id.clone(),
             addr,
         )
@@ -950,6 +980,7 @@ impl ListenerGroupHandle {
     pub fn udp_key(&self, addr: SocketAddr) -> ListenerGroupKey {
         ListenerGroupKey::udp(
             self.pipeline_group_id.clone(),
+            self.pipeline_id.clone(),
             self.receiver_node_id.clone(),
             addr,
         )
@@ -1066,8 +1097,18 @@ mod tests {
         addr: SocketAddr,
         members: &[(u32, u32, u32)],
     ) -> ListenerGroupPlan {
+        plan_with_pipeline_ids(pg, "pipe", recv, addr, members)
+    }
+
+    fn plan_with_pipeline_ids(
+        pg: &str,
+        pipe: &str,
+        recv: &str,
+        addr: SocketAddr,
+        members: &[(u32, u32, u32)],
+    ) -> ListenerGroupPlan {
         ListenerGroupPlan {
-            key: ListenerGroupKey::tcp(pg, recv, addr),
+            key: ListenerGroupKey::tcp(pg, pipe, recv, addr),
             expected_members: members
                 .iter()
                 .map(|(listener_id, core_id, numa_node)| ListenerGroupMember {
@@ -1094,27 +1135,32 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:18001".parse().unwrap();
         // Same identity = same key.
         assert_eq!(
-            ListenerGroupKey::tcp("pg", "recv", addr),
-            ListenerGroupKey::tcp("pg", "recv", addr),
+            ListenerGroupKey::tcp("pg", "pipe", "recv", addr),
+            ListenerGroupKey::tcp("pg", "pipe", "recv", addr),
         );
         // Different protocol = different key.
-        let mut udp = ListenerGroupKey::tcp("pg", "recv", addr);
+        let mut udp = ListenerGroupKey::tcp("pg", "pipe", "recv", addr);
         udp.protocol = Protocol::Udp;
-        assert_ne!(udp, ListenerGroupKey::tcp("pg", "recv", addr));
+        assert_ne!(udp, ListenerGroupKey::tcp("pg", "pipe", "recv", addr));
         // Different pipeline_group_id = different key.
         assert_ne!(
-            ListenerGroupKey::tcp("pg-a", "recv", addr),
-            ListenerGroupKey::tcp("pg-b", "recv", addr),
+            ListenerGroupKey::tcp("pg-a", "pipe", "recv", addr),
+            ListenerGroupKey::tcp("pg-b", "pipe", "recv", addr),
+        );
+        // Different pipeline_id = different key.
+        assert_ne!(
+            ListenerGroupKey::tcp("pg", "pipe-a", "recv", addr),
+            ListenerGroupKey::tcp("pg", "pipe-b", "recv", addr),
         );
         // Different receiver_node_id = different key.
         assert_ne!(
-            ListenerGroupKey::tcp("pg", "recv-a", addr),
-            ListenerGroupKey::tcp("pg", "recv-b", addr),
+            ListenerGroupKey::tcp("pg", "pipe", "recv-a", addr),
+            ListenerGroupKey::tcp("pg", "pipe", "recv-b", addr),
         );
         // Different bind_device = different key (identity-only).
-        let mut keyed_eth0 = ListenerGroupKey::tcp("pg", "recv", addr);
+        let mut keyed_eth0 = ListenerGroupKey::tcp("pg", "pipe", "recv", addr);
         keyed_eth0.bind_device = Some("eth0".into());
-        let mut keyed_eth1 = ListenerGroupKey::tcp("pg", "recv", addr);
+        let mut keyed_eth1 = ListenerGroupKey::tcp("pg", "pipe", "recv", addr);
         keyed_eth1.bind_device = Some("eth1".into());
         assert_ne!(keyed_eth0, keyed_eth1);
     }
@@ -1129,10 +1175,21 @@ mod tests {
             .unwrap();
         mgr.register_plan(plan_with_ids("pg-b", "recv", addr, &[(0, 0, 0)]))
             .unwrap();
+        // Same pipeline group, same receiver node, different pipeline
+        // id -> distinct. Node names are only unique within one
+        // pipeline.
+        mgr.register_plan(plan_with_pipeline_ids(
+            "pg-a",
+            "pipe-other",
+            "recv",
+            addr,
+            &[(0, 0, 0)],
+        ))
+        .unwrap();
         // Same pipeline group, different receiver nodes -> still distinct.
         mgr.register_plan(plan_with_ids("pg-a", "recv-other", addr, &[(0, 0, 0)]))
             .unwrap();
-        assert_eq!(mgr.plan_count(), 3);
+        assert_eq!(mgr.plan_count(), 4);
     }
 
     #[test]
@@ -1152,7 +1209,7 @@ mod tests {
 
         // Empty members.
         let mut plan = loopback_plan(addr, &[]);
-        plan.key = ListenerGroupKey::tcp("pg", "recv", addr);
+        plan.key = ListenerGroupKey::tcp("pg", "pipe", "recv", addr);
         assert_eq!(mgr.register_plan(plan), Err(PlanError::NoMembers));
 
         // Duplicate listener id (under a fresh key, since the empty
@@ -1188,7 +1245,7 @@ mod tests {
         let mgr = ListenerGroupManager::new();
         let addr = ephemeral_addr();
         let outcome = mgr.acquire(
-            &ListenerGroupKey::tcp("pg", "recv", addr),
+            &ListenerGroupKey::tcp("pg", "pipe", "recv", addr),
             0,
             Duration::from_millis(1),
         );
@@ -1203,7 +1260,7 @@ mod tests {
             .unwrap();
         let start = Instant::now();
         let outcome = mgr.acquire(
-            &ListenerGroupKey::tcp("pg", "recv", addr),
+            &ListenerGroupKey::tcp("pg", "pipe", "recv", addr),
             99, // not in plan
             Duration::from_secs(60),
         );
@@ -1225,7 +1282,7 @@ mod tests {
         let barrier = Arc::new(Barrier::new(2));
         let mgr_a = mgr.clone();
         let mgr_b = mgr.clone();
-        let key_a = ListenerGroupKey::tcp("pg", "recv", addr);
+        let key_a = ListenerGroupKey::tcp("pg", "pipe", "recv", addr);
         let key_b = key_a.clone();
         let bar_a = Arc::clone(&barrier);
         let bar_b = Arc::clone(&barrier);
@@ -1266,7 +1323,7 @@ mod tests {
 
         let barrier = Arc::new(Barrier::new(2));
         let key = {
-            let mut key = ListenerGroupKey::tcp("pg", "recv", addr);
+            let mut key = ListenerGroupKey::tcp("pg", "pipe", "recv", addr);
             key.protocol = Protocol::Udp;
             key
         };
@@ -1306,7 +1363,7 @@ mod tests {
         let addr = ephemeral_addr();
         mgr.register_plan(loopback_plan(addr, &[(10, 5, 0), (20, 6, 0), (30, 7, 0)]))
             .unwrap();
-        let key = ListenerGroupKey::tcp("pg", "recv", addr);
+        let key = ListenerGroupKey::tcp("pg", "pipe", "recv", addr);
 
         let barrier = Arc::new(Barrier::new(3));
         let mut handles = Vec::new();
@@ -1339,7 +1396,7 @@ mod tests {
         // Two expected members; only one will arrive.
         mgr.register_plan(loopback_plan(addr, &[(0, 0, 0), (1, 1, 0)]))
             .unwrap();
-        let key = ListenerGroupKey::tcp("pg", "recv", addr);
+        let key = ListenerGroupKey::tcp("pg", "pipe", "recv", addr);
 
         let start = Instant::now();
         let outcome = mgr.acquire(&key, 0, Duration::from_millis(50));
@@ -1364,7 +1421,7 @@ mod tests {
         let addr = ephemeral_addr();
         mgr.register_plan(loopback_plan(addr, &[(0, 0, 0), (1, 1, 0)]))
             .unwrap();
-        let key = ListenerGroupKey::tcp("pg", "recv", addr);
+        let key = ListenerGroupKey::tcp("pg", "pipe", "recv", addr);
         mgr.force_fallback(&key);
         assert!(matches!(
             mgr.acquire(&key, 0, Duration::from_millis(1)),
@@ -1388,7 +1445,7 @@ mod tests {
         let addr = ephemeral_addr();
         mgr.register_plan(plan_with_ids("pg", "recv", addr, &[(0, 0, 0)]))
             .unwrap();
-        let key = ListenerGroupKey::tcp("pg", "recv", addr);
+        let key = ListenerGroupKey::tcp("pg", "pipe", "recv", addr);
         let first = mgr.acquire(&key, 0, Duration::from_secs(1));
         assert!(matches!(first, AcquireOutcome::Listener(_)), "{first:?}");
         let second = mgr.acquire(&key, 0, Duration::from_secs(1));
@@ -1445,7 +1502,7 @@ mod tests {
             Ok(AttachOutcome::default())
         }));
 
-        let key = ListenerGroupKey::tcp("pg", "recv", addr);
+        let key = ListenerGroupKey::tcp("pg", "pipe", "recv", addr);
         let barrier = Arc::new(Barrier::new(3));
         let mut handles = Vec::new();
         for core in [5u32, 6, 7] {
@@ -1482,7 +1539,7 @@ mod tests {
                 "no CAP_BPF in test",
             ))
         }));
-        let key = ListenerGroupKey::tcp("pg", "recv", addr);
+        let key = ListenerGroupKey::tcp("pg", "pipe", "recv", addr);
         let outcome = mgr.acquire(&key, 0, Duration::from_secs(1));
         assert!(
             matches!(outcome, AcquireOutcome::MaterialisationFailed(_)),
@@ -1519,10 +1576,12 @@ mod tests {
         // receiver. Both go through the canonical Display-based
         // stringifier.
         let addr: SocketAddr = "127.0.0.1:18099".parse().unwrap();
-        let from_extraction = ListenerGroupKey::tcp_for_receiver("pg", "otlp_receiver", addr);
+        let from_extraction =
+            ListenerGroupKey::tcp_for_receiver("pg", "pipe", "otlp_receiver", addr);
         let manager = ListenerGroupManager::new();
         let from_runtime =
-            ListenerGroupHandle::for_receiver(manager, "pg", "otlp_receiver", 0).tcp_key(addr);
+            ListenerGroupHandle::for_receiver(manager, "pg", "pipe", "otlp_receiver", 0)
+                .tcp_key(addr);
         assert_eq!(from_extraction, from_runtime);
     }
 }

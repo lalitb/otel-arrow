@@ -104,6 +104,7 @@ pub fn extract_plans_for_pipeline(
     }
 
     let pipeline_group_id = pipeline.pipeline_group_id.as_ref().to_string();
+    let pipeline_id = pipeline.pipeline_id.as_ref().to_string();
 
     for (node_id, node_cfg) in pipeline.pipeline.nodes().iter() {
         let urn_str = node_cfg.r#type.as_str();
@@ -131,12 +132,18 @@ pub fn extract_plans_for_pipeline(
                 })
                 .collect::<Vec<_>>();
             let key = match protocol {
-                ListenerProtocol::Tcp => {
-                    ListenerGroupKey::tcp_for_receiver(pipeline_group_id.clone(), node_id, addr)
-                }
-                ListenerProtocol::Udp => {
-                    ListenerGroupKey::udp_for_receiver(pipeline_group_id.clone(), node_id, addr)
-                }
+                ListenerProtocol::Tcp => ListenerGroupKey::tcp_for_receiver(
+                    pipeline_group_id.clone(),
+                    pipeline_id.clone(),
+                    node_id,
+                    addr,
+                ),
+                ListenerProtocol::Udp => ListenerGroupKey::udp_for_receiver(
+                    pipeline_group_id.clone(),
+                    pipeline_id.clone(),
+                    node_id,
+                    addr,
+                ),
             };
             plans.push(ListenerGroupPlan {
                 key,
@@ -201,10 +208,10 @@ mod tests {
     /// Regression: the key the controller registers must equal the
     /// key the runtime later builds for the same receiver. The
     /// runtime constructs a `ListenerGroupHandle` with
-    /// `receiver_node_id = node_id.name.to_string()` and then calls
-    /// `handle.tcp_key(addr)`. Extraction must produce the same key,
-    /// otherwise `acquire(...)` returns `NoPlan` and silently falls
-    /// back to independent bind.
+    /// `pipeline_id` plus `receiver_node_id = node_id.name.to_string()`
+    /// and then calls `handle.tcp_key(addr)`. Extraction must produce
+    /// the same key, otherwise `acquire(...)` returns `NoPlan` and
+    /// silently falls back to independent bind.
     #[test]
     fn extracted_plan_key_matches_runtime_handle_key() {
         use crate::listener_group::{ListenerGroupHandle, ListenerGroupManager};
@@ -238,7 +245,7 @@ mod tests {
         // `runtime_pipeline.rs` does, then compare keys.
         let manager = ListenerGroupManager::new();
         let addr = plan.key.addr;
-        let handle = ListenerGroupHandle::new(manager.clone(), "pg", "otlp_receiver", 0);
+        let handle = ListenerGroupHandle::new(manager.clone(), "pg", "pipe", "otlp_receiver", 0);
         assert_eq!(handle.tcp_key(addr), plan.key);
     }
 
@@ -298,7 +305,7 @@ mod tests {
             let bar = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
                 let _ = bar.wait();
-                let h = ListenerGroupHandle::new(mgr.clone(), "pg", "otlp_receiver", core);
+                let h = ListenerGroupHandle::new(mgr.clone(), "pg", "pipe", "otlp_receiver", core);
                 mgr.acquire(&h.tcp_key(addr), core, Duration::from_secs(2))
             }));
         }
@@ -313,5 +320,53 @@ mod tests {
         assert_eq!(listeners[0].local_addr().unwrap(), addr);
         assert_eq!(listeners[1].local_addr().unwrap(), addr);
         assert_ne!(listeners[0].as_raw_fd(), listeners[1].as_raw_fd());
+    }
+
+    #[test]
+    fn extracted_keys_include_pipeline_id() {
+        use otap_df_config::engine::{ResolvedPipelineConfig, ResolvedPipelineRole};
+        use otap_df_config::pipeline::PipelineConfig;
+        use otap_df_config::policy::ResolvedPolicies;
+
+        let yaml = r#"
+            nodes:
+              receiver:
+                type: "urn:otel:receiver:otlp"
+                config:
+                  listening_addr: "127.0.0.1:18012"
+        "#;
+        let pipeline_a = PipelineConfig::from_yaml("pg".into(), "pipe-a".into(), yaml).unwrap();
+        let pipeline_b = PipelineConfig::from_yaml("pg".into(), "pipe-b".into(), yaml).unwrap();
+        let resolved_a = ResolvedPipelineConfig {
+            pipeline_group_id: "pg".into(),
+            pipeline_id: "pipe-a".into(),
+            pipeline: pipeline_a,
+            policies: ResolvedPolicies::default(),
+            role: ResolvedPipelineRole::Regular,
+        };
+        let resolved_b = ResolvedPipelineConfig {
+            pipeline_group_id: "pg".into(),
+            pipeline_id: "pipe-b".into(),
+            pipeline: pipeline_b,
+            policies: ResolvedPolicies::default(),
+            role: ResolvedPipelineRole::Regular,
+        };
+
+        let topo = CpuTopology::empty();
+        let cores = vec![0u32, 1];
+        let key_a = extract_plans_for_pipeline(&resolved_a, &cores, &topo)
+            .into_iter()
+            .next()
+            .unwrap()
+            .key;
+        let key_b = extract_plans_for_pipeline(&resolved_b, &cores, &topo)
+            .into_iter()
+            .next()
+            .unwrap()
+            .key;
+
+        assert_ne!(key_a, key_b);
+        assert_eq!(key_a.pipeline_id, "pipe-a");
+        assert_eq!(key_b.pipeline_id, "pipe-b");
     }
 }

@@ -63,13 +63,14 @@ placeholder.
 `crates/engine/src/listener_group/` defines:
 
 - `Protocol::{Tcp, Udp}`
-- `ListenerGroupKey { pipeline_group_id, receiver_node_id, addr,
+- `ListenerGroupKey { pipeline_group_id, pipeline_id, receiver_node_id, addr,
   protocol, bind_device }` -- the **full identity** of a planned
   group. Keying on the complete tuple avoids collisions when two
   unrelated receiver groups in different pipelines or nodes happen to
-  share the same bind address. `bind_device` participates in the key
-  as identity only; the current materialisation path does **not**
-  apply `SO_BINDTODEVICE`.
+  share the same bind address. Receiver node names are only unique
+  inside a pipeline, so `pipeline_id` is part of the identity.
+  `bind_device` participates in the key as identity only; the current
+  materialisation path does **not** apply `SO_BINDTODEVICE`.
 - `ListenerGroupMember { listener_id, core_id, numa_node }`
 - `ListenerGroupPlan { key, expected_members }`
 - `ListenerGroupManager` (held in `ControllerContext`)
@@ -126,14 +127,15 @@ the manager when:
    environment (the **single user-facing switch** -- see
    "Environment variables" below), **and**
 2. the controller has registered a [`ListenerGroupPlan`] covering
-   `(pipeline_group_id, receiver_node_id, addr, protocol)`.
+   `(pipeline_group_id, pipeline_id, receiver_node_id, addr, protocol)`.
 
 If either condition is unmet, the receiver falls through to the existing
 per-receiver bind path with byte-identical behaviour. With the env var unset,
 the code path is dead. The handle is plumbed by:
 
 - `EffectHandlerCore` carrying an optional `ListenerGroupHandle`
-  (`pipeline_group_id`, `receiver_node_id`, `core_id`, manager Arc),
+  (`pipeline_group_id`, `pipeline_id`, `receiver_node_id`, `core_id`,
+  manager Arc),
 - `ReceiverWrapper::start(...)` taking the handle as a parameter,
 - `runtime_pipeline.rs` constructing it from `PipelineContext` for
   every receiver before starting the pipeline thread, via

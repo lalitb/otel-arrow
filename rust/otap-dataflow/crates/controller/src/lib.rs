@@ -1524,6 +1524,7 @@ impl<
                         otel_warn!(
                             "listener_group.plan.register_failed",
                             pipeline_group_id = key.pipeline_group_id.as_str(),
+                            pipeline_id = key.pipeline_id.as_str(),
                             receiver_node_id = key.receiver_node_id.as_str(),
                             bind_addr = key.addr.to_string().as_str(),
                             error = error.to_string().as_str(),
@@ -1532,6 +1533,7 @@ impl<
                         otel_info!(
                             "listener_group.plan.registered",
                             pipeline_group_id = key.pipeline_group_id.as_str(),
+                            pipeline_id = key.pipeline_id.as_str(),
                             receiver_node_id = key.receiver_node_id.as_str(),
                             bind_addr = key.addr.to_string().as_str(),
                             members = plan_cores.len() as i64,
