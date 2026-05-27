@@ -106,10 +106,13 @@ Lifecycle:
    deadlocks.
 
 Materialisation `io::Error`s (e.g. address already bound by an
-unrelated process without `SO_REUSEPORT`) are surfaced as a hard
+unrelated process without `SO_REUSEPORT`) are surfaced as
 `AcquireOutcome::MaterialisationFailed` to the first acquirer and
-replayed for any later acquirer, matching the existing
-`EffectHandler::{tcp_listener,udp_socket}` failure semantics.
+replayed for any later acquirer. In non-strict mode the effect handler
+logs the failure and falls back to its independent bind path; if that
+bind fails, the existing `EffectHandler::{tcp_listener,udp_socket}`
+failure semantics apply. In strict mode the materialisation failure is
+returned immediately as a hard startup error.
 
 The manager never stores long-lived `RawFd`s. Listeners are owned by the
 manager only between materialisation and acquire; once distributed they
@@ -185,8 +188,9 @@ on expiry the group transitions to fallback for everyone.
   listener): the seam returns a hard `Error::IoError` rather than
   silently rebinding a fresh listener. Receivers must call
   `tcp_listener` at most once per `(addr, core)` per startup.
-- `acquire` returns `MaterialisationFailed`: same hard `Error::IoError`
-  as today's bind would have produced.
+- `acquire` returns `MaterialisationFailed`: non-strict mode logs and
+  falls back to the independent bind path; strict mode returns the hard
+  `Error::IoError`.
 - duplicate effective bind identity at plan-registration time: the
   manager rejects the duplicate and removes any earlier plan for the
   same `(addr, protocol)`, so all matching receivers use the

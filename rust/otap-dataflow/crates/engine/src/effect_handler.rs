@@ -14,6 +14,7 @@ use crate::control::{
 use crate::error::Error;
 use crate::listener_group::{
     AcquireOutcome, ListenerGroupHandle, ListenerGroupLease, QUORUM_TIMEOUT, manager_active,
+    reuseport_ebpf_strict,
 };
 use crate::node::NodeId;
 use crate::node_local_scheduler::NodeLocalSchedulerHandle;
@@ -21,6 +22,7 @@ use crate::{WakeupError, WakeupSetOutcome};
 use otap_df_channel::error::SendError;
 use otap_df_telemetry::error::Error as TelemetryError;
 use otap_df_telemetry::metrics::{MetricSet, MetricSetHandler};
+use otap_df_telemetry::otel_warn;
 use otap_df_telemetry::reporter::MetricsReporter;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -241,7 +243,19 @@ impl<PData> EffectHandlerCore<PData> {
                         ))));
                     }
                     AcquireOutcome::MaterialisationFailed(error) => {
-                        return Err(into_engine_error(error));
+                        if reuseport_ebpf_strict() {
+                            return Err(into_engine_error(error));
+                        }
+                        otel_warn!(
+                            "listener_group.tcp.materialisation_failed.fallback",
+                            receiver = receiver_id.name.as_ref(),
+                            addr = addr.to_string(),
+                            error = error.to_string(),
+                        );
+                        // Non-strict mode treats coordinated
+                        // materialisation failures the same as other
+                        // coordinated fallback cases: bind this
+                        // receiver independently below.
                     }
                     AcquireOutcome::AlreadyAcquired => {
                         // H1: refuse to silently rebind a fresh
@@ -339,7 +353,17 @@ impl<PData> EffectHandlerCore<PData> {
                         return UdpSocket::from_std(std_socket).map_err(into_engine_error);
                     }
                     AcquireOutcome::MaterialisationFailed(error) => {
-                        return Err(into_engine_error(error));
+                        if reuseport_ebpf_strict() {
+                            return Err(into_engine_error(error));
+                        }
+                        otel_warn!(
+                            "listener_group.udp.materialisation_failed.fallback",
+                            receiver = receiver_id.name.as_ref(),
+                            addr = addr.to_string(),
+                            error = error.to_string(),
+                        );
+                        // Fall through to the independent-bind path
+                        // below.
                     }
                     AcquireOutcome::AlreadyAcquired => {
                         return Err(into_engine_error(std::io::Error::new(
