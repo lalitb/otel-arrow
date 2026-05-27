@@ -16,9 +16,9 @@
 //! third-party receiver is not rejected.
 //!
 //! Because the controller crate cannot depend on receiver crates
-//! (circular), we deserialise just the `listening_addr` field as a
-//! free-form `{ listening_addr: SocketAddr }` shape rather than
-//! pulling in each receiver's typed `Config`.
+//! (circular), we read just the known `listening_addr` fields from
+//! raw `serde_json::Value` rather than pulling in each receiver's
+//! typed `Config`.
 
 use crate::listener_group::{
     ListenerGroupKey, ListenerGroupMember, ListenerGroupPlan, Protocol as ListenerProtocol,
@@ -28,56 +28,51 @@ use otap_df_config::engine::ResolvedPipelineConfig;
 use std::net::SocketAddr;
 use std::str::FromStr;
 
-/// Receiver URNs that the helper recognises. Each one has a
-/// `listening_addr: SocketAddr` field at the top level of its node
-/// config that the seam can bind via `EffectHandler::tcp_listener` or
+/// Receiver URNs that the helper recognises. Each one has one or more
+/// `listening_addr: SocketAddr` fields in its node config that the
+/// seam can bind via `EffectHandler::tcp_listener` or
 /// `EffectHandler::udp_socket`.
-///
-/// HTTP and gRPC server settings used by the OTLP receiver are nested
-/// under the `grpc` / `http` keys in its config; the conservative
-/// extractor below tries the top level first and then those two
-/// nested keys, which is enough for the current OTLP receiver shape.
 const KNOWN_RECEIVER_URNS: &[&str] = &[
     "urn:otel:receiver:otlp",
     "urn:otel:receiver:otap",
     "urn:otel:receiver:syslog_cef",
 ];
 
-/// Extracts every listener address present in `config`, looking at the
-/// top level, OTLP-style `{grpc, http}` TCP nesting, and syslog CEF's
-/// `{protocol: {tcp|udp}}` shape. Returns an empty vector if no
-/// recognised shape applies. Uses raw `serde_json::Value` access so the
-/// engine crate does not need a direct `serde` derive dependency.
-fn extract_listener_addresses(config: &serde_json::Value) -> Vec<(ListenerProtocol, SocketAddr)> {
-    let mut out = Vec::new();
-    if let Some(addr) = config
+fn parse_listening_addr(value: &serde_json::Value) -> Option<SocketAddr> {
+    value
         .get("listening_addr")
         .and_then(serde_json::Value::as_str)
         .and_then(|s| SocketAddr::from_str(s).ok())
-    {
+}
+
+/// Extracts every listener address present in `config`, looking at the
+/// top level, OTLP's actual `{protocols: {grpc|http}}` TCP nesting,
+/// the older direct `{grpc|http}` TCP nesting accepted by early tests,
+/// and syslog CEF's `{protocol: {tcp|udp}}` shape. Returns an empty
+/// vector if no recognised shape applies. Uses raw `serde_json::Value`
+/// access so the engine crate does not need a direct `serde` derive
+/// dependency.
+fn extract_listener_addresses(config: &serde_json::Value) -> Vec<(ListenerProtocol, SocketAddr)> {
+    let mut out = Vec::new();
+    if let Some(addr) = parse_listening_addr(config) {
         out.push((ListenerProtocol::Tcp, addr));
     }
-    for sub in ["grpc", "http"] {
-        if let Some(addr) = config
-            .get(sub)
-            .and_then(|v| v.get("listening_addr"))
-            .and_then(serde_json::Value::as_str)
-            .and_then(|s| SocketAddr::from_str(s).ok())
-        {
-            out.push((ListenerProtocol::Tcp, addr));
+
+    let protocol_parents = [Some(config), config.get("protocols")];
+    for parent in protocol_parents.into_iter().flatten() {
+        for sub in ["grpc", "http"] {
+            if let Some(addr) = parent.get(sub).and_then(parse_listening_addr) {
+                out.push((ListenerProtocol::Tcp, addr));
+            }
         }
     }
+
     if let Some(protocol) = config.get("protocol") {
         for (key, listener_protocol) in [
             ("tcp", ListenerProtocol::Tcp),
             ("udp", ListenerProtocol::Udp),
         ] {
-            if let Some(addr) = protocol
-                .get(key)
-                .and_then(|v| v.get("listening_addr"))
-                .and_then(serde_json::Value::as_str)
-                .and_then(|s| SocketAddr::from_str(s).ok())
-            {
+            if let Some(addr) = protocol.get(key).and_then(parse_listening_addr) {
                 out.push((listener_protocol, addr));
             }
         }
@@ -185,6 +180,21 @@ mod tests {
     }
 
     #[test]
+    fn extract_otlp_protocols_grpc_and_http() {
+        let cfg = json!({
+            "protocols": {
+                "grpc": {"listening_addr": "0.0.0.0:4317"},
+                "http": {"listening_addr": "0.0.0.0:4318"}
+            }
+        });
+        let addrs = extract_listener_addresses(&cfg);
+        assert_eq!(addrs.len(), 2);
+        let ports: Vec<u16> = addrs.iter().map(|(_, a)| a.port()).collect();
+        assert!(ports.contains(&4317));
+        assert!(ports.contains(&4318));
+    }
+
+    #[test]
     fn extract_syslog_udp_protocol_addr() {
         let cfg = json!({
             "protocol": {
@@ -224,7 +234,9 @@ mod tests {
               otlp_receiver:
                 type: "urn:otel:receiver:otlp"
                 config:
-                  listening_addr: "127.0.0.1:18011"
+                  protocols:
+                    grpc:
+                      listening_addr: "127.0.0.1:18011"
         "#;
         let pipeline = PipelineConfig::from_yaml("pg".into(), "pipe".into(), yaml).unwrap();
         let resolved = ResolvedPipelineConfig {
@@ -276,7 +288,9 @@ mod tests {
               otlp_receiver:
                 type: "urn:otel:receiver:otlp"
                 config:
-                  listening_addr: "{addr}"
+                  protocols:
+                    grpc:
+                      listening_addr: "{addr}"
             "#
         );
         let pipeline = PipelineConfig::from_yaml("pg".into(), "pipe".into(), &yaml).unwrap();
@@ -333,7 +347,9 @@ mod tests {
               receiver:
                 type: "urn:otel:receiver:otlp"
                 config:
-                  listening_addr: "127.0.0.1:18012"
+                  protocols:
+                    grpc:
+                      listening_addr: "127.0.0.1:18012"
         "#;
         let pipeline_a = PipelineConfig::from_yaml("pg".into(), "pipe-a".into(), yaml).unwrap();
         let pipeline_b = PipelineConfig::from_yaml("pg".into(), "pipe-b".into(), yaml).unwrap();
