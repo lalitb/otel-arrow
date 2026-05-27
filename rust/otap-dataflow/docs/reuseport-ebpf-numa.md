@@ -147,9 +147,9 @@ The controller calls it for every pipeline, before launching its
 threads, and registers one plan per recognised receiver URN
 (`urn:otel:receiver:{otlp,otap,syslog_cef}`). The helper reads the
 node config as a raw `serde_json::Value`, extracting
-`listening_addr` either at the top level or under `grpc.listening_addr`
-/ `http.listening_addr` so the controller does not need to depend on
-receiver-specific typed configs.
+`listening_addr` either at the top level or under
+`protocols.grpc.listening_addr` / `protocols.http.listening_addr` so the
+controller does not need to depend on receiver-specific typed configs.
 
 `listening_addr` values must be a literal `IP:port` (`SocketAddr`
 parseable string, e.g. `127.0.0.1:4318` or `[::1]:4318`). Hostnames
