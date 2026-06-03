@@ -1,0 +1,73 @@
+name: Rust-Miri
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'rust/otap-dataflow/Cargo.toml'
+      - 'rust/otap-dataflow/Cargo.lock'
+      - 'rust/otap-dataflow/crates/pdata/**'
+      - 'rust/otap-dataflow/crates/contrib-nodes/**'
+      - 'rust/otap-dataflow/crates/telemetry/**'
+      - 'rust/otap-dataflow/crates/telemetry-macros/**'
+      - '.github/workflows/rust-miri.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'rust/otap-dataflow/Cargo.toml'
+      - 'rust/otap-dataflow/Cargo.lock'
+      - 'rust/otap-dataflow/crates/pdata/**'
+      - 'rust/otap-dataflow/crates/contrib-nodes/**'
+      - 'rust/otap-dataflow/crates/telemetry/**'
+      - 'rust/otap-dataflow/crates/telemetry-macros/**'
+      - '.github/workflows/rust-miri.yml'
+  merge_group:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  MIRIFLAGS: -Zmiri-backtrace=full
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  miri:
+    name: Miri unsafe-focused tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: nightly
+          components: miri
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: ./rust/otap-dataflow
+          cache-bin: false
+          shared-key: miri
+
+      - name: Set up Miri sysroot
+        run: cargo +nightly miri setup
+        working-directory: ./rust/otap-dataflow
+
+      - name: Miri pdata Arrow transform tests
+        run: cargo +nightly miri test -p otap-df-pdata --lib otap::transform
+        working-directory: ./rust/otap-dataflow
+
+      - name: Miri RecordSet protobuf serializer tests
+        run: cargo +nightly miri test -p otap-df-contrib-nodes --features recordset-kql-processor --lib recordset_kql_processor::otlp_bridge::serializer
+        working-directory: ./rust/otap-dataflow
+
+      - name: Miri telemetry unsafe optimization tests
+        run: cargo +nightly miri test -p otap-df-telemetry --features unsafe-optimizations --lib iterator
+        working-directory: ./rust/otap-dataflow
