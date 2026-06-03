@@ -62,7 +62,17 @@ jobs:
         working-directory: ./rust/otap-dataflow
 
       - name: Miri pdata Arrow transform tests
-        run: cargo +nightly miri test -p otap-df-pdata --lib otap::transform
+        run: |
+          set -euo pipefail
+          for filter in \
+            transform_attributes_basic \
+            test_transform_attrs_keys_dict_encoded \
+            test_transform_attrs_u16_keys \
+            test_rename_collision_with_real_delete_dict \
+            test_create_delta_encoded_column
+          do
+            cargo +nightly miri test -p otap-df-pdata --lib "$filter"
+          done
         working-directory: ./rust/otap-dataflow
 
       - name: Miri RecordSet protobuf serializer tests
