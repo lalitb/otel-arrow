@@ -76,7 +76,12 @@ jobs:
         working-directory: ./rust/otap-dataflow
 
       - name: Miri RecordSet protobuf serializer tests
-        run: cargo +nightly miri test -p otap-df-contrib-nodes --features recordset-kql-processor --lib recordset_kql_processor::otlp_bridge::serializer
+        run: |
+          set -euo pipefail
+          for filter in protobuf_reader protobuf_writer
+          do
+            cargo +nightly miri test -p otap-df-contrib-nodes --features recordset-kql-processor --lib "$filter"
+          done
         working-directory: ./rust/otap-dataflow
 
       - name: Miri telemetry unsafe optimization tests
