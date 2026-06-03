@@ -184,6 +184,20 @@ NUMA topology and placement should live in a sibling resource-placement module
 or a future `memory-placement.md` design. It is discussed later only because
 runtime budget metrics should carry real `numa_node_id` when available.
 
+```mermaid
+flowchart LR
+    Process["Phase 1 process limiter<br/>cgroup/RSS/jemalloc sampling"]
+    Budget["Phase 2 memory_budget<br/>runtime accounts, leases, tickets"]
+    Escrow["Cross-runtime escrow<br/>topics and shared boundaries"]
+    Placement["NUMA placement track<br/>topology and optional policy"]
+    Admission["Admission decision<br/>max pressure with source attribution"]
+
+    Process --> Admission
+    Budget --> Admission
+    Escrow --> Admission
+    Placement -. "metadata only" .-> Budget
+```
+
 ### Core Types
 
 ```rust
@@ -574,6 +588,25 @@ Escrow solves this:
 3. Consumer redeems the escrow into its local `LocalMemoryTicket`.
 4. If redemption fails in enforce mode, the queue applies its configured drop,
    retry, or backpressure behavior.
+
+```mermaid
+sequenceDiagram
+    participant P as Producer runtime
+    participant E as Topic/shared escrow
+    participant C as Consumer runtime
+
+    P->>P: owns LocalMemoryTicket
+    P->>E: try_into_escrow(ticket)
+    alt escrow accepts
+        E->>E: owns EscrowTicket
+        E->>C: deliver escrowed message
+        C->>E: redeem
+        C->>C: owns LocalMemoryTicket
+    else escrow full
+        E-->>P: return original ticket
+        P->>P: drop, retry, or backpressure
+    end
+```
 
 Escrow accounts are not generation-scoped. On `try_into_escrow`, ownership
 leaves the producer runtime generation immediately and moves to the escrow
