@@ -9,6 +9,12 @@ process limiter as the outer safety net.
 This is a design document. It intentionally does not describe a patch to the
 current implementation.
 
+In short:
+
+- Phase 1 already provides a process-wide memory pressure guardrail.
+- Phase 2's main feature is per-runtime memory budgeting across cores.
+- NUMA-aware allocation is a related placement option, not the budget itself.
+
 ## Goals
 
 Phase 2 should provide:
