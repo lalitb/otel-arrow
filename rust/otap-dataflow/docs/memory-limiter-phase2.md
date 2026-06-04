@@ -151,13 +151,13 @@ target is:
 - no budget acquisition for release, drop, drain, or control-plane cleanup
 
 Phase 2 memory budgeting must be a hot-path non-regression. On the local
-retained-item path below the lease boundary, charge, refund, admission, and
-local ticket drop must not acquire locks, read shared configuration, publish
-metric snapshots, or touch shared atomics. Values needed on that path should be
-copied into the runtime-local account or cached as runtime-local state. Shared
-coordination is allowed only at coarse lease refill/return, existing
-cross-runtime boundaries such as topics and shared queues, metric tick
-publication, or pressure-level transitions.
+retained-item path below the lease boundary, charge, refund, local
+runtime-budget admission, and local ticket drop must not acquire locks, read
+shared configuration, publish metric snapshots, or touch shared atomics. Values
+needed on that path should be copied into the runtime-local account or cached as
+runtime-local state. Shared coordination is allowed only at coarse lease
+refill/return, existing cross-runtime boundaries such as topics and shared
+queues, metric tick publication, or pressure-level transitions.
 
 Runtime metric snapshots are not part of the per-item charge path. Local
 `Cell` state should be published to cross-thread-readable atomics only at the
@@ -165,6 +165,9 @@ metrics interval, on pressure-level transition, or another explicitly batched
 checkpoint. Per-ticket diagnostics such as oldest-ticket age and outstanding
 ticket counts must remain sampled, debug-only, or observe-only unless they can
 be maintained without adding per-item shared-memory traffic.
+Transition-driven publication must be de-duplicated and should use hysteresis or
+debounce where needed so a runtime near a threshold does not publish shared
+state on every retained item.
 
 ### Never Block Reclaim or Release
 
@@ -430,8 +433,8 @@ Runtime budget pressure has different meaning from process pressure:
 <!-- markdownlint-disable MD013 -->
 | Level | Meaning | Default behavior |
 | --- | --- | --- |
-| `Normal` | Charged bytes are within local budget. | Admit normally. |
-| `Soft` | Runtime is above soft budget or consuming borrowed lease. | Continue, emit metrics/logs. |
+| `Normal` | Charged bytes are within local floor plus borrowed leases. | Admit normally. |
+| `Soft` | Runtime is above local floor plus borrowed leases and consuming overshoot. | Continue, emit metrics/logs. |
 | `Hard` | Runtime exceeded hard budget and cannot borrow. | Shed new local ingress in enforce mode. |
 <!-- markdownlint-enable MD013 -->
 
@@ -815,10 +818,12 @@ Balanced queues and broadcast rings release escrow differently:
 
 - balanced delivery redeems on delivery, then commits or aborts exactly one
   item
-- broadcast ring occupancy owns escrow until eviction, disconnect, or final
-  subscriber release according to the topic policy
+- broadcast ring occupancy owns escrow until eviction, disconnect, topic close,
+  or final broker-slot drain according to the topic policy
 - lag/drop-oldest releases the evicted ring slot's escrow and records the
   configured lag outcome
+
+Per-subscriber release requires future subscriber-cursor ownership.
 
 ### Failed-Send Lifecycle
 
