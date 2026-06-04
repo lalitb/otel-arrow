@@ -150,6 +150,22 @@ target is:
 - at most one global coordination event per `lease_step_bytes`
 - no budget acquisition for release, drop, drain, or control-plane cleanup
 
+Phase 2 memory budgeting must be a hot-path non-regression. On the local
+retained-item path below the lease boundary, charge, refund, admission, and
+local ticket drop must not acquire locks, read shared configuration, publish
+metric snapshots, or touch shared atomics. Values needed on that path should be
+copied into the runtime-local account or cached as runtime-local state. Shared
+coordination is allowed only at coarse lease refill/return, existing
+cross-runtime boundaries such as topics and shared queues, metric tick
+publication, or pressure-level transitions.
+
+Runtime metric snapshots are not part of the per-item charge path. Local
+`Cell` state should be published to cross-thread-readable atomics only at the
+metrics interval, on pressure-level transition, or another explicitly batched
+checkpoint. Per-ticket diagnostics such as oldest-ticket age and outstanding
+ticket counts must remain sampled, debug-only, or observe-only unless they can
+be maintained without adding per-item shared-memory traffic.
+
 ### Never Block Reclaim or Release
 
 Memory pressure handling must not deadlock. Releasing, dropping, draining,
@@ -488,6 +504,11 @@ pub trait ChargedSize {
     fn charged_size_bytes(&self) -> u64;
 }
 ```
+
+`ChargedSize` implementations used on hot paths must be O(1), allocation-free,
+and lock-free. If exact retained size requires traversal, parsing, or
+aggregation, the component should compute or cache that size when the retained
+envelope or buffer is created and charge from the cached value.
 
 Allowed charge sources:
 
@@ -884,6 +905,11 @@ Escrow pressure is most precise at publish time. Receiver admission should use
 to, that receiver/runtime. It should not shed unrelated ingress because some
 other process-wide topic is full.
 
+Admission must not poll every downstream escrow's shared counters on the
+per-item path. Escrow pressure used by admission should be delivered through a
+coarse change notification, watch channel, or equivalent mechanism and cached
+in runtime-local state, mirroring Phase 1 process-pressure caching.
+
 Admission should have up to three checkpoints:
 
 1. **Pre-decode:** reject immediately if effective pressure is `Hard`.
@@ -907,6 +933,10 @@ NUMA locality is still separate from memory isolation:
 - Memory budget answers how many logical retained bytes a runtime may own.
 
 Phase 2 should treat NUMA as placement metadata and optional policy.
+Memory budgeting is part of Phase 2 and must not introduce new NUMA regressions
+on the local runtime path. It should preserve runtime-local first-touch
+behavior for local budget state and confine shared-memory traffic to coarse
+lease, metric, or explicit shared-boundary operations.
 
 NUMA placement is an orthogonal resource-placement track. The memory-budget
 design does not depend on it. If this section grows beyond topology metadata
@@ -992,6 +1022,28 @@ policy is applied keep the controller or creator thread's placement behavior.
 That is acceptable for shared control-plane state, telemetry registry state,
 and other process-level objects. The engine should not promise NUMA locality for
 objects constructed before pipeline-thread startup.
+
+### NUMA Locality of Budget State
+
+Per-runtime budget state should be constructed after CPU pinning and memory
+placement are applied on the pipeline runtime thread. This includes
+`RuntimeMemoryAccount`, runtime-local cached pressure state, and any
+per-runtime snapshot backing storage that the runtime writes frequently.
+Controller-created or process-global budget state must not be written on every
+local charge, refund, admission, or ticket-drop path.
+
+Some memory-budget structures are intentionally shared. The global lease pool
+is process-wide and may require a cross-NUMA atomic when a runtime borrows or
+returns a lease; `lease_step_bytes` and lazy return keep that cost coarse.
+Escrow is a shared-boundary cost and may cross NUMA nodes when producers and
+consumers are placed on different nodes. These costs must stay at lease or
+boundary granularity and must not be introduced into purely local channels or
+processor inner loops.
+
+Strict NUMA memory isolation is out of scope for Phase 2. Eliminating
+cross-NUMA access would require a separate architecture, such as per-NUMA
+engine shards or NUMA-local topic brokers with explicit cross-node bridge,
+copy, or re-home boundaries.
 
 ### Allocator Interaction
 
