@@ -441,6 +441,16 @@ Runtime budget pressure has different meaning from process pressure:
 Process `Hard` still overrides runtime state because it protects the whole
 process or container.
 
+The level bands classify the current `charged_bytes` position on the runtime's
+logical budget axis:
+
+```mermaid
+flowchart LR
+    A["0 .. floor_bytes<br/>Normal"] --> B["floor + borrowed leases<br/>Normal"]
+    B --> C["+ overshoot up to max_overshoot_per_runtime<br/>Soft"]
+    C --> D["beyond floor + leases + overshoot<br/>Hard"]
+```
+
 ### Budget Arithmetic
 
 Floors are guaranteed. Overshoot is best-effort.
@@ -493,6 +503,22 @@ Invariant: anything retained across an await, queue, topic, retry, durable
 buffer, delayed work, stream state, or component-state boundary must have
 exactly one logical owner. Pure stack-local scratch that is released within one
 poll turn is not charged.
+
+The ticket lifecycle and its single-owner transitions are:
+
+```mermaid
+stateDiagram-v2
+    [*] --> LocalProducer: charge()
+    LocalProducer --> LocalProducer: reconcile / grow
+    LocalProducer --> [*]: drop, refund to runtime account
+    LocalProducer --> Escrow: try_into_escrow (accepted)
+    LocalProducer --> LocalProducer: try_into_escrow (rejected, ticket returned)
+    Escrow --> LocalConsumer: redeem, consumer charge
+    LocalConsumer --> [*]: drop, refund to consumer account
+    Escrow --> [*]: explicit release (abort / evict / drop-oldest)
+    Escrow --> Graveyard: drop while unresolved
+    Graveyard --> [*]: leak detector resolves (future)
+```
 
 ### Charge Sizing Model
 
