@@ -953,6 +953,39 @@ Validation:
 The policy should be ignored by `ResolvedPolicies::eq_ignoring_resources`, just
 like other resource placement and scaling controls.
 
+### Pipeline Group and Topic Scope
+
+The first `memory_budget` configuration shape is intentionally top-level only.
+Pipeline-group and pipeline-level `policies.resources.memory_budget` overrides
+must be rejected until ownership metadata and escrow accounting are proven.
+
+Pipeline groups are useful attribution and policy domains, but they are not the
+first ownership boundary for retained bytes. A group may run on multiple runtime
+instances, publish to topics consumed by other groups, or share process-global
+broker state. Enforcing a group budget before local tickets and escrow tickets
+own those bytes would risk double-counting, missed releases, or ambiguous
+admission decisions.
+
+Future group budgets should be layered on top of the runtime and escrow
+ownership model instead of becoming a separate allocator:
+
+- local tickets and escrow tickets carry `pipeline_group_id` and `pipeline_id`
+  attribution when that identity is known
+- runtime snapshots and escrow snapshots aggregate charged bytes by group and
+  pipeline for metrics
+- group quota enforcement uses those aggregates only after local, shared-channel,
+  and topic ownership paths are complete
+- group pressure can become an additional admission-decision source, alongside
+  process, runtime, and escrow pressure
+
+Topics remain escrow boundaries in the current broker design. The current
+process-global topic broker must not carry `LocalMemoryTicket`; topic publish,
+balanced delivery, broadcast ring occupancy, eviction, lag/drop-oldest,
+disconnect, and final release paths must use escrow ownership or remain
+uncharged observe-only until the escrow path is complete. A runtime-local topic
+backend could carry local tickets later, but that requires a distinct backend
+with explicit single-runtime ownership.
+
 ## Metrics
 
 Add runtime/generation-scoped metrics:
