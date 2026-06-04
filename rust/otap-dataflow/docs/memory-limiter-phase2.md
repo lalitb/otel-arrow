@@ -264,6 +264,52 @@ flowchart LR
     Placement -. "metadata only" .-> Budget
 ```
 
+At runtime, the local-vs-shared ownership shape is:
+
+```mermaid
+flowchart TB
+    Process["df-engine process"]
+    Pool["GlobalLeasePool<br/>process spare capacity"]
+    Escrow["Cross-runtime escrow<br/>topics / shared queues"]
+    Metrics["Engine metrics<br/>periodic snapshot reader"]
+
+    Process --> R1
+    Process --> R2
+    Process --> RN
+
+    subgraph R1["Pinned runtime thread core 0"]
+        A1["RuntimeMemoryAccount<br/>Rc + Cell, !Send"]
+        T1["Local tickets<br/>retained local work"]
+    end
+
+    subgraph R2["Pinned runtime thread core 1"]
+        A2["RuntimeMemoryAccount<br/>Rc + Cell, !Send"]
+        T2["Local tickets<br/>retained local work"]
+    end
+
+    subgraph RN["Pinned runtime thread core N"]
+        AN["RuntimeMemoryAccount<br/>Rc + Cell, !Send"]
+        TN["Local tickets<br/>retained local work"]
+    end
+
+    A1 -. "coarse lease borrow / return" .-> Pool
+    A2 -. "coarse lease borrow / return" .-> Pool
+    AN -. "coarse lease borrow / return" .-> Pool
+
+    T1 -->|"try_into_escrow"| Escrow
+    Escrow -->|"redeem"| T2
+    T2 -->|"try_into_escrow"| Escrow
+    Escrow -->|"redeem"| TN
+
+    A1 -. "metric flush" .-> Metrics
+    A2 -. "metric flush" .-> Metrics
+    AN -. "metric flush" .-> Metrics
+```
+
+Solid arrows are ownership transfer at retention boundaries. Dotted arrows are
+coarse shared coordination or metric publication. The per-item local charge path
+stays inside one pinned runtime thread.
+
 ### Core Types
 
 ```rust
