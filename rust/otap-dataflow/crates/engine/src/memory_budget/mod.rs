@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 /// Immutable attribution carried by budget owners when the identity is known.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -208,13 +208,16 @@ pub struct MemoryBudgetSnapshot {
     pub escrow_ticket_count: u64,
     /// Escrow bytes currently owning logical retained bytes.
     pub escrow_charged_bytes: u64,
+    /// Spare bytes currently available to lease from the global pool.
+    pub spare_available_bytes: u64,
 }
 
 #[derive(Debug, Default)]
 struct MemoryBudgetStateInner {
     config: Mutex<Option<RuntimeMemoryBudgetConfig>>,
     pool: GlobalLeasePool,
-    snapshots: Mutex<Vec<Arc<RuntimeMemorySnapshot>>>,
+    snapshots: Mutex<Vec<Weak<RuntimeMemorySnapshot>>>,
+    // Phase 2e leak detection will need entry identity, scope, and timestamps.
     abandoned_escrow: Mutex<VecDeque<u64>>,
     abandoned_escrow_count: AtomicU64,
     abandoned_escrow_bytes: AtomicU64,
@@ -263,29 +266,20 @@ impl MemoryBudgetState {
 
     /// Registers one deployed runtime snapshot.
     #[must_use]
-    pub fn register_runtime_snapshot(&self) -> RuntimeMemorySnapshotHandle {
+    pub fn register_runtime_snapshot(&self, scope: BudgetScopeId) -> RuntimeMemorySnapshotHandle {
         let snapshot = Arc::new(RuntimeMemorySnapshot::default());
-        if let Some(config) = self.config() {
-            snapshot.publish(
-                0,
-                0,
-                0,
-                0,
-                if config.mode == BudgetMode::ObserveOnly {
-                    BudgetLevel::Normal
-                } else {
-                    BudgetLevel::Hard
-                },
-            );
+        if self.config().is_some() {
+            snapshot.publish(0, 0, 0, 0, BudgetLevel::Normal);
         }
         self.inner
             .snapshots
             .lock()
             .expect("memory budget snapshots poisoned")
-            .push(snapshot.clone());
+            .push(Arc::downgrade(&snapshot));
         RuntimeMemorySnapshotHandle {
             snapshot,
             state: self.clone(),
+            scope,
         }
     }
 
@@ -302,20 +296,23 @@ impl MemoryBudgetState {
     /// Returns an aggregated snapshot across all registered runtimes.
     #[must_use]
     pub fn snapshot(&self) -> MemoryBudgetSnapshot {
-        let snapshots = self
+        let mut snapshots = self
             .inner
             .snapshots
             .lock()
             .expect("memory budget snapshots poisoned");
+        let live_snapshots: Vec<_> = snapshots.iter().filter_map(Weak::upgrade).collect();
+        snapshots.retain(|snapshot| snapshot.strong_count() > 0);
         let mut snapshot = MemoryBudgetSnapshot {
-            runtime_count: snapshots.len() as u64,
+            runtime_count: live_snapshots.len() as u64,
             abandoned_escrow_count: self.inner.abandoned_escrow_count.load(Ordering::Relaxed),
             abandoned_escrow_bytes: self.inner.abandoned_escrow_bytes.load(Ordering::Relaxed),
             escrow_ticket_count: self.inner.escrow_ticket_count.load(Ordering::Relaxed),
             escrow_charged_bytes: self.inner.escrow_charged_bytes.load(Ordering::Relaxed),
+            spare_available_bytes: self.inner.pool.available_bytes(),
             ..MemoryBudgetSnapshot::default()
         };
-        for runtime in snapshots.iter() {
+        for runtime in live_snapshots.iter() {
             snapshot.borrowed_bytes = snapshot
                 .borrowed_bytes
                 .saturating_add(runtime.borrowed_bytes());
@@ -353,22 +350,39 @@ impl MemoryBudgetState {
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
-    fn escrow_accepts(&self, bytes: u64) -> bool {
-        bytes
-            <= self
-                .config()
-                .map_or(0, |config| config.topic_default_limit_bytes)
-    }
-
-    fn charge_escrow(&self, bytes: u64) {
+    fn try_charge_escrow(&self, bytes: u64) -> bool {
+        let Some(config) = self.config() else {
+            return false;
+        };
+        if config.mode == BudgetMode::Enforce {
+            let limit = config.topic_default_limit_bytes;
+            let mut current = self.inner.escrow_charged_bytes.load(Ordering::Relaxed);
+            loop {
+                let next = current.saturating_add(bytes);
+                if next > limit {
+                    return false;
+                }
+                match self.inner.escrow_charged_bytes.compare_exchange_weak(
+                    current,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => current = observed,
+                }
+            }
+        } else {
+            let _ = self
+                .inner
+                .escrow_charged_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
         let _ = self
             .inner
             .escrow_ticket_count
             .fetch_add(1, Ordering::Relaxed);
-        let _ = self
-            .inner
-            .escrow_charged_bytes
-            .fetch_add(bytes, Ordering::Relaxed);
+        true
     }
 
     fn release_escrow(&self, bytes: u64) {
@@ -392,6 +406,7 @@ impl MemoryBudgetState {
 pub struct RuntimeMemorySnapshotHandle {
     snapshot: Arc<RuntimeMemorySnapshot>,
     state: MemoryBudgetState,
+    scope: BudgetScopeId,
 }
 
 impl RuntimeMemorySnapshotHandle {
@@ -403,9 +418,10 @@ impl RuntimeMemorySnapshotHandle {
             config.sizing.floor_per_runtime_bytes,
             config.sizing.lease_step_bytes,
             config.sizing.max_overshoot_per_runtime_bytes,
+            config.mode,
             self.state.lease_authority(),
             self.snapshot.clone(),
-            BudgetScopeId::default(),
+            self.scope.clone(),
         ))
     }
 }
@@ -488,6 +504,7 @@ impl LeaseAuthority for GlobalLeasePool {
 #[derive(Debug)]
 pub struct RuntimeMemoryAccount {
     scope: BudgetScopeId,
+    mode: BudgetMode,
     floor_bytes: u64,
     lease: LocalMemoryLease,
     charged_bytes: Cell<u64>,
@@ -504,12 +521,14 @@ impl RuntimeMemoryAccount {
         floor_bytes: u64,
         lease_step_bytes: u64,
         max_overshoot_bytes: u64,
+        mode: BudgetMode,
         lease_authority: Arc<dyn LeaseAuthority>,
         snapshot: Arc<RuntimeMemorySnapshot>,
         scope: BudgetScopeId,
     ) -> Self {
         let account = Self {
             scope,
+            mode,
             floor_bytes,
             lease: LocalMemoryLease::new(lease_step_bytes, max_overshoot_bytes, lease_authority),
             charged_bytes: Cell::new(0),
@@ -540,6 +559,9 @@ impl RuntimeMemoryAccount {
             self.publish();
             return true;
         }
+        if self.mode == BudgetMode::ObserveOnly {
+            return true;
+        }
         next <= self.hard_limit()
     }
 
@@ -547,8 +569,15 @@ impl RuntimeMemoryAccount {
     #[must_use]
     pub fn charge<'a>(&'a self, size: impl ChargedSize) -> Option<LocalMemoryTicket<'a>> {
         let bytes = size.charged_size();
-        if !self.try_reserve_extra(bytes) {
-            return None;
+        match self.mode {
+            BudgetMode::ObserveOnly => {
+                let _ = self.try_reserve_extra(bytes);
+            }
+            BudgetMode::Enforce => {
+                if !self.try_reserve_extra(bytes) {
+                    return None;
+                }
+            }
         }
         self.charged_bytes
             .set(self.charged_bytes.get().saturating_add(bytes));
@@ -634,7 +663,7 @@ impl LocalMemoryLease {
             borrowed_bytes: Cell::new(0),
             lease_step_bytes,
             max_overshoot_bytes,
-            return_watermark_bytes: lease_step_bytes.saturating_mul(2),
+            return_watermark_bytes: lease_step_bytes / 2,
             lease_authority,
         }
     }
@@ -707,12 +736,11 @@ impl<'a> LocalMemoryTicket<'a> {
         state: &MemoryBudgetState,
     ) -> Result<EscrowTicket, LocalMemoryTicket<'a>> {
         let bytes = self.bytes;
-        if !state.escrow_accepts(bytes) {
+        if !state.try_charge_escrow(bytes) {
             return Err(self);
         }
         self.active = false;
         self.account.refund(bytes);
-        state.charge_escrow(bytes);
         Ok(EscrowTicket {
             bytes,
             state: state.clone(),
@@ -814,20 +842,31 @@ pub enum AdmissionDecision {
 mod tests {
     use super::*;
 
-    fn account(floor: u64, step: u64, overshoot: u64, spare: u64) -> RuntimeMemoryAccount {
+    fn account_with_mode(
+        mode: BudgetMode,
+        floor: u64,
+        step: u64,
+        overshoot: u64,
+        spare: u64,
+    ) -> RuntimeMemoryAccount {
         RuntimeMemoryAccount::new(
             floor,
             step,
             overshoot,
+            mode,
             Arc::new(GlobalLeasePool::new(spare)),
             Arc::new(RuntimeMemorySnapshot::default()),
             BudgetScopeId::default(),
         )
     }
 
+    fn account(floor: u64, step: u64, overshoot: u64, spare: u64) -> RuntimeMemoryAccount {
+        account_with_mode(BudgetMode::ObserveOnly, floor, step, overshoot, spare)
+    }
+
     #[test]
     fn lease_arithmetic_borrows_full_steps_and_rejects_partial_borrow() {
-        let acct = account(100, 10, 20, 15);
+        let acct = account_with_mode(BudgetMode::Enforce, 100, 10, 20, 15);
 
         assert!(acct.try_reserve_extra(105));
         assert_eq!(acct.lease.borrowed_bytes(), 10);
@@ -860,6 +899,39 @@ mod tests {
         let _ticket = acct.charge(115_u64).expect("overshoot is allowed");
         assert_eq!(acct.snapshot.overshoot_bytes(), 15);
         assert_eq!(acct.snapshot.level(), BudgetLevel::Soft.as_u64());
+    }
+
+    #[test]
+    fn dropped_runtime_snapshots_are_pruned_from_aggregate() {
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 100,
+                    lease_step_bytes: 10,
+                    max_overshoot_per_runtime_bytes: 20,
+                    overshoot_debt_limit_bytes: 10,
+                },
+                topic_default_limit_bytes: 100,
+                runtime_count: 1,
+            },
+            None,
+        );
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let account = handle.local_account().expect("budget should be configured");
+        let ticket = account.charge(40_u64).expect("charge should fit");
+
+        assert_eq!(state.snapshot().runtime_count, 1);
+        drop(ticket);
+        drop(account);
+        drop(handle);
+
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.runtime_count, 0);
+        assert_eq!(snapshot.charged_bytes, 0);
     }
 
     #[test]
@@ -902,7 +974,7 @@ mod tests {
         let state = MemoryBudgetState::default();
         state.configure(
             RuntimeMemoryBudgetConfig {
-                mode: BudgetMode::ObserveOnly,
+                mode: BudgetMode::Enforce,
                 retry_after_secs: 1,
                 sizing: MemoryBudgetSizing {
                     reserve_bytes: 0,
@@ -924,6 +996,73 @@ mod tests {
 
         assert_eq!(ticket.bytes(), 50);
         assert_eq!(acct.snapshot.charged_bytes(), 50);
+    }
+
+    #[test]
+    fn observe_only_escrow_records_above_configured_limit() {
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 100,
+                    lease_step_bytes: 10,
+                    max_overshoot_per_runtime_bytes: 20,
+                    overshoot_debt_limit_bytes: 10,
+                },
+                topic_default_limit_bytes: 10,
+                runtime_count: 1,
+            },
+            None,
+        );
+        let acct = account(100, 10, 20, 100);
+        let ticket = acct.charge(50_u64).expect("observe-only charge should fit");
+        let escrow = ticket
+            .try_into_escrow(&state)
+            .expect("observe-only escrow should record above limit");
+
+        assert_eq!(escrow.bytes(), 50);
+        assert_eq!(state.snapshot().escrow_ticket_count, 1);
+        assert_eq!(state.snapshot().escrow_charged_bytes, 50);
+    }
+
+    #[test]
+    fn enforce_escrow_limit_is_aggregate() {
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::Enforce,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 100,
+                    lease_step_bytes: 10,
+                    max_overshoot_per_runtime_bytes: 20,
+                    overshoot_debt_limit_bytes: 10,
+                },
+                topic_default_limit_bytes: 60,
+                runtime_count: 1,
+            },
+            None,
+        );
+        let acct = account(100, 10, 20, 100);
+        let first = acct
+            .charge(40_u64)
+            .expect("first local charge should fit")
+            .try_into_escrow(&state)
+            .expect("first escrow should fit aggregate limit");
+        let second = acct
+            .charge(30_u64)
+            .expect("second local charge should fit")
+            .try_into_escrow(&state)
+            .expect_err("second escrow should exceed aggregate limit");
+
+        assert_eq!(first.bytes(), 40);
+        assert_eq!(second.bytes(), 30);
+        assert_eq!(state.snapshot().escrow_ticket_count, 1);
+        assert_eq!(state.snapshot().escrow_charged_bytes, 40);
     }
 
     #[test]
@@ -961,10 +1100,14 @@ mod tests {
     }
 
     #[test]
-    fn normal_reservation_rejects_unbounded_first_item() {
+    fn observe_only_charge_records_above_hard_limit() {
         let acct = account(100, 10, 20, 0);
-        assert!(acct.try_reserve_extra(120));
-        assert_eq!(acct.level(), BudgetLevel::Normal);
-        assert!(!acct.try_reserve_extra(121));
+        let ticket = acct
+            .charge(121_u64)
+            .expect("observe-only charge should record above hard");
+
+        assert_eq!(ticket.bytes(), 121);
+        assert_eq!(acct.snapshot.charged_bytes(), 121);
+        assert_eq!(acct.level(), BudgetLevel::Hard);
     }
 }

@@ -124,6 +124,10 @@ pub struct EngineMetrics {
     /// Escrow bytes currently owning logical retained bytes.
     #[metric(unit = "{By}")]
     pub runtime_memory_budget_escrow_charged_bytes: Gauge<u64>,
+
+    /// Spare bytes available to lease from the global memory-budget pool.
+    #[metric(unit = "{By}")]
+    pub runtime_memory_budget_spare_available_bytes: Gauge<u64>,
 }
 
 /// Monitors and reports engine-wide metrics.
@@ -242,6 +246,9 @@ impl EngineMetricsMonitor {
         self.metrics
             .runtime_memory_budget_escrow_charged_bytes
             .set(memory_budget.escrow_charged_bytes);
+        self.metrics
+            .runtime_memory_budget_spare_available_bytes
+            .set(memory_budget.spare_available_bytes);
         self.wall_start = now_wall;
         self.cpu_start = now_cpu;
     }
@@ -400,7 +407,9 @@ mod tests {
             },
             None,
         );
-        let handle = controller.memory_budget_state().register_runtime_snapshot();
+        let handle = controller
+            .memory_budget_state()
+            .register_runtime_snapshot(crate::memory_budget::BudgetScopeId::default());
         let account = handle.local_account().expect("budget should be configured");
         let _ticket = account
             .charge(115_u64)

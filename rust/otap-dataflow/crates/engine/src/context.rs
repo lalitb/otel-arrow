@@ -10,7 +10,7 @@ use crate::attributes::{
     NodeWithTopicAttributeSet, PipelineAttributeSet, config_map_to_telemetry,
 };
 use crate::entity_context::{current_node_telemetry_handle, node_entity_key};
-use crate::memory_budget::{MemoryBudgetState, RuntimeMemorySnapshotHandle};
+use crate::memory_budget::{BudgetScopeId, MemoryBudgetState, RuntimeMemorySnapshotHandle};
 use crate::memory_limiter::MemoryPressureState;
 use crate::node::NodeId as EngineNodeId;
 use otap_df_config::node::NodeKind;
@@ -312,9 +312,19 @@ impl PipelineContext {
         deployment_generation: u64,
     ) -> Self {
         let memory_budget_state = parent_ctx.memory_budget_state();
-        let memory_budget_snapshot = memory_budget_state
-            .is_enabled()
-            .then(|| memory_budget_state.register_runtime_snapshot());
+        let memory_budget_snapshot = memory_budget_state.is_enabled().then(|| {
+            memory_budget_state.register_runtime_snapshot(BudgetScopeId {
+                pipeline_group_id: Some(
+                    pipeline_context_params
+                        .pipeline_group_id
+                        .as_ref()
+                        .to_owned(),
+                ),
+                pipeline_id: Some(pipeline_context_params.pipeline_id.as_ref().to_owned()),
+                runtime_generation: Some(deployment_generation),
+                topic_or_boundary: None,
+            })
+        });
         Self {
             controller_context: parent_ctx,
             pipeline_context_params,
