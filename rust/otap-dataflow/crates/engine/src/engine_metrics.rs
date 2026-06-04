@@ -116,6 +116,14 @@ pub struct EngineMetrics {
     /// Abandoned escrow bytes retained for leak detection.
     #[metric(unit = "{By}")]
     pub runtime_memory_budget_abandoned_escrow_bytes: Gauge<u64>,
+
+    /// Escrow tickets currently owning logical retained bytes.
+    #[metric(unit = "{ticket}")]
+    pub runtime_memory_budget_escrow_ticket_count: Gauge<u64>,
+
+    /// Escrow bytes currently owning logical retained bytes.
+    #[metric(unit = "{By}")]
+    pub runtime_memory_budget_escrow_charged_bytes: Gauge<u64>,
 }
 
 /// Monitors and reports engine-wide metrics.
@@ -228,6 +236,12 @@ impl EngineMetricsMonitor {
         self.metrics
             .runtime_memory_budget_abandoned_escrow_bytes
             .set(memory_budget.abandoned_escrow_bytes);
+        self.metrics
+            .runtime_memory_budget_escrow_ticket_count
+            .set(memory_budget.escrow_ticket_count);
+        self.metrics
+            .runtime_memory_budget_escrow_charged_bytes
+            .set(memory_budget.escrow_charged_bytes);
         self.wall_start = now_wall;
         self.cpu_start = now_cpu;
     }
