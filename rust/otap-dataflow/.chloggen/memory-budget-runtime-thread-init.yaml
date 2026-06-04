@@ -1,0 +1,4 @@
+change_type: enhancement
+component: engine
+note: "Initialize observe-only runtime memory-budget account on the pinned pipeline runtime thread so the snapshot's backing pages are first-touched on that thread's NUMA node. Move snapshot publication off the per-item charge hot path: charge/refund/reconcile only mutate runtime-local Cell state and publish only on pressure-level transitions or via explicit flush_snapshot()."
+issues: []

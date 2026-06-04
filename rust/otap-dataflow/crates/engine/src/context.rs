@@ -311,20 +311,16 @@ impl PipelineContext {
         pipeline_context_params: PipelineContextParams,
         deployment_generation: u64,
     ) -> Self {
-        let memory_budget_state = parent_ctx.memory_budget_state();
-        let memory_budget_snapshot = memory_budget_state.is_enabled().then(|| {
-            memory_budget_state.register_runtime_snapshot(BudgetScopeId {
-                pipeline_group_id: Some(
-                    pipeline_context_params
-                        .pipeline_group_id
-                        .as_ref()
-                        .to_owned(),
-                ),
-                pipeline_id: Some(pipeline_context_params.pipeline_id.as_ref().to_owned()),
-                runtime_generation: Some(deployment_generation),
-                topic_or_boundary: None,
-            })
-        });
+        // NOTE: The runtime memory-budget snapshot is intentionally NOT
+        // registered here. `PipelineContext::new_with_generation` runs on the
+        // controller thread before the pipeline thread is spawned. Registering
+        // the snapshot here would first-touch its backing pages on the
+        // controller's NUMA node, defeating the per-runtime NUMA-local
+        // placement that Phase 2 depends on.
+        //
+        // The pipeline runtime thread must call
+        // `initialize_memory_budget_runtime` after `core_affinity::set_for_current`
+        // so the snapshot's allocation is first-touched on this runtime's core.
         Self {
             controller_context: parent_ctx,
             pipeline_context_params,
@@ -337,7 +333,7 @@ impl PipelineContext {
             internal_telemetry: None,
             node_names: Arc::new(HashMap::new()),
             topic_set: None,
-            memory_budget_snapshot,
+            memory_budget_snapshot: None,
         }
     }
 
@@ -401,6 +397,41 @@ impl PipelineContext {
     #[must_use]
     pub fn memory_budget_snapshot(&self) -> Option<RuntimeMemorySnapshotHandle> {
         self.memory_budget_snapshot.clone()
+    }
+
+    /// Initializes the runtime memory-budget snapshot on the current thread.
+    ///
+    /// Must be called from the pinned pipeline runtime thread (after
+    /// `core_affinity::set_for_current`) and before any pipeline build or
+    /// node task is spawned. This ensures the snapshot's backing pages are
+    /// first-touched on the runtime's NUMA node, not on the controller
+    /// thread that constructed the [`PipelineContext`].
+    ///
+    /// Returns `true` when a snapshot was registered for the first time,
+    /// `false` if the runtime memory budget is disabled or initialization
+    /// already ran on this context (idempotent).
+    pub fn initialize_memory_budget_runtime(&mut self) -> bool {
+        if self.memory_budget_snapshot.is_some() {
+            return false;
+        }
+        let state = self.controller_context.memory_budget_state();
+        if !state.is_enabled() {
+            return false;
+        }
+        let scope = BudgetScopeId {
+            pipeline_group_id: Some(
+                self.pipeline_context_params
+                    .pipeline_group_id
+                    .as_ref()
+                    .to_owned(),
+            ),
+            pipeline_id: Some(self.pipeline_context_params.pipeline_id.as_ref().to_owned()),
+            core_id: Some(self.pipeline_context_params.core_id),
+            runtime_generation: Some(self.deployment_generation),
+            topic_or_boundary: None,
+        };
+        self.memory_budget_snapshot = Some(state.register_runtime_snapshot(scope));
+        true
     }
 
     /// Sets the shared node-name-to-index mapping for this pipeline context.
@@ -801,6 +832,7 @@ impl ExtensionContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory_budget::{BudgetMode, MemoryBudgetSizing, RuntimeMemoryBudgetConfig};
 
     #[test]
     fn resource_attributes_maps_semconv_keys() {
@@ -838,5 +870,107 @@ mod tests {
             ctx.resource_attributes(),
             vec![("service.instance.id".to_string(), "proc-123".to_string())]
         );
+    }
+
+    fn enable_observe_only_budget(controller: &ControllerContext) {
+        controller.configure_memory_budget(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 1_024,
+                    lease_step_bytes: 128,
+                    max_overshoot_per_runtime_bytes: 512,
+                    overshoot_debt_limit_bytes: 64,
+                },
+                topic_default_limit_bytes: 1_024,
+                runtime_count: 1,
+            },
+            None,
+        );
+    }
+
+    fn make_pipeline_context(controller: &ControllerContext) -> PipelineContext {
+        controller.pipeline_context_with_generation(
+            PipelineGroupId::from("group-x"),
+            PipelineId::from("pipeline-y"),
+            /* core_id */ 3,
+            /* num_cores */ 8,
+            /* thread_id */ 11,
+            /* deployment_generation */ 7,
+        )
+    }
+
+    #[test]
+    fn new_pipeline_context_does_not_register_snapshot_eagerly() {
+        let registry = TelemetryRegistryHandle::new();
+        let controller = ControllerContext::new(registry);
+        enable_observe_only_budget(&controller);
+
+        // Construction on the controller thread must not allocate the
+        // runtime snapshot. Initialization is deferred to the pipeline
+        // thread via `initialize_memory_budget_runtime`.
+        let ctx = make_pipeline_context(&controller);
+        assert!(ctx.memory_budget_snapshot().is_none());
+        assert_eq!(controller.memory_budget_state().snapshot().runtime_count, 0);
+    }
+
+    #[test]
+    fn initialize_memory_budget_runtime_no_op_when_disabled() {
+        let registry = TelemetryRegistryHandle::new();
+        let controller = ControllerContext::new(registry);
+        let mut ctx = make_pipeline_context(&controller);
+
+        assert!(!ctx.initialize_memory_budget_runtime());
+        assert!(ctx.memory_budget_snapshot().is_none());
+        assert_eq!(controller.memory_budget_state().snapshot().runtime_count, 0);
+    }
+
+    #[test]
+    fn initialize_memory_budget_runtime_populates_scope_from_context() {
+        let registry = TelemetryRegistryHandle::new();
+        let controller = ControllerContext::new(registry);
+        enable_observe_only_budget(&controller);
+        let mut ctx = make_pipeline_context(&controller);
+
+        assert!(ctx.initialize_memory_budget_runtime());
+        let handle = ctx
+            .memory_budget_snapshot()
+            .expect("budget should be initialized");
+        let scope = handle.scope();
+        assert_eq!(scope.pipeline_group_id.as_deref(), Some("group-x"));
+        assert_eq!(scope.pipeline_id.as_deref(), Some("pipeline-y"));
+        assert_eq!(scope.core_id, Some(3));
+        assert_eq!(scope.runtime_generation, Some(7));
+        assert!(scope.topic_or_boundary.is_none());
+        assert_eq!(controller.memory_budget_state().snapshot().runtime_count, 1);
+    }
+
+    #[test]
+    fn initialize_memory_budget_runtime_is_idempotent() {
+        let registry = TelemetryRegistryHandle::new();
+        let controller = ControllerContext::new(registry);
+        enable_observe_only_budget(&controller);
+        let mut ctx = make_pipeline_context(&controller);
+
+        assert!(ctx.initialize_memory_budget_runtime());
+        assert!(!ctx.initialize_memory_budget_runtime());
+        assert_eq!(controller.memory_budget_state().snapshot().runtime_count, 1);
+    }
+
+    #[test]
+    fn dropped_pipeline_context_prunes_runtime_snapshot() {
+        let registry = TelemetryRegistryHandle::new();
+        let controller = ControllerContext::new(registry);
+        enable_observe_only_budget(&controller);
+        {
+            let mut ctx = make_pipeline_context(&controller);
+            assert!(ctx.initialize_memory_budget_runtime());
+            assert_eq!(controller.memory_budget_state().snapshot().runtime_count, 1);
+        }
+        // The handle dropped with the context, so the next aggregate snapshot
+        // prunes the stale weak entry.
+        assert_eq!(controller.memory_budget_state().snapshot().runtime_count, 0);
     }
 }

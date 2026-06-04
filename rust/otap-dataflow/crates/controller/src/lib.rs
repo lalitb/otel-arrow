@@ -77,7 +77,9 @@ use otap_df_engine::entity_context::{
     node_entity_key, pipeline_entity_key, set_pipeline_entity_key,
 };
 use otap_df_engine::error::Error as EngineError;
-use otap_df_engine::memory_budget::RuntimeMemoryBudgetConfig;
+use otap_df_engine::memory_budget::{
+    RuntimeMemoryBudget, RuntimeMemoryBudgetConfig, set_current_runtime_memory_budget,
+};
 use otap_df_engine::memory_limiter::{
     EffectiveMemoryLimiter, MemoryLimiterTick, MemoryPressureBehaviorConfig, MemoryPressureChanged,
     MemoryPressureLevel,
@@ -2093,6 +2095,7 @@ impl<
                 message = "Failed to set core affinity for pipeline thread. Performance may be less predictable."
             );
         }
+        let mut pipeline_context = pipeline_context;
 
         // Run the pipeline with thread-local tracing subscriber active.
         tracing_setup.with_subscriber(|| {
@@ -2100,6 +2103,29 @@ impl<
             // so that all logs within this scope include pipeline context.
             let span = otel_info_span!("pipeline_thread", core.id = core_id.id);
             let _guard = span.enter();
+
+            // Initialize per-runtime memory budget state on this pinned
+            // pipeline thread (after `core_affinity::set_for_current`, before
+            // any node task is built). This first-touches the runtime's
+            // snapshot allocation on this thread's NUMA node rather than on
+            // the controller thread that constructed `pipeline_context`.
+            //
+            // The runtime memory account is `!Send`, so it must be created
+            // here too. Once created, it is wrapped in `Rc<RuntimeMemoryBudget>`
+            // and installed in the per-thread `current_runtime_memory_budget`
+            // slot so future local charge sites can reach the single
+            // per-runtime account without re-deriving it from the snapshot
+            // handle (which enforces single-take). The returned guard keeps
+            // the budget installed for the entire pipeline run and clears the
+            // slot on drop.
+            pipeline_context.initialize_memory_budget_runtime();
+            let runtime_memory_budget = pipeline_context
+                .memory_budget_snapshot()
+                .and_then(|handle| handle.local_account())
+                .map(RuntimeMemoryBudget::new)
+                .map(std::rc::Rc::new);
+            let _runtime_memory_budget_guard =
+                set_current_runtime_memory_budget(runtime_memory_budget);
 
             // The controller creates a pipeline instance into a dedicated thread. The corresponding
             // entity is registered here for proper context tracking and set into thread-local storage
