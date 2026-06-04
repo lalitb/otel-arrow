@@ -627,10 +627,10 @@ the producer charge before the consumer reserves a new charge creates an
 unowned interval. A design that keeps the producer charged forever misattributes
 consumer-retained work.
 
-Escrow solves this:
+Point-to-point escrow solves this for balanced topics and shared queues:
 
 1. Producer converts `LocalMemoryTicket` into `EscrowTicket` when publishing to
-   a cross-runtime topic or queue.
+   a balanced topic or shared queue.
 2. The escrow account owns the charge while the message is in transit.
 3. Consumer redeems the escrow into its local `LocalMemoryTicket`.
 4. If redemption fails in enforce mode, the queue applies its configured drop,
@@ -639,7 +639,7 @@ Escrow solves this:
 ```mermaid
 sequenceDiagram
     participant P as Producer runtime
-    participant E as Topic/shared escrow
+    participant E as Balanced/shared escrow
     participant C as Consumer runtime
 
     P->>P: owns LocalMemoryTicket
