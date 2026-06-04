@@ -88,6 +88,12 @@ impl TestMsg {
     }
 }
 
+impl crate::memory_budget::ChargedSize for TestMsg {
+    fn charged_size(&self) -> Option<u64> {
+        self.0.charged_size()
+    }
+}
+
 /// Set of counters for tracking the number of control messages processed.
 #[derive(Clone)]
 pub struct CtrlMsgCounters {

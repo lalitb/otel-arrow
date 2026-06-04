@@ -22,6 +22,9 @@ use otap_df_config::SignalType;
 use otap_df_config::{error::Error as ConfigError, node::NodeUserConfig};
 use otap_df_engine::MessageSourceLocalEffectHandlerExtension;
 use otap_df_engine::context::PipelineContext;
+use otap_df_engine::memory_budget::{
+    ChargedSize, LocalMemoryTicket, current_runtime_memory_budget,
+};
 use otap_df_engine::{
     ConsumerEffectHandlerExtension, Interests, ProcessorFactory, ProducerEffectHandlerExtension,
     config::ProcessorConfig,
@@ -36,6 +39,7 @@ use otap_df_telemetry::instrument::Counter;
 use otap_df_telemetry::metrics::MetricSet;
 use otap_df_telemetry_macros::metric_set;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -342,6 +346,7 @@ pub struct RetryProcessor {
 
     config: RetryConfig,
     metrics: MetricSet<RetryProcessorMetrics>,
+    retry_budget_tickets: VecDeque<(Instant, LocalMemoryTicket)>,
 }
 
 /// Factory function to create a SignalTypeRouter processor
@@ -447,7 +452,29 @@ impl RetryProcessor {
             delays,
             config,
             metrics,
+            retry_budget_tickets: VecDeque::new(),
         })
+    }
+
+    fn release_retry_budget_ticket(&mut self, when: Instant, data: &OtapPdata) {
+        let charged_size = data.charged_size();
+        // The local scheduler gives the delayed item back with the same
+        // deadline used in `requeue_later`. Match size as well so same-tick
+        // retries with different retained sizes refund the intended ticket.
+        let index = self
+            .retry_budget_tickets
+            .iter()
+            .position(|(ticket_when, ticket)| {
+                *ticket_when == when && ticket.bytes() == charged_size
+            })
+            .or_else(|| {
+                self.retry_budget_tickets
+                    .iter()
+                    .position(|(ticket_when, _)| *ticket_when == when)
+            });
+        if let Some(index) = index {
+            let _ = self.retry_budget_tickets.remove(index);
+        }
     }
 
     async fn handle_ack(
@@ -547,9 +574,33 @@ impl RetryProcessor {
 
         self.metrics.increment_retry_attempts(signal);
 
+        let budget_ticket = if let Some(budget) = current_runtime_memory_budget() {
+            match budget.charge(rereq.as_ref()) {
+                Some(ticket) => Some(ticket),
+                None => {
+                    // Observe-only budgets always return `Some`. This branch
+                    // activates only when `mode: enforce` is enabled in a
+                    // later memory-budget phase.
+                    effect_handler
+                        .notify_nack(NackMsg::new("cannot requeue: memory budget full", *rereq))
+                        .await?;
+                    self.metrics.add_consumed_failure(signal, num_items);
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
+
         // Requeue the data onto this node, we'll continue in the DelayedData branch next.
         match effect_handler.requeue_later(next_retry_time_i, rereq) {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                if let Some(ticket) = budget_ticket {
+                    self.retry_budget_tickets
+                        .push_back((next_retry_time_i, ticket));
+                }
+                Ok(())
+            }
             Err(refused) => {
                 effect_handler
                     .notify_nack(NackMsg::new("cannot requeue", refused))
@@ -563,7 +614,6 @@ impl RetryProcessor {
 
     async fn handle_delayed(
         &mut self,
-        _when: Instant,
         data: Box<OtapPdata>,
         effect_handler: &mut EffectHandler<OtapPdata>,
         num_items: u64,
@@ -628,10 +678,14 @@ impl Processor<OtapPdata> for RetryProcessor {
                 NodeControlMsg::Ack(ack) => self.handle_ack(ack, effect_handler).await,
                 NodeControlMsg::Nack(nack) => self.handle_nack(nack, effect_handler).await,
                 NodeControlMsg::DelayedData { when, data } => {
+                    // The retained queue lifetime ends as soon as this
+                    // processor receives the delayed item, even if route
+                    // metadata is malformed and the item cannot be resumed.
+                    self.release_retry_budget_ticket(when, data.as_ref());
                     if let Some(calldata) = data.source_route() {
                         let rstate: RetryState = calldata.calldata.try_into()?;
                         let _ = self
-                            .handle_delayed(when, data, effect_handler, rstate.num_items)
+                            .handle_delayed(data, effect_handler, rstate.num_items)
                             .await?;
                     }
                     Ok(())
@@ -676,6 +730,7 @@ impl RetryProcessor {
             delays,
             config,
             metrics,
+            retry_budget_tickets: VecDeque::new(),
         }
     }
 }
@@ -688,14 +743,22 @@ mod test {
     use otap_df_engine::control::{
         AckMsg, NackMsg, NodeControlMsg, PipelineCompletionMsg, pipeline_completion_msg_channel,
     };
+    use otap_df_engine::engine_metrics::{EngineMetrics, EngineMetricsMonitor};
+    use otap_df_engine::memory_budget::{
+        BudgetMode, BudgetScopeId, MemoryBudgetSizing, MemoryBudgetState, RuntimeMemoryBudget,
+        RuntimeMemoryBudgetConfig, set_current_runtime_memory_budget,
+    };
     use otap_df_engine::testing::liveness::next_completion;
     use otap_df_engine::testing::node::test_node;
     use otap_df_engine::testing::processor::TestRuntime;
     use otap_df_engine::{Interests, message::Message};
     use otap_df_otap::pdata::OtapPdata;
     use otap_df_otap::testing::{TestCallData, create_test_pdata, next_ack, next_nack};
+    use otap_df_telemetry::metrics::{MetricSetHandler, MetricSetSnapshot, MetricValue};
     use otap_df_telemetry::registry::TelemetryRegistryHandle;
+    use otap_df_telemetry::reporter::MetricsReporter;
     use serde_json::json;
+    use std::rc::Rc;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -792,6 +855,46 @@ mod test {
             "max_elapsed_time": "0.5s",      // 500ms total timeout
             "multiplier": 2.0,            // Double
         })
+    }
+
+    fn install_test_runtime_budget(
+        state: MemoryBudgetState,
+    ) -> (
+        MemoryBudgetState,
+        Rc<RuntimeMemoryBudget>,
+        otap_df_engine::memory_budget::RuntimeMemoryBudgetGuard,
+    ) {
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 1,
+                    lease_step_bytes: 1,
+                    max_overshoot_per_runtime_bytes: 10_000,
+                    overshoot_debt_limit_bytes: 10,
+                },
+                topic_default_limit_bytes: 100,
+                runtime_count: 1,
+            },
+            None,
+        );
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let account = handle.local_account().expect("account should be available");
+        let budget = Rc::new(RuntimeMemoryBudget::new(account));
+        let guard = set_current_runtime_memory_budget(Some(budget.clone()));
+        (state, budget, guard)
+    }
+
+    fn engine_metric(snapshot: &MetricSetSnapshot, name: &str) -> MetricValue {
+        let index = EngineMetrics::default()
+            .descriptor()
+            .metrics
+            .iter()
+            .position(|field| field.name == name)
+            .unwrap_or_else(|| panic!("engine metric {name} should exist"));
+        snapshot.get_metrics()[index]
     }
 
     #[test]
@@ -922,7 +1025,15 @@ mod test {
     /// into a terminal NACK instead of leaving retry state stranded.
     #[test]
     fn test_retry_processor_cannot_requeue_becomes_terminal_nack() {
-        let pipeline_ctx = create_test_pipeline_context();
+        let telemetry_registry = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(telemetry_registry);
+        let pipeline_ctx = controller_ctx.pipeline_context_with(
+            "test_grp".into(),
+            "test_pipeline".into(),
+            0,
+            1,
+            0,
+        );
         let node = test_node("retry-processor-cannot-delay");
         let rt: TestRuntime<OtapPdata> = TestRuntime::with_channel_capacities(10, 1);
 
@@ -940,6 +1051,8 @@ mod test {
 
         rt.set_processor(proc)
             .run_test(move |mut ctx| async move {
+                let (budget_state, budget, _budget_guard) =
+                    install_test_runtime_budget(controller_ctx.memory_budget_state());
                 let (pipeline_completion_tx, mut pipeline_completion_rx) =
                     pipeline_completion_msg_channel(10);
                 ctx.set_pipeline_completion_sender(pipeline_completion_tx);
@@ -965,6 +1078,12 @@ mod test {
                     .await
                     .expect("process nack");
 
+                budget.flush_snapshot();
+                let charged_before_failed_requeue = budget_state.snapshot().charged_bytes;
+                assert!(
+                    charged_before_failed_requeue > 0,
+                    "first delayed retry should retain a budget ticket"
+                );
                 assert!(
                     ctx.next_local_control_deadline().is_some(),
                     "first retry should occupy the only local requeue slot"
@@ -990,6 +1109,13 @@ mod test {
                     .await
                     .expect("process second nack");
 
+                budget.flush_snapshot();
+                assert_eq!(
+                    budget_state.snapshot().charged_bytes,
+                    charged_before_failed_requeue,
+                    "failed requeue should drop the second retry budget ticket"
+                );
+
                 match next_completion(
                     &mut pipeline_completion_rx,
                     Duration::from_secs(1),
@@ -1007,6 +1133,124 @@ mod test {
                     }
                     other => panic!("expected terminal nack, got {other:?}"),
                 }
+            })
+            .validate(|ctx| async move {
+                ctx.counters().assert(0, 0, 0, 0);
+            });
+    }
+
+    #[test]
+    fn test_retry_processor_delayed_retry_updates_runtime_budget() {
+        let telemetry_registry = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(telemetry_registry.clone());
+        let pipeline_ctx = controller_ctx.pipeline_context_with(
+            "test_grp".into(),
+            "test_pipeline".into(),
+            0,
+            1,
+            0,
+        );
+        let node = test_node("retry-processor-memory-budget");
+        let rt: TestRuntime<OtapPdata> = TestRuntime::new();
+
+        let mut node_config = NodeUserConfig::new_processor_config(RETRY_PROCESSOR_URN);
+        node_config.config = create_test_config();
+
+        let proc = crate::processors::retry_processor::create_retry_processor(
+            pipeline_ctx,
+            node,
+            Arc::new(node_config),
+            rt.config(),
+            &otap_df_engine::capability::registry::Capabilities::empty(),
+        )
+        .expect("create processor");
+
+        rt.set_processor(proc)
+            .run_test(move |mut ctx| async move {
+                let (budget_state, budget, _budget_guard) =
+                    install_test_runtime_budget(controller_ctx.memory_budget_state());
+
+                let pdata_in = create_test_pdata().test_subscribe_to(
+                    Interests::ACKS | Interests::NACKS | Interests::RETURN_DATA,
+                    TestCallData::default().into(),
+                    4444,
+                );
+
+                ctx.process(Message::PData(pdata_in))
+                    .await
+                    .expect("process initial message");
+
+                let mut output = ctx.drain_pdata().await;
+                assert_eq!(output.len(), 1);
+                let first_attempt = output.remove(0);
+
+                let (_, nack_msg) =
+                    next_nack(NackMsg::new("simulated downstream failure", first_attempt))
+                        .expect("expected nack subscriber");
+                ctx.process(Message::nack_ctrl_msg(nack_msg))
+                    .await
+                    .expect("process nack");
+
+                budget.flush_snapshot();
+                assert!(
+                    budget_state.snapshot().charged_bytes > 0,
+                    "delayed retry retention should be charged while queued"
+                );
+                assert_eq!(
+                    budget_state.snapshot().soft_runtime_count,
+                    1,
+                    "delayed retry retention should cross the runtime budget soft threshold"
+                );
+
+                let entity_key = controller_ctx.register_engine_entity();
+                let (rx, reporter) = MetricsReporter::create_new_and_receiver(16);
+                let mut monitor = EngineMetricsMonitor::new(
+                    telemetry_registry,
+                    entity_key,
+                    reporter,
+                    controller_ctx.memory_pressure_state(),
+                    controller_ctx.memory_budget_state(),
+                );
+                monitor.update();
+                monitor
+                    .report()
+                    .expect("engine metrics report should succeed");
+                let snapshot = rx
+                    .try_recv()
+                    .expect("engine metrics snapshot should be emitted");
+                assert_eq!(
+                    engine_metric(&snapshot, "runtime.memory.budget.soft.runtime.count"),
+                    MetricValue::U64(1),
+                    "reported soft runtime count should reflect retry retention threshold crossing"
+                );
+                assert!(
+                    matches!(
+                        engine_metric(&snapshot, "runtime.memory.budget.charged.bytes"),
+                        MetricValue::U64(bytes) if bytes > 0
+                    ),
+                    "reported charged bytes should include delayed retry retention"
+                );
+
+                let when = ctx
+                    .next_local_control_deadline()
+                    .expect("retry should be scheduled");
+                let control = ctx
+                    .take_due_local_control(when)
+                    .expect("scheduled local control");
+                assert!(
+                    matches!(control, NodeControlMsg::DelayedData { .. }),
+                    "retry should requeue retained pdata as DelayedData"
+                );
+                ctx.process(Message::Control(control))
+                    .await
+                    .expect("process delayed retry");
+
+                budget.flush_snapshot();
+                assert_eq!(
+                    budget_state.snapshot().charged_bytes,
+                    0,
+                    "retry budget ticket should be released after delayed data resumes"
+                );
             })
             .validate(|ctx| async move {
                 ctx.counters().assert(0, 0, 0, 0);

@@ -23,6 +23,7 @@ use crate::control::{
 };
 use crate::control_plane_metrics::{PipelineCompletionMetricsState, RuntimeControlMetricsState};
 use crate::error::Error;
+use crate::memory_budget::current_runtime_memory_budget;
 use crate::memory_limiter::MemoryPressureChanged;
 use crate::pipeline_metrics::PipelineMetricsMonitor;
 use crate::{Interests, RequestOutcome, Unwindable};
@@ -755,6 +756,12 @@ impl<PData> RuntimeCtrlMsgManager<PData> {
             ));
             collect_telemetry_count += 1;
         });
+
+        if collect_telemetry_count > 0 {
+            if let Some(budget) = current_runtime_memory_budget() {
+                budget.flush_snapshot();
+            }
+        }
 
         while self
             .delayed_data
