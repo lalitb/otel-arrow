@@ -273,18 +273,12 @@ flowchart TB
     Escrow["Cross-runtime escrow<br/>topics / shared queues"]
     Metrics["Engine metrics<br/>periodic snapshot reader"]
 
-    Process --> R1
-    Process --> R2
+    Process --> R0
     Process --> RN
 
-    subgraph R1["Pinned runtime thread core 0"]
-        A1["RuntimeMemoryAccount<br/>Rc + Cell, !Send"]
-        T1["Local tickets<br/>retained local work"]
-    end
-
-    subgraph R2["Pinned runtime thread core 1"]
-        A2["RuntimeMemoryAccount<br/>Rc + Cell, !Send"]
-        T2["Local tickets<br/>retained local work"]
+    subgraph R0["Pinned runtime thread core 0"]
+        A0["RuntimeMemoryAccount<br/>Rc + Cell, !Send"]
+        T0["Local tickets<br/>retained local work"]
     end
 
     subgraph RN["Pinned runtime thread core N"]
@@ -292,17 +286,13 @@ flowchart TB
         TN["Local tickets<br/>retained local work"]
     end
 
-    A1 -. "coarse lease borrow / return" .-> Pool
-    A2 -. "coarse lease borrow / return" .-> Pool
+    A0 -. "coarse lease borrow / return" .-> Pool
     AN -. "coarse lease borrow / return" .-> Pool
 
-    T1 -->|"try_into_escrow"| Escrow
-    Escrow -->|"redeem"| T2
-    T2 -->|"try_into_escrow"| Escrow
+    T0 -->|"try_into_escrow"| Escrow
     Escrow -->|"redeem"| TN
 
-    A1 -. "metric flush" .-> Metrics
-    A2 -. "metric flush" .-> Metrics
+    A0 -. "metric flush" .-> Metrics
     AN -. "metric flush" .-> Metrics
 ```
 
