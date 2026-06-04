@@ -78,7 +78,7 @@ The current memory limiter is process-wide:
 Phase 1 explicitly leaves these Phase 2 items for later:
 
 - queue and topic byte accounting
-- per-pipeline memory budgets
+- per-runtime memory budgets with pipeline attribution
 - per-core local leases with bounded overshoot
 - `MemoryTicket` ownership on retained work items
 - reclaim hooks for stateful components
@@ -212,8 +212,16 @@ pub enum BudgetLevel {
     Hard,
 }
 
+pub struct BudgetScopeId {
+    pipeline_group_id: Option<PipelineGroupId>,
+    pipeline_id: Option<PipelineId>,
+    runtime_generation: Option<u64>,
+    topic_or_boundary: Option<TopicName>,
+}
+
 pub struct RuntimeMemoryAccount {
     deployment_key: DeployedPipelineKey,
+    scope: BudgetScopeId,
     floor_bytes: u64,
     soft_bytes: u64,
     hard_bytes: u64,
@@ -221,6 +229,7 @@ pub struct RuntimeMemoryAccount {
     peak_bytes: Cell<u64>,
     level: Cell<BudgetLevel>,
     lease: LocalMemoryLease,
+    lease_authority: Rc<dyn LeaseAuthority>,
 }
 
 pub struct LocalMemoryLease {
@@ -234,25 +243,39 @@ pub struct GlobalLeasePool {
     max_overshoot_per_runtime: u64,
 }
 
+pub trait LeaseAuthority {
+    fn try_borrow(&self, bytes: u64) -> Result<LeaseGrant, BudgetError>;
+    fn return_lease(&self, grant: LeaseGrant);
+}
+
 #[must_use]
 pub struct LocalMemoryTicket {
     bytes: u64,
     account: Rc<RuntimeMemoryAccount>,
     generation: u64,
+    scope: BudgetScopeId,
 }
 
 pub struct EscrowTicket {
     bytes: u64,
     escrow: Arc<CrossRuntimeEscrow>,
+    scope: BudgetScopeId,
 }
 ```
 
 The exact names can change during implementation. The important split is:
 
 - `RuntimeMemoryAccount` is local and `!Send`.
-- `GlobalLeasePool` coordinates bounded overshoot.
+- `GlobalLeasePool` coordinates bounded overshoot through the `LeaseAuthority`
+  interface.
 - `LocalMemoryTicket` owns a logical charge while data is retained locally.
 - `EscrowTicket` owns a charge while data is in a cross-runtime boundary.
+- `BudgetScopeId` is immutable attribution carried by accounts, tickets, and
+  escrow when identity is known.
+
+`GlobalLeasePool` is the only `LeaseAuthority` implementation in Phase 2.
+Future group or pipeline budgets should be added as additional authorities in
+the lease hierarchy, not by changing ticket or escrow ownership shapes.
 
 ### Ticket Attachment
 
@@ -282,6 +305,9 @@ Attachment rules:
 
 This type-state boundary is the design invariant. It prevents a `!Send` ticket
 from entering a `SharedSender` while preserving the existing `PData` bounds.
+The `!Send` property is required for soundness because local tickets refund
+through runtime-local state. Debug builds should assert that local ticket drop
+runs on the creating runtime thread.
 
 ## Budget Model
 
@@ -302,6 +328,10 @@ The remainder is distributed as local floor leases.
 An internal telemetry pipeline must be funded exactly once. It can either be
 covered by reserved headroom as shared system overhead, or it can participate as
 a normal runtime with its own floor. It should not be counted in both.
+When enforcement is enabled for application pipelines, the internal telemetry
+pipeline should remain observe-only unless a later design explicitly proves that
+telemetry shedding cannot hide the pressure signals needed to diagnose budget
+events.
 
 Example:
 
@@ -416,10 +446,19 @@ sum(runtime_charged_bytes) + sum(escrow_charged_bytes)
 
 Floors are admission guarantees, not permanently carved physical reservations.
 Moving bytes from a runtime account into escrow should transfer logical
-ownership without increasing the global logical total. If the spare pool has
-fewer than `lease_step_bytes` available, the default policy is to refuse the
-borrow rather than issue a partial chunk; this preserves coarse coordination and
-keeps the final small remainder as process headroom.
+ownership without increasing the global logical total. The transfer should
+either draw from the producer's existing lease or eagerly return the converted
+bytes from the producer before escrow borrows from global spare. It must not
+double-draw spare for the same logical owner.
+
+Creating additional retained owners is different from transferring ownership.
+Fanout, mixed-topic branches, retries that keep both old and new retained
+copies, or any other duplicate retained owner must reserve additional budget for
+the additional owner before it becomes retained.
+
+If the spare pool has fewer than `lease_step_bytes` available, the default
+policy is to refuse the borrow rather than issue a partial chunk; this preserves
+coarse coordination and keeps the final small remainder as process headroom.
 
 ## Ticket Ownership
 
@@ -503,21 +542,24 @@ Phase 2 should charge these retention sites:
 | Local data envelope | Engine-owned local envelope carries `PData` plus `LocalMemoryTicket`. |
 | Local channel queue | Queue owns the local envelope while the item is buffered. |
 | Shared channel queue | Sender converts local ownership into sendable escrow before enqueue. |
-| Topic queue | Current broker topics own sendable escrow; runtime-local topics require a new backend. |
+| Topic queue | Current broker topics own sendable escrow; runtime-local topics require a new backend. Mixed topics must reserve all retained owners atomically. |
 | Fanout/clone | Reserve one logical owner per retained branch. |
 | Batch processor | Retains tickets for buffered items and adjusts to batch size. |
 | Retry buffer | Owns tickets for retained retry payloads. |
 | Durable buffer | Owns tickets until payload is durably handed off or released. |
 | OTAP stream state | Charges retained stream buffers and recyclable state. |
 | Delayed local work | Retained delayed payload keeps its ticket until delivered or dropped. |
-| Ack/Nack with pdata | Return-path pdata keeps existing ownership; no fresh budget is required. |
+| Ack/Nack with pdata | Return-path pdata keeps existing ownership; no fresh budget is required. Shared return paths must convert that ownership to escrow before crossing runtimes. |
 <!-- markdownlint-enable MD013 -->
 
 Pure control messages such as shutdown, configuration, timer ticks, telemetry
 collection, and drain requests must never require memory budget. Control
 messages that carry `PData`, such as ack/nack and delayed data, are
 data-bearing control messages and must preserve existing ticket ownership
-without requiring a new reservation.
+without requiring a new reservation. If the return path crosses a shared
+runtime, topic, or process-global boundary, the owner must be represented as a
+sendable escrow ticket on that boundary; a `LocalMemoryTicket` must never ride
+the shared return path.
 
 APIs that currently retain `Box<PData>`, such as delayed local scheduling,
 would need a charged envelope or side-table entry. They should not accept raw
@@ -625,6 +667,62 @@ payloads. Therefore current broker topics are escrow-backed boundaries even when
 the producer and consumer happen to run on the same runtime. Keeping local
 tickets in a topic requires a new runtime-local topic backend.
 
+Balanced topics and broadcast topics use different escrow shapes:
+
+- balanced delivery is point-to-point transfer escrow
+- broadcast delivery is retained-ring escrow owned by broker ring occupancy
+- mixed topics combine one or more point-to-point owners with broadcast ring
+  occupancy for the same publish operation
+
+### Broadcast and Retained-Ring Boundaries
+
+The current broadcast broker stores `Arc<T>` payloads in a process-global ring.
+Physical resident bytes are shared by `Arc`, but the broker ring is still a
+retained owner that must be charged while the slot can be delivered. The first
+topic-budget implementation should charge broadcast escrow by accepted ring-slot
+payload bytes, not by eagerly multiplying by subscriber count.
+
+The broadcast escrow owner is the broker slot:
+
+1. Publish reserves the ring-slot charge before the payload is accepted.
+2. The broker owns that charge while the slot is retained.
+3. Subscriber delivery may redeem into a local ticket when the subscriber
+   actually retains the item outside the broker slot.
+4. Ring overwrite, drop-oldest eviction, subscriber disconnect with pending
+   retained items, explicit abort, and final slot release must release the
+   corresponding escrow owner exactly once.
+
+Per-subscriber virtual branch tickets are a future extension. If added, the
+broker must snapshot the subscriber set at publish time and create refcounted
+escrow ownership whose release paths are tied to each subscriber cursor. Until
+that ownership exists, broadcast accounting is ring-slot occupancy plus any
+local tickets created by actual subscriber retention.
+
+### Mixed Topic Admission
+
+Mixed topics can create multiple retained owners from one publish: balanced
+queue entries, broadcast ring occupancy, or future subscriber-view ownership.
+Admission must be all-or-nothing across those owners.
+
+Publish must reserve every retained owner before committing any owner to the
+broker. If one branch fails reservation, the broker must unwind all reservations
+already acquired for that publish and return the original local ticket or escrow
+owner to the caller. Partial topic admission is not allowed because it creates
+ambiguous publish results and accounting drift.
+
+### Escrow Lifecycle
+
+`CrossRuntimeEscrow` should be created by the broker when a topic or shared
+boundary is declared. The initial implementation should use one escrow account
+per topic or boundary, with scope metadata identifying the topic, producer
+runtime when known, and consumer/runtime attribution when redeemed.
+
+In-flight `EscrowTicket` instances keep the escrow account alive independently
+of the producer or consumer generation. Topic removal during live
+reconfiguration stops new publish, then waits for retained escrow owners to
+redeem, abort, evict, or move to the leak-detection graveyard. The broker must
+not tear down escrow state while live tickets can still release into it.
+
 `try_into_escrow` must return the original ticket on failure:
 
 ```rust
@@ -646,6 +744,12 @@ Existing channel `SendError<T>` shapes should be reused where possible by
 making `T` the local or escrow envelope. Phase 2 should not introduce a
 parallel ticket-aware send-error hierarchy unless the existing returned-item
 semantics are insufficient.
+
+Broker eviction hooks are part of the escrow contract. The topic backend must
+call the escrow release path when it drops an already-accepted item for
+drop-oldest, disconnect, lag policy, ring overwrite, topic close, or final drain
+cleanup. The abandoned-escrow graveyard is a safety net for unresolved drops,
+not the normal release mechanism.
 
 ### Redemption Progress Guarantee
 
@@ -693,9 +797,13 @@ Every boundary must have exactly one owner at all times:
 | --- | --- | --- |
 | Local channel send | Queue owns local ticket. | Caller receives original local ticket with message. |
 | Shared channel send | Queue owns escrow ticket. | Caller receives original local ticket or escrow ticket. |
-| Topic publish | Topic escrow owns charge. | Publisher keeps original local ticket. |
+| Balanced topic publish | Topic transfer escrow owns the point-to-point charge. | Publisher keeps original local ticket. |
+| Mixed topic publish | All retained owners are committed atomically. | All acquired owners unwind; publisher keeps original local ticket. |
+| Broadcast ring accept | Broker ring slot owns escrow charge. | Publisher keeps original local ticket. |
+| Broadcast ring eviction | Broker releases the slot escrow exactly once. | Abandoned escrow graveyard records unresolved release. |
+| Broadcast subscriber disconnect | Broker releases pending subscriber-view escrow, if any. | Abandoned escrow graveyard records unresolved release. |
 | Topic delivery redeem | Consumer owns local ticket. | Delivery can abort/drop and release escrow. |
-| Ack/Nack unwind | Existing ticket follows returned pdata. | Sender keeps returned pdata and ticket. |
+| Ack/Nack unwind | Existing ticket follows returned pdata locally or becomes escrow on shared return. | Sender keeps returned pdata and ticket/escrow. |
 <!-- markdownlint-enable MD013 -->
 
 The implementation should encode these transitions in result types instead of
@@ -950,8 +1058,23 @@ Validation:
 - `memory_placement.bind_node` requires Linux NUMA support and explicit
   unsupported handling.
 
-The policy should be ignored by `ResolvedPolicies::eq_ignoring_resources`, just
-like other resource placement and scaling controls.
+The top-level-only scope is a Phase 2 policy choice, not a permanent statement
+that group budgets are impossible. Reserve sizing, runtime floors, lease
+authority, and escrow spare all begin as process-global concerns. Group and
+pipeline budgets are future hierarchical fairness scopes over the same ticket
+and escrow ownership graph.
+
+Some validation requires resolved runtime count and the effective process hard
+limit, so it must run during controller startup after preflight core resolution,
+not only at YAML parse time. Startup should fail with a budget-specific error
+when `floor_per_runtime * runtime_count + reserve` exceeds the process hard
+limit in a mode that needs derived sizing.
+
+Sizing and placement fields should be ignored by
+`ResolvedPolicies::eq_ignoring_resources`, just like other resource placement
+and scaling controls. Behavioral fields such as `memory_budget.mode` and
+`memory_budget.enforcement.*` are not just placement; live reconfiguration must
+detect and apply them to running accounts.
 
 ### Pipeline Group and Topic Scope
 
@@ -997,15 +1120,25 @@ Add runtime/generation-scoped metrics:
 | `engine.runtime_memory.peak_charged_bytes` | Peak logical bytes since runtime start. |
 | `engine.runtime_memory.floor_bytes` | Guaranteed local floor. |
 | `engine.runtime_memory.borrowed_bytes` | Bytes borrowed from the global lease pool. |
-| `engine.runtime_memory.overshoot_bytes` | Bytes reconciled after growth without prior reservation. |
+| `engine.runtime_memory.current_overshoot_bytes` | Current bytes above local floor plus leases. |
+| `engine.runtime_memory.overshoot_bytes` | Cumulative bytes reconciled after growth without prior reservation. |
 | `engine.runtime_memory.level` | Runtime budget pressure state. |
 | `engine.runtime_memory.outstanding_tickets` | Number of live local tickets. |
 | `engine.runtime_memory.oldest_ticket_age_ms` | Age of the oldest live local ticket. |
 | `engine.runtime_memory.lease_borrows` | Count of successful lease borrows. |
 | `engine.runtime_memory.lease_failures` | Count of failed lease borrows. |
 | `engine.runtime_memory.rejections` | Rejections by local memory budget. |
+| `engine.runtime_memory.shadow_rejections` | Work that would have been rejected if enforcement were enabled. |
+| `engine.runtime_memory.unknown_size_bytes` | Retained bytes excluded from enforcement because exact logical size is unknown. |
+| `engine.runtime_memory.covered_retained_bytes` | Retained bytes covered by ticket ownership. |
+| `engine.runtime_memory.uncovered_retained_bytes` | Retained bytes observed without a ticket owner. |
 | `engine.escrow_memory.charged_bytes` | Logical bytes owned by an escrow boundary. |
+| `engine.escrow_memory.ring_occupancy_bytes` | Broadcast or mixed-topic ring-slot escrow bytes. |
+| `engine.escrow_memory.evicted_bytes` | Escrow bytes released by eviction or lag policy. |
+| `engine.escrow_memory.abandoned_bytes` | Escrow bytes moved to the leak-detection graveyard. |
+| `engine.escrow_memory.oldest_in_transit_age_ms` | Age of the oldest retained escrow owner. |
 | `engine.escrow_memory.rejections` | Publish or redemption failures by escrow. |
+| `engine.escrow_memory.shadow_rejections` | Publish or redemption work that would have failed under enforcement. |
 | `engine.global_memory.runtime_charged_bytes` | Sum of runtime logical charges. |
 | `engine.global_memory.escrow_charged_bytes` | Sum of escrow logical charges. |
 | `engine.global_memory.spare_available_bytes` | Remaining global spare pool. |
@@ -1020,6 +1153,10 @@ Metric attributes should include:
 - `core_id`
 - `deployment_generation`
 - `numa_node_id`, when known
+- `site`, for low-cardinality charge sites such as receiver, queue, topic,
+  batch, retry, durable_buffer, stream, or delayed_work
+- `release_cause`, for escrow release paths such as redeemed, evicted, aborted,
+  disconnected, dropped, or graveyard
 - `source`, for rejection and pressure source metrics
 
 Metrics backed by local `Cell` state must be snapshotted on the pipeline runtime
@@ -1125,6 +1262,9 @@ On resize:
 - shrinking floors should be grandfathered and drained down instead of pushing
   existing runtimes immediately to local `Hard`
 - enforcement changes should preserve observe-only safety during rollout
+- sizing and placement changes can be treated as resource updates, but
+  behavioral changes such as `mode` and `enforcement.*` must be applied to
+  running accounts and admission gates
 
 On runtime teardown:
 
@@ -1169,14 +1309,19 @@ who require placement can choose `unsupported: error`.
 - Add manual charges at receiver ingress and selected retained buffers.
 - Add queue/topic byte-depth observability.
 - Validate charged bytes, resident bytes, and process samples side by side.
+- Add observe-only coverage metrics for charged, uncharged, and unknown-size
+  retained paths.
+- Add shadow-rejection counters for runtime and escrow decisions.
 - Continue observe-only.
 
 ### Phase 2b: Ticket Ownership
 
 - Add `LocalMemoryTicket`.
+- Add immutable attribution metadata to local and escrow ownership.
 - Add local envelopes or side tables; do not modify `PData`.
 - Add ticket adjustment for known size changes.
 - Add cross-runtime `EscrowTicket` for topics and queues.
+- Add topic escrow release-cause metrics before topic enforcement.
 - Continue observe-only.
 
 ### Phase 2c: Receiver Enforcement
@@ -1196,7 +1341,9 @@ who require placement can choose `unsupported: error`.
 - Enforce escrow and queue byte limits.
 - Add publish refusal/backpressure behavior.
 - Add per-topic budget metrics.
-- Gate topic enforcement on the finalized balanced/broadcast ownership model.
+- Gate topic enforcement on the finalized balanced/broadcast/mixed ownership
+  model, all-or-nothing publish reservation, and eviction/disconnect release
+  hooks.
 
 ### Phase 2e: Reclaim Hooks
 
@@ -1211,6 +1358,71 @@ who require placement can choose `unsupported: error`.
 - Add optional per-runtime arena creation if validated.
 - Add optional targeted arena purge.
 - Add Linux thread memory placement if not already shipped with NUMA telemetry.
+
+## Validation Scenarios
+
+The implementation plan should include focused tests for these scenarios before
+each enforcement gate is enabled.
+
+Configuration and sizing:
+
+- reject group-level and pipeline-level `policies.resources.memory_budget`
+- reject `mode: enforce` until ticket and escrow ownership is implemented
+- reject derived sizing when no process hard limit is known and no explicit
+  `floor_per_runtime` exists
+- run runtime-count sizing validation after preflight core resolution
+- count the internal telemetry pipeline exactly once when it participates in
+  budget sizing; otherwise fund it from reserve, not both
+- validate `lease_step <= floor_per_runtime` and
+  `lease_step <= max_overshoot_per_runtime / 2`
+
+Type and ownership:
+
+- compile-fail test that `LocalMemoryTicket` is `!Send`
+- compile-fail test that a shared/topic envelope cannot carry
+  `LocalMemoryTicket`
+- failed local, shared, and topic sends return the original owner without
+  charge loss
+- ack/nack with `PData` uses local ownership on local return paths and escrow on
+  shared return paths
+- raw retained `PData` cannot be accepted in enforced paths without a charged
+  envelope, side-table entry, or explicit exclusion
+
+Topic and escrow:
+
+- balanced topic publish/redeem transfers ownership exactly once
+- broadcast publish charges ring-slot occupancy and releases on overwrite,
+  drop-oldest, disconnect, abort, and final drain
+- mixed topic publish reserves every retained owner atomically and unwinds all
+  reservations on partial failure
+- eviction racing with late redeem cannot double-release or underflow escrow
+- topic removal during live reconfiguration preserves in-flight escrow until
+  redeem, abort, eviction, or graveyard
+- escrow drop creates an abandoned-entry metric instead of silent success
+
+Accounting and pressure:
+
+- ownership transfer from local ticket to escrow does not increase global
+  logical total
+- fanout that creates `N` retained logical owners charges `N` owners, except
+  broadcast ring-slot occupancy follows the broker-owned ring model
+- spare-pool conservation holds across borrow, escrow transfer, redeem, abort,
+  and lazy return
+- `reconcile_size` shrink always succeeds; overshoot reclassifies the runtime
+  before subsequent admission
+- observe-only mode emits shadow rejections and coverage metrics without
+  changing behavior
+
+Lifecycle and reclaim:
+
+- shrinking floors during live resize grandfathers existing accounts into
+  drain/reclaim instead of immediate `Hard`
+- runtime generation replacement keeps old local accounts alive until old
+  tickets drop
+- producer or consumer teardown with in-flight escrow does not leak silently
+- shutdown, drain, release, abort, and reclaim paths never acquire budget
+- reclaim hooks release bytes or report no progress without re-entering the same
+  hook concurrently
 
 ## Risks and Mitigations
 
