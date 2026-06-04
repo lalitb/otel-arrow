@@ -76,6 +76,7 @@ use otap_df_engine::entity_context::{
     node_entity_key, pipeline_entity_key, set_pipeline_entity_key,
 };
 use otap_df_engine::error::Error as EngineError;
+use otap_df_engine::memory_budget::RuntimeMemoryBudgetConfig;
 use otap_df_engine::memory_limiter::{
     EffectiveMemoryLimiter, MemoryLimiterTick, MemoryPressureBehaviorConfig, MemoryPressureChanged,
     MemoryPressureLevel,
@@ -1346,6 +1347,22 @@ impl<
         }
         let planned_core_assignments =
             Self::preflight_pipeline_core_allocations(&pipelines, &all_cores)?;
+        if let Some(memory_budget_policy) = engine_config
+            .policies
+            .resources()
+            .and_then(|resources| resources.memory_budget.as_ref())
+        {
+            let runtime_count = planned_core_assignments.iter().map(Vec::len).sum::<usize>()
+                + usize::from(observability_pipeline.is_some());
+            let hard_limit_bytes = match memory_pressure_state.hard_limit_bytes() {
+                0 => None,
+                bytes => Some(bytes),
+            };
+            controller_ctx.configure_memory_budget(
+                RuntimeMemoryBudgetConfig::from_policy(memory_budget_policy, runtime_count),
+                hard_limit_bytes,
+            );
+        }
 
         let runtime = Arc::new(ControllerRuntime::new(
             self.pipeline_factory,
@@ -1443,6 +1460,7 @@ impl<
         let engine_registry = controller_ctx.telemetry_registry();
         let engine_reporter = metrics_reporter.clone();
         let engine_metrics_memory_pressure_state = memory_pressure_state.clone();
+        let engine_metrics_memory_budget_state = controller_ctx.memory_budget_state();
         let engine_metrics_handle = spawn_thread_local_task(
             "engine-metrics",
             admin_tracing_setup.clone(),
@@ -1459,6 +1477,7 @@ impl<
                     engine_entity_key,
                     engine_reporter,
                     engine_metrics_memory_pressure_state.clone(),
+                    engine_metrics_memory_budget_state.clone(),
                 );
 
                 let mut ticker = interval(ENGINE_METRICS_INTERVAL);
@@ -2196,6 +2215,8 @@ connections:
             policies: ResolvedPolicies {
                 resources: ResourcesPolicy {
                     core_allocation,
+                    memory_limiter: None,
+                    memory_budget: None,
                     ..Default::default()
                 },
                 ..Default::default()

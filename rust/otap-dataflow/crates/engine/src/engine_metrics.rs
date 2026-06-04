@@ -34,6 +34,7 @@
 //!   TODO: Also emit a cumulative `cpu_time` counter (like the Go Collector's
 //!   `process_cpu_seconds_total`) for users who prefer query-time computation.
 
+use crate::memory_budget::MemoryBudgetState;
 use crate::memory_limiter::MemoryPressureState;
 use cpu_time::ProcessTime;
 use otap_df_telemetry::instrument::{Gauge, ObserveUpDownCounter};
@@ -75,6 +76,46 @@ pub struct EngineMetrics {
     /// Effective process-wide memory limiter hard limit, in bytes.
     #[metric(unit = "{By}")]
     pub process_memory_hard_limit_bytes: Gauge<u64>,
+
+    /// Registered runtime memory-budget snapshot count.
+    #[metric(unit = "{runtime}")]
+    pub runtime_memory_budget_runtime_count: Gauge<u64>,
+
+    /// Runtime memory-budget snapshots currently at normal level.
+    #[metric(unit = "{runtime}")]
+    pub runtime_memory_budget_normal_runtime_count: Gauge<u64>,
+
+    /// Runtime memory-budget snapshots currently at soft level.
+    #[metric(unit = "{runtime}")]
+    pub runtime_memory_budget_soft_runtime_count: Gauge<u64>,
+
+    /// Runtime memory-budget snapshots currently at hard level.
+    #[metric(unit = "{runtime}")]
+    pub runtime_memory_budget_hard_runtime_count: Gauge<u64>,
+
+    /// Known logical retained bytes charged to runtime memory budgets.
+    #[metric(unit = "{By}")]
+    pub runtime_memory_budget_charged_bytes: Gauge<u64>,
+
+    /// Lease bytes borrowed by runtime memory budgets.
+    #[metric(unit = "{By}")]
+    pub runtime_memory_budget_borrowed_bytes: Gauge<u64>,
+
+    /// Retained bytes observed without a known logical size.
+    #[metric(unit = "{By}")]
+    pub runtime_memory_budget_unknown_bytes: Gauge<u64>,
+
+    /// Bytes above runtime floor plus leases.
+    #[metric(unit = "{By}")]
+    pub runtime_memory_budget_overshoot_bytes: Gauge<u64>,
+
+    /// Abandoned escrow tickets retained for leak detection.
+    #[metric(unit = "{ticket}")]
+    pub runtime_memory_budget_abandoned_escrow_count: Gauge<u64>,
+
+    /// Abandoned escrow bytes retained for leak detection.
+    #[metric(unit = "{By}")]
+    pub runtime_memory_budget_abandoned_escrow_bytes: Gauge<u64>,
 }
 
 /// Monitors and reports engine-wide metrics.
@@ -94,6 +135,8 @@ pub struct EngineMetricsMonitor {
     num_cores: usize,
     /// Shared process-wide memory limiter state.
     memory_pressure_state: MemoryPressureState,
+    /// Shared runtime memory-budget state.
+    memory_budget_state: MemoryBudgetState,
 }
 
 impl EngineMetricsMonitor {
@@ -107,6 +150,7 @@ impl EngineMetricsMonitor {
         entity_key: EntityKey,
         reporter: MetricsReporter,
         memory_pressure_state: MemoryPressureState,
+        memory_budget_state: MemoryBudgetState,
     ) -> Self {
         let metrics = registry.register_metric_set_for_entity::<EngineMetrics>(entity_key);
         let num_cores = std::thread::available_parallelism()
@@ -120,6 +164,7 @@ impl EngineMetricsMonitor {
             cpu_start: ProcessTime::now(),
             num_cores,
             memory_pressure_state,
+            memory_budget_state,
         }
     }
 
@@ -152,6 +197,37 @@ impl EngineMetricsMonitor {
         self.metrics
             .process_memory_hard_limit_bytes
             .set(self.memory_pressure_state.hard_limit_bytes());
+        let memory_budget = self.memory_budget_state.snapshot();
+        self.metrics
+            .runtime_memory_budget_runtime_count
+            .set(memory_budget.runtime_count);
+        self.metrics
+            .runtime_memory_budget_normal_runtime_count
+            .set(memory_budget.normal_runtime_count);
+        self.metrics
+            .runtime_memory_budget_soft_runtime_count
+            .set(memory_budget.soft_runtime_count);
+        self.metrics
+            .runtime_memory_budget_hard_runtime_count
+            .set(memory_budget.hard_runtime_count);
+        self.metrics
+            .runtime_memory_budget_charged_bytes
+            .set(memory_budget.charged_bytes);
+        self.metrics
+            .runtime_memory_budget_borrowed_bytes
+            .set(memory_budget.borrowed_bytes);
+        self.metrics
+            .runtime_memory_budget_unknown_bytes
+            .set(memory_budget.unknown_bytes);
+        self.metrics
+            .runtime_memory_budget_overshoot_bytes
+            .set(memory_budget.overshoot_bytes);
+        self.metrics
+            .runtime_memory_budget_abandoned_escrow_count
+            .set(memory_budget.abandoned_escrow_count);
+        self.metrics
+            .runtime_memory_budget_abandoned_escrow_bytes
+            .set(memory_budget.abandoned_escrow_bytes);
         self.wall_start = now_wall;
         self.cpu_start = now_cpu;
     }
@@ -198,6 +274,7 @@ mod tests {
             entity_key,
             reporter,
             controller.memory_pressure_state(),
+            controller.memory_budget_state(),
         );
         monitor.update();
 
@@ -219,6 +296,7 @@ mod tests {
             entity_key,
             reporter,
             controller.memory_pressure_state(),
+            controller.memory_budget_state(),
         );
         monitor.update();
         assert!(monitor.report().is_ok());
@@ -236,6 +314,7 @@ mod tests {
             entity_key,
             reporter,
             controller.memory_pressure_state(),
+            controller.memory_budget_state(),
         );
 
         // Do a small busy-spin so there is measurable CPU time.
@@ -271,7 +350,13 @@ mod tests {
 
         let entity_key = controller.register_engine_entity();
         let (_rx, reporter) = MetricsReporter::create_new_and_receiver(16);
-        let mut monitor = EngineMetricsMonitor::new(registry, entity_key, reporter, state);
+        let mut monitor = EngineMetricsMonitor::new(
+            registry,
+            entity_key,
+            reporter,
+            state,
+            controller.memory_budget_state(),
+        );
 
         monitor.update();
 
@@ -279,5 +364,61 @@ mod tests {
         assert_eq!(monitor.metrics.process_memory_usage_bytes.get(), 95);
         assert_eq!(monitor.metrics.process_memory_soft_limit_bytes.get(), 90);
         assert_eq!(monitor.metrics.process_memory_hard_limit_bytes.get(), 100);
+    }
+
+    #[test]
+    fn engine_metrics_expose_runtime_memory_budget_snapshot() {
+        let registry = TelemetryRegistryHandle::new();
+        let controller = ControllerContext::new(registry.clone());
+        controller.configure_memory_budget(
+            crate::memory_budget::RuntimeMemoryBudgetConfig {
+                mode: crate::memory_budget::BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: crate::memory_budget::MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 100,
+                    lease_step_bytes: 10,
+                    max_overshoot_per_runtime_bytes: 20,
+                    overshoot_debt_limit_bytes: 10,
+                },
+                topic_default_limit_bytes: 100,
+                runtime_count: 1,
+            },
+            None,
+        );
+        let handle = controller.memory_budget_state().register_runtime_snapshot();
+        let account = handle.local_account().expect("budget should be configured");
+        let _ticket = account
+            .charge(115_u64)
+            .expect("overshoot should be observed");
+
+        let entity_key = controller.register_engine_entity();
+        let (_rx, reporter) = MetricsReporter::create_new_and_receiver(16);
+        let mut monitor = EngineMetricsMonitor::new(
+            registry,
+            entity_key,
+            reporter,
+            controller.memory_pressure_state(),
+            controller.memory_budget_state(),
+        );
+
+        monitor.update();
+
+        assert_eq!(monitor.metrics.runtime_memory_budget_runtime_count.get(), 1);
+        assert_eq!(
+            monitor.metrics.runtime_memory_budget_charged_bytes.get(),
+            115
+        );
+        assert_eq!(
+            monitor.metrics.runtime_memory_budget_overshoot_bytes.get(),
+            15
+        );
+        assert_eq!(
+            monitor
+                .metrics
+                .runtime_memory_budget_soft_runtime_count
+                .get(),
+            1
+        );
     }
 }

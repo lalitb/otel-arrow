@@ -264,6 +264,7 @@ connections:
                 resources: ResourcesPolicy {
                     core_allocation: CoreAllocation::core_count(1),
                     memory_limiter: None,
+                    memory_budget: None,
                 },
                 ..ResolvedPolicies::default()
             },
@@ -298,6 +299,7 @@ connections:
                 resources: ResourcesPolicy {
                     core_allocation: CoreAllocation::core_count(2),
                     memory_limiter: None,
+                    memory_budget: None,
                 },
                 ..ResolvedPolicies::default()
             },

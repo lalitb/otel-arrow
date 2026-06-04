@@ -9,6 +9,7 @@ use crate::attributes::{
     PipelineAttributeSet, config_map_to_telemetry,
 };
 use crate::entity_context::{current_node_telemetry_handle, node_entity_key};
+use crate::memory_budget::{MemoryBudgetState, RuntimeMemorySnapshotHandle};
 use crate::memory_limiter::MemoryPressureState;
 use crate::node::NodeId as EngineNodeId;
 use otap_df_config::node::NodeKind;
@@ -103,6 +104,7 @@ pub struct ControllerContext {
     container_id: Cow<'static, str>,
     numa_node_id: usize,
     memory_pressure_state: MemoryPressureState,
+    memory_budget_state: MemoryBudgetState,
 }
 
 /// Parameters required to create a pipeline context.
@@ -144,6 +146,8 @@ pub struct PipelineContext {
     /// Optional pipeline-scoped topic set injected by the controller.
     /// ToDo: Make PipelineContext generic over a TopicSet type to avoid dynamic typing here.
     topic_set: Option<Arc<dyn Any + Send + Sync>>,
+    /// Observe-only runtime memory-budget snapshot for this deployed runtime.
+    memory_budget_snapshot: Option<RuntimeMemorySnapshotHandle>,
 }
 
 impl ControllerContext {
@@ -156,6 +160,7 @@ impl ControllerContext {
             container_id: CONTAINER_ID.clone(),
             numa_node_id: 0, // ToDo(LQ): Set NUMA node ID if available
             memory_pressure_state: MemoryPressureState::default(),
+            memory_budget_state: MemoryBudgetState::default(),
         }
     }
 
@@ -231,6 +236,22 @@ impl ControllerContext {
     pub fn memory_pressure_state(&self) -> MemoryPressureState {
         self.memory_pressure_state.clone()
     }
+
+    /// Returns the shared runtime memory-budget state.
+    #[must_use]
+    pub fn memory_budget_state(&self) -> MemoryBudgetState {
+        self.memory_budget_state.clone()
+    }
+
+    /// Configures the shared runtime memory-budget state.
+    pub fn configure_memory_budget(
+        &self,
+        config: crate::memory_budget::RuntimeMemoryBudgetConfig,
+        process_hard_limit_bytes: Option<u64>,
+    ) {
+        self.memory_budget_state
+            .configure(config, process_hard_limit_bytes);
+    }
 }
 
 impl PipelineContext {
@@ -249,6 +270,10 @@ impl PipelineContext {
         pipeline_context_params: PipelineContextParams,
         deployment_generation: u64,
     ) -> Self {
+        let memory_budget_state = parent_ctx.memory_budget_state();
+        let memory_budget_snapshot = memory_budget_state
+            .is_enabled()
+            .then(|| memory_budget_state.register_runtime_snapshot());
         Self {
             controller_context: parent_ctx,
             pipeline_context_params,
@@ -261,6 +286,7 @@ impl PipelineContext {
             internal_telemetry: None,
             node_names: Arc::new(HashMap::new()),
             topic_set: None,
+            memory_budget_snapshot,
         }
     }
 
@@ -318,6 +344,12 @@ impl PipelineContext {
     #[must_use]
     pub fn memory_pressure_state(&self) -> MemoryPressureState {
         self.controller_context.memory_pressure_state()
+    }
+
+    /// Returns the runtime memory-budget snapshot for this deployed runtime, if configured.
+    #[must_use]
+    pub fn memory_budget_snapshot(&self) -> Option<RuntimeMemorySnapshotHandle> {
+        self.memory_budget_snapshot.clone()
     }
 
     /// Sets the shared node-name-to-index mapping for this pipeline context.
@@ -592,6 +624,7 @@ impl PipelineContext {
             internal_telemetry: None,
             node_names: self.node_names.clone(),
             topic_set: self.topic_set.clone(),
+            memory_budget_snapshot: self.memory_budget_snapshot.clone(),
         }
     }
 }

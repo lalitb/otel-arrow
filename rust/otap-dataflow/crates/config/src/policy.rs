@@ -7,7 +7,8 @@ use crate::byte_units;
 use crate::health::HealthPolicy;
 use crate::transport_headers_policy::TransportHeadersPolicy;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::de::Error as DeError;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashSet;
 use std::fmt::Display;
 use std::time::Duration;
@@ -172,6 +173,67 @@ impl Policies {
                 _ => errors.push(format!(
                     "{limiter_path}.soft_limit and {limiter_path}.hard_limit must either both be set or both be omitted"
                 )),
+            }
+        }
+        if let Some(memory_budget) = self
+            .resources
+            .as_ref()
+            .and_then(|resources| resources.memory_budget.as_ref())
+        {
+            let budget_path = format!("{path_prefix}.resources.memory_budget");
+            if memory_budget.mode == MemoryBudgetMode::Enforce {
+                errors.push(format!(
+                    "{budget_path}.mode enforce is not supported until memory-budget ticket and escrow ownership is implemented"
+                ));
+            }
+            if memory_budget.retry_after_secs == 0 {
+                errors.push(format!(
+                    "{budget_path}.retry_after_secs must be greater than 0"
+                ));
+            }
+            if memory_budget.sizing.reserve == 0 {
+                errors.push(format!(
+                    "{budget_path}.sizing.reserve must be greater than 0"
+                ));
+            }
+            if memory_budget.sizing.floor_per_runtime == 0 {
+                errors.push(format!(
+                    "{budget_path}.sizing.floor_per_runtime must be greater than 0"
+                ));
+            }
+            if memory_budget.sizing.lease_step == 0 {
+                errors.push(format!(
+                    "{budget_path}.sizing.lease_step must be greater than 0"
+                ));
+            }
+            if memory_budget.sizing.max_overshoot_per_runtime == 0 {
+                errors.push(format!(
+                    "{budget_path}.sizing.max_overshoot_per_runtime must be greater than 0"
+                ));
+            }
+            if memory_budget.sizing.lease_step > memory_budget.sizing.floor_per_runtime {
+                errors.push(format!(
+                    "{budget_path}.sizing.lease_step must be less than or equal to {budget_path}.sizing.floor_per_runtime"
+                ));
+            }
+            if memory_budget.sizing.lease_step > memory_budget.sizing.max_overshoot_per_runtime / 2
+            {
+                errors.push(format!(
+                    "{budget_path}.sizing.lease_step must be less than or equal to half of {budget_path}.sizing.max_overshoot_per_runtime"
+                ));
+            }
+            if memory_budget.escrow.topic_default_limit == 0 {
+                errors.push(format!(
+                    "{budget_path}.escrow.topic_default_limit must be greater than 0"
+                ));
+            }
+            if memory_budget.enforcement.receiver_admission
+                || memory_budget.enforcement.queue_publish
+                || memory_budget.enforcement.reclaim_hooks
+            {
+                errors.push(format!(
+                    "{budget_path}.enforcement flags must remain false until memory-budget ownership and reclaim paths are implemented"
+                ));
             }
         }
 
@@ -384,6 +446,12 @@ pub struct ResourcesPolicy {
     /// scope. Group and pipeline overrides are rejected during engine validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_limiter: Option<MemoryLimiterPolicy>,
+    /// Optional runtime memory-budget configuration.
+    ///
+    /// This is currently supported only at the top-level `policies.resources`
+    /// scope. Group and pipeline overrides are rejected during engine validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_budget: Option<MemoryBudgetPolicy>,
 }
 
 /// Process-wide memory limiter declarations.
@@ -459,6 +527,14 @@ const fn default_memory_limiter_purge_min_interval() -> Duration {
     Duration::from_secs(5)
 }
 
+fn deserialize_required_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    byte_units::deserialize_u64(deserializer)?
+        .ok_or_else(|| DeError::custom("required byte size is missing"))
+}
+
 /// Preferred memory source for the process-wide limiter.
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -472,6 +548,97 @@ pub enum MemoryLimiterSource {
     Rss,
     /// Use jemalloc resident bytes only.
     JemallocResident,
+}
+
+/// Runtime memory-budget declarations.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryBudgetPolicy {
+    /// Runtime behavior applied by the budget. Only observe-only is supported
+    /// until ticket and escrow ownership lands.
+    pub mode: MemoryBudgetMode,
+    /// Retry-After hint reserved for future admission enforcement.
+    #[serde(default = "default_memory_limiter_retry_after_secs")]
+    pub retry_after_secs: u32,
+    /// Runtime lease sizing policy.
+    pub sizing: MemoryBudgetSizingPolicy,
+    /// Cross-runtime escrow policy.
+    pub escrow: MemoryBudgetEscrowPolicy,
+    /// Enforcement feature gates. All gates must remain false in observe-only.
+    #[serde(default)]
+    pub enforcement: MemoryBudgetEnforcementPolicy,
+}
+
+/// Runtime memory-budget mode.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryBudgetMode {
+    /// Update metrics/logs only; do not reject or shed.
+    ObserveOnly,
+    /// Reject or defer work at budget boundaries.
+    Enforce,
+}
+
+/// Runtime memory-budget sizing strategy.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryBudgetSizingStrategy {
+    /// Runtime budgets are backed by local floors plus leases from a global pool.
+    Leased,
+}
+
+/// Runtime memory-budget sizing policy.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryBudgetSizingPolicy {
+    /// Sizing strategy.
+    pub strategy: MemoryBudgetSizingStrategy,
+    /// Process-wide bytes reserved outside runtime floors.
+    #[serde(deserialize_with = "deserialize_required_u64")]
+    #[schemars(with = "String")]
+    pub reserve: u64,
+    /// Minimum bytes assigned to each runtime when a process hard limit is not
+    /// available or after reserve/floor allocation.
+    #[serde(deserialize_with = "deserialize_required_u64")]
+    #[schemars(with = "String")]
+    pub floor_per_runtime: u64,
+    /// Coarse lease unit borrowed from the global pool.
+    #[serde(deserialize_with = "deserialize_required_u64")]
+    #[schemars(with = "String")]
+    pub lease_step: u64,
+    /// Maximum local overshoot before the runtime is classified as hard.
+    #[serde(deserialize_with = "deserialize_required_u64")]
+    #[schemars(with = "String")]
+    pub max_overshoot_per_runtime: u64,
+    /// Overshoot debt threshold retained for future enforcement and reclaim.
+    #[serde(deserialize_with = "deserialize_required_u64")]
+    #[schemars(with = "String")]
+    pub overshoot_debt_limit: u64,
+}
+
+/// Cross-runtime escrow policy.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryBudgetEscrowPolicy {
+    /// Default bytes allowed per topic escrow bucket.
+    #[serde(deserialize_with = "deserialize_required_u64")]
+    #[schemars(with = "String")]
+    pub topic_default_limit: u64,
+}
+
+/// Runtime memory-budget enforcement gates.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryBudgetEnforcementPolicy {
+    /// Enforce receiver admission against runtime budget.
+    #[serde(default)]
+    pub receiver_admission: bool,
+    /// Enforce local/shared queue publish against runtime or escrow budget.
+    #[serde(default)]
+    pub queue_publish: bool,
+    /// Enable reclaim hooks for retained-memory sources.
+    #[serde(default)]
+    pub reclaim_hooks: bool,
 }
 
 /// Defines how CPU cores should be allocated for pipeline execution.
@@ -709,6 +876,7 @@ mod tests {
             resources: super::ResourcesPolicy {
                 core_allocation: super::CoreAllocation::core_count(1),
                 memory_limiter: None,
+                memory_budget: None,
             },
             ..super::ResolvedPolicies::default()
         };
@@ -716,6 +884,7 @@ mod tests {
             resources: super::ResourcesPolicy {
                 core_allocation: super::CoreAllocation::core_count(2),
                 memory_limiter: None,
+                memory_budget: None,
             },
             ..super::ResolvedPolicies::default()
         };
@@ -955,6 +1124,7 @@ mod tests {
                     purge_on_hard: false,
                     purge_min_interval: Duration::from_secs(5),
                 }),
+                memory_budget: None,
             }),
             ..Policies::default()
         };
@@ -983,6 +1153,7 @@ mod tests {
                     purge_on_hard: false,
                     purge_min_interval: Duration::from_secs(5),
                 }),
+                memory_budget: None,
             }),
             ..Policies::default()
         };
@@ -1009,6 +1180,7 @@ mod tests {
                     purge_on_hard: false,
                     purge_min_interval: Duration::from_secs(5),
                 }),
+                memory_budget: None,
             }),
             ..Policies::default()
         };
@@ -1035,6 +1207,7 @@ mod tests {
                     purge_on_hard: false,
                     purge_min_interval: Duration::from_secs(5),
                 }),
+                memory_budget: None,
             }),
             ..Policies::default()
         };
@@ -1061,6 +1234,7 @@ mod tests {
                     purge_on_hard: false,
                     purge_min_interval: Duration::from_secs(5),
                 }),
+                memory_budget: None,
             }),
             ..Policies::default()
         };
@@ -1087,6 +1261,7 @@ mod tests {
                     purge_on_hard: true,
                     purge_min_interval: Duration::ZERO,
                 }),
+                memory_budget: None,
             }),
             ..Policies::default()
         };
@@ -1094,6 +1269,75 @@ mod tests {
         let errors = policies.validation_errors("policies");
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("purge_min_interval must be greater than 0"));
+    }
+
+    #[test]
+    fn validates_memory_budget_rejects_enforce_until_ownership_lands() {
+        let policies = Policies {
+            resources: Some(super::ResourcesPolicy {
+                core_allocation: super::CoreAllocation::all_cores(),
+                memory_limiter: None,
+                memory_budget: Some(super::MemoryBudgetPolicy {
+                    mode: super::MemoryBudgetMode::Enforce,
+                    retry_after_secs: 1,
+                    sizing: super::MemoryBudgetSizingPolicy {
+                        strategy: super::MemoryBudgetSizingStrategy::Leased,
+                        reserve: 512 * 1024 * 1024,
+                        floor_per_runtime: 256 * 1024 * 1024,
+                        lease_step: 64 * 1024,
+                        max_overshoot_per_runtime: 128 * 1024 * 1024,
+                        overshoot_debt_limit: 16 * 1024 * 1024,
+                    },
+                    escrow: super::MemoryBudgetEscrowPolicy {
+                        topic_default_limit: 64 * 1024 * 1024,
+                    },
+                    enforcement: super::MemoryBudgetEnforcementPolicy::default(),
+                }),
+            }),
+            ..Policies::default()
+        };
+
+        let errors = policies.validation_errors("policies");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("mode enforce is not supported"));
+    }
+
+    #[test]
+    fn validates_memory_budget_lease_sizing() {
+        let policies = Policies {
+            resources: Some(super::ResourcesPolicy {
+                core_allocation: super::CoreAllocation::all_cores(),
+                memory_limiter: None,
+                memory_budget: Some(super::MemoryBudgetPolicy {
+                    mode: super::MemoryBudgetMode::ObserveOnly,
+                    retry_after_secs: 1,
+                    sizing: super::MemoryBudgetSizingPolicy {
+                        strategy: super::MemoryBudgetSizingStrategy::Leased,
+                        reserve: 512 * 1024 * 1024,
+                        floor_per_runtime: 64 * 1024,
+                        lease_step: 128 * 1024,
+                        max_overshoot_per_runtime: 128 * 1024,
+                        overshoot_debt_limit: 16 * 1024,
+                    },
+                    escrow: super::MemoryBudgetEscrowPolicy {
+                        topic_default_limit: 64 * 1024 * 1024,
+                    },
+                    enforcement: super::MemoryBudgetEnforcementPolicy::default(),
+                }),
+            }),
+            ..Policies::default()
+        };
+
+        let errors = policies.validation_errors("policies");
+        assert_eq!(errors.len(), 2);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("sizing.floor_per_runtime"))
+        );
+        assert!(errors.iter().any(|error| error.contains(
+            "half of policies.resources.memory_budget.sizing.max_overshoot_per_runtime"
+        )));
     }
 
     #[test]
