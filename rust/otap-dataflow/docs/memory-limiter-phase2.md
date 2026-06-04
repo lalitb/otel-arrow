@@ -444,6 +444,11 @@ sum(runtime_charged_bytes) + sum(escrow_charged_bytes)
     <= process_budget - reserve + allowed_overshoot
 ```
 
+`allowed_overshoot` is the bounded debt allowance, initially
+`overshoot_debt_limit * active_runtime_count`. It is intentionally tighter than
+`max_overshoot_per_runtime * active_runtime_count`, which is a per-runtime
+classification ceiling rather than a steady-state process allowance.
+
 Floors are admission guarantees, not permanently carved physical reservations.
 Moving bytes from a runtime account into escrow should transfer logical
 ownership without increasing the global logical total. The transfer should
@@ -527,9 +532,9 @@ fanout materializes retained branches and should reserve one logical owner per
 branch. The current topic backend stores sendable `Arc<T>` envelopes in a
 process-global broker/ring, so the first topic-budget implementation should
 charge broadcast by ring-slot occupancy and release on eviction, disconnect, or
-final delivery cleanup. Per-subscriber virtual branch tickets are a possible
-future extension, but they require explicit subscriber-cursor ownership rather
-than the current shared ring-slot model.
+topic close. Per-subscriber virtual branch tickets and final-subscriber release
+are possible future extensions, but they require explicit subscriber-cursor
+ownership rather than the current shared ring-slot model.
 
 ### Charge Sites
 
@@ -688,9 +693,8 @@ The broadcast escrow owner is the broker slot:
 2. The broker owns that charge while the slot is retained.
 3. Subscriber delivery may redeem into a local ticket when the subscriber
    actually retains the item outside the broker slot.
-4. Ring overwrite, drop-oldest eviction, subscriber disconnect with pending
-   retained items, explicit abort, and final slot release must release the
-   corresponding escrow owner exactly once.
+4. Ring overwrite, drop-oldest eviction, explicit abort, topic close, and final
+   broker-slot drain must release the ring-slot escrow owner exactly once.
 
 Per-subscriber virtual branch tickets are a future extension. If added, the
 broker must snapshot the subscriber set at publish time and create refcounted
@@ -737,8 +741,11 @@ accounting ownership.
 
 `EscrowTicket::drop` should not silently release accounting as if delivery had
 succeeded. Dropping an unresolved escrow ticket records an abandoned escrow
-entry in a leak-detection graveyard with a deadline. A normal abort, eviction,
-or tracked negative outcome should release escrow explicitly before drop.
+entry in a leak-detection graveyard with a deadline. Graveyard entries remain
+charged until leak detection resolves them explicitly, so leaks remain visible
+instead of being converted into silent accounting success. A normal abort,
+eviction, or tracked negative outcome should release escrow explicitly before
+drop.
 
 Existing channel `SendError<T>` shapes should be reused where possible by
 making `T` the local or escrow envelope. Phase 2 should not introduce a
@@ -774,6 +781,10 @@ Bytes redeemed through this allowance are still charged to the consumer runtime.
 The allowance only permits redemption/drain progress while the runtime remains
 at local `Hard`; it does not make the work uncharged and does not admit new
 external ingress.
+
+The allowance applies regardless of why the runtime is at local `Hard`,
+including overshoot-debt-induced `Hard`. Otherwise a runtime that already owes
+budget debt could lose the drain path it needs to return to `Normal`.
 
 If the allowance is exhausted, the consumer should be able to abort the delivery
 without acquiring budget. Abort/drop releases escrow ownership and reports the
@@ -1068,7 +1079,8 @@ Some validation requires resolved runtime count and the effective process hard
 limit, so it must run during controller startup after preflight core resolution,
 not only at YAML parse time. Startup should fail with a budget-specific error
 when `floor_per_runtime * runtime_count + reserve` exceeds the process hard
-limit in a mode that needs derived sizing.
+limit in a mode that needs derived sizing, for example
+`MemoryBudgetError::OverBudget { floors_sum, reserve, process_hard_limit }`.
 
 Sizing and placement fields should be ignored by
 `ResolvedPolicies::eq_ignoring_resources`, just like other resource placement
@@ -1123,6 +1135,9 @@ Add runtime/generation-scoped metrics:
 | `engine.runtime_memory.current_overshoot_bytes` | Current bytes above local floor plus leases. |
 | `engine.runtime_memory.overshoot_bytes` | Cumulative bytes reconciled after growth without prior reservation. |
 | `engine.runtime_memory.level` | Runtime budget pressure state. |
+| `engine.runtime_memory.time_in_normal_secs` | Cumulative time spent at runtime `Normal`. |
+| `engine.runtime_memory.time_in_soft_secs` | Cumulative time spent at runtime `Soft`. |
+| `engine.runtime_memory.time_in_hard_secs` | Cumulative time spent at runtime `Hard`. |
 | `engine.runtime_memory.outstanding_tickets` | Number of live local tickets. |
 | `engine.runtime_memory.oldest_ticket_age_ms` | Age of the oldest live local ticket. |
 | `engine.runtime_memory.lease_borrows` | Count of successful lease borrows. |
@@ -1161,7 +1176,9 @@ Metric attributes should include:
 
 Metrics backed by local `Cell` state must be snapshotted on the pipeline runtime
 thread. Cross-thread metric consumers should read a separately published atomic
-or registry snapshot. Expensive ticket cardinality metrics such as
+or registry snapshot. Global metrics such as spare-pool bytes and global
+runtime/escrow totals read from global atomic counters and do not use the
+per-runtime local snapshot protocol. Expensive ticket cardinality metrics such as
 `outstanding_tickets` and `oldest_ticket_age_ms` are observe-only diagnostics or
 feature-gated debug metrics; they must not add ordered per-ticket tracking to
 the enforce hot path by default.
@@ -1238,6 +1255,11 @@ Reclaim ordering should be deterministic. The engine should ask reclaimers in
 `ReclaimPriority` order, use a fixed component-kind tie breaker, and stop once
 the target byte count is met or all reclaimers report no progress.
 
+In Phase 2e, shared retained memory is reported through metrics but is not
+eligible for local reclaim hooks. A later phase can add `SharedMemoryReclaim`
+for shared retention sites that materially contribute to runtime or escrow
+pressure.
+
 ## Live Reconfiguration
 
 Budget state must be generation-scoped. A runtime instance key includes
@@ -1300,6 +1322,8 @@ who require placement can choose `unsupported: error`.
 - Add NUMA topology discovery in the parallel placement track if runtime NUMA
   attributes are desired for metrics.
 - Populate real runtime `numa_node_id` when the placement track is available.
+- Do not gate memory-budget observability on the placement track. If placement
+  has not landed, emit `numa_node_id = 0` and report topology as unavailable.
 - Add runtime memory budget config in disabled/observe-only mode.
 - Add `RuntimeMemoryAccount` and metrics with manual or coarse charge points.
 - No behavior change.
