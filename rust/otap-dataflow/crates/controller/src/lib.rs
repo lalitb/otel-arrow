@@ -2118,7 +2118,7 @@ impl<
             // handle (which enforces single-take). The returned guard keeps
             // the budget installed for the entire pipeline run and clears the
             // slot on drop.
-            pipeline_context.initialize_memory_budget_runtime();
+            let _ = pipeline_context.initialize_memory_budget_runtime();
             let runtime_memory_budget = pipeline_context
                 .memory_budget_snapshot()
                 .and_then(|handle| handle.local_account())
