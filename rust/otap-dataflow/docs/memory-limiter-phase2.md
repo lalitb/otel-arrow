@@ -1357,6 +1357,15 @@ On runtime teardown:
 
 Logical memory budgets are platform-independent.
 
+Platform-specific functionality should sit behind small backend traits. The
+logical memory-budget model must not depend on a Linux-only implementation.
+Initial backends may target Linux, but process hard-limit discovery, NUMA
+topology discovery, memory placement, and allocator diagnostics should remain
+replaceable so Windows, macOS, and other Unix platforms can degrade explicitly
+or add native support later. Examples include process-memory-limit,
+NUMA-topology, memory-placement, and allocator-diagnostics backends; detailed
+trait APIs can be defined when each backend is implemented.
+
 NUMA placement is platform-specific:
 
 <!-- markdownlint-disable MD013 -->
