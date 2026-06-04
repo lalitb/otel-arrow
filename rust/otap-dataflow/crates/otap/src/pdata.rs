@@ -354,6 +354,14 @@ impl otap_df_engine::StampOutputPort for OtapPdata {
     }
 }
 
+impl otap_df_engine::memory_budget::ChargedSize for OtapPdata {
+    fn charged_size(&self) -> Option<u64> {
+        self.payload_ref()
+            .num_bytes()
+            .and_then(|bytes| u64::try_from(bytes).ok())
+    }
+}
+
 impl FlowMetricAccumulation for OtapPdata {
     fn start_flow_metric(&mut self) {
         // Build-time validation in `build_flow_metric_state` rejects flow_metrics

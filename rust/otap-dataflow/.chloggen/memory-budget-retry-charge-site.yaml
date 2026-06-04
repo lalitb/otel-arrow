@@ -1,0 +1,4 @@
+change_type: enhancement
+component: pipeline
+note: "Charge retry processor delayed-retry retention against the observe-only runtime memory budget."
+issues: []

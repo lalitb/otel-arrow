@@ -105,6 +105,10 @@ pub struct EngineMetrics {
     #[metric(unit = "{By}")]
     pub runtime_memory_budget_unknown_bytes: Gauge<u64>,
 
+    /// Retained item count observed without a known logical size.
+    #[metric(unit = "{item}")]
+    pub runtime_memory_budget_unknown_count: Gauge<u64>,
+
     /// Bytes above runtime floor plus leases.
     #[metric(unit = "{By}")]
     pub runtime_memory_budget_overshoot_bytes: Gauge<u64>,
@@ -232,6 +236,9 @@ impl EngineMetricsMonitor {
             .runtime_memory_budget_unknown_bytes
             .set(memory_budget.unknown_bytes);
         self.metrics
+            .runtime_memory_budget_unknown_count
+            .set(memory_budget.unknown_count);
+        self.metrics
             .runtime_memory_budget_overshoot_bytes
             .set(memory_budget.overshoot_bytes);
         self.metrics
@@ -281,7 +288,18 @@ impl Drop for EngineMetricsMonitor {
 mod tests {
     use super::*;
     use crate::context::ControllerContext;
+    use otap_df_telemetry::metrics::{MetricSetHandler, MetricSetSnapshot, MetricValue};
     use otap_df_telemetry::registry::TelemetryRegistryHandle;
+
+    fn engine_metric(snapshot: &MetricSetSnapshot, name: &str) -> MetricValue {
+        let index = EngineMetrics::default()
+            .descriptor()
+            .metrics
+            .iter()
+            .position(|field| field.name == name)
+            .unwrap_or_else(|| panic!("engine metric {name} should exist"));
+        snapshot.get_metrics()[index]
+    }
 
     #[test]
     fn engine_metrics_reports_nonzero_rss() {
@@ -420,7 +438,7 @@ mod tests {
         account.flush_snapshot();
 
         let entity_key = controller.register_engine_entity();
-        let (_rx, reporter) = MetricsReporter::create_new_and_receiver(16);
+        let (rx, reporter) = MetricsReporter::create_new_and_receiver(16);
         let mut monitor = EngineMetricsMonitor::new(
             registry,
             entity_key,
@@ -446,6 +464,28 @@ mod tests {
                 .runtime_memory_budget_soft_runtime_count
                 .get(),
             1
+        );
+
+        monitor
+            .report()
+            .expect("engine metrics report should succeed");
+        let snapshot = rx
+            .try_recv()
+            .expect("engine metrics snapshot should be emitted");
+        assert_eq!(
+            engine_metric(&snapshot, "runtime.memory.budget.soft.runtime.count"),
+            MetricValue::U64(1),
+            "reported soft runtime count should reflect threshold crossing"
+        );
+        assert_eq!(
+            engine_metric(&snapshot, "runtime.memory.budget.charged.bytes"),
+            MetricValue::U64(115),
+            "reported charged bytes should include retained runtime budget charge"
+        );
+        assert_eq!(
+            engine_metric(&snapshot, "runtime.memory.budget.overshoot.bytes"),
+            MetricValue::U64(15),
+            "reported overshoot bytes should include bytes above floor plus leases"
         );
     }
 }

@@ -131,6 +131,7 @@ pub struct RuntimeMemorySnapshot {
     borrowed_bytes: AtomicU64,
     charged_bytes: AtomicU64,
     unknown_bytes: AtomicU64,
+    unknown_count: AtomicU64,
     overshoot_bytes: AtomicU64,
     level: AtomicU64,
 }
@@ -141,12 +142,14 @@ impl RuntimeMemorySnapshot {
         borrowed_bytes: u64,
         charged_bytes: u64,
         unknown_bytes: u64,
+        unknown_count: u64,
         overshoot_bytes: u64,
         level: BudgetLevel,
     ) {
         self.borrowed_bytes.store(borrowed_bytes, Ordering::Relaxed);
         self.charged_bytes.store(charged_bytes, Ordering::Relaxed);
         self.unknown_bytes.store(unknown_bytes, Ordering::Relaxed);
+        self.unknown_count.store(unknown_count, Ordering::Relaxed);
         self.overshoot_bytes
             .store(overshoot_bytes, Ordering::Relaxed);
         self.level.store(level.as_u64(), Ordering::Relaxed);
@@ -168,6 +171,12 @@ impl RuntimeMemorySnapshot {
     #[must_use]
     pub fn unknown_bytes(&self) -> u64 {
         self.unknown_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Returns retained item count observed without a known logical size.
+    #[must_use]
+    pub fn unknown_count(&self) -> u64 {
+        self.unknown_count.load(Ordering::Relaxed)
     }
 
     /// Returns bytes above local floor plus leases.
@@ -200,6 +209,8 @@ pub struct MemoryBudgetSnapshot {
     pub charged_bytes: u64,
     /// Total unknown retained bytes observed without a known logical size.
     pub unknown_bytes: u64,
+    /// Total retained item count observed without a known logical size.
+    pub unknown_count: u64,
     /// Total bytes above runtime floors plus leases.
     pub overshoot_bytes: u64,
     /// Abandoned escrow tickets retained for leak detection.
@@ -275,7 +286,7 @@ impl MemoryBudgetState {
     pub fn register_runtime_snapshot(&self, scope: BudgetScopeId) -> RuntimeMemorySnapshotHandle {
         let snapshot = Arc::new(RuntimeMemorySnapshot::default());
         if self.config().is_some() {
-            snapshot.publish(0, 0, 0, 0, BudgetLevel::Normal);
+            snapshot.publish(0, 0, 0, 0, 0, BudgetLevel::Normal);
         }
         self.inner
             .snapshots
@@ -329,6 +340,9 @@ impl MemoryBudgetState {
             snapshot.unknown_bytes = snapshot
                 .unknown_bytes
                 .saturating_add(runtime.unknown_bytes());
+            snapshot.unknown_count = snapshot
+                .unknown_count
+                .saturating_add(runtime.unknown_count());
             snapshot.overshoot_bytes = snapshot
                 .overshoot_bytes
                 .saturating_add(runtime.overshoot_bytes());
@@ -551,6 +565,7 @@ pub struct RuntimeMemoryAccount {
     lease: LocalMemoryLease,
     charged_bytes: Cell<u64>,
     unknown_bytes: Cell<u64>,
+    unknown_count: Cell<u64>,
     overshoot_bytes: Cell<u64>,
     published_level: Cell<BudgetLevel>,
     dirty: Cell<bool>,
@@ -577,6 +592,7 @@ impl RuntimeMemoryAccount {
             lease: LocalMemoryLease::new(lease_step_bytes, max_overshoot_bytes, lease_authority),
             charged_bytes: Cell::new(0),
             unknown_bytes: Cell::new(0),
+            unknown_count: Cell::new(0),
             overshoot_bytes: Cell::new(0),
             published_level: Cell::new(BudgetLevel::Normal),
             dirty: Cell::new(false),
@@ -629,7 +645,21 @@ impl RuntimeMemoryAccount {
     /// to [`flush_snapshot`](Self::flush_snapshot) or a level transition.
     #[must_use]
     pub fn charge(self: &Rc<Self>, size: impl ChargedSize) -> Option<LocalMemoryTicket> {
-        let bytes = size.charged_size();
+        let Some(bytes) = size.charged_size() else {
+            if self.mode == BudgetMode::Enforce {
+                return None;
+            }
+            self.unknown_count
+                .set(self.unknown_count.get().saturating_add(1));
+            self.mark_dirty();
+            return Some(LocalMemoryTicket {
+                account: Rc::clone(self),
+                charge: LocalMemoryCharge::Unknown,
+                active: true,
+                scope: self.scope.clone(),
+                _not_send: PhantomData,
+            });
+        };
         match self.mode {
             BudgetMode::ObserveOnly => {
                 let _ = self.try_reserve_extra(bytes);
@@ -645,7 +675,7 @@ impl RuntimeMemoryAccount {
         self.reconcile_size();
         Some(LocalMemoryTicket {
             account: Rc::clone(self),
-            bytes,
+            charge: LocalMemoryCharge::KnownBytes(bytes),
             active: true,
             scope: self.scope.clone(),
             _not_send: PhantomData,
@@ -697,6 +727,12 @@ impl RuntimeMemoryAccount {
         self.reconcile_size();
     }
 
+    fn refund_unknown(&self) {
+        self.unknown_count
+            .set(self.unknown_count.get().saturating_sub(1));
+        self.mark_dirty();
+    }
+
     fn classify(&self, charged: u64) -> BudgetLevel {
         if charged <= self.available_without_overshoot() {
             BudgetLevel::Normal
@@ -726,6 +762,7 @@ impl RuntimeMemoryAccount {
             self.lease.borrowed_bytes(),
             self.charged_bytes.get(),
             self.unknown_bytes.get(),
+            self.unknown_count.get(),
             self.overshoot_bytes.get(),
             level,
         );
@@ -805,17 +842,26 @@ impl LocalMemoryLease {
 #[derive(Debug)]
 pub struct LocalMemoryTicket {
     account: Rc<RuntimeMemoryAccount>,
-    bytes: u64,
+    charge: LocalMemoryCharge,
     active: bool,
     scope: BudgetScopeId,
     _not_send: PhantomData<Rc<()>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalMemoryCharge {
+    KnownBytes(u64),
+    Unknown,
+}
+
 impl LocalMemoryTicket {
     /// Returns bytes owned by this ticket.
     #[must_use]
-    pub fn bytes(&self) -> u64 {
-        self.bytes
+    pub const fn bytes(&self) -> Option<u64> {
+        match self.charge {
+            LocalMemoryCharge::KnownBytes(bytes) => Some(bytes),
+            LocalMemoryCharge::Unknown => None,
+        }
     }
 
     /// Returns attribution scope for this ticket.
@@ -830,7 +876,9 @@ impl LocalMemoryTicket {
         mut self,
         state: &MemoryBudgetState,
     ) -> Result<EscrowTicket, LocalMemoryTicket> {
-        let bytes = self.bytes;
+        let LocalMemoryCharge::KnownBytes(bytes) = self.charge else {
+            return Err(self);
+        };
         if !state.try_charge_escrow(bytes) {
             return Err(self);
         }
@@ -848,7 +896,10 @@ impl LocalMemoryTicket {
 impl Drop for LocalMemoryTicket {
     fn drop(&mut self) {
         if self.active {
-            self.account.refund(self.bytes);
+            match self.charge {
+                LocalMemoryCharge::KnownBytes(bytes) => self.account.refund(bytes),
+                LocalMemoryCharge::Unknown => self.account.refund_unknown(),
+            }
             self.active = false;
         }
     }
@@ -894,31 +945,67 @@ impl Drop for EscrowTicket {
 
 /// Logical retained-size contract for memory budgeting.
 pub trait ChargedSize {
-    /// Returns the logical retained byte size.
-    fn charged_size(&self) -> u64;
+    /// Returns the logical retained byte size when known.
+    fn charged_size(&self) -> Option<u64>;
 }
 
 impl ChargedSize for u64 {
-    fn charged_size(&self) -> u64 {
-        *self
+    fn charged_size(&self) -> Option<u64> {
+        Some(*self)
+    }
+}
+
+impl ChargedSize for u32 {
+    fn charged_size(&self) -> Option<u64> {
+        Some((*self).into())
+    }
+}
+
+impl ChargedSize for i32 {
+    fn charged_size(&self) -> Option<u64> {
+        Some(u64::try_from(*self).unwrap_or(0))
     }
 }
 
 impl ChargedSize for usize {
-    fn charged_size(&self) -> u64 {
-        *self as u64
+    fn charged_size(&self) -> Option<u64> {
+        Some(*self as u64)
+    }
+}
+
+impl<T: ChargedSize + ?Sized> ChargedSize for &T {
+    fn charged_size(&self) -> Option<u64> {
+        (*self).charged_size()
+    }
+}
+
+impl<T: ChargedSize + ?Sized> ChargedSize for Box<T> {
+    fn charged_size(&self) -> Option<u64> {
+        self.as_ref().charged_size()
     }
 }
 
 impl ChargedSize for &[u8] {
-    fn charged_size(&self) -> u64 {
-        self.len() as u64
+    fn charged_size(&self) -> Option<u64> {
+        Some(self.len() as u64)
+    }
+}
+
+impl ChargedSize for str {
+    fn charged_size(&self) -> Option<u64> {
+        Some(self.len() as u64)
+    }
+}
+
+impl ChargedSize for String {
+    fn charged_size(&self) -> Option<u64> {
+        Some(self.len() as u64)
     }
 }
 
 impl ChargedSize for Vec<u8> {
-    fn charged_size(&self) -> u64 {
-        self.len() as u64
+    fn charged_size(&self) -> Option<u64> {
+        Some(self.len() as u64)
     }
 }
 
@@ -1081,6 +1168,20 @@ pub fn current_runtime_memory_budget() -> Option<Rc<RuntimeMemoryBudget>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use static_assertions::assert_not_impl_any;
+
+    struct UnknownSize;
+
+    impl ChargedSize for UnknownSize {
+        fn charged_size(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    assert_not_impl_any!(RuntimeMemoryAccount: Send, Sync);
+    assert_not_impl_any!(RuntimeMemoryBudget: Send, Sync);
+    assert_not_impl_any!(RuntimeMemoryBudgetGuard: Send, Sync);
+    assert_not_impl_any!(LocalMemoryTicket: Send, Sync);
 
     fn account_with_mode(
         mode: BudgetMode,
@@ -1120,12 +1221,61 @@ mod tests {
         let acct = account(100, 10, 20, 100);
         {
             let ticket = acct.charge(50_u64).expect("charge should fit");
-            assert_eq!(ticket.bytes(), 50);
+            assert_eq!(ticket.bytes(), Some(50));
             acct.flush_snapshot();
             assert_eq!(acct.snapshot.charged_bytes(), 50);
         }
         acct.flush_snapshot();
         assert_eq!(acct.snapshot.charged_bytes(), 0);
+    }
+
+    #[test]
+    fn unknown_size_ticket_tracks_unknown_retention_and_refunds_on_drop() {
+        let acct = account(100, 10, 20, 100);
+        {
+            let ticket = acct.charge(UnknownSize).expect("unknown is observed");
+            assert_eq!(ticket.bytes(), None);
+            acct.flush_snapshot();
+            assert_eq!(acct.snapshot.charged_bytes(), 0);
+            assert_eq!(acct.snapshot.unknown_count(), 1);
+        }
+        acct.flush_snapshot();
+        assert_eq!(acct.snapshot.unknown_count(), 0);
+    }
+
+    #[test]
+    fn unknown_size_ticket_cannot_convert_to_escrow() {
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 100,
+                    lease_step_bytes: 10,
+                    max_overshoot_per_runtime_bytes: 20,
+                    overshoot_debt_limit_bytes: 10,
+                },
+                topic_default_limit_bytes: 100,
+                runtime_count: 1,
+            },
+            None,
+        );
+        let acct = account(100, 10, 20, 100);
+        let ticket = acct.charge(UnknownSize).expect("unknown is observed");
+
+        assert!(ticket.try_into_escrow(&state).is_err());
+    }
+
+    #[test]
+    fn charged_size_blanket_impls_delegate_to_inner_value() {
+        let value = 42_u64;
+        let boxed = Box::new(7_u64);
+        assert_eq!((&value).charged_size(), Some(42));
+        assert_eq!(boxed.charged_size(), Some(7));
+        assert_eq!("abc".charged_size(), Some(3));
+        assert_eq!(String::from("abcd").charged_size(), Some(4));
     }
 
     #[test]
@@ -1237,7 +1387,7 @@ mod tests {
             .try_into_escrow(&state)
             .expect_err("escrow should reject above topic limit");
 
-        assert_eq!(ticket.bytes(), 50);
+        assert_eq!(ticket.bytes(), Some(50));
         acct.flush_snapshot();
         assert_eq!(acct.snapshot.charged_bytes(), 50);
     }
@@ -1304,7 +1454,7 @@ mod tests {
             .expect_err("second escrow should exceed aggregate limit");
 
         assert_eq!(first.bytes(), 40);
-        assert_eq!(second.bytes(), 30);
+        assert_eq!(second.bytes(), Some(30));
         assert_eq!(state.snapshot().escrow_ticket_count, 1);
         assert_eq!(state.snapshot().escrow_charged_bytes, 40);
     }
@@ -1350,7 +1500,7 @@ mod tests {
             .charge(121_u64)
             .expect("observe-only charge should record above hard");
 
-        assert_eq!(ticket.bytes(), 121);
+        assert_eq!(ticket.bytes(), Some(121));
         assert_eq!(acct.snapshot.charged_bytes(), 121);
         assert_eq!(acct.level(), BudgetLevel::Hard);
     }
