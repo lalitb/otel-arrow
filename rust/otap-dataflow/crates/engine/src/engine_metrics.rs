@@ -414,6 +414,10 @@ mod tests {
         let _ticket = account
             .charge(115_u64)
             .expect("overshoot should be observed");
+        // The charge crossed a level threshold (Normal -> Soft) which publishes
+        // automatically, but a final flush keeps the test resilient to future
+        // changes that defer the transition publish.
+        account.flush_snapshot();
 
         let entity_key = controller.register_engine_entity();
         let (_rx, reporter) = MetricsReporter::create_new_and_receiver(16);
