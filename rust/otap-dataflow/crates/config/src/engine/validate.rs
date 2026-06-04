@@ -95,6 +95,19 @@ impl OtelDataflowSpec {
                     ),
                 });
             }
+            if pipeline_group
+                .policies
+                .as_ref()
+                .and_then(|policies| policies.resources.as_ref())
+                .and_then(|resources| resources.memory_budget.as_ref())
+                .is_some()
+            {
+                errors.push(Error::InvalidUserConfig {
+                    error: format!(
+                        "groups.{pipeline_group_id}.policies.resources.memory_budget is not supported; configure the runtime budget only at top-level policies.resources.memory_budget"
+                    ),
+                });
+            }
             for (pipeline_id, pipeline) in &pipeline_group.pipelines {
                 if pipeline
                     .policies()
@@ -105,6 +118,18 @@ impl OtelDataflowSpec {
                     errors.push(Error::InvalidUserConfig {
                         error: format!(
                             "groups.{pipeline_group_id}.pipelines.{pipeline_id}.policies.resources.memory_limiter is not supported; configure the process-wide limiter only at top-level policies.resources.memory_limiter"
+                        ),
+                    });
+                }
+                if pipeline
+                    .policies()
+                    .and_then(|policies| policies.resources.as_ref())
+                    .and_then(|resources| resources.memory_budget.as_ref())
+                    .is_some()
+                {
+                    errors.push(Error::InvalidUserConfig {
+                        error: format!(
+                            "groups.{pipeline_group_id}.pipelines.{pipeline_id}.policies.resources.memory_budget is not supported; configure the runtime budget only at top-level policies.resources.memory_budget"
                         ),
                     });
                 }
