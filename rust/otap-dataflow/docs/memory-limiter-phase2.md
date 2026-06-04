@@ -15,6 +15,24 @@ In short:
 - Phase 2's main feature is per-runtime memory budgeting across cores.
 - NUMA-aware allocation is a related placement option, not the budget itself.
 
+## Table of Contents
+
+- [Goals](#goals)
+- [Non-Goals](#non-goals)
+- [Design at a Glance](#design-at-a-glance)
+- [Current Runtime Shape](#current-runtime-shape)
+- [Design Principles](#design-principles)
+- [Proposed Architecture](#proposed-architecture)
+- [Budget Model](#budget-model)
+- [Ticket Ownership](#ticket-ownership)
+- [Cross-Runtime Escrow](#cross-runtime-escrow)
+- [Admission Model](#admission-model)
+- [NUMA Placement Appendix](#numa-placement-appendix)
+- [Configuration](#configuration)
+- [Metrics](#metrics)
+- [Phased Rollout](#phased-rollout)
+- [Validation Scenarios](#validation-scenarios)
+
 ## Goals
 
 Phase 2 should provide:
@@ -52,6 +70,35 @@ Phase 2 also does not:
 - Require jemalloc for the logical accounting design.
 - Charge temporary scratch memory that is allocated and released within one
   poll turn unless it is retained across an await, queue, or state boundary.
+
+## Design at a Glance
+
+The rest of the design should preserve these invariants:
+
+- Every retained item has exactly one logical owner.
+- Logical charged bytes are not allocator bytes, RSS, jemalloc resident bytes,
+  or cgroup usage.
+- The common local charge path uses runtime-local `Cell` state; shared
+  coordination is coarse.
+- Local ownership is `!Send`; cross-runtime ownership uses sendable escrow.
+- Release, refund, drop, drain, and control-plane cleanup never acquire budget.
+- Observe-only metrics and coverage precede enforcement.
+
+Glossary:
+
+<!-- markdownlint-disable MD013 -->
+| Term | Meaning |
+| --- | --- |
+| Charged bytes | Logical retained bytes currently owned by a runtime or escrow boundary. |
+| Floor | Guaranteed logical budget assigned to each runtime before borrowing. |
+| Lease / `lease_step` | Coarse chunk borrowed from the process spare pool when a runtime exceeds its floor. |
+| Overshoot | Charged bytes above the local floor plus borrowed leases. |
+| Spare pool | Process hard limit minus reserve and runtime floors; leases are drawn from this pool. |
+| Escrow | Sendable ownership used while retained data sits in a shared queue, topic, or cross-runtime boundary. |
+| Redemption | Moving escrow ownership into the consumer runtime's local account. |
+| Graveyard | Leak-detection holding area for unresolved escrow drops. |
+| Generation | Deployment instance of a runtime; runtime-local accounts are generation-scoped, escrow is not. |
+<!-- markdownlint-enable MD013 -->
 
 ## Current Runtime Shape
 
@@ -328,6 +375,26 @@ The `!Send` property is required for soundness because local tickets refund
 through runtime-local state. Debug builds should assert that local ticket drop
 runs on the creating runtime thread.
 
+### Runtime Budget Access
+
+Local charge sites need a way to reach the single account owned by the pinned
+pipeline runtime thread without passing it through `PData` or shared node APIs.
+The intended implementation shape is a runtime-thread accessor installed after
+core pinning and before node construction:
+
+```rust
+pub fn set_current_runtime_memory_budget(
+    budget: Option<Rc<RuntimeMemoryBudget>>,
+) -> RuntimeMemoryBudgetGuard;
+
+pub fn current_runtime_memory_budget() -> Option<Rc<RuntimeMemoryBudget>>;
+```
+
+`RuntimeMemoryBudget` wraps the runtime's `Rc<RuntimeMemoryAccount>` and is
+itself `!Send`. The RAII guard clears the thread-local slot on the same runtime
+thread. Local charge sites may clone the returned `Rc` and charge retained work;
+shared queues, topics, and shared nodes must use escrow instead.
+
 ## Budget Model
 
 ### Initial Sizing
@@ -383,6 +450,28 @@ explicit `floor_per_runtime` and `reserve` values or remain disabled.
 
 Explicit sizing should override derived sizing for production deployments that
 know workload shape.
+
+### Worked Example
+
+Assume a 4 GiB process hard limit, 512 MiB reserve, and 4 active runtime
+instances with a 256 MiB floor each:
+
+```text
+runtime_floors = 4 * 256 MiB = 1024 MiB
+spare_pool = 4096 MiB - 512 MiB - 1024 MiB = 2560 MiB
+```
+
+With `lease_step = 64 MiB` and `max_overshoot_per_runtime = 128 MiB`, runtime A
+classifies as:
+
+- 200 MiB charged: `Normal`, within its 256 MiB floor.
+- 260 MiB charged: borrows one 64 MiB lease, still `Normal`.
+- 380 MiB charged: 60 MiB above floor plus lease, so `Soft`.
+- 460 MiB charged: above floor plus lease plus 128 MiB overshoot, so `Hard`.
+
+If runtime A later drops retained work back to 240 MiB, it returns lease chunks
+lazily and publishes the lower charged-byte snapshot at the next metric flush
+or level transition.
 
 ### Elastic Leases
 
@@ -530,14 +619,17 @@ Implement a sizing contract such as:
 
 ```rust
 pub trait ChargedSize {
-    fn charged_size_bytes(&self) -> u64;
+    fn charged_size(&self) -> Option<u64>;
 }
 ```
 
 `ChargedSize` implementations used on hot paths must be O(1), allocation-free,
 and lock-free. If exact retained size requires traversal, parsing, or
 aggregation, the component should compute or cache that size when the retained
-envelope or buffer is created and charge from the cached value.
+envelope or buffer is created and charge from the cached value. Returning
+`None` means the retained item has unknown logical size; observe-only must count
+it explicitly, and enforcement must exclude or reject it until a known-size path
+exists.
 
 Allowed charge sources:
 
@@ -1206,42 +1298,44 @@ with explicit single-runtime ownership.
 
 ## Metrics
 
-Add runtime/generation-scoped metrics:
+Add engine metric-set fields for runtime budget visibility. The telemetry
+macro derives dotted metric names from Rust field names, so a field such as
+`runtime_memory_budget_charged_bytes` is emitted as
+`engine.runtime.memory.budget.charged.bytes`.
 
 <!-- markdownlint-disable MD013 -->
 | Metric | Description |
 | --- | --- |
-| `engine.runtime_memory.charged_bytes` | Logical bytes charged to the runtime. |
-| `engine.runtime_memory.peak_charged_bytes` | Peak logical bytes since runtime start. |
-| `engine.runtime_memory.floor_bytes` | Guaranteed local floor. |
-| `engine.runtime_memory.borrowed_bytes` | Bytes borrowed from the global lease pool. |
-| `engine.runtime_memory.current_overshoot_bytes` | Current bytes above local floor plus leases. |
-| `engine.runtime_memory.overshoot_bytes` | Cumulative bytes reconciled after growth without prior reservation. |
-| `engine.runtime_memory.level` | Runtime budget pressure state. |
-| `engine.runtime_memory.time_in_normal_secs` | Cumulative time spent at runtime `Normal`. |
-| `engine.runtime_memory.time_in_soft_secs` | Cumulative time spent at runtime `Soft`. |
-| `engine.runtime_memory.time_in_hard_secs` | Cumulative time spent at runtime `Hard`. |
-| `engine.runtime_memory.outstanding_tickets` | Number of live local tickets. |
-| `engine.runtime_memory.oldest_ticket_age_ms` | Age of the oldest live local ticket. |
-| `engine.runtime_memory.lease_borrows` | Count of successful lease borrows. |
-| `engine.runtime_memory.lease_failures` | Count of failed lease borrows. |
-| `engine.runtime_memory.rejections` | Rejections by local memory budget. |
-| `engine.runtime_memory.shadow_rejections` | Work that would have been rejected if enforcement were enabled. |
-| `engine.runtime_memory.unknown_size_bytes` | Retained bytes excluded from enforcement because exact logical size is unknown. |
-| `engine.runtime_memory.covered_retained_bytes` | Retained bytes covered by ticket ownership. |
-| `engine.runtime_memory.uncovered_retained_bytes` | Retained bytes observed without a ticket owner. |
-| `engine.escrow_memory.charged_bytes` | Logical bytes owned by an escrow boundary. |
-| `engine.escrow_memory.ring_occupancy_bytes` | Broadcast or mixed-topic ring-slot escrow bytes. |
-| `engine.escrow_memory.evicted_bytes` | Escrow bytes released by eviction or lag policy. |
-| `engine.escrow_memory.abandoned_bytes` | Escrow bytes moved to the leak-detection graveyard. |
-| `engine.escrow_memory.oldest_in_transit_age_ms` | Age of the oldest retained escrow owner. |
-| `engine.escrow_memory.rejections` | Publish or redemption failures by escrow. |
-| `engine.escrow_memory.shadow_rejections` | Publish or redemption work that would have failed under enforcement. |
-| `engine.global_memory.runtime_charged_bytes` | Sum of runtime logical charges. |
-| `engine.global_memory.escrow_charged_bytes` | Sum of escrow logical charges. |
-| `engine.global_memory.spare_available_bytes` | Remaining global spare pool. |
-| `engine.numa.node_id` | NUMA node assigned to the runtime core. |
-| `engine.allocator.arena_resident_bytes` | Optional jemalloc arena resident bytes. |
+| `engine.runtime.memory.budget.charged.bytes` | Logical bytes charged to runtimes. |
+| `engine.runtime.memory.budget.peak.charged.bytes` | Peak logical bytes since runtime start. |
+| `engine.runtime.memory.budget.floor.bytes` | Guaranteed local floor. |
+| `engine.runtime.memory.budget.borrowed.bytes` | Bytes borrowed from the global lease pool. |
+| `engine.runtime.memory.budget.current.overshoot.bytes` | Current bytes above local floor plus leases. |
+| `engine.runtime.memory.budget.overshoot.bytes` | Cumulative bytes reconciled after growth without prior reservation. |
+| `engine.runtime.memory.budget.level` | Runtime budget pressure state. |
+| `engine.runtime.memory.budget.time.in.normal.secs` | Cumulative time spent at runtime `Normal`. |
+| `engine.runtime.memory.budget.time.in.soft.secs` | Cumulative time spent at runtime `Soft`. |
+| `engine.runtime.memory.budget.time.in.hard.secs` | Cumulative time spent at runtime `Hard`. |
+| `engine.runtime.memory.budget.outstanding.tickets` | Number of live local tickets. |
+| `engine.runtime.memory.budget.oldest.ticket.age.ms` | Age of the oldest live local ticket. |
+| `engine.runtime.memory.budget.lease.borrows` | Count of successful lease borrows. |
+| `engine.runtime.memory.budget.lease.failures` | Count of failed lease borrows. |
+| `engine.runtime.memory.budget.rejections` | Rejections by local memory budget. |
+| `engine.runtime.memory.budget.shadow.rejections` | Work that would have been rejected if enforcement were enabled. |
+| `engine.runtime.memory.budget.unknown.bytes` | Retained bytes excluded from enforcement because exact logical size is unknown. |
+| `engine.runtime.memory.budget.unknown.count` | Retained item count observed without a known logical size. |
+| `engine.runtime.memory.budget.covered.retained.bytes` | Retained bytes covered by ticket ownership. |
+| `engine.runtime.memory.budget.uncovered.retained.bytes` | Retained bytes observed without a ticket owner. |
+| `engine.runtime.memory.budget.escrow.charged.bytes` | Logical bytes owned by an escrow boundary. |
+| `engine.runtime.memory.budget.escrow.ring.occupancy.bytes` | Broadcast or mixed-topic ring-slot escrow bytes. |
+| `engine.runtime.memory.budget.escrow.evicted.bytes` | Escrow bytes released by eviction or lag policy. |
+| `engine.runtime.memory.budget.escrow.abandoned.bytes` | Escrow bytes moved to the leak-detection graveyard. |
+| `engine.runtime.memory.budget.escrow.oldest.in.transit.age.ms` | Age of the oldest retained escrow owner. |
+| `engine.runtime.memory.budget.escrow.rejections` | Publish or redemption failures by escrow. |
+| `engine.runtime.memory.budget.escrow.shadow.rejections` | Publish or redemption work that would have failed under enforcement. |
+| `engine.runtime.memory.budget.spare.available.bytes` | Remaining global spare pool. |
+| `engine.numa.node.id` | NUMA node assigned to the runtime core. |
+| `engine.allocator.arena.resident.bytes` | Optional jemalloc arena resident bytes. |
 <!-- markdownlint-enable MD013 -->
 
 Metric attributes should include:
