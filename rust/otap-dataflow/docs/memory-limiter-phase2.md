@@ -375,9 +375,12 @@ The exact names can change during implementation. The important split is:
 - `BudgetScopeId` is immutable attribution carried by accounts, tickets, and
   escrow when identity is known.
 
-`GlobalLeasePool` is the only `LeaseAuthority` implementation in Phase 2.
-Future group or pipeline budgets should be added as additional authorities in
-the lease hierarchy, not by changing ticket or escrow ownership shapes.
+`GlobalLeasePool` is the only `LeaseAuthority` implementation in Phase 2. This
+keeps the capacity hierarchy flat: global spare pool to per-runtime leases.
+Future group, pipeline, or tenant enforcement can add policy authorities later,
+but only after local ticket ownership and escrow ownership are proven. Those
+future authorities must layer on top of the same ticket and escrow ownership
+shapes instead of changing what owns retained bytes.
 
 ### Ticket Attachment
 
@@ -755,6 +758,7 @@ Some components change retained size. They should update the ticket:
 
 ```rust
 impl LocalMemoryTicket {
+    pub fn try_resize(&mut self, old_bytes: u64, new_bytes: u64) -> Result<(), BudgetError>;
     pub fn try_reserve_extra(&mut self, extra_bytes: u64) -> Result<(), BudgetError>;
     pub fn reconcile_size(&mut self, new_bytes: u64);
     pub fn try_reserve_clone(&self, bytes: u64) -> Result<LocalMemoryTicket, BudgetError>;
@@ -765,7 +769,14 @@ impl LocalMemoryTicket {
 }
 ```
 
-Growing retained memory requires reserving before the grow:
+When a component knows both the previous and new retained size, it should use
+`try_resize(old_bytes, new_bytes)`. The method reserves any positive delta
+before the caller commits the growth, shrinks infallibly when `new_bytes` is
+smaller, and leaves the original ticket and original charge valid if the grow
+reservation fails.
+
+Some components only learn the final size after mutation. In those cases,
+growing retained memory requires reserving before the grow:
 
 1. Call `try_reserve_extra(extra_bytes)`.
 2. Grow the retained buffer or state only if reservation succeeds.
@@ -787,6 +798,9 @@ Component-specific behavior applies when reservation fails before growth:
 - processors can request drain/reclaim or stop buffering
 - exporters can apply backpressure or fail according to existing policy
 
+In all cases, a failed grow or resize must preserve the existing owner and
+charge. The caller must be able to continue using, retrying, dropping, or
+returning the original retained item without creating an uncharged interval.
 Shrinking or dropping a ticket must always succeed.
 
 Repeated reconciliation overshoot is budget debt. The policy should define an
@@ -1312,6 +1326,12 @@ broker state. Enforcing a group budget before local tickets and escrow tickets
 own those bytes would risk double-counting, missed releases, or ambiguous
 admission decisions.
 
+Phase 2 should still carry group and pipeline attribution as soon as that
+identity is known. Observe-only accounting and diagnostics can aggregate charged
+bytes by pipeline group, pipeline, node, and retention site without making those
+dimensions budget owners. This gives operators group-level visibility before
+group-level enforcement exists.
+
 Future group budgets should be layered on top of the runtime and escrow
 ownership model instead of becoming a separate allocator:
 
@@ -1320,7 +1340,8 @@ ownership model instead of becoming a separate allocator:
 - runtime snapshots and escrow snapshots aggregate charged bytes by group and
   pipeline for metrics
 - group quota enforcement uses those aggregates only after local, shared-channel,
-  and topic ownership paths are complete
+  topic, retry, fanout, failed-send, drop, reclaim, and live-reconfiguration
+  ownership paths are complete
 - group pressure can become an additional admission-decision source, alongside
   process, runtime, and escrow pressure
 
