@@ -1863,8 +1863,8 @@ Lifecycle and reclaim:
   tickets drop
 - producer or consumer teardown with in-flight escrow does not leak silently
 - shutdown, drain, release, abort, and reclaim paths never acquire budget
-- reclaim hooks release bytes or report no progress without re-entering the same
-  hook concurrently
+- reclaim hooks release bytes or report no progress without re-entering the
+  same hook concurrently
 
 ## Risks and Mitigations
 
