@@ -628,6 +628,11 @@ flowchart LR
     O -->|"Hard"| H
 ```
 
+Arrow labels show the pressure level while charged bytes are in the segment
+between the two boundaries. Because the soft boundary is dynamic, a runtime can
+move from `Soft` back to `Normal` when a spare lease is granted, even if
+`charged_bytes` does not change.
+
 There is no independent static `soft_bytes` trigger in Phase 2. The soft
 boundary moves as leases are borrowed and returned. Implementations may expose
 the current soft boundary as a cached or metric value, but enforcement should
@@ -655,13 +660,23 @@ sum(runtime_charged_bytes) + sum(escrow_charged_bytes)
     <= process_hard_limit - reserve + allowed_overshoot
 ```
 
-`allowed_overshoot` is the bounded process-wide debt allowance, initially
-`overshoot_debt_limit * active_runtime_count`. It must be backed by an explicit
-global overshoot-debt pool. When a runtime cannot borrow spare capacity and
-needs to retain above `floor_bytes + borrowed_lease_bytes`, it must acquire
-debt from that pool before the work is retained. The per-runtime
-`max_overshoot_per_runtime` is a classification ceiling; the debt pool is the
-global enforcement mechanism that keeps the tighter invariant true.
+This is the normal admission invariant. `allowed_overshoot` is the bounded
+process-wide debt allowance, initially `overshoot_debt_limit *
+active_runtime_count`. It must be backed by an explicit global overshoot-debt
+pool. When a runtime cannot borrow spare capacity and needs to retain above
+`floor_bytes + borrowed_lease_bytes`, it must acquire debt from that pool before
+the work is retained. The per-runtime `max_overshoot_per_runtime` is a
+classification ceiling; the debt pool is the global enforcement mechanism that
+keeps the tighter admission invariant true.
+
+`reconcile_size` is the one post-hoc exception. If retained memory already grew
+before the exact size was known, reconciliation charges the excess and attempts
+to debit the same global overshoot-debt pool after the fact. If the pool cannot
+cover the excess, the pool balance may go negative and the runtime records
+`reconcile.debt.bytes`. A negative debt-pool balance is an explicit invariant
+violation signal, not hidden capacity: the runtime transitions to `Hard`,
+further growth reservations are disabled, and reclaim or drop must repay the
+debt before new retained work can be admitted normally.
 
 Floors are admission guarantees, not permanently carved physical reservations.
 Moving bytes from a runtime account into escrow should transfer logical
@@ -795,10 +810,10 @@ flowchart LR
     subgraph RA["Runtime A - pinned current-thread runtime"]
         RX["Receiver ingress<br/>charge LocalMemoryTicket"]
         Q["Local channel queue<br/>queue owns local envelope"]
-        BP["Batch processor<br/>try_resize to retained batch"]
+        BP["Batch processor<br/>resizes retained ticket via try_resize"]
     end
 
-    TB["Topic broker<br/>process-global Send + Sync<br/>try_into_escrow"]
+    TB["Topic broker<br/>process-global Send + Sync<br/>holds EscrowTickets"]
 
     subgraph RB["Runtime B - pinned current-thread runtime"]
         RD["Delivery<br/>redeem EscrowTicket"]
@@ -807,12 +822,13 @@ flowchart LR
     end
 
     Net --> RX --> Q --> BP
-    BP -->|"shared publish boundary"| TB
+    BP -->|"try_into_escrow at shared publish boundary"| TB
     TB -->|"deliver escrowed payload"| RD --> EX --> Done
 ```
 
-Solid arrows are ownership transfer at retention boundaries. Global lease or
-metric coordination is intentionally absent from this per-item path.
+Solid arrows show ownership creation, transfer, or release at retention
+boundaries. Global lease or metric coordination is intentionally absent from
+this per-item path.
 
 <!-- markdownlint-disable MD013 -->
 | Site | Charge rule |
@@ -977,8 +993,9 @@ The broadcast escrow owner is the broker slot:
 
 1. Publish reserves the ring-slot charge before the payload is accepted.
 2. The broker owns that charge while the slot is retained.
-3. Subscriber delivery may redeem into a local ticket when the subscriber
-   actually retains the item outside the broker slot.
+3. Subscriber delivery may reserve a separate local owner when the subscriber
+   actually retains the item outside the broker slot. The broker-slot escrow
+   remains charged.
 4. Ring overwrite, drop-oldest eviction, explicit abort, topic close, and final
    broker-slot drain must release the ring-slot escrow owner exactly once.
 
@@ -987,6 +1004,7 @@ sequenceDiagram
     participant P as Producer runtime
     participant B as Broadcast topic broker
     participant S as Subscriber runtime
+    participant S2 as Other subscribers
 
     P->>P: owns LocalMemoryTicket
     P->>B: reserve ring-slot escrow
@@ -994,14 +1012,19 @@ sequenceDiagram
         B->>B: ring slot owns EscrowTicket
         B->>S: deliver shared payload view
         opt subscriber retains outside broker slot
-            S->>B: redeem or reserve local owner
+            S->>B: reserve local owner for subscriber retention
             S->>S: owns LocalMemoryTicket
         end
+        B->>S2: deliver same slot to other subscribers
         B->>B: release escrow on eviction, close, or final drain
     else broker rejects
         B-->>P: return original ticket
     end
 ```
+
+The broker may deliver the same ring slot to multiple subscribers. Ring-slot
+escrow is released on eviction, topic close, or final drain, not on ordinary
+subscriber receipt.
 
 Per-subscriber virtual branch tickets are a future extension. If added, the
 broker must snapshot the subscriber set at publish time and create refcounted
