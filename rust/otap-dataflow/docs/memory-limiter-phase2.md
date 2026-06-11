@@ -325,13 +325,15 @@ pub struct RuntimeMemoryAccount {
     deployment_key: DeployedPipelineKey,
     scope: BudgetScopeId,
     floor_bytes: u64,
-    soft_bytes: u64,
-    hard_bytes: u64,
     charged_bytes: Cell<u64>,
     peak_bytes: Cell<u64>,
     level: Cell<BudgetLevel>,
     lease: LocalMemoryLease,
     lease_authority: Rc<dyn LeaseAuthority>,
+}
+
+pub struct RuntimeMemoryBudget {
+    account: Rc<RuntimeMemoryAccount>,
 }
 
 pub struct LocalMemoryLease {
@@ -342,6 +344,7 @@ pub struct LocalMemoryLease {
 
 pub struct GlobalLeasePool {
     spare_bytes: AtomicU64,
+    overshoot_debt_available_bytes: AtomicU64,
     max_overshoot_per_runtime: u64,
 }
 
@@ -358,6 +361,7 @@ pub struct LocalMemoryTicket {
     scope: BudgetScopeId,
 }
 
+#[must_use]
 pub struct EscrowTicket {
     bytes: u64,
     escrow: Arc<CrossRuntimeEscrow>,
@@ -368,12 +372,17 @@ pub struct EscrowTicket {
 The exact names can change during implementation. The important split is:
 
 - `RuntimeMemoryAccount` is local and `!Send`.
-- `GlobalLeasePool` coordinates bounded overshoot through the `LeaseAuthority`
-  interface.
+- `RuntimeMemoryBudget` is a thin local runtime wrapper around the current
+  `RuntimeMemoryAccount`.
+- `GlobalLeasePool` coordinates coarse spare leases and bounded overshoot debt.
 - `LocalMemoryTicket` owns a logical charge while data is retained locally.
 - `EscrowTicket` owns a charge while data is in a cross-runtime boundary.
 - `BudgetScopeId` is immutable attribution carried by accounts, tickets, and
   escrow when identity is known.
+
+Attribution carried on the hot path must be cheap to clone. The implementation
+should use compact IDs or interned handles for `BudgetScopeId` fields rather
+than repeatedly allocating strings while creating tickets or escrow owners.
 
 `GlobalLeasePool` is the only `LeaseAuthority` implementation in Phase 2. This
 keeps the capacity hierarchy flat: global spare pool to per-runtime leases.
@@ -413,6 +422,25 @@ from entering a `SharedSender` while preserving the existing `PData` bounds.
 The `!Send` property is required for soundness because local tickets refund
 through runtime-local state. Debug builds should assert that local ticket drop
 runs on the creating runtime thread.
+
+```mermaid
+flowchart LR
+    subgraph Local["Pinned runtime thread / LocalSet (!Send)"]
+        Env["Local envelope<br/>PData + LocalMemoryTicket<br/>Rc account"]
+    end
+
+    subgraph Shared["Shared boundary<br/>PData: Clone + Send + Sync"]
+        Sender["SharedSender / topic publish"]
+        Escrow["EscrowTicket<br/>Arc CrossRuntimeEscrow"]
+    end
+
+    Env -->|"try_into_escrow consumes local ticket"| Escrow
+    Escrow -->|"redeem into consumer runtime"| Env
+    Env -. "compile-fail: LocalMemoryTicket must not enter SharedSender" .-> Sender
+```
+
+Solid arrows are ownership transfer. Dotted arrows are invalid ownership paths
+that should be rejected by the type system or by construction.
 
 ### Runtime Budget Access
 
@@ -500,8 +528,9 @@ runtime_floors = 4 * 256 MiB = 1024 MiB
 spare_pool = 4096 MiB - 512 MiB - 1024 MiB = 2560 MiB
 ```
 
-With `lease_step = 64 MiB` and `max_overshoot_per_runtime = 128 MiB`, runtime A
-classifies as:
+With an explicit `lease_step = 64 MiB` and `max_overshoot_per_runtime = 128 MiB`,
+runtime A classifies as follows when it has one borrowed lease and cannot borrow
+another:
 
 - 200 MiB charged: `Normal`, within its 256 MiB floor.
 - 260 MiB charged: borrows one 64 MiB lease, still `Normal`.
@@ -511,6 +540,11 @@ classifies as:
 If runtime A later drops retained work back to 240 MiB, it returns lease chunks
 lazily and publishes the lower charged-byte snapshot at the next metric flush
 or level transition.
+
+This example ignores the redemption/drain allowance for simplicity. If an
+allowance is carved out of the 256 MiB floor, the runtime's ordinary admission
+floor is `256 MiB - redemption_allowance`; the allowance remains reserved for
+draining, aborting, dropping, or redeeming already-admitted work.
 
 ### Elastic Leases
 
@@ -532,20 +566,28 @@ This gives fairness without leaving unused memory stranded on idle runtimes.
 The lease policy must define coarse refill and return behavior:
 
 - `floor_bytes` is guaranteed local capacity.
-- `soft_bytes` is the point where the runtime reports `Soft`.
-- `hard_bytes` is the point where the runtime reports `Hard` if borrowing
-  cannot cover the excess.
-- `hard_bytes` must be no greater than
-  `floor_bytes + max_overshoot_per_runtime`.
+- the current `Soft` threshold is `floor_bytes + borrowed_lease_bytes`.
+- `Hard` is reached when the runtime cannot acquire the spare lease or
+  overshoot debt needed to cover a new retained owner.
+- current overshoot must be no greater than `max_overshoot_per_runtime`.
 - `lease_step_bytes` controls global-pool borrow granularity.
 - `return_low_watermark_bytes` controls when borrowed capacity is returned.
+- `overshoot_debt_limit` caps the process-wide debt pool used when runtimes
+  consume overshoot instead of spare leases.
 
 Recommended defaults:
 
 ```text
-lease_step_bytes = max(64 KiB, floor_bytes / 16)
+lease_step_bytes = min(
+    max(64 KiB, floor_bytes / 16),
+    max_overshoot_per_runtime / 2,
+)
 return_low_watermark_bytes = lease_step_bytes / 2
 ```
+
+The `lease_step_bytes` clamp applies when overshoot is enabled. A configuration
+with no overshoot allowance should choose an explicit lease step that satisfies
+validation.
 
 When charged bytes cross the currently leased capacity, the runtime borrows one
 or more `lease_step_bytes` chunks. When charged bytes later fall far enough
@@ -562,8 +604,8 @@ Runtime budget pressure has different meaning from process pressure:
 | Level | Meaning | Default behavior |
 | --- | --- | --- |
 | `Normal` | Charged bytes are within local floor plus borrowed leases. | Admit normally. |
-| `Soft` | Runtime is above local floor plus borrowed leases and consuming overshoot. | Continue, emit metrics/logs. |
-| `Hard` | Runtime exceeded hard budget and cannot borrow. | Shed new local ingress in enforce mode. |
+| `Soft` | Runtime is above local floor plus borrowed leases and consuming authorized overshoot debt. | Continue, emit metrics/logs. |
+| `Hard` | Runtime cannot borrow spare capacity or authorized overshoot debt for additional retained work. | Shed new local ingress in enforce mode. |
 <!-- markdownlint-enable MD013 -->
 
 Process `Hard` still overrides runtime state because it protects the whole
@@ -574,18 +616,30 @@ logical budget axis:
 
 ```mermaid
 flowchart LR
-    A["0 .. floor_bytes<br/>Normal"] --> B["floor + borrowed leases<br/>Normal"]
-    B --> C["+ overshoot up to max_overshoot_per_runtime<br/>Soft"]
-    C --> D["beyond floor + leases + overshoot<br/>Hard"]
+    Z["0"]
+    F["floor<br/>256 MiB"]
+    L["floor + borrowed leases<br/>320 MiB"]
+    O["authorized overshoot debt<br/>up to 128 MiB more"]
+    H["cannot borrow lease or debt<br/>Hard for new admission"]
+
+    Z -->|"Normal"| F
+    F -->|"Normal while spare leases are available"| L
+    L -->|"Soft"| O
+    O -->|"Hard"| H
 ```
+
+There is no independent static `soft_bytes` trigger in Phase 2. The soft
+boundary moves as leases are borrowed and returned. Implementations may expose
+the current soft boundary as a cached or metric value, but enforcement should
+derive it from `floor_bytes + borrowed_lease_bytes`.
 
 ### Budget Arithmetic
 
 Floors are guaranteed. Overshoot is best-effort.
 
 ```text
-0 < floor_bytes <= soft_bytes < hard_bytes
-hard_bytes <= floor_bytes + max_overshoot_per_runtime
+0 < floor_bytes
+0 <= current_overshoot_bytes <= max_overshoot_per_runtime
 spare_pool_bytes = process_hard_limit - reserve - sum(floor_bytes)
 ```
 
@@ -598,13 +652,16 @@ The global logical invariant is:
 
 ```text
 sum(runtime_charged_bytes) + sum(escrow_charged_bytes)
-    <= process_budget - reserve + allowed_overshoot
+    <= process_hard_limit - reserve + allowed_overshoot
 ```
 
-`allowed_overshoot` is the bounded debt allowance, initially
-`overshoot_debt_limit * active_runtime_count`. It is intentionally tighter than
-`max_overshoot_per_runtime * active_runtime_count`, which is a per-runtime
-classification ceiling rather than a steady-state process allowance.
+`allowed_overshoot` is the bounded process-wide debt allowance, initially
+`overshoot_debt_limit * active_runtime_count`. It must be backed by an explicit
+global overshoot-debt pool. When a runtime cannot borrow spare capacity and
+needs to retain above `floor_bytes + borrowed_lease_bytes`, it must acquire
+debt from that pool before the work is retained. The per-runtime
+`max_overshoot_per_runtime` is a classification ceiling; the debt pool is the
+global enforcement mechanism that keeps the tighter invariant true.
 
 Floors are admission guarantees, not permanently carved physical reservations.
 Moving bytes from a runtime account into escrow should transfer logical
@@ -653,6 +710,14 @@ stateDiagram-v2
 Phase 2 charges logical retained size. It must not use allocator allocation
 size, `size_of_val`, jemalloc arena stats, RSS deltas, or cgroup usage as the
 ticket size.
+
+Charged size is a declared retained payload size, often the encoded payload
+length, used as a stable logical approximation. It is not the exact Rust object
+footprint. Even fully covered routes can diverge from process RSS: shallow
+`Arc` or `Bytes` clones can make logical charged bytes exceed resident bytes,
+while struct overhead, alignment, allocator metadata, and cached capacity can
+make resident bytes exceed charged bytes. Operators should compare logical
+charged bytes and process memory samples as related but different signals.
 
 Implement a sizing contract such as:
 
@@ -721,6 +786,34 @@ ownership rather than the current shared ring-slot model.
 
 Phase 2 should charge these retention sites:
 
+The common end-to-end path should look like this for one payload:
+
+```mermaid
+flowchart LR
+    Net["Network<br/>OTLP request"]
+
+    subgraph RA["Runtime A - pinned current-thread runtime"]
+        RX["Receiver ingress<br/>charge LocalMemoryTicket"]
+        Q["Local channel queue<br/>queue owns local envelope"]
+        BP["Batch processor<br/>try_resize to retained batch"]
+    end
+
+    TB["Topic broker<br/>process-global Send + Sync<br/>try_into_escrow"]
+
+    subgraph RB["Runtime B - pinned current-thread runtime"]
+        RD["Delivery<br/>redeem EscrowTicket"]
+        EX["Exporter pending request<br/>retains local ticket"]
+        Done["Send success<br/>drop ticket and refund"]
+    end
+
+    Net --> RX --> Q --> BP
+    BP -->|"shared publish boundary"| TB
+    TB -->|"deliver escrowed payload"| RD --> EX --> Done
+```
+
+Solid arrows are ownership transfer at retention boundaries. Global lease or
+metric coordination is intentionally absent from this per-item path.
+
 <!-- markdownlint-disable MD013 -->
 | Site | Charge rule |
 | --- | --- |
@@ -785,11 +878,11 @@ growing retained memory requires reserving before the grow:
 `reconcile_size` is infallible. If it observes that retained memory grew beyond
 the reserved amount, it records an overshoot metric/event and updates the
 logical charge. It must not reject after the allocation has already happened.
-After reconciliation, the account immediately re-evaluates pressure from the
-updated `charged_bytes`. If the overshoot pushes the runtime past `hard_bytes`,
-the runtime transitions to local `Hard` for subsequent admission checks and
-should request reclaim or drain. In-flight retained work is not retroactively
-rejected.
+After reconciliation, the account immediately attempts to classify the excess
+against available lease capacity or the global overshoot-debt pool. If the
+excess cannot be authorized after the fact, the account records reconciliation
+debt, transitions to local `Hard` for subsequent admission checks, and should
+request reclaim or drain. In-flight retained work is not retroactively rejected.
 
 Component-specific behavior applies when reservation fails before growth:
 
@@ -803,10 +896,11 @@ charge. The caller must be able to continue using, retrying, dropping, or
 returning the original retained item without creating an uncharged interval.
 Shrinking or dropping a ticket must always succeed.
 
-Repeated reconciliation overshoot is budget debt. The policy should define an
-`overshoot_debt_limit`; exceeding it forces local `Hard`, emits a warning, and
-disables further growth reservations for that runtime until reclaim or drop
-brings the account back under budget.
+Repeated reconciliation overshoot is current budget debt, not a monotonic
+counter. It decreases as charged bytes drop back under authorized capacity. The
+policy should define an `overshoot_debt_limit`; exceeding it forces local
+`Hard`, emits a warning, and disables further growth reservations for that
+runtime until reclaim or drop brings the account back under budget.
 
 For fanout, `try_reserve_clone` reserves a new logical owner for each retained
 branch. It does not split one charge into smaller parts unless the payload
@@ -888,6 +982,27 @@ The broadcast escrow owner is the broker slot:
 4. Ring overwrite, drop-oldest eviction, explicit abort, topic close, and final
    broker-slot drain must release the ring-slot escrow owner exactly once.
 
+```mermaid
+sequenceDiagram
+    participant P as Producer runtime
+    participant B as Broadcast topic broker
+    participant S as Subscriber runtime
+
+    P->>P: owns LocalMemoryTicket
+    P->>B: reserve ring-slot escrow
+    alt broker accepts slot
+        B->>B: ring slot owns EscrowTicket
+        B->>S: deliver shared payload view
+        opt subscriber retains outside broker slot
+            S->>B: redeem or reserve local owner
+            S->>S: owns LocalMemoryTicket
+        end
+        B->>B: release escrow on eviction, close, or final drain
+    else broker rejects
+        B-->>P: return original ticket
+    end
+```
+
 Per-subscriber virtual branch tickets are a future extension. If added, the
 broker must snapshot the subscriber set at publish time and create refcounted
 escrow ownership whose release paths are tied to each subscriber cursor. Until
@@ -900,11 +1015,17 @@ Mixed topics can create multiple retained owners from one publish: balanced
 queue entries, broadcast ring occupancy, or future subscriber-view ownership.
 Admission must be all-or-nothing across those owners.
 
-Publish must reserve every retained owner before committing any owner to the
-broker. If one branch fails reservation, the broker must unwind all reservations
-already acquired for that publish and return the original local ticket or escrow
-owner to the caller. Partial topic admission is not allowed because it creates
-ambiguous publish results and accounting drift.
+Publish should use two phases:
+
+1. Reserve every retained owner needed by the publish without making the item
+   visible in the broker.
+2. Commit the publish only after all reservations succeed.
+
+If any reservation fails in phase 1, the broker must release reservations
+already acquired for that publish, preferably in reverse acquisition order, and
+return the original local ticket or escrow owner to the caller. Partial topic
+admission is not allowed because it creates ambiguous publish results and
+accounting drift.
 
 ### Escrow Lifecycle
 
@@ -1061,6 +1182,10 @@ pub enum AdmissionPressureSource {
 }
 ```
 
+In `ObserveOnly` mode, admission must not return `Shed` solely because of the
+memory budget. It should return the normal admission outcome and record the
+corresponding shadow-rejection metric or event.
+
 `Admit` without a ticket is only valid for work that releases its memory within
 one poll turn and does not cross an await, queue, topic, retry, durable-buffer,
 delayed-work, stream-state, or component-state boundary. Any retained work must
@@ -1089,6 +1214,14 @@ Admission should have up to three checkpoints:
 2. **Estimated reserve:** reserve from content length, frame size, or known
    payload size when available.
 3. **Final adjust:** update the ticket after exact retained bytes are known.
+
+If final adjust requires additional budget and that growth cannot be authorized,
+the original retained owner and charge remain valid. The receiver or component
+then applies its existing failed-admission policy, such as rejecting the
+request, applying connection backpressure, returning a protocol error, or
+dropping according to configured policy. It must not commit a larger retained
+item without either an authorized charge or a recorded reconciliation-debt
+transition to local `Hard`.
 
 This keeps expensive decode work out of the system when pressure is already
 known and improves attribution once exact sizes are available.
@@ -1260,7 +1393,7 @@ policies:
         strategy: leased
         reserve: 512 MiB
         floor_per_runtime: 256 MiB
-        lease_step: 64 KiB
+        lease_step: 64 MiB
         max_overshoot_per_runtime: 128 MiB
         overshoot_debt_limit: 16 MiB
       escrow:
@@ -1349,7 +1482,7 @@ Topics remain escrow boundaries in the current broker design. The current
 process-global topic broker must not carry `LocalMemoryTicket`; topic publish,
 balanced delivery, broadcast ring occupancy, eviction, lag/drop-oldest,
 disconnect, and final release paths must use escrow ownership or remain
-uncharged observe-only until the escrow path is complete. A runtime-local topic
+uncovered observe-only until the escrow path is complete. A runtime-local topic
 backend could carry local tickets later, but that requires a distinct backend
 with explicit single-runtime ownership.
 
@@ -1368,7 +1501,7 @@ macro derives dotted metric names from Rust field names, so a field such as
 | `engine.runtime.memory.budget.floor.bytes` | Guaranteed local floor. |
 | `engine.runtime.memory.budget.borrowed.bytes` | Bytes borrowed from the global lease pool. |
 | `engine.runtime.memory.budget.current.overshoot.bytes` | Current bytes above local floor plus leases. |
-| `engine.runtime.memory.budget.overshoot.bytes` | Cumulative bytes reconciled after growth without prior reservation. |
+| `engine.runtime.memory.budget.reconcile.debt.bytes` | Current bytes reconciled after growth without prior authorization. |
 | `engine.runtime.memory.budget.level` | Runtime budget pressure state. |
 | `engine.runtime.memory.budget.time.in.normal.secs` | Cumulative time spent at runtime `Normal`. |
 | `engine.runtime.memory.budget.time.in.soft.secs` | Cumulative time spent at runtime `Soft`. |
@@ -1455,6 +1588,7 @@ pub struct ReclaimContext<'a> {
 }
 
 pub struct ReclaimResult {
+    attempted_bytes: u64,
     released_bytes: u64,
     more_available: bool,
 }
@@ -1483,7 +1617,9 @@ Reclaim must be best-effort and bounded. It must not require additional budget
 to release memory. The reclaim context should not expose reservation APIs; it
 should expose only release paths. Shared components can add a separate
 `SharedMemoryReclaim` variant if needed, mirroring the engine's local/shared
-node split.
+node split. `attempted_bytes` lets the controller distinguish no useful reclaim
+from partial reclaim and avoid immediately repolling a component that released
+far less than requested.
 
 Reclaim ordering should be deterministic. The engine should ask reclaimers in
 `ReclaimPriority` order, use a fixed component-kind tie breaker, and stop once
@@ -1576,7 +1712,7 @@ who require placement can choose `unsupported: error`.
 - Add manual charges at receiver ingress and selected retained buffers.
 - Add queue/topic byte-depth observability.
 - Validate charged bytes, resident bytes, and process samples side by side.
-- Add observe-only coverage metrics for charged, uncharged, and unknown-size
+- Add observe-only coverage metrics for charged, uncovered, and unknown-size
   retained paths.
 - Add shadow-rejection counters for runtime and escrow decisions.
 - Continue observe-only.
