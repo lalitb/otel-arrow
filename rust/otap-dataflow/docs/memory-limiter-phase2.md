@@ -151,6 +151,18 @@ effective_pressure = max(
 )
 ```
 
+If multiple sources report the same effective pressure level, admission must
+choose one deterministic source for decisions, logs, metrics, and
+`retry_after_secs`. Tie-break order is:
+
+1. `ProcessHard`
+2. `EscrowFull`
+3. `RuntimeBudgetHard`
+
+Process pressure wins because it is the outer safety guard. Escrow pressure
+wins over runtime budget when a directly attributable shared boundary is
+saturated.
+
 Metrics and logs must preserve the source so operators can distinguish a
 process-wide safety event, a single noisy runtime, and a saturated
 cross-runtime boundary.
@@ -1204,6 +1216,10 @@ pub enum AdmissionPressureSource {
     EscrowFull,
 }
 ```
+
+When more than one source is eligible for `Shed` at the same level, admission
+uses the tie-break order defined in the design principles section:
+`ProcessHard`, then `EscrowFull`, then `RuntimeBudgetHard`.
 
 In `ObserveOnly` mode, admission must not return `Shed` solely because of the
 memory budget. It should return the normal admission outcome and record the
