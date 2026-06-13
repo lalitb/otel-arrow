@@ -12,10 +12,18 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 /// Immutable attribution carried by budget owners when the identity is known.
+///
+/// The string-bearing fields exist for config, metrics, and reporting
+/// boundaries. On the per-item ownership hot path the attribution is never
+/// cloned field-by-field: it is interned once per runtime account into a
+/// [`BudgetScope`] handle (see that alias), and owners either borrow it through
+/// the account `Rc` they already hold (local tickets) or clone the cheap
+/// reference-counted handle at shared boundaries (escrow). No `String` is
+/// allocated when a [`LocalMemoryTicket`] or [`EscrowTicket`] is created.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BudgetScopeId {
     /// Pipeline group owning or attributing the retained bytes.
@@ -29,6 +37,16 @@ pub struct BudgetScopeId {
     /// Topic or shared boundary owning or attributing the retained bytes.
     pub topic_or_boundary: Option<String>,
 }
+
+/// Interned, reference-counted attribution handle carried by budget owners.
+///
+/// Cloning a `BudgetScope` is a single reference-count bump with no string
+/// allocation, so it is cheap enough to move with ownership at escrow and
+/// shared boundaries. `Arc` (not `Rc`) is required because an [`EscrowTicket`]
+/// is `Send` and the scope travels with it across runtime boundaries. Local
+/// tickets avoid even this refcount bump by borrowing the scope through the
+/// account `Rc` they already own.
+pub type BudgetScope = Arc<BudgetScopeId>;
 
 /// Runtime memory-budget mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,10 +151,12 @@ pub struct RuntimeMemorySnapshot {
     unknown_bytes: AtomicU64,
     unknown_count: AtomicU64,
     overshoot_bytes: AtomicU64,
+    reconcile_debt_bytes: AtomicU64,
     level: AtomicU64,
 }
 
 impl RuntimeMemorySnapshot {
+    #[allow(clippy::too_many_arguments)]
     fn publish(
         &self,
         borrowed_bytes: u64,
@@ -144,6 +164,7 @@ impl RuntimeMemorySnapshot {
         unknown_bytes: u64,
         unknown_count: u64,
         overshoot_bytes: u64,
+        reconcile_debt_bytes: u64,
         level: BudgetLevel,
     ) {
         self.borrowed_bytes.store(borrowed_bytes, Ordering::Relaxed);
@@ -152,6 +173,8 @@ impl RuntimeMemorySnapshot {
         self.unknown_count.store(unknown_count, Ordering::Relaxed);
         self.overshoot_bytes
             .store(overshoot_bytes, Ordering::Relaxed);
+        self.reconcile_debt_bytes
+            .store(reconcile_debt_bytes, Ordering::Relaxed);
         self.level.store(level.as_u64(), Ordering::Relaxed);
     }
 
@@ -185,6 +208,13 @@ impl RuntimeMemorySnapshot {
         self.overshoot_bytes.load(Ordering::Relaxed)
     }
 
+    /// Returns reconciliation-debt bytes: overshoot recorded after growth that
+    /// overdrew the global debt pool and remains unbacked.
+    #[must_use]
+    pub fn reconcile_debt_bytes(&self) -> u64 {
+        self.reconcile_debt_bytes.load(Ordering::Relaxed)
+    }
+
     /// Returns pressure level encoded as `0=normal`, `1=soft`, `2=hard`.
     #[must_use]
     pub fn level(&self) -> u64 {
@@ -213,6 +243,9 @@ pub struct MemoryBudgetSnapshot {
     pub unknown_count: u64,
     /// Total bytes above runtime floors plus leases.
     pub overshoot_bytes: u64,
+    /// Total reconciliation-debt bytes: overshoot recorded after growth that
+    /// overdrew the global debt pool and remains unbacked.
+    pub reconcile_debt_bytes: u64,
     /// Abandoned escrow tickets retained for leak detection.
     pub abandoned_escrow_count: u64,
     /// Abandoned escrow bytes retained for leak detection.
@@ -223,6 +256,9 @@ pub struct MemoryBudgetSnapshot {
     pub escrow_charged_bytes: u64,
     /// Spare bytes currently available to lease from the global pool.
     pub spare_available_bytes: u64,
+    /// Signed overshoot-debt pool balance. Negative means the pool has been
+    /// overdrawn by post-hoc reconciliation (an invariant-violation signal).
+    pub overshoot_debt_balance: i64,
 }
 
 #[derive(Debug, Default)]
@@ -260,6 +296,15 @@ impl MemoryBudgetState {
             .saturating_sub(config.sizing.reserve_bytes)
             .saturating_sub(floor_total);
         self.inner.pool.set_available(spare);
+        // The process-wide overshoot-debt allowance is the per-runtime debt
+        // limit summed across all runtimes (design: `overshoot_debt_limit *
+        // active_runtime_count`). Runtimes acquire from this pool before
+        // retaining above floor+leases; post-hoc reconciliation may overdraw it.
+        let allowed_overshoot = config
+            .sizing
+            .overshoot_debt_limit_bytes
+            .saturating_mul(config.runtime_count as u64);
+        self.inner.pool.set_overshoot_debt(allowed_overshoot);
         *self
             .inner
             .config
@@ -286,7 +331,7 @@ impl MemoryBudgetState {
     pub fn register_runtime_snapshot(&self, scope: BudgetScopeId) -> RuntimeMemorySnapshotHandle {
         let snapshot = Arc::new(RuntimeMemorySnapshot::default());
         if self.config().is_some() {
-            snapshot.publish(0, 0, 0, 0, 0, BudgetLevel::Normal);
+            snapshot.publish(0, 0, 0, 0, 0, 0, BudgetLevel::Normal);
         }
         self.inner
             .snapshots
@@ -296,7 +341,10 @@ impl MemoryBudgetState {
         RuntimeMemorySnapshotHandle {
             snapshot,
             state: self.clone(),
-            scope,
+            // Intern the attribution once per runtime so every ticket and
+            // escrow owner derived from this handle shares it without cloning
+            // strings on the per-item path.
+            scope: Arc::new(scope),
             account_taken: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -328,6 +376,7 @@ impl MemoryBudgetState {
             escrow_ticket_count: self.inner.escrow_ticket_count.load(Ordering::Relaxed),
             escrow_charged_bytes: self.inner.escrow_charged_bytes.load(Ordering::Relaxed),
             spare_available_bytes: self.inner.pool.available_bytes(),
+            overshoot_debt_balance: self.inner.pool.overshoot_debt_balance(),
             ..MemoryBudgetSnapshot::default()
         };
         for runtime in live_snapshots.iter() {
@@ -346,6 +395,9 @@ impl MemoryBudgetState {
             snapshot.overshoot_bytes = snapshot
                 .overshoot_bytes
                 .saturating_add(runtime.overshoot_bytes());
+            snapshot.reconcile_debt_bytes = snapshot
+                .reconcile_debt_bytes
+                .saturating_add(runtime.reconcile_debt_bytes());
             match runtime.level() {
                 1 => snapshot.soft_runtime_count += 1,
                 2 => snapshot.hard_runtime_count += 1,
@@ -433,7 +485,7 @@ impl MemoryBudgetState {
 pub struct RuntimeMemorySnapshotHandle {
     snapshot: Arc<RuntimeMemorySnapshot>,
     state: MemoryBudgetState,
-    scope: BudgetScopeId,
+    scope: BudgetScope,
     account_taken: Arc<AtomicBool>,
 }
 
@@ -472,23 +524,55 @@ impl RuntimeMemorySnapshotHandle {
 }
 
 /// Shared spare pool used by runtime leases.
+///
+/// Tracks two distinct process-global pools:
+///
+/// - `available_bytes`: the spare lease pool. Runtimes borrow coarse
+///   `lease_step` chunks from it once they exceed their local floor.
+/// - `overshoot_debt_balance`: the bounded global overshoot-debt pool. When a
+///   runtime needs to retain above `floor + borrowed_lease` it must acquire
+///   authorized debt from this pool first. The balance is signed because a
+///   post-hoc [`reconcile_size`](LocalMemoryTicket::reconcile_size) can overdraw
+///   it: a negative balance is an explicit invariant-violation signal, not
+///   hidden capacity.
 #[derive(Debug, Default, Clone)]
 pub struct GlobalLeasePool {
     available_bytes: Arc<AtomicU64>,
+    overshoot_debt_balance: Arc<AtomicI64>,
 }
 
 impl GlobalLeasePool {
-    /// Creates a pool with the given spare bytes.
+    /// Creates a pool with the given spare bytes and no overshoot-debt
+    /// allowance.
     #[must_use]
     pub fn new(available_bytes: u64) -> Self {
         Self {
             available_bytes: Arc::new(AtomicU64::new(available_bytes)),
+            overshoot_debt_balance: Arc::new(AtomicI64::new(0)),
+        }
+    }
+
+    /// Creates a pool with explicit spare and overshoot-debt allowances.
+    #[must_use]
+    pub fn with_overshoot_debt(available_bytes: u64, overshoot_debt_bytes: u64) -> Self {
+        Self {
+            available_bytes: Arc::new(AtomicU64::new(available_bytes)),
+            overshoot_debt_balance: Arc::new(AtomicI64::new(
+                i64::try_from(overshoot_debt_bytes).unwrap_or(i64::MAX),
+            )),
         }
     }
 
     fn set_available(&self, available_bytes: u64) {
         self.available_bytes
             .store(available_bytes, Ordering::Relaxed);
+    }
+
+    fn set_overshoot_debt(&self, overshoot_debt_bytes: u64) {
+        self.overshoot_debt_balance.store(
+            i64::try_from(overshoot_debt_bytes).unwrap_or(i64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     /// Attempts to borrow a full amount. Partial borrows are not allowed.
@@ -524,6 +608,70 @@ impl GlobalLeasePool {
     pub fn available_bytes(&self) -> u64 {
         self.available_bytes.load(Ordering::Relaxed)
     }
+
+    /// Acquires up to `bytes` of authorized overshoot debt without overdrawing.
+    ///
+    /// Returns the amount actually acquired, which is `bytes` when the pool has
+    /// enough positive balance and less (down to zero) otherwise. The caller is
+    /// responsible for deciding whether a short acquisition should overdraw via
+    /// [`overdraw_debt`](Self::overdraw_debt) (post-hoc reconcile) or be
+    /// rejected (admission).
+    #[must_use]
+    pub fn acquire_debt_up_to(&self, bytes: u64) -> u64 {
+        if bytes == 0 {
+            return 0;
+        }
+        let want = i64::try_from(bytes).unwrap_or(i64::MAX);
+        let mut current = self.overshoot_debt_balance.load(Ordering::Relaxed);
+        loop {
+            if current <= 0 {
+                return 0;
+            }
+            let take = want.min(current);
+            match self.overshoot_debt_balance.compare_exchange_weak(
+                current,
+                current - take,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return u64::try_from(take).unwrap_or(0),
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    /// Unconditionally subtracts `bytes` from the overshoot-debt pool, allowing
+    /// the balance to go negative.
+    ///
+    /// Used only by post-hoc reconciliation, which must be infallible. A
+    /// resulting negative balance is the explicit invariant-violation signal.
+    pub fn overdraw_debt(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let amount = i64::try_from(bytes).unwrap_or(i64::MAX);
+        let _ = self
+            .overshoot_debt_balance
+            .fetch_sub(amount, Ordering::AcqRel);
+    }
+
+    /// Repays previously acquired or overdrawn overshoot debt.
+    pub fn repay_debt(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let amount = i64::try_from(bytes).unwrap_or(i64::MAX);
+        let _ = self
+            .overshoot_debt_balance
+            .fetch_add(amount, Ordering::Release);
+    }
+
+    /// Returns the current signed overshoot-debt balance. Negative means the
+    /// pool has been overdrawn by post-hoc reconciliation.
+    #[must_use]
+    pub fn overshoot_debt_balance(&self) -> i64 {
+        self.overshoot_debt_balance.load(Ordering::Relaxed)
+    }
 }
 
 /// Authority that grants and receives coarse lease bytes.
@@ -533,6 +681,16 @@ pub trait LeaseAuthority: std::fmt::Debug {
 
     /// Returns bytes to this lease authority.
     fn return_bytes(&self, bytes: u64);
+
+    /// Acquires up to `bytes` of authorized overshoot debt without overdrawing.
+    fn acquire_debt_up_to(&self, bytes: u64) -> u64;
+
+    /// Unconditionally subtracts overshoot debt, allowing the balance to go
+    /// negative (post-hoc reconcile overdraw).
+    fn overdraw_debt(&self, bytes: u64);
+
+    /// Repays previously acquired or overdrawn overshoot debt.
+    fn repay_debt(&self, bytes: u64);
 }
 
 impl LeaseAuthority for GlobalLeasePool {
@@ -542,6 +700,18 @@ impl LeaseAuthority for GlobalLeasePool {
 
     fn return_bytes(&self, bytes: u64) {
         GlobalLeasePool::return_bytes(self, bytes);
+    }
+
+    fn acquire_debt_up_to(&self, bytes: u64) -> u64 {
+        GlobalLeasePool::acquire_debt_up_to(self, bytes)
+    }
+
+    fn overdraw_debt(&self, bytes: u64) {
+        GlobalLeasePool::overdraw_debt(self, bytes);
+    }
+
+    fn repay_debt(&self, bytes: u64) {
+        GlobalLeasePool::repay_debt(self, bytes);
     }
 }
 
@@ -559,7 +729,7 @@ impl LeaseAuthority for GlobalLeasePool {
 /// [`flush_snapshot`]: RuntimeMemoryAccount::flush_snapshot
 #[derive(Debug)]
 pub struct RuntimeMemoryAccount {
-    scope: BudgetScopeId,
+    scope: BudgetScope,
     mode: BudgetMode,
     floor_bytes: u64,
     lease: LocalMemoryLease,
@@ -567,6 +737,12 @@ pub struct RuntimeMemoryAccount {
     unknown_bytes: Cell<u64>,
     unknown_count: Cell<u64>,
     overshoot_bytes: Cell<u64>,
+    /// Overshoot debt acquired from the global pool and currently backed by it.
+    debt_held: Cell<u64>,
+    /// Overshoot debt that overdrew the global pool (unbacked). While this is
+    /// non-zero the runtime is pinned to `Hard` and the global pool balance is
+    /// negative by at least this amount until repaid.
+    reconcile_debt: Cell<u64>,
     published_level: Cell<BudgetLevel>,
     dirty: Cell<bool>,
     snapshot: Arc<RuntimeMemorySnapshot>,
@@ -583,7 +759,7 @@ impl RuntimeMemoryAccount {
         mode: BudgetMode,
         lease_authority: Arc<dyn LeaseAuthority>,
         snapshot: Arc<RuntimeMemorySnapshot>,
-        scope: BudgetScopeId,
+        scope: BudgetScope,
     ) -> Self {
         let account = Self {
             scope,
@@ -594,6 +770,8 @@ impl RuntimeMemoryAccount {
             unknown_bytes: Cell::new(0),
             unknown_count: Cell::new(0),
             overshoot_bytes: Cell::new(0),
+            debt_held: Cell::new(0),
+            reconcile_debt: Cell::new(0),
             published_level: Cell::new(BudgetLevel::Normal),
             dirty: Cell::new(false),
             snapshot,
@@ -619,24 +797,65 @@ impl RuntimeMemoryAccount {
 
     /// Attempts to reserve additional bytes before growth.
     ///
+    /// Admission path: raises authorized capacity with coarse lease borrows,
+    /// then acquires authorized overshoot debt from the global pool for any
+    /// remainder. In enforce mode it returns `false` (rolling back any partial
+    /// debt acquisition) when neither leases nor the debt pool can cover the
+    /// growth, leaving the existing charge untouched. In observe-only mode it
+    /// always returns `true`, recording any would-be overdraw as reconciliation
+    /// debt so operators can see the projected pressure.
+    ///
     /// Hot-path: mutates only local `Cell` state; touches the shared global
-    /// lease pool only when the reservation requires crossing the current
-    /// lease boundary.
+    /// pool only when the reservation crosses the current lease/debt boundary.
     #[must_use]
     pub fn try_reserve_extra(&self, bytes: u64) -> bool {
         let next = self.charged_bytes.get().saturating_add(bytes);
         if next <= self.available_without_overshoot() {
             return true;
         }
+        // Raise authorized capacity with coarse lease borrows first.
         let needed = next.saturating_sub(self.available_without_overshoot());
         if self.lease.try_borrow_for(needed) {
+            self.mark_dirty();
+        }
+        if next <= self.available_without_overshoot() {
+            return true;
+        }
+        // Still short: the remainder must be covered by overshoot debt.
+        let overshoot_needed = next.saturating_sub(self.available_without_overshoot());
+        if overshoot_needed > self.lease.max_overshoot_bytes() {
+            // Beyond the per-runtime classification ceiling: cannot authorize.
+            return self.mode == BudgetMode::ObserveOnly;
+        }
+        let held_total = self
+            .debt_held
+            .get()
+            .saturating_add(self.reconcile_debt.get());
+        let additional = overshoot_needed.saturating_sub(held_total);
+        if additional == 0 {
+            return true;
+        }
+        let got = self.lease.acquire_debt_up_to(additional);
+        self.debt_held.set(self.debt_held.get().saturating_add(got));
+        if got == additional {
             self.mark_dirty();
             return true;
         }
         if self.mode == BudgetMode::ObserveOnly {
+            // Observe-only never overdraws the pool or pins Hard at admission:
+            // the position-based Soft classification within the ceiling stands
+            // and the unbacked remainder is surfaced via `overshoot_bytes`.
+            // Reconciliation debt is reserved for the post-hoc `reconcile_size`
+            // overdraw path.
+            self.mark_dirty();
             return true;
         }
-        next <= self.hard_limit()
+        // Enforce: roll back the partial acquisition so no debt is stranded.
+        let got_back = got;
+        self.lease.repay_debt(got_back);
+        self.debt_held
+            .set(self.debt_held.get().saturating_sub(got_back));
+        false
     }
 
     /// Charges known retained bytes and returns a local ticket.
@@ -656,7 +875,6 @@ impl RuntimeMemoryAccount {
                 account: Rc::clone(self),
                 charge: LocalMemoryCharge::Unknown,
                 active: true,
-                scope: self.scope.clone(),
                 _not_send: PhantomData,
             });
         };
@@ -670,16 +888,22 @@ impl RuntimeMemoryAccount {
                 }
             }
         }
-        self.charged_bytes
-            .set(self.charged_bytes.get().saturating_add(bytes));
-        self.reconcile_size();
+        self.commit_charge(bytes);
         Some(LocalMemoryTicket {
             account: Rc::clone(self),
             charge: LocalMemoryCharge::KnownBytes(bytes),
             active: true,
-            scope: self.scope.clone(),
             _not_send: PhantomData,
         })
+    }
+
+    /// Commits a previously-reserved growth: grows charged bytes and settles
+    /// debt/level state. Used by [`charge`](Self::charge) and the ticket-level
+    /// grow APIs after [`try_reserve_extra`](Self::try_reserve_extra) succeeds.
+    fn commit_charge(&self, bytes: u64) {
+        self.charged_bytes
+            .set(self.charged_bytes.get().saturating_add(bytes));
+        self.settle();
     }
 
     /// Records retained bytes whose logical size is unknown.
@@ -691,22 +915,86 @@ impl RuntimeMemoryAccount {
         self.mark_dirty();
     }
 
-    /// Reconciles current charged size and updates pressure/overshoot.
+    /// Grows charged bytes post-hoc when the exact retained size is only known
+    /// after the growth already happened.
+    ///
+    /// This is infallible: it acquires authorized overshoot debt where the pool
+    /// allows and overdraws the pool for any remainder, recording the unbacked
+    /// excess as reconciliation debt (which pins the runtime to `Hard` until it
+    /// drains below authorized capacity and repays).
+    fn reconcile_grow(&self, extra: u64) {
+        self.charged_bytes
+            .set(self.charged_bytes.get().saturating_add(extra));
+        self.raise_debt_to_overshoot();
+        self.settle();
+    }
+
+    /// Tops up overshoot debt to back the current overshoot, overdrawing the
+    /// global pool (and recording reconciliation debt) for any shortfall.
+    fn raise_debt_to_overshoot(&self) {
+        let charged = self.charged_bytes.get();
+        let overshoot = charged.saturating_sub(self.available_without_overshoot());
+        let held_total = self
+            .debt_held
+            .get()
+            .saturating_add(self.reconcile_debt.get());
+        if overshoot <= held_total {
+            return;
+        }
+        let need = overshoot - held_total;
+        let got = self.lease.acquire_debt_up_to(need);
+        self.debt_held.set(self.debt_held.get().saturating_add(got));
+        let short = need - got;
+        if short > 0 {
+            self.lease.overdraw_debt(short);
+            self.reconcile_debt
+                .set(self.reconcile_debt.get().saturating_add(short));
+        }
+    }
+
+    /// Recomputes overshoot, returns surplus leases/debt, and republishes the
+    /// pressure level on a transition.
     ///
     /// Hot-path: mutates only local `Cell` state. The shared snapshot is
     /// touched only if the pressure level transitioned (an explicit
     /// operator-relevant event), never on every charged item.
-    pub fn reconcile_size(&self) {
+    fn settle(&self) {
         let charged = self.charged_bytes.get();
+        self.lease.return_lazy(charged, self.floor_bytes);
         let overshoot = charged.saturating_sub(self.available_without_overshoot());
         self.overshoot_bytes.set(overshoot);
-        self.lease.return_lazy(charged, self.floor_bytes);
+        self.repay_surplus_debt(overshoot);
         let new_level = self.classify(charged);
         if new_level != self.published_level.get() {
             // Level transitions are operator-visible; publish immediately.
             self.publish_level(new_level);
         } else {
             self.mark_dirty();
+        }
+    }
+
+    /// Repays overshoot debt down to the current overshoot.
+    ///
+    /// Authorized `debt_held` is repaid first so that unbacked reconciliation
+    /// debt (and the `Hard` pin it implies) persists until the overshoot is
+    /// fully drained.
+    fn repay_surplus_debt(&self, overshoot: u64) {
+        let held = self.debt_held.get();
+        let recon = self.reconcile_debt.get();
+        let total = held.saturating_add(recon);
+        if total <= overshoot {
+            return;
+        }
+        let mut surplus = total - overshoot;
+        let from_held = surplus.min(held);
+        if from_held > 0 {
+            self.lease.repay_debt(from_held);
+            self.debt_held.set(held - from_held);
+            surplus -= from_held;
+        }
+        if surplus > 0 {
+            self.lease.repay_debt(surplus);
+            self.reconcile_debt.set(recon - surplus);
         }
     }
 
@@ -724,7 +1012,7 @@ impl RuntimeMemoryAccount {
     fn refund(&self, bytes: u64) {
         self.charged_bytes
             .set(self.charged_bytes.get().saturating_sub(bytes));
-        self.reconcile_size();
+        self.settle();
     }
 
     fn refund_unknown(&self) {
@@ -734,6 +1022,10 @@ impl RuntimeMemoryAccount {
     }
 
     fn classify(&self, charged: u64) -> BudgetLevel {
+        if self.reconcile_debt.get() > 0 {
+            // Unbacked overshoot debt pins the runtime to Hard until repaid.
+            return BudgetLevel::Hard;
+        }
         if charged <= self.available_without_overshoot() {
             BudgetLevel::Normal
         } else if charged <= self.hard_limit() {
@@ -764,6 +1056,7 @@ impl RuntimeMemoryAccount {
             self.unknown_bytes.get(),
             self.unknown_count.get(),
             self.overshoot_bytes.get(),
+            self.reconcile_debt.get(),
             level,
         );
         self.published_level.set(level);
@@ -836,7 +1129,47 @@ impl LocalMemoryLease {
         self.borrowed_bytes.set(needed_borrow);
         self.lease_authority.return_bytes(return_bytes);
     }
+
+    fn acquire_debt_up_to(&self, bytes: u64) -> u64 {
+        self.lease_authority.acquire_debt_up_to(bytes)
+    }
+
+    fn overdraw_debt(&self, bytes: u64) {
+        self.lease_authority.overdraw_debt(bytes);
+    }
+
+    fn repay_debt(&self, bytes: u64) {
+        self.lease_authority.repay_debt(bytes);
+    }
 }
+
+/// Error returned by fallible memory-budget growth operations.
+///
+/// Shrinking, dropping, and releasing a ticket are always infallible; only
+/// growth (which must reserve budget before it commits) can fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetError {
+    /// The growth could not be authorized (no spare lease or overshoot debt
+    /// available under enforcement). The original charge is preserved.
+    Exhausted,
+    /// The operation requires a known retained size but the ticket has an
+    /// unknown size. Convert it first with
+    /// [`reconcile_size`](LocalMemoryTicket::reconcile_size).
+    UnknownSize,
+}
+
+impl std::fmt::Display for BudgetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exhausted => f.write_str("memory budget growth could not be authorized"),
+            Self::UnknownSize => {
+                f.write_str("operation requires a known retained size on the ticket")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BudgetError {}
 
 /// Local logical charge. This type is intentionally `!Send`.
 #[derive(Debug)]
@@ -844,7 +1177,6 @@ pub struct LocalMemoryTicket {
     account: Rc<RuntimeMemoryAccount>,
     charge: LocalMemoryCharge,
     active: bool,
-    scope: BudgetScopeId,
     _not_send: PhantomData<Rc<()>>,
 }
 
@@ -865,13 +1197,101 @@ impl LocalMemoryTicket {
     }
 
     /// Returns attribution scope for this ticket.
+    ///
+    /// Borrowed from the owning account, so reading the scope costs nothing on
+    /// the per-item path: there is no interned-handle refcount bump and no
+    /// string clone.
     #[must_use]
     pub fn scope(&self) -> &BudgetScopeId {
-        &self.scope
+        self.account.scope()
+    }
+
+    /// Resizes the retained charge from `old_bytes` to `new_bytes`.
+    ///
+    /// Reserves any positive delta before committing the growth, shrinks
+    /// infallibly when `new_bytes` is smaller, and leaves the original ticket
+    /// and original charge valid if a grow reservation fails. `old_bytes` must
+    /// equal the ticket's current known charge; resizing an unknown-size ticket
+    /// returns [`BudgetError::UnknownSize`].
+    pub fn try_resize(&mut self, old_bytes: u64, new_bytes: u64) -> Result<(), BudgetError> {
+        let LocalMemoryCharge::KnownBytes(current) = self.charge else {
+            return Err(BudgetError::UnknownSize);
+        };
+        debug_assert_eq!(
+            current, old_bytes,
+            "try_resize old_bytes must match the ticket's current charge"
+        );
+        if new_bytes > current {
+            let extra = new_bytes - current;
+            if !self.account.try_reserve_extra(extra) {
+                return Err(BudgetError::Exhausted);
+            }
+            self.account.commit_charge(extra);
+        } else if new_bytes < current {
+            self.account.refund(current - new_bytes);
+        }
+        self.charge = LocalMemoryCharge::KnownBytes(new_bytes);
+        Ok(())
+    }
+
+    /// Reserves additional retained bytes before a deferred growth.
+    ///
+    /// On success the account is charged for the extra bytes and the ticket's
+    /// known size grows by `extra_bytes`; the caller may then grow the retained
+    /// buffer and finalize the exact size with
+    /// [`reconcile_size`](Self::reconcile_size). Fails without side effects when
+    /// the ticket has an unknown size or the reservation cannot be authorized.
+    pub fn try_reserve_extra(&mut self, extra_bytes: u64) -> Result<(), BudgetError> {
+        let LocalMemoryCharge::KnownBytes(current) = self.charge else {
+            return Err(BudgetError::UnknownSize);
+        };
+        if extra_bytes == 0 {
+            return Ok(());
+        }
+        if !self.account.try_reserve_extra(extra_bytes) {
+            return Err(BudgetError::Exhausted);
+        }
+        self.account.commit_charge(extra_bytes);
+        self.charge = LocalMemoryCharge::KnownBytes(current.saturating_add(extra_bytes));
+        Ok(())
+    }
+
+    /// Reconciles the ticket to an exact retained size known only after growth.
+    ///
+    /// Infallible: any excess beyond previously reserved budget is charged
+    /// post-hoc against authorized overshoot debt, overdrawing the global pool
+    /// (and recording reconciliation debt that pins the runtime to `Hard`) when
+    /// it cannot be authorized. Also converts an unknown-size ticket into a
+    /// known-size charge.
+    pub fn reconcile_size(&mut self, new_bytes: u64) {
+        match self.charge {
+            LocalMemoryCharge::KnownBytes(current) => {
+                if new_bytes > current {
+                    self.account.reconcile_grow(new_bytes - current);
+                } else if new_bytes < current {
+                    self.account.refund(current - new_bytes);
+                }
+            }
+            LocalMemoryCharge::Unknown => {
+                // Convert an unknown observation into a known charge.
+                self.account.refund_unknown();
+                self.account.reconcile_grow(new_bytes);
+            }
+        }
+        self.charge = LocalMemoryCharge::KnownBytes(new_bytes);
+    }
+
+    /// Reserves a new logical owner for a retained fanout/clone branch.
+    ///
+    /// Each retained branch needs its own charge, so this charges a fresh
+    /// ticket of `bytes` against the same account rather than splitting the
+    /// existing charge. Returns [`BudgetError::Exhausted`] if the additional
+    /// owner cannot be authorized under enforcement.
+    pub fn try_reserve_clone(&self, bytes: u64) -> Result<LocalMemoryTicket, BudgetError> {
+        self.account.charge(bytes).ok_or(BudgetError::Exhausted)
     }
 
     /// Converts this local ticket into escrow ownership.
-    #[must_use]
     pub fn try_into_escrow(
         mut self,
         state: &MemoryBudgetState,
@@ -887,8 +1307,9 @@ impl LocalMemoryTicket {
         Ok(EscrowTicket {
             bytes,
             state: state.clone(),
-            scope: self.scope.clone(),
-            redeemed: false,
+            // One reference-count bump at the shared boundary; no string clone.
+            scope: Arc::clone(&self.account.scope),
+            resolved: false,
         })
     }
 }
@@ -910,8 +1331,8 @@ impl Drop for LocalMemoryTicket {
 pub struct EscrowTicket {
     bytes: u64,
     state: MemoryBudgetState,
-    scope: BudgetScopeId,
-    redeemed: bool,
+    scope: BudgetScope,
+    resolved: bool,
 }
 
 impl EscrowTicket {
@@ -927,18 +1348,79 @@ impl EscrowTicket {
         &self.scope
     }
 
-    /// Redeems escrow on delivery or release.
+    /// Releases this escrow's accounting exactly once.
+    ///
+    /// Shared by every explicit terminal transition (`redeem`, `release`,
+    /// `abort`). It returns the logical bytes to the escrow boundary and marks
+    /// the ticket resolved so `Drop` does not route it to the graveyard.
+    fn resolve_release(&mut self) {
+        if !self.resolved {
+            self.state.release_escrow(self.bytes);
+            self.resolved = true;
+        }
+    }
+
+    /// Redeems escrow on point-to-point delivery without re-charging a consumer
+    /// account.
+    ///
+    /// Use this for balanced delivery where the consumer does not retain the
+    /// payload in its own runtime account. To move ownership into a consumer
+    /// runtime instead, use [`redeem_into`](Self::redeem_into).
     pub fn redeem(mut self) {
-        self.state.release_escrow(self.bytes);
-        self.redeemed = true;
+        self.resolve_release();
+    }
+
+    /// Redeems escrow into a consumer runtime's local account.
+    ///
+    /// On success the escrow charge is released and an equivalent
+    /// [`LocalMemoryTicket`] is charged to `account`, so the global logical
+    /// total is preserved across the handoff. On failure (enforce mode rejects
+    /// the consumer charge) the original [`EscrowTicket`] is returned unchanged
+    /// and still owns the charge, so the boundary can apply its drop/retry
+    /// policy without creating an unowned interval.
+    ///
+    /// Future work: wire the per-runtime redemption/drain allowance so a
+    /// consumer at local `Hard` can still redeem at least one in-transit item.
+    #[must_use = "a returned EscrowTicket still owns the escrow charge"]
+    pub fn redeem_into(
+        mut self,
+        account: &Rc<RuntimeMemoryAccount>,
+    ) -> Result<LocalMemoryTicket, EscrowTicket> {
+        match account.charge(self.bytes) {
+            Some(ticket) => {
+                self.resolve_release();
+                Ok(ticket)
+            }
+            None => Err(self),
+        }
+    }
+
+    /// Releases escrow on eviction, drop-oldest, topic close, or final drain.
+    ///
+    /// This is the broker-driven release path. It is accounting-equivalent to
+    /// [`redeem`](Self::redeem) but names the eviction lifecycle event for
+    /// release-cause metrics.
+    pub fn release(mut self) {
+        self.resolve_release();
+    }
+
+    /// Explicitly aborts an in-flight escrow owner, releasing its charge inline.
+    ///
+    /// Aborting is the tracked negative outcome. Only bypassing this (and the
+    /// other explicit terminal paths) by dropping an unresolved ticket routes
+    /// the charge to the leak-detection graveyard.
+    pub fn abort(mut self) {
+        self.resolve_release();
     }
 }
 
 impl Drop for EscrowTicket {
     fn drop(&mut self) {
-        if !self.redeemed {
+        if !self.resolved {
+            // No explicit redeem/release/abort ran: record an abandoned-escrow
+            // entry so the leak stays visible instead of silently succeeding.
             self.state.abandon_escrow(self.bytes);
-            self.redeemed = true;
+            self.resolved = true;
         }
     }
 }
@@ -1197,7 +1679,7 @@ mod tests {
             mode,
             Arc::new(GlobalLeasePool::new(spare)),
             Arc::new(RuntimeMemorySnapshot::default()),
-            BudgetScopeId::default(),
+            Arc::new(BudgetScopeId::default()),
         ))
     }
 
