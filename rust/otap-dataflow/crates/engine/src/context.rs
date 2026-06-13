@@ -187,6 +187,7 @@ impl ControllerContext {
             container_id: container_id.into(),
             numa_node_id: 0,
             memory_pressure_state: MemoryPressureState::default(),
+            memory_budget_state: MemoryBudgetState::default(),
         }
     }
 
