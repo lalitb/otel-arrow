@@ -1,0 +1,4 @@
+change_type: enhancement
+component: engine
+note: "Extend the observe-only runtime memory budget toward a production foundation: ticket resize/reserve/reconcile and clone APIs, a global overshoot-debt pool with per-runtime reconciliation-debt tracking and Hard pinning, compact (non-string-cloning) attribution, a !Send LocalEnvelope retained-work type, resume-id-keyed retry ticket ownership, explicit escrow release/abort/redeem-into, and a first escrow integration at the balanced topic publish boundary. Enforcement remains gated."
+issues: [3272]
