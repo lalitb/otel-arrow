@@ -31,6 +31,7 @@ In short:
 - [NUMA Placement Appendix](#numa-placement-appendix)
 - [Configuration](#configuration)
 - [Metrics](#metrics)
+- [Integration Guide](#integrating-a-component-with-memory-budgeting)
 - [Phased Rollout](#phased-rollout)
 - [Validation Scenarios](#validation-scenarios)
 
@@ -1615,6 +1616,79 @@ In Phase 2e, shared retained memory is reported through metrics but is not
 eligible for local reclaim hooks. A later phase can add `SharedMemoryReclaim`
 for shared retention sites that materially contribute to runtime or escrow
 pressure.
+
+## Integrating a Component with Memory Budgeting
+
+This is a practical checklist for node and component authors. The goal is that
+every byte retained across an `await`, queue, topic, retry, or state boundary
+has exactly one charged owner, and that release never needs budget.
+
+### When to charge
+
+Charge when your component starts retaining a payload beyond the current call:
+
+- before pushing into a local queue, batch buffer, retry buffer, delayed
+  scheduler, or any processor state that outlives the message handler
+- before holding a payload across an `await`
+
+Do not charge for transient, stack-local work that is dropped before the next
+`await`.
+
+### How to attach a ticket
+
+Reach the runtime account through the thread-local accessor and charge the
+retained size:
+
+```rust
+if let Some(budget) = current_runtime_memory_budget() {
+    if let Some(ticket) = budget.charge(retained_bytes) {
+        // keep `ticket` alongside the payload
+    }
+}
+```
+
+Pair the payload with its ticket using `LocalEnvelope<T>`, or a side table that
+has the same drop, send-error, and drain guarantees. Never place a
+`LocalMemoryTicket` inside `PData`: `PData` is `Clone + Send + Sync` and the
+ticket is intentionally `!Send`.
+
+### When to convert to escrow
+
+When the payload crosses a shared (`Send + Sync`) boundary - a shared channel,
+a topic publish, or a shared-return ack/nack - consume the local ticket and
+produce a sendable `EscrowTicket` with `try_into_escrow`. The accepting boundary
+owns the escrow. On a failed send, the original owner is returned: you keep the
+local ticket (or escrow) and can retry or drop. Never send a `LocalMemoryTicket`
+across a shared boundary.
+
+### How to release, drop, drain, or abort
+
+Release is RAII. Dropping a `LocalMemoryTicket`, `EscrowTicket`, `EscrowSlot`,
+or `LocalEnvelope` refunds the charge exactly once. Use the explicit
+`EscrowTicket::{redeem, redeem_into, release, abort}` methods to make the
+release cause clear at boundaries. The hard rule: **release, drop, drain,
+abort, and reclaim must never acquire budget.** A consumer pinned to local
+`Hard` may still redeem already-admitted escrow through the per-runtime drain
+allowance (`try_charge_for_drain`); that path charges the bytes but does not
+admit new external work.
+
+### How to handle unknown sizes
+
+If the exact retained size is not known, return `None` from `ChargedSize` (or
+call `observe_unknown`). The bytes are tracked separately as unknown/uncovered
+retention instead of being silently treated as zero. Make unknown-size routes
+explicit and observable; do not guess a size.
+
+### What not to do
+
+- Do not put a `LocalMemoryTicket` in `PData` or any shared/topic envelope.
+- Do not let a `LocalMemoryTicket` cross a `Send + Sync` boundary.
+- Do not acquire budget on a release, drop, drain, abort, or reclaim path.
+- Do not clone rich attribution or `String`s per retained item; attribution is
+  interned once per runtime and carried by the account `Rc` (local) or the
+  cheap `Arc` scope handle (escrow).
+- Do not enable enforcement: it stays gated until ownership, escrow, and
+  reclaim are complete for the boundaries your component uses.
 
 ## Live Reconfiguration
 
