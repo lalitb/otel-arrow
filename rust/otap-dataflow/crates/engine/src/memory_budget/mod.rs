@@ -450,9 +450,7 @@ impl MemoryBudgetState {
 
     /// Outcome of [`MemoryBudgetState::try_charge_escrow`].
     fn try_charge_escrow(&self, bytes: u64) -> Option<EscrowChargeAck> {
-        let Some(config) = self.config() else {
-            return None;
-        };
+        let config = self.config()?;
         let enforce = config.mode == BudgetMode::Enforce;
         // Step 1: bound the topic-level escrow occupancy (enforce only).
         if enforce {
