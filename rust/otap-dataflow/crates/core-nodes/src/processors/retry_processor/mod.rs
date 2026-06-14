@@ -878,6 +878,7 @@ mod test {
                     lease_step_bytes: 1,
                     max_overshoot_per_runtime_bytes: 10_000,
                     overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
                 },
                 topic_default_limit_bytes: 100,
                 runtime_count: 1,

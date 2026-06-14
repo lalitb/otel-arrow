@@ -100,6 +100,11 @@ pub struct MemoryBudgetSizing {
     pub max_overshoot_per_runtime_bytes: u64,
     /// Overshoot debt threshold reserved for future reclaim policy.
     pub overshoot_debt_limit_bytes: u64,
+    /// Per-runtime drain/redemption allowance carved out of `floor_bytes`
+    /// (design lines 1166-1171). `0` means "use the default", which the engine
+    /// resolves to `lease_step_bytes` so a runtime at local `Hard` can still
+    /// drain at least one lease-step-sized in-flight item.
+    pub drain_allowance_bytes: u64,
 }
 
 impl MemoryBudgetSizing {
@@ -110,6 +115,18 @@ impl MemoryBudgetSizing {
             lease_step_bytes: policy.sizing.lease_step,
             max_overshoot_per_runtime_bytes: policy.sizing.max_overshoot_per_runtime,
             overshoot_debt_limit_bytes: policy.sizing.overshoot_debt_limit,
+            drain_allowance_bytes: policy.sizing.drain_allowance.unwrap_or(0),
+        }
+    }
+
+    /// Resolves the effective per-runtime drain allowance, applying the
+    /// `lease_step_bytes` default when the operator left it unset (`0`).
+    #[must_use]
+    fn effective_drain_allowance_bytes(&self) -> u64 {
+        if self.drain_allowance_bytes == 0 {
+            self.lease_step_bytes
+        } else {
+            self.drain_allowance_bytes
         }
     }
 }
@@ -621,7 +638,7 @@ impl RuntimeMemorySnapshotHandle {
         {
             return None;
         }
-        Some(Rc::new(RuntimeMemoryAccount::new(
+        let account = RuntimeMemoryAccount::new(
             config.sizing.floor_per_runtime_bytes,
             config.sizing.lease_step_bytes,
             config.sizing.max_overshoot_per_runtime_bytes,
@@ -629,7 +646,12 @@ impl RuntimeMemorySnapshotHandle {
             self.state.lease_authority(),
             self.snapshot.clone(),
             self.scope.clone(),
-        )))
+        );
+        // Apply the operator-configured drain/redemption allowance (or the
+        // resolved `lease_step_bytes` default). This is a one-time runtime
+        // initialization step, off the per-item hot path.
+        account.set_drain_allowance_bytes(config.sizing.effective_drain_allowance_bytes());
+        Some(Rc::new(account))
     }
 }
 
@@ -2200,6 +2222,7 @@ mod tests {
                     lease_step_bytes: 10,
                     max_overshoot_per_runtime_bytes: 20,
                     overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
                 },
                 topic_default_limit_bytes: 100,
                 runtime_count: 1,
@@ -2251,6 +2274,7 @@ mod tests {
                     lease_step_bytes: 10,
                     max_overshoot_per_runtime_bytes: 20,
                     overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
                 },
                 topic_default_limit_bytes: 100,
                 runtime_count: 1,
@@ -2271,6 +2295,80 @@ mod tests {
         assert_eq!(snapshot.charged_bytes, 0);
     }
 
+    fn configure_state_with_drain_allowance(
+        lease_step: u64,
+        drain_allowance_bytes: u64,
+    ) -> MemoryBudgetState {
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 10_000,
+                    lease_step_bytes: lease_step,
+                    max_overshoot_per_runtime_bytes: 2 * lease_step,
+                    overshoot_debt_limit_bytes: lease_step,
+                    drain_allowance_bytes,
+                },
+                topic_default_limit_bytes: 1_000,
+                runtime_count: 1,
+            },
+            None,
+        );
+        state
+    }
+
+    #[test]
+    fn local_account_applies_configured_drain_allowance() {
+        // An explicit, larger-than-lease-step allowance must be applied verbatim
+        // to the runtime account created on the pinned thread.
+        let state = configure_state_with_drain_allowance(64, 4_096);
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let account = handle.local_account().expect("budget should be configured");
+        assert_eq!(account.drain_allowance_bytes(), 4_096);
+    }
+
+    #[test]
+    fn local_account_defaults_drain_allowance_to_lease_step() {
+        // `0` means "use the default", which the engine resolves to
+        // `lease_step_bytes` so a `Hard` runtime can drain one lease-sized item.
+        let state = configure_state_with_drain_allowance(256, 0);
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let account = handle.local_account().expect("budget should be configured");
+        assert_eq!(account.drain_allowance_bytes(), 256);
+    }
+
+    #[test]
+    fn configured_drain_allowance_admits_one_sized_item_at_hard() {
+        // A consumer pinned to local `Hard` must be able to drain at least one
+        // item sized up to the configured allowance, but not more.
+        let allowance = 4_096_u64;
+        let state = configure_state_with_drain_allowance(64, allowance);
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let account = handle.local_account().expect("budget should be configured");
+        // Force the account to local `Hard` via an overshoot-debt overdraw so
+        // the drain path is the only way to admit work.
+        let mut ticket = account.charge(account.floor_bytes).expect("floor charge");
+        ticket.reconcile_size(account.floor_bytes + account.lease.max_overshoot_bytes() + 1);
+        assert_eq!(account.level(), BudgetLevel::Hard);
+
+        let drained = account
+            .try_charge_for_drain(allowance)
+            .expect("one allowance-sized item should drain at Hard");
+        assert!(
+            account.try_charge_for_drain(1).is_none(),
+            "allowance is exhausted after the first drain charge"
+        );
+        drop(drained);
+        // Releasing the drained ticket frees the allowance for the next item.
+        assert!(
+            account.try_charge_for_drain(allowance).is_some(),
+            "allowance is restored after the drained ticket drops"
+        );
+    }
+
     #[test]
     fn try_into_escrow_success_transfers_ownership() {
         let state = MemoryBudgetState::default();
@@ -2284,6 +2382,7 @@ mod tests {
                     lease_step_bytes: 10,
                     max_overshoot_per_runtime_bytes: 20,
                     overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
                 },
                 topic_default_limit_bytes: 100,
                 runtime_count: 1,
@@ -2320,6 +2419,7 @@ mod tests {
                     lease_step_bytes: 10,
                     max_overshoot_per_runtime_bytes: 20,
                     overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
                 },
                 topic_default_limit_bytes: 10,
                 runtime_count: 1,
@@ -2350,6 +2450,7 @@ mod tests {
                     lease_step_bytes: 10,
                     max_overshoot_per_runtime_bytes: 20,
                     overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
                 },
                 topic_default_limit_bytes: 10,
                 runtime_count: 1,
@@ -2380,6 +2481,7 @@ mod tests {
                     lease_step_bytes: 10,
                     max_overshoot_per_runtime_bytes: 20,
                     overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
                 },
                 topic_default_limit_bytes: 60,
                 runtime_count: 1,
@@ -2420,6 +2522,7 @@ mod tests {
                     lease_step_bytes: 10,
                     max_overshoot_per_runtime_bytes: 20,
                     overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
                 },
                 topic_default_limit_bytes: 100,
                 runtime_count: 1,
@@ -2458,6 +2561,7 @@ mod tests {
                     lease_step_bytes: 10,
                     max_overshoot_per_runtime_bytes: 20,
                     overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
                 },
                 topic_default_limit_bytes: 200,
                 runtime_count: 1,
@@ -2527,6 +2631,7 @@ mod tests {
                     lease_step_bytes: 10,
                     max_overshoot_per_runtime_bytes: 20,
                     overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
                 },
                 topic_default_limit_bytes: 200,
                 runtime_count: 1,
@@ -2567,6 +2672,7 @@ mod tests {
                     lease_step_bytes: 10,
                     max_overshoot_per_runtime_bytes: 20,
                     overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
                 },
                 topic_default_limit_bytes: 200,
                 runtime_count: 1,
@@ -2623,6 +2729,7 @@ mod tests {
                     lease_step_bytes: 10,
                     max_overshoot_per_runtime_bytes: 20,
                     overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
                 },
                 topic_default_limit_bytes: 100,
                 runtime_count: 1,
@@ -2889,6 +2996,7 @@ mod tests {
                     lease_step_bytes: 10,
                     max_overshoot_per_runtime_bytes: 20,
                     overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
                 },
                 topic_default_limit_bytes: 1_000,
                 runtime_count: 1,
@@ -3284,6 +3392,7 @@ mod tests {
                     lease_step_bytes: 10,
                     max_overshoot_per_runtime_bytes: 20,
                     overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
                 },
                 topic_default_limit_bytes: 100,
                 runtime_count: 1,

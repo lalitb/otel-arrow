@@ -227,6 +227,23 @@ impl Policies {
                     "{budget_path}.escrow.topic_default_limit must be greater than 0"
                 ));
             }
+            if let Some(drain_allowance) = memory_budget.sizing.drain_allowance {
+                // The drain/redemption allowance is carved out of the runtime
+                // floor and must be able to cover at least one lease-step-sized
+                // in-flight item so a `Hard` consumer can make progress
+                // (design lines 1166-1171). `0`/omitted falls back to
+                // `lease_step` in the engine, so only validate explicit values.
+                if drain_allowance != 0 && drain_allowance < memory_budget.sizing.lease_step {
+                    errors.push(format!(
+                        "{budget_path}.sizing.drain_allowance must be greater than or equal to {budget_path}.sizing.lease_step"
+                    ));
+                }
+                if drain_allowance > memory_budget.sizing.floor_per_runtime {
+                    errors.push(format!(
+                        "{budget_path}.sizing.drain_allowance must be less than or equal to {budget_path}.sizing.floor_per_runtime"
+                    ));
+                }
+            }
             if memory_budget.enforcement.receiver_admission
                 || memory_budget.enforcement.queue_publish
                 || memory_budget.enforcement.reclaim_hooks
@@ -623,6 +640,16 @@ pub struct MemoryBudgetSizingPolicy {
     #[serde(deserialize_with = "deserialize_required_u64")]
     #[schemars(with = "String")]
     pub overshoot_debt_limit: u64,
+    /// Per-runtime drain/redemption allowance carved out of `floor_per_runtime`.
+    ///
+    /// While a runtime is at local `Hard`, consumers may still redeem/drain up
+    /// to this many bytes of already-admitted work so they can make forward
+    /// progress (design lines 1154-1184). It never admits new external ingress.
+    /// When omitted (or `0`), the engine falls back to `lease_step` so a
+    /// `Hard` runtime can still drain at least one lease-step-sized item.
+    #[serde(default, deserialize_with = "byte_units::deserialize_u64")]
+    #[schemars(with = "Option<String>")]
+    pub drain_allowance: Option<u64>,
 }
 
 /// Cross-runtime escrow policy.
@@ -1321,6 +1348,7 @@ mod tests {
                         lease_step: 64 * 1024,
                         max_overshoot_per_runtime: 128 * 1024 * 1024,
                         overshoot_debt_limit: 16 * 1024 * 1024,
+                        drain_allowance: None,
                     },
                     escrow: super::MemoryBudgetEscrowPolicy {
                         topic_default_limit: 64 * 1024 * 1024,
@@ -1352,6 +1380,7 @@ mod tests {
                         lease_step: 128 * 1024,
                         max_overshoot_per_runtime: 128 * 1024,
                         overshoot_debt_limit: 16 * 1024,
+                        drain_allowance: None,
                     },
                     escrow: super::MemoryBudgetEscrowPolicy {
                         topic_default_limit: 64 * 1024 * 1024,
@@ -1390,6 +1419,7 @@ mod tests {
                         lease_step: 64 * 1024,
                         max_overshoot_per_runtime: 128 * 1024 * 1024,
                         overshoot_debt_limit: 16 * 1024 * 1024,
+                        drain_allowance: None,
                     },
                     escrow: super::MemoryBudgetEscrowPolicy {
                         topic_default_limit: 64 * 1024 * 1024,
@@ -1409,6 +1439,77 @@ mod tests {
         assert!(
             errors[0].contains("enforcement flags must remain false"),
             "observe-only foundation must reject enforcement flags: {errors:?}"
+        );
+    }
+
+    fn observe_only_budget_with_drain_allowance(
+        drain_allowance: Option<u64>,
+    ) -> super::MemoryBudgetPolicy {
+        super::MemoryBudgetPolicy {
+            mode: super::MemoryBudgetMode::ObserveOnly,
+            retry_after_secs: 1,
+            sizing: super::MemoryBudgetSizingPolicy {
+                strategy: super::MemoryBudgetSizingStrategy::Leased,
+                reserve: 512 * 1024 * 1024,
+                floor_per_runtime: 256 * 1024,
+                lease_step: 64 * 1024,
+                max_overshoot_per_runtime: 256 * 1024,
+                overshoot_debt_limit: 16 * 1024,
+                drain_allowance,
+            },
+            escrow: super::MemoryBudgetEscrowPolicy {
+                topic_default_limit: 64 * 1024 * 1024,
+            },
+            enforcement: super::MemoryBudgetEnforcementPolicy::default(),
+        }
+    }
+
+    fn budget_validation_errors(budget: super::MemoryBudgetPolicy) -> Vec<String> {
+        Policies {
+            resources: Some(super::ResourcesPolicy {
+                core_allocation: super::CoreAllocation::all_cores(),
+                memory_limiter: None,
+                memory_budget: Some(budget),
+            }),
+            ..Policies::default()
+        }
+        .validation_errors("policies")
+    }
+
+    #[test]
+    fn validates_memory_budget_accepts_default_and_sized_drain_allowance() {
+        // Omitted allowance (engine falls back to lease_step) is always valid.
+        assert!(
+            budget_validation_errors(observe_only_budget_with_drain_allowance(None)).is_empty()
+        );
+        // An explicit allowance within [lease_step, floor] is valid.
+        assert!(
+            budget_validation_errors(observe_only_budget_with_drain_allowance(Some(128 * 1024)))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn validates_memory_budget_rejects_drain_allowance_below_lease_step() {
+        let errors =
+            budget_validation_errors(observe_only_budget_with_drain_allowance(Some(1_024)));
+        assert!(
+            errors.iter().any(|error| error
+                .contains("sizing.drain_allowance must be greater than or equal to")
+                && error.contains("sizing.lease_step")),
+            "drain allowance below one lease step must be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validates_memory_budget_rejects_drain_allowance_above_floor() {
+        let errors =
+            budget_validation_errors(observe_only_budget_with_drain_allowance(Some(512 * 1024)));
+        assert!(
+            errors.iter().any(|error| error
+                .contains("sizing.drain_allowance must be less than or equal to")
+                && error.contains("sizing.floor_per_runtime")),
+            "drain allowance above the runtime floor must be rejected: {errors:?}"
         );
     }
 

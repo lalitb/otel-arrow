@@ -2385,6 +2385,7 @@ fn observe_only_budget_state() -> crate::memory_budget::MemoryBudgetState {
                 lease_step_bytes: 1_000,
                 max_overshoot_per_runtime_bytes: 10_000,
                 overshoot_debt_limit_bytes: 1_000,
+                drain_allowance_bytes: 0,
             },
             topic_default_limit_bytes: 1_000_000,
             runtime_count: 1,
