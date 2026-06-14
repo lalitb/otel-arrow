@@ -152,6 +152,8 @@ pub struct RuntimeMemorySnapshot {
     unknown_count: AtomicU64,
     overshoot_bytes: AtomicU64,
     reconcile_debt_bytes: AtomicU64,
+    drain_allowance_bytes: AtomicU64,
+    drain_committed_bytes: AtomicU64,
     level: AtomicU64,
 }
 
@@ -165,6 +167,8 @@ impl RuntimeMemorySnapshot {
         unknown_count: u64,
         overshoot_bytes: u64,
         reconcile_debt_bytes: u64,
+        drain_allowance_bytes: u64,
+        drain_committed_bytes: u64,
         level: BudgetLevel,
     ) {
         self.borrowed_bytes.store(borrowed_bytes, Ordering::Relaxed);
@@ -175,6 +179,10 @@ impl RuntimeMemorySnapshot {
             .store(overshoot_bytes, Ordering::Relaxed);
         self.reconcile_debt_bytes
             .store(reconcile_debt_bytes, Ordering::Relaxed);
+        self.drain_allowance_bytes
+            .store(drain_allowance_bytes, Ordering::Relaxed);
+        self.drain_committed_bytes
+            .store(drain_committed_bytes, Ordering::Relaxed);
         self.level.store(level.as_u64(), Ordering::Relaxed);
     }
 
@@ -213,6 +221,24 @@ impl RuntimeMemorySnapshot {
     #[must_use]
     pub fn reconcile_debt_bytes(&self) -> u64 {
         self.reconcile_debt_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Returns the bounded drain/redemption allowance configured for this
+    /// runtime. Published from local `Cell` state at flush time so observers
+    /// can validate that Hard consumers retain a path to drain in-transit
+    /// escrow without enabling new external admission.
+    #[must_use]
+    pub fn drain_allowance_bytes(&self) -> u64 {
+        self.drain_allowance_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Returns the bytes currently outstanding against the drain allowance.
+    /// Increments only when a Hard consumer admits an in-transit escrow item
+    /// via the drain path; decrements exactly once when the returned drain
+    /// ticket drops.
+    #[must_use]
+    pub fn drain_committed_bytes(&self) -> u64 {
+        self.drain_committed_bytes.load(Ordering::Relaxed)
     }
 
     /// Returns pressure level encoded as `0=normal`, `1=soft`, `2=hard`.
@@ -265,6 +291,10 @@ pub struct MemoryBudgetSnapshot {
     /// In enforce mode, escrow creation that would land here is rejected so the
     /// global logical invariant is preserved.
     pub escrow_pool_overshoot_bytes: u64,
+    /// Total drain/redemption allowance configured across runtimes.
+    pub drain_allowance_bytes: u64,
+    /// Total drain bytes currently outstanding across runtimes.
+    pub drain_committed_bytes: u64,
     /// Spare bytes currently available to lease from the global pool.
     pub spare_available_bytes: u64,
     /// Signed overshoot-debt pool balance. Negative means the pool has been
@@ -351,7 +381,7 @@ impl MemoryBudgetState {
     pub fn register_runtime_snapshot(&self, scope: BudgetScopeId) -> RuntimeMemorySnapshotHandle {
         let snapshot = Arc::new(RuntimeMemorySnapshot::default());
         if self.config().is_some() {
-            snapshot.publish(0, 0, 0, 0, 0, 0, BudgetLevel::Normal);
+            snapshot.publish(0, 0, 0, 0, 0, 0, 0, 0, BudgetLevel::Normal);
         }
         self.inner
             .snapshots
@@ -423,6 +453,12 @@ impl MemoryBudgetState {
             snapshot.reconcile_debt_bytes = snapshot
                 .reconcile_debt_bytes
                 .saturating_add(runtime.reconcile_debt_bytes());
+            snapshot.drain_allowance_bytes = snapshot
+                .drain_allowance_bytes
+                .saturating_add(runtime.drain_allowance_bytes());
+            snapshot.drain_committed_bytes = snapshot
+                .drain_committed_bytes
+                .saturating_add(runtime.drain_committed_bytes());
             match runtime.level() {
                 1 => snapshot.soft_runtime_count += 1,
                 2 => snapshot.hard_runtime_count += 1,
@@ -884,6 +920,7 @@ impl RuntimeMemoryAccount {
     /// the per-item hot path.
     pub fn set_drain_allowance_bytes(&self, bytes: u64) {
         self.drain_allowance_bytes.set(bytes);
+        self.mark_dirty();
     }
 
     /// Returns the configured drain/redemption allowance.
@@ -1215,6 +1252,8 @@ impl RuntimeMemoryAccount {
             self.unknown_count.get(),
             self.overshoot_bytes.get(),
             self.reconcile_debt.get(),
+            self.drain_allowance_bytes.get(),
+            self.drain_committed.get(),
             level,
         );
         self.published_level.set(level);
@@ -3052,6 +3091,39 @@ mod tests {
         let consumer = account(1_000, 64, 0, 1_000);
         assert_eq!(consumer.level(), BudgetLevel::Normal);
         assert!(consumer.try_charge_for_drain(32_u64).is_none());
+    }
+
+    /// `RuntimeMemorySnapshot::publish` propagates the per-runtime
+    /// drain allowance and outstanding committed bytes from local `Cell`
+    /// state, so observers can validate the Hard-consumer drain path
+    /// without any new per-item shared atomics.
+    #[test]
+    fn flush_snapshot_publishes_drain_allowance_and_committed_bytes() {
+        let state = escrow_state();
+        let producer = account(100, 10, 20, 100);
+        let pool = Arc::new(GlobalLeasePool::with_overshoot_debt(0, 0));
+        let consumer = account_with_pool(BudgetMode::Enforce, 50, 64, 10, pool);
+        let mut filler = consumer.charge(50_u64).expect("fill floor");
+        filler.reconcile_size(120);
+        assert_eq!(consumer.level(), BudgetLevel::Hard);
+
+        consumer.flush_snapshot();
+        assert_eq!(consumer.snapshot.drain_allowance_bytes(), 64);
+        assert_eq!(consumer.snapshot.drain_committed_bytes(), 0);
+
+        let drained = producer
+            .charge(32_u64)
+            .expect("producer charge")
+            .try_into_escrow(&state)
+            .expect("escrow")
+            .redeem_into(&consumer)
+            .expect("drain admits one redeem");
+        consumer.flush_snapshot();
+        assert_eq!(consumer.snapshot.drain_committed_bytes(), 32);
+
+        drop(drained);
+        consumer.flush_snapshot();
+        assert_eq!(consumer.snapshot.drain_committed_bytes(), 0);
     }
 
     // -------------------------------------------------------------------------
