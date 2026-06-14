@@ -819,6 +819,20 @@ pub struct RuntimeMemoryAccount {
     /// non-zero the runtime is pinned to `Hard` and the global pool balance is
     /// negative by at least this amount until repaid.
     reconcile_debt: Cell<u64>,
+    /// Per-runtime drain/redemption allowance (Phase 2 design lines 1154-1184).
+    ///
+    /// While the runtime is at local `Hard`, the consumer side may still admit
+    /// up to this many bytes of redemption/drain work so consumers can make
+    /// forward progress against retained escrow even when their account is
+    /// otherwise at the classification ceiling. The allowance is only consumed
+    /// by [`Self::try_charge_for_drain`] (the redeem/drain path) and never by
+    /// regular receiver admission, so it cannot be turned into a sneak path
+    /// for new external ingress.
+    drain_allowance_bytes: Cell<u64>,
+    /// Bytes currently outstanding against [`Self::drain_allowance_bytes`].
+    /// Each successful drain charge increments this and the matching ticket
+    /// drop decrements it.
+    drain_committed: Cell<u64>,
     published_level: Cell<BudgetLevel>,
     dirty: Cell<bool>,
     snapshot: Arc<RuntimeMemorySnapshot>,
@@ -827,6 +841,11 @@ pub struct RuntimeMemoryAccount {
 
 impl RuntimeMemoryAccount {
     /// Creates a local runtime account.
+    ///
+    /// The drain/redemption allowance defaults to `lease_step_bytes` per the
+    /// design's "at least `max(lease_step_bytes, largest_configured_topic_
+    /// message_estimate)`" guidance; callers that know a more specific bound
+    /// can adjust via [`Self::set_drain_allowance_bytes`].
     #[must_use]
     pub fn new(
         floor_bytes: u64,
@@ -848,6 +867,8 @@ impl RuntimeMemoryAccount {
             overshoot_bytes: Cell::new(0),
             debt_held: Cell::new(0),
             reconcile_debt: Cell::new(0),
+            drain_allowance_bytes: Cell::new(lease_step_bytes),
+            drain_committed: Cell::new(0),
             published_level: Cell::new(BudgetLevel::Normal),
             dirty: Cell::new(false),
             snapshot,
@@ -857,6 +878,20 @@ impl RuntimeMemoryAccount {
         // per-item hot path.
         account.publish();
         account
+    }
+
+    /// Overrides the drain/redemption allowance for this account.
+    ///
+    /// Intended for runtime initialization (controller-driven). Not part of
+    /// the per-item hot path.
+    pub fn set_drain_allowance_bytes(&self, bytes: u64) {
+        self.drain_allowance_bytes.set(bytes);
+    }
+
+    /// Returns the configured drain/redemption allowance.
+    #[must_use]
+    pub fn drain_allowance_bytes(&self) -> u64 {
+        self.drain_allowance_bytes.get()
     }
 
     /// Returns the current pressure level.
@@ -951,6 +986,7 @@ impl RuntimeMemoryAccount {
                 account: Rc::clone(self),
                 charge: LocalMemoryCharge::Unknown,
                 active: true,
+                drain_used: 0,
                 _not_send: PhantomData,
             });
         };
@@ -969,6 +1005,54 @@ impl RuntimeMemoryAccount {
             account: Rc::clone(self),
             charge: LocalMemoryCharge::KnownBytes(bytes),
             active: true,
+            drain_used: 0,
+            _not_send: PhantomData,
+        })
+    }
+
+    /// Drain/redemption-only admission path: charges `bytes` against the
+    /// per-runtime drain allowance even when the account is at local `Hard`.
+    ///
+    /// Per the design (lines 1154-1184) the consumer side at local `Hard`
+    /// must be able to redeem at least one in-transit escrowed item so that
+    /// release can drain the queue and let pressure recover. This method is
+    /// the primitive that admission of `EscrowTicket::redeem_into` falls back
+    /// to in enforce mode when the consumer's normal charge would be
+    /// rejected. It never admits new external work because it is callable
+    /// only from the redemption/drain path.
+    ///
+    /// Returns `Some(ticket)` if the account is at `Hard` and the allowance
+    /// has room for `bytes`. Returns `None` if the account is not at `Hard`
+    /// (the regular [`Self::charge`] should be used instead), the allowance
+    /// is exhausted, or the size is unknown.
+    ///
+    /// The bytes are still counted in `charged_bytes`, so the work remains
+    /// attributed to this runtime. The release path is automatic: dropping
+    /// the returned ticket refunds the charge and frees the allowance slot.
+    #[must_use]
+    pub fn try_charge_for_drain(
+        self: &Rc<Self>,
+        size: impl ChargedSize,
+    ) -> Option<LocalMemoryTicket> {
+        let bytes = size.charged_size()?;
+        if self.level() != BudgetLevel::Hard {
+            return None;
+        }
+        let used = self.drain_committed.get();
+        let remaining = self.drain_allowance_bytes.get().saturating_sub(used);
+        if bytes > remaining {
+            return None;
+        }
+        // Allowance accounted; commit the charge bytes (still attributed to
+        // this runtime) without going through `try_reserve_extra` so we do
+        // not trip the enforce-mode admission rejection at Hard.
+        self.drain_committed.set(used.saturating_add(bytes));
+        self.commit_charge(bytes);
+        Some(LocalMemoryTicket {
+            account: Rc::clone(self),
+            charge: LocalMemoryCharge::KnownBytes(bytes),
+            active: true,
+            drain_used: bytes,
             _not_send: PhantomData,
         })
     }
@@ -1253,6 +1337,11 @@ pub struct LocalMemoryTicket {
     account: Rc<RuntimeMemoryAccount>,
     charge: LocalMemoryCharge,
     active: bool,
+    /// Non-zero only when this ticket was admitted via
+    /// [`RuntimeMemoryAccount::try_charge_for_drain`]. On drop the account's
+    /// `drain_committed` counter is decremented by this amount so the
+    /// allowance slot is returned.
+    drain_used: u64,
     _not_send: PhantomData<Rc<()>>,
 }
 
@@ -1368,10 +1457,18 @@ impl LocalMemoryTicket {
     }
 
     /// Converts this local ticket into escrow ownership.
+    ///
+    /// Tickets admitted via [`RuntimeMemoryAccount::try_charge_for_drain`]
+    /// (the per-runtime drain/redemption allowance) cannot be transferred
+    /// back to escrow: the allowance is a redeem-only path, not a producer
+    /// path. Those tickets must be drop-released by the consumer instead.
     pub fn try_into_escrow(
         mut self,
         state: &MemoryBudgetState,
     ) -> Result<EscrowTicket, LocalMemoryTicket> {
+        if self.drain_used > 0 {
+            return Err(self);
+        }
         let LocalMemoryCharge::KnownBytes(bytes) = self.charge else {
             return Err(self);
         };
@@ -1403,6 +1500,13 @@ impl Drop for LocalMemoryTicket {
             match self.charge {
                 LocalMemoryCharge::KnownBytes(bytes) => self.account.refund(bytes),
                 LocalMemoryCharge::Unknown => self.account.refund_unknown(),
+            }
+            if self.drain_used > 0 {
+                let used = self.account.drain_committed.get();
+                self.account
+                    .drain_committed
+                    .set(used.saturating_sub(self.drain_used));
+                self.drain_used = 0;
             }
             self.active = false;
         }
@@ -1475,24 +1579,35 @@ impl EscrowTicket {
     /// On success the escrow charge is released and an equivalent
     /// [`LocalMemoryTicket`] is charged to `account`, so the global logical
     /// total is preserved across the handoff. On failure (enforce mode rejects
-    /// the consumer charge) the original [`EscrowTicket`] is returned unchanged
-    /// and still owns the charge, so the boundary can apply its drop/retry
-    /// policy without creating an unowned interval.
+    /// the consumer charge even after the drain-allowance fallback) the
+    /// original [`EscrowTicket`] is returned unchanged and still owns the
+    /// charge, so the boundary can apply its drop/retry policy without
+    /// creating an unowned interval.
     ///
-    /// Future work: wire the per-runtime redemption/drain allowance so a
-    /// consumer at local `Hard` can still redeem at least one in-transit item.
+    /// Drain allowance fallback (Phase 2 design lines 1154-1184): when the
+    /// consumer's normal admission is rejected and the account is at local
+    /// `Hard`, this falls back to the per-runtime drain/redemption allowance
+    /// so consumers can still drain at least one in-transit escrowed item
+    /// even when their account is otherwise at the classification ceiling.
+    /// The allowance bytes are still charged to the consumer runtime; this
+    /// path does not admit new external ingress.
     #[must_use = "a returned EscrowTicket still owns the escrow charge"]
     pub fn redeem_into(
         mut self,
         account: &Rc<RuntimeMemoryAccount>,
     ) -> Result<LocalMemoryTicket, EscrowTicket> {
-        match account.charge(self.bytes) {
-            Some(ticket) => {
-                self.resolve_release();
-                Ok(ticket)
-            }
-            None => Err(self),
+        if let Some(ticket) = account.charge(self.bytes) {
+            self.resolve_release();
+            return Ok(ticket);
         }
+        // Normal admission was rejected (enforce mode). If we are at local
+        // Hard, the drain allowance permits a bounded redeem so the queue
+        // can keep draining.
+        if let Some(ticket) = account.try_charge_for_drain(self.bytes) {
+            self.resolve_release();
+            return Ok(ticket);
+        }
+        Err(self)
     }
 
     /// Releases escrow on eviction, drop-oldest, topic close, or final drain.
@@ -2813,8 +2928,10 @@ mod tests {
     fn escrow_redeem_into_failure_returns_original_escrow() {
         let state = escrow_state();
         let producer = account(100, 10, 20, 100);
-        // Enforce-mode consumer with no spare/overshoot: rejects the redemption.
+        // Enforce-mode consumer with no spare/overshoot AND a zero drain
+        // allowance: rejects the redemption with no fallback.
         let consumer = account_with_mode(BudgetMode::Enforce, 0, 10, 0, 0);
+        consumer.set_drain_allowance_bytes(0);
 
         let escrow = producer
             .charge(40_u64)
@@ -2823,7 +2940,7 @@ mod tests {
             .expect("escrow should fit");
         let escrow = escrow
             .redeem_into(&consumer)
-            .expect_err("consumer at hard rejects redemption");
+            .expect_err("consumer at hard with no drain allowance rejects redemption");
         assert_eq!(
             escrow.bytes(),
             40,
@@ -2835,6 +2952,108 @@ mod tests {
             "escrow still owns the charge after a failed redemption"
         );
         escrow.abort();
+    }
+
+    /// Consumer at local `Hard` (pinned via reconcile overdraw) with normal
+    /// admission rejected can still redeem an in-transit escrow item via
+    /// the per-runtime drain/redemption allowance (design lines 1154-1184).
+    /// The bytes are still charged to the consumer; the escrow is released
+    /// exactly once.
+    #[test]
+    fn drain_allowance_lets_hard_consumer_redeem_at_least_one_item() {
+        let state = escrow_state();
+        let producer = account(100, 10, 20, 100);
+        // Enforce-mode consumer pinned to Hard via post-hoc reconcile overdraw:
+        // floor=50, lease_step=64 (also seeds drain_allowance=64), overshoot=10,
+        // pool with no debt allowance. Filling the floor then reconcile-growing
+        // past authorized capacity drives unbacked reconciliation debt and
+        // pins the account to Hard regardless of normal admission paths.
+        let pool = Arc::new(GlobalLeasePool::with_overshoot_debt(0, 0));
+        let consumer = account_with_pool(BudgetMode::Enforce, 50, 64, 10, pool);
+        let mut filler = consumer.charge(50_u64).expect("fill floor");
+        filler.reconcile_size(120);
+        assert_eq!(
+            consumer.level(),
+            BudgetLevel::Hard,
+            "reconcile overdraw must pin the consumer to Hard"
+        );
+        assert_eq!(consumer.drain_allowance_bytes(), 64);
+        // Sanity: normal admission for new external work at Hard is still
+        // rejected -- the drain allowance must not turn into a sneak path.
+        assert!(consumer.charge(32_u64).is_none());
+
+        let escrow = producer
+            .charge(32_u64)
+            .expect("producer charge should fit")
+            .try_into_escrow(&state)
+            .expect("escrow should fit");
+
+        let ticket = escrow
+            .redeem_into(&consumer)
+            .expect("drain allowance must admit one redeem under Hard");
+        assert_eq!(ticket.bytes(), Some(32));
+        assert_eq!(consumer.drain_committed.get(), 32);
+        assert_eq!(state.snapshot().escrow_charged_bytes, 0);
+
+        // Drop the drain ticket: the allowance slot is returned.
+        drop(ticket);
+        assert_eq!(consumer.drain_committed.get(), 0);
+    }
+
+    /// Drain allowance exhaustion still rejects further redemption (the
+    /// remaining escrow can be aborted/released without acquiring budget).
+    /// The allowance is a single bounded reservoir, not unlimited.
+    #[test]
+    fn drain_allowance_exhaustion_rejects_further_redemption() {
+        let state = escrow_state();
+        let producer = account(100, 10, 20, 100);
+        let pool = Arc::new(GlobalLeasePool::with_overshoot_debt(0, 0));
+        let consumer = account_with_pool(BudgetMode::Enforce, 50, 32, 10, pool);
+        // Pin to Hard with reconcile overdraw.
+        let mut filler = consumer.charge(50_u64).expect("fill floor");
+        filler.reconcile_size(120);
+        assert_eq!(consumer.level(), BudgetLevel::Hard);
+        assert_eq!(consumer.drain_allowance_bytes(), 32);
+
+        let first = producer
+            .charge(32_u64)
+            .expect("producer charge")
+            .try_into_escrow(&state)
+            .expect("first escrow")
+            .redeem_into(&consumer)
+            .expect("first redeem consumes the entire allowance");
+        let second = producer
+            .charge(8_u64)
+            .expect("producer charge")
+            .try_into_escrow(&state)
+            .expect("second escrow")
+            .redeem_into(&consumer)
+            .expect_err("allowance exhausted: no further redeems admitted");
+        // Caller can still abort the unredeemable escrow without acquiring
+        // any budget (drop/abort paths are budget-free).
+        second.abort();
+        // Dropping the first redeemed ticket frees the allowance slot so
+        // subsequent redeems can proceed.
+        drop(first);
+        assert_eq!(consumer.drain_committed.get(), 0);
+        let third = producer
+            .charge(20_u64)
+            .expect("producer charge")
+            .try_into_escrow(&state)
+            .expect("third escrow")
+            .redeem_into(&consumer)
+            .expect("allowance refreshed after release");
+        assert_eq!(third.bytes(), Some(20));
+    }
+
+    /// The drain allowance is gated behind `level() == Hard`: when the
+    /// consumer is below Hard, `try_charge_for_drain` returns `None` so the
+    /// regular `charge` path is used instead (which already admits).
+    #[test]
+    fn drain_allowance_only_admits_when_at_hard() {
+        let consumer = account(1_000, 64, 0, 1_000);
+        assert_eq!(consumer.level(), BudgetLevel::Normal);
+        assert!(consumer.try_charge_for_drain(32_u64).is_none());
     }
 
     // -------------------------------------------------------------------------
