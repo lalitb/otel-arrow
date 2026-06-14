@@ -143,3 +143,73 @@ impl OtelDataflowSpec {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::engine::OtelDataflowSpec;
+
+    const OVERRIDE_SPEC_YAML: &str = r#"
+version: otel_dataflow/v1
+groups:
+  g1:
+    policies:
+      resources:
+        memory_budget:
+          mode: observe_only
+          sizing:
+            strategy: leased
+            reserve: 536870912
+            floor_per_runtime: 268435456
+            lease_step: 65536
+            max_overshoot_per_runtime: 134217728
+            overshoot_debt_limit: 16777216
+          escrow:
+            topic_default_limit: 67108864
+    pipelines:
+      p1:
+        policies:
+          resources:
+            memory_budget:
+              mode: observe_only
+              sizing:
+                strategy: leased
+                reserve: 536870912
+                floor_per_runtime: 268435456
+                lease_step: 65536
+                max_overshoot_per_runtime: 134217728
+                overshoot_debt_limit: 16777216
+              escrow:
+                topic_default_limit: 67108864
+        nodes:
+          receiver:
+            type: "urn:test:receiver:example"
+            config: null
+          exporter:
+            type: "urn:test:exporter:example"
+            config: null
+        connections:
+          - from: receiver
+            to: exporter
+"#;
+
+    #[test]
+    fn validate_rejects_group_and_pipeline_memory_budget_overrides() {
+        // The runtime budget is a top-level-only policy. Group and pipeline
+        // scopes must be rejected so a per-group/per-pipeline override cannot
+        // silently diverge from the process-wide budget. `from_yaml` validates
+        // as it loads, so the override is rejected at load time.
+        let error = OtelDataflowSpec::from_yaml(OVERRIDE_SPEC_YAML)
+            .expect_err("overrides must be rejected");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("groups.g1.policies.resources.memory_budget is not supported"),
+            "missing group-level override rejection: {rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "groups.g1.pipelines.p1.policies.resources.memory_budget is not supported"
+            ),
+            "missing pipeline-level override rejection: {rendered}"
+        );
+    }
+}
