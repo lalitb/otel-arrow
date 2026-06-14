@@ -1,0 +1,7 @@
+change_type: enhancement
+
+component: engine
+
+note: "Extend the observe-only runtime memory budget: add a configurable `policies.resources.memory_budget.sizing.drain_allowance` so operators can size the per-runtime redemption/drain allowance (defaults to `lease_step`), surface drain and pool-backed escrow accounting as new low-cardinality engine metrics, and add a budget-free reclaim-hook foundation (`LocalMemoryReclaim`, `ReclaimCoordinator`). Enforcement remains gated."
+
+issues: [3272]
