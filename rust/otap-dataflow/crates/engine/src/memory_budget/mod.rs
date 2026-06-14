@@ -1767,7 +1767,7 @@ pub fn current_runtime_memory_budget() -> Option<Rc<RuntimeMemoryBudget>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use static_assertions::assert_not_impl_any;
+    use static_assertions::{assert_impl_all, assert_not_impl_any};
 
     struct UnknownSize;
 
@@ -1781,6 +1781,14 @@ mod tests {
     assert_not_impl_any!(RuntimeMemoryBudget: Send, Sync);
     assert_not_impl_any!(RuntimeMemoryBudgetGuard: Send, Sync);
     assert_not_impl_any!(LocalMemoryTicket: Send, Sync);
+    // A LocalEnvelope can hold a !Send LocalMemoryTicket, so it must not be
+    // Send/Sync regardless of payload sendability.
+    assert_not_impl_any!(LocalEnvelope<u64>: Send, Sync);
+    // EscrowTicket is the sendable owner used at shared/runtime boundaries.
+    assert_impl_all!(EscrowTicket: Send, Sync);
+    // The interned attribution handle travels with escrow, so it must be
+    // sendable too.
+    assert_impl_all!(BudgetScope: Send, Sync);
 
     fn account_with_mode(
         mode: BudgetMode,
@@ -1802,6 +1810,26 @@ mod tests {
 
     fn account(floor: u64, step: u64, overshoot: u64, spare: u64) -> Rc<RuntimeMemoryAccount> {
         account_with_mode(BudgetMode::ObserveOnly, floor, step, overshoot, spare)
+    }
+
+    /// Builds an account backed by a shared pool with an explicit overshoot-debt
+    /// allowance so tests can exercise debt acquisition, overdraw, and repayment.
+    fn account_with_pool(
+        mode: BudgetMode,
+        floor: u64,
+        step: u64,
+        overshoot: u64,
+        pool: Arc<GlobalLeasePool>,
+    ) -> Rc<RuntimeMemoryAccount> {
+        Rc::new(RuntimeMemoryAccount::new(
+            floor,
+            step,
+            overshoot,
+            mode,
+            pool,
+            Arc::new(RuntimeMemorySnapshot::default()),
+            Arc::new(BudgetScopeId::default()),
+        ))
     }
 
     #[test]
@@ -2180,8 +2208,353 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Runtime-local accessor tests.
-    //
+    // Ticket size-adjustment tests.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn try_resize_grow_then_shrink_tracks_charge() {
+        let acct = account(1_000, 10, 20, 0);
+        let mut ticket = acct.charge(50_u64).expect("charge should fit");
+        ticket.try_resize(50, 80).expect("grow within floor");
+        acct.flush_snapshot();
+        assert_eq!(acct.snapshot.charged_bytes(), 80);
+        ticket.try_resize(80, 30).expect("shrink always succeeds");
+        acct.flush_snapshot();
+        assert_eq!(acct.snapshot.charged_bytes(), 30);
+        assert_eq!(ticket.bytes(), Some(30));
+    }
+
+    #[test]
+    fn try_resize_failed_grow_preserves_original_charge() {
+        // Enforce mode, no spare and no overshoot debt: a grow beyond the floor
+        // cannot be authorized and must leave the original charge intact.
+        let acct = account_with_mode(BudgetMode::Enforce, 100, 10, 0, 0);
+        let mut ticket = acct.charge(100_u64).expect("charge fills the floor");
+        acct.flush_snapshot();
+        assert_eq!(acct.snapshot.charged_bytes(), 100);
+
+        let err = ticket
+            .try_resize(100, 160)
+            .expect_err("grow must fail without capacity");
+        assert_eq!(err, BudgetError::Exhausted);
+        acct.flush_snapshot();
+        assert_eq!(
+            acct.snapshot.charged_bytes(),
+            100,
+            "failed grow must preserve the original charge"
+        );
+        assert_eq!(ticket.bytes(), Some(100));
+    }
+
+    #[test]
+    fn unknown_size_ticket_cannot_resize_but_can_reconcile() {
+        let acct = account(1_000, 10, 20, 0);
+        let mut ticket = acct.charge(UnknownSize).expect("unknown is observed");
+        assert_eq!(
+            ticket.try_resize(0, 10),
+            Err(BudgetError::UnknownSize),
+            "unknown-size tickets have no baseline to resize from"
+        );
+        assert_eq!(
+            ticket.try_reserve_extra(10),
+            Err(BudgetError::UnknownSize),
+            "unknown-size tickets cannot reserve extra without a baseline"
+        );
+        // reconcile_size converts the unknown observation into a known charge.
+        ticket.reconcile_size(64);
+        acct.flush_snapshot();
+        assert_eq!(ticket.bytes(), Some(64));
+        assert_eq!(acct.snapshot.charged_bytes(), 64);
+        assert_eq!(acct.snapshot.unknown_count(), 0);
+    }
+
+    #[test]
+    fn try_reserve_clone_charges_an_additional_owner() {
+        let acct = account(1_000, 10, 20, 0);
+        let ticket = acct.charge(40_u64).expect("charge should fit");
+        let clone = ticket
+            .try_reserve_clone(40)
+            .expect("clone owner should be charged");
+        acct.flush_snapshot();
+        assert_eq!(
+            acct.snapshot.charged_bytes(),
+            80,
+            "each retained branch reserves its own charge"
+        );
+        drop(clone);
+        acct.flush_snapshot();
+        assert_eq!(acct.snapshot.charged_bytes(), 40);
+        drop(ticket);
+        acct.flush_snapshot();
+        assert_eq!(acct.snapshot.charged_bytes(), 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // Overshoot / reconciliation-debt model tests.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn enforce_admission_acquires_overshoot_debt_from_pool() {
+        // floor 100, no spare lease, overshoot ceiling 50, debt pool 50.
+        let pool = Arc::new(GlobalLeasePool::with_overshoot_debt(0, 50));
+        let acct = account_with_pool(BudgetMode::Enforce, 100, 10, 50, pool.clone());
+        // 140 charged = 40 overshoot, authorized from the debt pool.
+        let ticket = acct
+            .charge(140_u64)
+            .expect("overshoot debt should authorize");
+        assert_eq!(
+            pool.overshoot_debt_balance(),
+            10,
+            "40 debt acquired from 50"
+        );
+        assert_eq!(acct.level(), BudgetLevel::Soft);
+        drop(ticket);
+        assert_eq!(
+            pool.overshoot_debt_balance(),
+            50,
+            "dropping the owner repays acquired debt"
+        );
+        assert_eq!(acct.level(), BudgetLevel::Normal);
+    }
+
+    #[test]
+    fn enforce_admission_rejected_when_debt_pool_exhausted() {
+        // Overshoot ceiling allows 50, but the debt pool only has 20.
+        let pool = Arc::new(GlobalLeasePool::with_overshoot_debt(0, 20));
+        let acct = account_with_pool(BudgetMode::Enforce, 100, 10, 50, pool.clone());
+        assert!(
+            acct.charge(160_u64).is_none(),
+            "60 overshoot cannot be authorized from a 20-byte debt pool"
+        );
+        assert_eq!(
+            pool.overshoot_debt_balance(),
+            20,
+            "rejected admission must not strand acquired debt"
+        );
+        acct.flush_snapshot();
+        assert_eq!(acct.snapshot.charged_bytes(), 0);
+    }
+
+    #[test]
+    fn reconcile_grow_overdraws_pool_and_pins_hard() {
+        // Post-hoc growth: only 20 debt available but reconcile needs 40.
+        let pool = Arc::new(GlobalLeasePool::with_overshoot_debt(0, 20));
+        let acct = account_with_pool(BudgetMode::Enforce, 100, 10, 50, pool.clone());
+        let mut ticket = acct.charge(100_u64).expect("charge fills the floor");
+
+        // Grow to 140 after the fact (size only known post-allocation).
+        ticket.reconcile_size(140);
+        acct.flush_snapshot();
+        assert_eq!(acct.snapshot.charged_bytes(), 140);
+        assert_eq!(
+            acct.snapshot.reconcile_debt_bytes(),
+            20,
+            "20 of the 40 overshoot is unbacked reconciliation debt"
+        );
+        assert_eq!(
+            pool.overshoot_debt_balance(),
+            -20,
+            "overdrawn debt pool balance is negative"
+        );
+        assert_eq!(
+            acct.level(),
+            BudgetLevel::Hard,
+            "unbacked reconciliation debt pins the runtime to Hard"
+        );
+
+        // Drain back below authorized capacity: debt is repaid and Hard clears.
+        ticket.reconcile_size(100);
+        acct.flush_snapshot();
+        assert_eq!(acct.snapshot.reconcile_debt_bytes(), 0);
+        assert_eq!(
+            pool.overshoot_debt_balance(),
+            20,
+            "repayment restores the pool"
+        );
+        assert_eq!(acct.level(), BudgetLevel::Normal);
+    }
+
+    #[test]
+    fn observe_only_never_overdraws_or_records_reconcile_debt_on_admission() {
+        let pool = Arc::new(GlobalLeasePool::with_overshoot_debt(0, 0));
+        let acct = account_with_pool(BudgetMode::ObserveOnly, 100, 10, 50, pool.clone());
+        let _ticket = acct
+            .charge(130_u64)
+            .expect("observe-only admits above authorized capacity");
+        acct.flush_snapshot();
+        assert_eq!(acct.snapshot.charged_bytes(), 130);
+        assert_eq!(
+            acct.snapshot.reconcile_debt_bytes(),
+            0,
+            "observe-only admission must not record reconciliation debt"
+        );
+        assert_eq!(
+            pool.overshoot_debt_balance(),
+            0,
+            "observe-only admission must not overdraw the debt pool"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Escrow release/abort/redeem tests.
+    // -------------------------------------------------------------------------
+
+    fn escrow_state() -> MemoryBudgetState {
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 100,
+                    lease_step_bytes: 10,
+                    max_overshoot_per_runtime_bytes: 20,
+                    overshoot_debt_limit_bytes: 10,
+                },
+                topic_default_limit_bytes: 1_000,
+                runtime_count: 1,
+            },
+            None,
+        );
+        state
+    }
+
+    #[test]
+    fn explicit_escrow_abort_releases_without_graveyard() {
+        let state = escrow_state();
+        let acct = account(100, 10, 20, 100);
+        let escrow = acct
+            .charge(42_u64)
+            .expect("charge should fit")
+            .try_into_escrow(&state)
+            .expect("escrow should fit topic limit");
+        escrow.abort();
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.escrow_charged_bytes, 0);
+        assert_eq!(
+            snapshot.abandoned_escrow_count, 0,
+            "explicit abort must not record an abandoned-escrow entry"
+        );
+    }
+
+    #[test]
+    fn explicit_escrow_release_is_not_graveyard() {
+        let state = escrow_state();
+        let acct = account(100, 10, 20, 100);
+        let escrow = acct
+            .charge(30_u64)
+            .expect("charge should fit")
+            .try_into_escrow(&state)
+            .expect("escrow should fit");
+        escrow.release();
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.escrow_charged_bytes, 0);
+        assert_eq!(snapshot.abandoned_escrow_count, 0);
+    }
+
+    #[test]
+    fn escrow_redeem_into_transfers_ownership_to_consumer() {
+        let state = escrow_state();
+        let producer = account(100, 10, 20, 100);
+        let consumer = account(100, 10, 20, 100);
+
+        let escrow = producer
+            .charge(40_u64)
+            .expect("producer charge should fit")
+            .try_into_escrow(&state)
+            .expect("escrow should fit");
+        producer.flush_snapshot();
+        assert_eq!(producer.snapshot.charged_bytes(), 0);
+        assert_eq!(state.snapshot().escrow_charged_bytes, 40);
+
+        let ticket = escrow
+            .redeem_into(&consumer)
+            .expect("consumer should accept redemption");
+        assert_eq!(ticket.bytes(), Some(40));
+        consumer.flush_snapshot();
+        assert_eq!(
+            consumer.snapshot.charged_bytes(),
+            40,
+            "redeemed bytes move into the consumer account"
+        );
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.escrow_charged_bytes, 0);
+        assert_eq!(snapshot.abandoned_escrow_count, 0);
+    }
+
+    #[test]
+    fn escrow_redeem_into_failure_returns_original_escrow() {
+        let state = escrow_state();
+        let producer = account(100, 10, 20, 100);
+        // Enforce-mode consumer with no spare/overshoot: rejects the redemption.
+        let consumer = account_with_mode(BudgetMode::Enforce, 0, 10, 0, 0);
+
+        let escrow = producer
+            .charge(40_u64)
+            .expect("producer charge should fit")
+            .try_into_escrow(&state)
+            .expect("escrow should fit");
+        let escrow = escrow
+            .redeem_into(&consumer)
+            .expect_err("consumer at hard rejects redemption");
+        assert_eq!(
+            escrow.bytes(),
+            40,
+            "the original escrow owner is returned on failure"
+        );
+        assert_eq!(
+            state.snapshot().escrow_charged_bytes,
+            40,
+            "escrow still owns the charge after a failed redemption"
+        );
+        escrow.abort();
+    }
+
+    // -------------------------------------------------------------------------
+    // Local envelope tests.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn local_envelope_drop_releases_ticket_once() {
+        let acct = account(1_000, 10, 20, 0);
+        let ticket = acct.charge(64_u64).expect("charge should fit");
+        let envelope = LocalEnvelope::new("payload", ticket);
+        assert_eq!(envelope.payload(), &"payload");
+        assert!(envelope.has_ticket());
+        acct.flush_snapshot();
+        assert_eq!(acct.snapshot.charged_bytes(), 64);
+        drop(envelope);
+        acct.flush_snapshot();
+        assert_eq!(
+            acct.snapshot.charged_bytes(),
+            0,
+            "dropping the envelope refunds the ticket exactly once"
+        );
+    }
+
+    #[test]
+    fn local_envelope_into_parts_transfers_ticket_ownership() {
+        let acct = account(1_000, 10, 20, 0);
+        let ticket = acct.charge(50_u64).expect("charge should fit");
+        let envelope = LocalEnvelope::new(7_u32, ticket);
+        let (payload, ticket) = envelope.into_parts();
+        assert_eq!(payload, 7);
+        // The ticket outlives the envelope; the charge is still held.
+        acct.flush_snapshot();
+        assert_eq!(acct.snapshot.charged_bytes(), 50);
+        drop(ticket);
+        acct.flush_snapshot();
+        assert_eq!(acct.snapshot.charged_bytes(), 0);
+    }
+
+    #[test]
+    fn local_envelope_without_ticket_is_inert() {
+        let envelope = LocalEnvelope::without_ticket(99_u64);
+        assert!(!envelope.has_ticket());
+        assert_eq!(envelope.into_payload(), 99);
+    }
+
     // These tests run on the test thread (which doubles as the runtime
     // thread). Each test installs at most one budget and drops its guard at
     // the end, leaving the TLS slot clean for the next test.

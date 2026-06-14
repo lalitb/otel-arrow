@@ -1375,6 +1375,44 @@ mod tests {
     }
 
     #[test]
+    fn validates_memory_budget_rejects_enforcement_flags_until_gates_met() {
+        let policies = Policies {
+            resources: Some(super::ResourcesPolicy {
+                core_allocation: super::CoreAllocation::all_cores(),
+                memory_limiter: None,
+                memory_budget: Some(super::MemoryBudgetPolicy {
+                    mode: super::MemoryBudgetMode::ObserveOnly,
+                    retry_after_secs: 1,
+                    sizing: super::MemoryBudgetSizingPolicy {
+                        strategy: super::MemoryBudgetSizingStrategy::Leased,
+                        reserve: 512 * 1024 * 1024,
+                        floor_per_runtime: 256 * 1024 * 1024,
+                        lease_step: 64 * 1024,
+                        max_overshoot_per_runtime: 128 * 1024 * 1024,
+                        overshoot_debt_limit: 16 * 1024 * 1024,
+                    },
+                    escrow: super::MemoryBudgetEscrowPolicy {
+                        topic_default_limit: 64 * 1024 * 1024,
+                    },
+                    enforcement: super::MemoryBudgetEnforcementPolicy {
+                        receiver_admission: true,
+                        queue_publish: false,
+                        reclaim_hooks: false,
+                    },
+                }),
+            }),
+            ..Policies::default()
+        };
+
+        let errors = policies.validation_errors("policies");
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("enforcement flags must remain false"),
+            "observe-only foundation must reject enforcement flags: {errors:?}"
+        );
+    }
+
+    #[test]
     fn validates_transport_headers_selector() {
         use crate::transport_headers_policy::{
             HeaderPropagationPolicy, PropagationDefault, PropagationSelector,

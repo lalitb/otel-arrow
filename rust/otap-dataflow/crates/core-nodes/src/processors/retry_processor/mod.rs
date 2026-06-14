@@ -740,11 +740,12 @@ impl RetryProcessor {
 
 #[cfg(test)]
 mod test {
-    use super::{RETRY_PROCESSOR_URN, RetryConfig};
+    use super::{RETRY_PROCESSOR_URN, RetryConfig, RetryProcessor};
     use otap_df_config::node::NodeUserConfig;
     use otap_df_engine::context::{ControllerContext, PipelineContext};
     use otap_df_engine::control::{
-        AckMsg, NackMsg, NodeControlMsg, PipelineCompletionMsg, pipeline_completion_msg_channel,
+        AckMsg, LocalResumeId, NackMsg, NodeControlMsg, PipelineCompletionMsg,
+        pipeline_completion_msg_channel,
     };
     use otap_df_engine::engine_metrics::{EngineMetrics, EngineMetricsMonitor};
     use otap_df_engine::memory_budget::{
@@ -898,6 +899,58 @@ mod test {
             .position(|field| field.name == name)
             .unwrap_or_else(|| panic!("engine metric {name} should exist"));
         snapshot.get_metrics()[index]
+    }
+
+    #[test]
+    fn test_retry_processor_drop_releases_queued_retry_budget_tickets() {
+        // Drain/shutdown path: when the processor is torn down with retry
+        // tickets still queued, dropping it must release every owned ticket
+        // exactly once (RAII), refunding the runtime account.
+        let telemetry_registry = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(telemetry_registry);
+        let pipeline_ctx = controller_ctx.pipeline_context_with(
+            "test_grp".into(),
+            "test_pipeline".into(),
+            0,
+            1,
+            0,
+        );
+
+        let config: RetryConfig =
+            serde_json::from_value(create_test_config()).expect("valid retry config");
+        let mut processor =
+            RetryProcessor::with_pipeline_ctx(pipeline_ctx, config).expect("create processor");
+
+        let (budget_state, budget, _budget_guard) =
+            install_test_runtime_budget(controller_ctx.memory_budget_state());
+
+        // Simulate two queued delayed retries by charging and stashing their
+        // tickets under scheduler-assigned resume ids, as the requeue path does.
+        let ticket_a = budget.charge(64_u64).expect("charge a");
+        let ticket_b = budget.charge(128_u64).expect("charge b");
+        let _ = processor
+            .retry_budget_tickets
+            .insert(LocalResumeId(1), ticket_a);
+        let _ = processor
+            .retry_budget_tickets
+            .insert(LocalResumeId(2), ticket_b);
+
+        budget.flush_snapshot();
+        assert_eq!(
+            budget_state.snapshot().charged_bytes,
+            192,
+            "queued retry tickets should be charged while retained"
+        );
+
+        // Teardown (drain/shutdown): dropping the processor drops the ticket
+        // map, releasing every ticket exactly once.
+        drop(processor);
+        budget.flush_snapshot();
+        assert_eq!(
+            budget_state.snapshot().charged_bytes,
+            0,
+            "dropping the processor must release all queued retry tickets"
+        );
     }
 
     #[test]
