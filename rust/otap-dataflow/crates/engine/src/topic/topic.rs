@@ -14,6 +14,7 @@ use crate::error::Error::{
     MessageNotTracked, SubscribeBalancedNotSupported, SubscribeBroadcastNotSupported,
     SubscribeSingleGroupViolation, SubscriptionClosed, TopicClosed,
 };
+use crate::memory_budget::{EscrowSlot, LocalMemoryTicket, MemoryBudgetState};
 use crate::topic::backend::{PublishFuture, PublishTrackedFuture, SubscriptionBackend, TopicState};
 use crate::topic::subscription::{Delivery, RecvDelivery};
 use crate::topic::types::{
@@ -29,6 +30,11 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 struct QueuedEnvelope<T> {
     envelope: Envelope<T>,
+    // Owns the in-transit escrow charge (if any) while this item sits in the
+    // balanced queue. Dropping the queued item — on delivery, eviction, topic
+    // close, or final drain — releases the escrow exactly once via EscrowSlot's
+    // Drop. Empty when memory budgeting is disabled or the item is uncharged.
+    _escrow: EscrowSlot,
     _admission_permit: OwnedSemaphorePermit,
 }
 
@@ -95,10 +101,12 @@ impl WakerSet {
 fn send_queued_envelope<T>(
     sender: &async_channel::Sender<QueuedEnvelope<T>>,
     envelope: Envelope<T>,
+    escrow: EscrowSlot,
     permit: OwnedSemaphorePermit,
 ) -> Result<(), Error> {
     match sender.try_send(QueuedEnvelope {
         envelope,
+        _escrow: escrow,
         _admission_permit: permit,
     }) {
         Ok(()) => Ok(()),
@@ -308,6 +316,29 @@ impl<T: Send + Sync + 'static> TopicState<T> for TopicInner<T> {
         }
     }
 
+    fn try_publish_owned(
+        &self,
+        msg: Arc<T>,
+        ticket: LocalMemoryTicket,
+        state: &MemoryBudgetState,
+    ) -> Result<(PublishOutcome, Option<LocalMemoryTicket>), Error> {
+        match self {
+            // Balanced topics retain a runtime-local queue entry, so they own
+            // the escrow charge while the item is in transit.
+            TopicInner::BalancedOnly(topic) => Ok(topic.try_publish_owned(msg, ticket, state)),
+            // Broadcast and mixed topics use the ring/all-or-nothing model which
+            // is not yet escrow-integrated; keep the payload locally charged.
+            TopicInner::BroadcastOnly(topic) => {
+                let outcome = topic.try_publish(msg).map(|(outcome, _)| outcome)?;
+                Ok((outcome, Some(ticket)))
+            }
+            TopicInner::Mixed(topic) => {
+                let outcome = topic.try_publish(msg).map(|(outcome, _)| outcome)?;
+                Ok((outcome, Some(ticket)))
+            }
+        }
+    }
+
     fn try_publish_tracked(
         &self,
         msg: Arc<T>,
@@ -426,7 +457,7 @@ impl<T: Send + Sync + 'static> BalancedOnlyTopic<T> {
                 tracked: false,
                 payload: msg,
             };
-            send_queued_envelope(&group.tx, envelope, permit)?;
+            send_queued_envelope(&group.tx, envelope, EscrowSlot::empty(), permit)?;
         }
         Ok(id)
     }
@@ -450,7 +481,7 @@ impl<T: Send + Sync + 'static> BalancedOnlyTopic<T> {
                 tracked: true,
                 payload: msg,
             };
-            send_queued_envelope(&group.tx, envelope, admission_permit)?;
+            send_queued_envelope(&group.tx, envelope, EscrowSlot::empty(), admission_permit)?;
             Ok(receipt)
         } else {
             Ok(self.outcomes.register(id, timeout, permit))
@@ -472,9 +503,57 @@ impl<T: Send + Sync + 'static> BalancedOnlyTopic<T> {
                 tracked: false,
                 payload: msg,
             };
-            send_queued_envelope(&group.tx, envelope, permit)?;
+            send_queued_envelope(&group.tx, envelope, EscrowSlot::empty(), permit)?;
         }
         Ok((PublishOutcome::Published, id))
+    }
+
+    /// Owner-carrying balanced publish.
+    ///
+    /// Converts the producer's `LocalMemoryTicket` into a sendable
+    /// `EscrowTicket` at this shared boundary and lets the queued item own the
+    /// escrow charge while in transit. The escrow is released exactly once when
+    /// the item is delivered, dropped on full, evicted, or dropped on topic
+    /// close/drain (via `EscrowSlot`'s `Drop`).
+    ///
+    /// Ownership-preserving failure handling:
+    /// - topic closed or escrow conversion refused (enforce + over the topic
+    ///   escrow limit): the original local ticket is returned to the caller.
+    /// - dropped on full: nothing is enqueued and the original local ticket is
+    ///   returned, still locally charged.
+    fn try_publish_owned(
+        &self,
+        msg: Arc<T>,
+        ticket: LocalMemoryTicket,
+        state: &MemoryBudgetState,
+    ) -> (PublishOutcome, Option<LocalMemoryTicket>) {
+        if self.closed.load(Ordering::Relaxed) {
+            return (PublishOutcome::DroppedOnFull, Some(ticket));
+        }
+        let id = self.next_message_id();
+        let Some(group) = self.group.get() else {
+            // No balanced consumer group: nothing to retain at this boundary.
+            return (PublishOutcome::Published, Some(ticket));
+        };
+        let Ok(Some(permit)) = try_acquire_balanced_permit(&group.admission) else {
+            return (PublishOutcome::DroppedOnFull, Some(ticket));
+        };
+        // Capacity is secured; only now convert local ownership into escrow so a
+        // dropped-on-full publish never leaves an orphaned escrow charge.
+        let escrow = match ticket.try_into_escrow(state) {
+            Ok(escrow) => escrow,
+            Err(ticket) => return (PublishOutcome::DroppedOnFull, Some(ticket)),
+        };
+        let envelope = Envelope {
+            id,
+            tracked: false,
+            payload: msg,
+        };
+        // After this point the queued item owns the escrow; if the channel was
+        // racing closed, `send_queued_envelope` drops the slot and releases the
+        // escrow cleanly.
+        let _ = send_queued_envelope(&group.tx, envelope, EscrowSlot::new(escrow), permit);
+        (PublishOutcome::Published, None)
     }
 
     fn try_publish_tracked(
@@ -498,7 +577,7 @@ impl<T: Send + Sync + 'static> BalancedOnlyTopic<T> {
                 tracked: true,
                 payload: msg,
             };
-            send_queued_envelope(&group.tx, envelope, admission_permit)?;
+            send_queued_envelope(&group.tx, envelope, EscrowSlot::empty(), admission_permit)?;
             Ok(TrackedTryPublishOutcome::Published(receipt))
         } else {
             Ok(TrackedTryPublishOutcome::Published(
@@ -748,7 +827,7 @@ impl<T: Send + Sync + 'static> MixedTopic<T> {
                 payload: Arc::clone(&msg),
             };
             for (group, permit) in groups.as_ref().iter().zip(permits) {
-                send_queued_envelope(&group.tx, envelope.clone(), permit)?;
+                send_queued_envelope(&group.tx, envelope.clone(), EscrowSlot::empty(), permit)?;
             }
         }
 
@@ -787,7 +866,12 @@ impl<T: Send + Sync + 'static> MixedTopic<T> {
                 payload: Arc::clone(&msg),
             };
             for (group, admission_permit) in groups.as_ref().iter().zip(permits) {
-                send_queued_envelope(&group.tx, envelope.clone(), admission_permit)?;
+                send_queued_envelope(
+                    &group.tx,
+                    envelope.clone(),
+                    EscrowSlot::empty(),
+                    admission_permit,
+                )?;
             }
             self.broadcast_ring.publish(Envelope {
                 id,
@@ -834,7 +918,7 @@ impl<T: Send + Sync + 'static> MixedTopic<T> {
             Ok((PublishOutcome::DroppedOnFull, id))
         } else {
             for (group, permit) in groups.as_ref().iter().zip(permits) {
-                send_queued_envelope(&group.tx, envelope.clone(), permit)?;
+                send_queued_envelope(&group.tx, envelope.clone(), EscrowSlot::empty(), permit)?;
             }
             self.broadcast_ring.publish(Envelope {
                 id,
@@ -869,7 +953,12 @@ impl<T: Send + Sync + 'static> MixedTopic<T> {
                 payload: Arc::clone(&msg),
             };
             for (group, admission_permit) in groups.as_ref().iter().zip(permits) {
-                send_queued_envelope(&group.tx, envelope.clone(), admission_permit)?;
+                send_queued_envelope(
+                    &group.tx,
+                    envelope.clone(),
+                    EscrowSlot::empty(),
+                    admission_permit,
+                )?;
             }
             self.broadcast_ring.publish(Envelope {
                 id,

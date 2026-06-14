@@ -1425,6 +1425,72 @@ impl Drop for EscrowTicket {
     }
 }
 
+/// RAII holder for an escrow owner stored inside a shared-boundary queue slot.
+///
+/// A queued item at a shared boundary (such as a balanced topic queue entry)
+/// owns its escrow charge while it sits in transit. `EscrowSlot` makes the
+/// release path uniform and exactly-once: whenever the slot is dropped — on
+/// delivery, eviction, drop-on-full, topic close, or final drain — it releases
+/// the escrow through [`EscrowTicket::release`] rather than routing it to the
+/// abandoned-escrow graveyard. The graveyard then stays reserved for genuine
+/// leaks where an [`EscrowTicket`] is separated from its slot and lost.
+///
+/// `EscrowSlot` is `Send` (it holds only a sendable [`EscrowTicket`]), so it can
+/// live inside a `Send` shared-queue envelope.
+#[derive(Debug, Default)]
+pub struct EscrowSlot {
+    ticket: Option<EscrowTicket>,
+}
+
+impl EscrowSlot {
+    /// Creates a slot owning the given escrow ticket.
+    #[must_use]
+    pub fn new(ticket: EscrowTicket) -> Self {
+        Self {
+            ticket: Some(ticket),
+        }
+    }
+
+    /// Creates an empty slot that owns nothing (the budget-disabled or
+    /// uncharged case).
+    #[must_use]
+    pub fn empty() -> Self {
+        Self { ticket: None }
+    }
+
+    /// Returns whether this slot owns an escrow ticket.
+    #[must_use]
+    pub fn is_some(&self) -> bool {
+        self.ticket.is_some()
+    }
+
+    /// Returns the escrow bytes owned by this slot, if any.
+    #[must_use]
+    pub fn bytes(&self) -> Option<u64> {
+        self.ticket.as_ref().map(EscrowTicket::bytes)
+    }
+
+    /// Removes and returns the owned escrow ticket, leaving the slot empty.
+    ///
+    /// The caller becomes responsible for resolving the returned ticket
+    /// (redeem/release/abort). Used when a consumer wants to redeem the escrow
+    /// into its own runtime account on delivery rather than release it.
+    #[must_use]
+    pub fn take(&mut self) -> Option<EscrowTicket> {
+        self.ticket.take()
+    }
+}
+
+impl Drop for EscrowSlot {
+    fn drop(&mut self) {
+        if let Some(ticket) = self.ticket.take() {
+            // Uniform clean release on every queue-exit path (delivery, close,
+            // drain, eviction, drop-on-full). Not the abandoned graveyard.
+            ticket.release();
+        }
+    }
+}
+
 /// Pairs a retained local payload with the [`LocalMemoryTicket`] that owns its
 /// charge, for retained local-channel and local-scheduler paths.
 ///
@@ -1488,10 +1554,9 @@ impl<T> LocalEnvelope<T> {
         T: ChargedSize,
     {
         match current_runtime_memory_budget() {
-            Some(budget) => match budget.charge(&payload) {
-                Some(ticket) => Some(Self::new(payload, ticket)),
-                None => None,
-            },
+            Some(budget) => budget
+                .charge(&payload)
+                .map(|ticket| Self::new(payload, ticket)),
             None => Some(Self::without_ticket(payload)),
         }
     }
@@ -1899,7 +1964,8 @@ mod tests {
     fn charged_size_blanket_impls_delegate_to_inner_value() {
         let value = 42_u64;
         let boxed = Box::new(7_u64);
-        assert_eq!((&value).charged_size(), Some(42));
+        // Exercise the `&T` blanket impl explicitly via the trait function.
+        assert_eq!(ChargedSize::charged_size(&&value), Some(42));
         assert_eq!(boxed.charged_size(), Some(7));
         assert_eq!("abc".charged_size(), Some(3));
         assert_eq!(String::from("abcd").charged_size(), Some(4));

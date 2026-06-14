@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use crate::error::Error;
+use crate::memory_budget::{LocalMemoryTicket, MemoryBudgetState};
 use crate::topic::backend::TopicState;
 use crate::topic::subscription::Subscription;
 use crate::topic::types::{
@@ -98,6 +99,26 @@ impl<T: Send + Sync + 'static> TopicHandle<T> {
     /// Try to publish a message without awaiting under backpressure.
     pub fn try_publish(&self, msg: Arc<T>) -> Result<PublishOutcome, Error> {
         self.inner.try_publish(msg)
+    }
+
+    /// Try to publish a message that carries memory-budget ownership.
+    ///
+    /// At this shared (Send + Sync) boundary the producer's local
+    /// [`LocalMemoryTicket`] is converted into a sendable escrow owner that the
+    /// queued item holds while in transit, then released exactly once on
+    /// delivery, eviction, drop-on-full, topic close, or drain.
+    ///
+    /// Returns the [`PublishOutcome`] and the original local ticket when
+    /// ownership was not taken (dropped on full, escrow refused, or the topic
+    /// does not retain a runtime-local queue entry), so the caller keeps the
+    /// charge and can apply its failed-publish policy.
+    pub fn try_publish_owned(
+        &self,
+        msg: Arc<T>,
+        ticket: LocalMemoryTicket,
+        state: &MemoryBudgetState,
+    ) -> Result<(PublishOutcome, Option<LocalMemoryTicket>), Error> {
+        self.inner.try_publish_owned(msg, ticket, state)
     }
 
     /// Subscribe to this topic.

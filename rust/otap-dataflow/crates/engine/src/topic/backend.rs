@@ -34,6 +34,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use crate::error::Error;
+use crate::memory_budget::{LocalMemoryTicket, MemoryBudgetState};
 use crate::topic::subscription::RecvDelivery;
 use crate::topic::topic::TopicInner;
 use crate::topic::types::{
@@ -90,6 +91,29 @@ pub trait TopicState<T: Send + Sync + 'static>: Send + Sync {
     ) -> PublishTrackedFuture<'_>;
     /// Try to publish one payload without awaiting.
     fn try_publish(&self, msg: Arc<T>) -> Result<PublishOutcome, Error>;
+    /// Try to publish one payload that carries memory-budget ownership.
+    ///
+    /// Converts the producer's `LocalMemoryTicket` into a sendable escrow owner
+    /// at this shared boundary when the backend retains the payload in a
+    /// runtime-local queue (currently only balanced topics). The escrow charge
+    /// is owned by the queued item while in transit and released exactly once on
+    /// delivery, eviction, drop-on-full, topic close, or drain.
+    ///
+    /// Returns the resulting [`PublishOutcome`] and, when ownership was not taken
+    /// (dropped on full, escrow refused, or the backend does not retain a local
+    /// queue entry), the original [`LocalMemoryTicket`] so the caller keeps the
+    /// charge. The default implementation does not convert to escrow and returns
+    /// the ticket unchanged, leaving the payload observe-only locally owned.
+    fn try_publish_owned(
+        &self,
+        msg: Arc<T>,
+        ticket: LocalMemoryTicket,
+        state: &MemoryBudgetState,
+    ) -> Result<(PublishOutcome, Option<LocalMemoryTicket>), Error> {
+        let _ = state;
+        let outcome = self.try_publish(msg)?;
+        Ok((outcome, Some(ticket)))
+    }
     /// Try to publish one tracked payload without awaiting.
     ///
     /// `timeout` and `permit` have the same meaning as in

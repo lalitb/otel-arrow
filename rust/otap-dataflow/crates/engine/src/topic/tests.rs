@@ -2365,3 +2365,182 @@ async fn topic_set_len_and_is_empty() {
     assert!(!set.is_empty());
     assert_eq!(set.len(), 1);
 }
+
+// =========================================================================
+// Memory-budget escrow integration (balanced publish ownership)
+// =========================================================================
+
+fn observe_only_budget_state() -> crate::memory_budget::MemoryBudgetState {
+    use crate::memory_budget::{
+        BudgetMode, MemoryBudgetSizing, MemoryBudgetState, RuntimeMemoryBudgetConfig,
+    };
+    let state = MemoryBudgetState::default();
+    state.configure(
+        RuntimeMemoryBudgetConfig {
+            mode: BudgetMode::ObserveOnly,
+            retry_after_secs: 1,
+            sizing: MemoryBudgetSizing {
+                reserve_bytes: 0,
+                floor_per_runtime_bytes: 10_000,
+                lease_step_bytes: 1_000,
+                max_overshoot_per_runtime_bytes: 10_000,
+                overshoot_debt_limit_bytes: 1_000,
+            },
+            topic_default_limit_bytes: 1_000_000,
+            runtime_count: 1,
+        },
+        None,
+    );
+    state
+}
+
+/// A successful balanced `try_publish_owned` converts the producer's local
+/// ticket into escrow at the shared boundary, the queue owns the charge while
+/// in transit, and delivery releases the escrow exactly once.
+#[tokio::test]
+async fn balanced_publish_owned_transfers_then_releases_escrow_on_delivery() {
+    use crate::memory_budget::BudgetScopeId;
+    use crate::topic::types::PublishOutcome;
+
+    let state = observe_only_budget_state();
+    let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+    let account = handle.local_account().expect("budget configured");
+
+    let broker = TopicBroker::new();
+    let topic = broker
+        .create_in_memory_topic(
+            "escrow-balanced",
+            TopicOptions::BalancedOnly { capacity: 16 },
+        )
+        .unwrap();
+    let mut sub = topic
+        .subscribe(
+            SubscriptionMode::Balanced {
+                group: SubscriptionGroupName::from("g1"),
+            },
+            SubscriberOptions::default(),
+        )
+        .unwrap();
+
+    let ticket = account.charge(64_u64).expect("charge should fit");
+    account.flush_snapshot();
+    assert_eq!(state.snapshot().charged_bytes, 64);
+
+    let (outcome, returned) = topic
+        .try_publish_owned(Arc::new(7_u64), ticket, &state)
+        .expect("publish should not error");
+    assert_eq!(outcome, PublishOutcome::Published);
+    assert!(
+        returned.is_none(),
+        "ownership should transfer to escrow on a successful balanced publish"
+    );
+
+    // While the item is queued in transit, escrow owns the charge and the local
+    // account has been refunded.
+    assert_eq!(state.snapshot().escrow_charged_bytes, 64);
+    account.flush_snapshot();
+    assert_eq!(state.snapshot().charged_bytes, 0);
+
+    // Delivery drops the queued item, releasing the escrow exactly once.
+    let item = sub.recv().await.expect("subscriber should receive");
+    assert!(matches!(item, RecvItem::Message(env) if *env.payload == 7));
+
+    let snapshot = state.snapshot();
+    assert_eq!(snapshot.escrow_charged_bytes, 0, "delivery releases escrow");
+    assert_eq!(
+        snapshot.abandoned_escrow_count, 0,
+        "clean delivery release must not record an abandoned-escrow entry"
+    );
+}
+
+/// Closing/draining a balanced topic with an owned item still queued releases
+/// the escrow cleanly (not into the abandoned-escrow graveyard).
+#[tokio::test]
+async fn balanced_publish_owned_releases_escrow_on_close_drain() {
+    use crate::memory_budget::BudgetScopeId;
+    use crate::topic::types::PublishOutcome;
+
+    let state = observe_only_budget_state();
+    let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+    let account = handle.local_account().expect("budget configured");
+
+    let broker = TopicBroker::new();
+    let topic = broker
+        .create_in_memory_topic("escrow-close", TopicOptions::BalancedOnly { capacity: 16 })
+        .unwrap();
+    let sub = topic
+        .subscribe(
+            SubscriptionMode::Balanced {
+                group: SubscriptionGroupName::from("g1"),
+            },
+            SubscriberOptions::default(),
+        )
+        .unwrap();
+
+    let ticket = account.charge(50_u64).expect("charge should fit");
+    let (outcome, returned) = topic
+        .try_publish_owned(Arc::new(1_u64), ticket, &state)
+        .expect("publish should not error");
+    assert_eq!(outcome, PublishOutcome::Published);
+    assert!(returned.is_none());
+    assert_eq!(state.snapshot().escrow_charged_bytes, 50);
+
+    // Tear down without delivering: close the topic and drop every holder of the
+    // balanced channel so the queued item is dropped.
+    topic.close();
+    drop(sub);
+    drop(topic);
+    drop(broker);
+
+    let snapshot = state.snapshot();
+    assert_eq!(
+        snapshot.escrow_charged_bytes, 0,
+        "close/drain must release the in-transit escrow"
+    );
+    assert_eq!(
+        snapshot.abandoned_escrow_count, 0,
+        "close/drain release must be clean, not graveyard"
+    );
+}
+
+/// A balanced `try_publish_owned` that is dropped on full returns the original
+/// local ticket so the producer keeps the charge.
+#[tokio::test]
+async fn balanced_publish_owned_dropped_on_full_returns_local_ticket() {
+    use crate::memory_budget::BudgetScopeId;
+    use crate::topic::types::PublishOutcome;
+
+    let state = observe_only_budget_state();
+    let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+    let account = handle.local_account().expect("budget configured");
+
+    let broker = TopicBroker::new();
+    // Capacity 1: fill the single slot, then the next owned publish drops on full.
+    let topic = broker
+        .create_in_memory_topic("escrow-full", TopicOptions::BalancedOnly { capacity: 1 })
+        .unwrap();
+    let _sub = topic
+        .subscribe(
+            SubscriptionMode::Balanced {
+                group: SubscriptionGroupName::from("g1"),
+            },
+            SubscriberOptions::default(),
+        )
+        .unwrap();
+
+    // Fill the queue with one untracked message (no escrow).
+    assert_eq!(
+        topic.try_publish(Arc::new(0_u64)).unwrap(),
+        PublishOutcome::Published
+    );
+
+    let ticket = account.charge(32_u64).expect("charge should fit");
+    let (outcome, returned) = topic
+        .try_publish_owned(Arc::new(1_u64), ticket, &state)
+        .expect("publish should not error");
+    assert_eq!(outcome, PublishOutcome::DroppedOnFull);
+    let returned = returned.expect("dropped-on-full must return the original local ticket");
+    assert_eq!(returned.bytes(), Some(32));
+    // No escrow was created for the dropped publish.
+    assert_eq!(state.snapshot().escrow_charged_bytes, 0);
+}
