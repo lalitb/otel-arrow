@@ -1425,6 +1425,123 @@ impl Drop for EscrowTicket {
     }
 }
 
+/// Pairs a retained local payload with the [`LocalMemoryTicket`] that owns its
+/// charge, for retained local-channel and local-scheduler paths.
+///
+/// This is the engine-owned attachment strategy from the design: it keeps the
+/// ticket out of `PData` (which is `Clone + Send + Sync`) while binding the
+/// ticket lifetime to the payload it accounts for. Because it can hold a
+/// `LocalMemoryTicket`, a `LocalEnvelope<T>` is intentionally `!Send` and must
+/// not cross a shared boundary; publishing across a shared boundary must first
+/// convert the ticket with [`LocalMemoryTicket::try_into_escrow`].
+///
+/// Dropping the envelope drops the ticket through RAII, releasing the charge
+/// exactly once. Splitting the envelope with [`into_parts`](Self::into_parts)
+/// moves the ticket out so the caller becomes responsible for its single
+/// release.
+///
+/// The envelope carries an `Option<LocalMemoryTicket>` rather than a required
+/// ticket so the same type works when memory budgeting is disabled (no ambient
+/// runtime budget) without forcing callers to branch on two payload shapes.
+#[derive(Debug)]
+pub struct LocalEnvelope<T> {
+    payload: T,
+    ticket: Option<LocalMemoryTicket>,
+    // Redundant with `LocalMemoryTicket`'s own `!Send` marker, but keeps the
+    // envelope `!Send` even in the `None`/budget-disabled case so callers can
+    // rely on a single, mode-independent ownership invariant.
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl<T> LocalEnvelope<T> {
+    /// Creates an envelope that pairs `payload` with its owning `ticket`.
+    #[must_use]
+    pub fn new(payload: T, ticket: LocalMemoryTicket) -> Self {
+        Self {
+            payload,
+            ticket: Some(ticket),
+            _not_send: PhantomData,
+        }
+    }
+
+    /// Creates an envelope with no ticket, for when memory budgeting is disabled
+    /// or the payload is not charged.
+    #[must_use]
+    pub fn without_ticket(payload: T) -> Self {
+        Self {
+            payload,
+            ticket: None,
+            _not_send: PhantomData,
+        }
+    }
+
+    /// Charges `payload` against the current runtime budget (if installed) and
+    /// wraps it in an envelope.
+    ///
+    /// Returns `None` only when an enforce-mode budget refuses the charge; in
+    /// that case the caller still owns `payload` and can apply its
+    /// failed-admission policy. When no runtime budget is installed the payload
+    /// is wrapped without a ticket.
+    #[must_use]
+    pub fn charge_current(payload: T) -> Option<Self>
+    where
+        T: ChargedSize,
+    {
+        match current_runtime_memory_budget() {
+            Some(budget) => match budget.charge(&payload) {
+                Some(ticket) => Some(Self::new(payload, ticket)),
+                None => None,
+            },
+            None => Some(Self::without_ticket(payload)),
+        }
+    }
+
+    /// Returns a shared reference to the retained payload.
+    #[must_use]
+    pub fn payload(&self) -> &T {
+        &self.payload
+    }
+
+    /// Returns a mutable reference to the retained payload.
+    pub fn payload_mut(&mut self) -> &mut T {
+        &mut self.payload
+    }
+
+    /// Returns the owning ticket, if any.
+    #[must_use]
+    pub fn ticket(&self) -> Option<&LocalMemoryTicket> {
+        self.ticket.as_ref()
+    }
+
+    /// Returns whether this envelope owns a ticket.
+    #[must_use]
+    pub fn has_ticket(&self) -> bool {
+        self.ticket.is_some()
+    }
+
+    /// Consumes the envelope, returning the payload and releasing the ticket.
+    #[must_use]
+    pub fn into_payload(self) -> T {
+        // The ticket field drops here, releasing the charge exactly once.
+        self.payload
+    }
+
+    /// Splits the envelope into its payload and ticket.
+    ///
+    /// Ownership of the ticket transfers to the caller, who becomes responsible
+    /// for its single release (drop, convert to escrow, etc.).
+    #[must_use]
+    pub fn into_parts(self) -> (T, Option<LocalMemoryTicket>) {
+        (self.payload, self.ticket)
+    }
+
+    /// Replaces the payload while preserving the ticket, returning the previous
+    /// payload. Useful when a processor swaps the retained value in place.
+    pub fn replace_payload(&mut self, payload: T) -> T {
+        std::mem::replace(&mut self.payload, payload)
+    }
+}
+
 /// Logical retained-size contract for memory budgeting.
 pub trait ChargedSize {
     /// Returns the logical retained byte size when known.

@@ -920,7 +920,7 @@ mod tests {
     async fn processor_inbox_emits_due_delayed_resume_as_control_message() {
         let (_control_tx, _pdata_tx, scheduler, mut inbox) = local_processor_inbox(4);
         let when = Instant::now();
-        scheduler
+        let _ = scheduler
             .requeue_later(when, Box::new(TestMsg::new("delayed")))
             .expect("delayed resume should schedule");
 
@@ -930,7 +930,7 @@ mod tests {
             .expect("message should arrive");
         assert!(matches!(
             message,
-            Message::Control(NodeControlMsg::DelayedData { when: observed, data })
+            Message::Control(NodeControlMsg::DelayedData { when: observed, data, .. })
                 if observed == when && *data == TestMsg::new("delayed")
         ));
     }
@@ -976,7 +976,7 @@ mod tests {
             .expect("pdata should enqueue");
         let when = Instant::now();
         for idx in 0..40 {
-            scheduler
+            let _ = scheduler
                 .requeue_later(when, Box::new(TestMsg::new(format!("delayed-{idx}"))))
                 .expect("delayed resume should schedule");
         }
@@ -1170,7 +1170,7 @@ mod tests {
     async fn processor_inbox_returns_pending_delayed_resumes_on_shutdown_latch() {
         let (control_tx, _pdata_tx, scheduler, mut inbox) = local_processor_inbox(4);
         let original_when = Instant::now() + Duration::from_secs(60);
-        scheduler
+        let _ = scheduler
             .requeue_later(original_when, Box::new(TestMsg::new("delayed")))
             .expect("delayed resume should schedule");
         control_tx
@@ -1202,7 +1202,7 @@ mod tests {
             .expect("delayed resume should return immediately during shutdown");
         assert!(matches!(
             resumed,
-            Message::Control(NodeControlMsg::DelayedData { when, data })
+            Message::Control(NodeControlMsg::DelayedData { when, data, .. })
                 if when < original_when && *data == TestMsg::new("delayed")
         ));
 

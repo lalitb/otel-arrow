@@ -22,13 +22,11 @@ use otap_df_config::SignalType;
 use otap_df_config::{error::Error as ConfigError, node::NodeUserConfig};
 use otap_df_engine::MessageSourceLocalEffectHandlerExtension;
 use otap_df_engine::context::PipelineContext;
-use otap_df_engine::memory_budget::{
-    ChargedSize, LocalMemoryTicket, current_runtime_memory_budget,
-};
+use otap_df_engine::memory_budget::{LocalMemoryTicket, current_runtime_memory_budget};
 use otap_df_engine::{
     ConsumerEffectHandlerExtension, Interests, ProcessorFactory, ProducerEffectHandlerExtension,
     config::ProcessorConfig,
-    control::{AckMsg, CallData, NackMsg, NodeControlMsg},
+    control::{AckMsg, CallData, LocalResumeId, NackMsg, NodeControlMsg},
     error::{Error, TypedError},
     local::processor::{EffectHandler, Processor},
     message::Message,
@@ -39,7 +37,7 @@ use otap_df_telemetry::instrument::Counter;
 use otap_df_telemetry::metrics::MetricSet;
 use otap_df_telemetry_macros::metric_set;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -346,7 +344,12 @@ pub struct RetryProcessor {
 
     config: RetryConfig,
     metrics: MetricSet<RetryProcessorMetrics>,
-    retry_budget_tickets: VecDeque<(Instant, LocalMemoryTicket)>,
+    /// Memory-budget tickets owning each in-flight delayed retry payload,
+    /// keyed by the scheduler-assigned [`LocalResumeId`]. The ticket is removed
+    /// (and dropped, refunding the runtime account) exactly once when the
+    /// matching `DelayedData` resumes, when a requeue fails, or when the
+    /// processor is dropped (drain/shutdown).
+    retry_budget_tickets: HashMap<LocalResumeId, LocalMemoryTicket>,
 }
 
 /// Factory function to create a SignalTypeRouter processor
@@ -452,28 +455,20 @@ impl RetryProcessor {
             delays,
             config,
             metrics,
-            retry_budget_tickets: VecDeque::new(),
+            retry_budget_tickets: HashMap::new(),
         })
     }
 
-    fn release_retry_budget_ticket(&mut self, when: Instant, data: &OtapPdata) {
-        let charged_size = data.charged_size();
-        // The local scheduler gives the delayed item back with the same
-        // deadline used in `requeue_later`. Match size as well so same-tick
-        // retries with different retained sizes refund the intended ticket.
-        let index = self
-            .retry_budget_tickets
-            .iter()
-            .position(|(ticket_when, ticket)| {
-                *ticket_when == when && ticket.bytes() == charged_size
-            })
-            .or_else(|| {
-                self.retry_budget_tickets
-                    .iter()
-                    .position(|(ticket_when, _)| *ticket_when == when)
-            });
-        if let Some(index) = index {
-            let _ = self.retry_budget_tickets.remove(index);
+    /// Releases the budget ticket owning a resumed delayed retry payload.
+    ///
+    /// The scheduler returns the same [`LocalResumeId`] it assigned in
+    /// `requeue_later`, so the owner is found by exact id rather than by
+    /// matching deadline/size. Dropping the removed ticket refunds the runtime
+    /// account exactly once. Runtime-global delayed data (no resume id) carries
+    /// no retry budget ticket.
+    fn release_retry_budget_ticket(&mut self, resume_id: Option<LocalResumeId>) {
+        if let Some(resume_id) = resume_id {
+            let _ = self.retry_budget_tickets.remove(&resume_id);
         }
     }
 
@@ -594,14 +589,18 @@ impl RetryProcessor {
 
         // Requeue the data onto this node, we'll continue in the DelayedData branch next.
         match effect_handler.requeue_later(next_retry_time_i, rereq) {
-            Ok(_) => {
+            Ok(resume_id) => {
+                // Key the retained ticket by the scheduler-assigned resume id so
+                // the matching `DelayedData` releases exactly this owner.
                 if let Some(ticket) = budget_ticket {
-                    self.retry_budget_tickets
-                        .push_back((next_retry_time_i, ticket));
+                    let _ = self.retry_budget_tickets.insert(resume_id, ticket);
                 }
                 Ok(())
             }
             Err(refused) => {
+                // Requeue failed: drop the budget ticket (refunding the
+                // account) before nacking so no charge is stranded.
+                drop(budget_ticket);
                 effect_handler
                     .notify_nack(NackMsg::new("cannot requeue", refused))
                     .await?;
@@ -677,11 +676,15 @@ impl Processor<OtapPdata> for RetryProcessor {
             Message::Control(control_msg) => match control_msg {
                 NodeControlMsg::Ack(ack) => self.handle_ack(ack, effect_handler).await,
                 NodeControlMsg::Nack(nack) => self.handle_nack(nack, effect_handler).await,
-                NodeControlMsg::DelayedData { when, data } => {
+                NodeControlMsg::DelayedData {
+                    when: _,
+                    resume_id,
+                    data,
+                } => {
                     // The retained queue lifetime ends as soon as this
                     // processor receives the delayed item, even if route
                     // metadata is malformed and the item cannot be resumed.
-                    self.release_retry_budget_ticket(when, data.as_ref());
+                    self.release_retry_budget_ticket(resume_id);
                     if let Some(calldata) = data.source_route() {
                         let rstate: RetryState = calldata.calldata.try_into()?;
                         let _ = self
@@ -730,7 +733,7 @@ impl RetryProcessor {
             delays,
             config,
             metrics,
-            retry_budget_tickets: VecDeque::new(),
+            retry_budget_tickets: HashMap::new(),
         }
     }
 }

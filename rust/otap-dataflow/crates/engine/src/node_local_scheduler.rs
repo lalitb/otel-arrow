@@ -22,7 +22,7 @@
 //! the older runtime-global delayed-data path for processor-local retry work.
 
 use crate::clock;
-use crate::control::{NodeControlMsg, WakeupRevision, WakeupSlot};
+use crate::control::{LocalResumeId, NodeControlMsg, WakeupRevision, WakeupSlot};
 use crate::entity_context::current_node_telemetry_handle;
 use crate::indexed_min_heap::IndexedMinHeap;
 use otap_df_telemetry::error::Error as TelemetryError;
@@ -251,9 +251,15 @@ impl<PData> NodeLocalScheduler<PData> {
 
     /// Stores a retained payload for later delivery to this processor.
     ///
-    /// Returns the original payload on capacity pressure or after shutdown is
-    /// latched so callers never lose ownership on rejection.
-    fn requeue_later(&mut self, when: Instant, data: Box<PData>) -> Result<(), Box<PData>> {
+    /// Returns the scheduler-assigned [`LocalResumeId`] on success so the caller
+    /// can correlate the later `DelayedData` delivery with per-payload state it
+    /// keeps out of band. Returns the original payload on capacity pressure or
+    /// after shutdown is latched so callers never lose ownership on rejection.
+    fn requeue_later(
+        &mut self,
+        when: Instant,
+        data: Box<PData>,
+    ) -> Result<LocalResumeId, Box<PData>> {
         if self.shutting_down || self.delayed_resumes.len() >= self.delayed_resume_capacity {
             return Err(data);
         }
@@ -264,7 +270,7 @@ impl<PData> NodeLocalScheduler<PData> {
             sequence,
             data,
         });
-        Ok(())
+        Ok(LocalResumeId(sequence))
     }
 
     /// Inserts or replaces a lightweight keyed wakeup.
@@ -390,6 +396,7 @@ impl<PData> NodeLocalScheduler<PData> {
                 .expect("resume must exist");
             return Some(NodeControlMsg::DelayedData {
                 when: resume.when,
+                resume_id: Some(LocalResumeId(resume.sequence)),
                 data: resume.data,
             });
         }
@@ -447,6 +454,7 @@ impl<PData> NodeLocalScheduler<PData> {
         while let Some(resume) = self.delayed_resumes.pop() {
             self.due_now.push_back(NodeControlMsg::DelayedData {
                 when: now,
+                resume_id: Some(LocalResumeId(resume.sequence)),
                 data: resume.data,
             });
         }
@@ -515,7 +523,11 @@ impl<PData> NodeLocalSchedulerHandle<PData> {
         f(&mut guard)
     }
 
-    pub(crate) fn requeue_later(&self, when: Instant, data: Box<PData>) -> Result<(), Box<PData>> {
+    pub(crate) fn requeue_later(
+        &self,
+        when: Instant,
+        data: Box<PData>,
+    ) -> Result<LocalResumeId, Box<PData>> {
         let result = self.with_scheduler(|scheduler| scheduler.requeue_later(when, data));
         if result.is_ok() {
             self.notify.notify_one();
@@ -598,7 +610,7 @@ mod tests {
         expected_data: i32,
     ) {
         match msg {
-            Some(NodeControlMsg::DelayedData { when, data }) => {
+            Some(NodeControlMsg::DelayedData { when, data, .. }) => {
                 assert_eq!(when, expected_when);
                 assert_eq!(*data, expected_data);
             }
@@ -635,7 +647,7 @@ mod tests {
         let mut scheduler = NodeLocalScheduler::<i32>::new(2, 2);
         let when = Instant::now() + Duration::from_secs(1);
 
-        assert_eq!(scheduler.requeue_later(when, Box::new(17)), Ok(()));
+        assert!(scheduler.requeue_later(when, Box::new(17)).is_ok());
         expect_delayed(scheduler.pop_due(when), when, 17);
         assert_eq!(scheduler.next_expiry(), None);
     }
@@ -653,10 +665,10 @@ mod tests {
         let same_time_a = now + Duration::from_secs(2);
         let same_time_b = same_time_a;
 
-        assert_eq!(scheduler.requeue_later(later, Box::new(3)), Ok(()));
-        assert_eq!(scheduler.requeue_later(same_time_a, Box::new(1)), Ok(()));
-        assert_eq!(scheduler.requeue_later(same_time_b, Box::new(2)), Ok(()));
-        assert_eq!(scheduler.requeue_later(sooner, Box::new(0)), Ok(()));
+        assert!(scheduler.requeue_later(later, Box::new(3)).is_ok());
+        assert!(scheduler.requeue_later(same_time_a, Box::new(1)).is_ok());
+        assert!(scheduler.requeue_later(same_time_b, Box::new(2)).is_ok());
+        assert!(scheduler.requeue_later(sooner, Box::new(0)).is_ok());
 
         expect_delayed(scheduler.pop_due(sooner), sooner, 0);
         expect_delayed(scheduler.pop_due(same_time_a), same_time_a, 1);
@@ -672,7 +684,7 @@ mod tests {
         let mut scheduler = NodeLocalScheduler::new(1, 1);
         let when = Instant::now() + Duration::from_secs(1);
 
-        assert_eq!(scheduler.requeue_later(when, Box::new(1)), Ok(()));
+        assert!(scheduler.requeue_later(when, Box::new(1)).is_ok());
         let rejected = scheduler
             .requeue_later(when, Box::new(2))
             .expect_err("capacity should reject");
@@ -705,10 +717,11 @@ mod tests {
         let now = Instant::now();
         let later = now + Duration::from_secs(30);
 
-        assert_eq!(scheduler.requeue_later(later, Box::new(11)), Ok(()));
-        assert_eq!(
-            scheduler.requeue_later(later + Duration::from_secs(1), Box::new(12)),
-            Ok(())
+        assert!(scheduler.requeue_later(later, Box::new(11)).is_ok());
+        assert!(
+            scheduler
+                .requeue_later(later + Duration::from_secs(1), Box::new(12))
+                .is_ok()
         );
 
         scheduler.begin_shutdown(now);

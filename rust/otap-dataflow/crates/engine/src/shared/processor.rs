@@ -34,7 +34,7 @@
 use crate::Interests;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::control::WakeupRevision;
-use crate::control::{AckMsg, NackMsg, RuntimeCtrlMsgSender, WakeupSlot};
+use crate::control::{AckMsg, LocalResumeId, NackMsg, RuntimeCtrlMsgSender, WakeupSlot};
 use crate::effect_handler::{
     EffectHandlerCore, SourceTagging, TelemetryTimerCancelHandle, TimerCancelHandle,
 };
@@ -440,7 +440,7 @@ impl<PData> EffectHandler<PData> {
     }
 
     /// Requeue retained pdata onto this node later.
-    pub fn requeue_later(&self, when: Instant, data: Box<PData>) -> Result<(), PData> {
+    pub fn requeue_later(&self, when: Instant, data: Box<PData>) -> Result<LocalResumeId, PData> {
         self.core.requeue_later(when, data)
     }
 

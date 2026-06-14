@@ -96,6 +96,20 @@ pub struct WakeupSlot(pub u128);
 /// current wakeup from a stale delivery for the same slot.
 pub type WakeupRevision = u64;
 
+/// Correlation id assigned by the processor-local scheduler to one retained
+/// delayed-resume payload.
+///
+/// Returned from `requeue_later` and carried back on
+/// [`NodeControlMsg::DelayedData`] so a processor can match the resumed payload
+/// to out-of-band per-payload state (such as a `!Send` memory-budget ticket
+/// that cannot travel inside the `Send` scheduler or `Send` control message).
+/// Ids are unique within a processor-local scheduler instance and are not
+/// reused. Delayed data delivered through the runtime-global delay path carries
+/// no resume id.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LocalResumeId(pub u64);
+
 /// Engine-managed call data envelope. Wraps the CallData with an envelope
 /// containing timestamp. Lives on the forward path (in context stack frames).
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -307,6 +321,12 @@ pub enum NodeControlMsg<PData> {
 
         /// The data.
         data: Box<PData>,
+
+        /// Correlation id assigned by the processor-local scheduler when the
+        /// payload was requeued, or `None` for runtime-global delayed data.
+        /// Lets the resuming node match the payload to per-payload state it
+        /// kept out of band (e.g. a `!Send` memory-budget ticket).
+        resume_id: Option<LocalResumeId>,
     },
 
     /// Announces a process-wide memory pressure transition to receiver-local admission state.

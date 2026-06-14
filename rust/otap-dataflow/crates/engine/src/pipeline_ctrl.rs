@@ -636,6 +636,7 @@ impl<PData> RuntimeCtrlMsgManager<PData> {
                                     node_id,
                                     NodeControlMsg::DelayedData {
                                         when: now,
+                                        resume_id: None,
                                         data,
                                     },
                                 );
@@ -719,6 +720,7 @@ impl<PData> RuntimeCtrlMsgManager<PData> {
                 delayed.node_id,
                 NodeControlMsg::DelayedData {
                     when,
+                    resume_id: None,
                     data: delayed.data,
                 },
             );
@@ -774,6 +776,7 @@ impl<PData> RuntimeCtrlMsgManager<PData> {
                 delayed.node_id,
                 NodeControlMsg::DelayedData {
                     when: delayed.when,
+                    resume_id: None,
                     data: delayed.data,
                 },
             ));
@@ -2209,7 +2212,7 @@ mod tests {
                 let delayed_result = async { receiver.recv().await };
 
                 match delayed_result.await {
-                    Ok(NodeControlMsg::DelayedData { when, data }) => {
+                    Ok(NodeControlMsg::DelayedData { when, data, .. }) => {
                         assert_eq!(*data, *test_data);
                         assert_eq!(when, delay_time);
                     }
@@ -2933,7 +2936,7 @@ mod tests {
                     .expect("processor control channel should stay open");
 
                 match msg {
-                    NodeControlMsg::DelayedData { when, data } => {
+                    NodeControlMsg::DelayedData { when, data, .. } => {
                         assert_eq!(*data, "drain_retry");
                         assert!(
                             when < original_when,
@@ -2990,7 +2993,7 @@ mod tests {
                     .expect("Queued delayed data should flush when draining begins")
                     .expect("processor control channel should stay open");
                 match msg {
-                    NodeControlMsg::DelayedData { when, data } => {
+                    NodeControlMsg::DelayedData { when, data, .. } => {
                         assert_eq!(*data, "queued_retry");
                         assert!(
                             when < original_when,
