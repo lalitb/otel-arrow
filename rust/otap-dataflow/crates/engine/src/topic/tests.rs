@@ -2604,3 +2604,328 @@ async fn balanced_publish_owned_on_closed_topic_propagates_error_and_releases_ch
         "the failure path must not record an abandoned-escrow leak"
     );
 }
+
+// =========================================================================
+// Memory-budget escrow integration (broadcast ring-slot ownership)
+// =========================================================================
+
+/// A broadcast `try_publish_owned` charges the ring slot, every subscriber can
+/// receive the slot without releasing its escrow, and topic close releases the
+/// ring-slot escrow exactly once.
+#[tokio::test]
+async fn broadcast_publish_owned_charges_ring_slot_and_releases_on_close() {
+    use crate::memory_budget::BudgetScopeId;
+    use crate::topic::types::PublishOutcome;
+
+    let state = observe_only_budget_state();
+    let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+    let account = handle.local_account().expect("budget configured");
+
+    let broker = TopicBroker::new();
+    let topic = broker
+        .create_in_memory_topic(
+            "escrow-broadcast",
+            TopicOptions::BroadcastOnly {
+                capacity: 16,
+                on_lag: TopicBroadcastOnLagPolicy::DropOldest,
+            },
+        )
+        .unwrap();
+    // Subscribe before publishing so each subscriber cursor observes the slot.
+    let mut sub1 = topic
+        .subscribe(SubscriptionMode::Broadcast, SubscriberOptions::default())
+        .unwrap();
+    let mut sub2 = topic
+        .subscribe(SubscriptionMode::Broadcast, SubscriberOptions::default())
+        .unwrap();
+
+    let ticket = account.charge(64_u64).expect("charge should fit");
+    account.flush_snapshot();
+    assert_eq!(state.snapshot().charged_bytes, 64);
+
+    let (outcome, returned) = topic
+        .try_publish_owned(Arc::new(7_u64), ticket, &state)
+        .expect("publish should not error");
+    assert_eq!(outcome, PublishOutcome::Published);
+    assert!(
+        returned.is_none(),
+        "ownership transfers to the broadcast ring slot"
+    );
+
+    // The ring slot owns the escrow and the producer was refunded.
+    assert_eq!(state.snapshot().escrow_charged_bytes, 64);
+    account.flush_snapshot();
+    assert_eq!(state.snapshot().charged_bytes, 0);
+
+    // Both subscribers receive the same ring slot; receipt must not release it.
+    let m1 = sub1.recv().await.expect("sub1 should receive");
+    assert!(matches!(m1, RecvItem::Message(env) if *env.payload == 7));
+    let m2 = sub2.recv().await.expect("sub2 should receive");
+    assert!(matches!(m2, RecvItem::Message(env) if *env.payload == 7));
+    assert_eq!(
+        state.snapshot().escrow_charged_bytes,
+        64,
+        "subscriber receipt must not release the broker-slot escrow"
+    );
+
+    // Topic close releases the ring-slot escrow exactly once.
+    topic.close();
+    let snap = state.snapshot();
+    assert_eq!(
+        snap.escrow_charged_bytes, 0,
+        "topic close releases the ring-slot escrow"
+    );
+    assert_eq!(
+        snap.abandoned_escrow_count, 0,
+        "clean close release must not record an abandoned-escrow leak"
+    );
+}
+
+/// Overwriting a full broadcast ring releases the evicted slot's escrow exactly
+/// once (drop-oldest), so only the retained slots stay charged.
+#[tokio::test]
+async fn broadcast_publish_owned_releases_evicted_slot_escrow_on_overwrite() {
+    use crate::memory_budget::BudgetScopeId;
+    use crate::topic::types::PublishOutcome;
+
+    let state = observe_only_budget_state();
+    let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+    let account = handle.local_account().expect("budget configured");
+
+    let broker = TopicBroker::new();
+    // Capacity rounds up to 2 power-of-two slots.
+    let topic = broker
+        .create_in_memory_topic(
+            "escrow-broadcast-overwrite",
+            TopicOptions::BroadcastOnly {
+                capacity: 2,
+                on_lag: TopicBroadcastOnLagPolicy::DropOldest,
+            },
+        )
+        .unwrap();
+
+    for i in 0..3u64 {
+        let ticket = account.charge(10_u64).expect("charge should fit");
+        let (outcome, returned) = topic
+            .try_publish_owned(Arc::new(i), ticket, &state)
+            .expect("publish should not error");
+        assert_eq!(outcome, PublishOutcome::Published);
+        assert!(returned.is_none());
+    }
+    account.flush_snapshot();
+
+    // Three publishes into two slots: the first slot was overwritten and its
+    // escrow released, leaving exactly two retained owners charged.
+    let snap = state.snapshot();
+    assert_eq!(
+        snap.escrow_charged_bytes, 20,
+        "the overwritten slot's escrow must be released on eviction"
+    );
+    assert_eq!(
+        snap.abandoned_escrow_count, 0,
+        "eviction release must be clean, not graveyard"
+    );
+    assert_eq!(
+        snap.charged_bytes, 0,
+        "each owned publish refunds the producer charge"
+    );
+
+    topic.close();
+    let snap = state.snapshot();
+    assert_eq!(snap.escrow_charged_bytes, 0, "close releases retained slots");
+    assert_eq!(snap.abandoned_escrow_count, 0);
+}
+
+// =========================================================================
+// Memory-budget escrow integration (mixed all-or-nothing ownership)
+// =========================================================================
+
+/// A successful mixed `try_publish_owned` commits one balanced owner per
+/// consumer group plus one broadcast ring-slot owner. Balanced delivery
+/// releases its owner; the broadcast slot is released on close.
+#[tokio::test]
+async fn mixed_publish_owned_commits_all_owners_then_releases() {
+    use crate::memory_budget::BudgetScopeId;
+    use crate::topic::types::PublishOutcome;
+
+    let state = observe_only_budget_state();
+    let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+    let account = handle.local_account().expect("budget configured");
+
+    let broker = TopicBroker::new();
+    let topic = broker
+        .create_in_memory_topic(
+            "escrow-mixed",
+            TopicOptions::Mixed {
+                balanced_capacity: 16,
+                broadcast_capacity: 16,
+                on_lag: TopicBroadcastOnLagPolicy::DropOldest,
+            },
+        )
+        .unwrap();
+    let mut bsub = topic
+        .subscribe(
+            SubscriptionMode::Balanced {
+                group: SubscriptionGroupName::from("g1"),
+            },
+            SubscriberOptions::default(),
+        )
+        .unwrap();
+    let mut bcast = topic
+        .subscribe(SubscriptionMode::Broadcast, SubscriberOptions::default())
+        .unwrap();
+
+    let ticket = account.charge(30_u64).expect("charge should fit");
+    account.flush_snapshot();
+    assert_eq!(state.snapshot().charged_bytes, 30);
+
+    let (outcome, returned) = topic
+        .try_publish_owned(Arc::new(5_u64), ticket, &state)
+        .expect("publish should not error");
+    assert_eq!(outcome, PublishOutcome::Published);
+    assert!(returned.is_none(), "all owners committed, no ticket returned");
+
+    // One balanced group + one broadcast ring slot = two retained owners.
+    assert_eq!(state.snapshot().escrow_charged_bytes, 60);
+    account.flush_snapshot();
+    assert_eq!(state.snapshot().charged_bytes, 0);
+
+    // Balanced delivery drops the queued item, releasing its owner only.
+    let m = bsub.recv().await.expect("balanced subscriber should receive");
+    assert!(matches!(m, RecvItem::Message(env) if *env.payload == 5));
+    assert_eq!(
+        state.snapshot().escrow_charged_bytes,
+        30,
+        "balanced delivery releases only the balanced owner"
+    );
+
+    // Broadcast receipt does not release the ring-slot owner.
+    let mb = bcast.recv().await.expect("broadcast subscriber should receive");
+    assert!(matches!(mb, RecvItem::Message(env) if *env.payload == 5));
+    assert_eq!(state.snapshot().escrow_charged_bytes, 30);
+
+    topic.close();
+    let snap = state.snapshot();
+    assert_eq!(
+        snap.escrow_charged_bytes, 0,
+        "close releases the broadcast ring-slot owner"
+    );
+    assert_eq!(snap.abandoned_escrow_count, 0);
+}
+
+/// A mixed `try_publish_owned` whose balanced side is full commits nothing,
+/// mints no escrow, and returns the original local ticket still owning the
+/// charge.
+#[tokio::test]
+async fn mixed_publish_owned_balanced_full_returns_local_ticket() {
+    use crate::memory_budget::BudgetScopeId;
+    use crate::topic::types::PublishOutcome;
+
+    let state = observe_only_budget_state();
+    let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+    let account = handle.local_account().expect("budget configured");
+
+    let broker = TopicBroker::new();
+    let topic = broker
+        .create_in_memory_topic(
+            "escrow-mixed-full",
+            TopicOptions::Mixed {
+                balanced_capacity: 1,
+                broadcast_capacity: 16,
+                on_lag: TopicBroadcastOnLagPolicy::DropOldest,
+            },
+        )
+        .unwrap();
+    let _bsub = topic
+        .subscribe(
+            SubscriptionMode::Balanced {
+                group: SubscriptionGroupName::from("g1"),
+            },
+            SubscriberOptions::default(),
+        )
+        .unwrap();
+
+    // Fill the single balanced slot with a non-owned publish.
+    let outcome = topic.try_publish(Arc::new(0_u64)).expect("filler publish");
+    assert_eq!(outcome, PublishOutcome::Published);
+
+    let ticket = account.charge(30_u64).expect("charge should fit");
+    account.flush_snapshot();
+    assert_eq!(state.snapshot().charged_bytes, 30);
+
+    let (outcome, returned) = topic
+        .try_publish_owned(Arc::new(1_u64), ticket, &state)
+        .expect("publish should not error");
+    assert_eq!(outcome, PublishOutcome::DroppedOnFull);
+    let returned = returned.expect("the original ticket is returned uncommitted");
+    assert_eq!(returned.bytes(), Some(30));
+
+    // No escrow was minted for the uncommitted publish, and the ticket still
+    // owns its full charge.
+    let snap = state.snapshot();
+    assert_eq!(
+        snap.escrow_charged_bytes, 0,
+        "all-or-nothing failure mints no escrow"
+    );
+    account.flush_snapshot();
+    assert_eq!(
+        state.snapshot().charged_bytes,
+        30,
+        "the returned ticket still owns the producer charge"
+    );
+
+    drop(returned);
+    account.flush_snapshot();
+    assert_eq!(state.snapshot().charged_bytes, 0, "dropping refunds");
+}
+
+/// A mixed `try_publish_owned` on a closed topic surfaces `TopicClosed`,
+/// consumes and refunds the ticket, and leaves no escrow or graveyard entry.
+#[tokio::test]
+async fn mixed_publish_owned_on_closed_topic_propagates_error_and_refunds() {
+    use crate::memory_budget::BudgetScopeId;
+
+    let state = observe_only_budget_state();
+    let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+    let account = handle.local_account().expect("budget configured");
+
+    let broker = TopicBroker::new();
+    let topic = broker
+        .create_in_memory_topic(
+            "escrow-mixed-closed",
+            TopicOptions::Mixed {
+                balanced_capacity: 16,
+                broadcast_capacity: 16,
+                on_lag: TopicBroadcastOnLagPolicy::DropOldest,
+            },
+        )
+        .unwrap();
+    let _bsub = topic
+        .subscribe(
+            SubscriptionMode::Balanced {
+                group: SubscriptionGroupName::from("g1"),
+            },
+            SubscriberOptions::default(),
+        )
+        .unwrap();
+
+    let ticket = account.charge(40_u64).expect("charge should fit");
+    account.flush_snapshot();
+    assert_eq!(state.snapshot().charged_bytes, 40);
+
+    topic.close();
+
+    let err = topic
+        .try_publish_owned(Arc::new(9_u64), ticket, &state)
+        .expect_err("closed topic must surface an error, not a false Published");
+    assert!(matches!(err, Error::TopicClosed));
+
+    account.flush_snapshot();
+    let snap = state.snapshot();
+    assert_eq!(
+        snap.charged_bytes, 0,
+        "ticket dropped on TopicClosed must refund the runtime account"
+    );
+    assert_eq!(snap.escrow_charged_bytes, 0, "no escrow minted on close");
+    assert_eq!(snap.abandoned_escrow_count, 0, "no graveyard leak");
+}

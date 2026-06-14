@@ -17,6 +17,8 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+use smallvec::SmallVec;
+
 /// Immutable attribution carried by budget owners when the identity is known.
 ///
 /// The string-bearing fields exist for config, metrics, and reporting
@@ -596,6 +598,32 @@ impl MemoryBudgetState {
                 .escrow_pool_overshoot_bytes
                 .fetch_sub(bytes, Ordering::Relaxed);
         }
+    }
+
+    /// Mints one sendable [`EscrowTicket`] owner for `bytes` attributed to
+    /// `scope`, charging the escrow boundary exactly once.
+    ///
+    /// This is the shared escrow-minting path used both by the single-owner
+    /// [`LocalMemoryTicket::try_into_escrow`] transfer and by the multi-owner
+    /// [`LocalMemoryTicket::try_into_escrow_fanout`] used for mixed-topic
+    /// all-or-nothing publish. It does not touch any producer local account;
+    /// the caller is responsible for refunding the producer charge once when a
+    /// transfer commits. Returns `None` when the escrow boundary refuses the
+    /// charge (enforce-mode topic cap or exhausted global pool).
+    pub(crate) fn try_charge_escrow_owner(
+        &self,
+        bytes: u64,
+        scope: &BudgetScope,
+    ) -> Option<EscrowTicket> {
+        let ack = self.try_charge_escrow(bytes)?;
+        Some(EscrowTicket {
+            bytes,
+            pool_backed: ack.pool_backed,
+            state: self.clone(),
+            // One reference-count bump at the shared boundary; no string clone.
+            scope: Arc::clone(scope),
+            resolved: false,
+        })
     }
 
     fn lease_authority(&self) -> Arc<dyn LeaseAuthority> {
@@ -1533,25 +1561,64 @@ impl LocalMemoryTicket {
         let LocalMemoryCharge::KnownBytes(bytes) = self.charge else {
             return Err(self);
         };
-        let Some(ack) = state.try_charge_escrow(bytes) else {
+        let Some(escrow) = state.try_charge_escrow_owner(bytes, &self.account.scope) else {
             return Err(self);
         };
         self.active = false;
         // The escrow charge now holds an explicit pool borrow for `bytes` (when
-        // `ack.pool_backed`); refunding the producer here lets the producer's
+        // `pool_backed`); refunding the producer here lets the producer's
         // lease return surplus to the pool on settle, restoring approximately
         // the same pool draw we just took. This is the "transfer from existing
         // lease" path described by the design (line 728-733): the global
         // logical total does not increase across the transfer.
         self.account.refund(bytes);
-        Ok(EscrowTicket {
-            bytes,
-            pool_backed: ack.pool_backed,
-            state: state.clone(),
-            // One reference-count bump at the shared boundary; no string clone.
-            scope: Arc::clone(&self.account.scope),
-            resolved: false,
-        })
+        Ok(escrow)
+    }
+
+    /// Converts this local ticket into `count` independent escrow owners for an
+    /// all-or-nothing fanout publish (mixed topics).
+    ///
+    /// Each owner is charged the ticket's full logical bytes because Phase 2
+    /// charges per retained logical owner, not per underlying allocation
+    /// (design "Fanout and Shared-Buffer Semantics"): a mixed publish that
+    /// retains the same `Arc<T>` in `N` balanced queues plus one broadcast ring
+    /// slot has `N + 1` retained owners.
+    ///
+    /// Reservation is transactional. If every owner is charged, the producer's
+    /// local charge is refunded exactly once and the owners are returned. If
+    /// any owner cannot be charged, all already-acquired owners are released in
+    /// reverse acquisition order and the original [`LocalMemoryTicket`] is
+    /// returned unchanged so the caller keeps the charge and can apply its
+    /// failed-publish policy. Drain-allowance and unknown-size tickets cannot
+    /// fan out into escrow and are returned unchanged.
+    pub fn try_into_escrow_fanout(
+        mut self,
+        state: &MemoryBudgetState,
+        count: usize,
+    ) -> Result<SmallVec<[EscrowTicket; 4]>, LocalMemoryTicket> {
+        if count == 0 || self.drain_used > 0 {
+            return Err(self);
+        }
+        let LocalMemoryCharge::KnownBytes(bytes) = self.charge else {
+            return Err(self);
+        };
+        let mut owners: SmallVec<[EscrowTicket; 4]> = SmallVec::with_capacity(count);
+        for _ in 0..count {
+            match state.try_charge_escrow_owner(bytes, &self.account.scope) {
+                Some(owner) => owners.push(owner),
+                None => {
+                    // Unwind already-acquired owners in reverse order, then
+                    // return the original ticket: nothing was committed.
+                    while let Some(owner) = owners.pop() {
+                        owner.release();
+                    }
+                    return Err(self);
+                }
+            }
+        }
+        self.active = false;
+        self.account.refund(bytes);
+        Ok(owners)
     }
 }
 
@@ -2704,6 +2771,147 @@ mod tests {
         // but releases the unbacked-overshoot counter accounting cleanly.
         let snap = state.snapshot();
         assert!(snap.abandoned_escrow_count > 0);
+    }
+
+    /// A fanout into `count` escrow owners charges each owner the full logical
+    /// bytes (per-retained-owner accounting), refunds the producer once, and
+    /// releases cleanly without recording any abandoned-escrow leak.
+    #[test]
+    fn escrow_fanout_charges_each_owner_and_refunds_producer_once() {
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 1_000,
+                    lease_step_bytes: 100,
+                    max_overshoot_per_runtime_bytes: 1_000,
+                    overshoot_debt_limit_bytes: 100,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: 1_000_000,
+                runtime_count: 1,
+            },
+            None,
+        );
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let acct = handle.local_account().expect("account");
+        let ticket = acct.charge(20_u64).expect("charge fits within floor");
+        acct.flush_snapshot();
+        assert_eq!(state.snapshot().charged_bytes, 20);
+
+        let owners = ticket
+            .try_into_escrow_fanout(&state, 3)
+            .expect("observe-only fanout always succeeds");
+        assert_eq!(owners.len(), 3);
+        acct.flush_snapshot();
+        let snap = state.snapshot();
+        assert_eq!(
+            snap.charged_bytes, 0,
+            "producer local charge refunded exactly once"
+        );
+        assert_eq!(
+            snap.escrow_charged_bytes, 60,
+            "three owners each charge the full 20 bytes"
+        );
+
+        for owner in owners {
+            owner.release();
+        }
+        let snap = state.snapshot();
+        assert_eq!(snap.escrow_charged_bytes, 0, "all owners released");
+        assert_eq!(
+            snap.abandoned_escrow_count, 0,
+            "clean release must not record a leak"
+        );
+    }
+
+    /// An enforce-mode fanout that cannot charge every owner unwinds the
+    /// already-acquired owners in reverse order, restores the pool, and returns
+    /// the original local ticket still owning the charge.
+    #[test]
+    fn escrow_fanout_unwinds_partial_reservation_on_pool_exhaustion() {
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::Enforce,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 100,
+                    lease_step_bytes: 10,
+                    max_overshoot_per_runtime_bytes: 20,
+                    overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
+                },
+                // Topic cap is generous so the global pool is the binding limit.
+                topic_default_limit_bytes: 1_000,
+                runtime_count: 1,
+            },
+            // Spare pool room for exactly one 50-byte owner: 150 - 0 - 100 = 50.
+            Some(150),
+        );
+        assert_eq!(state.inner.pool.available_bytes(), 50);
+        let acct = account_with_mode(BudgetMode::Enforce, 100, 10, 20, 100);
+        let ticket = acct.charge(50_u64).expect("local charge fits within floor");
+
+        let returned = ticket
+            .try_into_escrow_fanout(&state, 2)
+            .expect_err("second owner cannot be backed by the exhausted pool");
+        assert_eq!(
+            returned.bytes(),
+            Some(50),
+            "original ticket survives and still owns the charge"
+        );
+
+        let snap = state.snapshot();
+        assert_eq!(snap.escrow_charged_bytes, 0, "partial owner unwound");
+        assert_eq!(snap.escrow_pool_held_bytes, 0);
+        assert_eq!(snap.escrow_ticket_count, 0);
+        assert_eq!(
+            snap.abandoned_escrow_count, 0,
+            "reverse-order unwind releases cleanly, no graveyard entry"
+        );
+        assert_eq!(
+            state.inner.pool.available_bytes(),
+            50,
+            "the borrowed pool bytes are fully returned on unwind"
+        );
+    }
+
+    /// Zero-count fanout requests cannot fan out into escrow and are returned
+    /// unchanged with the producer charge intact.
+    #[test]
+    fn escrow_fanout_rejects_zero_count_and_returns_ticket() {
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 1_000,
+                    lease_step_bytes: 100,
+                    max_overshoot_per_runtime_bytes: 1_000,
+                    overshoot_debt_limit_bytes: 100,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: 1_000_000,
+                runtime_count: 1,
+            },
+            None,
+        );
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let acct = handle.local_account().expect("account");
+        let ticket = acct.charge(20_u64).expect("charge fits");
+
+        let returned = ticket
+            .try_into_escrow_fanout(&state, 0)
+            .expect_err("zero-count fanout must return the ticket unchanged");
+        assert_eq!(returned.bytes(), Some(20));
+        assert_eq!(state.snapshot().escrow_charged_bytes, 0);
     }
 
     #[test]

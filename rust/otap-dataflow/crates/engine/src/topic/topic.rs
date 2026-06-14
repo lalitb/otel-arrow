@@ -140,12 +140,26 @@ fn try_acquire_balanced_permit(
 type BalancedPermitVec = SmallVec<[OwnedSemaphorePermit; 4]>;
 
 pub(crate) struct FastBroadcastRing<T: Send + Sync + 'static> {
-    slots: Box<[Mutex<Option<(u64, Envelope<T>)>>]>,
+    slots: Box<[Mutex<Option<BroadcastSlot<T>>>]>,
     capacity: usize,
     mask: usize,
     write_seq: AtomicU64,
     waker_set: WakerSet,
     closed: AtomicBool,
+}
+
+/// One retained broadcast ring slot.
+///
+/// The slot owns its in-transit escrow charge for as long as the payload is
+/// retained in the ring. Dropping the slot — on ring overwrite, topic close, or
+/// final ring teardown — releases the escrow exactly once via [`EscrowSlot`]'s
+/// `Drop`. Ordinary subscriber receipt clones `envelope` only and never touches
+/// the slot escrow, so the broker slot remains the sole retained owner while it
+/// can still be delivered.
+struct BroadcastSlot<T: Send + Sync + 'static> {
+    seq: u64,
+    envelope: Envelope<T>,
+    _escrow: EscrowSlot,
 }
 
 impl<T: Send + Sync + 'static> FastBroadcastRing<T> {
@@ -169,9 +183,21 @@ impl<T: Send + Sync + 'static> FastBroadcastRing<T> {
     }
 
     pub(crate) fn publish(&self, envelope: Envelope<T>) {
+        self.publish_with_escrow(envelope, EscrowSlot::empty());
+    }
+
+    /// Publish a payload that carries ring-slot escrow ownership.
+    ///
+    /// Overwriting the target slot drops the previous occupant, releasing its
+    /// ring-slot escrow exactly once (ring overwrite / drop-oldest eviction).
+    pub(crate) fn publish_with_escrow(&self, envelope: Envelope<T>, escrow: EscrowSlot) {
         let seq = self.write_seq.fetch_add(1, Ordering::Release) + 1;
         let idx = ((seq - 1) as usize) & self.mask;
-        *self.slots[idx].lock() = Some((seq, envelope));
+        *self.slots[idx].lock() = Some(BroadcastSlot {
+            seq,
+            envelope,
+            _escrow: escrow,
+        });
         self.waker_set.wake_all();
     }
 
@@ -195,10 +221,8 @@ impl<T: Send + Sync + 'static> FastBroadcastRing<T> {
         let idx = ((read_seq - 1) as usize) & self.mask;
         let slot = self.slots[idx].lock();
         match &*slot {
-            Some((slot_seq, envelope)) if *slot_seq == read_seq => {
-                BroadcastReadResult::Ready(envelope.clone())
-            }
-            Some((slot_seq, _)) if *slot_seq > read_seq => {
+            Some(s) if s.seq == read_seq => BroadcastReadResult::Ready(s.envelope.clone()),
+            Some(s) if s.seq > read_seq => {
                 let now = self.write_seq.load(Ordering::Acquire);
                 if now >= self.capacity as u64 && read_seq <= now - self.capacity as u64 {
                     let new_read_seq = now - self.capacity as u64 + 1;
@@ -212,7 +236,7 @@ impl<T: Send + Sync + 'static> FastBroadcastRing<T> {
                 }
             }
             None => BroadcastReadResult::NotReady,
-            Some((_slot_seq, _envelope)) => BroadcastReadResult::NotReady,
+            Some(_) => BroadcastReadResult::NotReady,
         }
     }
 
@@ -226,6 +250,19 @@ impl<T: Send + Sync + 'static> FastBroadcastRing<T> {
 
     pub(crate) fn close(&self) {
         self.closed.store(true, Ordering::Release);
+        // Release ring-slot escrow on topic close (design "Failed-Send
+        // Lifecycle": broadcast ring eviction/close releases the slot escrow
+        // exactly once). The payload `Arc` stays resident so any in-flight
+        // reader can still drain it, but it is no longer a charged retained
+        // owner. Replacing with an empty slot drops the old `EscrowSlot`, which
+        // releases cleanly rather than routing to the abandoned graveyard; the
+        // now-empty slot makes the later ring teardown a no-op (no double
+        // release).
+        for slot in self.slots.iter() {
+            if let Some(s) = slot.lock().as_mut() {
+                let _ = std::mem::replace(&mut s._escrow, EscrowSlot::empty());
+            }
+        }
         self.waker_set.wake_all();
     }
 
@@ -323,19 +360,15 @@ impl<T: Send + Sync + 'static> TopicState<T> for TopicInner<T> {
         state: &MemoryBudgetState,
     ) -> Result<(PublishOutcome, Option<LocalMemoryTicket>), Error> {
         match self {
-            // Balanced topics retain a runtime-local queue entry, so they own
-            // the escrow charge while the item is in transit.
+            // Balanced topics retain a single runtime-local queue entry, so they
+            // own one point-to-point escrow charge while the item is in transit.
             TopicInner::BalancedOnly(topic) => topic.try_publish_owned(msg, ticket, state),
-            // Broadcast and mixed topics use the ring/all-or-nothing model which
-            // is not yet escrow-integrated; keep the payload locally charged.
-            TopicInner::BroadcastOnly(topic) => {
-                let outcome = topic.try_publish(msg).map(|(outcome, _)| outcome)?;
-                Ok((outcome, Some(ticket)))
-            }
-            TopicInner::Mixed(topic) => {
-                let outcome = topic.try_publish(msg).map(|(outcome, _)| outcome)?;
-                Ok((outcome, Some(ticket)))
-            }
+            // Broadcast topics retain a ring slot that owns the escrow charge
+            // until overwrite, eviction, close, or final drain.
+            TopicInner::BroadcastOnly(topic) => topic.try_publish_owned(msg, ticket, state),
+            // Mixed topics create one balanced owner per consumer group plus one
+            // broadcast ring-slot owner, reserved all-or-nothing.
+            TopicInner::Mixed(topic) => topic.try_publish_owned(msg, ticket, state),
         }
     }
 
@@ -712,6 +745,47 @@ impl<T: Send + Sync + 'static> BroadcastOnlyTopic<T> {
         Ok((PublishOutcome::Published, id))
     }
 
+    /// Owner-carrying broadcast publish.
+    ///
+    /// Converts the producer's `LocalMemoryTicket` into a sendable ring-slot
+    /// escrow owner and hands it to the broadcast ring. The ring slot owns the
+    /// escrow while the payload is retained; it is released exactly once on
+    /// overwrite, drop-oldest eviction, topic close, or final ring teardown
+    /// (design "Broadcast and Retained-Ring Boundaries"). Subscriber receipt
+    /// does not release the broker-slot escrow.
+    ///
+    /// Failure handling mirrors the balanced path:
+    /// - topic closed at entry: returns `Err(TopicClosed)`; the passed-in
+    ///   `LocalMemoryTicket` is dropped here, refunding the local charge.
+    /// - escrow conversion refused (enforce + over the topic escrow limit, or
+    ///   pool exhausted, or a non-transferable drain/unknown ticket): returns
+    ///   `Ok((DroppedOnFull, Some(ticket)))` with the original local ticket so
+    ///   the caller keeps the charge.
+    fn try_publish_owned(
+        &self,
+        msg: Arc<T>,
+        ticket: LocalMemoryTicket,
+        state: &MemoryBudgetState,
+    ) -> Result<(PublishOutcome, Option<LocalMemoryTicket>), Error> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(TopicClosed);
+        }
+        let id = self.next_message_id();
+        let escrow = match ticket.try_into_escrow(state) {
+            Ok(escrow) => escrow,
+            Err(ticket) => return Ok((PublishOutcome::DroppedOnFull, Some(ticket))),
+        };
+        self.broadcast_ring.publish_with_escrow(
+            Envelope {
+                id,
+                tracked: false,
+                payload: msg,
+            },
+            EscrowSlot::new(escrow),
+        );
+        Ok((PublishOutcome::Published, None))
+    }
+
     fn try_publish_tracked(
         &self,
         msg: Arc<T>,
@@ -943,6 +1017,98 @@ impl<T: Send + Sync + 'static> MixedTopic<T> {
             });
             Ok((PublishOutcome::Published, id))
         }
+    }
+
+    /// Owner-carrying mixed publish with all-or-nothing ownership reservation.
+    ///
+    /// A mixed publish retains one balanced queue entry per consumer group plus
+    /// one broadcast ring slot, so it has `groups + 1` retained owners (design
+    /// "Mixed Topic Admission" and "Fanout and Shared-Buffer Semantics").
+    /// Admission is two-phase and transactional:
+    ///
+    /// 1. Reserve balanced admission permits for every consumer group
+    ///    (all-or-nothing) and mint one escrow owner per retained destination.
+    /// 2. Commit only after every reservation succeeded: hand each balanced
+    ///    queue and the broadcast ring its escrow owner.
+    ///
+    /// On any phase-1 failure nothing is committed, every acquired reservation
+    /// is unwound, and the original `LocalMemoryTicket` is returned so the
+    /// publisher keeps the charge:
+    /// - topic closed at entry: `Err(TopicClosed)`; the ticket is dropped here,
+    ///   refunding the local charge.
+    /// - a balanced group is full: `Ok((DroppedOnFull, Some(ticket)))`; no
+    ///   escrow was minted.
+    /// - escrow fanout refused (enforce cap / pool exhausted): the partial
+    ///   owners are released in reverse order and `Ok((DroppedOnFull,
+    ///   Some(ticket)))` is returned.
+    /// - post-reservation channel-close race during commit: already-sent items
+    ///   own their escrow (released on drain/close) and the still-held
+    ///   broadcast owner is released explicitly; surfaces `Err(TopicClosed)`.
+    fn try_publish_owned(
+        &self,
+        msg: Arc<T>,
+        ticket: LocalMemoryTicket,
+        state: &MemoryBudgetState,
+    ) -> Result<(PublishOutcome, Option<LocalMemoryTicket>), Error> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(TopicClosed);
+        }
+        let id = self.next_message_id();
+
+        // Phase 1a: reserve balanced admission across every consumer group
+        // (all-or-nothing). `groups` is the source of truth for retained
+        // balanced owners; the broadcast ring is always a retained owner.
+        let groups = self.group_handles.read().clone();
+        let (permits, blocking_group) = Self::try_acquire_balanced_admission(&groups)?;
+        if blocking_group.is_some() {
+            return Ok((PublishOutcome::DroppedOnFull, Some(ticket)));
+        }
+
+        // Phase 1b: mint one escrow owner per balanced group plus one for the
+        // broadcast ring slot. Fanout is transactional: any failure unwinds the
+        // partial owners and returns the original ticket unchanged.
+        let owner_count = groups.len() + 1;
+        let mut owners = match ticket.try_into_escrow_fanout(state, owner_count) {
+            Ok(owners) => owners,
+            Err(ticket) => {
+                drop(permits);
+                return Ok((PublishOutcome::DroppedOnFull, Some(ticket)));
+            }
+        };
+
+        // Phase 2: commit. The last owner backs the broadcast ring slot; the
+        // remaining owners back the balanced queue entries.
+        let broadcast_owner = owners.pop().expect("owner_count >= 1");
+        for ((group, permit), owner) in groups.as_ref().iter().zip(permits).zip(owners) {
+            let envelope = Envelope {
+                id,
+                tracked: false,
+                payload: Arc::clone(&msg),
+            };
+            if let Err(err) = send_queued_envelope(
+                &group.tx,
+                envelope,
+                EscrowSlot::new(owner),
+                permit,
+            ) {
+                // Close race during commit: the failed send already released
+                // its own escrow via the dropped EscrowSlot, and previously
+                // sent items are owned by their queues (released on drain or
+                // close). Release the broadcast owner we still hold so no
+                // escrow leaks, then surface the close.
+                broadcast_owner.release();
+                return Err(err);
+            }
+        }
+        self.broadcast_ring.publish_with_escrow(
+            Envelope {
+                id,
+                tracked: false,
+                payload: msg,
+            },
+            EscrowSlot::new(broadcast_owner),
+        );
+        Ok((PublishOutcome::Published, None))
     }
 
     fn try_publish_tracked(
