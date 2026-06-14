@@ -2544,3 +2544,65 @@ async fn balanced_publish_owned_dropped_on_full_returns_local_ticket() {
     // No escrow was created for the dropped publish.
     assert_eq!(state.snapshot().escrow_charged_bytes, 0);
 }
+
+/// A balanced `try_publish_owned` on a closed topic returns `TopicClosed`
+/// and leaves no orphaned escrow. The producer's local ticket is consumed
+/// (and dropped, refunding the account); no false `Published` is reported.
+///
+/// The closest we can directly induce with the public topic API is the
+/// `closed`-at-entry case. The deeper post-permit / post-escrow channel-close
+/// race shares the same release path: `send_queued_envelope`'s `Err` drops the
+/// `QueuedEnvelope`, whose `EscrowSlot::Drop` releases the escrow exactly once,
+/// then the `?` propagates `Err(TopicClosed)` to the caller without reporting
+/// a misleading `Published` outcome.
+#[tokio::test]
+async fn balanced_publish_owned_on_closed_topic_propagates_error_and_releases_charge() {
+    use crate::memory_budget::BudgetScopeId;
+
+    let state = observe_only_budget_state();
+    let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+    let account = handle.local_account().expect("budget configured");
+
+    let broker = TopicBroker::new();
+    let topic = broker
+        .create_in_memory_topic(
+            "escrow-closed",
+            TopicOptions::BalancedOnly { capacity: 16 },
+        )
+        .unwrap();
+    let _sub = topic
+        .subscribe(
+            SubscriptionMode::Balanced {
+                group: SubscriptionGroupName::from("g1"),
+            },
+            SubscriberOptions::default(),
+        )
+        .unwrap();
+
+    let ticket = account.charge(48_u64).expect("charge should fit");
+    account.flush_snapshot();
+    assert_eq!(state.snapshot().charged_bytes, 48);
+
+    topic.close();
+
+    let err = topic
+        .try_publish_owned(Arc::new(99_u64), ticket, &state)
+        .expect_err("closed topic must surface an error, not a false Published");
+    assert!(matches!(err, Error::TopicClosed));
+
+    // The ticket was consumed by the call; its Drop refunded the account.
+    account.flush_snapshot();
+    let snap = state.snapshot();
+    assert_eq!(
+        snap.charged_bytes, 0,
+        "ticket dropped on TopicClosed must refund the runtime account"
+    );
+    assert_eq!(
+        snap.escrow_charged_bytes, 0,
+        "no escrow should be retained when the closed-topic path fails before conversion"
+    );
+    assert_eq!(
+        snap.abandoned_escrow_count, 0,
+        "the failure path must not record an abandoned-escrow leak"
+    );
+}

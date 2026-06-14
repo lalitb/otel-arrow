@@ -325,7 +325,7 @@ impl<T: Send + Sync + 'static> TopicState<T> for TopicInner<T> {
         match self {
             // Balanced topics retain a runtime-local queue entry, so they own
             // the escrow charge while the item is in transit.
-            TopicInner::BalancedOnly(topic) => Ok(topic.try_publish_owned(msg, ticket, state)),
+            TopicInner::BalancedOnly(topic) => topic.try_publish_owned(msg, ticket, state),
             // Broadcast and mixed topics use the ring/all-or-nothing model which
             // is not yet escrow-integrated; keep the payload locally charged.
             TopicInner::BroadcastOnly(topic) => {
@@ -526,23 +526,24 @@ impl<T: Send + Sync + 'static> BalancedOnlyTopic<T> {
         msg: Arc<T>,
         ticket: LocalMemoryTicket,
         state: &MemoryBudgetState,
-    ) -> (PublishOutcome, Option<LocalMemoryTicket>) {
+    ) -> Result<(PublishOutcome, Option<LocalMemoryTicket>), Error> {
         if self.closed.load(Ordering::Relaxed) {
-            return (PublishOutcome::DroppedOnFull, Some(ticket));
+            return Err(TopicClosed);
         }
         let id = self.next_message_id();
         let Some(group) = self.group.get() else {
             // No balanced consumer group: nothing to retain at this boundary.
-            return (PublishOutcome::Published, Some(ticket));
+            return Ok((PublishOutcome::Published, Some(ticket)));
         };
-        let Ok(Some(permit)) = try_acquire_balanced_permit(&group.admission) else {
-            return (PublishOutcome::DroppedOnFull, Some(ticket));
+        let permit = match try_acquire_balanced_permit(&group.admission)? {
+            Some(p) => p,
+            None => return Ok((PublishOutcome::DroppedOnFull, Some(ticket))),
         };
         // Capacity is secured; only now convert local ownership into escrow so a
         // dropped-on-full publish never leaves an orphaned escrow charge.
         let escrow = match ticket.try_into_escrow(state) {
             Ok(escrow) => escrow,
-            Err(ticket) => return (PublishOutcome::DroppedOnFull, Some(ticket)),
+            Err(ticket) => return Ok((PublishOutcome::DroppedOnFull, Some(ticket))),
         };
         let envelope = Envelope {
             id,
@@ -550,10 +551,13 @@ impl<T: Send + Sync + 'static> BalancedOnlyTopic<T> {
             payload: msg,
         };
         // After this point the queued item owns the escrow; if the channel was
-        // racing closed, `send_queued_envelope` drops the slot and releases the
-        // escrow cleanly.
-        let _ = send_queued_envelope(&group.tx, envelope, EscrowSlot::new(escrow), permit);
-        (PublishOutcome::Published, None)
+        // racing closed, `send_queued_envelope` drops the slot, which releases
+        // the escrow cleanly via `EscrowSlot::Drop`. The producer's original
+        // local ticket has already been consumed, so we surface `TopicClosed`
+        // (rather than a false `Published`) so the caller knows the publish did
+        // not succeed and the charge is gone.
+        send_queued_envelope(&group.tx, envelope, EscrowSlot::new(escrow), permit)?;
+        Ok((PublishOutcome::Published, None))
     }
 
     fn try_publish_tracked(
