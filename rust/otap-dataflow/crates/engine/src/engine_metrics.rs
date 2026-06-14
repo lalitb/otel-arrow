@@ -113,6 +113,11 @@ pub struct EngineMetrics {
     #[metric(unit = "{By}")]
     pub runtime_memory_budget_overshoot_bytes: Gauge<u64>,
 
+    /// Reconciliation-debt bytes: overshoot recorded after growth that
+    /// overdrew the global debt pool and remains unbacked.
+    #[metric(unit = "{By}")]
+    pub runtime_memory_budget_reconcile_debt_bytes: Gauge<u64>,
+
     /// Abandoned escrow tickets retained for leak detection.
     #[metric(unit = "{ticket}")]
     pub runtime_memory_budget_abandoned_escrow_count: Gauge<u64>,
@@ -241,6 +246,9 @@ impl EngineMetricsMonitor {
         self.metrics
             .runtime_memory_budget_overshoot_bytes
             .set(memory_budget.overshoot_bytes);
+        self.metrics
+            .runtime_memory_budget_reconcile_debt_bytes
+            .set(memory_budget.reconcile_debt_bytes);
         self.metrics
             .runtime_memory_budget_abandoned_escrow_count
             .set(memory_budget.abandoned_escrow_count);
