@@ -134,6 +134,24 @@ pub struct EngineMetrics {
     #[metric(unit = "{By}")]
     pub runtime_memory_budget_escrow_charged_bytes: Gauge<u64>,
 
+    /// Escrow bytes currently backed by an explicit borrow against the global
+    /// spare pool (the pool-backed share of `escrow_charged_bytes`).
+    #[metric(unit = "{By}")]
+    pub runtime_memory_budget_escrow_pool_held_bytes: Gauge<u64>,
+
+    /// Escrow bytes that could not be backed by a pool borrow at conversion
+    /// time and are tolerated only in observe-only mode (enforce rejects them).
+    #[metric(unit = "{By}")]
+    pub runtime_memory_budget_escrow_pool_overshoot_bytes: Gauge<u64>,
+
+    /// Drain/redemption allowance configured across runtimes.
+    #[metric(unit = "{By}")]
+    pub runtime_memory_budget_drain_allowance_bytes: Gauge<u64>,
+
+    /// Drain/redemption bytes currently outstanding across runtimes.
+    #[metric(unit = "{By}")]
+    pub runtime_memory_budget_drain_committed_bytes: Gauge<u64>,
+
     /// Spare bytes available to lease from the global memory-budget pool.
     #[metric(unit = "{By}")]
     pub runtime_memory_budget_spare_available_bytes: Gauge<u64>,
@@ -261,6 +279,18 @@ impl EngineMetricsMonitor {
         self.metrics
             .runtime_memory_budget_escrow_charged_bytes
             .set(memory_budget.escrow_charged_bytes);
+        self.metrics
+            .runtime_memory_budget_escrow_pool_held_bytes
+            .set(memory_budget.escrow_pool_held_bytes);
+        self.metrics
+            .runtime_memory_budget_escrow_pool_overshoot_bytes
+            .set(memory_budget.escrow_pool_overshoot_bytes);
+        self.metrics
+            .runtime_memory_budget_drain_allowance_bytes
+            .set(memory_budget.drain_allowance_bytes);
+        self.metrics
+            .runtime_memory_budget_drain_committed_bytes
+            .set(memory_budget.drain_committed_bytes);
         self.metrics
             .runtime_memory_budget_spare_available_bytes
             .set(memory_budget.spare_available_bytes);
@@ -473,6 +503,22 @@ mod tests {
                 .runtime_memory_budget_soft_runtime_count
                 .get(),
             1
+        );
+        // The drain allowance defaults to `lease_step_bytes` (10) via the
+        // local_account wiring, and nothing is drained yet.
+        assert_eq!(
+            monitor
+                .metrics
+                .runtime_memory_budget_drain_allowance_bytes
+                .get(),
+            10
+        );
+        assert_eq!(
+            monitor
+                .metrics
+                .runtime_memory_budget_drain_committed_bytes
+                .get(),
+            0
         );
 
         monitor

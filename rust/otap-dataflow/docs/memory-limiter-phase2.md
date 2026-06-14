@@ -1492,6 +1492,8 @@ item that has no owner.
 | `engine.runtime.memory.budget.borrowed.bytes` | Bytes borrowed from the global lease pool. |
 | `engine.runtime.memory.budget.current.overshoot.bytes` | Current bytes above local floor plus leases. |
 | `engine.runtime.memory.budget.reconcile.debt.bytes` | Current bytes reconciled after growth without prior authorization. |
+| `engine.runtime.memory.budget.drain.allowance.bytes` | Configured per-runtime redemption/drain allowance, summed across runtimes. |
+| `engine.runtime.memory.budget.drain.committed.bytes` | Drain/redemption bytes currently outstanding against the allowance. |
 | `engine.runtime.memory.budget.level` | Runtime budget pressure state. |
 | `engine.runtime.memory.budget.lease.borrows` | Count of successful lease borrows. |
 | `engine.runtime.memory.budget.lease.failures` | Count of failed lease borrows. |
@@ -1500,8 +1502,11 @@ item that has no owner.
 | `engine.runtime.memory.budget.unknown.bytes` | Retained bytes excluded from enforcement because exact logical size is unknown. |
 | `engine.runtime.memory.budget.uncovered.retained.bytes` | Retained bytes observed without a ticket owner. |
 | `engine.runtime.memory.budget.escrow.charged.bytes` | Logical bytes owned by an escrow boundary. |
+| `engine.runtime.memory.budget.escrow.pool.held.bytes` | Escrow bytes backed by an explicit borrow against the global spare pool. |
+| `engine.runtime.memory.budget.escrow.pool.overshoot.bytes` | Escrow bytes not backed by a pool borrow, tolerated only in observe-only mode. |
 | `engine.runtime.memory.budget.escrow.ring.occupancy.bytes` | Broadcast or mixed-topic ring-slot escrow bytes. |
 | `engine.runtime.memory.budget.escrow.abandoned.bytes` | Escrow bytes moved to the leak-detection graveyard. |
+| `engine.runtime.memory.budget.escrow.abandoned.count` | Escrow tickets moved to the leak-detection graveyard. |
 | `engine.runtime.memory.budget.escrow.rejections` | Publish or redemption failures by escrow. |
 | `engine.runtime.memory.budget.escrow.shadow.rejections` | Publish or redemption work that would have failed under enforcement. |
 | `engine.runtime.memory.budget.spare.available.bytes` | Remaining global spare pool. |
