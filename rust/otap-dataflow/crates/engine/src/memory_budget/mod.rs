@@ -254,6 +254,17 @@ pub struct MemoryBudgetSnapshot {
     pub escrow_ticket_count: u64,
     /// Escrow bytes currently owning logical retained bytes.
     pub escrow_charged_bytes: u64,
+    /// Escrow bytes currently backed by an explicit borrow against the global
+    /// spare pool. Equal to `escrow_charged_bytes - escrow_pool_overshoot_bytes`
+    /// in steady state. Surfaces the design invariant
+    /// `sum(runtime_charged) + sum(escrow_charged) <= bounded global capacity`
+    /// by making the escrow draw on the pool explicit.
+    pub escrow_pool_held_bytes: u64,
+    /// Escrow bytes that could not be backed by a pool borrow at conversion
+    /// time and are tolerated only because the runtime is in observe-only mode.
+    /// In enforce mode, escrow creation that would land here is rejected so the
+    /// global logical invariant is preserved.
+    pub escrow_pool_overshoot_bytes: u64,
     /// Spare bytes currently available to lease from the global pool.
     pub spare_available_bytes: u64,
     /// Signed overshoot-debt pool balance. Negative means the pool has been
@@ -272,6 +283,15 @@ struct MemoryBudgetStateInner {
     abandoned_escrow_bytes: AtomicU64,
     escrow_ticket_count: AtomicU64,
     escrow_charged_bytes: AtomicU64,
+    /// Sum of bytes the escrow pool currently holds against the global spare
+    /// pool. Incremented when [`MemoryBudgetState::try_charge_escrow`] succeeds
+    /// at borrowing from `pool`, decremented on the matching release.
+    escrow_pool_held_bytes: AtomicU64,
+    /// Sum of escrow bytes that observe-only created without a backing pool
+    /// borrow (because the pool was already exhausted at conversion time). The
+    /// enforce-mode admission path rejects this case instead of accumulating
+    /// here, so this counter only grows under `mode: observe_only`.
+    escrow_pool_overshoot_bytes: AtomicU64,
 }
 
 /// Shared runtime memory-budget state.
@@ -375,6 +395,11 @@ impl MemoryBudgetState {
             abandoned_escrow_bytes: self.inner.abandoned_escrow_bytes.load(Ordering::Relaxed),
             escrow_ticket_count: self.inner.escrow_ticket_count.load(Ordering::Relaxed),
             escrow_charged_bytes: self.inner.escrow_charged_bytes.load(Ordering::Relaxed),
+            escrow_pool_held_bytes: self.inner.escrow_pool_held_bytes.load(Ordering::Relaxed),
+            escrow_pool_overshoot_bytes: self
+                .inner
+                .escrow_pool_overshoot_bytes
+                .load(Ordering::Relaxed),
             spare_available_bytes: self.inner.pool.available_bytes(),
             overshoot_debt_balance: self.inner.pool.overshoot_debt_balance(),
             ..MemoryBudgetSnapshot::default()
@@ -423,17 +448,20 @@ impl MemoryBudgetState {
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
-    fn try_charge_escrow(&self, bytes: u64) -> bool {
+    /// Outcome of [`MemoryBudgetState::try_charge_escrow`].
+    fn try_charge_escrow(&self, bytes: u64) -> Option<EscrowChargeAck> {
         let Some(config) = self.config() else {
-            return false;
+            return None;
         };
-        if config.mode == BudgetMode::Enforce {
+        let enforce = config.mode == BudgetMode::Enforce;
+        // Step 1: bound the topic-level escrow occupancy (enforce only).
+        if enforce {
             let limit = config.topic_default_limit_bytes;
             let mut current = self.inner.escrow_charged_bytes.load(Ordering::Relaxed);
             loop {
                 let next = current.saturating_add(bytes);
                 if next > limit {
-                    return false;
+                    return None;
                 }
                 match self.inner.escrow_charged_bytes.compare_exchange_weak(
                     current,
@@ -446,19 +474,52 @@ impl MemoryBudgetState {
                 }
             }
         } else {
+            // Observe-only: always record the escrow occupancy.
             let _ = self
                 .inner
                 .escrow_charged_bytes
                 .fetch_add(bytes, Ordering::Relaxed);
         }
+        // Step 2: back the escrow with an explicit global-pool borrow so the
+        // design invariant
+        //     sum(runtime_charged) + sum(escrow_charged) <= bounded capacity
+        // is enforceable rather than optimistic. The producer's local lease
+        // returns surplus to the pool on the matching `account.refund(bytes)`
+        // performed by the caller after we ack the charge, so this borrow does
+        // not durably double-draw the pool for the same logical bytes.
+        let pool_backed = if bytes == 0 {
+            true
+        } else if self.inner.pool.try_borrow(bytes) {
+            let _ = self
+                .inner
+                .escrow_pool_held_bytes
+                .fetch_add(bytes, Ordering::AcqRel);
+            true
+        } else if enforce {
+            // Roll back the topic-cap reservation; do not admit escrow that
+            // would violate the global logical invariant in enforce mode.
+            let _ = self
+                .inner
+                .escrow_charged_bytes
+                .fetch_sub(bytes, Ordering::AcqRel);
+            return None;
+        } else {
+            // Observe-only: record the unbacked escrow so the projected
+            // overshoot is visible without rejecting the producer.
+            let _ = self
+                .inner
+                .escrow_pool_overshoot_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+            false
+        };
         let _ = self
             .inner
             .escrow_ticket_count
             .fetch_add(1, Ordering::Relaxed);
-        true
+        Some(EscrowChargeAck { pool_backed })
     }
 
-    fn release_escrow(&self, bytes: u64) {
+    fn release_escrow(&self, bytes: u64, pool_backed: bool) {
         let _ = self
             .inner
             .escrow_ticket_count
@@ -467,6 +528,21 @@ impl MemoryBudgetState {
             .inner
             .escrow_charged_bytes
             .fetch_sub(bytes, Ordering::Relaxed);
+        if bytes == 0 {
+            return;
+        }
+        if pool_backed {
+            let _ = self
+                .inner
+                .escrow_pool_held_bytes
+                .fetch_sub(bytes, Ordering::AcqRel);
+            self.inner.pool.return_bytes(bytes);
+        } else {
+            let _ = self
+                .inner
+                .escrow_pool_overshoot_bytes
+                .fetch_sub(bytes, Ordering::Relaxed);
+        }
     }
 
     fn lease_authority(&self) -> Arc<dyn LeaseAuthority> {
@@ -1299,13 +1375,20 @@ impl LocalMemoryTicket {
         let LocalMemoryCharge::KnownBytes(bytes) = self.charge else {
             return Err(self);
         };
-        if !state.try_charge_escrow(bytes) {
+        let Some(ack) = state.try_charge_escrow(bytes) else {
             return Err(self);
-        }
+        };
         self.active = false;
+        // The escrow charge now holds an explicit pool borrow for `bytes` (when
+        // `ack.pool_backed`); refunding the producer here lets the producer's
+        // lease return surplus to the pool on settle, restoring approximately
+        // the same pool draw we just took. This is the "transfer from existing
+        // lease" path described by the design (line 728-733): the global
+        // logical total does not increase across the transfer.
         self.account.refund(bytes);
         Ok(EscrowTicket {
             bytes,
+            pool_backed: ack.pool_backed,
             state: state.clone(),
             // One reference-count bump at the shared boundary; no string clone.
             scope: Arc::clone(&self.account.scope),
@@ -1326,10 +1409,27 @@ impl Drop for LocalMemoryTicket {
     }
 }
 
+/// Acknowledgement returned by [`MemoryBudgetState::try_charge_escrow`]:
+/// the escrow occupancy and the pool draw have been recorded and the escrow
+/// counter is live; the caller now owns the matching release.
+#[derive(Debug, Clone, Copy)]
+struct EscrowChargeAck {
+    /// True iff this escrow created an explicit borrow against the global
+    /// spare pool. False only when admission ran in observe-only mode and the
+    /// pool could not satisfy the borrow (the escrow proceeded but the global
+    /// logical invariant is overshot — surfaced via `escrow_pool_overshoot_bytes`).
+    pool_backed: bool,
+}
+
 /// Cross-runtime/topic logical charge.
 #[derive(Debug)]
 pub struct EscrowTicket {
     bytes: u64,
+    /// Whether this ticket holds an explicit pool borrow. Drives the matching
+    /// release path: pool-backed releases return `bytes` to the pool;
+    /// observe-only-overshoot releases decrement the overshoot counter without
+    /// returning to a pool draw that was never taken.
+    pool_backed: bool,
     state: MemoryBudgetState,
     scope: BudgetScope,
     resolved: bool,
@@ -1355,7 +1455,7 @@ impl EscrowTicket {
     /// the ticket resolved so `Drop` does not route it to the graveyard.
     fn resolve_release(&mut self) {
         if !self.resolved {
-            self.state.release_escrow(self.bytes);
+            self.state.release_escrow(self.bytes, self.pool_backed);
             self.resolved = true;
         }
     }
@@ -2132,7 +2232,10 @@ mod tests {
                 topic_default_limit_bytes: 60,
                 runtime_count: 1,
             },
-            None,
+            // Provide enough process headroom (floor 100 + 100 spare) so the
+            // global pool can back the first escrow's transfer charge. The
+            // test isolates the topic-aggregate cap, not the pool-backing path.
+            Some(200),
         );
         let acct = account(100, 10, 20, 100);
         let first = acct
@@ -2184,6 +2287,163 @@ mod tests {
         assert_eq!(snapshot.abandoned_escrow_bytes, 42);
         assert_eq!(snapshot.escrow_ticket_count, 1);
         assert_eq!(snapshot.escrow_charged_bytes, 42);
+    }
+
+    /// Local-ticket → escrow conversion must transfer ownership without
+    /// inflating the global logical total. After the transfer the sum
+    /// `runtime_charged + escrow_charged` equals the original local charge
+    /// and the escrow draws an explicit pool borrow.
+    #[test]
+    fn try_into_escrow_does_not_inflate_global_logical_total() {
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 100,
+                    lease_step_bytes: 10,
+                    max_overshoot_per_runtime_bytes: 20,
+                    overshoot_debt_limit_bytes: 10,
+                },
+                topic_default_limit_bytes: 200,
+                runtime_count: 1,
+            },
+            Some(200),
+        );
+        let pool = state.inner.pool.clone();
+        let acct = Rc::new(RuntimeMemoryAccount::new(
+            100,
+            10,
+            20,
+            BudgetMode::ObserveOnly,
+            Arc::new(pool.clone()),
+            Arc::new(RuntimeMemorySnapshot::default()),
+            Arc::new(BudgetScopeId::default()),
+        ));
+
+        let pool_before = state.inner.pool.available_bytes();
+        let ticket = acct.charge(40_u64).expect("charge should fit");
+        acct.flush_snapshot();
+        let charged_before = acct.snapshot.charged_bytes();
+        assert_eq!(charged_before, 40);
+
+        let escrow = ticket
+            .try_into_escrow(&state)
+            .expect("escrow transfer should succeed");
+
+        acct.flush_snapshot();
+        let snap = state.snapshot();
+        assert_eq!(
+            acct.snapshot.charged_bytes() + snap.escrow_charged_bytes,
+            charged_before,
+            "logical total is conserved across local → escrow transfer"
+        );
+        assert_eq!(snap.escrow_pool_held_bytes, 40);
+        assert_eq!(snap.escrow_pool_overshoot_bytes, 0);
+        // Pool is approximately conserved (drew 40 for escrow; producer's
+        // lease may have returned its small borrow on settle).
+        assert!(
+            state.inner.pool.available_bytes() <= pool_before,
+            "escrow pool draw must not increase global spare"
+        );
+
+        escrow.release();
+        let snap = state.snapshot();
+        assert_eq!(snap.escrow_pool_held_bytes, 0);
+        assert_eq!(
+            state.inner.pool.available_bytes(),
+            pool_before,
+            "release returns the escrow's pool borrow exactly"
+        );
+    }
+
+    /// Enforce mode rejects escrow creation when the global pool cannot back
+    /// the transfer charge. The original local ticket is returned to the
+    /// caller and no escrow counters move.
+    #[test]
+    fn enforce_escrow_rejected_when_pool_cannot_back_transfer() {
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::Enforce,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 100,
+                    lease_step_bytes: 10,
+                    max_overshoot_per_runtime_bytes: 20,
+                    overshoot_debt_limit_bytes: 10,
+                },
+                topic_default_limit_bytes: 200,
+                runtime_count: 1,
+            },
+            // No process headroom: pool is empty after subtracting the floor.
+            Some(100),
+        );
+        assert_eq!(state.inner.pool.available_bytes(), 0);
+        let acct = account(100, 10, 20, 100);
+        let ticket = acct.charge(40_u64).expect("local charge fits within floor");
+
+        let returned = ticket
+            .try_into_escrow(&state)
+            .expect_err("escrow must be rejected when pool cannot back transfer");
+        assert_eq!(returned.bytes(), Some(40));
+
+        let snap = state.snapshot();
+        assert_eq!(snap.escrow_charged_bytes, 0);
+        assert_eq!(snap.escrow_pool_held_bytes, 0);
+        assert_eq!(snap.escrow_pool_overshoot_bytes, 0);
+        assert_eq!(snap.escrow_ticket_count, 0);
+    }
+
+    /// Observe-only escrow creation that exceeds global capacity still
+    /// succeeds (observe-only never rejects), but the unbacked excess is
+    /// surfaced via `escrow_pool_overshoot_bytes` so operators see the
+    /// projected invariant violation.
+    #[test]
+    fn observe_only_escrow_records_pool_overshoot_when_pool_exhausted() {
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 100,
+                    lease_step_bytes: 10,
+                    max_overshoot_per_runtime_bytes: 20,
+                    overshoot_debt_limit_bytes: 10,
+                },
+                topic_default_limit_bytes: 200,
+                runtime_count: 1,
+            },
+            // No process headroom: pool is empty after subtracting the floor.
+            Some(100),
+        );
+        assert_eq!(state.inner.pool.available_bytes(), 0);
+        let acct = account(100, 10, 20, 100);
+        let ticket = acct.charge(40_u64).expect("local charge fits within floor");
+
+        let escrow = ticket
+            .try_into_escrow(&state)
+            .expect("observe-only escrow records pressure rather than rejecting");
+
+        let snap = state.snapshot();
+        assert_eq!(snap.escrow_charged_bytes, 40);
+        assert_eq!(snap.escrow_pool_held_bytes, 0);
+        assert_eq!(
+            snap.escrow_pool_overshoot_bytes, 40,
+            "unbacked observe-only escrow must surface projected pressure"
+        );
+
+        drop(escrow);
+        // Drop without explicit release routes to the abandoned graveyard,
+        // which keeps the leak visible (escrow_charged_bytes stays elevated)
+        // but releases the unbacked-overshoot counter accounting cleanly.
+        let snap = state.snapshot();
+        assert!(snap.abandoned_escrow_count > 0);
     }
 
     #[test]
