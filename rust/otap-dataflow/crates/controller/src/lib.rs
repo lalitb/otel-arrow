@@ -2265,7 +2265,6 @@ connections:
                     core_allocation,
                     memory_limiter: None,
                     memory_budget: None,
-                    ..Default::default()
                 },
                 ..Default::default()
             },
