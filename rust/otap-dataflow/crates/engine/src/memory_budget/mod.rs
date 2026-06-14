@@ -7,6 +7,8 @@
 //! and cross-runtime ownership types used by later milestones and exposes shared
 //! snapshots for engine-level metrics.
 
+pub mod reclaim;
+
 use otap_df_config::policy::{MemoryBudgetMode as ConfigBudgetMode, MemoryBudgetPolicy};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
