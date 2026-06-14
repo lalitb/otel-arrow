@@ -516,11 +516,23 @@ impl<T: Send + Sync + 'static> BalancedOnlyTopic<T> {
     /// the item is delivered, dropped on full, evicted, or dropped on topic
     /// close/drain (via `EscrowSlot`'s `Drop`).
     ///
-    /// Ownership-preserving failure handling:
-    /// - topic closed or escrow conversion refused (enforce + over the topic
-    ///   escrow limit): the original local ticket is returned to the caller.
-    /// - dropped on full: nothing is enqueued and the original local ticket is
-    ///   returned, still locally charged.
+    /// Failure handling:
+    /// - topic closed at entry: returns `Err(TopicClosed)`. The passed-in
+    ///   `LocalMemoryTicket` is dropped here, which refunds the local charge
+    ///   via `LocalMemoryTicket::Drop` -- the producer's accounting is
+    ///   restored without the caller having to thread the ticket back.
+    /// - escrow conversion refused (enforce + over the topic escrow limit, or
+    ///   pool exhausted): returns `Ok((DroppedOnFull, Some(ticket)))` with the
+    ///   original local ticket so the caller can retry or release explicitly.
+    /// - dropped on full at the admission permit step: same as above --
+    ///   nothing is enqueued and the original local ticket is returned, still
+    ///   locally charged.
+    /// - post-conversion channel close race: the escrow is already owned by
+    ///   the queued slot, so `send_queued_envelope` drops the `EscrowSlot`
+    ///   which releases escrow exactly once via its `Drop`; we surface
+    ///   `Err(TopicClosed)` rather than a false `Published`. The producer's
+    ///   local charge has already been refunded by the successful
+    ///   `try_into_escrow`.
     fn try_publish_owned(
         &self,
         msg: Arc<T>,

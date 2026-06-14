@@ -2565,10 +2565,7 @@ async fn balanced_publish_owned_on_closed_topic_propagates_error_and_releases_ch
 
     let broker = TopicBroker::new();
     let topic = broker
-        .create_in_memory_topic(
-            "escrow-closed",
-            TopicOptions::BalancedOnly { capacity: 16 },
-        )
+        .create_in_memory_topic("escrow-closed", TopicOptions::BalancedOnly { capacity: 16 })
         .unwrap();
     let _sub = topic
         .subscribe(
