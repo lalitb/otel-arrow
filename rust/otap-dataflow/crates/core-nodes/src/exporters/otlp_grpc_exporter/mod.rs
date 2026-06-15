@@ -24,6 +24,7 @@ use otap_df_engine::control::{AckMsg, NackMsg, NodeControlMsg};
 use otap_df_engine::error::{Error, ExporterErrorKind, format_error_sources};
 use otap_df_engine::exporter::ExporterWrapper;
 use otap_df_engine::local::exporter::{EffectHandler, Exporter};
+use otap_df_engine::memory_budget::{LocalMemoryTicket, current_runtime_memory_budget};
 use otap_df_engine::message::{ExporterInbox, Message};
 use otap_df_engine::node::NodeId;
 use otap_df_engine::terminal_state::TerminalState;
@@ -217,6 +218,12 @@ impl Exporter<OtapPdata> for OTLPExporter {
 
         let mut inflight_exports = InFlightExports::new();
         let mut pending_msg: Option<Message<OtapPdata>> = None;
+        // Memory-budget ticket owning the backpressure-parked pending request
+        // while it is retained in `pending_msg`. Charged when a request is
+        // parked because the in-flight budget is full; released when the request
+        // is taken back for dispatch (where it is re-charged as in-flight), or
+        // when the loop exits (drop refunds the account).
+        let mut pending_ticket: Option<LocalMemoryTicket> = None;
 
         // Main loop: 1) finish ready completions, 2) biased wait for either a completion
         // or the next message, 3) dispatch work while respecting the in-flight budget.
@@ -246,6 +253,10 @@ impl Exporter<OtapPdata> for OTLPExporter {
 
             // Prefer completions if any are ready, otherwise biased select between completion and recv.
             let msg = if let Some(msg) = pending_msg.take() {
+                // The parked request is about to be dispatched and re-charged as
+                // in-flight, so release its pending charge now to avoid
+                // double-counting.
+                drop(pending_ticket.take());
                 msg
             } else if inflight_exports.is_empty() {
                 let msg = msg_chan.recv().await?;
@@ -304,6 +315,11 @@ impl Exporter<OtapPdata> for OTLPExporter {
                 }
                 Message::PData(pdata) => {
                     if inflight_exports.len() >= max_in_flight {
+                        // Backpressure: charge the parked request while it is
+                        // retained, then park it. The charge is released when the
+                        // request is later taken for dispatch (or on loop exit).
+                        pending_ticket = current_runtime_memory_budget()
+                            .and_then(|budget| budget.charge(&pdata));
                         pending_msg = Some(Message::PData(pdata));
                         continue;
                     }
@@ -463,6 +479,26 @@ struct EncodedExport {
     /// gRPC metadata built from transport headers via the propagation policy.
     /// `None` when no headers need to be propagated (zero overhead).
     metadata: Option<MetadataMap>,
+    /// Memory-budget ticket owning the encoded request bytes while the export
+    /// is retained in-flight. `None` when no runtime budget is installed (or,
+    /// under `enforce`, when admission rejected the charge — the exporter is an
+    /// accounting site, not an enforcement point, so the export still proceeds).
+    /// Dropping the ticket on any terminal path (completion, error, nack,
+    /// timeout, shutdown, drain, or early drop of the in-flight future) refunds
+    /// the runtime account exactly once.
+    ticket: Option<LocalMemoryTicket>,
+}
+
+/// Charges the encoded request `bytes` against the current runtime memory
+/// budget, returning the owning ticket while the request is retained in-flight.
+///
+/// Returns `None` when no runtime budget is installed for this runtime, or when
+/// an `enforce`-mode account rejects the charge. The exporter is an accounting
+/// site rather than an admission point, so callers proceed with the export in
+/// both cases; the only consequence of `None` is that the in-flight bytes are
+/// not attributed to the runtime account.
+fn charge_inflight(bytes: &[u8]) -> Option<LocalMemoryTicket> {
+    current_runtime_memory_budget().and_then(|budget| budget.charge(bytes))
 }
 
 /// Encoding failed before the request was sent; we still need to surface a Nack with payload.
@@ -506,6 +542,9 @@ fn prepare_otap_export<Enc: ProtoBytesEncoder>(
     let (bytes, next_capacity) = proto_buffer.take_into_bytes();
     proto_buffer.ensure_capacity(next_capacity);
 
+    // Charge the encoded request bytes while they are retained in-flight.
+    let ticket = charge_inflight(bytes.as_ref());
+
     if !context.may_return_payload() {
         // drop before the export, payload not requested
         let _drop = otap_batch.take_payload();
@@ -518,6 +557,7 @@ fn prepare_otap_export<Enc: ProtoBytesEncoder>(
         saved_payload,
         signal_type,
         metadata,
+        ticket,
     })
 }
 
@@ -528,6 +568,9 @@ fn prepare_otlp_export(
     signal_type: SignalType,
     save_payload_fn: impl FnOnce(Bytes) -> OtapPayload,
 ) -> EncodedExport {
+    // Charge the request bytes while they are retained in-flight.
+    let ticket = charge_inflight(bytes.as_ref());
+
     let saved_payload = if context.may_return_payload() {
         save_payload_fn(bytes.clone())
     } else {
@@ -540,6 +583,7 @@ fn prepare_otlp_export(
         saved_payload,
         signal_type,
         metadata,
+        ticket,
     }
 }
 
@@ -613,6 +657,7 @@ async fn finalize_completed_export(
         saved_payload,
         signal_type,
         client,
+        ticket,
     } = completed;
 
     match route_export_result(result, context, saved_payload, effect_handler).await {
@@ -626,6 +671,11 @@ async fn finalize_completed_export(
             pdata_metrics.add_failed(signal_type, 1)
         }
     }
+
+    // The export is finalized: release the in-flight memory charge. Dropping the
+    // ticket refunds the runtime account exactly once regardless of outcome
+    // (ack/success, nack/error, or timeout surfaced as a tonic::Status).
+    drop(ticket);
 
     client
 }
@@ -713,6 +763,7 @@ fn make_export_future(
         saved_payload,
         signal_type,
         metadata,
+        ticket,
     } = prepared;
 
     // Build a tonic::Request that carries the propagated metadata.
@@ -731,6 +782,7 @@ fn make_export_future(
                     saved_payload,
                     signal_type,
                     client: SignalClient::Logs(client),
+                    ticket,
                 }
             }
             SignalClient::Metrics(mut client) => {
@@ -741,6 +793,7 @@ fn make_export_future(
                     saved_payload,
                     signal_type,
                     client: SignalClient::Metrics(client),
+                    ticket,
                 }
             }
             SignalClient::Traces(mut client) => {
@@ -751,6 +804,7 @@ fn make_export_future(
                     saved_payload,
                     signal_type,
                     client: SignalClient::Traces(client),
+                    ticket,
                 }
             }
         }
@@ -915,6 +969,11 @@ struct CompletedExport {
     saved_payload: OtapPayload,
     signal_type: SignalType,
     client: SignalClient,
+    /// Memory-budget ticket owning the in-flight request bytes. Dropped when the
+    /// export is finalized (on success, error, nack, or timeout), refunding the
+    /// runtime account. Carried here so the charge is released exactly once on
+    /// every completion path.
+    ticket: Option<LocalMemoryTicket>,
 }
 
 #[cfg(test)]
@@ -1760,6 +1819,161 @@ mod tests {
         assert!(
             result.is_none(),
             "should return None when policy drops all headers"
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // Memory-budget retained-work ownership (pending + in-flight requests).
+    // ----------------------------------------------------------------------
+
+    /// Installs an observe-only/enforce runtime memory budget on the current
+    /// thread, mirroring the deployed-runtime wiring, and returns the state,
+    /// budget, and the thread-local guard (kept alive by the caller).
+    fn install_test_budget(
+        state: otap_df_engine::memory_budget::MemoryBudgetState,
+        mode: otap_df_engine::memory_budget::BudgetMode,
+        max_overshoot_per_runtime_bytes: u64,
+    ) -> (
+        otap_df_engine::memory_budget::MemoryBudgetState,
+        std::rc::Rc<otap_df_engine::memory_budget::RuntimeMemoryBudget>,
+        otap_df_engine::memory_budget::RuntimeMemoryBudgetGuard,
+    ) {
+        use otap_df_engine::memory_budget::{
+            BudgetScopeId, MemoryBudgetEnforcement, MemoryBudgetSizing, RuntimeMemoryBudget,
+            RuntimeMemoryBudgetConfig, set_current_runtime_memory_budget,
+        };
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 1,
+                    lease_step_bytes: 1,
+                    max_overshoot_per_runtime_bytes,
+                    overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: 100,
+                runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement::default(),
+            },
+            None,
+        );
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let account = handle.local_account().expect("account should be available");
+        let budget = std::rc::Rc::new(RuntimeMemoryBudget::new(account));
+        let guard = set_current_runtime_memory_budget(Some(budget.clone()));
+        (state, budget, guard)
+    }
+
+    #[test]
+    fn test_prepare_export_charges_inflight_and_releases_on_drop() {
+        // Acquisition + release: encoding a request charges its bytes while the
+        // export is retained in-flight; dropping the prepared export (the same
+        // drop `finalize_completed_export` performs on completion, and the same
+        // drop the in-flight `FuturesUnordered` performs on early
+        // shutdown/teardown) refunds the runtime account exactly once.
+        let registry = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(registry);
+        let (state, budget, _guard) = install_test_budget(
+            controller_ctx.memory_budget_state(),
+            otap_df_engine::memory_budget::BudgetMode::ObserveOnly,
+            1_000_000,
+        );
+
+        let bytes = Bytes::from_static(b"encoded-otlp-export-request-bytes");
+        let expected = bytes.len() as u64;
+
+        let prepared = prepare_otlp_export(
+            bytes.clone(),
+            context_without_headers(),
+            None,
+            SignalType::Logs,
+            |b| OtlpProtoBytes::ExportLogsRequest(b).into(),
+        );
+        assert!(
+            prepared.ticket.is_some(),
+            "the encoded in-flight request must own a memory-budget ticket"
+        );
+        budget.flush_snapshot();
+        assert_eq!(
+            state.snapshot().charged_bytes,
+            expected,
+            "encoded request bytes must be charged while retained in-flight"
+        );
+
+        drop(prepared);
+        budget.flush_snapshot();
+        assert_eq!(
+            state.snapshot().charged_bytes,
+            0,
+            "finalizing/dropping the in-flight export must release the charge"
+        );
+    }
+
+    #[test]
+    fn test_pending_request_charge_and_release() {
+        // Backpressure-parked pending request: charged while retained in
+        // `pending_msg`, released when taken back for dispatch (where it is
+        // re-charged as in-flight).
+        use otap_df_engine::memory_budget::ChargedSize;
+        let registry = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(registry);
+        let (state, budget, _guard) = install_test_budget(
+            controller_ctx.memory_budget_state(),
+            otap_df_engine::memory_budget::BudgetMode::ObserveOnly,
+            1_000_000,
+        );
+
+        let req_bytes = Bytes::from_static(b"a-parked-pending-otlp-request-payload");
+        let pdata = OtapPdata::new_default(OtlpProtoBytes::ExportLogsRequest(req_bytes).into());
+        let expected = pdata.charged_size().expect("pdata has a known size");
+        assert!(expected > 0, "test payload must have a non-zero known size");
+
+        // Park: charge the pending request exactly as the backpressure path does.
+        let mut pending_ticket = current_runtime_memory_budget().and_then(|b| b.charge(&pdata));
+        assert!(
+            pending_ticket.is_some(),
+            "the backpressure-parked request must be charged"
+        );
+        budget.flush_snapshot();
+        assert_eq!(
+            state.snapshot().charged_bytes,
+            expected,
+            "the parked pending request must be charged while retained"
+        );
+
+        // Un-park (dispatch): release the pending charge.
+        drop(pending_ticket.take());
+        budget.flush_snapshot();
+        assert_eq!(
+            state.snapshot().charged_bytes,
+            0,
+            "taking the parked request for dispatch must release its pending charge"
+        );
+    }
+
+    #[test]
+    fn test_inflight_charge_degrades_without_rejecting_in_enforce_mode() {
+        // The exporter is a retained-work *accounting* site, not an *admission*
+        // point. Even under `enforce`, a rejected charge simply yields no ticket
+        // and the export still proceeds (no data dropped here). Enforcement of
+        // retained work is the receiver/admission layer's responsibility.
+        let registry = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(registry);
+        let (_state, _budget, _guard) = install_test_budget(
+            controller_ctx.memory_budget_state(),
+            otap_df_engine::memory_budget::BudgetMode::Enforce,
+            16,
+        );
+
+        // A request far larger than the tiny runtime budget.
+        let big = vec![0u8; 65_536];
+        let ticket = charge_inflight(big.as_slice());
+        assert!(
+            ticket.is_none(),
+            "an over-budget enforce charge yields no ticket; the export proceeds"
         );
     }
 }
