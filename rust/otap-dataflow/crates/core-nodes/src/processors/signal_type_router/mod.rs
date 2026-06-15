@@ -445,14 +445,20 @@ impl SignalTypeRouter {
         // Re-probing happens only for messages the router still owns locally.
         // Already-admitted downstream work is intentionally out of scope here.
         for pending in due {
-            let (port, data, context) = pending.into_parts();
+            let (port, data, context, ticket) = pending.into_parts();
             let admission = effect_handler
                 .try_admit_message_with_source_node_to(port.clone(), data)
                 .map_err(EngineError::from)?;
 
             match admission {
-                RouteAdmission::Accepted => self.record_forwarded_route(context),
+                RouteAdmission::Accepted => {
+                    // Admitted downstream: release the parked charge.
+                    drop(ticket);
+                    self.record_forwarded_route(context)
+                }
                 RouteAdmission::RejectedClosed(data) => {
+                    // No longer parked: release the charge before nacking.
+                    drop(ticket);
                     self.emit_route_closed_nack(
                         port.as_ref(),
                         effect_handler,
@@ -462,9 +468,11 @@ impl SignalTypeRouter {
                     .await?;
                 }
                 RouteAdmission::RejectedFull(data) => {
+                    // Still parked: carry the existing charge back into the
+                    // re-park so it is not double-counted or leaked.
                     self.admission
                         .repark_after_full(PendingRoute::from_retry_parts(
-                            port, data, context, now,
+                            port, data, context, now, ticket,
                         ));
                 }
             }
@@ -486,7 +494,10 @@ impl SignalTypeRouter {
         reason: &str,
     ) -> Result<(), EngineError> {
         for pending in self.admission.drain_for_shutdown(effect_handler) {
-            let (port, data, context) = pending.into_parts();
+            // Drained: no longer parked, so release the charge before turning the
+            // message into a retryable nack.
+            let (port, data, context, ticket) = pending.into_parts();
+            drop(ticket);
             self.emit_shutdown_nack(
                 port.as_ref(),
                 effect_handler,

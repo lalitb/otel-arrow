@@ -20,6 +20,9 @@ use otap_df_config::PortName;
 use otap_df_config::error::Error as ConfigError;
 use otap_df_engine::control::{WakeupRevision, WakeupSlot};
 use otap_df_engine::local::processor::EffectHandler;
+use otap_df_engine::memory_budget::{
+    ChargedSize, LocalMemoryTicket, current_runtime_memory_budget,
+};
 use otap_df_engine::{ProcessorRuntimeRequirements, WakeupError};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -86,15 +89,31 @@ pub(crate) struct PendingRoute<PData, Meta> {
     pub(crate) data: PData,
     pub(crate) meta: Meta,
     next_probe_at: Instant,
+    /// Memory-budget ticket owning the parked payload while it is retained in
+    /// router-local state. `None` when no runtime budget is installed (or, under
+    /// `enforce`, when admission rejected the charge — the router is an
+    /// accounting site, not an enforcement point). The ticket travels with the
+    /// parked route through probe/re-park cycles via [`Self::into_parts`] and
+    /// [`Self::from_retry_parts`]; dropping it on any terminal path (downstream
+    /// admission, nack, shutdown drain, or drop) refunds the runtime account
+    /// exactly once.
+    ticket: Option<LocalMemoryTicket>,
 }
 
 impl<PData, Meta> PendingRoute<PData, Meta> {
-    fn new(port: PortName, data: PData, meta: Meta, now: Instant) -> Self {
+    fn new(
+        port: PortName,
+        data: PData,
+        meta: Meta,
+        now: Instant,
+        ticket: Option<LocalMemoryTicket>,
+    ) -> Self {
         Self {
             port,
             data,
             meta,
             next_probe_at: now + PROBE_INTERVAL,
+            ticket,
         }
     }
 
@@ -102,12 +121,21 @@ impl<PData, Meta> PendingRoute<PData, Meta> {
         self.next_probe_at <= now
     }
 
-    pub(crate) fn into_parts(self) -> (PortName, PData, Meta) {
-        (self.port, self.data, self.meta)
+    /// Decompose the parked route, returning the owning memory-budget ticket so
+    /// the caller can release it (downstream admission / nack) or carry it back
+    /// into a re-park via [`Self::from_retry_parts`].
+    pub(crate) fn into_parts(self) -> (PortName, PData, Meta, Option<LocalMemoryTicket>) {
+        (self.port, self.data, self.meta, self.ticket)
     }
 
-    pub(crate) fn from_retry_parts(port: PortName, data: PData, meta: Meta, now: Instant) -> Self {
-        Self::new(port, data, meta, now)
+    pub(crate) fn from_retry_parts(
+        port: PortName,
+        data: PData,
+        meta: Meta,
+        now: Instant,
+        ticket: Option<LocalMemoryTicket>,
+    ) -> Self {
+        Self::new(port, data, meta, now, ticket)
     }
 }
 
@@ -172,7 +200,10 @@ impl<PData, Meta> ExclusiveRouteScheduler<PData, Meta> {
         data: PData,
         meta: Meta,
         effect_handler: &EffectHandler<PData>,
-    ) -> Result<FullRouteHandling<PData>, WakeupError> {
+    ) -> Result<FullRouteHandling<PData>, WakeupError>
+    where
+        PData: ChargedSize,
+    {
         let now = Instant::now();
 
         match self.policy.on_full {
@@ -182,7 +213,12 @@ impl<PData, Meta> ExclusiveRouteScheduler<PData, Meta> {
                     return Ok(FullRouteHandling::ImmediateNack(data));
                 }
 
-                let pending = PendingRoute::new(port.clone(), data, meta, now);
+                // Charge the parked payload while it is retained in router-local
+                // state. The ticket rides inside the `PendingRoute` so every
+                // terminal path (admission, nack, drain, drop) releases it once.
+                let ticket =
+                    current_runtime_memory_budget().and_then(|budget| budget.charge(&data));
+                let pending = PendingRoute::new(port.clone(), data, meta, now, ticket);
                 let _ = self.pending_by_port.insert(port.clone(), pending);
                 if let Err(error) = self.sync_armed_wakeup(effect_handler) {
                     let pending = self
@@ -344,6 +380,126 @@ mod tests {
         assert_eq!(
             policy.runtime_requirements(),
             ProcessorRuntimeRequirements::with_local_wakeups(1)
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // Memory-budget retained-work ownership (parked selected routes).
+    // ----------------------------------------------------------------------
+
+    /// A test payload with a fixed, known charged size.
+    struct SizedPayload(u64);
+
+    impl ChargedSize for SizedPayload {
+        fn charged_size(&self) -> Option<u64> {
+            Some(self.0)
+        }
+    }
+
+    /// Installs an observe-only/enforce runtime memory budget on the current
+    /// thread and returns the state, budget, and the thread-local guard.
+    fn install_test_budget(
+        state: otap_df_engine::memory_budget::MemoryBudgetState,
+        mode: otap_df_engine::memory_budget::BudgetMode,
+        max_overshoot_per_runtime_bytes: u64,
+    ) -> (
+        otap_df_engine::memory_budget::MemoryBudgetState,
+        std::rc::Rc<otap_df_engine::memory_budget::RuntimeMemoryBudget>,
+        otap_df_engine::memory_budget::RuntimeMemoryBudgetGuard,
+    ) {
+        use otap_df_engine::memory_budget::{
+            BudgetScopeId, MemoryBudgetEnforcement, MemoryBudgetSizing, RuntimeMemoryBudget,
+            RuntimeMemoryBudgetConfig, set_current_runtime_memory_budget,
+        };
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 1,
+                    lease_step_bytes: 1,
+                    max_overshoot_per_runtime_bytes,
+                    overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: 100,
+                runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement::default(),
+            },
+            None,
+        );
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let account = handle.local_account().expect("account should be available");
+        let budget = std::rc::Rc::new(RuntimeMemoryBudget::new(account));
+        let guard = set_current_runtime_memory_budget(Some(budget.clone()));
+        (state, budget, guard)
+    }
+
+    #[test]
+    fn parked_route_charge_survives_reprobe_and_releases_on_drop() {
+        // A parked route's charge is retained while it stays parked (carried
+        // across a probe/re-park cycle through `into_parts`/`from_retry_parts`)
+        // and is released exactly once when the route is finally dropped (the
+        // downstream-admission / nack / drain terminal path).
+        let registry = otap_df_telemetry::registry::TelemetryRegistryHandle::new();
+        let controller_ctx = otap_df_engine::context::ControllerContext::new(registry);
+        let (state, budget, _guard) = install_test_budget(
+            controller_ctx.memory_budget_state(),
+            otap_df_engine::memory_budget::BudgetMode::ObserveOnly,
+            1_000_000,
+        );
+
+        let now = Instant::now();
+        let ticket = current_runtime_memory_budget().and_then(|b| b.charge(SizedPayload(256)));
+        assert!(ticket.is_some(), "parked payload must be charged");
+        let pending = PendingRoute::new(PortName::from("out"), SizedPayload(256), (), now, ticket);
+
+        budget.flush_snapshot();
+        assert_eq!(
+            state.snapshot().charged_bytes,
+            256,
+            "the parked route must be charged while retained"
+        );
+
+        // Probe cycle: take the route apart and re-park it, carrying the ticket.
+        let (port, data, meta, ticket) = pending.into_parts();
+        let reparked = PendingRoute::from_retry_parts(port, data, meta, now, ticket);
+        budget.flush_snapshot();
+        assert_eq!(
+            state.snapshot().charged_bytes,
+            256,
+            "re-parking a still-full route must preserve the existing charge"
+        );
+
+        // Terminal path: take the route apart and release the ticket.
+        let (_port, _data, _meta, ticket) = reparked.into_parts();
+        drop(ticket);
+        budget.flush_snapshot();
+        assert_eq!(
+            state.snapshot().charged_bytes,
+            0,
+            "releasing a parked route (admit/nack/drain/drop) must refund the charge"
+        );
+    }
+
+    #[test]
+    fn parked_route_charge_degrades_without_rejecting_in_enforce_mode() {
+        // The router is a retained-work accounting site, not an admission point:
+        // under `enforce`, an over-budget charge yields no ticket and the caller
+        // still parks/handles the route.
+        let registry = otap_df_telemetry::registry::TelemetryRegistryHandle::new();
+        let controller_ctx = otap_df_engine::context::ControllerContext::new(registry);
+        let (_state, _budget, _guard) = install_test_budget(
+            controller_ctx.memory_budget_state(),
+            otap_df_engine::memory_budget::BudgetMode::Enforce,
+            16,
+        );
+
+        let ticket = current_runtime_memory_budget().and_then(|b| b.charge(SizedPayload(65_536)));
+        assert!(
+            ticket.is_none(),
+            "an over-budget enforce charge yields no ticket; the route still parks"
         );
     }
 }

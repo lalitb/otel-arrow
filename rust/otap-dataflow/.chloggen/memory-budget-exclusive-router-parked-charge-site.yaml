@@ -1,0 +1,4 @@
+change_type: enhancement
+component: pipeline
+note: "Charge backpressure-parked routes in the content router and signal-type router against the observe-only runtime memory budget, releasing on downstream admission, nack, shutdown drain, and drop."
+issues: []

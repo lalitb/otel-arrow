@@ -721,23 +721,30 @@ impl ContentRouter {
         // Re-probing happens only for messages the router still owns locally.
         // Already-admitted downstream work is intentionally out of scope here.
         for pending in due {
-            let (port, data, route_kind) = pending.into_parts();
+            let (port, data, route_kind, ticket) = pending.into_parts();
             let admission = effect_handler
                 .try_admit_message_with_source_node_to(port.clone(), data)
                 .map_err(EngineError::from)?;
 
             match admission {
                 RouteAdmission::Accepted => {
+                    // Admitted downstream: the route is no longer parked here, so
+                    // release its memory-budget charge.
+                    drop(ticket);
                     self.record_forwarded_route(route_kind);
                 }
                 RouteAdmission::RejectedClosed(data) => {
+                    // No longer parked: release the charge before nacking.
+                    drop(ticket);
                     self.emit_route_closed_nack(effect_handler, port.as_ref(), data)
                         .await?;
                 }
                 RouteAdmission::RejectedFull(data) => {
+                    // Still parked: carry the existing charge back into the
+                    // re-park so it is not double-counted or leaked.
                     self.admission
                         .repark_after_full(PendingRoute::from_retry_parts(
-                            port, data, route_kind, now,
+                            port, data, route_kind, now, ticket,
                         ));
                 }
             }
@@ -759,7 +766,10 @@ impl ContentRouter {
         reason: &str,
     ) -> Result<(), EngineError> {
         for pending in self.admission.drain_for_shutdown(effect_handler) {
-            let (port, data, _) = pending.into_parts();
+            // Drained: no longer parked, so release the charge before turning the
+            // message into a retryable nack.
+            let (port, data, _, ticket) = pending.into_parts();
+            drop(ticket);
             self.emit_shutdown_nack(effect_handler, port.as_ref(), data, reason)
                 .await?;
         }
@@ -2078,6 +2088,129 @@ mod tests {
                             nack_c.reason
                         );
                         assert!(!nack_c.permanent);
+                    })
+                });
+
+            validation.validate(|_| async {});
+        }
+
+        /// Installs an observe-only runtime memory budget on the current
+        /// (test) thread, mirroring the deployed-runtime wiring.
+        fn install_test_runtime_budget(
+            state: otap_df_engine::memory_budget::MemoryBudgetState,
+        ) -> (
+            otap_df_engine::memory_budget::MemoryBudgetState,
+            std::rc::Rc<otap_df_engine::memory_budget::RuntimeMemoryBudget>,
+            otap_df_engine::memory_budget::RuntimeMemoryBudgetGuard,
+        ) {
+            use otap_df_engine::memory_budget::{
+                BudgetMode, BudgetScopeId, MemoryBudgetEnforcement, MemoryBudgetSizing,
+                RuntimeMemoryBudget, RuntimeMemoryBudgetConfig, set_current_runtime_memory_budget,
+            };
+            state.configure(
+                RuntimeMemoryBudgetConfig {
+                    mode: BudgetMode::ObserveOnly,
+                    retry_after_secs: 1,
+                    sizing: MemoryBudgetSizing {
+                        reserve_bytes: 0,
+                        floor_per_runtime_bytes: 1,
+                        lease_step_bytes: 1,
+                        max_overshoot_per_runtime_bytes: 10_000_000,
+                        overshoot_debt_limit_bytes: 10,
+                        drain_allowance_bytes: 0,
+                    },
+                    topic_default_limit_bytes: 100,
+                    runtime_count: 1,
+                    enforcement: MemoryBudgetEnforcement::default(),
+                },
+                None,
+            );
+            let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+            let account = handle.local_account().expect("account should be available");
+            let budget = std::rc::Rc::new(RuntimeMemoryBudget::new(account));
+            let guard = set_current_runtime_memory_budget(Some(budget.clone()));
+            (state, budget, guard)
+        }
+
+        #[test]
+        fn test_parked_messages_charge_memory_budget_and_release_on_shutdown() {
+            // End-to-end: backpressure-parked routes charge the runtime memory
+            // budget while retained in router-local state, and shutdown draining
+            // (which nacks each parked message) releases every charge.
+            let test_runtime = TestRuntime::new();
+            let node_id = test_node(test_runtime.config().name.clone());
+            let config = make_policy_config(OnFullPolicy::Backpressure);
+            let user_cfg = Arc::new(NodeUserConfig::new_processor_config(CONTENT_ROUTER_URN));
+            let controller_ctx = otap_df_engine::context::ControllerContext::new(
+                otap_df_telemetry::registry::TelemetryRegistryHandle::new(),
+            );
+            let mut wrapper = ProcessorWrapper::local(
+                ContentRouter::new(config),
+                node_id.clone(),
+                user_cfg,
+                test_runtime.config(),
+            );
+
+            let (tx_a, _rx_a) = mpsc::Channel::new(1);
+            tx_a.send(logs_pdata("/sub/a"))
+                .expect("prefill should occupy tenant_a");
+            wrapper
+                .set_pdata_sender(
+                    node_id.clone(),
+                    "tenant_a".into(),
+                    Sender::Local(LocalSender::mpsc(tx_a)),
+                )
+                .expect("tenant_a sender should attach");
+
+            let (tx_c, _rx_c) = mpsc::Channel::new(1);
+            tx_c.send(logs_pdata("/sub/c"))
+                .expect("prefill should occupy the blocked route");
+            wrapper
+                .set_pdata_sender(
+                    node_id,
+                    "tenant_c".into(),
+                    Sender::Local(LocalSender::mpsc(tx_c)),
+                )
+                .expect("blocked route sender should attach");
+
+            let validation = test_runtime
+                .set_processor(wrapper)
+                .run_test(move |mut ctx| {
+                    Box::pin(async move {
+                        let (budget_state, budget, _budget_guard) =
+                            install_test_runtime_budget(controller_ctx.memory_budget_state());
+                        let (completion_tx, mut completion_rx) = pipeline_completion_msg_channel(4);
+                        ctx.set_pipeline_completion_sender(completion_tx);
+
+                        ctx.process(Message::PData(subscribed_logs_pdata("/sub/a", 94)))
+                            .await
+                            .expect("backpressure should park tenant_a");
+                        ctx.process(Message::PData(subscribed_logs_pdata("/sub/c", 94)))
+                            .await
+                            .expect("backpressure should park tenant_c");
+
+                        budget.flush_snapshot();
+                        assert!(
+                            budget_state.snapshot().charged_bytes > 0,
+                            "parked routes must charge the runtime memory budget while retained"
+                        );
+
+                        ctx.process(Message::Control(NodeControlMsg::Shutdown {
+                            deadline: Instant::now(),
+                            reason: "test shutdown".to_string(),
+                        }))
+                        .await
+                        .expect("shutdown should drain parked router state");
+
+                        let _ = expect_nack(&mut completion_rx, 94).await;
+                        let _ = expect_nack(&mut completion_rx, 94).await;
+
+                        budget.flush_snapshot();
+                        assert_eq!(
+                            budget_state.snapshot().charged_bytes,
+                            0,
+                            "shutdown drain must release every parked-route charge"
+                        );
                     })
                 });
 
