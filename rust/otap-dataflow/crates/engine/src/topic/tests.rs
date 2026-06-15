@@ -2389,8 +2389,44 @@ fn observe_only_budget_state() -> crate::memory_budget::MemoryBudgetState {
             },
             topic_default_limit_bytes: 1_000_000,
             runtime_count: 1,
+            enforcement: crate::memory_budget::MemoryBudgetEnforcement::default(),
         },
         None,
+    );
+    state
+}
+
+/// An enforce-mode budget state with the `queue_publish` gate enabled and a
+/// tight topic escrow cap, so an owned publish whose payload exceeds the cap is
+/// deterministically rejected at the publish boundary.
+fn enforce_queue_publish_budget_state(topic_limit: u64) -> crate::memory_budget::MemoryBudgetState {
+    use crate::memory_budget::{
+        BudgetMode, MemoryBudgetEnforcement, MemoryBudgetSizing, MemoryBudgetState,
+        RuntimeMemoryBudgetConfig,
+    };
+    let state = MemoryBudgetState::default();
+    state.configure(
+        RuntimeMemoryBudgetConfig {
+            mode: BudgetMode::Enforce,
+            retry_after_secs: 1,
+            sizing: MemoryBudgetSizing {
+                reserve_bytes: 0,
+                floor_per_runtime_bytes: 10_000,
+                lease_step_bytes: 1_000,
+                max_overshoot_per_runtime_bytes: 10_000,
+                overshoot_debt_limit_bytes: 1_000,
+                drain_allowance_bytes: 0,
+            },
+            topic_default_limit_bytes: topic_limit,
+            runtime_count: 1,
+            enforcement: MemoryBudgetEnforcement {
+                queue_publish: true,
+                receiver_admission: false,
+                reclaim_hooks: false,
+            },
+        },
+        // Give the pool ample headroom so the topic cap is the binding limit.
+        Some(10_000_000),
     );
     state
 }
@@ -2940,4 +2976,114 @@ async fn mixed_publish_owned_on_closed_topic_propagates_error_and_refunds() {
     );
     assert_eq!(snap.escrow_charged_bytes, 0, "no escrow minted on close");
     assert_eq!(snap.abandoned_escrow_count, 0, "no graveyard leak");
+}
+
+// =========================================================================
+// Memory-budget enforcement (opt-in queue_publish at owned topic publish)
+// =========================================================================
+
+/// With enforce mode and the `queue_publish` gate enabled, a balanced owned
+/// publish whose payload exceeds the topic escrow cap is rejected
+/// deterministically: it returns `DroppedOnFull` with the original local ticket
+/// (nothing committed, no escrow retained), so the producer keeps its charge.
+#[tokio::test]
+async fn enforce_balanced_publish_owned_over_escrow_cap_drops_on_full() {
+    use crate::memory_budget::BudgetScopeId;
+    use crate::topic::types::PublishOutcome;
+
+    // Topic escrow cap of 30 bytes; the publish charges 64 and must be refused.
+    let state = enforce_queue_publish_budget_state(30);
+    let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+    let account = handle.local_account().expect("budget configured");
+
+    let broker = TopicBroker::new();
+    let topic = broker
+        .create_in_memory_topic(
+            "enforce-escrow",
+            TopicOptions::BalancedOnly { capacity: 16 },
+        )
+        .unwrap();
+    let _sub = topic
+        .subscribe(
+            SubscriptionMode::Balanced {
+                group: SubscriptionGroupName::from("g1"),
+            },
+            SubscriberOptions::default(),
+        )
+        .unwrap();
+
+    let ticket = account
+        .charge(64_u64)
+        .expect("local charge fits within floor");
+    account.flush_snapshot();
+    assert_eq!(state.snapshot().charged_bytes, 64);
+
+    let (outcome, returned) = topic
+        .try_publish_owned(Arc::new(1_u64), ticket, &state)
+        .expect("publish should not error");
+    assert_eq!(
+        outcome,
+        PublishOutcome::DroppedOnFull,
+        "over-cap owned publish must be rejected under queue_publish enforcement"
+    );
+    let returned = returned.expect("original ticket returned when nothing committed");
+    assert_eq!(returned.bytes(), Some(64));
+
+    let snap = state.snapshot();
+    assert_eq!(
+        snap.escrow_charged_bytes, 0,
+        "no escrow committed on rejection"
+    );
+    assert_eq!(snap.abandoned_escrow_count, 0);
+
+    // The returned ticket still owns the producer charge.
+    account.flush_snapshot();
+    assert_eq!(state.snapshot().charged_bytes, 64);
+    drop(returned);
+    account.flush_snapshot();
+    assert_eq!(state.snapshot().charged_bytes, 0, "dropping refunds");
+}
+
+/// With enforce mode and `queue_publish` enabled, an owned publish that fits
+/// within the topic escrow cap still commits normally (enforcement rejects only
+/// over-budget publishes).
+#[tokio::test]
+async fn enforce_balanced_publish_owned_within_cap_commits() {
+    use crate::memory_budget::BudgetScopeId;
+    use crate::topic::types::PublishOutcome;
+
+    let state = enforce_queue_publish_budget_state(1_000);
+    let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+    let account = handle.local_account().expect("budget configured");
+
+    let broker = TopicBroker::new();
+    let topic = broker
+        .create_in_memory_topic(
+            "enforce-escrow-ok",
+            TopicOptions::BalancedOnly { capacity: 16 },
+        )
+        .unwrap();
+    let mut sub = topic
+        .subscribe(
+            SubscriptionMode::Balanced {
+                group: SubscriptionGroupName::from("g1"),
+            },
+            SubscriberOptions::default(),
+        )
+        .unwrap();
+
+    let ticket = account.charge(64_u64).expect("charge fits");
+    let (outcome, returned) = topic
+        .try_publish_owned(Arc::new(7_u64), ticket, &state)
+        .expect("publish should not error");
+    assert_eq!(outcome, PublishOutcome::Published);
+    assert!(returned.is_none(), "ownership transfers to escrow");
+    assert_eq!(state.snapshot().escrow_charged_bytes, 64);
+
+    // Delivery releases the escrow exactly once.
+    let item = sub.recv().await.expect("subscriber should receive");
+    assert!(matches!(item, RecvItem::Message(env) if *env.payload == 7));
+    let snap = state.snapshot();
+    assert_eq!(snap.escrow_charged_bytes, 0);
+    assert_eq!(snap.abandoned_escrow_count, 0);
 }

@@ -461,6 +461,7 @@ mod tests {
                 },
                 topic_default_limit_bytes: 100,
                 runtime_count: 1,
+                enforcement: crate::memory_budget::MemoryBudgetEnforcement::default(),
             },
             None,
         );

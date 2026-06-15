@@ -135,6 +135,28 @@ impl MemoryBudgetSizing {
     }
 }
 
+/// Per-path runtime enforcement gates carried into the engine.
+///
+/// Mirrors [`MemoryBudgetEnforcementPolicy`](otap_df_config::policy::MemoryBudgetEnforcementPolicy).
+/// When `mode == Enforce`, these flags select *which* admission points actually
+/// reject; they are all `false` in observe-only. In production builds config
+/// validation rejects enforce mode entirely unless the
+/// `unstable-memory-enforcement` feature is enabled, so enforcement is
+/// unreachable by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MemoryBudgetEnforcement {
+    /// Enforce receiver admission against runtime budget. Not wired into a
+    /// runtime admission point yet; carried for forward compatibility.
+    pub receiver_admission: bool,
+    /// Enforce queue/topic publish against escrow/topic-cap budget. Honored by
+    /// the owned topic-publish path ([`LocalMemoryTicket::try_into_escrow`] /
+    /// [`try_into_escrow_fanout`](LocalMemoryTicket::try_into_escrow_fanout)).
+    pub queue_publish: bool,
+    /// Enable reclaim hooks for retained-memory sources. Not wired into a
+    /// runtime driver yet; carried for forward compatibility.
+    pub reclaim_hooks: bool,
+}
+
 /// Runtime memory-budget configuration applied by the controller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeMemoryBudgetConfig {
@@ -148,6 +170,8 @@ pub struct RuntimeMemoryBudgetConfig {
     pub topic_default_limit_bytes: u64,
     /// Number of deployed runtime instances used for sizing.
     pub runtime_count: usize,
+    /// Per-path enforcement gates (only meaningful when `mode == Enforce`).
+    pub enforcement: MemoryBudgetEnforcement,
 }
 
 impl RuntimeMemoryBudgetConfig {
@@ -160,6 +184,11 @@ impl RuntimeMemoryBudgetConfig {
             sizing: MemoryBudgetSizing::from_policy(policy),
             topic_default_limit_bytes: policy.escrow.topic_default_limit,
             runtime_count: runtime_count.max(1),
+            enforcement: MemoryBudgetEnforcement {
+                receiver_admission: policy.enforcement.receiver_admission,
+                queue_publish: policy.enforcement.queue_publish,
+                reclaim_hooks: policy.enforcement.reclaim_hooks,
+            },
         }
     }
 }
@@ -508,7 +537,11 @@ impl MemoryBudgetState {
     /// Outcome of [`MemoryBudgetState::try_charge_escrow`].
     fn try_charge_escrow(&self, bytes: u64) -> Option<EscrowChargeAck> {
         let config = self.config()?;
-        let enforce = config.mode == BudgetMode::Enforce;
+        // The escrow boundary is the queue/topic publish admission point, so it
+        // only rejects when enforce mode is active AND the per-path
+        // `queue_publish` gate is enabled. With enforce mode but `queue_publish`
+        // off (or in observe-only) it records pressure without rejecting.
+        let enforce = config.mode == BudgetMode::Enforce && config.enforcement.queue_publish;
         // Step 1: bound the topic-level escrow occupancy (enforce only).
         if enforce {
             let limit = config.topic_default_limit_bytes;
@@ -2413,6 +2446,7 @@ mod tests {
                 },
                 topic_default_limit_bytes: 100,
                 runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement::default(),
             },
             None,
         );
@@ -2465,6 +2499,7 @@ mod tests {
                 },
                 topic_default_limit_bytes: 100,
                 runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement::default(),
             },
             None,
         );
@@ -2501,6 +2536,7 @@ mod tests {
                 },
                 topic_default_limit_bytes: 1_000,
                 runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement::default(),
             },
             None,
         );
@@ -2573,6 +2609,7 @@ mod tests {
                 },
                 topic_default_limit_bytes: 100,
                 runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement::default(),
             },
             None,
         );
@@ -2610,6 +2647,11 @@ mod tests {
                 },
                 topic_default_limit_bytes: 10,
                 runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement {
+                    queue_publish: true,
+                    receiver_admission: false,
+                    reclaim_hooks: false,
+                },
             },
             None,
         );
@@ -2641,6 +2683,7 @@ mod tests {
                 },
                 topic_default_limit_bytes: 10,
                 runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement::default(),
             },
             None,
         );
@@ -2672,6 +2715,11 @@ mod tests {
                 },
                 topic_default_limit_bytes: 60,
                 runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement {
+                    queue_publish: true,
+                    receiver_admission: false,
+                    reclaim_hooks: false,
+                },
             },
             // Provide enough process headroom (floor 100 + 100 spare) so the
             // global pool can back the first escrow's transfer charge. The
@@ -2713,6 +2761,7 @@ mod tests {
                 },
                 topic_default_limit_bytes: 100,
                 runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement::default(),
             },
             None,
         );
@@ -2752,6 +2801,7 @@ mod tests {
                 },
                 topic_default_limit_bytes: 200,
                 runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement::default(),
             },
             Some(200),
         );
@@ -2822,6 +2872,11 @@ mod tests {
                 },
                 topic_default_limit_bytes: 200,
                 runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement {
+                    queue_publish: true,
+                    receiver_admission: false,
+                    reclaim_hooks: false,
+                },
             },
             // No process headroom: pool is empty after subtracting the floor.
             Some(100),
@@ -2840,6 +2895,54 @@ mod tests {
         assert_eq!(snap.escrow_pool_held_bytes, 0);
         assert_eq!(snap.escrow_pool_overshoot_bytes, 0);
         assert_eq!(snap.escrow_ticket_count, 0);
+    }
+
+    /// Enforce mode with the `queue_publish` gate disabled does NOT reject escrow
+    /// at the topic/queue publish boundary: it records pressure (unbacked
+    /// overshoot) exactly like observe-only. This proves the per-path gate, not
+    /// just `mode`, drives publish-boundary enforcement.
+    #[test]
+    fn enforce_without_queue_publish_records_pressure_instead_of_rejecting() {
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::Enforce,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 100,
+                    lease_step_bytes: 10,
+                    max_overshoot_per_runtime_bytes: 20,
+                    overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
+                },
+                // Cap below the charge so enforce-mode WOULD reject if the
+                // queue_publish gate were honored on `mode` alone.
+                topic_default_limit_bytes: 10,
+                runtime_count: 1,
+                // queue_publish disabled: the publish boundary must not reject.
+                enforcement: MemoryBudgetEnforcement::default(),
+            },
+            Some(100),
+        );
+        assert_eq!(state.inner.pool.available_bytes(), 0);
+        let acct = account(100, 10, 20, 100);
+        let ticket = acct.charge(40_u64).expect("local charge fits within floor");
+
+        let escrow = ticket
+            .try_into_escrow(&state)
+            .expect("queue_publish disabled must not reject escrow at the boundary");
+
+        let snap = state.snapshot();
+        assert_eq!(
+            snap.escrow_charged_bytes, 40,
+            "escrow is recorded even though enforce mode is set"
+        );
+        assert_eq!(
+            snap.escrow_pool_overshoot_bytes, 40,
+            "unbacked escrow surfaces as projected pressure, not a rejection"
+        );
+        escrow.release();
     }
 
     /// Observe-only escrow creation that exceeds global capacity still
@@ -2863,6 +2966,7 @@ mod tests {
                 },
                 topic_default_limit_bytes: 200,
                 runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement::default(),
             },
             // No process headroom: pool is empty after subtracting the floor.
             Some(100),
@@ -2911,6 +3015,7 @@ mod tests {
                 },
                 topic_default_limit_bytes: 1_000_000,
                 runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement::default(),
             },
             None,
         );
@@ -2967,6 +3072,11 @@ mod tests {
                 // Topic cap is generous so the global pool is the binding limit.
                 topic_default_limit_bytes: 1_000,
                 runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement {
+                    queue_publish: true,
+                    receiver_admission: false,
+                    reclaim_hooks: false,
+                },
             },
             // Spare pool room for exactly one 50-byte owner: 150 - 0 - 100 = 50.
             Some(150),
@@ -3018,6 +3128,7 @@ mod tests {
                 },
                 topic_default_limit_bytes: 1_000_000,
                 runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement::default(),
             },
             None,
         );
@@ -3048,6 +3159,7 @@ mod tests {
                 },
                 topic_default_limit_bytes: 1_000_000,
                 runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement::default(),
             },
             None,
         );
@@ -3131,6 +3243,11 @@ mod tests {
                 },
                 topic_default_limit_bytes: 1_000,
                 runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement {
+                    queue_publish: true,
+                    receiver_admission: false,
+                    reclaim_hooks: false,
+                },
             },
             // No process headroom: the escrow pool is empty after the floor.
             Some(100),
@@ -3201,6 +3318,7 @@ mod tests {
                 },
                 topic_default_limit_bytes: 100,
                 runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement::default(),
             },
             None,
         );
@@ -3468,6 +3586,7 @@ mod tests {
                 },
                 topic_default_limit_bytes: 1_000,
                 runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement::default(),
             },
             None,
         );
@@ -3864,6 +3983,7 @@ mod tests {
                 },
                 topic_default_limit_bytes: 100,
                 runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement::default(),
             },
             None,
         );

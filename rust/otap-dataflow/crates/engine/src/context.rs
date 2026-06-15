@@ -888,6 +888,7 @@ mod tests {
                 },
                 topic_default_limit_bytes: 1_024,
                 runtime_count: 1,
+                enforcement: crate::memory_budget::MemoryBudgetEnforcement::default(),
             },
             None,
         );

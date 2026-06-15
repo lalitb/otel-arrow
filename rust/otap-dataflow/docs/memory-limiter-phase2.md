@@ -1403,8 +1403,16 @@ Validation:
   `unstable-memory-enforcement` feature. Production builds do not enable that
   feature, so enforcement cannot be reached accidentally from normal config; it
   is a compile-time opt-in for tests and experimental builds. The default
-  remains `observe_only`. Runtime budget accounts honor `enforce` mode whenever
-  they are configured with it, so the gate lives entirely in config validation.
+  remains `observe_only`.
+- The only enforcement path wired so far is `enforcement.queue_publish` at the
+  owned topic-publish boundary: with `mode = enforce` and `queue_publish: true`,
+  an owned publish whose payload exceeds the topic escrow cap or the global
+  spare pool is rejected and returns the original local ticket
+  (`DroppedOnFull`), committing nothing. `enforcement.receiver_admission` and
+  `enforcement.reclaim_hooks` are carried into the runtime config but are not yet
+  wired to any admission point or reclaim driver; setting them changes no runtime
+  behavior today. Observe-only (and `mode = enforce` with `queue_publish: false`)
+  records escrow/pool pressure without rejecting.
 - `reserve` must be smaller than the process hard limit when a hard limit is
   known.
 - `runtime_count` is the total resolved runtime instances in the process.

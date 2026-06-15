@@ -1590,6 +1590,7 @@ mod ring_close_race_tests {
                 },
                 topic_default_limit_bytes: 1_000_000,
                 runtime_count: 1,
+                enforcement: crate::memory_budget::MemoryBudgetEnforcement::default(),
             },
             None,
         );
@@ -1722,7 +1723,10 @@ mod ring_close_race_tests {
 
         // Simulate close racing in after the entry check: close only the ring.
         topic.broadcast_ring.close();
-        assert!(!topic.closed.load(Ordering::Relaxed), "topic entry stays open");
+        assert!(
+            !topic.closed.load(Ordering::Relaxed),
+            "topic entry stays open"
+        );
 
         let ticket = account.charge(30_u64).expect("charge fits");
         let result = topic.try_publish_owned(Arc::new(1_u64), ticket, &state);
@@ -1747,7 +1751,10 @@ mod ring_close_race_tests {
         drop(sub);
         drop(topic);
         let snap = state.snapshot();
-        assert_eq!(snap.escrow_charged_bytes, 0, "all owners released on teardown");
+        assert_eq!(
+            snap.escrow_charged_bytes, 0,
+            "all owners released on teardown"
+        );
         assert_eq!(snap.abandoned_escrow_count, 0);
     }
 

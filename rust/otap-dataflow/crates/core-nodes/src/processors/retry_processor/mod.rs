@@ -882,6 +882,7 @@ mod test {
                 },
                 topic_default_limit_bytes: 100,
                 runtime_count: 1,
+                enforcement: otap_df_engine::memory_budget::MemoryBudgetEnforcement::default(),
             },
             None,
         );
