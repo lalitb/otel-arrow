@@ -1948,6 +1948,120 @@ impl<T> LocalEnvelope<T> {
     pub fn replace_payload(&mut self, payload: T) -> T {
         std::mem::replace(&mut self.payload, payload)
     }
+
+    /// Converts this local-owned envelope into a sendable shared-owned envelope
+    /// by moving its ticket into escrow ownership.
+    ///
+    /// Use this when retained work crosses from a local (`!Send`) context into a
+    /// shared channel or shared node that must hold the charge across threads.
+    /// The resulting [`SharedEnvelope`] is `Send` and holds only an
+    /// [`EscrowSlot`], so a `!Send` [`LocalMemoryTicket`] can never cross the
+    /// shared boundary inside it by construction.
+    ///
+    /// - No ticket (budgeting disabled / uncharged): the payload moves into an
+    ///   owner-less shared envelope.
+    /// - Ticket present and escrow accepts: the charge transfers to escrow
+    ///   exactly once (the producer local charge is refunded by the transfer).
+    /// - Escrow refused (enforce-mode cap, exhausted pool, or a
+    ///   non-transferable drain/unknown ticket): the original [`LocalEnvelope`]
+    ///   is returned unchanged so the caller keeps the local charge.
+    pub fn into_shared(
+        self,
+        state: &MemoryBudgetState,
+    ) -> Result<SharedEnvelope<T>, LocalEnvelope<T>> {
+        let (payload, ticket) = self.into_parts();
+        match ticket {
+            None => Ok(SharedEnvelope::without_owner(payload)),
+            Some(ticket) => match ticket.try_into_escrow(state) {
+                Ok(escrow) => Ok(SharedEnvelope::new(payload, EscrowSlot::new(escrow))),
+                Err(ticket) => Err(LocalEnvelope::new(payload, ticket)),
+            },
+        }
+    }
+}
+
+/// Pairs a retained payload with a sendable escrow owner for shared-channel and
+/// shared-node retention.
+///
+/// Unlike [`LocalEnvelope<T>`] — which is `!Send` because it can hold a `!Send`
+/// [`LocalMemoryTicket`] — `SharedEnvelope<T>` holds only an [`EscrowSlot`]
+/// (which owns a `Send` [`EscrowTicket`]). It is therefore `Send` whenever `T`
+/// is `Send`, and a local ticket can never enter a shared boundary inside it by
+/// construction: the only way to obtain a charged `SharedEnvelope` is to mint
+/// an escrow owner, which already left the producer runtime generation.
+///
+/// The shared retained charge is charged exactly once when the owner is created
+/// (via [`LocalEnvelope::into_shared`] or an explicit escrow owner) and released
+/// exactly once when the envelope is dropped or split with
+/// [`into_parts`](Self::into_parts). Like [`LocalEnvelope`], the owner is
+/// optional so the same type works when memory budgeting is disabled.
+#[derive(Debug)]
+pub struct SharedEnvelope<T> {
+    payload: T,
+    // Owns the shared retained escrow charge. Dropping the envelope drops this
+    // slot, releasing the charge exactly once via EscrowSlot's Drop. Empty when
+    // budgeting is disabled or the payload is uncharged.
+    escrow: EscrowSlot,
+}
+
+impl<T> SharedEnvelope<T> {
+    /// Creates a shared envelope pairing `payload` with its sendable escrow
+    /// owner.
+    #[must_use]
+    pub fn new(payload: T, escrow: EscrowSlot) -> Self {
+        Self { payload, escrow }
+    }
+
+    /// Creates a shared envelope with no owner, for when memory budgeting is
+    /// disabled or the payload is not charged.
+    #[must_use]
+    pub fn without_owner(payload: T) -> Self {
+        Self {
+            payload,
+            escrow: EscrowSlot::empty(),
+        }
+    }
+
+    /// Returns a shared reference to the retained payload.
+    #[must_use]
+    pub fn payload(&self) -> &T {
+        &self.payload
+    }
+
+    /// Returns a mutable reference to the retained payload.
+    pub fn payload_mut(&mut self) -> &mut T {
+        &mut self.payload
+    }
+
+    /// Returns whether this envelope owns an escrow charge.
+    #[must_use]
+    pub fn has_owner(&self) -> bool {
+        self.escrow.is_some()
+    }
+
+    /// Returns the escrow bytes owned by this envelope, if any.
+    #[must_use]
+    pub fn owner_bytes(&self) -> Option<u64> {
+        self.escrow.bytes()
+    }
+
+    /// Consumes the envelope, returning the payload and releasing the escrow
+    /// owner exactly once.
+    #[must_use]
+    pub fn into_payload(self) -> T {
+        // The escrow slot field drops here, releasing the charge exactly once.
+        self.payload
+    }
+
+    /// Splits the envelope into its payload and escrow owner.
+    ///
+    /// Ownership of the escrow transfers to the caller via the returned
+    /// [`EscrowSlot`], who becomes responsible for resolving it (redeem on
+    /// delivery, release on eviction, or drop for a clean release).
+    #[must_use]
+    pub fn into_parts(self) -> (T, EscrowSlot) {
+        (self.payload, self.escrow)
+    }
 }
 
 /// Logical retained-size contract for memory budgeting.
@@ -2192,6 +2306,10 @@ mod tests {
     // A LocalEnvelope can hold a !Send LocalMemoryTicket, so it must not be
     // Send/Sync regardless of payload sendability.
     assert_not_impl_any!(LocalEnvelope<u64>: Send, Sync);
+    // A SharedEnvelope holds only a Send EscrowSlot owner, never a local
+    // ticket, so it is Send whenever its payload is Send. This is the
+    // type-level guarantee that a local ticket cannot enter a shared boundary.
+    assert_impl_all!(SharedEnvelope<u64>: Send);
     // EscrowTicket is the sendable owner used at shared/runtime boundaries.
     assert_impl_all!(EscrowTicket: Send, Sync);
     // The interned attribution handle travels with escrow, so it must be
@@ -2912,6 +3030,146 @@ mod tests {
             .expect_err("zero-count fanout must return the ticket unchanged");
         assert_eq!(returned.bytes(), Some(20));
         assert_eq!(state.snapshot().escrow_charged_bytes, 0);
+    }
+
+    fn shared_owner_state() -> MemoryBudgetState {
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 1_000,
+                    lease_step_bytes: 100,
+                    max_overshoot_per_runtime_bytes: 1_000,
+                    overshoot_debt_limit_bytes: 100,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: 1_000_000,
+                runtime_count: 1,
+            },
+            None,
+        );
+        state
+    }
+
+    /// Converting a local envelope into a shared envelope moves the charge into
+    /// a sendable escrow owner exactly once (producer refunded), keeps it
+    /// charged while the shared envelope is held, and releases it exactly once
+    /// on drop without recording a leak.
+    #[test]
+    fn local_envelope_into_shared_transfers_then_releases_once() {
+        let state = shared_owner_state();
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let acct = handle.local_account().expect("account");
+
+        let ticket = acct.charge(40_u64).expect("charge fits");
+        acct.flush_snapshot();
+        assert_eq!(state.snapshot().charged_bytes, 40);
+
+        let local = LocalEnvelope::new(7_u64, ticket);
+        let shared = local
+            .into_shared(&state)
+            .expect("observe-only conversion always succeeds");
+        assert!(shared.has_owner());
+        assert_eq!(shared.owner_bytes(), Some(40));
+        assert_eq!(*shared.payload(), 7);
+
+        // The shared owner holds the charge; the producer was refunded.
+        acct.flush_snapshot();
+        let snap = state.snapshot();
+        assert_eq!(snap.charged_bytes, 0, "producer refunded by the transfer");
+        assert_eq!(
+            snap.escrow_charged_bytes, 40,
+            "shared owner holds the charge"
+        );
+
+        // Dropping the shared envelope releases the escrow exactly once.
+        drop(shared);
+        let snap = state.snapshot();
+        assert_eq!(
+            snap.escrow_charged_bytes, 0,
+            "drop releases the shared owner"
+        );
+        assert_eq!(
+            snap.abandoned_escrow_count, 0,
+            "clean drop must not record an abandoned-escrow leak"
+        );
+    }
+
+    /// An owner-less (budget-disabled / uncharged) local envelope converts into
+    /// an owner-less shared envelope that carries no charge.
+    #[test]
+    fn local_envelope_without_ticket_into_shared_has_no_owner() {
+        let state = shared_owner_state();
+        let local = LocalEnvelope::without_ticket(9_u64);
+        let shared = local.into_shared(&state).expect("no-ticket conversion");
+        assert!(!shared.has_owner());
+        assert_eq!(shared.owner_bytes(), None);
+        assert_eq!(shared.into_payload(), 9);
+        assert_eq!(state.snapshot().escrow_charged_bytes, 0);
+    }
+
+    /// When escrow is refused (enforce-mode pool exhausted), `into_shared`
+    /// returns the original local envelope unchanged so the caller keeps the
+    /// local charge.
+    #[test]
+    fn local_envelope_into_shared_returns_original_on_escrow_refusal() {
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::Enforce,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 100,
+                    lease_step_bytes: 10,
+                    max_overshoot_per_runtime_bytes: 20,
+                    overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: 1_000,
+                runtime_count: 1,
+            },
+            // No process headroom: the escrow pool is empty after the floor.
+            Some(100),
+        );
+        assert_eq!(state.inner.pool.available_bytes(), 0);
+        let acct = account_with_mode(BudgetMode::Enforce, 100, 10, 20, 100);
+        let ticket = acct.charge(40_u64).expect("local charge fits within floor");
+
+        let local = LocalEnvelope::new(3_u64, ticket);
+        let returned = local
+            .into_shared(&state)
+            .expect_err("escrow refusal must return the original local envelope");
+        assert!(returned.has_ticket(), "local charge preserved on refusal");
+        assert_eq!(returned.ticket().and_then(|t| t.bytes()), Some(40));
+        assert_eq!(state.snapshot().escrow_charged_bytes, 0);
+    }
+
+    /// Splitting a shared envelope hands the escrow owner to the caller, who can
+    /// resolve it explicitly (clean release, no graveyard entry).
+    #[test]
+    fn shared_envelope_into_parts_hands_off_owner() {
+        let state = shared_owner_state();
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let acct = handle.local_account().expect("account");
+        let ticket = acct.charge(25_u64).expect("charge fits");
+
+        let shared = LocalEnvelope::new(1_u64, ticket)
+            .into_shared(&state)
+            .expect("conversion succeeds");
+        let (payload, mut slot) = shared.into_parts();
+        assert_eq!(payload, 1);
+        assert_eq!(state.snapshot().escrow_charged_bytes, 25);
+
+        // The caller now owns the escrow and resolves it explicitly.
+        let escrow = slot.take().expect("owner present");
+        escrow.release();
+        let snap = state.snapshot();
+        assert_eq!(snap.escrow_charged_bytes, 0);
+        assert_eq!(snap.abandoned_escrow_count, 0);
     }
 
     #[test]

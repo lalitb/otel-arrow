@@ -2732,7 +2732,10 @@ async fn broadcast_publish_owned_releases_evicted_slot_escrow_on_overwrite() {
 
     topic.close();
     let snap = state.snapshot();
-    assert_eq!(snap.escrow_charged_bytes, 0, "close releases retained slots");
+    assert_eq!(
+        snap.escrow_charged_bytes, 0,
+        "close releases retained slots"
+    );
     assert_eq!(snap.abandoned_escrow_count, 0);
 }
 
@@ -2783,7 +2786,10 @@ async fn mixed_publish_owned_commits_all_owners_then_releases() {
         .try_publish_owned(Arc::new(5_u64), ticket, &state)
         .expect("publish should not error");
     assert_eq!(outcome, PublishOutcome::Published);
-    assert!(returned.is_none(), "all owners committed, no ticket returned");
+    assert!(
+        returned.is_none(),
+        "all owners committed, no ticket returned"
+    );
 
     // One balanced group + one broadcast ring slot = two retained owners.
     assert_eq!(state.snapshot().escrow_charged_bytes, 60);
@@ -2791,7 +2797,10 @@ async fn mixed_publish_owned_commits_all_owners_then_releases() {
     assert_eq!(state.snapshot().charged_bytes, 0);
 
     // Balanced delivery drops the queued item, releasing its owner only.
-    let m = bsub.recv().await.expect("balanced subscriber should receive");
+    let m = bsub
+        .recv()
+        .await
+        .expect("balanced subscriber should receive");
     assert!(matches!(m, RecvItem::Message(env) if *env.payload == 5));
     assert_eq!(
         state.snapshot().escrow_charged_bytes,
@@ -2800,7 +2809,10 @@ async fn mixed_publish_owned_commits_all_owners_then_releases() {
     );
 
     // Broadcast receipt does not release the ring-slot owner.
-    let mb = bcast.recv().await.expect("broadcast subscriber should receive");
+    let mb = bcast
+        .recv()
+        .await
+        .expect("broadcast subscriber should receive");
     assert!(matches!(mb, RecvItem::Message(env) if *env.payload == 5));
     assert_eq!(state.snapshot().escrow_charged_bytes, 30);
 

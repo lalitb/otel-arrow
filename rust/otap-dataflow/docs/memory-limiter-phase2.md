@@ -1668,12 +1668,24 @@ owns the escrow. On a failed send, the original owner is returned: you keep the
 local ticket (or escrow) and can retry or drop. Never send a `LocalMemoryTicket`
 across a shared boundary.
 
+For retained work that moves from a local (`!Send`) context into a shared
+channel or shared node, prefer `LocalEnvelope::into_shared`. It converts the
+local ticket into a sendable `SharedEnvelope<T>` that holds only an
+`EscrowSlot`. `SharedEnvelope<T>` is `Send` whenever `T` is `Send`, so a local
+ticket cannot enter a shared boundary inside it by construction; the shared
+charge is held until the envelope is dropped (clean RAII release) or split with
+`into_parts` to hand the `EscrowSlot` to the boundary. Topic publishers do not
+call this directly: `try_publish_owned` performs the equivalent conversion at
+the broker boundary (point-to-point escrow for balanced, ring-slot escrow for
+broadcast, and an all-or-nothing fanout of one owner per retained destination
+for mixed).
+
 ### How to release, drop, drain, or abort
 
 Release is RAII. Dropping a `LocalMemoryTicket`, `EscrowTicket`, `EscrowSlot`,
-or `LocalEnvelope` refunds the charge exactly once. Use the explicit
-`EscrowTicket::{redeem, redeem_into, release, abort}` methods to make the
-release cause clear at boundaries. The hard rule: **release, drop, drain,
+`LocalEnvelope`, or `SharedEnvelope` refunds the charge exactly once. Use the
+explicit `EscrowTicket::{redeem, redeem_into, release, abort}` methods to make
+the release cause clear at boundaries. The hard rule: **release, drop, drain,
 abort, and reclaim must never acquire budget.** A consumer pinned to local
 `Hard` may still redeem already-admitted escrow through the per-runtime drain
 allowance (`try_charge_for_drain`); that path charges the bytes but does not
@@ -1694,8 +1706,10 @@ explicit and observable; do not guess a size.
 - Do not clone rich attribution or `String`s per retained item; attribution is
   interned once per runtime and carried by the account `Rc` (local) or the
   cheap `Arc` scope handle (escrow).
-- Do not enable enforcement: it stays gated until ownership, escrow, and
-  reclaim are complete for the boundaries your component uses.
+- Do not enable enforcement in production: it is gated behind the
+  `unstable-memory-enforcement` build feature (off by default) and rejected by
+  config validation in normal builds. Use it only for tests and experiments
+  where the ownership and escrow paths your component touches are complete.
 
 ## Live Reconfiguration
 

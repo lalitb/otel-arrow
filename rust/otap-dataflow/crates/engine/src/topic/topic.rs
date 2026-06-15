@@ -1085,12 +1085,9 @@ impl<T: Send + Sync + 'static> MixedTopic<T> {
                 tracked: false,
                 payload: Arc::clone(&msg),
             };
-            if let Err(err) = send_queued_envelope(
-                &group.tx,
-                envelope,
-                EscrowSlot::new(owner),
-                permit,
-            ) {
+            if let Err(err) =
+                send_queued_envelope(&group.tx, envelope, EscrowSlot::new(owner), permit)
+            {
                 // Close race during commit: the failed send already released
                 // its own escrow via the dropped EscrowSlot, and previously
                 // sent items are owned by their queues (released on drain or
