@@ -183,22 +183,51 @@ impl<T: Send + Sync + 'static> FastBroadcastRing<T> {
     }
 
     pub(crate) fn publish(&self, envelope: Envelope<T>) {
-        self.publish_with_escrow(envelope, EscrowSlot::empty());
+        // Non-owned publish carries no escrow, so a close race cannot leak a
+        // charge; ignore the close-aware result and preserve the prior
+        // infallible behavior for the uncharged path.
+        let _ = self.publish_with_escrow(envelope, EscrowSlot::empty());
     }
 
-    /// Publish a payload that carries ring-slot escrow ownership.
+    /// Publish a payload that may carry ring-slot escrow ownership.
     ///
     /// Overwriting the target slot drops the previous occupant, releasing its
     /// ring-slot escrow exactly once (ring overwrite / drop-oldest eviction).
-    pub(crate) fn publish_with_escrow(&self, envelope: Envelope<T>, escrow: EscrowSlot) {
+    ///
+    /// Close-aware: the `closed` flag is re-checked while the target slot lock
+    /// is held. Because [`close`](Self::close) takes every slot lock while it
+    /// clears escrow, this serializes install-versus-close per slot. Either we
+    /// install before `close` reaches this slot (then `close` releases the
+    /// escrow), or we observe `closed` and refuse to install (then dropping
+    /// `escrow` here releases it cleanly via RAII, never via the abandoned
+    /// graveyard). In both cases the escrow is released exactly once. On refusal
+    /// the call returns [`Error::TopicClosed`] so owned publishers surface the
+    /// close instead of a false `Published`.
+    pub(crate) fn publish_with_escrow(
+        &self,
+        envelope: Envelope<T>,
+        escrow: EscrowSlot,
+    ) -> Result<(), Error> {
         let seq = self.write_seq.fetch_add(1, Ordering::Release) + 1;
         let idx = ((seq - 1) as usize) & self.mask;
-        *self.slots[idx].lock() = Some(BroadcastSlot {
+        let mut slot = self.slots[idx].lock();
+        if self.closed.load(Ordering::Acquire) {
+            // Topic closed (possibly racing this publish): do not install into a
+            // closed ring. Releasing the slot lock and dropping `escrow` cleans
+            // up the charge exactly once. The consumed `seq` leaves an empty
+            // slot, which is harmless on a closing ring.
+            drop(slot);
+            drop(escrow);
+            return Err(TopicClosed);
+        }
+        *slot = Some(BroadcastSlot {
             seq,
             envelope,
             _escrow: escrow,
         });
+        drop(slot);
         self.waker_set.wake_all();
+        Ok(())
     }
 
     pub(crate) fn try_read(&self, read_seq: u64) -> BroadcastReadResult<T> {
@@ -761,6 +790,8 @@ impl<T: Send + Sync + 'static> BroadcastOnlyTopic<T> {
     ///   pool exhausted, or a non-transferable drain/unknown ticket): returns
     ///   `Ok((DroppedOnFull, Some(ticket)))` with the original local ticket so
     ///   the caller keeps the charge.
+    /// - close races the ring install: the ring releases the minted escrow
+    ///   cleanly and `Err(TopicClosed)` is surfaced (not a false `Published`).
     fn try_publish_owned(
         &self,
         msg: Arc<T>,
@@ -775,6 +806,9 @@ impl<T: Send + Sync + 'static> BroadcastOnlyTopic<T> {
             Ok(escrow) => escrow,
             Err(ticket) => return Ok((PublishOutcome::DroppedOnFull, Some(ticket))),
         };
+        // On a close race the ring releases the minted escrow exactly once and
+        // returns TopicClosed, which we propagate. The producer's original local
+        // ticket was already consumed (refunded) by try_into_escrow.
         self.broadcast_ring.publish_with_escrow(
             Envelope {
                 id,
@@ -782,7 +816,7 @@ impl<T: Send + Sync + 'static> BroadcastOnlyTopic<T> {
                 payload: msg,
             },
             EscrowSlot::new(escrow),
-        );
+        )?;
         Ok((PublishOutcome::Published, None))
     }
 
@@ -1097,6 +1131,11 @@ impl<T: Send + Sync + 'static> MixedTopic<T> {
                 return Err(err);
             }
         }
+        // Phase 2 commit: the broadcast ring slot is installed last and is
+        // close-aware. On a close race it releases the broadcast owner cleanly
+        // and returns TopicClosed. Any balanced items already sent are owned by
+        // their queues and released on drain/close, so no owner leaks; we
+        // surface the close to the caller.
         self.broadcast_ring.publish_with_escrow(
             Envelope {
                 id,
@@ -1104,7 +1143,7 @@ impl<T: Send + Sync + 'static> MixedTopic<T> {
                 payload: msg,
             },
             EscrowSlot::new(broadcast_owner),
-        );
+        )?;
         Ok((PublishOutcome::Published, None))
     }
 
@@ -1517,6 +1556,255 @@ impl AckState {
             Ok(())
         } else {
             Err(MessageNotTracked)
+        }
+    }
+}
+
+#[cfg(test)]
+mod ring_close_race_tests {
+    //! Deterministic tests for the close-aware broadcast ring owned-publish
+    //! path. These live in the same module as `FastBroadcastRing` so they can
+    //! drive its private constructor and exercise the under-lock `closed` check
+    //! directly, which the public topic API cannot reach without a true thread
+    //! race (covered separately by a topic-level stress test).
+
+    use super::*;
+    use crate::memory_budget::{
+        BudgetMode, BudgetScopeId, EscrowSlot, MemoryBudgetSizing, MemoryBudgetState,
+        RuntimeMemoryBudgetConfig,
+    };
+
+    fn observe_only_state() -> MemoryBudgetState {
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 10_000,
+                    lease_step_bytes: 1_000,
+                    max_overshoot_per_runtime_bytes: 10_000,
+                    overshoot_debt_limit_bytes: 1_000,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: 1_000_000,
+                runtime_count: 1,
+            },
+            None,
+        );
+        state
+    }
+
+    fn escrow_slot(state: &MemoryBudgetState, bytes: u64) -> EscrowSlot {
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let account = handle.local_account().expect("account");
+        let ticket = account.charge(bytes).expect("charge fits");
+        let escrow = ticket.try_into_escrow(state).expect("observe-only escrow");
+        EscrowSlot::new(escrow)
+    }
+
+    /// Publishing an owned payload into an already-closed ring refuses to
+    /// install, returns `TopicClosed`, and releases the minted escrow exactly
+    /// once (clean release, not the abandoned graveyard).
+    #[test]
+    fn publish_with_escrow_into_closed_ring_releases_and_errors() {
+        let state = observe_only_state();
+        let ring: FastBroadcastRing<u64> = FastBroadcastRing::new(8);
+        ring.close();
+
+        let slot = escrow_slot(&state, 64);
+        assert_eq!(state.snapshot().escrow_charged_bytes, 64);
+
+        let result = ring.publish_with_escrow(
+            Envelope {
+                id: 1,
+                tracked: false,
+                payload: Arc::new(7_u64),
+            },
+            slot,
+        );
+        assert!(matches!(result, Err(TopicClosed)));
+
+        let snap = state.snapshot();
+        assert_eq!(
+            snap.escrow_charged_bytes, 0,
+            "refused install must release the minted escrow exactly once"
+        );
+        assert_eq!(
+            snap.abandoned_escrow_count, 0,
+            "clean close-race cleanup must not record an abandoned-escrow leak"
+        );
+    }
+
+    /// A successful owned publish followed by close releases the retained ring
+    /// slot escrow exactly once.
+    #[test]
+    fn publish_then_close_releases_slot_once() {
+        let state = observe_only_state();
+        let ring: FastBroadcastRing<u64> = FastBroadcastRing::new(8);
+
+        let slot = escrow_slot(&state, 50);
+        ring.publish_with_escrow(
+            Envelope {
+                id: 1,
+                tracked: false,
+                payload: Arc::new(1_u64),
+            },
+            slot,
+        )
+        .expect("open ring accepts the publish");
+        assert_eq!(state.snapshot().escrow_charged_bytes, 50);
+
+        ring.close();
+        let snap = state.snapshot();
+        assert_eq!(snap.escrow_charged_bytes, 0, "close releases the slot once");
+        assert_eq!(snap.abandoned_escrow_count, 0);
+
+        // Dropping the ring afterwards must not double-release.
+        drop(ring);
+        assert_eq!(state.snapshot().escrow_charged_bytes, 0);
+        assert_eq!(state.snapshot().abandoned_escrow_count, 0);
+    }
+
+    /// Overwriting a full ring releases the evicted slot escrow exactly once.
+    #[test]
+    fn overwrite_releases_evicted_slot_once() {
+        let state = observe_only_state();
+        // Capacity rounds to 2 slots.
+        let ring: FastBroadcastRing<u64> = FastBroadcastRing::new(2);
+
+        for i in 0..3u64 {
+            let slot = escrow_slot(&state, 10);
+            ring.publish_with_escrow(
+                Envelope {
+                    id: i + 1,
+                    tracked: false,
+                    payload: Arc::new(i),
+                },
+                slot,
+            )
+            .expect("open ring accepts the publish");
+        }
+        // Three publishes into two slots: one slot was overwritten and released.
+        let snap = state.snapshot();
+        assert_eq!(snap.escrow_charged_bytes, 20, "two retained owners remain");
+        assert_eq!(snap.abandoned_escrow_count, 0);
+
+        ring.close();
+        assert_eq!(state.snapshot().escrow_charged_bytes, 0);
+        assert_eq!(state.snapshot().abandoned_escrow_count, 0);
+    }
+
+    /// A mixed owned publish whose broadcast ring is closed mid-commit (after
+    /// the topic entry check passed) surfaces `TopicClosed`, releases the
+    /// broadcast owner inline, and leaves the already-committed balanced owner
+    /// owned by its queue (released on drain), with no abandoned-escrow leak.
+    ///
+    /// Closing only the ring (leaving the topic's own `closed` flag false)
+    /// deterministically reproduces the close-after-entry-check race that a
+    /// thread interleaving would otherwise produce nondeterministically.
+    #[test]
+    fn mixed_owned_publish_ring_close_race_unwinds_all_owners() {
+        use crate::topic::types::SubscriberOptions;
+
+        let state = observe_only_state();
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let account = handle.local_account().expect("account");
+
+        let topic: MixedTopic<u64> =
+            MixedTopic::new("mixed".into(), 16, 8, TopicBroadcastOnLagPolicy::DropOldest);
+        // Register one balanced consumer group so the publish has two retained
+        // owners (one balanced queue entry + one broadcast ring slot).
+        let sub = topic
+            .subscribe_balanced("g1".into(), SubscriberOptions::default())
+            .expect("balanced subscribe");
+
+        // Simulate close racing in after the entry check: close only the ring.
+        topic.broadcast_ring.close();
+        assert!(!topic.closed.load(Ordering::Relaxed), "topic entry stays open");
+
+        let ticket = account.charge(30_u64).expect("charge fits");
+        let result = topic.try_publish_owned(Arc::new(1_u64), ticket, &state);
+        assert!(
+            matches!(result, Err(TopicClosed)),
+            "ring close during commit must surface TopicClosed"
+        );
+
+        // The broadcast owner was released inline; the balanced owner is still
+        // owned by the queue entry (released on drain/teardown). No leak.
+        let snap = state.snapshot();
+        assert_eq!(
+            snap.escrow_charged_bytes, 30,
+            "only the queued balanced owner remains charged"
+        );
+        assert_eq!(
+            snap.abandoned_escrow_count, 0,
+            "clean ring-close cleanup must not record an abandoned-escrow leak"
+        );
+
+        // Draining the balanced side releases the last owner exactly once.
+        drop(sub);
+        drop(topic);
+        let snap = state.snapshot();
+        assert_eq!(snap.escrow_charged_bytes, 0, "all owners released on teardown");
+        assert_eq!(snap.abandoned_escrow_count, 0);
+    }
+
+    /// Stress the real concurrent race: a publisher thread issues owned
+    /// broadcast publishes while another thread closes the topic. Whichever
+    /// side wins, the escrow invariant must hold — every iteration ends with no
+    /// retained escrow and no abandoned-escrow leak — and the publish result is
+    /// always either `Published` or `TopicClosed`.
+    #[test]
+    fn broadcast_owned_publish_close_race_never_leaks() {
+        use crate::topic::TopicBroker;
+        use crate::topic::types::{PublishOutcome, TopicOptions};
+
+        let state = observe_only_state();
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let account = handle.local_account().expect("account");
+
+        for _ in 0..400 {
+            let broker = TopicBroker::new();
+            let topic = broker
+                .create_in_memory_topic(
+                    "race",
+                    TopicOptions::BroadcastOnly {
+                        capacity: 8,
+                        on_lag: TopicBroadcastOnLagPolicy::DropOldest,
+                    },
+                )
+                .expect("create topic");
+
+            let topic_for_close = topic.clone();
+            let closer = std::thread::spawn(move || {
+                topic_for_close.close();
+            });
+
+            let ticket = account.charge(64_u64).expect("charge fits");
+            let result = topic.try_publish_owned(Arc::new(1_u64), ticket, &state);
+            closer.join().expect("closer thread");
+
+            // Tear the topic down so any retained ring slot is released.
+            topic.close();
+            drop(topic);
+            drop(broker);
+
+            let snap = state.snapshot();
+            assert_eq!(
+                snap.escrow_charged_bytes, 0,
+                "the race must not leak retained escrow"
+            );
+            assert_eq!(
+                snap.abandoned_escrow_count, 0,
+                "the race must not route any owner to the abandoned graveyard"
+            );
+            match result {
+                Ok((PublishOutcome::Published, None)) => {}
+                Err(TopicClosed) => {}
+                other => panic!("unexpected owned-publish race outcome: {other:?}"),
+            }
         }
     }
 }
