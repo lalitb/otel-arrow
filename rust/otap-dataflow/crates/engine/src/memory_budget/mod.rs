@@ -3289,6 +3289,43 @@ mod tests {
         assert_eq!(snap.abandoned_escrow_count, 0);
     }
 
+    /// A `SharedEnvelope` charged on the producer thread crosses a real Send
+    /// channel to another OS thread and releases its escrow exactly once when
+    /// dropped on the consumer thread. This exercises the type across an actual
+    /// `Send` boundary (not just the compile-time `Send` assertion), which is
+    /// the property a shared-channel/shared-node retention site relies on.
+    #[test]
+    fn shared_envelope_crosses_real_thread_boundary_and_releases_once() {
+        let state = shared_owner_state();
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let acct = handle.local_account().expect("account");
+
+        let ticket = acct.charge(40_u64).expect("charge fits");
+        acct.flush_snapshot();
+        let shared = LocalEnvelope::new(7_u64, ticket)
+            .into_shared(&state)
+            .expect("conversion succeeds");
+        assert_eq!(state.snapshot().escrow_charged_bytes, 40);
+
+        // Move the shared owner across a real thread via a Send channel.
+        let (tx, rx) = std::sync::mpsc::channel::<SharedEnvelope<u64>>();
+        tx.send(shared).expect("SharedEnvelope is Send");
+        let consumer = std::thread::spawn(move || {
+            let env = rx.recv().expect("receive on consumer thread");
+            assert_eq!(*env.payload(), 7);
+            // Dropping on the consumer thread releases the escrow once.
+            drop(env);
+        });
+        consumer.join().expect("consumer thread");
+
+        let snap = state.snapshot();
+        assert_eq!(
+            snap.escrow_charged_bytes, 0,
+            "consumer-thread drop releases the shared owner exactly once"
+        );
+        assert_eq!(snap.abandoned_escrow_count, 0);
+    }
+
     #[test]
     fn observe_only_charge_records_above_hard_limit() {
         let acct = account(100, 10, 20, 0);

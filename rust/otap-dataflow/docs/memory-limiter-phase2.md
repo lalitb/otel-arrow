@@ -1677,13 +1677,20 @@ local ticket (or escrow) and can retry or drop. Never send a `LocalMemoryTicket`
 across a shared boundary.
 
 For retained work that moves from a local (`!Send`) context into a shared
-channel or shared node, prefer `LocalEnvelope::into_shared`. It converts the
-local ticket into a sendable `SharedEnvelope<T>` that holds only an
-`EscrowSlot`. `SharedEnvelope<T>` is `Send` whenever `T` is `Send`, so a local
-ticket cannot enter a shared boundary inside it by construction; the shared
-charge is held until the envelope is dropped (clean RAII release) or split with
-`into_parts` to hand the `EscrowSlot` to the boundary. Topic publishers do not
-call this directly: `try_publish_owned` performs the equivalent conversion at
+channel or shared node, the intended owner type is `SharedEnvelope<T>`, produced
+by `LocalEnvelope::into_shared`. It converts the local ticket into a sendable
+owner that holds only an `EscrowSlot`. `SharedEnvelope<T>` is `Send` whenever
+`T` is `Send`, so a local ticket cannot enter a shared boundary inside it by
+construction; the shared charge is held until the envelope is dropped (clean
+RAII release) or split with `into_parts` to hand the `EscrowSlot` to the
+boundary.
+
+`SharedEnvelope<T>` is currently a primitive: it is verified to cross a real
+`Send`/thread boundary and release exactly once, but the engine's shared
+channels still carry plain `PData` and do not yet attach it, so shared-channel
+and shared-node steady-state retention is **not** production-complete. New
+shared retention sites should adopt it as they are wired. Topic publishers do
+not call it directly: `try_publish_owned` performs the equivalent conversion at
 the broker boundary (point-to-point escrow for balanced, ring-slot escrow for
 broadcast, and an all-or-nothing fanout of one owner per retained destination
 for mixed).
