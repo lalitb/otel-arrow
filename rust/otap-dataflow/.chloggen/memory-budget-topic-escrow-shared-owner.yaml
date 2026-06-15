@@ -1,0 +1,7 @@
+change_type: enhancement
+
+component: engine
+
+note: "Complete the retained-ownership model at the shared boundaries: broadcast topic publish now charges ring-slot escrow (released once on overwrite, eviction, close, or drain) and mixed topic publish reserves owners all-or-nothing (one per balanced group plus the broadcast ring slot, unwinding cleanly on failure). Add `SharedEnvelope<T>` (a `Send` escrow-owning counterpart to `LocalEnvelope<T>`) and `LocalEnvelope::into_shared` for shared-channel/shared-node retention. Memory-budget enforcement is now reachable only behind the off-by-default `unstable-memory-enforcement` build feature and stays rejected by config validation in production builds."
+
+issues: [3272]
