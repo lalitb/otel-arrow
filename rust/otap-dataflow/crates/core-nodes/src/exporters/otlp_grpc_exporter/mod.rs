@@ -497,7 +497,10 @@ struct EncodedExport {
 /// site rather than an admission point, so callers proceed with the export in
 /// both cases; the only consequence of `None` is that the in-flight bytes are
 /// not attributed to the runtime account.
-fn charge_inflight(bytes: &[u8]) -> Option<LocalMemoryTicket> {
+///
+/// Shared with the OTLP HTTP exporter, which retains request bodies in-flight
+/// the same way and reuses this helper to keep the charge semantics identical.
+pub(crate) fn charge_inflight(bytes: &[u8]) -> Option<LocalMemoryTicket> {
     current_runtime_memory_budget().and_then(|budget| budget.charge(bytes))
 }
 

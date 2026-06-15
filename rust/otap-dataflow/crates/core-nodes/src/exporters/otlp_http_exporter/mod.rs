@@ -28,6 +28,7 @@ use otap_df_engine::control::{AckMsg, NackMsg, NodeControlMsg};
 use otap_df_engine::error::{Error as EngineError, ExporterErrorKind};
 use otap_df_engine::exporter::ExporterWrapper;
 use otap_df_engine::local::exporter::{EffectHandler, Exporter};
+use otap_df_engine::memory_budget::LocalMemoryTicket;
 use otap_df_engine::message::{ExporterInbox, Message};
 use otap_df_engine::node::NodeId;
 use otap_df_engine::terminal_state::TerminalState;
@@ -55,7 +56,7 @@ use prost::Message as _;
 use reqwest::{Client, Response};
 
 use self::config::Config;
-use crate::exporters::otlp_grpc_exporter::InFlightExports;
+use crate::exporters::otlp_grpc_exporter::{InFlightExports, charge_inflight};
 use otap_df_otap::OTAP_EXPORTER_FACTORIES;
 use otap_df_otap::metrics::ExporterPDataMetrics;
 use otap_df_otap::otlp_http::client_settings::{HttpClientError, HttpClientSettings};
@@ -207,6 +208,13 @@ struct CompletedExport {
     context: Context,
     saved_payload: OtapPayload,
     signal_type: SignalType,
+    /// Memory-budget ticket owning the in-flight request body bytes. Carried
+    /// from dispatch through the export future so the charge is released exactly
+    /// once when the export is finalized (success, partial-success rejection,
+    /// error, nack, or timeout). Dropping the in-flight future before it
+    /// completes (shutdown/drain/early teardown) drops this ticket too, so every
+    /// terminal path refunds the runtime account exactly once.
+    ticket: Option<LocalMemoryTicket>,
 }
 
 #[async_trait(?Send)]
@@ -439,6 +447,10 @@ impl Exporter<OtapPdata> for OtlpHttpExporter {
                     let max_response_body_len = self.config.max_response_body_length;
 
                     let client = client_pool.get_client();
+                    // Charge the request body while it is retained in-flight; the
+                    // ticket travels with the export future and is released when
+                    // the export is finalized or the future is dropped.
+                    let ticket = charge_inflight(body.as_ref());
                     inflight_exports.push(async move {
                         let mut req = client.post(endpoint.as_str()).body(body);
                         if let Some(method) = compression {
@@ -459,6 +471,7 @@ impl Exporter<OtapPdata> for OtlpHttpExporter {
                             context,
                             saved_payload,
                             signal_type,
+                            ticket,
                         }
                     })
                 }
@@ -663,7 +676,13 @@ async fn finalize_completed_export(
         context,
         saved_payload,
         signal_type,
+        ticket,
     } = completed;
+
+    // The export is finalized: release the in-flight memory charge. Dropping the
+    // ticket refunds the runtime account exactly once regardless of outcome
+    // (ack/success, partial-success rejection, error, nack, or timeout).
+    drop(ticket);
 
     let pdata = OtapPdata::new(context, saved_payload);
 
@@ -3099,5 +3118,124 @@ mod test {
     #[test]
     fn test_export_without_compression_omits_content_encoding() {
         run_compression_round_trip(None, None);
+    }
+
+    // ----------------------------------------------------------------------
+    // Memory-budget retained-work ownership (in-flight request bodies).
+    // ----------------------------------------------------------------------
+
+    /// Installs an observe-only/enforce runtime memory budget on the current
+    /// thread, mirroring the deployed-runtime wiring, and returns the state,
+    /// budget, and the thread-local guard (kept alive by the caller).
+    fn install_test_budget(
+        state: otap_df_engine::memory_budget::MemoryBudgetState,
+        mode: otap_df_engine::memory_budget::BudgetMode,
+        max_overshoot_per_runtime_bytes: u64,
+    ) -> (
+        otap_df_engine::memory_budget::MemoryBudgetState,
+        Rc<otap_df_engine::memory_budget::RuntimeMemoryBudget>,
+        otap_df_engine::memory_budget::RuntimeMemoryBudgetGuard,
+    ) {
+        use otap_df_engine::memory_budget::{
+            BudgetScopeId, MemoryBudgetEnforcement, MemoryBudgetSizing, RuntimeMemoryBudget,
+            RuntimeMemoryBudgetConfig, set_current_runtime_memory_budget,
+        };
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 1,
+                    lease_step_bytes: 1,
+                    max_overshoot_per_runtime_bytes,
+                    overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: 100,
+                runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement::default(),
+            },
+            None,
+        );
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let account = handle.local_account().expect("account should be available");
+        let budget = Rc::new(RuntimeMemoryBudget::new(account));
+        let guard = set_current_runtime_memory_budget(Some(budget.clone()));
+        (state, budget, guard)
+    }
+
+    #[test]
+    fn test_inflight_request_charge_and_release() {
+        // Acquisition + release: dispatching a request charges its body bytes
+        // while the export is retained in-flight; finalizing the export (which
+        // drops `CompletedExport.ticket`) or dropping the in-flight future on
+        // shutdown/teardown refunds the runtime account exactly once.
+        let registry = otap_df_telemetry::registry::TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(registry);
+        let (state, budget, _guard) = install_test_budget(
+            controller_ctx.memory_budget_state(),
+            otap_df_engine::memory_budget::BudgetMode::ObserveOnly,
+            1_000_000,
+        );
+
+        let body = Bytes::from_static(b"an-encoded-otlp-http-request-body");
+        let expected = body.len() as u64;
+        let ticket = charge_inflight(body.as_ref());
+        assert!(
+            ticket.is_some(),
+            "the in-flight request body must own a memory-budget ticket"
+        );
+
+        let pdata = OtapPdata::new_default(OtlpProtoBytes::ExportLogsRequest(Bytes::new()).into());
+        let (context, saved_payload) = pdata.into_parts();
+        let completed = CompletedExport {
+            result: Ok(ServiceResponse {
+                partial_success: None,
+            }),
+            context,
+            saved_payload,
+            signal_type: SignalType::Logs,
+            ticket,
+        };
+
+        budget.flush_snapshot();
+        assert_eq!(
+            state.snapshot().charged_bytes,
+            expected,
+            "the request body must be charged while retained in-flight"
+        );
+
+        // `finalize_completed_export` destructures and drops the ticket on every
+        // completion path; dropping the `CompletedExport` here exercises that
+        // same release (and the in-flight future teardown path).
+        drop(completed);
+        budget.flush_snapshot();
+        assert_eq!(
+            state.snapshot().charged_bytes,
+            0,
+            "finalizing/dropping the in-flight export must release the charge"
+        );
+    }
+
+    #[test]
+    fn test_inflight_charge_degrades_without_rejecting_in_enforce_mode() {
+        // The exporter is a retained-work *accounting* site, not an *admission*
+        // point. Even under `enforce`, a rejected charge simply yields no ticket
+        // and the export still proceeds (no data dropped here).
+        let registry = otap_df_telemetry::registry::TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(registry);
+        let (_state, _budget, _guard) = install_test_budget(
+            controller_ctx.memory_budget_state(),
+            otap_df_engine::memory_budget::BudgetMode::Enforce,
+            16,
+        );
+
+        let big = vec![0u8; 65_536];
+        let ticket = charge_inflight(big.as_slice());
+        assert!(
+            ticket.is_none(),
+            "an over-budget enforce charge yields no ticket; the export proceeds"
+        );
     }
 }

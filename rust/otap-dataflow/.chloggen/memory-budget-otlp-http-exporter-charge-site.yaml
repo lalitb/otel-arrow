@@ -1,0 +1,4 @@
+change_type: enhancement
+component: pipeline
+note: "Charge the OTLP HTTP exporter's in-flight request bodies against the observe-only runtime memory budget, releasing on every completion, shutdown, and drain path."
+issues: []
