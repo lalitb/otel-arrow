@@ -134,6 +134,14 @@ pub struct EngineMetrics {
     #[metric(unit = "{By}")]
     pub runtime_memory_budget_escrow_charged_bytes: Gauge<u64>,
 
+    /// Escrow buckets currently holding logical retained bytes.
+    #[metric(unit = "{bucket}")]
+    pub runtime_memory_budget_escrow_active_bucket_count: Gauge<u64>,
+
+    /// Maximum logical retained bytes currently held by one escrow bucket.
+    #[metric(unit = "{By}")]
+    pub runtime_memory_budget_escrow_max_bucket_bytes: Gauge<u64>,
+
     /// Escrow bytes currently backed by an explicit borrow against the global
     /// spare pool (the pool-backed share of `escrow_charged_bytes`).
     #[metric(unit = "{By}")]
@@ -279,6 +287,12 @@ impl EngineMetricsMonitor {
         self.metrics
             .runtime_memory_budget_escrow_charged_bytes
             .set(memory_budget.escrow_charged_bytes);
+        self.metrics
+            .runtime_memory_budget_escrow_active_bucket_count
+            .set(memory_budget.escrow_active_bucket_count);
+        self.metrics
+            .runtime_memory_budget_escrow_max_bucket_bytes
+            .set(memory_budget.escrow_max_bucket_bytes);
         self.metrics
             .runtime_memory_budget_escrow_pool_held_bytes
             .set(memory_budget.escrow_pool_held_bytes);
@@ -472,6 +486,11 @@ mod tests {
         let _ticket = account
             .charge(115_u64)
             .expect("overshoot should be observed");
+        let _escrow = account
+            .charge(30_u64)
+            .expect("escrow source charge should fit")
+            .try_into_escrow(&controller.memory_budget_state())
+            .expect("observe-only escrow should fit");
         // The charge crossed a level threshold (Normal -> Soft) which publishes
         // automatically, but a final flush keeps the test resilient to future
         // changes that defer the transition publish.
@@ -497,6 +516,27 @@ mod tests {
         assert_eq!(
             monitor.metrics.runtime_memory_budget_overshoot_bytes.get(),
             15
+        );
+        assert_eq!(
+            monitor
+                .metrics
+                .runtime_memory_budget_escrow_charged_bytes
+                .get(),
+            30
+        );
+        assert_eq!(
+            monitor
+                .metrics
+                .runtime_memory_budget_escrow_active_bucket_count
+                .get(),
+            1
+        );
+        assert_eq!(
+            monitor
+                .metrics
+                .runtime_memory_budget_escrow_max_bucket_bytes
+                .get(),
+            30
         );
         assert_eq!(
             monitor

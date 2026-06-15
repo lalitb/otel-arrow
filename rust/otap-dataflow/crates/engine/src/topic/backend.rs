@@ -34,7 +34,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use crate::error::Error;
-use crate::memory_budget::{LocalMemoryTicket, MemoryBudgetState};
+use crate::memory_budget::{EscrowBucket, LocalMemoryTicket, MemoryBudgetState};
 use crate::topic::subscription::RecvDelivery;
 use crate::topic::topic::TopicInner;
 use crate::topic::types::{
@@ -109,8 +109,9 @@ pub trait TopicState<T: Send + Sync + 'static>: Send + Sync {
         msg: Arc<T>,
         ticket: LocalMemoryTicket,
         state: &MemoryBudgetState,
+        escrow_bucket: &EscrowBucket,
     ) -> Result<(PublishOutcome, Option<LocalMemoryTicket>), Error> {
-        let _ = state;
+        let _ = (state, escrow_bucket);
         let outcome = self.try_publish(msg)?;
         Ok((outcome, Some(ticket)))
     }

@@ -3087,3 +3087,227 @@ async fn enforce_balanced_publish_owned_within_cap_commits() {
     assert_eq!(snap.escrow_charged_bytes, 0);
     assert_eq!(snap.abandoned_escrow_count, 0);
 }
+
+/// Queue-publish enforcement is scoped per topic bucket: filling one topic's
+/// bucket does not consume another topic's independent publish cap, while the
+/// aggregate escrow snapshot still reports the total retained work.
+#[tokio::test]
+async fn enforce_topic_escrow_caps_are_per_topic_with_aggregate_rollup() {
+    use crate::memory_budget::BudgetScopeId;
+    use crate::topic::types::PublishOutcome;
+
+    let state = enforce_queue_publish_budget_state(100);
+    let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+    let account = handle.local_account().expect("budget configured");
+
+    let broker = TopicBroker::new();
+    let topic_a = broker
+        .create_in_memory_topic(
+            "enforce-per-topic-a",
+            TopicOptions::BalancedOnly { capacity: 16 },
+        )
+        .unwrap();
+    let topic_b = broker
+        .create_in_memory_topic(
+            "enforce-per-topic-b",
+            TopicOptions::BalancedOnly { capacity: 16 },
+        )
+        .unwrap();
+    let _sub_a = topic_a
+        .subscribe(
+            SubscriptionMode::Balanced {
+                group: SubscriptionGroupName::from("g1"),
+            },
+            SubscriberOptions::default(),
+        )
+        .unwrap();
+    let _sub_b = topic_b
+        .subscribe(
+            SubscriptionMode::Balanced {
+                group: SubscriptionGroupName::from("g1"),
+            },
+            SubscriberOptions::default(),
+        )
+        .unwrap();
+
+    for (topic, value) in [(&topic_a, 1_u64), (&topic_b, 2_u64)] {
+        let ticket = account.charge(70_u64).expect("local charge fits");
+        let (outcome, returned) = topic
+            .try_publish_owned(Arc::new(value), ticket, &state)
+            .expect("publish should not error");
+        assert_eq!(outcome, PublishOutcome::Published);
+        assert!(returned.is_none());
+    }
+
+    let snap = state.snapshot();
+    assert_eq!(snap.escrow_charged_bytes, 140);
+    assert_eq!(snap.escrow_active_bucket_count, 2);
+    assert_eq!(snap.escrow_max_bucket_bytes, 70);
+    assert_eq!(
+        state.escrow_bucket_charged_bytes("topic:enforce-per-topic-a"),
+        Some(70)
+    );
+    assert_eq!(
+        state.escrow_bucket_charged_bytes("topic:enforce-per-topic-b"),
+        Some(70)
+    );
+
+    let ticket = account.charge(40_u64).expect("local charge fits");
+    let (outcome, returned) = topic_a
+        .try_publish_owned(Arc::new(3_u64), ticket, &state)
+        .expect("publish should not error");
+    assert_eq!(
+        outcome,
+        PublishOutcome::DroppedOnFull,
+        "topic A is over its own bucket cap"
+    );
+    drop(returned.expect("rejected publish returns the original ticket"));
+    assert_eq!(
+        state.escrow_bucket_charged_bytes("topic:enforce-per-topic-a"),
+        Some(70)
+    );
+
+    let ticket = account.charge(30_u64).expect("local charge fits");
+    let (outcome, returned) = topic_b
+        .try_publish_owned(Arc::new(4_u64), ticket, &state)
+        .expect("publish should not error");
+    assert_eq!(
+        outcome,
+        PublishOutcome::Published,
+        "topic B can still fill its independent bucket"
+    );
+    assert!(returned.is_none());
+
+    let snap = state.snapshot();
+    assert_eq!(snap.escrow_charged_bytes, 170);
+    assert_eq!(snap.escrow_active_bucket_count, 2);
+    assert_eq!(snap.escrow_max_bucket_bytes, 100);
+    assert_eq!(
+        state.escrow_bucket_charged_bytes("topic:enforce-per-topic-b"),
+        Some(100)
+    );
+}
+
+/// Closing a topic releases only that topic's bucket; unrelated retained topic
+/// work remains charged in its own bucket until its own close/drain path runs.
+#[tokio::test]
+async fn broadcast_close_releases_only_the_closed_topic_bucket() {
+    use crate::memory_budget::BudgetScopeId;
+    use crate::topic::types::PublishOutcome;
+
+    let state = observe_only_budget_state();
+    let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+    let account = handle.local_account().expect("budget configured");
+
+    let broker = TopicBroker::new();
+    let topic_a = broker
+        .create_in_memory_topic(
+            "bucket-close-a",
+            TopicOptions::BroadcastOnly {
+                capacity: 16,
+                on_lag: TopicBroadcastOnLagPolicy::DropOldest,
+            },
+        )
+        .unwrap();
+    let topic_b = broker
+        .create_in_memory_topic(
+            "bucket-close-b",
+            TopicOptions::BroadcastOnly {
+                capacity: 16,
+                on_lag: TopicBroadcastOnLagPolicy::DropOldest,
+            },
+        )
+        .unwrap();
+
+    for (topic, value, bytes) in [(&topic_a, 1_u64, 40_u64), (&topic_b, 2_u64, 60_u64)] {
+        let ticket = account.charge(bytes).expect("local charge fits");
+        let (outcome, returned) = topic
+            .try_publish_owned(Arc::new(value), ticket, &state)
+            .expect("publish should not error");
+        assert_eq!(outcome, PublishOutcome::Published);
+        assert!(returned.is_none());
+    }
+    assert_eq!(
+        state.escrow_bucket_charged_bytes("topic:bucket-close-a"),
+        Some(40)
+    );
+    assert_eq!(
+        state.escrow_bucket_charged_bytes("topic:bucket-close-b"),
+        Some(60)
+    );
+
+    topic_a.close();
+    assert_eq!(
+        state.escrow_bucket_charged_bytes("topic:bucket-close-a"),
+        Some(0)
+    );
+    assert_eq!(
+        state.escrow_bucket_charged_bytes("topic:bucket-close-b"),
+        Some(60)
+    );
+    let snap = state.snapshot();
+    assert_eq!(snap.escrow_charged_bytes, 60);
+    assert_eq!(snap.escrow_active_bucket_count, 1);
+    assert_eq!(snap.escrow_max_bucket_bytes, 60);
+
+    topic_b.close();
+    assert_eq!(state.snapshot().escrow_charged_bytes, 0);
+}
+
+/// Mixed publish fanout is transactional inside one topic bucket: if all owners
+/// would exceed that topic's bucket cap, already minted owners are unwound and
+/// the original local ticket is returned unchanged.
+#[tokio::test]
+async fn enforce_mixed_publish_over_topic_bucket_cap_unwinds_fanout() {
+    use crate::memory_budget::BudgetScopeId;
+    use crate::topic::types::PublishOutcome;
+
+    let state = enforce_queue_publish_budget_state(50);
+    let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+    let account = handle.local_account().expect("budget configured");
+
+    let broker = TopicBroker::new();
+    let topic = broker
+        .create_in_memory_topic(
+            "enforce-mixed-bucket",
+            TopicOptions::Mixed {
+                balanced_capacity: 16,
+                broadcast_capacity: 16,
+                on_lag: TopicBroadcastOnLagPolicy::DropOldest,
+            },
+        )
+        .unwrap();
+    let _balanced = topic
+        .subscribe(
+            SubscriptionMode::Balanced {
+                group: SubscriptionGroupName::from("g1"),
+            },
+            SubscriberOptions::default(),
+        )
+        .unwrap();
+    let _broadcast = topic
+        .subscribe(SubscriptionMode::Broadcast, SubscriberOptions::default())
+        .unwrap();
+
+    let ticket = account.charge(30_u64).expect("local charge fits");
+    let (outcome, returned) = topic
+        .try_publish_owned(Arc::new(1_u64), ticket, &state)
+        .expect("publish should not error");
+    assert_eq!(
+        outcome,
+        PublishOutcome::DroppedOnFull,
+        "two 30-byte mixed owners would exceed the 50-byte topic bucket"
+    );
+    let returned = returned.expect("fanout failure returns the original ticket");
+    assert_eq!(returned.bytes(), Some(30));
+    assert_eq!(
+        state.escrow_bucket_charged_bytes("topic:enforce-mixed-bucket"),
+        Some(0),
+        "partial fanout owners must be released during unwind"
+    );
+    assert_eq!(state.snapshot().escrow_charged_bytes, 0);
+    assert_eq!(state.snapshot().abandoned_escrow_count, 0);
+    drop(returned);
+    account.flush_snapshot();
+    assert_eq!(state.snapshot().charged_bytes, 0);
+}

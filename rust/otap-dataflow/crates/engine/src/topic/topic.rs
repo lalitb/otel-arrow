@@ -14,7 +14,7 @@ use crate::error::Error::{
     MessageNotTracked, SubscribeBalancedNotSupported, SubscribeBroadcastNotSupported,
     SubscribeSingleGroupViolation, SubscriptionClosed, TopicClosed,
 };
-use crate::memory_budget::{EscrowSlot, LocalMemoryTicket, MemoryBudgetState};
+use crate::memory_budget::{EscrowBucket, EscrowSlot, LocalMemoryTicket, MemoryBudgetState};
 use crate::topic::backend::{PublishFuture, PublishTrackedFuture, SubscriptionBackend, TopicState};
 use crate::topic::subscription::{Delivery, RecvDelivery};
 use crate::topic::types::{
@@ -387,17 +387,22 @@ impl<T: Send + Sync + 'static> TopicState<T> for TopicInner<T> {
         msg: Arc<T>,
         ticket: LocalMemoryTicket,
         state: &MemoryBudgetState,
+        escrow_bucket: &EscrowBucket,
     ) -> Result<(PublishOutcome, Option<LocalMemoryTicket>), Error> {
         match self {
             // Balanced topics retain a single runtime-local queue entry, so they
             // own one point-to-point escrow charge while the item is in transit.
-            TopicInner::BalancedOnly(topic) => topic.try_publish_owned(msg, ticket, state),
+            TopicInner::BalancedOnly(topic) => {
+                topic.try_publish_owned(msg, ticket, state, escrow_bucket)
+            }
             // Broadcast topics retain a ring slot that owns the escrow charge
             // until overwrite, eviction, close, or final drain.
-            TopicInner::BroadcastOnly(topic) => topic.try_publish_owned(msg, ticket, state),
+            TopicInner::BroadcastOnly(topic) => {
+                topic.try_publish_owned(msg, ticket, state, escrow_bucket)
+            }
             // Mixed topics create one balanced owner per consumer group plus one
             // broadcast ring-slot owner, reserved all-or-nothing.
-            TopicInner::Mixed(topic) => topic.try_publish_owned(msg, ticket, state),
+            TopicInner::Mixed(topic) => topic.try_publish_owned(msg, ticket, state, escrow_bucket),
         }
     }
 
@@ -600,6 +605,7 @@ impl<T: Send + Sync + 'static> BalancedOnlyTopic<T> {
         msg: Arc<T>,
         ticket: LocalMemoryTicket,
         state: &MemoryBudgetState,
+        escrow_bucket: &EscrowBucket,
     ) -> Result<(PublishOutcome, Option<LocalMemoryTicket>), Error> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(TopicClosed);
@@ -615,7 +621,7 @@ impl<T: Send + Sync + 'static> BalancedOnlyTopic<T> {
         };
         // Capacity is secured; only now convert local ownership into escrow so a
         // dropped-on-full publish never leaves an orphaned escrow charge.
-        let escrow = match ticket.try_into_escrow(state) {
+        let escrow = match ticket.try_into_escrow_in_bucket(state, escrow_bucket) {
             Ok(escrow) => escrow,
             Err(ticket) => return Ok((PublishOutcome::DroppedOnFull, Some(ticket))),
         };
@@ -797,12 +803,13 @@ impl<T: Send + Sync + 'static> BroadcastOnlyTopic<T> {
         msg: Arc<T>,
         ticket: LocalMemoryTicket,
         state: &MemoryBudgetState,
+        escrow_bucket: &EscrowBucket,
     ) -> Result<(PublishOutcome, Option<LocalMemoryTicket>), Error> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(TopicClosed);
         }
         let id = self.next_message_id();
-        let escrow = match ticket.try_into_escrow(state) {
+        let escrow = match ticket.try_into_escrow_in_bucket(state, escrow_bucket) {
             Ok(escrow) => escrow,
             Err(ticket) => return Ok((PublishOutcome::DroppedOnFull, Some(ticket))),
         };
@@ -1083,6 +1090,7 @@ impl<T: Send + Sync + 'static> MixedTopic<T> {
         msg: Arc<T>,
         ticket: LocalMemoryTicket,
         state: &MemoryBudgetState,
+        escrow_bucket: &EscrowBucket,
     ) -> Result<(PublishOutcome, Option<LocalMemoryTicket>), Error> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(TopicClosed);
@@ -1102,13 +1110,14 @@ impl<T: Send + Sync + 'static> MixedTopic<T> {
         // broadcast ring slot. Fanout is transactional: any failure unwinds the
         // partial owners and returns the original ticket unchanged.
         let owner_count = groups.len() + 1;
-        let mut owners = match ticket.try_into_escrow_fanout(state, owner_count) {
-            Ok(owners) => owners,
-            Err(ticket) => {
-                drop(permits);
-                return Ok((PublishOutcome::DroppedOnFull, Some(ticket)));
-            }
-        };
+        let mut owners =
+            match ticket.try_into_escrow_fanout_in_bucket(state, owner_count, escrow_bucket) {
+                Ok(owners) => owners,
+                Err(ticket) => {
+                    drop(permits);
+                    return Ok((PublishOutcome::DroppedOnFull, Some(ticket)));
+                }
+            };
 
         // Phase 2: commit. The last owner backs the broadcast ring slot; the
         // remaining owners back the balanced queue entries.
@@ -1729,7 +1738,8 @@ mod ring_close_race_tests {
         );
 
         let ticket = account.charge(30_u64).expect("charge fits");
-        let result = topic.try_publish_owned(Arc::new(1_u64), ticket, &state);
+        let bucket = state.escrow_bucket(&Arc::from("topic:mixed"));
+        let result = topic.try_publish_owned(Arc::new(1_u64), ticket, &state, &bucket);
         assert!(
             matches!(result, Err(TopicClosed)),
             "ring close during commit must surface TopicClosed"

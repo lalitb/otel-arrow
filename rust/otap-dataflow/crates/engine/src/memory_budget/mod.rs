@@ -11,13 +11,15 @@ pub mod reclaim;
 
 use otap_df_config::policy::{MemoryBudgetMode as ConfigBudgetMode, MemoryBudgetPolicy};
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use smallvec::SmallVec;
+
+static DEFAULT_ESCROW_BUCKET: LazyLock<Arc<str>> = LazyLock::new(|| Arc::<str>::from("shared"));
 
 /// Immutable attribution carried by budget owners when the identity is known.
 ///
@@ -333,6 +335,10 @@ pub struct MemoryBudgetSnapshot {
     pub escrow_ticket_count: u64,
     /// Escrow bytes currently owning logical retained bytes.
     pub escrow_charged_bytes: u64,
+    /// Number of escrow buckets with currently charged bytes.
+    pub escrow_active_bucket_count: u64,
+    /// Maximum charged bytes currently held by any one escrow bucket.
+    pub escrow_max_bucket_bytes: u64,
     /// Escrow bytes currently backed by an explicit borrow against the global
     /// spare pool. Equal to `escrow_charged_bytes - escrow_pool_overshoot_bytes`
     /// in steady state. Surfaces the design invariant
@@ -366,6 +372,7 @@ struct MemoryBudgetStateInner {
     abandoned_escrow_bytes: AtomicU64,
     escrow_ticket_count: AtomicU64,
     escrow_charged_bytes: AtomicU64,
+    escrow_buckets: Mutex<HashMap<Arc<str>, EscrowBucket>>,
     /// Sum of bytes the escrow pool currently holds against the global spare
     /// pool. Incremented when [`MemoryBudgetState::try_charge_escrow`] succeeds
     /// at borrowing from `pool`, decremented on the matching release.
@@ -381,6 +388,68 @@ struct MemoryBudgetStateInner {
 #[derive(Debug, Clone, Default)]
 pub struct MemoryBudgetState {
     inner: Arc<MemoryBudgetStateInner>,
+}
+
+/// Per-boundary escrow bucket.
+///
+/// A bucket is created once for a topic or shared boundary and then reused by
+/// shared-boundary publishers. Cloning the bucket is one `Arc` refcount bump;
+/// the boundary name is interned in the bucket and is not cloned per item.
+#[derive(Debug, Clone)]
+pub struct EscrowBucket {
+    inner: Arc<EscrowBucketInner>,
+}
+
+#[derive(Debug)]
+struct EscrowBucketInner {
+    charged_bytes: AtomicU64,
+}
+
+impl EscrowBucket {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(EscrowBucketInner {
+                charged_bytes: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    /// Returns charged bytes currently held by this bucket.
+    #[must_use]
+    pub fn charged_bytes(&self) -> u64 {
+        self.inner.charged_bytes.load(Ordering::Relaxed)
+    }
+
+    fn reserve(&self, bytes: u64, limit: u64, enforce: bool) -> Option<bool> {
+        if enforce {
+            let mut current = self.inner.charged_bytes.load(Ordering::Relaxed);
+            loop {
+                let next = current.saturating_add(bytes);
+                if next > limit {
+                    return None;
+                }
+                match self.inner.charged_bytes.compare_exchange_weak(
+                    current,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return Some(current == 0 && next > 0),
+                    Err(observed) => current = observed,
+                }
+            }
+        }
+
+        Some(self.inner.charged_bytes.fetch_add(bytes, Ordering::Relaxed) == 0 && bytes > 0)
+    }
+
+    fn release(&self, bytes: u64) -> bool {
+        if bytes == 0 {
+            return false;
+        }
+        let previous = self.inner.charged_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        previous <= bytes
+    }
 }
 
 impl MemoryBudgetState {
@@ -487,6 +556,21 @@ impl MemoryBudgetState {
             overshoot_debt_balance: self.inner.pool.overshoot_debt_balance(),
             ..MemoryBudgetSnapshot::default()
         };
+        {
+            let buckets = self
+                .inner
+                .escrow_buckets
+                .lock()
+                .expect("memory budget escrow buckets poisoned");
+            for bucket in buckets.values() {
+                let charged = bucket.charged_bytes();
+                if charged > 0 {
+                    snapshot.escrow_active_bucket_count += 1;
+                    snapshot.escrow_max_bucket_bytes =
+                        snapshot.escrow_max_bucket_bytes.max(charged);
+                }
+            }
+        }
         for runtime in live_snapshots.iter() {
             snapshot.borrowed_bytes = snapshot
                 .borrowed_bytes
@@ -521,6 +605,40 @@ impl MemoryBudgetState {
         snapshot
     }
 
+    /// Stable identity for lightweight per-handle caches.
+    #[must_use]
+    pub(crate) fn cache_id(&self) -> usize {
+        Arc::as_ptr(&self.inner) as usize
+    }
+
+    /// Returns the escrow bucket for a topic or shared boundary.
+    ///
+    /// The boundary id is interned by the caller, typically once per topic
+    /// handle. This method clones only the cheap bucket handle.
+    #[must_use]
+    pub(crate) fn escrow_bucket(&self, boundary: &Arc<str>) -> EscrowBucket {
+        let mut buckets = self
+            .inner
+            .escrow_buckets
+            .lock()
+            .expect("memory budget escrow buckets poisoned");
+        buckets
+            .entry(Arc::clone(boundary))
+            .or_insert_with(EscrowBucket::new)
+            .clone()
+    }
+
+    /// Returns charged bytes for a named escrow bucket, when it exists.
+    #[must_use]
+    pub fn escrow_bucket_charged_bytes(&self, boundary: &str) -> Option<u64> {
+        self.inner
+            .escrow_buckets
+            .lock()
+            .expect("memory budget escrow buckets poisoned")
+            .get(boundary)
+            .map(EscrowBucket::charged_bytes)
+    }
+
     fn abandon_escrow(&self, bytes: u64) {
         self.inner
             .abandoned_escrow
@@ -538,39 +656,19 @@ impl MemoryBudgetState {
     }
 
     /// Outcome of [`MemoryBudgetState::try_charge_escrow`].
-    fn try_charge_escrow(&self, bytes: u64) -> Option<EscrowChargeAck> {
+    fn try_charge_escrow(&self, bytes: u64, bucket: &EscrowBucket) -> Option<EscrowChargeAck> {
         let config = self.config()?;
         // The escrow boundary is the queue/topic publish admission point, so it
         // only rejects when enforce mode is active AND the per-path
         // `queue_publish` gate is enabled. With enforce mode but `queue_publish`
         // off (or in observe-only) it records pressure without rejecting.
         let enforce = config.mode == BudgetMode::Enforce && config.enforcement.queue_publish;
-        // Step 1: bound the topic-level escrow occupancy (enforce only).
-        if enforce {
-            let limit = config.topic_default_limit_bytes;
-            let mut current = self.inner.escrow_charged_bytes.load(Ordering::Relaxed);
-            loop {
-                let next = current.saturating_add(bytes);
-                if next > limit {
-                    return None;
-                }
-                match self.inner.escrow_charged_bytes.compare_exchange_weak(
-                    current,
-                    next,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(observed) => current = observed,
-                }
-            }
-        } else {
-            // Observe-only: always record the escrow occupancy.
-            let _ = self
-                .inner
-                .escrow_charged_bytes
-                .fetch_add(bytes, Ordering::Relaxed);
-        }
+        // Step 1: bound the topic/boundary bucket occupancy (enforce only).
+        let _activated_bucket = bucket.reserve(bytes, config.topic_default_limit_bytes, enforce)?;
+        let _ = self
+            .inner
+            .escrow_charged_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
         // Step 2: back the escrow with an explicit global-pool borrow so the
         // design invariant
         //     sum(runtime_charged) + sum(escrow_charged) <= bounded capacity
@@ -593,6 +691,7 @@ impl MemoryBudgetState {
                 .inner
                 .escrow_charged_bytes
                 .fetch_sub(bytes, Ordering::AcqRel);
+            let _ = bucket.release(bytes);
             return None;
         } else {
             // Observe-only: record the unbacked escrow so the projected
@@ -610,7 +709,7 @@ impl MemoryBudgetState {
         Some(EscrowChargeAck { pool_backed })
     }
 
-    fn release_escrow(&self, bytes: u64, pool_backed: bool) {
+    fn release_escrow(&self, bytes: u64, pool_backed: bool, bucket: &EscrowBucket) {
         let _ = self
             .inner
             .escrow_ticket_count
@@ -619,6 +718,7 @@ impl MemoryBudgetState {
             .inner
             .escrow_charged_bytes
             .fetch_sub(bytes, Ordering::Relaxed);
+        let _ = bucket.release(bytes);
         if bytes == 0 {
             return;
         }
@@ -636,26 +736,19 @@ impl MemoryBudgetState {
         }
     }
 
-    /// Mints one sendable [`EscrowTicket`] owner for `bytes` attributed to
-    /// `scope`, charging the escrow boundary exactly once.
-    ///
-    /// This is the shared escrow-minting path used both by the single-owner
-    /// [`LocalMemoryTicket::try_into_escrow`] transfer and by the multi-owner
-    /// [`LocalMemoryTicket::try_into_escrow_fanout`] used for mixed-topic
-    /// all-or-nothing publish. It does not touch any producer local account;
-    /// the caller is responsible for refunding the producer charge once when a
-    /// transfer commits. Returns `None` when the escrow boundary refuses the
-    /// charge (enforce-mode topic cap or exhausted global pool).
-    pub(crate) fn try_charge_escrow_owner(
+    /// Mints one escrow owner in the provided topic or shared-boundary bucket.
+    pub(crate) fn try_charge_escrow_owner_in_bucket(
         &self,
         bytes: u64,
         scope: &BudgetScope,
+        bucket: &EscrowBucket,
     ) -> Option<EscrowTicket> {
-        let ack = self.try_charge_escrow(bytes)?;
+        let ack = self.try_charge_escrow(bytes, bucket)?;
         Some(EscrowTicket {
             bytes,
             pool_backed: ack.pool_backed,
             state: self.clone(),
+            bucket: bucket.clone(),
             // One reference-count bump at the shared boundary; no string clone.
             scope: Arc::clone(scope),
             resolved: false,
@@ -1588,8 +1681,19 @@ impl LocalMemoryTicket {
     /// back to escrow: the allowance is a redeem-only path, not a producer
     /// path. Those tickets must be drop-released by the consumer instead.
     pub fn try_into_escrow(
+        self,
+        state: &MemoryBudgetState,
+    ) -> Result<EscrowTicket, LocalMemoryTicket> {
+        let bucket = state.escrow_bucket(&DEFAULT_ESCROW_BUCKET);
+        self.try_into_escrow_in_bucket(state, &bucket)
+    }
+
+    /// Converts this local ticket into escrow ownership in a specific boundary
+    /// bucket.
+    pub(crate) fn try_into_escrow_in_bucket(
         mut self,
         state: &MemoryBudgetState,
+        bucket: &EscrowBucket,
     ) -> Result<EscrowTicket, LocalMemoryTicket> {
         if self.drain_used > 0 {
             return Err(self);
@@ -1597,7 +1701,9 @@ impl LocalMemoryTicket {
         let LocalMemoryCharge::KnownBytes(bytes) = self.charge else {
             return Err(self);
         };
-        let Some(escrow) = state.try_charge_escrow_owner(bytes, &self.account.scope) else {
+        let Some(escrow) =
+            state.try_charge_escrow_owner_in_bucket(bytes, &self.account.scope, bucket)
+        else {
             return Err(self);
         };
         self.active = false;
@@ -1628,9 +1734,21 @@ impl LocalMemoryTicket {
     /// failed-publish policy. Drain-allowance and unknown-size tickets cannot
     /// fan out into escrow and are returned unchanged.
     pub fn try_into_escrow_fanout(
+        self,
+        state: &MemoryBudgetState,
+        count: usize,
+    ) -> Result<SmallVec<[EscrowTicket; 4]>, LocalMemoryTicket> {
+        let bucket = state.escrow_bucket(&DEFAULT_ESCROW_BUCKET);
+        self.try_into_escrow_fanout_in_bucket(state, count, &bucket)
+    }
+
+    /// Converts this local ticket into `count` independent escrow owners in a
+    /// specific boundary bucket.
+    pub(crate) fn try_into_escrow_fanout_in_bucket(
         mut self,
         state: &MemoryBudgetState,
         count: usize,
+        bucket: &EscrowBucket,
     ) -> Result<SmallVec<[EscrowTicket; 4]>, LocalMemoryTicket> {
         if count == 0 || self.drain_used > 0 {
             return Err(self);
@@ -1640,7 +1758,7 @@ impl LocalMemoryTicket {
         };
         let mut owners: SmallVec<[EscrowTicket; 4]> = SmallVec::with_capacity(count);
         for _ in 0..count {
-            match state.try_charge_escrow_owner(bytes, &self.account.scope) {
+            match state.try_charge_escrow_owner_in_bucket(bytes, &self.account.scope, bucket) {
                 Some(owner) => owners.push(owner),
                 None => {
                     // Unwind already-acquired owners in reverse order, then
@@ -1699,6 +1817,7 @@ pub struct EscrowTicket {
     /// returning to a pool draw that was never taken.
     pool_backed: bool,
     state: MemoryBudgetState,
+    bucket: EscrowBucket,
     scope: BudgetScope,
     resolved: bool,
 }
@@ -1723,7 +1842,8 @@ impl EscrowTicket {
     /// the ticket resolved so `Drop` does not route it to the graveyard.
     fn resolve_release(&mut self) {
         if !self.resolved {
-            self.state.release_escrow(self.bytes, self.pool_backed);
+            self.state
+                .release_escrow(self.bytes, self.pool_backed, &self.bucket);
             self.resolved = true;
         }
     }
@@ -2702,7 +2822,7 @@ mod tests {
     }
 
     #[test]
-    fn enforce_escrow_limit_is_aggregate() {
+    fn enforce_escrow_limit_is_per_default_bucket() {
         let state = MemoryBudgetState::default();
         state.configure(
             RuntimeMemoryBudgetConfig {
@@ -2726,7 +2846,7 @@ mod tests {
             },
             // Provide enough process headroom (floor 100 + 100 spare) so the
             // global pool can back the first escrow's transfer charge. The
-            // test isolates the topic-aggregate cap, not the pool-backing path.
+            // test isolates the default-bucket cap, not the pool-backing path.
             Some(200),
         );
         let acct = account(100, 10, 20, 100);
@@ -2734,12 +2854,12 @@ mod tests {
             .charge(40_u64)
             .expect("first local charge should fit")
             .try_into_escrow(&state)
-            .expect("first escrow should fit aggregate limit");
+            .expect("first escrow should fit bucket limit");
         let second = acct
             .charge(30_u64)
             .expect("second local charge should fit")
             .try_into_escrow(&state)
-            .expect_err("second escrow should exceed aggregate limit");
+            .expect_err("second escrow should exceed bucket limit");
 
         assert_eq!(first.bytes(), 40);
         assert_eq!(second.bytes(), Some(30));

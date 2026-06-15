@@ -2,6 +2,6 @@ change_type: enhancement
 
 component: engine
 
-note: "Extend the retained-ownership foundation at shared boundaries: broadcast topic publish now charges ring-slot escrow (released once on overwrite, eviction, close, or drain) and mixed topic publish reserves owners all-or-nothing (one per balanced group plus the broadcast ring slot, unwinding cleanly on failure). Add `SharedEnvelope<T>` (a `Send` escrow-owning counterpart to `LocalEnvelope<T>`) and `LocalEnvelope::into_shared` as a primitive for future shared-channel/shared-node retention; those paths are not production-adopted yet. Memory-budget enforcement is reachable only behind the off-by-default `unstable-memory-enforcement` build feature, and the wired queue_publish gate currently uses an aggregate topic-publish escrow bucket."
+note: "Extend the retained-ownership foundation at shared boundaries: broadcast topic publish now charges ring-slot escrow (released once on overwrite, eviction, close, or drain) and mixed topic publish reserves owners all-or-nothing (one per balanced group plus the broadcast ring slot, unwinding cleanly on failure). Add `SharedEnvelope<T>` (a `Send` escrow-owning counterpart to `LocalEnvelope<T>`) and `LocalEnvelope::into_shared` as a primitive for future shared-channel/shared-node retention; those paths are not production-adopted yet. Memory-budget enforcement is reachable only behind the off-by-default `unstable-memory-enforcement` build feature, and the wired queue_publish gate now uses per-topic/per-boundary escrow buckets with aggregate rollup."
 
 issues: [3272]

@@ -3,10 +3,10 @@
 
 //! Topic handle is the user-facing publish/subscribe entry point.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::error::Error;
-use crate::memory_budget::{LocalMemoryTicket, MemoryBudgetState};
+use crate::memory_budget::{EscrowBucket, LocalMemoryTicket, MemoryBudgetState};
 use crate::topic::backend::TopicState;
 use crate::topic::subscription::Subscription;
 use crate::topic::types::{
@@ -21,6 +21,8 @@ use tokio::sync::Semaphore;
 pub struct TopicHandle<T: Send + Sync + 'static> {
     inner: Arc<dyn TopicState<T>>,
     publish_outcome_default: TopicPublishOutcomeConfig,
+    memory_boundary: Arc<str>,
+    memory_bucket_cache: Arc<OnceLock<(usize, EscrowBucket)>>,
 }
 
 impl<T: Send + Sync + 'static> Clone for TopicHandle<T> {
@@ -28,6 +30,8 @@ impl<T: Send + Sync + 'static> Clone for TopicHandle<T> {
         Self {
             inner: Arc::clone(&self.inner),
             publish_outcome_default: self.publish_outcome_default,
+            memory_boundary: Arc::clone(&self.memory_boundary),
+            memory_bucket_cache: Arc::clone(&self.memory_bucket_cache),
         }
     }
 }
@@ -53,9 +57,12 @@ impl<T: Send + Sync + 'static> Clone for TrackedTopicPublisher<T> {
 
 impl<T: Send + Sync + 'static> TopicHandle<T> {
     pub(crate) fn new(inner: Arc<dyn TopicState<T>>) -> Self {
+        let memory_boundary = Arc::from(format!("topic:{}", inner.name()));
         Self {
             inner,
             publish_outcome_default: TopicPublishOutcomeConfig::default(),
+            memory_boundary,
+            memory_bucket_cache: Arc::new(OnceLock::new()),
         }
     }
 
@@ -65,6 +72,8 @@ impl<T: Send + Sync + 'static> TopicHandle<T> {
         Self {
             inner: Arc::clone(&self.inner),
             publish_outcome_default: config,
+            memory_boundary: Arc::clone(&self.memory_boundary),
+            memory_bucket_cache: Arc::clone(&self.memory_bucket_cache),
         }
     }
 
@@ -118,7 +127,8 @@ impl<T: Send + Sync + 'static> TopicHandle<T> {
         ticket: LocalMemoryTicket,
         state: &MemoryBudgetState,
     ) -> Result<(PublishOutcome, Option<LocalMemoryTicket>), Error> {
-        self.inner.try_publish_owned(msg, ticket, state)
+        let bucket = self.memory_escrow_bucket(state);
+        self.inner.try_publish_owned(msg, ticket, state, &bucket)
     }
 
     /// Subscribe to this topic.
@@ -143,6 +153,18 @@ impl<T: Send + Sync + 'static> TopicHandle<T> {
     #[must_use]
     pub fn name(&self) -> &TopicName {
         self.inner.name()
+    }
+
+    fn memory_escrow_bucket(&self, state: &MemoryBudgetState) -> EscrowBucket {
+        let cache_id = state.cache_id();
+        if let Some((cached_id, bucket)) = self.memory_bucket_cache.get()
+            && *cached_id == cache_id
+        {
+            return bucket.clone();
+        }
+        let bucket = state.escrow_bucket(&self.memory_boundary);
+        let _ = self.memory_bucket_cache.set((cache_id, bucket.clone()));
+        bucket
     }
 
     /// Topic-level default configuration for tracked publish outcomes.
