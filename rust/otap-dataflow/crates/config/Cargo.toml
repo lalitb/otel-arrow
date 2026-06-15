@@ -9,6 +9,14 @@ publish.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+# Opt-in, off in production builds. Allows config validation to accept
+# `memory_budget.mode = enforce` and the per-runtime enforcement gate flags so
+# enforcement can be exercised in tests and experimental builds. Production
+# builds do not enable this feature, so an enforce-mode config is rejected at
+# validation time and cannot be reached accidentally.
+unstable-memory-enforcement = []
+
 [lints]
 workspace = true
 

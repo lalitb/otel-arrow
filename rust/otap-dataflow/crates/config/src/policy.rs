@@ -181,9 +181,18 @@ impl Policies {
             .and_then(|resources| resources.memory_budget.as_ref())
         {
             let budget_path = format!("{path_prefix}.resources.memory_budget");
+            // Enforcement is gated behind the `unstable-memory-enforcement`
+            // build feature, which production builds do not enable. With the
+            // feature off, an `enforce` mode (and the per-runtime enforcement
+            // gate flags below) is rejected at validation time so it cannot be
+            // reached accidentally from normal production config. With the
+            // feature on, enforce mode is accepted (still subject to the sizing
+            // and escrow validations) so enforcement can be exercised in tests
+            // and experimental builds.
+            #[cfg(not(feature = "unstable-memory-enforcement"))]
             if memory_budget.mode == MemoryBudgetMode::Enforce {
                 errors.push(format!(
-                    "{budget_path}.mode enforce is not supported until memory-budget ticket and escrow ownership is implemented"
+                    "{budget_path}.mode enforce requires the `unstable-memory-enforcement` build feature, which is disabled in production builds"
                 ));
             }
             if memory_budget.retry_after_secs == 0 {
@@ -244,12 +253,13 @@ impl Policies {
                     ));
                 }
             }
+            #[cfg(not(feature = "unstable-memory-enforcement"))]
             if memory_budget.enforcement.receiver_admission
                 || memory_budget.enforcement.queue_publish
                 || memory_budget.enforcement.reclaim_hooks
             {
                 errors.push(format!(
-                    "{budget_path}.enforcement flags must remain false until memory-budget ownership and reclaim paths are implemented"
+                    "{budget_path}.enforcement flags require the `unstable-memory-enforcement` build feature, which is disabled in production builds"
                 ));
             }
         }
@@ -1332,6 +1342,7 @@ mod tests {
         assert!(errors[0].contains("purge_min_interval must be greater than 0"));
     }
 
+    #[cfg(not(feature = "unstable-memory-enforcement"))]
     #[test]
     fn validates_memory_budget_rejects_enforce_until_ownership_lands() {
         let policies = Policies {
@@ -1361,7 +1372,7 @@ mod tests {
 
         let errors = policies.validation_errors("policies");
         assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("mode enforce is not supported"));
+        assert!(errors[0].contains("unstable-memory-enforcement"));
     }
 
     #[test]
@@ -1403,6 +1414,7 @@ mod tests {
         )));
     }
 
+    #[cfg(not(feature = "unstable-memory-enforcement"))]
     #[test]
     fn validates_memory_budget_rejects_enforcement_flags_until_gates_met() {
         let policies = Policies {
@@ -1437,8 +1449,51 @@ mod tests {
         let errors = policies.validation_errors("policies");
         assert_eq!(errors.len(), 1);
         assert!(
-            errors[0].contains("enforcement flags must remain false"),
+            errors[0].contains("unstable-memory-enforcement"),
             "observe-only foundation must reject enforcement flags: {errors:?}"
+        );
+    }
+
+    /// With the `unstable-memory-enforcement` build feature enabled, an
+    /// enforce-mode budget config validates successfully (still subject to the
+    /// sizing and escrow checks). Production builds do not enable the feature,
+    /// so this path is unreachable from normal config.
+    #[cfg(feature = "unstable-memory-enforcement")]
+    #[test]
+    fn unstable_enforcement_feature_accepts_enforce_mode_and_flags() {
+        let policies = Policies {
+            resources: Some(super::ResourcesPolicy {
+                core_allocation: super::CoreAllocation::all_cores(),
+                memory_limiter: None,
+                memory_budget: Some(super::MemoryBudgetPolicy {
+                    mode: super::MemoryBudgetMode::Enforce,
+                    retry_after_secs: 1,
+                    sizing: super::MemoryBudgetSizingPolicy {
+                        strategy: super::MemoryBudgetSizingStrategy::Leased,
+                        reserve: 512 * 1024 * 1024,
+                        floor_per_runtime: 256 * 1024 * 1024,
+                        lease_step: 64 * 1024,
+                        max_overshoot_per_runtime: 128 * 1024 * 1024,
+                        overshoot_debt_limit: 16 * 1024 * 1024,
+                        drain_allowance: None,
+                    },
+                    escrow: super::MemoryBudgetEscrowPolicy {
+                        topic_default_limit: 64 * 1024 * 1024,
+                    },
+                    enforcement: super::MemoryBudgetEnforcementPolicy {
+                        receiver_admission: true,
+                        queue_publish: true,
+                        reclaim_hooks: true,
+                    },
+                }),
+            }),
+            ..Policies::default()
+        };
+
+        let errors = policies.validation_errors("policies");
+        assert!(
+            errors.is_empty(),
+            "gated enforce-mode config must validate cleanly: {errors:?}"
         );
     }
 

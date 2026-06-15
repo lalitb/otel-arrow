@@ -1398,6 +1398,13 @@ Validation:
 
 - `memory_budget` is supported only at top-level `policies.resources`.
 - `memory_budget.mode` is required when configured.
+- `memory_budget.mode = enforce` and any `memory_budget.enforcement.*` gate flag
+  are **rejected at validation time** unless the crate is built with the
+  `unstable-memory-enforcement` feature. Production builds do not enable that
+  feature, so enforcement cannot be reached accidentally from normal config; it
+  is a compile-time opt-in for tests and experimental builds. The default
+  remains `observe_only`. Runtime budget accounts honor `enforce` mode whenever
+  they are configured with it, so the gate lives entirely in config validation.
 - `reserve` must be smaller than the process hard limit when a hard limit is
   known.
 - `runtime_count` is the total resolved runtime instances in the process.
