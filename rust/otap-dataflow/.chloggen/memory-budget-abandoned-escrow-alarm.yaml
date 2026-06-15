@@ -1,0 +1,7 @@
+change_type: enhancement
+
+component: engine
+
+note: "Expose abandoned escrow leak-detection telemetry for the retained-work memory-budget foundation: unresolved escrow drops now keep sticky count/bytes/oldest-age accounting and emit one bounded low-cardinality alarm per memory-budget state. Reaping remains future work."
+
+issues: [3272]

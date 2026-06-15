@@ -16,6 +16,7 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::time::Instant;
 
 use smallvec::SmallVec;
 
@@ -170,8 +171,8 @@ pub struct RuntimeMemoryBudgetConfig {
     pub sizing: MemoryBudgetSizing,
     /// Topic-publish escrow default limit.
     ///
-    /// Current foundation scope: one aggregate topic-publish escrow bucket.
-    /// Per-topic/per-boundary escrow buckets remain future work.
+    /// Current foundation scope: topic-owned publish applies this as a
+    /// per-topic/per-boundary escrow bucket limit and exposes aggregate rollups.
     pub topic_default_limit_bytes: u64,
     /// Number of deployed runtime instances used for sizing.
     pub runtime_count: usize,
@@ -331,6 +332,13 @@ pub struct MemoryBudgetSnapshot {
     pub abandoned_escrow_count: u64,
     /// Abandoned escrow bytes retained for leak detection.
     pub abandoned_escrow_bytes: u64,
+    /// Age in milliseconds of the oldest abandoned escrow entry.
+    ///
+    /// Zero means no abandoned escrow is currently recorded. Non-zero values
+    /// are sticky until a future explicit reaper/alarm policy is introduced.
+    pub abandoned_escrow_oldest_age_millis: u64,
+    /// Number of bounded abandoned-escrow alarms emitted by this state.
+    pub abandoned_escrow_alarm_count: u64,
     /// Escrow tickets currently owning logical retained bytes.
     pub escrow_ticket_count: u64,
     /// Escrow bytes currently owning logical retained bytes.
@@ -366,10 +374,13 @@ struct MemoryBudgetStateInner {
     config: Mutex<Option<RuntimeMemoryBudgetConfig>>,
     pool: GlobalLeasePool,
     snapshots: Mutex<Vec<Weak<RuntimeMemorySnapshot>>>,
-    // Phase 2e leak detection will need entry identity, scope, and timestamps.
-    abandoned_escrow: Mutex<VecDeque<u64>>,
+    // Phase 2e leak detection keeps a bounded, low-cardinality sticky view:
+    // count/bytes/oldest age. It intentionally does not store per-scope strings.
+    abandoned_escrow: Mutex<VecDeque<AbandonedEscrowEntry>>,
     abandoned_escrow_count: AtomicU64,
     abandoned_escrow_bytes: AtomicU64,
+    abandoned_escrow_alarm_count: AtomicU64,
+    abandoned_escrow_alarm_fired: AtomicBool,
     escrow_ticket_count: AtomicU64,
     escrow_charged_bytes: AtomicU64,
     escrow_buckets: Mutex<HashMap<Arc<str>, EscrowBucket>>,
@@ -382,6 +393,11 @@ struct MemoryBudgetStateInner {
     /// enforce-mode admission path rejects this case instead of accumulating
     /// here, so this counter only grows under `mode: observe_only`.
     escrow_pool_overshoot_bytes: AtomicU64,
+}
+
+#[derive(Debug)]
+struct AbandonedEscrowEntry {
+    abandoned_at: Instant,
 }
 
 /// Shared runtime memory-budget state.
@@ -545,6 +561,10 @@ impl MemoryBudgetState {
             runtime_count: live_snapshots.len() as u64,
             abandoned_escrow_count: self.inner.abandoned_escrow_count.load(Ordering::Relaxed),
             abandoned_escrow_bytes: self.inner.abandoned_escrow_bytes.load(Ordering::Relaxed),
+            abandoned_escrow_alarm_count: self
+                .inner
+                .abandoned_escrow_alarm_count
+                .load(Ordering::Relaxed),
             escrow_ticket_count: self.inner.escrow_ticket_count.load(Ordering::Relaxed),
             escrow_charged_bytes: self.inner.escrow_charged_bytes.load(Ordering::Relaxed),
             escrow_pool_held_bytes: self.inner.escrow_pool_held_bytes.load(Ordering::Relaxed),
@@ -556,6 +576,18 @@ impl MemoryBudgetState {
             overshoot_debt_balance: self.inner.pool.overshoot_debt_balance(),
             ..MemoryBudgetSnapshot::default()
         };
+        {
+            let abandoned = self
+                .inner
+                .abandoned_escrow
+                .lock()
+                .expect("memory budget abandoned escrow poisoned");
+            if let Some(oldest) = abandoned.front() {
+                let millis = oldest.abandoned_at.elapsed().as_millis();
+                snapshot.abandoned_escrow_oldest_age_millis =
+                    u64::try_from(millis).unwrap_or(u64::MAX).max(1);
+            }
+        }
         {
             let buckets = self
                 .inner
@@ -644,15 +676,35 @@ impl MemoryBudgetState {
             .abandoned_escrow
             .lock()
             .expect("memory budget abandoned escrow poisoned")
-            .push_back(bytes);
-        let _ = self
+            .push_back(AbandonedEscrowEntry {
+                abandoned_at: Instant::now(),
+            });
+        let count = self
             .inner
             .abandoned_escrow_count
-            .fetch_add(1, Ordering::Relaxed);
-        let _ = self
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let total_bytes = self
             .inner
             .abandoned_escrow_bytes
-            .fetch_add(bytes, Ordering::Relaxed);
+            .fetch_add(bytes, Ordering::Relaxed)
+            .saturating_add(bytes);
+        if !self
+            .inner
+            .abandoned_escrow_alarm_fired
+            .swap(true, Ordering::AcqRel)
+        {
+            let _ = self
+                .inner
+                .abandoned_escrow_alarm_count
+                .fetch_add(1, Ordering::Relaxed);
+            otap_df_telemetry::otel_warn!(
+                "runtime_memory_escrow.abandoned",
+                abandoned_escrow_count = count,
+                abandoned_escrow_bytes = total_bytes,
+                message = "unresolved escrow dropped; charge remains sticky until an explicit reaper policy is configured",
+            );
+        }
     }
 
     /// Outcome of [`MemoryBudgetState::try_charge_escrow`].
@@ -2899,8 +2951,52 @@ mod tests {
         let snapshot = state.snapshot();
         assert_eq!(snapshot.abandoned_escrow_count, 1);
         assert_eq!(snapshot.abandoned_escrow_bytes, 42);
+        assert!(
+            snapshot.abandoned_escrow_oldest_age_millis >= 1,
+            "abandoned escrow age must be visible immediately"
+        );
+        assert_eq!(
+            snapshot.abandoned_escrow_alarm_count, 1,
+            "first abandoned escrow emits one bounded alarm"
+        );
         assert_eq!(snapshot.escrow_ticket_count, 1);
         assert_eq!(snapshot.escrow_charged_bytes, 42);
+    }
+
+    #[test]
+    fn abandoned_escrow_alarm_is_bounded_and_sticky() {
+        let state = escrow_state();
+        let acct = account(100, 10, 20, 100);
+
+        let first = acct
+            .charge(10_u64)
+            .expect("first charge should fit")
+            .try_into_escrow(&state)
+            .expect("first escrow should fit");
+        let second = acct
+            .charge(20_u64)
+            .expect("second charge should fit")
+            .try_into_escrow(&state)
+            .expect("second escrow should fit");
+
+        drop(first);
+        drop(second);
+
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.abandoned_escrow_count, 2);
+        assert_eq!(snapshot.abandoned_escrow_bytes, 30);
+        assert_eq!(
+            snapshot.abandoned_escrow_alarm_count, 1,
+            "alarm is emitted at most once per memory-budget state"
+        );
+        assert_eq!(
+            snapshot.escrow_charged_bytes, 30,
+            "abandoned escrow remains sticky until a future reaper policy"
+        );
+        assert!(
+            snapshot.abandoned_escrow_oldest_age_millis >= 1,
+            "oldest abandoned age remains visible while sticky"
+        );
     }
 
     /// Local-ticket → escrow conversion must transfer ownership without

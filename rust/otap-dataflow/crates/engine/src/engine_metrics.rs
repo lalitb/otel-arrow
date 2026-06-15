@@ -126,6 +126,14 @@ pub struct EngineMetrics {
     #[metric(unit = "{By}")]
     pub runtime_memory_budget_abandoned_escrow_bytes: Gauge<u64>,
 
+    /// Age of the oldest abandoned escrow entry retained for leak detection.
+    #[metric(unit = "ms")]
+    pub runtime_memory_budget_abandoned_escrow_oldest_age_millis: Gauge<u64>,
+
+    /// Bounded abandoned-escrow alarms emitted by this engine.
+    #[metric(unit = "{alarm}")]
+    pub runtime_memory_budget_abandoned_escrow_alarm_count: Gauge<u64>,
+
     /// Escrow tickets currently owning logical retained bytes.
     #[metric(unit = "{ticket}")]
     pub runtime_memory_budget_escrow_ticket_count: Gauge<u64>,
@@ -281,6 +289,12 @@ impl EngineMetricsMonitor {
         self.metrics
             .runtime_memory_budget_abandoned_escrow_bytes
             .set(memory_budget.abandoned_escrow_bytes);
+        self.metrics
+            .runtime_memory_budget_abandoned_escrow_oldest_age_millis
+            .set(memory_budget.abandoned_escrow_oldest_age_millis);
+        self.metrics
+            .runtime_memory_budget_abandoned_escrow_alarm_count
+            .set(memory_budget.abandoned_escrow_alarm_count);
         self.metrics
             .runtime_memory_budget_escrow_ticket_count
             .set(memory_budget.escrow_ticket_count);
@@ -491,6 +505,12 @@ mod tests {
             .expect("escrow source charge should fit")
             .try_into_escrow(&controller.memory_budget_state())
             .expect("observe-only escrow should fit");
+        let abandoned_escrow = account
+            .charge(12_u64)
+            .expect("abandoned escrow source charge should fit")
+            .try_into_escrow(&controller.memory_budget_state())
+            .expect("observe-only abandoned escrow should fit");
+        drop(abandoned_escrow);
         // The charge crossed a level threshold (Normal -> Soft) which publishes
         // automatically, but a final flush keeps the test resilient to future
         // changes that defer the transition publish.
@@ -522,7 +542,7 @@ mod tests {
                 .metrics
                 .runtime_memory_budget_escrow_charged_bytes
                 .get(),
-            30
+            42
         );
         assert_eq!(
             monitor
@@ -536,7 +556,35 @@ mod tests {
                 .metrics
                 .runtime_memory_budget_escrow_max_bucket_bytes
                 .get(),
-            30
+            42
+        );
+        assert_eq!(
+            monitor
+                .metrics
+                .runtime_memory_budget_abandoned_escrow_count
+                .get(),
+            1
+        );
+        assert_eq!(
+            monitor
+                .metrics
+                .runtime_memory_budget_abandoned_escrow_bytes
+                .get(),
+            12
+        );
+        assert!(
+            monitor
+                .metrics
+                .runtime_memory_budget_abandoned_escrow_oldest_age_millis
+                .get()
+                >= 1
+        );
+        assert_eq!(
+            monitor
+                .metrics
+                .runtime_memory_budget_abandoned_escrow_alarm_count
+                .get(),
+            1
         );
         assert_eq!(
             monitor
