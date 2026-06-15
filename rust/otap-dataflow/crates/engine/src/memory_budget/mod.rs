@@ -166,7 +166,10 @@ pub struct RuntimeMemoryBudgetConfig {
     pub retry_after_secs: u32,
     /// Lease sizing parameters.
     pub sizing: MemoryBudgetSizing,
-    /// Topic escrow default limit.
+    /// Topic-publish escrow default limit.
+    ///
+    /// Current foundation scope: one aggregate topic-publish escrow bucket.
+    /// Per-topic/per-boundary escrow buckets remain future work.
     pub topic_default_limit_bytes: u64,
     /// Number of deployed runtime instances used for sizing.
     pub runtime_count: usize,

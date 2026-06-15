@@ -666,7 +666,10 @@ pub struct MemoryBudgetSizingPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryBudgetEscrowPolicy {
-    /// Default bytes allowed per topic escrow bucket.
+    /// Default bytes allowed for topic-publish escrow.
+    ///
+    /// The current Phase 2 foundation applies this as one aggregate
+    /// topic-publish escrow bucket. Per-topic buckets remain future work.
     #[serde(deserialize_with = "deserialize_required_u64")]
     #[schemars(with = "String")]
     pub topic_default_limit: u64,
