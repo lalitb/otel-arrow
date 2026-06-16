@@ -453,6 +453,67 @@ impl Drop for ReclaimRegistration {
     }
 }
 
+thread_local! {
+    /// Per-runtime-thread slot for the current pipeline's reclaim registry.
+    ///
+    /// Set on the pinned pipeline runtime thread by
+    /// [`set_current_reclaim_registry`] and cleared by dropping the returned
+    /// [`ReclaimRegistryGuard`]. Mirrors the runtime memory-budget accessor:
+    /// reads are intra-thread (`borrow().clone()` is a handful of `Rc`
+    /// strong-count bumps with no atomics or shared coordination), so a stateful
+    /// retention site running on the runtime thread can reach the single
+    /// per-runtime registry to register its reclaimer.
+    static CURRENT_RECLAIM_REGISTRY: RefCell<Option<ReclaimRegistry>> =
+        const { RefCell::new(None) };
+}
+
+/// RAII guard returned by [`set_current_reclaim_registry`].
+///
+/// On drop, restores the previous (typically `None`) value of the reclaim
+/// registry slot for this thread. The guard is `!Send` so it cannot escape the
+/// runtime thread it was created on, guaranteeing "the registry set here is also
+/// cleared here, on the same thread".
+#[must_use = "the reclaim registry remains installed until this guard is dropped"]
+pub struct ReclaimRegistryGuard {
+    previous: Option<ReclaimRegistry>,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl Drop for ReclaimRegistryGuard {
+    fn drop(&mut self) {
+        let prev = self.previous.take();
+        CURRENT_RECLAIM_REGISTRY.with(|slot: &RefCell<Option<ReclaimRegistry>>| {
+            let _ = slot.replace(prev);
+        });
+    }
+}
+
+/// Installs a reclaim registry as the current thread's accessor.
+///
+/// Returns a guard that, when dropped, restores whatever was installed before
+/// this call (typically `None`). Must be called on the pinned pipeline runtime
+/// thread; the returned guard is `!Send` and must drop on that same thread.
+/// Passing `None` clears the slot.
+pub fn set_current_reclaim_registry(registry: Option<ReclaimRegistry>) -> ReclaimRegistryGuard {
+    let previous = CURRENT_RECLAIM_REGISTRY
+        .with(|slot: &RefCell<Option<ReclaimRegistry>>| slot.replace(registry));
+    ReclaimRegistryGuard {
+        previous,
+        _not_send: PhantomData,
+    }
+}
+
+/// Returns a clone of the current runtime thread's reclaim registry.
+///
+/// Returns `None` outside a pipeline runtime thread, before
+/// [`set_current_reclaim_registry`] has been called, or after the guard for this
+/// runtime has been dropped. The clone shares the registry's `Rc`-backed state,
+/// so registering through it affects the single per-runtime registry.
+#[must_use]
+pub fn current_reclaim_registry() -> Option<ReclaimRegistry> {
+    CURRENT_RECLAIM_REGISTRY.with(|slot: &RefCell<Option<ReclaimRegistry>>| slot.borrow().clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,5 +843,77 @@ mod tests {
             "nested registry reclaim must be refused while a pass is in progress"
         );
         assert!(!registry.is_reclaiming());
+    }
+
+    // ----------------------------------------------------------------------
+    // Runtime-thread accessor.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn current_reclaim_registry_absent_by_default() {
+        assert!(
+            current_reclaim_registry().is_none(),
+            "no registry is installed outside a runtime thread setup"
+        );
+    }
+
+    #[test]
+    fn set_and_clear_current_reclaim_registry() {
+        let registry = ReclaimRegistry::new();
+        let account = test_account();
+        let reclaimer = Rc::new(RefCell::new(TicketReclaimer::new(
+            ReclaimPriority::Queue,
+            &account,
+            &[10],
+        )));
+
+        {
+            let _guard = set_current_reclaim_registry(Some(registry.clone()));
+            let current = current_reclaim_registry().expect("registry installed");
+            // The accessor returns a handle to the same registry: registering
+            // through it is visible on the original handle.
+            let _reg = current.register(reclaimer.clone() as Rc<RefCell<dyn LocalMemoryReclaim>>);
+            assert_eq!(registry.len(), 1, "registration via the accessor is shared");
+        }
+
+        assert!(
+            current_reclaim_registry().is_none(),
+            "dropping the guard clears the thread accessor"
+        );
+    }
+
+    #[test]
+    fn set_current_reclaim_registry_restores_previous_on_drop() {
+        let first = ReclaimRegistry::new();
+        let second = ReclaimRegistry::new();
+        let account = test_account();
+        let r = Rc::new(RefCell::new(TicketReclaimer::new(
+            ReclaimPriority::Queue,
+            &account,
+            &[10],
+        )));
+        let _first_reg = first.register(r.clone() as Rc<RefCell<dyn LocalMemoryReclaim>>);
+
+        let _outer = set_current_reclaim_registry(Some(first.clone()));
+        {
+            let _inner = set_current_reclaim_registry(Some(second.clone()));
+            assert_eq!(
+                current_reclaim_registry().expect("inner installed").len(),
+                0,
+                "inner registry is the empty second one"
+            );
+        }
+        // Dropping the inner guard restores the outer registry.
+        assert_eq!(
+            current_reclaim_registry().expect("outer restored").len(),
+            1,
+            "previous registry is restored after the inner guard drops"
+        );
+    }
+
+    #[test]
+    fn reclaim_registry_guard_is_not_send() {
+        static_assertions::assert_not_impl_any!(ReclaimRegistryGuard: Send);
+        static_assertions::assert_not_impl_any!(ReclaimRegistry: Send);
     }
 }

@@ -1,0 +1,4 @@
+change_type: enhancement
+component: engine
+note: "Install a per-runtime reclaim registry on each pinned pipeline thread and add a current_reclaim_registry() thread-local accessor (mirroring the runtime memory budget), so stateful retention sites can register reclaimers; the registry stays inert until sites register and reclaim is driven (gated by enforcement.reclaim_hooks)."
+issues: []

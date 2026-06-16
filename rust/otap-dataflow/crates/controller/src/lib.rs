@@ -77,6 +77,7 @@ use otap_df_engine::entity_context::{
     node_entity_key, pipeline_entity_key, set_pipeline_entity_key,
 };
 use otap_df_engine::error::Error as EngineError;
+use otap_df_engine::memory_budget::reclaim::{ReclaimRegistry, set_current_reclaim_registry};
 use otap_df_engine::memory_budget::{
     RuntimeMemoryBudget, RuntimeMemoryBudgetConfig, set_current_runtime_memory_budget,
 };
@@ -2136,6 +2137,16 @@ impl<
                 .map(std::rc::Rc::new);
             let _runtime_memory_budget_guard =
                 set_current_runtime_memory_budget(runtime_memory_budget);
+
+            // Install the per-runtime reclaim registry on this pinned pipeline
+            // thread alongside the budget, so stateful retention sites running on
+            // this runtime can register their reclaimers through
+            // `current_reclaim_registry()`. The registry is empty until sites
+            // register; driving reclaim from admission/pressure stays gated
+            // behind `enforcement.reclaim_hooks`. The guard clears the slot on
+            // drop, on this same thread.
+            let _runtime_reclaim_registry_guard =
+                set_current_reclaim_registry(Some(ReclaimRegistry::new()));
 
             // The controller creates a pipeline instance into a dedicated thread. The corresponding
             // entity is registered here for proper context tracking and set into thread-local storage
