@@ -1,0 +1,4 @@
+change_type: enhancement
+component: pipeline
+note: "Charge the fanout processor's in-flight requests (slim-primary and full await/sequential/fallback paths) against the observe-only runtime memory budget, releasing on completion, timeout, eviction, and processor drop."
+issues: []

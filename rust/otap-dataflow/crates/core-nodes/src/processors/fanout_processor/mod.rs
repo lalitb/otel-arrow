@@ -28,6 +28,7 @@ use otap_df_engine::context::PipelineContext;
 use otap_df_engine::control::{AckMsg, CallData, Context8u8, NackMsg, NodeControlMsg, UnwindData};
 use otap_df_engine::error::{Error, TypedError};
 use otap_df_engine::local::processor::{EffectHandler, Processor};
+use otap_df_engine::memory_budget::{LocalMemoryTicket, current_runtime_memory_budget};
 use otap_df_engine::message::Message;
 use otap_df_engine::node::NodeId;
 use otap_df_engine::{ConsumerEffectHandlerExtension, Interests, ProducerEffectHandlerExtension};
@@ -360,6 +361,23 @@ struct Inflight {
     /// In parallel mode, all non-fallback destinations are sent immediately.
     /// In sequential mode, only the head of this queue is dispatched at a time.
     next_send_queue: DestinationIndexQueue,
+    /// Memory-budget ticket owning the retained `original_pdata` while the
+    /// request is in-flight. `None` when no runtime budget is installed (or,
+    /// under `enforce`, when admission rejected the charge — fanout is an
+    /// accounting site, not an enforcement point). Dropping the `Inflight` entry
+    /// on any terminal path (completion ack/nack, timeout, capacity eviction, or
+    /// processor drop on shutdown) drops this ticket too, refunding the runtime
+    /// account exactly once.
+    _ticket: Option<LocalMemoryTicket>,
+}
+
+/// Slim primary-only inflight entry: the retained original pdata plus its owning
+/// memory-budget ticket. Dropping the entry (on primary ack/nack, capacity
+/// eviction, or processor drop on shutdown) drops the ticket too, refunding the
+/// runtime account exactly once.
+struct SlimInflight {
+    original_pdata: OtapPdata,
+    _ticket: Option<LocalMemoryTicket>,
 }
 
 #[metric_set(name = "processor.fanout")]
@@ -406,8 +424,9 @@ pub struct FanoutProcessor {
     metrics: MetricSet<FanoutMetrics>,
     /// Full inflight tracking for complex scenarios (sequential, await_all, fallback, timeout).
     inflight: HashMap<u64, Inflight>,
-    /// Slim inflight for primary-only fast path: just request_id -> original_pdata.
-    slim_inflight: HashMap<u64, OtapPdata>,
+    /// Slim inflight for primary-only fast path: just request_id -> original_pdata
+    /// plus its owning memory-budget ticket.
+    slim_inflight: HashMap<u64, SlimInflight>,
     /// Min-heap of deadlines for O(log n) timeout checking.
     /// Uses Reverse<Deadline> to make BinaryHeap behave as a min-heap.
     deadline_heap: BinaryHeap<Reverse<Deadline>>,
@@ -554,6 +573,12 @@ impl FanoutProcessor {
             .filter(|d| d.fallback_for.is_none())
             .count();
 
+        // Charge the retained original pdata while the request is in-flight. The
+        // ticket rides inside the `Inflight` entry so every terminal path
+        // (completion, timeout, capacity eviction, processor drop) releases it
+        // exactly once.
+        let ticket = current_runtime_memory_budget().and_then(|budget| budget.charge(&pdata));
+
         let _ = self.inflight.insert(
             request_id,
             Inflight {
@@ -565,6 +590,7 @@ impl FanoutProcessor {
                 required_origins,
                 original_pdata: pdata,
                 next_send_queue: queue,
+                _ticket: ticket,
             },
         );
 
@@ -977,8 +1003,18 @@ impl FanoutProcessor {
         let request_id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
 
-        // Store only the original pdata for upstream routing on primary ack.
-        let _ = self.slim_inflight.insert(request_id, pdata.clone());
+        // Store the original pdata (for upstream routing on primary ack) plus a
+        // memory-budget ticket charging it while retained. The ticket rides
+        // inside the entry, so primary ack/nack, capacity eviction, or processor
+        // drop releases it exactly once.
+        let ticket = current_runtime_memory_budget().and_then(|budget| budget.charge(&pdata));
+        let _ = self.slim_inflight.insert(
+            request_id,
+            SlimInflight {
+                original_pdata: pdata.clone(),
+                _ticket: ticket,
+            },
+        );
 
         // Send to all destinations with subscription so we receive acks.
         let interests = Interests::ACKS_OR_NACKS;
@@ -1009,7 +1045,9 @@ impl FanoutProcessor {
         }
 
         // Primary acked - forward upstream and clean up.
-        if let Some(original_pdata) = self.slim_inflight.remove(&request_id) {
+        if let Some(slim) = self.slim_inflight.remove(&request_id) {
+            // Removing the entry drops its ticket, releasing the charge.
+            let original_pdata = slim.original_pdata;
             self.metrics.acked.add(1);
             effect_handler
                 .notify_ack(AckMsg::new(original_pdata))
@@ -1033,7 +1071,9 @@ impl FanoutProcessor {
         }
 
         // Primary nacked - forward upstream and clean up.
-        if let Some(original_pdata) = self.slim_inflight.remove(&request_id) {
+        if let Some(slim) = self.slim_inflight.remove(&request_id) {
+            // Removing the entry drops its ticket, releasing the charge.
+            let original_pdata = slim.original_pdata;
             self.metrics.nacked.add(1);
             let nackmsg = NackMsg {
                 reason: nack.reason,
@@ -1676,6 +1716,143 @@ mod tests {
             .expect("ack ok");
         // This config uses slim_inflight (parallel + primary + no fallback/timeout).
         assert!(h.fanout.slim_inflight.is_empty());
+    }
+
+    /// Builds a pdata whose OTLP payload has a known, non-zero charged size,
+    /// subscribed for ack/nack routing like [`make_pdata`].
+    fn make_sized_pdata(n: usize) -> OtapPdata {
+        let payload = OtapPayload::OtlpBytes(OtlpProtoBytes::ExportLogsRequest(
+            bytes::Bytes::from(vec![0u8; n]),
+        ));
+        OtapPdata::new(Context::default(), payload).test_subscribe_to(
+            Interests::ACKS | Interests::NACKS,
+            smallvec![],
+            TEST_UPSTREAM_NODE_ID,
+        )
+    }
+
+    /// Installs an observe-only runtime memory budget on the current thread,
+    /// returning the state, budget, and the thread-local guard.
+    fn install_test_runtime_budget() -> (
+        otap_df_engine::memory_budget::MemoryBudgetState,
+        std::rc::Rc<otap_df_engine::memory_budget::RuntimeMemoryBudget>,
+        otap_df_engine::memory_budget::RuntimeMemoryBudgetGuard,
+    ) {
+        use otap_df_engine::memory_budget::{
+            BudgetMode, BudgetScopeId, MemoryBudgetEnforcement, MemoryBudgetSizing,
+            MemoryBudgetState, RuntimeMemoryBudget, RuntimeMemoryBudgetConfig,
+            set_current_runtime_memory_budget,
+        };
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 1,
+                    lease_step_bytes: 1,
+                    max_overshoot_per_runtime_bytes: 10_000_000,
+                    overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: 100,
+                runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement::default(),
+            },
+            None,
+        );
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let account = handle.local_account().expect("account should be available");
+        let budget = std::rc::Rc::new(RuntimeMemoryBudget::new(account));
+        let guard = set_current_runtime_memory_budget(Some(budget.clone()));
+        (state, budget, guard)
+    }
+
+    #[tokio::test]
+    async fn slim_primary_charges_budget_and_releases_on_ack() {
+        // The slim-primary fast path retains `original_pdata` until the primary
+        // ack/nack. It must charge the runtime memory budget while retained and
+        // release the charge when the request completes.
+        let (state, budget, _guard) = install_test_runtime_budget();
+        let mut h = build_harness(
+            json!([make_dest(TEST_OUT_PORT_NAME, true, None, None)]),
+            "parallel",
+            "primary",
+        );
+
+        h.fanout
+            .process(Message::PData(make_sized_pdata(1024)), &mut h.effect)
+            .await
+            .expect("process ok");
+
+        budget.flush_snapshot();
+        assert_eq!(
+            state.snapshot().charged_bytes,
+            1024,
+            "the retained slim-inflight request must be charged while in-flight"
+        );
+
+        let mut sent = drain(h.outputs.get_mut(TEST_OUT_PORT_NAME).expect("output port"));
+        assert_eq!(sent.len(), 1);
+        let mut ack = AckMsg::new(sent.pop().unwrap());
+        ack.unwind.route = ack.accepted.source_route().unwrap();
+        h.fanout
+            .process(Message::Control(NodeControlMsg::Ack(ack)), &mut h.effect)
+            .await
+            .expect("ack ok");
+
+        assert!(h.fanout.slim_inflight.is_empty());
+        budget.flush_snapshot();
+        assert_eq!(
+            state.snapshot().charged_bytes,
+            0,
+            "completing the request (primary ack) must release the charge"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_path_charges_budget_and_releases_on_drop() {
+        // The full inflight path (await_ack=all) retains `original_pdata` in the
+        // `inflight` map. It must charge while retained, and dropping the
+        // processor (shutdown/teardown, which drops the inflight map) must
+        // release every charge.
+        let (state, budget, _guard) = install_test_runtime_budget();
+        let mut h = build_harness(
+            json!([
+                make_dest("p1", true, None, None),
+                make_dest("p2", false, None, None),
+            ]),
+            "parallel",
+            "all",
+        );
+
+        h.fanout
+            .process(Message::PData(make_sized_pdata(2048)), &mut h.effect)
+            .await
+            .expect("process ok");
+
+        assert_eq!(
+            h.fanout.inflight.len(),
+            1,
+            "full path should track inflight"
+        );
+        budget.flush_snapshot();
+        assert_eq!(
+            state.snapshot().charged_bytes,
+            2048,
+            "the retained full-inflight request must be charged while in-flight"
+        );
+
+        // Teardown: dropping the processor drops the inflight map, releasing the
+        // ticket exactly once (mirrors shutdown, which drops inflight on drop).
+        drop(h);
+        budget.flush_snapshot();
+        assert_eq!(
+            state.snapshot().charged_bytes,
+            0,
+            "dropping the processor must release every in-flight charge"
+        );
     }
 
     #[test]
