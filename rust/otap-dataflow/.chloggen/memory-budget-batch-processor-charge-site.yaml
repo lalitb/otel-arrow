@@ -1,0 +1,4 @@
+change_type: enhancement
+component: pipeline
+note: "Charge the batch processor's pending input buffer against the observe-only runtime memory budget, releasing on flush and processor drop; known-size OTLP inputs charge byte length and unknown-size OTAP inputs are tracked as unknown."
+issues: []

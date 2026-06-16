@@ -42,6 +42,7 @@ use otap_df_engine::{
     control::{AckMsg, CallData, NackMsg, NodeControlMsg, WakeupSlot},
     error::{Error as EngineError, ProcessorErrorKind},
     local::processor as local,
+    memory_budget::{ChargedSize, LocalMemoryTicket, current_runtime_memory_budget},
     message::Message,
     node::NodeId,
     processor::ProcessorWrapper,
@@ -430,6 +431,35 @@ struct Inputs<T: OtapPayloadHelpers> {
 
     /// Total weight across all pending portions, in the active sizer's unit.
     weight: usize,
+
+    /// Memory-budget tickets owning the retained pending inputs, kept exactly
+    /// parallel to `pending` (one ticket per buffered batch, charged on
+    /// [`Inputs::accept`]). A ticket is `None` when no runtime budget is
+    /// installed, when the batch size is unknown (e.g. OTAP arrow records, whose
+    /// `num_bytes` is `None`), or when an `enforce`-mode account rejected the
+    /// charge — the batcher is an accounting site, not an enforcement point, so
+    /// buffering proceeds regardless. Tickets move with the buffer on
+    /// [`Inputs::drain`] and are dropped (refunding the runtime account) when the
+    /// pending batches leave the buffer via [`Inputs::take_pending`] (flush),
+    /// or when the processor is dropped on shutdown.
+    tickets: Vec<Option<LocalMemoryTicket>>,
+}
+
+/// Charges a single retained batch against the current runtime memory budget,
+/// returning the owning ticket. Returns `None` when no runtime budget is
+/// installed or when an `enforce`-mode account rejects the charge; an
+/// unknown-size batch (e.g. OTAP arrow records) yields an observe-only unknown
+/// ticket rather than a known-byte charge.
+fn charge_batch<T: OtapPayloadHelpers>(batch: &T) -> Option<LocalMemoryTicket> {
+    /// Adapts a batch's optional known byte size to the budget's `ChargedSize`.
+    struct BatchSize(Option<u64>);
+    impl ChargedSize for BatchSize {
+        fn charged_size(&self) -> Option<u64> {
+            self.0
+        }
+    }
+    let budget = current_runtime_memory_budget()?;
+    budget.charge(BatchSize(batch.num_bytes().map(|n| n as u64)))
 }
 
 struct MultiContext {
@@ -1317,6 +1347,7 @@ impl<T: OtapPayloadHelpers> Default for Inputs<T> {
             pending: Vec::new(),
             context: Vec::new(),
             weight: 0,
+            tickets: Vec::new(),
         }
     }
 }
@@ -1366,6 +1397,10 @@ impl<T: OtapPayloadHelpers> Inputs<T> {
             pending: self.pending.drain(..).collect(),
             context: self.context.drain(..).collect(),
             weight: std::mem::take(&mut self.weight),
+            // Move the owning tickets with the drained batches so the charge
+            // follows the data; the source buffer is left fully empty (no
+            // pending, no retained charge).
+            tickets: self.tickets.drain(..).collect(),
         }
     }
 
@@ -1391,12 +1426,20 @@ impl<T: OtapPayloadHelpers> Inputs<T> {
     }
 
     fn accept(&mut self, batch: T, part: BatchPortion) {
+        // Charge the retained batch while it is buffered. The ticket is kept
+        // exactly parallel to `pending`, so it is released when this batch later
+        // leaves the buffer (flush) or the processor is dropped.
+        self.tickets.push(charge_batch(&batch));
         self.weight += part.weight;
         self.pending.push(batch);
         self.context.push(part);
     }
 
     fn take_pending(&mut self) -> Vec<T> {
+        // The pending batches are leaving the buffer (flushed into output
+        // batches that become downstream's retained work), so release their
+        // charge by dropping the parallel tickets.
+        self.tickets.clear();
         std::mem::take(&mut self.pending)
     }
 
@@ -3785,5 +3828,154 @@ mod tests {
                 );
             })
             .validate(|_| async {});
+    }
+
+    // ----------------------------------------------------------------------
+    // Memory-budget retained-work ownership (pending batch buffer).
+    // ----------------------------------------------------------------------
+
+    /// Installs an observe-only runtime memory budget on the current thread,
+    /// returning the state, budget, and the thread-local guard.
+    fn install_test_runtime_budget() -> (
+        otap_df_engine::memory_budget::MemoryBudgetState,
+        std::rc::Rc<otap_df_engine::memory_budget::RuntimeMemoryBudget>,
+        otap_df_engine::memory_budget::RuntimeMemoryBudgetGuard,
+    ) {
+        use otap_df_engine::memory_budget::{
+            BudgetMode, BudgetScopeId, MemoryBudgetEnforcement, MemoryBudgetSizing,
+            MemoryBudgetState, RuntimeMemoryBudget, RuntimeMemoryBudgetConfig,
+            set_current_runtime_memory_budget,
+        };
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 1,
+                    lease_step_bytes: 1,
+                    max_overshoot_per_runtime_bytes: 10_000_000,
+                    overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: 100,
+                runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement::default(),
+            },
+            None,
+        );
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let account = handle.local_account().expect("account should be available");
+        let budget = std::rc::Rc::new(RuntimeMemoryBudget::new(account));
+        let guard = set_current_runtime_memory_budget(Some(budget.clone()));
+        (state, budget, guard)
+    }
+
+    fn sized_otlp_batch(n: usize) -> OtlpProtoBytes {
+        OtlpProtoBytes::ExportLogsRequest(Bytes::from(vec![0u8; n]))
+    }
+
+    fn part(weight: usize) -> BatchPortion {
+        BatchPortion::new(None, None, weight)
+    }
+
+    #[test]
+    fn pending_inputs_charge_on_accept_and_release_on_flush() {
+        // Each accepted input charges the runtime memory budget while buffered;
+        // flushing the buffer (take_pending, when the batches leave for output)
+        // releases every charge.
+        let (state, budget, _guard) = install_test_runtime_budget();
+        let mut inputs: Inputs<OtlpProtoBytes> = Inputs::default();
+
+        inputs.accept(sized_otlp_batch(100), part(1));
+        inputs.accept(sized_otlp_batch(250), part(1));
+        assert_eq!(inputs.tickets.len(), inputs.pending.len());
+
+        budget.flush_snapshot();
+        assert_eq!(
+            state.snapshot().charged_bytes,
+            350,
+            "buffered pending inputs must be charged while retained"
+        );
+
+        let flushed = inputs.take_pending();
+        assert_eq!(
+            flushed.len(),
+            2,
+            "take_pending returns the buffered batches"
+        );
+        assert!(inputs.tickets.is_empty(), "flushing releases the tickets");
+        budget.flush_snapshot();
+        assert_eq!(
+            state.snapshot().charged_bytes,
+            0,
+            "flushing the buffer must release every pending-input charge"
+        );
+    }
+
+    #[test]
+    fn pending_inputs_charge_moves_with_drain_and_releases_on_drop() {
+        // `drain` transfers ownership of the buffered inputs (and their charge)
+        // to the returned buffer; dropping that buffer (e.g. processor teardown
+        // on shutdown) releases the charge exactly once.
+        let (state, budget, _guard) = install_test_runtime_budget();
+        let mut inputs: Inputs<OtlpProtoBytes> = Inputs::default();
+        inputs.accept(sized_otlp_batch(128), part(1));
+        inputs.accept(sized_otlp_batch(384), part(1));
+
+        budget.flush_snapshot();
+        assert_eq!(state.snapshot().charged_bytes, 512);
+
+        let moved = inputs.drain();
+        assert!(
+            inputs.tickets.is_empty() && inputs.pending.is_empty(),
+            "drain leaves the source buffer empty (no retained charge)"
+        );
+        budget.flush_snapshot();
+        assert_eq!(
+            state.snapshot().charged_bytes,
+            512,
+            "drain transfers the charge; total retained bytes are unchanged"
+        );
+
+        // Teardown: dropping the drained buffer releases all tickets.
+        drop(moved);
+        budget.flush_snapshot();
+        assert_eq!(
+            state.snapshot().charged_bytes,
+            0,
+            "dropping the drained buffer must release every charge"
+        );
+    }
+
+    #[test]
+    fn unknown_size_inputs_do_not_reject_under_observe_only() {
+        // OTAP arrow records report an unknown size; buffering them must still
+        // succeed (observe-only tracks them as unknown rather than charging
+        // known bytes), keeping known charged bytes at zero.
+        let (state, budget, _guard) = install_test_runtime_budget();
+        let mut inputs: Inputs<OtapArrowRecords> = Inputs::default();
+
+        let mut datagen = DataGenerator::new(1);
+        let msg: OtlpProtoMessage = datagen.generate_logs().into();
+        let batch: OtapArrowRecords = otlp_to_otap(&msg);
+        inputs.accept(batch, part(1));
+        assert_eq!(
+            inputs.tickets.len(),
+            1,
+            "an unknown-size input is still buffered"
+        );
+
+        budget.flush_snapshot();
+        assert_eq!(
+            state.snapshot().charged_bytes,
+            0,
+            "unknown-size inputs contribute no known charged bytes"
+        );
+        assert!(
+            state.snapshot().unknown_count >= 1,
+            "unknown-size retained inputs are tracked as unknown"
+        );
     }
 }
