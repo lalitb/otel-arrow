@@ -349,6 +349,31 @@ pub struct RetryProcessor {
     /// (and dropped, refunding the runtime account) exactly once when the
     /// matching `DelayedData` resumes, when a requeue fails, or when the
     /// processor is dropped (drain/shutdown).
+    ///
+    /// Reclaim-hook blocker (Phase 2e): the retry processor is **not** a valid
+    /// first concrete `LocalMemoryReclaim` site, despite owning these tickets.
+    /// The retained payload itself is a `Box<OtapPdata>` that `requeue_later`
+    /// moves into the engine's `node_local_scheduler` delayed-resumes heap; this
+    /// map holds only the budget ticket, not the data. The scheduler exposes no
+    /// cancel-resume-by-id API (only `cancel_wakeup`, which carries no payload),
+    /// and a registry-driven reclaimer runs outside `process()` with no
+    /// `EffectHandler`/scheduler access. A reclaimer here could therefore only
+    /// drop tickets, which would lower `charged_bytes` without freeing the
+    /// retained `OtapPdata` (it still resumes and is processed) and without
+    /// shedding any data, i.e. it would undercount retained memory and silently
+    /// violate the reclaim contract (release only by dropping the owners already
+    /// held).
+    ///
+    /// Wiring a genuine retry reclaimer requires one of:
+    ///
+    /// 1. moving ownership of the scheduler-retained payload so a single owner
+    ///    holds both the `Box<OtapPdata>` and its `LocalMemoryTicket` and can
+    ///    drop them together under reclaim, or
+    /// 2. a safe scheduler cancel-resume API that returns (or drops) the
+    ///    retained payload together with its ticket.
+    ///
+    /// Until then, `enforcement.reclaim_hooks` stays rejected at config
+    /// validation and no reclaimer is registered from here.
     retry_budget_tickets: HashMap<LocalResumeId, LocalMemoryTicket>,
 }
 

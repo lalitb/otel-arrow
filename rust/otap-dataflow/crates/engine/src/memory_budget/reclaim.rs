@@ -33,6 +33,18 @@
 //! layer rejects until a reclaimer and a driver are wired end to end. Keeping
 //! the mechanism separate lets it be reviewed and tested in isolation before any
 //! site depends on it.
+//!
+//! First-site selection note: the retry processor was evaluated as the first
+//! concrete reclaimer and rejected. It owns the per-payload `LocalMemoryTicket`s
+//! but **not** the retained payload, which `requeue_later` moves into the
+//! engine's `node_local_scheduler` delayed-resumes heap. With no scheduler
+//! cancel-resume API and no scheduler access from a registry-driven reclaimer, a
+//! retry reclaimer could only drop tickets — lowering `charged_bytes` without
+//! freeing the retained `OtapPdata` or shedding data, which would violate the
+//! "release only by dropping owners already held" contract. A valid first site
+//! must own both the retained data and its ticket so reclaim drops them
+//! together (see `retry_processor::RetryProcessor::retry_budget_tickets` and the
+//! Reclaim Hooks section of `docs/memory-limiter-phase2.md`).
 
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
