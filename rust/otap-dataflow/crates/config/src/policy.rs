@@ -236,6 +236,11 @@ impl Policies {
                     "{budget_path}.escrow.topic_default_limit must be greater than 0"
                 ));
             }
+            if memory_budget.escrow.abandoned_reap_after_millis == Some(0) {
+                errors.push(format!(
+                    "{budget_path}.escrow.abandoned_reap_after_millis must be greater than 0 when set"
+                ));
+            }
             if let Some(drain_allowance) = memory_budget.sizing.drain_allowance {
                 // The drain/redemption allowance is carved out of the runtime
                 // floor and must be able to cover at least one lease-step-sized
@@ -673,6 +678,18 @@ pub struct MemoryBudgetEscrowPolicy {
     #[serde(deserialize_with = "deserialize_required_u64")]
     #[schemars(with = "String")]
     pub topic_default_limit: u64,
+
+    /// Optional abandoned-escrow reaper threshold, in milliseconds.
+    ///
+    /// When set, an abandoned escrow charge (an `EscrowTicket` dropped without an
+    /// explicit redeem/release/abort — a leak) is reclaimed once it has been held
+    /// for at least this long, returning its bytes to the global pool. Reclaimed
+    /// charges remain visible through the cumulative abandoned- and reaped-escrow
+    /// metrics, so leaks are never silently hidden. When omitted (the default),
+    /// abandoned escrow stays sticky indefinitely, preserving the prior behavior.
+    /// Must be greater than zero when present.
+    #[serde(default)]
+    pub abandoned_reap_after_millis: Option<u64>,
 }
 
 /// Runtime memory-budget enforcement gates.
@@ -1366,6 +1383,7 @@ mod tests {
                     },
                     escrow: super::MemoryBudgetEscrowPolicy {
                         topic_default_limit: 64 * 1024 * 1024,
+                        abandoned_reap_after_millis: None,
                     },
                     enforcement: super::MemoryBudgetEnforcementPolicy::default(),
                 }),
@@ -1398,6 +1416,7 @@ mod tests {
                     },
                     escrow: super::MemoryBudgetEscrowPolicy {
                         topic_default_limit: 64 * 1024 * 1024,
+                        abandoned_reap_after_millis: None,
                     },
                     enforcement: super::MemoryBudgetEnforcementPolicy::default(),
                 }),
@@ -1438,6 +1457,7 @@ mod tests {
                     },
                     escrow: super::MemoryBudgetEscrowPolicy {
                         topic_default_limit: 64 * 1024 * 1024,
+                        abandoned_reap_after_millis: None,
                     },
                     enforcement: super::MemoryBudgetEnforcementPolicy {
                         receiver_admission: true,
@@ -1482,6 +1502,7 @@ mod tests {
                     },
                     escrow: super::MemoryBudgetEscrowPolicy {
                         topic_default_limit: 64 * 1024 * 1024,
+                        abandoned_reap_after_millis: None,
                     },
                     enforcement: super::MemoryBudgetEnforcementPolicy {
                         receiver_admission: true,
@@ -1517,6 +1538,7 @@ mod tests {
             },
             escrow: super::MemoryBudgetEscrowPolicy {
                 topic_default_limit: 64 * 1024 * 1024,
+                abandoned_reap_after_millis: None,
             },
             enforcement: super::MemoryBudgetEnforcementPolicy::default(),
         }

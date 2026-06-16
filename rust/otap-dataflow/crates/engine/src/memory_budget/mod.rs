@@ -16,7 +16,7 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use smallvec::SmallVec;
 
@@ -339,6 +339,16 @@ pub struct MemoryBudgetSnapshot {
     pub abandoned_escrow_oldest_age_millis: u64,
     /// Number of bounded abandoned-escrow alarms emitted by this state.
     pub abandoned_escrow_alarm_count: u64,
+    /// Cumulative count of abandoned-escrow entries reclaimed by the reaper.
+    ///
+    /// Reaping returns a leaked escrow charge's bytes to the global pool once it
+    /// has been held longer than the configured reap threshold. The cumulative
+    /// abandoned-escrow count/bytes are never decremented, so the difference
+    /// between abandoned and reaped totals stays observable: leaks are reclaimed
+    /// but never silently hidden.
+    pub reaped_escrow_count: u64,
+    /// Cumulative bytes reclaimed from abandoned escrow by the reaper.
+    pub reaped_escrow_bytes: u64,
     /// Escrow tickets currently owning logical retained bytes.
     pub escrow_ticket_count: u64,
     /// Escrow bytes currently owning logical retained bytes.
@@ -381,6 +391,14 @@ struct MemoryBudgetStateInner {
     abandoned_escrow_bytes: AtomicU64,
     abandoned_escrow_alarm_count: AtomicU64,
     abandoned_escrow_alarm_fired: AtomicBool,
+    /// Reaper threshold in milliseconds. `0` (the default) disables reaping, so
+    /// abandoned escrow stays sticky indefinitely. When non-zero, abandoned
+    /// entries older than this are reclaimed (their bytes returned to the pool)
+    /// during the periodic snapshot maintenance pass.
+    abandoned_escrow_reap_after_millis: AtomicU64,
+    /// Cumulative count/bytes reclaimed by the reaper, preserved for observability.
+    reaped_escrow_count: AtomicU64,
+    reaped_escrow_bytes: AtomicU64,
     escrow_ticket_count: AtomicU64,
     escrow_charged_bytes: AtomicU64,
     escrow_buckets: Mutex<HashMap<Arc<str>, EscrowBucket>>,
@@ -398,6 +416,14 @@ struct MemoryBudgetStateInner {
 #[derive(Debug)]
 struct AbandonedEscrowEntry {
     abandoned_at: Instant,
+    /// Bytes owned by the abandoned escrow, needed to reverse the charge on reap.
+    bytes: u64,
+    /// Whether the abandoned escrow held an explicit pool borrow, so the reaper
+    /// returns bytes to the pool (vs. decrementing the observe-only overshoot).
+    pool_backed: bool,
+    /// The boundary bucket the abandoned escrow was charged against, so the
+    /// reaper releases the same bucket it charged.
+    bucket: EscrowBucket,
 }
 
 /// Shared runtime memory-budget state.
@@ -550,6 +576,10 @@ impl MemoryBudgetState {
     /// Returns an aggregated snapshot across all registered runtimes.
     #[must_use]
     pub fn snapshot(&self) -> MemoryBudgetSnapshot {
+        // Run the abandoned-escrow reaper as part of the periodic maintenance
+        // pass before reading the aggregated counters, so reclaimed bytes are
+        // reflected in the same snapshot. A no-op when reaping is disabled.
+        let _ = self.reap_abandoned_escrow();
         let mut snapshots = self
             .inner
             .snapshots
@@ -565,6 +595,8 @@ impl MemoryBudgetState {
                 .inner
                 .abandoned_escrow_alarm_count
                 .load(Ordering::Relaxed),
+            reaped_escrow_count: self.inner.reaped_escrow_count.load(Ordering::Relaxed),
+            reaped_escrow_bytes: self.inner.reaped_escrow_bytes.load(Ordering::Relaxed),
             escrow_ticket_count: self.inner.escrow_ticket_count.load(Ordering::Relaxed),
             escrow_charged_bytes: self.inner.escrow_charged_bytes.load(Ordering::Relaxed),
             escrow_pool_held_bytes: self.inner.escrow_pool_held_bytes.load(Ordering::Relaxed),
@@ -671,13 +703,16 @@ impl MemoryBudgetState {
             .map(EscrowBucket::charged_bytes)
     }
 
-    fn abandon_escrow(&self, bytes: u64) {
+    fn abandon_escrow(&self, bytes: u64, pool_backed: bool, bucket: &EscrowBucket) {
         self.inner
             .abandoned_escrow
             .lock()
             .expect("memory budget abandoned escrow poisoned")
             .push_back(AbandonedEscrowEntry {
                 abandoned_at: Instant::now(),
+                bytes,
+                pool_backed,
+                bucket: bucket.clone(),
             });
         let count = self
             .inner
@@ -705,6 +740,89 @@ impl MemoryBudgetState {
                 message = "unresolved escrow dropped; charge remains sticky until an explicit reaper policy is configured",
             );
         }
+    }
+
+    /// Configures the abandoned-escrow reaper threshold.
+    ///
+    /// `Some(duration)` enables reaping: an abandoned escrow charge (a leaked
+    /// `EscrowTicket` dropped without resolution) is reclaimed once it has been
+    /// held at least `duration`, returning its bytes to the global pool while the
+    /// cumulative abandoned/reaped metrics keep the leak observable. `None` (the
+    /// default) disables reaping, preserving the prior sticky-forever behavior.
+    /// A zero duration is treated as disabled.
+    pub fn set_abandoned_escrow_reap_after(&self, after: Option<Duration>) {
+        let millis = after
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        self.inner
+            .abandoned_escrow_reap_after_millis
+            .store(millis, Ordering::Relaxed);
+    }
+
+    /// Reclaims abandoned escrow entries older than the configured reap
+    /// threshold, returning their bytes to the global pool.
+    ///
+    /// This is the explicit, conservative reaper policy. It is safe because an
+    /// abandoned escrow charge is permanently orphaned the moment its
+    /// `EscrowTicket` is dropped — no code can ever redeem/release/abort it
+    /// again — so reclaiming only reverses an accounting charge that can never be
+    /// resolved otherwise. Entries are reaped oldest-first (the deque is
+    /// chronological); reclaimed bytes are recorded in the cumulative
+    /// `reaped_escrow_count`/`reaped_escrow_bytes` totals so leaks remain visible
+    /// rather than silently hidden. The cumulative abandoned totals are never
+    /// decremented. Returns the number of entries reaped.
+    ///
+    /// Runs during the periodic snapshot maintenance pass; a no-op when reaping
+    /// is disabled or no entry has aged past the threshold.
+    fn reap_abandoned_escrow(&self) -> u64 {
+        let after_millis = self
+            .inner
+            .abandoned_escrow_reap_after_millis
+            .load(Ordering::Relaxed);
+        if after_millis == 0 {
+            return 0;
+        }
+        let after = Duration::from_millis(after_millis);
+
+        // Collect the due entries under the lock, then reverse their charges
+        // outside it to avoid holding the deque lock across pool/bucket updates.
+        let mut due: Vec<AbandonedEscrowEntry> = Vec::new();
+        {
+            let mut abandoned = self
+                .inner
+                .abandoned_escrow
+                .lock()
+                .expect("memory budget abandoned escrow poisoned");
+            while let Some(front) = abandoned.front() {
+                if front.abandoned_at.elapsed() < after {
+                    // Entries are chronological; the first non-due entry means no
+                    // older entry remains.
+                    break;
+                }
+                due.push(abandoned.pop_front().expect("front exists"));
+            }
+        }
+
+        let mut reaped = 0u64;
+        let mut reaped_bytes = 0u64;
+        for entry in due {
+            // Reverse the abandoned charge exactly as an explicit release would,
+            // returning pool-backed bytes to the global pool.
+            self.release_escrow(entry.bytes, entry.pool_backed, &entry.bucket);
+            reaped = reaped.saturating_add(1);
+            reaped_bytes = reaped_bytes.saturating_add(entry.bytes);
+        }
+        if reaped > 0 {
+            let _ = self
+                .inner
+                .reaped_escrow_count
+                .fetch_add(reaped, Ordering::Relaxed);
+            let _ = self
+                .inner
+                .reaped_escrow_bytes
+                .fetch_add(reaped_bytes, Ordering::Relaxed);
+        }
+        reaped
     }
 
     /// Outcome of [`MemoryBudgetState::try_charge_escrow`].
@@ -1970,7 +2088,8 @@ impl Drop for EscrowTicket {
         if !self.resolved {
             // No explicit redeem/release/abort ran: record an abandoned-escrow
             // entry so the leak stays visible instead of silently succeeding.
-            self.state.abandon_escrow(self.bytes);
+            self.state
+                .abandon_escrow(self.bytes, self.pool_backed, &self.bucket);
             self.resolved = true;
         }
     }
@@ -3068,6 +3187,149 @@ mod tests {
             state.inner.pool.available_bytes(),
             pool_before,
             "release returns the escrow's pool borrow exactly"
+        );
+    }
+
+    /// Builds a pool-backed escrow state plus an account sharing its pool, so
+    /// escrow conversions draw an explicit pool borrow (mirrors the conservation
+    /// test setup). Used by the abandoned-escrow reaper tests.
+    fn pool_backed_escrow_state_and_account() -> (MemoryBudgetState, Rc<RuntimeMemoryAccount>) {
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 100,
+                    lease_step_bytes: 10,
+                    max_overshoot_per_runtime_bytes: 20,
+                    overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: 200,
+                runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement::default(),
+            },
+            Some(200),
+        );
+        let pool = state.inner.pool.clone();
+        let acct = Rc::new(RuntimeMemoryAccount::new(
+            100,
+            10,
+            20,
+            BudgetMode::ObserveOnly,
+            Arc::new(pool),
+            Arc::new(RuntimeMemorySnapshot::default()),
+            Arc::new(BudgetScopeId::default()),
+        ));
+        (state, acct)
+    }
+
+    #[test]
+    fn abandoned_escrow_reaper_reclaims_after_threshold() {
+        // With the reaper enabled, an abandoned escrow charge is reclaimed once
+        // it ages past the threshold: its bytes return to the pool and the escrow
+        // counters reverse, while the cumulative abandoned/reaped totals keep the
+        // leak observable.
+        let (state, acct) = pool_backed_escrow_state_and_account();
+        state.set_abandoned_escrow_reap_after(Some(Duration::from_millis(50)));
+        let pool_before = state.inner.pool.available_bytes();
+
+        let escrow = acct
+            .charge(40_u64)
+            .expect("charge should fit")
+            .try_into_escrow(&state)
+            .expect("escrow should fit");
+        drop(escrow); // abandoned (no explicit redeem/release/abort)
+
+        // Immediately (well under the 50ms threshold) the charge is still sticky.
+        let before = state.snapshot();
+        assert_eq!(before.abandoned_escrow_count, 1);
+        assert_eq!(before.reaped_escrow_count, 0, "not yet aged past threshold");
+        assert_eq!(before.escrow_charged_bytes, 40, "sticky before reaping");
+        assert_eq!(before.escrow_pool_held_bytes, 40);
+
+        std::thread::sleep(Duration::from_millis(70));
+        let after = state.snapshot(); // maintenance pass runs the reaper
+
+        assert_eq!(
+            after.reaped_escrow_count, 1,
+            "the aged abandoned escrow is reaped"
+        );
+        assert_eq!(after.reaped_escrow_bytes, 40);
+        assert_eq!(
+            after.escrow_charged_bytes, 0,
+            "reaping reverses the escrow charge"
+        );
+        assert_eq!(after.escrow_ticket_count, 0);
+        assert_eq!(
+            after.escrow_pool_held_bytes, 0,
+            "reaped bytes leave the pool hold"
+        );
+        assert_eq!(
+            state.inner.pool.available_bytes(),
+            pool_before,
+            "reaping returns the abandoned escrow's pool borrow exactly"
+        );
+        assert_eq!(
+            after.abandoned_escrow_count, 1,
+            "cumulative abandoned total stays observable after reaping"
+        );
+        assert_eq!(after.abandoned_escrow_bytes, 40);
+        assert_eq!(
+            after.abandoned_escrow_oldest_age_millis, 0,
+            "no un-reaped abandoned escrow remains"
+        );
+    }
+
+    #[test]
+    fn abandoned_escrow_not_reaped_when_disabled() {
+        // Default (reaper disabled): abandoned escrow stays sticky indefinitely.
+        let (state, acct) = pool_backed_escrow_state_and_account();
+        let escrow = acct
+            .charge(25_u64)
+            .expect("charge should fit")
+            .try_into_escrow(&state)
+            .expect("escrow should fit");
+        drop(escrow);
+
+        std::thread::sleep(Duration::from_millis(10));
+        let snap = state.snapshot();
+        assert_eq!(snap.reaped_escrow_count, 0, "no reaping when disabled");
+        assert_eq!(
+            snap.escrow_charged_bytes, 25,
+            "abandoned escrow remains sticky when the reaper is disabled"
+        );
+    }
+
+    #[test]
+    fn explicit_escrow_release_is_never_reaped() {
+        // Explicit release is a tracked terminal path: it never records an
+        // abandoned entry, so the reaper has nothing to reclaim.
+        let (state, acct) = pool_backed_escrow_state_and_account();
+        state.set_abandoned_escrow_reap_after(Some(Duration::from_millis(1)));
+
+        let escrow = acct
+            .charge(30_u64)
+            .expect("charge should fit")
+            .try_into_escrow(&state)
+            .expect("escrow should fit");
+        escrow.release();
+
+        std::thread::sleep(Duration::from_millis(10));
+        let snap = state.snapshot();
+        assert_eq!(
+            snap.abandoned_escrow_count, 0,
+            "explicit release records no abandoned escrow"
+        );
+        assert_eq!(
+            snap.reaped_escrow_count, 0,
+            "nothing to reap after explicit release"
+        );
+        assert_eq!(
+            snap.escrow_charged_bytes, 0,
+            "explicit release already returned the charge"
         );
     }
 

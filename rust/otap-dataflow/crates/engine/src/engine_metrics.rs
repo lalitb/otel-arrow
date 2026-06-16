@@ -134,6 +134,14 @@ pub struct EngineMetrics {
     #[metric(unit = "{alarm}")]
     pub runtime_memory_budget_abandoned_escrow_alarm_count: Gauge<u64>,
 
+    /// Abandoned-escrow entries reclaimed by the reaper (cumulative).
+    #[metric(unit = "{ticket}")]
+    pub runtime_memory_budget_reaped_escrow_count: Gauge<u64>,
+
+    /// Bytes reclaimed from abandoned escrow by the reaper (cumulative).
+    #[metric(unit = "{By}")]
+    pub runtime_memory_budget_reaped_escrow_bytes: Gauge<u64>,
+
     /// Escrow tickets currently owning logical retained bytes.
     #[metric(unit = "{ticket}")]
     pub runtime_memory_budget_escrow_ticket_count: Gauge<u64>,
@@ -295,6 +303,12 @@ impl EngineMetricsMonitor {
         self.metrics
             .runtime_memory_budget_abandoned_escrow_alarm_count
             .set(memory_budget.abandoned_escrow_alarm_count);
+        self.metrics
+            .runtime_memory_budget_reaped_escrow_count
+            .set(memory_budget.reaped_escrow_count);
+        self.metrics
+            .runtime_memory_budget_reaped_escrow_bytes
+            .set(memory_budget.reaped_escrow_bytes);
         self.metrics
             .runtime_memory_budget_escrow_ticket_count
             .set(memory_budget.escrow_ticket_count);

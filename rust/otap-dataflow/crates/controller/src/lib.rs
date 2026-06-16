@@ -1386,6 +1386,16 @@ impl<
                 RuntimeMemoryBudgetConfig::from_policy(memory_budget_policy, runtime_count),
                 hard_limit_bytes,
             );
+            // Wire the abandoned-escrow reaper threshold from policy. Defaults to
+            // disabled (sticky abandoned escrow) when omitted.
+            controller_ctx
+                .memory_budget_state()
+                .set_abandoned_escrow_reap_after(
+                    memory_budget_policy
+                        .escrow
+                        .abandoned_reap_after_millis
+                        .map(Duration::from_millis),
+                );
         }
 
         let runtime = Arc::new(ControllerRuntime::new(

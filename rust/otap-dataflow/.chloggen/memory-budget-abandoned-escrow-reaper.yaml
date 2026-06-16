@@ -1,0 +1,4 @@
+change_type: enhancement
+component: engine
+note: "Add an optional abandoned-escrow reaper (escrow.abandoned_reap_after_millis) that reclaims leaked escrow charges back to the global pool after a configurable age, with cumulative reaped-escrow metrics keeping the leak observable."
+issues: []
