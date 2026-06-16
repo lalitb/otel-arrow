@@ -1,0 +1,4 @@
+change_type: enhancement
+component: engine
+note: "Harden the reclaim mechanism before wiring concrete reclaimers: make LocalMemoryReclaim and the reclaim coordinator/registry synchronous (removing the async/borrow-across-await hazard), and make config gating honest by rejecting unwired enforcement.receiver_admission and enforcement.reclaim_hooks in all builds (including unstable-memory-enforcement) while still accepting the wired queue_publish only under that feature."
+issues: []

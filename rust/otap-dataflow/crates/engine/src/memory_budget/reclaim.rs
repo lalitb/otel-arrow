@@ -8,8 +8,10 @@
 //! memory on demand when a runtime is under pressure. This module provides the
 //! engine-side primitives for that, intentionally scoped to the *mechanism*:
 //!
-//! - [`LocalMemoryReclaim`]: the `!Send` reclaim trait a stateful component
-//!   implements.
+//! - [`LocalMemoryReclaim`]: the `!Send`, **synchronous** reclaim trait a
+//!   stateful component implements. Reclaim is non-blocking and releases memory
+//!   only through RAII drop of owners the component already holds, so it cannot
+//!   await, yield, or acquire budget.
 //! - [`ReclaimContext`]: a **budget-free** capability token. It exposes only
 //!   inspection; it has no method to reserve, charge, or otherwise acquire
 //!   budget, so a reclaim implementation cannot accidentally grow the budget
@@ -20,19 +22,21 @@
 //!   [`ReclaimPriority`] order, stops once the target byte count is met or all
 //!   reclaimers report no progress, and refuses re-entry on the same runtime
 //!   thread.
+//! - [`ReclaimRegistry`]: a runtime-local registration lifecycle over the
+//!   coordinator (register/unregister with RAII teardown), installed per pinned
+//!   pipeline thread and reachable via [`current_reclaim_registry`].
 //!
-//! This is the Phase 2e *foundation*: the coordinator does not own a registry
-//! of retention sites and is not yet wired into receiver admission or any node.
-//! Wiring concrete reclaimers (and enabling reclaim-driven enforcement) is
-//! gated behind `enforcement.reclaim_hooks`, which the config layer still
-//! rejects. Keeping the primitive separate lets it be reviewed and tested in
-//! isolation before any site depends on it.
+//! This is the Phase 2e *foundation/mechanism*. A registry is installed per
+//! runtime, but **no concrete site registers a reclaimer and no driver calls
+//! reclaim yet**. Wiring concrete reclaimers (and enabling reclaim-driven
+//! enforcement) is gated behind `enforcement.reclaim_hooks`, which the config
+//! layer rejects until a reclaimer and a driver are wired end to end. Keeping
+//! the mechanism separate lets it be reviewed and tested in isolation before any
+//! site depends on it.
 
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::rc::{Rc, Weak};
-
-use async_trait::async_trait;
 
 /// Deterministic ordering class for reclaim attempts.
 ///
@@ -121,19 +125,21 @@ impl ReclaimContext<'_> {
 
 /// A stateful, runtime-local component that can release retained memory.
 ///
-/// Implementations are `!Send` (`?Send` trait): they run on the pinned pipeline
-/// runtime thread alongside the local budget account. `reclaim` must be
-/// best-effort, bounded, and budget-free — it may drop, drain, abort, or report
-/// no progress, but it must not acquire budget. It must also tolerate being
-/// called again later.
-#[async_trait(?Send)]
+/// Implementations are `!Send`: they run on the pinned pipeline runtime thread
+/// alongside the local budget account. `reclaim` is **synchronous and
+/// non-blocking** by design — it releases memory by dropping, draining, or
+/// aborting the owners it already holds (RAII), which never blocks or awaits.
+/// Keeping it synchronous makes the contract enforceable: a reclaimer cannot
+/// yield to other tasks while the registry holds it borrowed, so there is no
+/// borrow-across-await hazard, and reclaim stays bounded, runtime-local, and
+/// budget-free. It must also tolerate being called again later.
 pub trait LocalMemoryReclaim {
     /// The ordering class for this reclaimer.
     fn reclaim_priority(&self) -> ReclaimPriority;
 
     /// Attempts to release up to `target_bytes`. Returns how much was attempted
     /// and released and whether more is available.
-    async fn reclaim(&mut self, target_bytes: u64, context: ReclaimContext<'_>) -> ReclaimResult;
+    fn reclaim(&mut self, target_bytes: u64, context: ReclaimContext<'_>) -> ReclaimResult;
 }
 
 /// Result of a coordinator-driven reclaim pass.
@@ -198,7 +204,7 @@ impl ReclaimCoordinator {
     /// coordinator) the nested call returns immediately with
     /// [`ReclaimOutcome::reentered`] set and performs no work, so the same hook
     /// cannot be driven concurrently.
-    pub async fn reclaim(
+    pub fn reclaim(
         &self,
         reclaimers: &mut [&mut dyn LocalMemoryReclaim],
         target_bytes: u64,
@@ -235,7 +241,7 @@ impl ReclaimCoordinator {
                 }
                 let remaining = target_bytes - released_total;
                 let context = ReclaimContext::new(remaining);
-                let result = reclaimers[index].reclaim(remaining, context).await;
+                let result = reclaimers[index].reclaim(remaining, context);
                 released_total = released_total.saturating_add(result.released_bytes);
                 if result.released_bytes > 0 {
                     progressed = true;
@@ -256,20 +262,13 @@ impl ReclaimCoordinator {
     /// Like [`reclaim`](Self::reclaim) but drives shared, runtime-local
     /// reclaimers held as `Rc<RefCell<dyn LocalMemoryReclaim>>` (the shape the
     /// [`ReclaimRegistry`] stores). Each reclaimer is borrowed only for the
-    /// duration of its own `reclaim` call, so registered reclaimers are never all
-    /// borrowed simultaneously and a reclaimer may safely register/unregister
-    /// others mid-pass (changes apply to the next pass).
-    //
-    // A reclaimer is necessarily borrowed (`borrow_mut`) across its own async
-    // `reclaim` call. This is sound here: the re-entry guard above refuses any
-    // nested registry/coordinator pass before it borrows anything, and the
-    // `LocalMemoryReclaim` contract requires reclaim to be bounded, budget-free,
-    // and non-yielding to tasks that could touch the same state. No other code
-    // path can re-borrow the same cell while the call is in flight on this single
-    // runtime thread, so the borrow-across-await hazard the lint guards against
-    // cannot occur.
-    #[allow(clippy::await_holding_refcell_ref)]
-    pub async fn reclaim_shared(
+    /// duration of its own (synchronous) `reclaim` call, so registered
+    /// reclaimers are never all borrowed simultaneously and a reclaimer may
+    /// safely register/unregister others mid-pass (changes apply to the next
+    /// pass). Because `reclaim` is synchronous it cannot yield while borrowed, so
+    /// no other code path on this single runtime thread can re-borrow the same
+    /// cell during the call.
+    pub fn reclaim_shared(
         &self,
         reclaimers: &[Rc<RefCell<dyn LocalMemoryReclaim>>],
         target_bytes: u64,
@@ -310,7 +309,7 @@ impl ReclaimCoordinator {
                 // Borrow only this reclaimer, and only across its own call.
                 let result = {
                     let mut reclaimer = reclaimers[index].borrow_mut();
-                    reclaimer.reclaim(remaining, context).await
+                    reclaimer.reclaim(remaining, context)
                 };
                 released_total = released_total.saturating_add(result.released_bytes);
                 if result.released_bytes > 0 {
@@ -412,7 +411,7 @@ impl ReclaimRegistry {
     /// reclaimer that calls back into the registry), the nested call returns
     /// immediately with [`ReclaimOutcome::reentered`] set and performs no work —
     /// without attempting to re-borrow the already-borrowed reclaimers.
-    pub async fn reclaim(&self, target_bytes: u64) -> ReclaimOutcome {
+    pub fn reclaim(&self, target_bytes: u64) -> ReclaimOutcome {
         // Snapshot the registered reclaimer handles so the registry inner is not
         // borrowed across the pass: a reclaimer may register or unregister
         // (mutating the registry) during the pass; such changes apply to the
@@ -426,9 +425,7 @@ impl ReclaimRegistry {
             .iter()
             .map(|entry| Rc::clone(&entry.reclaimer))
             .collect();
-        self.coordinator
-            .reclaim_shared(&handles, target_bytes)
-            .await
+        self.coordinator.reclaim_shared(&handles, target_bytes)
     }
 }
 
@@ -563,17 +560,12 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
     impl LocalMemoryReclaim for TicketReclaimer {
         fn reclaim_priority(&self) -> ReclaimPriority {
             self.priority
         }
 
-        async fn reclaim(
-            &mut self,
-            target_bytes: u64,
-            _context: ReclaimContext<'_>,
-        ) -> ReclaimResult {
+        fn reclaim(&mut self, target_bytes: u64, _context: ReclaimContext<'_>) -> ReclaimResult {
             self.calls += 1;
             let mut released = 0_u64;
             let mut attempted = 0_u64;
@@ -596,17 +588,12 @@ mod tests {
         priority: ReclaimPriority,
     }
 
-    #[async_trait(?Send)]
     impl LocalMemoryReclaim for StuckReclaimer {
         fn reclaim_priority(&self) -> ReclaimPriority {
             self.priority
         }
 
-        async fn reclaim(
-            &mut self,
-            _target_bytes: u64,
-            _context: ReclaimContext<'_>,
-        ) -> ReclaimResult {
+        fn reclaim(&mut self, _target_bytes: u64, _context: ReclaimContext<'_>) -> ReclaimResult {
             ReclaimResult::no_progress()
         }
     }
@@ -618,35 +605,28 @@ mod tests {
         observed_reentry: bool,
     }
 
-    #[async_trait(?Send)]
     impl LocalMemoryReclaim for ReentrantReclaimer {
         fn reclaim_priority(&self) -> ReclaimPriority {
             ReclaimPriority::Processor
         }
 
-        async fn reclaim(
-            &mut self,
-            _target_bytes: u64,
-            _context: ReclaimContext<'_>,
-        ) -> ReclaimResult {
+        fn reclaim(&mut self, _target_bytes: u64, _context: ReclaimContext<'_>) -> ReclaimResult {
             // Attempt a nested pass; it must be refused.
-            let nested = self.coordinator.reclaim(&mut [], 1).await;
+            let nested = self.coordinator.reclaim(&mut [], 1);
             self.observed_reentry = nested.reentered;
             ReclaimResult::no_progress()
         }
     }
 
-    #[tokio::test]
-    async fn reclaim_releases_up_to_target_and_stops() {
+    #[test]
+    fn reclaim_releases_up_to_target_and_stops() {
         let account = test_account();
         let mut reclaimer = TicketReclaimer::new(ReclaimPriority::Queue, &account, &[40, 40, 40]);
         let charged_before = account.charged_bytes.get();
         assert_eq!(charged_before, 120);
 
         let coordinator = ReclaimCoordinator::new();
-        let outcome = coordinator
-            .reclaim(&mut [&mut reclaimer as &mut dyn LocalMemoryReclaim], 60)
-            .await;
+        let outcome = coordinator.reclaim(&mut [&mut reclaimer as &mut dyn LocalMemoryReclaim], 60);
 
         assert!(outcome.target_met);
         assert_eq!(
@@ -660,15 +640,14 @@ mod tests {
         assert_eq!(reclaimer.held.len(), 1);
     }
 
-    #[tokio::test]
-    async fn reclaim_reports_partial_progress_when_target_unmet() {
+    #[test]
+    fn reclaim_reports_partial_progress_when_target_unmet() {
         let account = test_account();
         let mut reclaimer = TicketReclaimer::new(ReclaimPriority::Buffer, &account, &[30, 30]);
         let coordinator = ReclaimCoordinator::new();
 
-        let outcome = coordinator
-            .reclaim(&mut [&mut reclaimer as &mut dyn LocalMemoryReclaim], 1_000)
-            .await;
+        let outcome =
+            coordinator.reclaim(&mut [&mut reclaimer as &mut dyn LocalMemoryReclaim], 1_000);
 
         assert!(!outcome.target_met);
         assert_eq!(outcome.released_bytes, 60);
@@ -676,24 +655,22 @@ mod tests {
         assert!(reclaimer.held.is_empty());
     }
 
-    #[tokio::test]
-    async fn reclaim_handles_no_progress_without_spinning() {
+    #[test]
+    fn reclaim_handles_no_progress_without_spinning() {
         let mut stuck = StuckReclaimer {
             priority: ReclaimPriority::Stream,
         };
         let coordinator = ReclaimCoordinator::new();
 
-        let outcome = coordinator
-            .reclaim(&mut [&mut stuck as &mut dyn LocalMemoryReclaim], 500)
-            .await;
+        let outcome = coordinator.reclaim(&mut [&mut stuck as &mut dyn LocalMemoryReclaim], 500);
 
         assert!(!outcome.target_met);
         assert_eq!(outcome.released_bytes, 0);
         assert!(!outcome.reentered);
     }
 
-    #[tokio::test]
-    async fn reclaim_drives_priority_order_queue_before_stream() {
+    #[test]
+    fn reclaim_drives_priority_order_queue_before_stream() {
         let account = test_account();
         // Stream reclaimer is registered first but must run after the queue
         // reclaimer; with a target of 10 only the first-asked reclaimer releases.
@@ -701,32 +678,29 @@ mod tests {
         let mut queue = TicketReclaimer::new(ReclaimPriority::Queue, &account, &[10]);
         let coordinator = ReclaimCoordinator::new();
 
-        let outcome = coordinator
-            .reclaim(
-                &mut [
-                    &mut stream as &mut dyn LocalMemoryReclaim,
-                    &mut queue as &mut dyn LocalMemoryReclaim,
-                ],
-                10,
-            )
-            .await;
+        let outcome = coordinator.reclaim(
+            &mut [
+                &mut stream as &mut dyn LocalMemoryReclaim,
+                &mut queue as &mut dyn LocalMemoryReclaim,
+            ],
+            10,
+        );
 
         assert!(outcome.target_met);
         assert_eq!(queue.calls, 1, "queue reclaimer is asked first");
         assert_eq!(stream.calls, 0, "stream reclaimer is not reached once met");
     }
 
-    #[tokio::test]
-    async fn reclaim_refuses_reentry() {
+    #[test]
+    fn reclaim_refuses_reentry() {
         let coordinator = Rc::new(ReclaimCoordinator::new());
         let mut reentrant = ReentrantReclaimer {
             coordinator: Rc::clone(&coordinator),
             observed_reentry: false,
         };
 
-        let outcome = coordinator
-            .reclaim(&mut [&mut reentrant as &mut dyn LocalMemoryReclaim], 100)
-            .await;
+        let outcome =
+            coordinator.reclaim(&mut [&mut reentrant as &mut dyn LocalMemoryReclaim], 100);
 
         assert!(!outcome.reentered, "outer pass runs normally");
         assert!(
@@ -741,8 +715,8 @@ mod tests {
     // Registry lifecycle.
     // ----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn registry_drives_registered_reclaimers_in_priority_order() {
+    #[test]
+    fn registry_drives_registered_reclaimers_in_priority_order() {
         let account = test_account();
         let registry = ReclaimRegistry::new();
         assert!(registry.is_empty());
@@ -762,7 +736,7 @@ mod tests {
         let _queue_reg = registry.register(queue.clone() as Rc<RefCell<dyn LocalMemoryReclaim>>);
         assert_eq!(registry.len(), 2);
 
-        let outcome = registry.reclaim(10).await;
+        let outcome = registry.reclaim(10);
         assert!(outcome.target_met);
         assert_eq!(queue.borrow().calls, 1, "queue reclaimer is asked first");
         assert_eq!(
@@ -774,8 +748,8 @@ mod tests {
         assert_eq!(account.charged_bytes.get(), 10);
     }
 
-    #[tokio::test]
-    async fn registry_unregisters_on_registration_drop() {
+    #[test]
+    fn registry_unregisters_on_registration_drop() {
         let account = test_account();
         let registry = ReclaimRegistry::new();
 
@@ -793,7 +767,7 @@ mod tests {
         drop(registration);
         assert!(registry.is_empty());
 
-        let outcome = registry.reclaim(25).await;
+        let outcome = registry.reclaim(25);
         assert!(!outcome.target_met);
         assert_eq!(outcome.released_bytes, 0);
         assert_eq!(
@@ -803,8 +777,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn registry_reclaim_refuses_reentry_without_double_borrow() {
+    #[test]
+    fn registry_reclaim_refuses_reentry_without_double_borrow() {
         // A reclaimer that calls back into the same registry mid-pass must be
         // refused gracefully (no BorrowMutError panic from re-borrowing).
         struct RegistryReentrantReclaimer {
@@ -812,18 +786,17 @@ mod tests {
             observed_reentry: bool,
         }
 
-        #[async_trait(?Send)]
         impl LocalMemoryReclaim for RegistryReentrantReclaimer {
             fn reclaim_priority(&self) -> ReclaimPriority {
                 ReclaimPriority::Processor
             }
 
-            async fn reclaim(
+            fn reclaim(
                 &mut self,
                 _target_bytes: u64,
                 _context: ReclaimContext<'_>,
             ) -> ReclaimResult {
-                let nested = self.registry.reclaim(1).await;
+                let nested = self.registry.reclaim(1);
                 self.observed_reentry = nested.reentered;
                 ReclaimResult::no_progress()
             }
@@ -836,7 +809,7 @@ mod tests {
         }));
         let _reg = registry.register(reclaimer.clone() as Rc<RefCell<dyn LocalMemoryReclaim>>);
 
-        let outcome = registry.reclaim(100).await;
+        let outcome = registry.reclaim(100);
         assert!(!outcome.reentered, "outer pass runs normally");
         assert!(
             reclaimer.borrow().observed_reentry,

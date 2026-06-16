@@ -258,13 +258,31 @@ impl Policies {
                     ));
                 }
             }
-            #[cfg(not(feature = "unstable-memory-enforcement"))]
-            if memory_budget.enforcement.receiver_admission
-                || memory_budget.enforcement.queue_publish
-                || memory_budget.enforcement.reclaim_hooks
-            {
+            // Enforcement-flag gating honesty. `queue_publish` is the only
+            // enforcement path actually wired (at the owned topic-publish
+            // boundary), so it is accepted only with the `unstable-memory-
+            // enforcement` feature. `receiver_admission` and `reclaim_hooks` are
+            // carried for forward compatibility but are NOT wired to any runtime
+            // behavior yet: receiver admission is not driven by the runtime
+            // budget, and although a per-runtime reclaim registry is installed,
+            // no concrete reclaimer registers and no driver invokes reclaim.
+            // They are therefore rejected in *all* builds (including the unstable
+            // feature) until wired end to end, so enabling them cannot create a
+            // false sense of enforcement.
+            if memory_budget.enforcement.receiver_admission {
                 errors.push(format!(
-                    "{budget_path}.enforcement flags require the `unstable-memory-enforcement` build feature, which is disabled in production builds"
+                    "{budget_path}.enforcement.receiver_admission is not wired to runtime admission yet and cannot be enabled"
+                ));
+            }
+            if memory_budget.enforcement.reclaim_hooks {
+                errors.push(format!(
+                    "{budget_path}.enforcement.reclaim_hooks is not wired yet (no concrete reclaimer registers and no driver invokes reclaim) and cannot be enabled"
+                ));
+            }
+            #[cfg(not(feature = "unstable-memory-enforcement"))]
+            if memory_budget.enforcement.queue_publish {
+                errors.push(format!(
+                    "{budget_path}.enforcement.queue_publish requires the `unstable-memory-enforcement` build feature, which is disabled in production builds"
                 ));
             }
         }
@@ -1439,85 +1457,101 @@ mod tests {
     #[cfg(not(feature = "unstable-memory-enforcement"))]
     #[test]
     fn validates_memory_budget_rejects_enforcement_flags_until_gates_met() {
-        let policies = Policies {
-            resources: Some(super::ResourcesPolicy {
-                core_allocation: super::CoreAllocation::all_cores(),
-                memory_limiter: None,
-                memory_budget: Some(super::MemoryBudgetPolicy {
-                    mode: super::MemoryBudgetMode::ObserveOnly,
-                    retry_after_secs: 1,
-                    sizing: super::MemoryBudgetSizingPolicy {
-                        strategy: super::MemoryBudgetSizingStrategy::Leased,
-                        reserve: 512 * 1024 * 1024,
-                        floor_per_runtime: 256 * 1024 * 1024,
-                        lease_step: 64 * 1024,
-                        max_overshoot_per_runtime: 128 * 1024 * 1024,
-                        overshoot_debt_limit: 16 * 1024 * 1024,
-                        drain_allowance: None,
-                    },
-                    escrow: super::MemoryBudgetEscrowPolicy {
-                        topic_default_limit: 64 * 1024 * 1024,
-                        abandoned_reap_after_millis: None,
-                    },
-                    enforcement: super::MemoryBudgetEnforcementPolicy {
-                        receiver_admission: true,
-                        queue_publish: false,
-                        reclaim_hooks: false,
-                    },
-                }),
-            }),
-            ..Policies::default()
-        };
-
-        let errors = policies.validation_errors("policies");
-        assert_eq!(errors.len(), 1);
+        let queue = budget_validation_errors(budget_with_enforcement(
+            super::MemoryBudgetEnforcementPolicy {
+                receiver_admission: false,
+                queue_publish: true,
+                reclaim_hooks: false,
+            },
+        ));
+        assert_eq!(queue.len(), 1, "{queue:?}");
         assert!(
-            errors[0].contains("unstable-memory-enforcement"),
-            "observe-only foundation must reject enforcement flags: {errors:?}"
+            queue[0].contains("queue_publish") && queue[0].contains("unstable-memory-enforcement"),
+            "default build rejects queue_publish without the feature: {queue:?}"
+        );
+
+        let receiver = budget_validation_errors(budget_with_enforcement(
+            super::MemoryBudgetEnforcementPolicy {
+                receiver_admission: true,
+                queue_publish: false,
+                reclaim_hooks: false,
+            },
+        ));
+        assert_eq!(receiver.len(), 1, "{receiver:?}");
+        assert!(
+            receiver[0].contains("receiver_admission") && receiver[0].contains("not wired"),
+            "default build rejects receiver_admission as not wired: {receiver:?}"
+        );
+
+        let reclaim = budget_validation_errors(budget_with_enforcement(
+            super::MemoryBudgetEnforcementPolicy {
+                receiver_admission: false,
+                queue_publish: false,
+                reclaim_hooks: true,
+            },
+        ));
+        assert_eq!(reclaim.len(), 1, "{reclaim:?}");
+        assert!(
+            reclaim[0].contains("reclaim_hooks") && reclaim[0].contains("not wired"),
+            "default build rejects reclaim_hooks as not wired: {reclaim:?}"
         );
     }
 
     /// With the `unstable-memory-enforcement` build feature enabled, an
-    /// enforce-mode budget config validates successfully (still subject to the
-    /// sizing and escrow checks). Production builds do not enable the feature,
-    /// so this path is unreachable from normal config.
+    /// enforce-mode budget that enables only the wired `queue_publish` flag
+    /// validates cleanly. `receiver_admission` and `reclaim_hooks` stay rejected
+    /// even with the feature, because they are not wired to any runtime behavior.
     #[cfg(feature = "unstable-memory-enforcement")]
     #[test]
-    fn unstable_enforcement_feature_accepts_enforce_mode_and_flags() {
-        let policies = Policies {
-            resources: Some(super::ResourcesPolicy {
-                core_allocation: super::CoreAllocation::all_cores(),
-                memory_limiter: None,
-                memory_budget: Some(super::MemoryBudgetPolicy {
-                    mode: super::MemoryBudgetMode::Enforce,
-                    retry_after_secs: 1,
-                    sizing: super::MemoryBudgetSizingPolicy {
-                        strategy: super::MemoryBudgetSizingStrategy::Leased,
-                        reserve: 512 * 1024 * 1024,
-                        floor_per_runtime: 256 * 1024 * 1024,
-                        lease_step: 64 * 1024,
-                        max_overshoot_per_runtime: 128 * 1024 * 1024,
-                        overshoot_debt_limit: 16 * 1024 * 1024,
-                        drain_allowance: None,
-                    },
-                    escrow: super::MemoryBudgetEscrowPolicy {
-                        topic_default_limit: 64 * 1024 * 1024,
-                        abandoned_reap_after_millis: None,
-                    },
-                    enforcement: super::MemoryBudgetEnforcementPolicy {
-                        receiver_admission: true,
-                        queue_publish: true,
-                        reclaim_hooks: true,
-                    },
-                }),
-            }),
-            ..Policies::default()
-        };
-
-        let errors = policies.validation_errors("policies");
+    fn unstable_enforcement_feature_accepts_only_wired_queue_publish() {
+        let mut budget = budget_with_enforcement(super::MemoryBudgetEnforcementPolicy {
+            receiver_admission: false,
+            queue_publish: true,
+            reclaim_hooks: false,
+        });
+        budget.mode = super::MemoryBudgetMode::Enforce;
+        let errors = budget_validation_errors(budget);
         assert!(
             errors.is_empty(),
-            "gated enforce-mode config must validate cleanly: {errors:?}"
+            "unstable feature accepts enforce mode with the wired queue_publish flag: {errors:?}"
+        );
+    }
+
+    /// `receiver_admission` is not wired to runtime admission, so it is rejected
+    /// even with the unstable feature enabled.
+    #[cfg(feature = "unstable-memory-enforcement")]
+    #[test]
+    fn unstable_enforcement_feature_rejects_receiver_admission() {
+        let errors = budget_validation_errors(budget_with_enforcement(
+            super::MemoryBudgetEnforcementPolicy {
+                receiver_admission: true,
+                queue_publish: false,
+                reclaim_hooks: false,
+            },
+        ));
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("receiver_admission") && errors[0].contains("not wired"),
+            "unstable feature still rejects unwired receiver_admission: {errors:?}"
+        );
+    }
+
+    /// `reclaim_hooks` is not wired (no concrete reclaimer registers and no
+    /// driver invokes reclaim), so it is rejected even with the unstable feature.
+    #[cfg(feature = "unstable-memory-enforcement")]
+    #[test]
+    fn unstable_enforcement_feature_rejects_reclaim_hooks() {
+        let errors = budget_validation_errors(budget_with_enforcement(
+            super::MemoryBudgetEnforcementPolicy {
+                receiver_admission: false,
+                queue_publish: false,
+                reclaim_hooks: true,
+            },
+        ));
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("reclaim_hooks") && errors[0].contains("not wired"),
+            "unstable feature still rejects unwired reclaim_hooks: {errors:?}"
         );
     }
 
@@ -1554,6 +1588,31 @@ mod tests {
             ..Policies::default()
         }
         .validation_errors("policies")
+    }
+
+    /// Builds a cleanly-sized observe-only budget carrying the given enforcement
+    /// flags, so a test only exercises the enforcement-flag gating.
+    fn budget_with_enforcement(
+        enforcement: super::MemoryBudgetEnforcementPolicy,
+    ) -> super::MemoryBudgetPolicy {
+        super::MemoryBudgetPolicy {
+            mode: super::MemoryBudgetMode::ObserveOnly,
+            retry_after_secs: 1,
+            sizing: super::MemoryBudgetSizingPolicy {
+                strategy: super::MemoryBudgetSizingStrategy::Leased,
+                reserve: 512 * 1024 * 1024,
+                floor_per_runtime: 256 * 1024 * 1024,
+                lease_step: 64 * 1024,
+                max_overshoot_per_runtime: 128 * 1024 * 1024,
+                overshoot_debt_limit: 16 * 1024 * 1024,
+                drain_allowance: None,
+            },
+            escrow: super::MemoryBudgetEscrowPolicy {
+                topic_default_limit: 64 * 1024 * 1024,
+                abandoned_reap_after_millis: None,
+            },
+            enforcement,
+        }
     }
 
     #[test]
