@@ -28,8 +28,9 @@
 //! rejects. Keeping the primitive separate lets it be reviewed and tested in
 //! isolation before any site depends on it.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
+use std::rc::{Rc, Weak};
 
 use async_trait::async_trait;
 
@@ -249,6 +250,205 @@ impl ReclaimCoordinator {
             released_bytes: released_total,
             target_met: released_total >= target_bytes,
             reentered: false,
+        }
+    }
+
+    /// Like [`reclaim`](Self::reclaim) but drives shared, runtime-local
+    /// reclaimers held as `Rc<RefCell<dyn LocalMemoryReclaim>>` (the shape the
+    /// [`ReclaimRegistry`] stores). Each reclaimer is borrowed only for the
+    /// duration of its own `reclaim` call, so registered reclaimers are never all
+    /// borrowed simultaneously and a reclaimer may safely register/unregister
+    /// others mid-pass (changes apply to the next pass).
+    //
+    // A reclaimer is necessarily borrowed (`borrow_mut`) across its own async
+    // `reclaim` call. This is sound here: the re-entry guard above refuses any
+    // nested registry/coordinator pass before it borrows anything, and the
+    // `LocalMemoryReclaim` contract requires reclaim to be bounded, budget-free,
+    // and non-yielding to tasks that could touch the same state. No other code
+    // path can re-borrow the same cell while the call is in flight on this single
+    // runtime thread, so the borrow-across-await hazard the lint guards against
+    // cannot occur.
+    #[allow(clippy::await_holding_refcell_ref)]
+    pub async fn reclaim_shared(
+        &self,
+        reclaimers: &[Rc<RefCell<dyn LocalMemoryReclaim>>],
+        target_bytes: u64,
+    ) -> ReclaimOutcome {
+        if self.in_progress.replace(true) {
+            return ReclaimOutcome {
+                released_bytes: 0,
+                target_met: false,
+                reentered: true,
+            };
+        }
+        let _guard = ReentryGuard {
+            flag: &self.in_progress,
+        };
+
+        // Deterministic order: priority class first, registration index second.
+        // Priority is read under a short shared borrow, released before the loop.
+        let mut order: Vec<usize> = (0..reclaimers.len()).collect();
+        order.sort_by_key(|&index| (reclaimers[index].borrow().reclaim_priority(), index));
+
+        let mut released_total: u64 = 0;
+        if target_bytes == 0 {
+            return ReclaimOutcome {
+                released_bytes: 0,
+                target_met: true,
+                reentered: false,
+            };
+        }
+
+        loop {
+            let mut progressed = false;
+            for &index in &order {
+                if released_total >= target_bytes {
+                    break;
+                }
+                let remaining = target_bytes - released_total;
+                let context = ReclaimContext::new(remaining);
+                // Borrow only this reclaimer, and only across its own call.
+                let result = {
+                    let mut reclaimer = reclaimers[index].borrow_mut();
+                    reclaimer.reclaim(remaining, context).await
+                };
+                released_total = released_total.saturating_add(result.released_bytes);
+                if result.released_bytes > 0 {
+                    progressed = true;
+                }
+            }
+            if released_total >= target_bytes || !progressed {
+                break;
+            }
+        }
+
+        ReclaimOutcome {
+            released_bytes: released_total,
+            target_met: released_total >= target_bytes,
+            reentered: false,
+        }
+    }
+}
+
+/// One registered reclaimer plus its stable registration id.
+struct RegistryEntry {
+    id: u64,
+    reclaimer: Rc<RefCell<dyn LocalMemoryReclaim>>,
+}
+
+#[derive(Default)]
+struct ReclaimRegistryInner {
+    next_id: u64,
+    entries: Vec<RegistryEntry>,
+}
+
+/// Runtime-local registry of reclaimers, paired with a [`ReclaimCoordinator`].
+///
+/// This is the lifecycle layer over the reclaim primitive: stateful retention
+/// sites register a shared-but-runtime-local reclaimer (`Rc<RefCell<dyn
+/// LocalMemoryReclaim>>`) and receive a [`ReclaimRegistration`] RAII guard that
+/// unregisters on drop. A reclaim pass drives every currently-registered
+/// reclaimer through the coordinator in deterministic [`ReclaimPriority`] order.
+///
+/// The registry is `!Send` (it holds `Rc`), matching the pinned current-thread
+/// runtime model: registration, unregistration, and reclaim passes all happen on
+/// the same runtime thread as the local budget account. It is cheap to clone
+/// (shared `Rc` handles), so a site can hold a clone to register itself and the
+/// runtime can hold a clone to drive passes.
+///
+/// Reclaim remains budget-free: reclaimers release memory only by dropping the
+/// owners they already hold, never by acquiring budget. Wiring reclaim-driven
+/// admission/enforcement stays gated behind `enforcement.reclaim_hooks`.
+#[derive(Clone, Default)]
+pub struct ReclaimRegistry {
+    inner: Rc<RefCell<ReclaimRegistryInner>>,
+    coordinator: Rc<ReclaimCoordinator>,
+}
+
+impl ReclaimRegistry {
+    /// Creates an empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers `reclaimer` and returns an RAII guard that unregisters it when
+    /// dropped. The reclaimer is shared (`Rc<RefCell<_>>`) so the registering
+    /// component keeps a clone to mutate its own retained state on the hot path
+    /// while the registry borrows it only during a reclaim pass.
+    #[must_use = "dropping the returned registration immediately unregisters the reclaimer"]
+    pub fn register(&self, reclaimer: Rc<RefCell<dyn LocalMemoryReclaim>>) -> ReclaimRegistration {
+        let mut inner = self.inner.borrow_mut();
+        let id = inner.next_id;
+        inner.next_id = inner.next_id.wrapping_add(1);
+        inner.entries.push(RegistryEntry { id, reclaimer });
+        ReclaimRegistration {
+            registry: Rc::downgrade(&self.inner),
+            id,
+        }
+    }
+
+    /// Number of currently-registered reclaimers.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.borrow().entries.len()
+    }
+
+    /// Whether no reclaimers are currently registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner.borrow().entries.is_empty()
+    }
+
+    /// Whether a reclaim pass is currently running on this thread.
+    #[must_use]
+    pub fn is_reclaiming(&self) -> bool {
+        self.coordinator.is_reclaiming()
+    }
+
+    /// Drives every registered reclaimer to release up to `target_bytes`.
+    ///
+    /// Re-entry safe: if a pass is already running on this thread (for example a
+    /// reclaimer that calls back into the registry), the nested call returns
+    /// immediately with [`ReclaimOutcome::reentered`] set and performs no work —
+    /// without attempting to re-borrow the already-borrowed reclaimers.
+    pub async fn reclaim(&self, target_bytes: u64) -> ReclaimOutcome {
+        // Snapshot the registered reclaimer handles so the registry inner is not
+        // borrowed across the pass: a reclaimer may register or unregister
+        // (mutating the registry) during the pass; such changes apply to the
+        // next pass, not this one. The coordinator borrows each reclaimer only
+        // for its own call and refuses re-entry, so a re-entrant pass returns
+        // gracefully without attempting to re-borrow.
+        let handles: Vec<Rc<RefCell<dyn LocalMemoryReclaim>>> = self
+            .inner
+            .borrow()
+            .entries
+            .iter()
+            .map(|entry| Rc::clone(&entry.reclaimer))
+            .collect();
+        self.coordinator
+            .reclaim_shared(&handles, target_bytes)
+            .await
+    }
+}
+
+/// RAII registration handle. Dropping it unregisters the reclaimer from the
+/// [`ReclaimRegistry`] it came from, so a retention site's reclaimer is removed
+/// automatically when the site is torn down (no explicit unregister call and no
+/// dangling reclaimer left behind).
+#[must_use = "dropping the registration unregisters the reclaimer"]
+pub struct ReclaimRegistration {
+    registry: Weak<RefCell<ReclaimRegistryInner>>,
+    id: u64,
+}
+
+impl Drop for ReclaimRegistration {
+    fn drop(&mut self) {
+        if let Some(registry) = self.registry.upgrade() {
+            registry
+                .borrow_mut()
+                .entries
+                .retain(|entry| entry.id != self.id);
         }
     }
 }
@@ -474,5 +674,113 @@ mod tests {
         );
         // Guard is cleared after the pass completes.
         assert!(!coordinator.is_reclaiming());
+    }
+
+    // ----------------------------------------------------------------------
+    // Registry lifecycle.
+    // ----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn registry_drives_registered_reclaimers_in_priority_order() {
+        let account = test_account();
+        let registry = ReclaimRegistry::new();
+        assert!(registry.is_empty());
+
+        // Register stream first, queue second; priority must drive queue first.
+        let stream = Rc::new(RefCell::new(TicketReclaimer::new(
+            ReclaimPriority::Stream,
+            &account,
+            &[10],
+        )));
+        let queue = Rc::new(RefCell::new(TicketReclaimer::new(
+            ReclaimPriority::Queue,
+            &account,
+            &[10],
+        )));
+        let _stream_reg = registry.register(stream.clone() as Rc<RefCell<dyn LocalMemoryReclaim>>);
+        let _queue_reg = registry.register(queue.clone() as Rc<RefCell<dyn LocalMemoryReclaim>>);
+        assert_eq!(registry.len(), 2);
+
+        let outcome = registry.reclaim(10).await;
+        assert!(outcome.target_met);
+        assert_eq!(queue.borrow().calls, 1, "queue reclaimer is asked first");
+        assert_eq!(
+            stream.borrow().calls,
+            0,
+            "stream reclaimer is not reached once met"
+        );
+        // Budget-free: released bytes left the account, none acquired.
+        assert_eq!(account.charged_bytes.get(), 10);
+    }
+
+    #[tokio::test]
+    async fn registry_unregisters_on_registration_drop() {
+        let account = test_account();
+        let registry = ReclaimRegistry::new();
+
+        let reclaimer = Rc::new(RefCell::new(TicketReclaimer::new(
+            ReclaimPriority::Buffer,
+            &account,
+            &[25],
+        )));
+        let registration =
+            registry.register(reclaimer.clone() as Rc<RefCell<dyn LocalMemoryReclaim>>);
+        assert_eq!(registry.len(), 1);
+
+        // Dropping the registration removes the reclaimer; a later pass drives
+        // nothing (and so cannot meet a non-zero target).
+        drop(registration);
+        assert!(registry.is_empty());
+
+        let outcome = registry.reclaim(25).await;
+        assert!(!outcome.target_met);
+        assert_eq!(outcome.released_bytes, 0);
+        assert_eq!(
+            account.charged_bytes.get(),
+            25,
+            "unregistered reclaimer is not driven, so its bytes stay retained"
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_reclaim_refuses_reentry_without_double_borrow() {
+        // A reclaimer that calls back into the same registry mid-pass must be
+        // refused gracefully (no BorrowMutError panic from re-borrowing).
+        struct RegistryReentrantReclaimer {
+            registry: ReclaimRegistry,
+            observed_reentry: bool,
+        }
+
+        #[async_trait(?Send)]
+        impl LocalMemoryReclaim for RegistryReentrantReclaimer {
+            fn reclaim_priority(&self) -> ReclaimPriority {
+                ReclaimPriority::Processor
+            }
+
+            async fn reclaim(
+                &mut self,
+                _target_bytes: u64,
+                _context: ReclaimContext<'_>,
+            ) -> ReclaimResult {
+                let nested = self.registry.reclaim(1).await;
+                self.observed_reentry = nested.reentered;
+                ReclaimResult::no_progress()
+            }
+        }
+
+        let registry = ReclaimRegistry::new();
+        let reclaimer = Rc::new(RefCell::new(RegistryReentrantReclaimer {
+            registry: registry.clone(),
+            observed_reentry: false,
+        }));
+        let _reg = registry.register(reclaimer.clone() as Rc<RefCell<dyn LocalMemoryReclaim>>);
+
+        let outcome = registry.reclaim(100).await;
+        assert!(!outcome.reentered, "outer pass runs normally");
+        assert!(
+            reclaimer.borrow().observed_reentry,
+            "nested registry reclaim must be refused while a pass is in progress"
+        );
+        assert!(!registry.is_reclaiming());
     }
 }

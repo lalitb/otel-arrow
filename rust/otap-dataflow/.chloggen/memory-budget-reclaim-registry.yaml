@@ -1,0 +1,4 @@
+change_type: enhancement
+component: engine
+note: "Add a runtime-local ReclaimRegistry lifecycle over the memory-budget reclaim primitive: stateful retention sites can register/unregister reclaimers (RAII) and the registry drives them in deterministic priority order, re-entry-safe and budget-free. Concrete site wiring remains gated behind enforcement.reclaim_hooks."
+issues: []
