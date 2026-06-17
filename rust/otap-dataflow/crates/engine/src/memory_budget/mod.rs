@@ -94,6 +94,104 @@ impl BudgetLevel {
     }
 }
 
+/// Low-cardinality retained-work *site* attribution for local accounting.
+///
+/// This classifies **which kind of retained site** is holding bytes charged to
+/// a [`RuntimeMemoryAccount`], so operators can tell apart batch buffers, retry
+/// buffers, parked routes, in-flight exporter requests, etc. It is a small
+/// `Copy` discriminator carried by [`LocalMemoryTicket`]; it is **not** a byte
+/// size and is orthogonal to whether the ticket's size is known.
+///
+/// Attribution is deliberately additive: every variant indexes a fixed-size
+/// per-account counter array, so the per-site totals always sum to the
+/// aggregate `charged_bytes`/`unknown_count`. There is no dynamic map, no
+/// per-item string, and no atomics on the local charge/refund path.
+///
+/// Scope of this slice (local-ticket sites only):
+/// - Topic queue/ring retention is owned by **escrow buckets**, which already
+///   have their own per-boundary aggregate metrics; it is intentionally not
+///   folded into these local-ticket counters.
+/// - Shared-channel retention via `SharedEnvelope` is a primitive that is not
+///   yet production-adopted, so it has no variant here yet.
+/// - The drain/redemption allowance path attributes to [`Self::Unknown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum RetainedSiteKind {
+    /// Fallback when no specific site is attributed (also the default for the
+    /// back-compatible [`RuntimeMemoryAccount::charge`] entry point and the
+    /// drain/redemption path).
+    Unknown = 0,
+    /// Retry processor delayed-retry payload buffer.
+    RetryBuffer = 1,
+    /// Batch processor pending-input buffer.
+    BatchPending = 2,
+    /// Fanout processor in-flight retained original request.
+    FanoutInflight = 3,
+    /// Router (exclusive/content) backpressure-parked route.
+    RouterParked = 4,
+    /// Exporter request parked before it is sent (e.g. OTLP gRPC pending).
+    ExporterPending = 5,
+    /// Exporter request retained while in flight (encoded body awaiting ack).
+    ExporterInflight = 6,
+}
+
+impl RetainedSiteKind {
+    /// Number of attributed site kinds. Indexes a fixed-size counter array.
+    pub const COUNT: usize = 7;
+
+    /// Site kinds exposed as labeled metric series. Every entry is a site that
+    /// this slice actually attributes, so no always-zero series are emitted.
+    pub const METRIC_SITES: [RetainedSiteKind; Self::COUNT] = [
+        Self::Unknown,
+        Self::RetryBuffer,
+        Self::BatchPending,
+        Self::FanoutInflight,
+        Self::RouterParked,
+        Self::ExporterPending,
+        Self::ExporterInflight,
+    ];
+
+    /// Returns the fixed array index for this site kind.
+    #[inline]
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Returns the static, low-cardinality label for this site kind.
+    ///
+    /// The returned `&'static str` is used as a metric attribute value only at
+    /// snapshot/export time; it is never allocated or cloned on the charge
+    /// path.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::RetryBuffer => "retry_buffer",
+            Self::BatchPending => "batch_pending",
+            Self::FanoutInflight => "fanout_inflight",
+            Self::RouterParked => "router_parked",
+            Self::ExporterPending => "exporter_pending",
+            Self::ExporterInflight => "exporter_inflight",
+        }
+    }
+
+    /// Returns the site kind for a fixed array index, when in range.
+    #[must_use]
+    pub const fn from_index(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(Self::Unknown),
+            1 => Some(Self::RetryBuffer),
+            2 => Some(Self::BatchPending),
+            3 => Some(Self::FanoutInflight),
+            4 => Some(Self::RouterParked),
+            5 => Some(Self::ExporterPending),
+            6 => Some(Self::ExporterInflight),
+            _ => None,
+        }
+    }
+}
+
 /// Runtime memory-budget sizing parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryBudgetSizing {
@@ -211,6 +309,13 @@ pub struct RuntimeMemorySnapshot {
     drain_allowance_bytes: AtomicU64,
     drain_committed_bytes: AtomicU64,
     level: AtomicU64,
+    /// Per-retention-site breakdown of `charged_bytes`, indexed by
+    /// [`RetainedSiteKind::index`]. Published together with the scalar
+    /// snapshot, so the slots always sum back to `charged_bytes`.
+    charged_bytes_by_site: [AtomicU64; RetainedSiteKind::COUNT],
+    /// Per-retention-site breakdown of `unknown_count`, indexed by
+    /// [`RetainedSiteKind::index`].
+    unknown_count_by_site: [AtomicU64; RetainedSiteKind::COUNT],
 }
 
 impl RuntimeMemorySnapshot {
@@ -240,6 +345,37 @@ impl RuntimeMemorySnapshot {
         self.drain_committed_bytes
             .store(drain_committed_bytes, Ordering::Relaxed);
         self.level.store(level.as_u64(), Ordering::Relaxed);
+    }
+
+    /// Publishes the per-retention-site breakdown arrays.
+    ///
+    /// Called from [`RuntimeMemoryAccount`] alongside [`Self::publish`] at flush
+    /// and level-transition points only (never on the per-item charge path), so
+    /// the published slots always sum back to the published `charged_bytes` and
+    /// `unknown_count`.
+    fn publish_sites(
+        &self,
+        charged_by_site: &[u64; RetainedSiteKind::COUNT],
+        unknown_by_site: &[u64; RetainedSiteKind::COUNT],
+    ) {
+        for (slot, value) in self.charged_bytes_by_site.iter().zip(charged_by_site) {
+            slot.store(*value, Ordering::Relaxed);
+        }
+        for (slot, value) in self.unknown_count_by_site.iter().zip(unknown_by_site) {
+            slot.store(*value, Ordering::Relaxed);
+        }
+    }
+
+    /// Returns charged bytes attributed to `site` for this runtime.
+    #[must_use]
+    pub fn charged_bytes_for_site(&self, site: RetainedSiteKind) -> u64 {
+        self.charged_bytes_by_site[site.index()].load(Ordering::Relaxed)
+    }
+
+    /// Returns the unknown-size retained count attributed to `site`.
+    #[must_use]
+    pub fn unknown_count_for_site(&self, site: RetainedSiteKind) -> u64 {
+        self.unknown_count_by_site[site.index()].load(Ordering::Relaxed)
     }
 
     /// Returns borrowed bytes held by this runtime.
@@ -377,6 +513,13 @@ pub struct MemoryBudgetSnapshot {
     /// Signed overshoot-debt pool balance. Negative means the pool has been
     /// overdrawn by post-hoc reconciliation (an invariant-violation signal).
     pub overshoot_debt_balance: i64,
+    /// Per-retention-site breakdown of `charged_bytes`, summed across all
+    /// runtimes and indexed by [`RetainedSiteKind::index`]. The slots sum back
+    /// to `charged_bytes`, so this is an attribution view, not an extra total.
+    pub charged_bytes_by_site: [u64; RetainedSiteKind::COUNT],
+    /// Per-retention-site breakdown of `unknown_count`, summed across all
+    /// runtimes and indexed by [`RetainedSiteKind::index`].
+    pub unknown_count_by_site: [u64; RetainedSiteKind::COUNT],
 }
 
 #[derive(Debug, Default)]
@@ -660,6 +803,14 @@ impl MemoryBudgetState {
             snapshot.drain_committed_bytes = snapshot
                 .drain_committed_bytes
                 .saturating_add(runtime.drain_committed_bytes());
+            for i in 0..RetainedSiteKind::COUNT {
+                let site = RetainedSiteKind::from_index(i)
+                    .expect("index < RetainedSiteKind::COUNT is a valid site");
+                snapshot.charged_bytes_by_site[i] = snapshot.charged_bytes_by_site[i]
+                    .saturating_add(runtime.charged_bytes_for_site(site));
+                snapshot.unknown_count_by_site[i] = snapshot.unknown_count_by_site[i]
+                    .saturating_add(runtime.unknown_count_for_site(site));
+            }
             match runtime.level() {
                 1 => snapshot.soft_runtime_count += 1,
                 2 => snapshot.hard_runtime_count += 1,
@@ -1200,6 +1351,14 @@ pub struct RuntimeMemoryAccount {
     charged_bytes: Cell<u64>,
     unknown_bytes: Cell<u64>,
     unknown_count: Cell<u64>,
+    /// Per-retention-site breakdown of `charged_bytes`. The slot indexed by
+    /// each [`RetainedSiteKind`] always sums back to `charged_bytes`; this is a
+    /// pure additive view, not a second source of truth for classification.
+    /// Hot-path cost is one extra `Cell` read+write on a fixed-size array.
+    charged_bytes_by_site: [Cell<u64>; RetainedSiteKind::COUNT],
+    /// Per-retention-site breakdown of `unknown_count`. Sums back to
+    /// `unknown_count`.
+    unknown_count_by_site: [Cell<u64>; RetainedSiteKind::COUNT],
     overshoot_bytes: Cell<u64>,
     /// Overshoot debt acquired from the global pool and currently backed by it.
     debt_held: Cell<u64>,
@@ -1259,6 +1418,8 @@ impl RuntimeMemoryAccount {
             charged_bytes: Cell::new(0),
             unknown_bytes: Cell::new(0),
             unknown_count: Cell::new(0),
+            charged_bytes_by_site: std::array::from_fn(|_| Cell::new(0)),
+            unknown_count_by_site: std::array::from_fn(|_| Cell::new(0)),
             overshoot_bytes: Cell::new(0),
             debt_held: Cell::new(0),
             reconcile_debt: Cell::new(0),
@@ -1389,18 +1550,41 @@ impl RuntimeMemoryAccount {
     ///
     /// Hot-path: mutates only local `Cell` state; defers snapshot publication
     /// to [`flush_snapshot`](Self::flush_snapshot) or a level transition.
+    ///
+    /// The retained bytes are attributed to [`RetainedSiteKind::Unknown`]. Call
+    /// sites that know their retention kind should use
+    /// [`charge_at`](Self::charge_at) so the bytes are attributed to a specific
+    /// site without changing any ownership semantics.
     #[must_use]
     pub fn charge(self: &Rc<Self>, size: impl ChargedSize) -> Option<LocalMemoryTicket> {
+        self.charge_at(RetainedSiteKind::Unknown, size)
+    }
+
+    /// Charges known retained bytes attributed to a specific retention `site`.
+    ///
+    /// Identical to [`charge`](Self::charge) except the charged bytes (or the
+    /// unknown-size observation) are also recorded under `site` in the
+    /// per-site counter array. The returned ticket carries `site` so its
+    /// refund, resize, reconcile, and escrow-transfer paths update the same
+    /// site slot exactly once.
+    #[must_use]
+    pub fn charge_at(
+        self: &Rc<Self>,
+        site: RetainedSiteKind,
+        size: impl ChargedSize,
+    ) -> Option<LocalMemoryTicket> {
         let Some(bytes) = size.charged_size() else {
             if self.mode == BudgetMode::Enforce {
                 return None;
             }
             self.unknown_count
                 .set(self.unknown_count.get().saturating_add(1));
+            self.site_unknown_inc(site);
             self.mark_dirty();
             return Some(LocalMemoryTicket {
                 account: Rc::clone(self),
                 charge: LocalMemoryCharge::Unknown,
+                site,
                 active: true,
                 drain_used: 0,
                 _not_send: PhantomData,
@@ -1416,10 +1600,11 @@ impl RuntimeMemoryAccount {
                 }
             }
         }
-        self.commit_charge(bytes);
+        self.commit_charge(site, bytes);
         Some(LocalMemoryTicket {
             account: Rc::clone(self),
             charge: LocalMemoryCharge::KnownBytes(bytes),
+            site,
             active: true,
             drain_used: 0,
             _not_send: PhantomData,
@@ -1461,24 +1646,61 @@ impl RuntimeMemoryAccount {
         }
         // Allowance accounted; commit the charge bytes (still attributed to
         // this runtime) without going through `try_reserve_extra` so we do
-        // not trip the enforce-mode admission rejection at Hard.
+        // not trip the enforce-mode admission rejection at Hard. Drain/redeem
+        // admissions are transient consumer-side charges with no producer
+        // retention kind, so they attribute to `Unknown`.
         self.drain_committed.set(used.saturating_add(bytes));
-        self.commit_charge(bytes);
+        self.commit_charge(RetainedSiteKind::Unknown, bytes);
         Some(LocalMemoryTicket {
             account: Rc::clone(self),
             charge: LocalMemoryCharge::KnownBytes(bytes),
+            site: RetainedSiteKind::Unknown,
             active: true,
             drain_used: bytes,
             _not_send: PhantomData,
         })
     }
 
+    /// Adds `bytes` to the per-site charged-bytes slot for `site`.
+    ///
+    /// Hot-path helper: one `Cell` read+write on a fixed-size array. Keeps the
+    /// per-site breakdown in lockstep with `charged_bytes`.
+    #[inline]
+    fn site_add(&self, site: RetainedSiteKind, bytes: u64) {
+        let slot = &self.charged_bytes_by_site[site.index()];
+        slot.set(slot.get().saturating_add(bytes));
+    }
+
+    /// Subtracts `bytes` from the per-site charged-bytes slot for `site`.
+    #[inline]
+    fn site_sub(&self, site: RetainedSiteKind, bytes: u64) {
+        let slot = &self.charged_bytes_by_site[site.index()];
+        slot.set(slot.get().saturating_sub(bytes));
+    }
+
+    /// Increments the per-site unknown-size count for `site`.
+    #[inline]
+    fn site_unknown_inc(&self, site: RetainedSiteKind) {
+        let slot = &self.unknown_count_by_site[site.index()];
+        slot.set(slot.get().saturating_add(1));
+    }
+
+    /// Decrements the per-site unknown-size count for `site`.
+    #[inline]
+    fn site_unknown_dec(&self, site: RetainedSiteKind) {
+        let slot = &self.unknown_count_by_site[site.index()];
+        slot.set(slot.get().saturating_sub(1));
+    }
+
     /// Commits a previously-reserved growth: grows charged bytes and settles
-    /// debt/level state. Used by [`charge`](Self::charge) and the ticket-level
-    /// grow APIs after [`try_reserve_extra`](Self::try_reserve_extra) succeeds.
-    fn commit_charge(&self, bytes: u64) {
+    /// debt/level state. Used by [`charge_at`](Self::charge_at) and the
+    /// ticket-level grow APIs after [`try_reserve_extra`](Self::try_reserve_extra)
+    /// succeeds. `site` attributes the growth to the same retention kind that
+    /// owns the ticket.
+    fn commit_charge(&self, site: RetainedSiteKind, bytes: u64) {
         self.charged_bytes
             .set(self.charged_bytes.get().saturating_add(bytes));
+        self.site_add(site, bytes);
         self.settle();
     }
 
@@ -1498,9 +1720,10 @@ impl RuntimeMemoryAccount {
     /// allows and overdraws the pool for any remainder, recording the unbacked
     /// excess as reconciliation debt (which pins the runtime to `Hard` until it
     /// drains below authorized capacity and repays).
-    fn reconcile_grow(&self, extra: u64) {
+    fn reconcile_grow(&self, site: RetainedSiteKind, extra: u64) {
         self.charged_bytes
             .set(self.charged_bytes.get().saturating_add(extra));
+        self.site_add(site, extra);
         self.raise_debt_to_overshoot();
         self.settle();
     }
@@ -1585,15 +1808,17 @@ impl RuntimeMemoryAccount {
         }
     }
 
-    fn refund(&self, bytes: u64) {
+    fn refund(&self, site: RetainedSiteKind, bytes: u64) {
         self.charged_bytes
             .set(self.charged_bytes.get().saturating_sub(bytes));
+        self.site_sub(site, bytes);
         self.settle();
     }
 
-    fn refund_unknown(&self) {
+    fn refund_unknown(&self, site: RetainedSiteKind) {
         self.unknown_count
             .set(self.unknown_count.get().saturating_sub(1));
+        self.site_unknown_dec(site);
         self.mark_dirty();
     }
 
@@ -1637,6 +1862,16 @@ impl RuntimeMemoryAccount {
             self.drain_committed.get(),
             level,
         );
+        // Per-site breakdown is published at the same (off-hot-path) cadence as
+        // the scalar snapshot: only on level transitions and explicit flushes,
+        // never per charged item. The arrays are read fresh from the local
+        // `Cell`s, so they are always consistent with `charged_bytes` here.
+        let charged_by_site: [u64; RetainedSiteKind::COUNT] =
+            std::array::from_fn(|i| self.charged_bytes_by_site[i].get());
+        let unknown_by_site: [u64; RetainedSiteKind::COUNT] =
+            std::array::from_fn(|i| self.unknown_count_by_site[i].get());
+        self.snapshot
+            .publish_sites(&charged_by_site, &unknown_by_site);
         self.published_level.set(level);
         self.dirty.set(false);
     }
@@ -1754,6 +1989,11 @@ impl std::error::Error for BudgetError {}
 pub struct LocalMemoryTicket {
     account: Rc<RuntimeMemoryAccount>,
     charge: LocalMemoryCharge,
+    /// Retention-site attribution for this ticket. A `Copy` discriminator (one
+    /// byte, no allocation) recorded once at charge time. Every charge/refund/
+    /// resize/reconcile/escrow-transfer path for this ticket updates the same
+    /// site slot so the per-site totals stay in lockstep with the aggregate.
+    site: RetainedSiteKind,
     active: bool,
     /// Non-zero only when this ticket was admitted via
     /// [`RuntimeMemoryAccount::try_charge_for_drain`]. On drop the account's
@@ -1789,13 +2029,20 @@ impl LocalMemoryTicket {
         self.account.scope()
     }
 
+    /// Returns the retention-site attribution carried by this ticket.
+    #[must_use]
+    pub const fn site(&self) -> RetainedSiteKind {
+        self.site
+    }
+
     /// Resizes the retained charge from `old_bytes` to `new_bytes`.
     ///
     /// Reserves any positive delta before committing the growth, shrinks
     /// infallibly when `new_bytes` is smaller, and leaves the original ticket
     /// and original charge valid if a grow reservation fails. `old_bytes` must
     /// equal the ticket's current known charge; resizing an unknown-size ticket
-    /// returns [`BudgetError::UnknownSize`].
+    /// returns [`BudgetError::UnknownSize`]. The resize stays attributed to the
+    /// ticket's existing [`site`](Self::site).
     pub fn try_resize(&mut self, old_bytes: u64, new_bytes: u64) -> Result<(), BudgetError> {
         let LocalMemoryCharge::KnownBytes(current) = self.charge else {
             return Err(BudgetError::UnknownSize);
@@ -1809,9 +2056,9 @@ impl LocalMemoryTicket {
             if !self.account.try_reserve_extra(extra) {
                 return Err(BudgetError::Exhausted);
             }
-            self.account.commit_charge(extra);
+            self.account.commit_charge(self.site, extra);
         } else if new_bytes < current {
-            self.account.refund(current - new_bytes);
+            self.account.refund(self.site, current - new_bytes);
         }
         self.charge = LocalMemoryCharge::KnownBytes(new_bytes);
         Ok(())
@@ -1834,7 +2081,7 @@ impl LocalMemoryTicket {
         if !self.account.try_reserve_extra(extra_bytes) {
             return Err(BudgetError::Exhausted);
         }
-        self.account.commit_charge(extra_bytes);
+        self.account.commit_charge(self.site, extra_bytes);
         self.charge = LocalMemoryCharge::KnownBytes(current.saturating_add(extra_bytes));
         Ok(())
     }
@@ -1845,20 +2092,22 @@ impl LocalMemoryTicket {
     /// post-hoc against authorized overshoot debt, overdrawing the global pool
     /// (and recording reconciliation debt that pins the runtime to `Hard`) when
     /// it cannot be authorized. Also converts an unknown-size ticket into a
-    /// known-size charge.
+    /// known-size charge. All updates stay attributed to the ticket's
+    /// [`site`](Self::site).
     pub fn reconcile_size(&mut self, new_bytes: u64) {
         match self.charge {
             LocalMemoryCharge::KnownBytes(current) => {
                 if new_bytes > current {
-                    self.account.reconcile_grow(new_bytes - current);
+                    self.account.reconcile_grow(self.site, new_bytes - current);
                 } else if new_bytes < current {
-                    self.account.refund(current - new_bytes);
+                    self.account.refund(self.site, current - new_bytes);
                 }
             }
             LocalMemoryCharge::Unknown => {
-                // Convert an unknown observation into a known charge.
-                self.account.refund_unknown();
-                self.account.reconcile_grow(new_bytes);
+                // Convert an unknown observation into a known charge, keeping
+                // the same site attribution across the unknown->known move.
+                self.account.refund_unknown(self.site);
+                self.account.reconcile_grow(self.site, new_bytes);
             }
         }
         self.charge = LocalMemoryCharge::KnownBytes(new_bytes);
@@ -1868,10 +2117,13 @@ impl LocalMemoryTicket {
     ///
     /// Each retained branch needs its own charge, so this charges a fresh
     /// ticket of `bytes` against the same account rather than splitting the
-    /// existing charge. Returns [`BudgetError::Exhausted`] if the additional
-    /// owner cannot be authorized under enforcement.
+    /// existing charge. The new owner inherits this ticket's
+    /// [`site`](Self::site) attribution. Returns [`BudgetError::Exhausted`] if
+    /// the additional owner cannot be authorized under enforcement.
     pub fn try_reserve_clone(&self, bytes: u64) -> Result<LocalMemoryTicket, BudgetError> {
-        self.account.charge(bytes).ok_or(BudgetError::Exhausted)
+        self.account
+            .charge_at(self.site, bytes)
+            .ok_or(BudgetError::Exhausted)
     }
 
     /// Converts this local ticket into escrow ownership.
@@ -1912,8 +2164,10 @@ impl LocalMemoryTicket {
         // lease return surplus to the pool on settle, restoring approximately
         // the same pool draw we just took. This is the "transfer from existing
         // lease" path described by the design (line 728-733): the global
-        // logical total does not increase across the transfer.
-        self.account.refund(bytes);
+        // logical total does not increase across the transfer. The local
+        // per-site slot is decremented because the bytes leave the local site
+        // for the escrow boundary (which has its own per-bucket metrics).
+        self.account.refund(self.site, bytes);
         Ok(escrow)
     }
 
@@ -1971,7 +2225,7 @@ impl LocalMemoryTicket {
             }
         }
         self.active = false;
-        self.account.refund(bytes);
+        self.account.refund(self.site, bytes);
         Ok(owners)
     }
 }
@@ -1980,8 +2234,8 @@ impl Drop for LocalMemoryTicket {
     fn drop(&mut self) {
         if self.active {
             match self.charge {
-                LocalMemoryCharge::KnownBytes(bytes) => self.account.refund(bytes),
-                LocalMemoryCharge::Unknown => self.account.refund_unknown(),
+                LocalMemoryCharge::KnownBytes(bytes) => self.account.refund(self.site, bytes),
+                LocalMemoryCharge::Unknown => self.account.refund_unknown(self.site),
             }
             if self.drain_used > 0 {
                 let used = self.account.drain_committed.get();
@@ -2551,9 +2805,27 @@ impl RuntimeMemoryBudget {
     /// runtime-local account. That keeps the ticket usable in retained local
     /// envelopes and queues without making it `Send` or relying on a borrowed
     /// accessor lifetime.
+    ///
+    /// The bytes are attributed to [`RetainedSiteKind::Unknown`]; prefer
+    /// [`charge_at`](Self::charge_at) when the retention kind is known.
     #[must_use]
     pub fn charge(&self, size: impl ChargedSize) -> Option<LocalMemoryTicket> {
         self.account.charge(size)
+    }
+
+    /// Charges known retained bytes attributed to a specific retention `site`.
+    ///
+    /// Same ownership semantics as [`charge`](Self::charge); the only
+    /// difference is that the charged bytes are also recorded under `site` in
+    /// the per-site attribution counters so operators can see which kind of
+    /// retained work is holding memory.
+    #[must_use]
+    pub fn charge_at(
+        &self,
+        site: RetainedSiteKind,
+        size: impl ChargedSize,
+    ) -> Option<LocalMemoryTicket> {
+        self.account.charge_at(site, size)
     }
 
     /// Returns the attribution scope carried by the underlying account.
@@ -2766,6 +3038,316 @@ mod tests {
         }
         acct.flush_snapshot();
         assert_eq!(acct.snapshot.unknown_count(), 0);
+    }
+
+    // ----- Per-retention-site attribution -----
+
+    /// Sum of the per-site charged-bytes cells. Must always equal the aggregate
+    /// `charged_bytes` (the core attribution invariant).
+    fn site_charged_sum(acct: &RuntimeMemoryAccount) -> u64 {
+        (0..RetainedSiteKind::COUNT)
+            .map(|i| acct.charged_bytes_by_site[i].get())
+            .sum()
+    }
+
+    /// Sum of the per-site unknown-count cells. Must always equal the aggregate
+    /// `unknown_count`.
+    fn site_unknown_sum(acct: &RuntimeMemoryAccount) -> u64 {
+        (0..RetainedSiteKind::COUNT)
+            .map(|i| acct.unknown_count_by_site[i].get())
+            .sum()
+    }
+
+    #[test]
+    fn retained_site_kind_index_roundtrips() {
+        for i in 0..RetainedSiteKind::COUNT {
+            let site = RetainedSiteKind::from_index(i).expect("index in range is a site");
+            assert_eq!(site.index(), i);
+            assert!(!site.as_str().is_empty());
+        }
+        assert_eq!(RetainedSiteKind::from_index(RetainedSiteKind::COUNT), None);
+        assert_eq!(
+            RetainedSiteKind::METRIC_SITES.len(),
+            RetainedSiteKind::COUNT,
+            "every site kind must have a stable metric series"
+        );
+        assert_eq!(RetainedSiteKind::Unknown.as_str(), "unknown");
+        assert_eq!(RetainedSiteKind::BatchPending.as_str(), "batch_pending");
+        assert_eq!(
+            RetainedSiteKind::ExporterInflight.as_str(),
+            "exporter_inflight"
+        );
+    }
+
+    #[test]
+    fn charge_default_attributes_to_unknown_site() {
+        let acct = account(100, 10, 20, 100);
+        let ticket = acct.charge(50_u64).expect("charge should fit");
+        assert_eq!(ticket.site(), RetainedSiteKind::Unknown);
+        acct.flush_snapshot();
+        assert_eq!(
+            acct.snapshot
+                .charged_bytes_for_site(RetainedSiteKind::Unknown),
+            50
+        );
+        assert_eq!(acct.charged_bytes.get(), 50);
+        assert_eq!(site_charged_sum(&acct), 50);
+    }
+
+    #[test]
+    fn charge_at_increments_aggregate_and_site_counters_in_lockstep() {
+        let acct = account(1_000, 10, 20, 1_000);
+        let batch = acct
+            .charge_at(RetainedSiteKind::BatchPending, 50_u64)
+            .expect("batch charge fits");
+        let retry = acct
+            .charge_at(RetainedSiteKind::RetryBuffer, 30_u64)
+            .expect("retry charge fits");
+        assert_eq!(batch.site(), RetainedSiteKind::BatchPending);
+        assert_eq!(retry.site(), RetainedSiteKind::RetryBuffer);
+
+        acct.flush_snapshot();
+        assert_eq!(
+            acct.snapshot
+                .charged_bytes_for_site(RetainedSiteKind::BatchPending),
+            50
+        );
+        assert_eq!(
+            acct.snapshot
+                .charged_bytes_for_site(RetainedSiteKind::RetryBuffer),
+            30
+        );
+        // Unrelated sites stay zero; aggregate and per-site totals match.
+        assert_eq!(
+            acct.snapshot
+                .charged_bytes_for_site(RetainedSiteKind::FanoutInflight),
+            0
+        );
+        assert_eq!(acct.snapshot.charged_bytes(), 80);
+        assert_eq!(site_charged_sum(&acct), 80);
+
+        drop(batch);
+        acct.flush_snapshot();
+        assert_eq!(
+            acct.snapshot
+                .charged_bytes_for_site(RetainedSiteKind::BatchPending),
+            0
+        );
+        assert_eq!(
+            acct.snapshot
+                .charged_bytes_for_site(RetainedSiteKind::RetryBuffer),
+            30
+        );
+        assert_eq!(acct.snapshot.charged_bytes(), 30);
+        assert_eq!(site_charged_sum(&acct), 30);
+    }
+
+    #[test]
+    fn resize_updates_same_site_counter() {
+        let acct = account(1_000, 10, 20, 1_000);
+        let mut ticket = acct
+            .charge_at(RetainedSiteKind::FanoutInflight, 40_u64)
+            .expect("charge fits");
+        ticket.try_resize(40, 100).expect("grow fits");
+        assert_eq!(
+            acct.charged_bytes_by_site[RetainedSiteKind::FanoutInflight.index()].get(),
+            100
+        );
+        assert_eq!(acct.charged_bytes.get(), 100);
+        assert_eq!(site_charged_sum(&acct), 100);
+
+        ticket.try_resize(100, 30).expect("shrink is infallible");
+        assert_eq!(
+            acct.charged_bytes_by_site[RetainedSiteKind::FanoutInflight.index()].get(),
+            30
+        );
+        assert_eq!(acct.charged_bytes.get(), 30);
+        assert_eq!(site_charged_sum(&acct), 30);
+
+        drop(ticket);
+        assert_eq!(
+            acct.charged_bytes_by_site[RetainedSiteKind::FanoutInflight.index()].get(),
+            0
+        );
+        assert_eq!(site_charged_sum(&acct), 0);
+    }
+
+    #[test]
+    fn failed_grow_preserves_site_charge() {
+        // Enforce mode with a tight budget so a grow cannot be authorized.
+        let acct = account_with_mode(BudgetMode::Enforce, 100, 10, 20, 15);
+        let mut ticket = acct
+            .charge_at(RetainedSiteKind::BatchPending, 105_u64)
+            .expect("initial charge fits");
+        assert_eq!(
+            acct.charged_bytes_by_site[RetainedSiteKind::BatchPending.index()].get(),
+            105
+        );
+        // Grow beyond what leases + overshoot can authorize: must fail and leave
+        // both the aggregate and the per-site charge untouched.
+        assert_eq!(ticket.try_resize(105, 140), Err(BudgetError::Exhausted));
+        assert_eq!(acct.charged_bytes.get(), 105);
+        assert_eq!(
+            acct.charged_bytes_by_site[RetainedSiteKind::BatchPending.index()].get(),
+            105
+        );
+        assert_eq!(site_charged_sum(&acct), 105);
+    }
+
+    #[test]
+    fn reconcile_unknown_to_known_keeps_site() {
+        let acct = account(1_000, 10, 20, 1_000);
+        let mut ticket = acct
+            .charge_at(RetainedSiteKind::RouterParked, UnknownSize)
+            .expect("unknown is observed");
+        assert_eq!(
+            acct.unknown_count_by_site[RetainedSiteKind::RouterParked.index()].get(),
+            1
+        );
+        ticket.reconcile_size(70);
+        // The unknown observation becomes a known charge under the same site.
+        assert_eq!(
+            acct.unknown_count_by_site[RetainedSiteKind::RouterParked.index()].get(),
+            0
+        );
+        assert_eq!(
+            acct.charged_bytes_by_site[RetainedSiteKind::RouterParked.index()].get(),
+            70
+        );
+        assert_eq!(acct.charged_bytes.get(), 70);
+        assert_eq!(site_unknown_sum(&acct), 0);
+        assert_eq!(site_charged_sum(&acct), 70);
+
+        drop(ticket);
+        assert_eq!(
+            acct.charged_bytes_by_site[RetainedSiteKind::RouterParked.index()].get(),
+            0
+        );
+    }
+
+    #[test]
+    fn unknown_size_charge_at_tracks_site_and_releases_on_drop() {
+        let acct = account(100, 10, 20, 100);
+        {
+            let ticket = acct
+                .charge_at(RetainedSiteKind::ExporterPending, UnknownSize)
+                .expect("unknown is observed");
+            assert_eq!(ticket.site(), RetainedSiteKind::ExporterPending);
+            acct.flush_snapshot();
+            assert_eq!(acct.snapshot.unknown_count(), 1);
+            assert_eq!(
+                acct.snapshot
+                    .unknown_count_for_site(RetainedSiteKind::ExporterPending),
+                1
+            );
+            assert_eq!(site_unknown_sum(&acct), 1);
+        }
+        acct.flush_snapshot();
+        assert_eq!(acct.snapshot.unknown_count(), 0);
+        assert_eq!(
+            acct.snapshot
+                .unknown_count_for_site(RetainedSiteKind::ExporterPending),
+            0
+        );
+    }
+
+    #[test]
+    fn per_site_rollup_aggregates_across_runtimes() {
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 1_000,
+                    lease_step_bytes: 10,
+                    max_overshoot_per_runtime_bytes: 20,
+                    overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: 1_000,
+                runtime_count: 2,
+                enforcement: MemoryBudgetEnforcement::default(),
+            },
+            None,
+        );
+        let h1 = state.register_runtime_snapshot(BudgetScopeId::default());
+        let h2 = state.register_runtime_snapshot(BudgetScopeId::default());
+        let a1 = h1.local_account().expect("runtime 1 account");
+        let a2 = h2.local_account().expect("runtime 2 account");
+
+        let _t1 = a1
+            .charge_at(RetainedSiteKind::BatchPending, 40_u64)
+            .expect("fits");
+        let _t2 = a2
+            .charge_at(RetainedSiteKind::BatchPending, 25_u64)
+            .expect("fits");
+        let _t3 = a2
+            .charge_at(RetainedSiteKind::RetryBuffer, 15_u64)
+            .expect("fits");
+        a1.flush_snapshot();
+        a2.flush_snapshot();
+
+        let snap = state.snapshot();
+        assert_eq!(
+            snap.charged_bytes_by_site[RetainedSiteKind::BatchPending.index()],
+            65
+        );
+        assert_eq!(
+            snap.charged_bytes_by_site[RetainedSiteKind::RetryBuffer.index()],
+            15
+        );
+        // The per-site rollup always sums back to the aggregate charged bytes.
+        assert_eq!(
+            snap.charged_bytes_by_site.iter().sum::<u64>(),
+            snap.charged_bytes
+        );
+        assert_eq!(snap.charged_bytes, 80);
+    }
+
+    #[test]
+    fn escrow_conversion_decrements_local_site() {
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 1_000,
+                    lease_step_bytes: 10,
+                    max_overshoot_per_runtime_bytes: 20,
+                    overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: 1_000,
+                runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement::default(),
+            },
+            None,
+        );
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let account = handle.local_account().expect("configured account");
+        let ticket = account
+            .charge_at(RetainedSiteKind::ExporterInflight, 40_u64)
+            .expect("charge fits");
+        assert_eq!(
+            account.charged_bytes_by_site[RetainedSiteKind::ExporterInflight.index()].get(),
+            40
+        );
+        // Converting to escrow moves the bytes out of the local site (escrow has
+        // its own per-bucket metrics), so the local site counter drops to zero.
+        let escrow = ticket
+            .try_into_escrow(&state)
+            .expect("observe-only escrow conversion");
+        assert_eq!(
+            account.charged_bytes_by_site[RetainedSiteKind::ExporterInflight.index()].get(),
+            0
+        );
+        assert_eq!(account.charged_bytes.get(), 0);
+        assert_eq!(site_charged_sum(&account), 0);
+        drop(escrow);
     }
 
     #[test]

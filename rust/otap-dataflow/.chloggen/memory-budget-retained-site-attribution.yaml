@@ -1,0 +1,7 @@
+change_type: enhancement
+
+component: engine
+
+note: "Add low-cardinality per-retention-site attribution for runtime memory budgeting. A new `RetainedSiteKind` is carried by each `LocalMemoryTicket` and a `charge_at(site, size)` entry point attributes already-wired local retained-work charges to a specific site (batch_pending, retry_buffer, fanout_inflight, router_parked, exporter_pending, exporter_inflight); the back-compatible `charge` defaults to `unknown`. The runtime snapshot now exposes per-site charged-bytes and unknown-count rollups that always sum back to the aggregates, surfaced as `runtime_memory_budget_site_charged_bytes`/`runtime_memory_budget_site_unknown_count` engine metrics labeled by a `site` attribute. Attribution adds only a `Cell` read+write per charge on the local hot path and changes no ownership semantics. Topic queue/ring retention stays attributed via escrow buckets; shared-channel, per-group/pipeline/tenant attribution, and receiver admission remain future work."
+
+issues: [3272]

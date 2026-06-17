@@ -24,7 +24,9 @@ use otap_df_engine::control::{AckMsg, NackMsg, NodeControlMsg};
 use otap_df_engine::error::{Error, ExporterErrorKind, format_error_sources};
 use otap_df_engine::exporter::ExporterWrapper;
 use otap_df_engine::local::exporter::{EffectHandler, Exporter};
-use otap_df_engine::memory_budget::{LocalMemoryTicket, current_runtime_memory_budget};
+use otap_df_engine::memory_budget::{
+    LocalMemoryTicket, RetainedSiteKind, current_runtime_memory_budget,
+};
 use otap_df_engine::message::{ExporterInbox, Message};
 use otap_df_engine::node::NodeId;
 use otap_df_engine::terminal_state::TerminalState;
@@ -318,8 +320,9 @@ impl Exporter<OtapPdata> for OTLPExporter {
                         // Backpressure: charge the parked request while it is
                         // retained, then park it. The charge is released when the
                         // request is later taken for dispatch (or on loop exit).
-                        pending_ticket = current_runtime_memory_budget()
-                            .and_then(|budget| budget.charge(&pdata));
+                        pending_ticket = current_runtime_memory_budget().and_then(|budget| {
+                            budget.charge_at(RetainedSiteKind::ExporterPending, &pdata)
+                        });
                         pending_msg = Some(Message::PData(pdata));
                         continue;
                     }
@@ -501,7 +504,8 @@ struct EncodedExport {
 /// Shared with the OTLP HTTP exporter, which retains request bodies in-flight
 /// the same way and reuses this helper to keep the charge semantics identical.
 pub(crate) fn charge_inflight(bytes: &[u8]) -> Option<LocalMemoryTicket> {
-    current_runtime_memory_budget().and_then(|budget| budget.charge(bytes))
+    current_runtime_memory_budget()
+        .and_then(|budget| budget.charge_at(RetainedSiteKind::ExporterInflight, bytes))
 }
 
 /// Encoding failed before the request was sent; we still need to surface a Nack with payload.
@@ -1905,6 +1909,11 @@ mod tests {
             expected,
             "encoded request bytes must be charged while retained in-flight"
         );
+        assert_eq!(
+            state.snapshot().charged_bytes_by_site[RetainedSiteKind::ExporterInflight.index()],
+            expected,
+            "an in-flight encoded request must attribute to the ExporterInflight site"
+        );
 
         drop(prepared);
         budget.flush_snapshot();
@@ -1935,7 +1944,8 @@ mod tests {
         assert!(expected > 0, "test payload must have a non-zero known size");
 
         // Park: charge the pending request exactly as the backpressure path does.
-        let mut pending_ticket = current_runtime_memory_budget().and_then(|b| b.charge(&pdata));
+        let mut pending_ticket = current_runtime_memory_budget()
+            .and_then(|b| b.charge_at(RetainedSiteKind::ExporterPending, &pdata));
         assert!(
             pending_ticket.is_some(),
             "the backpressure-parked request must be charged"
@@ -1945,6 +1955,11 @@ mod tests {
             state.snapshot().charged_bytes,
             expected,
             "the parked pending request must be charged while retained"
+        );
+        assert_eq!(
+            state.snapshot().charged_bytes_by_site[RetainedSiteKind::ExporterPending.index()],
+            expected,
+            "a backpressure-parked request must attribute to the ExporterPending site"
         );
 
         // Un-park (dispatch): release the pending charge.

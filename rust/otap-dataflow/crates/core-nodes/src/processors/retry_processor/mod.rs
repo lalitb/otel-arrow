@@ -22,7 +22,9 @@ use otap_df_config::SignalType;
 use otap_df_config::{error::Error as ConfigError, node::NodeUserConfig};
 use otap_df_engine::MessageSourceLocalEffectHandlerExtension;
 use otap_df_engine::context::PipelineContext;
-use otap_df_engine::memory_budget::{LocalMemoryTicket, current_runtime_memory_budget};
+use otap_df_engine::memory_budget::{
+    LocalMemoryTicket, RetainedSiteKind, current_runtime_memory_budget,
+};
 use otap_df_engine::{
     ConsumerEffectHandlerExtension, Interests, ProcessorFactory, ProducerEffectHandlerExtension,
     config::ProcessorConfig,
@@ -595,7 +597,7 @@ impl RetryProcessor {
         self.metrics.increment_retry_attempts(signal);
 
         let budget_ticket = if let Some(budget) = current_runtime_memory_budget() {
-            match budget.charge(rereq.as_ref()) {
+            match budget.charge_at(RetainedSiteKind::RetryBuffer, rereq.as_ref()) {
                 Some(ticket) => Some(ticket),
                 None => {
                     // Observe-only budgets always return `Some`. This branch
@@ -774,8 +776,8 @@ mod test {
     };
     use otap_df_engine::engine_metrics::{EngineMetrics, EngineMetricsMonitor};
     use otap_df_engine::memory_budget::{
-        BudgetMode, BudgetScopeId, MemoryBudgetSizing, MemoryBudgetState, RuntimeMemoryBudget,
-        RuntimeMemoryBudgetConfig, set_current_runtime_memory_budget,
+        BudgetMode, BudgetScopeId, MemoryBudgetSizing, MemoryBudgetState, RetainedSiteKind,
+        RuntimeMemoryBudget, RuntimeMemoryBudgetConfig, set_current_runtime_memory_budget,
     };
     use otap_df_engine::testing::liveness::next_completion;
     use otap_df_engine::testing::node::test_node;
@@ -1278,6 +1280,12 @@ mod test {
                 assert!(
                     budget_state.snapshot().charged_bytes > 0,
                     "delayed retry retention should be charged while queued"
+                );
+                assert!(
+                    budget_state.snapshot().charged_bytes_by_site
+                        [RetainedSiteKind::RetryBuffer.index()]
+                        > 0,
+                    "delayed retry retention must attribute to the RetryBuffer site"
                 );
                 assert_eq!(
                     budget_state.snapshot().soft_runtime_count,

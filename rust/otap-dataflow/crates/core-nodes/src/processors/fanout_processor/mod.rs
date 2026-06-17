@@ -28,7 +28,9 @@ use otap_df_engine::context::PipelineContext;
 use otap_df_engine::control::{AckMsg, CallData, Context8u8, NackMsg, NodeControlMsg, UnwindData};
 use otap_df_engine::error::{Error, TypedError};
 use otap_df_engine::local::processor::{EffectHandler, Processor};
-use otap_df_engine::memory_budget::{LocalMemoryTicket, current_runtime_memory_budget};
+use otap_df_engine::memory_budget::{
+    LocalMemoryTicket, RetainedSiteKind, current_runtime_memory_budget,
+};
 use otap_df_engine::message::Message;
 use otap_df_engine::node::NodeId;
 use otap_df_engine::{ConsumerEffectHandlerExtension, Interests, ProducerEffectHandlerExtension};
@@ -577,7 +579,8 @@ impl FanoutProcessor {
         // ticket rides inside the `Inflight` entry so every terminal path
         // (completion, timeout, capacity eviction, processor drop) releases it
         // exactly once.
-        let ticket = current_runtime_memory_budget().and_then(|budget| budget.charge(&pdata));
+        let ticket = current_runtime_memory_budget()
+            .and_then(|budget| budget.charge_at(RetainedSiteKind::FanoutInflight, &pdata));
 
         let _ = self.inflight.insert(
             request_id,
@@ -1007,7 +1010,8 @@ impl FanoutProcessor {
         // memory-budget ticket charging it while retained. The ticket rides
         // inside the entry, so primary ack/nack, capacity eviction, or processor
         // drop releases it exactly once.
-        let ticket = current_runtime_memory_budget().and_then(|budget| budget.charge(&pdata));
+        let ticket = current_runtime_memory_budget()
+            .and_then(|budget| budget.charge_at(RetainedSiteKind::FanoutInflight, &pdata));
         let _ = self.slim_inflight.insert(
             request_id,
             SlimInflight {
@@ -1791,6 +1795,11 @@ mod tests {
             state.snapshot().charged_bytes,
             1024,
             "the retained slim-inflight request must be charged while in-flight"
+        );
+        assert_eq!(
+            state.snapshot().charged_bytes_by_site[RetainedSiteKind::FanoutInflight.index()],
+            1024,
+            "an in-flight fanout original must attribute to the FanoutInflight site"
         );
 
         let mut sent = drain(h.outputs.get_mut(TEST_OUT_PORT_NAME).expect("output port"));

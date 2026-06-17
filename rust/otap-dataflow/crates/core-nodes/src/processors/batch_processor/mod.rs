@@ -42,7 +42,9 @@ use otap_df_engine::{
     control::{AckMsg, CallData, NackMsg, NodeControlMsg, WakeupSlot},
     error::{Error as EngineError, ProcessorErrorKind},
     local::processor as local,
-    memory_budget::{ChargedSize, LocalMemoryTicket, current_runtime_memory_budget},
+    memory_budget::{
+        ChargedSize, LocalMemoryTicket, RetainedSiteKind, current_runtime_memory_budget,
+    },
     message::Message,
     node::NodeId,
     processor::ProcessorWrapper,
@@ -459,7 +461,10 @@ fn charge_batch<T: OtapPayloadHelpers>(batch: &T) -> Option<LocalMemoryTicket> {
         }
     }
     let budget = current_runtime_memory_budget()?;
-    budget.charge(BatchSize(batch.num_bytes().map(|n| n as u64)))
+    budget.charge_at(
+        RetainedSiteKind::BatchPending,
+        BatchSize(batch.num_bytes().map(|n| n as u64)),
+    )
 }
 
 struct MultiContext {
@@ -3971,6 +3976,13 @@ mod tests {
 
         budget.flush_snapshot();
         assert_eq!(state.snapshot().charged_bytes, 512);
+        // The pending input buffer attributes its retained bytes to the
+        // BatchPending site.
+        assert_eq!(
+            state.snapshot().charged_bytes_by_site[RetainedSiteKind::BatchPending.index()],
+            512,
+            "batch pending input must attribute to the BatchPending site"
+        );
 
         let moved = inputs.drain();
         assert!(

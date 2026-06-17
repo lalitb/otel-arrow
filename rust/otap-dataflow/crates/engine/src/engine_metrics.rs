@@ -34,14 +34,15 @@
 //!   TODO: Also emit a cumulative `cpu_time` counter (like the Go Collector's
 //!   `process_cpu_seconds_total`) for users who prefer query-time computation.
 
-use crate::memory_budget::MemoryBudgetState;
+use crate::memory_budget::{MemoryBudgetState, RetainedSiteKind};
 use crate::memory_limiter::MemoryPressureState;
 use cpu_time::ProcessTime;
 use otap_df_telemetry::instrument::{Gauge, ObserveUpDownCounter};
 use otap_df_telemetry::metrics::MetricSet;
 use otap_df_telemetry::registry::{EntityKey, TelemetryRegistryHandle};
 use otap_df_telemetry::reporter::MetricsReporter;
-use otap_df_telemetry_macros::metric_set;
+use otap_df_telemetry_macros::{attribute_set, metric_set};
+use std::borrow::Cow;
 use std::time::Instant;
 
 /// Engine-wide metrics emitted once per engine instance.
@@ -181,6 +182,42 @@ pub struct EngineMetrics {
     pub runtime_memory_budget_spare_available_bytes: Gauge<u64>,
 }
 
+/// Per-retention-site memory-budget attribution, emitted as one low-cardinality
+/// labeled series per [`RetainedSiteKind`] (selected by the `site` attribute).
+///
+/// This is a breakdown of the aggregate `runtime_memory_budget_charged_bytes`
+/// and `runtime_memory_budget_unknown_count` gauges: summing a field across all
+/// `site` values reproduces the aggregate. It lets operators tell apart which
+/// kind of retained work (batch buffers, retry buffers, parked routes, in-flight
+/// exporter requests, etc.) is holding memory, without per-item telemetry on the
+/// charge hot path — the values are read from a per-site snapshot at report time.
+///
+/// Topic queue/ring retention is owned by escrow buckets and surfaced by the
+/// `runtime_memory_budget_escrow_*` gauges, so it does not appear here.
+#[metric_set(name = "engine")]
+#[derive(Debug, Default, Clone)]
+pub struct RetainedSiteMetrics {
+    /// Known logical retained bytes charged to this retention site.
+    #[metric(unit = "{By}")]
+    pub runtime_memory_budget_site_charged_bytes: Gauge<u64>,
+
+    /// Retained item count observed without a known logical size at this site.
+    #[metric(unit = "{item}")]
+    pub runtime_memory_budget_site_unknown_count: Gauge<u64>,
+}
+
+/// Attribute set scoping a [`RetainedSiteMetrics`] series to one retention site.
+///
+/// The `site` value is the static, low-cardinality [`RetainedSiteKind::as_str`]
+/// label, so constructing this set is allocation-free (`Cow::Borrowed`).
+#[attribute_set(name = "engine.retained.site.attrs")]
+#[derive(Debug, Clone, Default, Hash)]
+pub struct RetainedSiteAttributeSet {
+    /// Low-cardinality retention-site label (e.g. `batch_pending`).
+    #[attribute(key = "site")]
+    pub site: Cow<'static, str>,
+}
+
 /// Monitors and reports engine-wide metrics.
 ///
 /// Created by the controller and driven by a periodic timer in a dedicated
@@ -188,6 +225,9 @@ pub struct EngineMetrics {
 /// and [`report`](Self::report) to flush them to the metrics pipeline.
 pub struct EngineMetricsMonitor {
     metrics: MetricSet<EngineMetrics>,
+    /// One labeled metric set per attributed retention site, paired with the
+    /// site kind it reports. Updated from the per-site snapshot rollup.
+    site_metrics: Vec<(RetainedSiteKind, MetricSet<RetainedSiteMetrics>)>,
     reporter: MetricsReporter,
     registry: TelemetryRegistryHandle,
     /// Wall-clock anchor for the current measurement interval.
@@ -216,11 +256,25 @@ impl EngineMetricsMonitor {
         memory_budget_state: MemoryBudgetState,
     ) -> Self {
         let metrics = registry.register_metric_set_for_entity::<EngineMetrics>(entity_key);
+        // One labeled metric set per attributed retention site. Constructing the
+        // attribute set is allocation-free because the `site` value is a static
+        // `&'static str` from `RetainedSiteKind::as_str`.
+        let site_metrics = RetainedSiteKind::METRIC_SITES
+            .iter()
+            .map(|&site| {
+                let metric_set =
+                    registry.register_metric_set::<RetainedSiteMetrics>(RetainedSiteAttributeSet {
+                        site: Cow::Borrowed(site.as_str()),
+                    });
+                (site, metric_set)
+            })
+            .collect();
         let num_cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
         Self {
             metrics,
+            site_metrics,
             reporter,
             registry,
             wall_start: Instant::now(),
@@ -336,6 +390,17 @@ impl EngineMetricsMonitor {
         self.metrics
             .runtime_memory_budget_spare_available_bytes
             .set(memory_budget.spare_available_bytes);
+        // Per-retention-site attribution: read the per-site rollup from the same
+        // snapshot so the labeled series stay consistent with the aggregates.
+        for (site, metric_set) in self.site_metrics.iter_mut() {
+            let index = site.index();
+            metric_set
+                .runtime_memory_budget_site_charged_bytes
+                .set(memory_budget.charged_bytes_by_site[index]);
+            metric_set
+                .runtime_memory_budget_site_unknown_count
+                .set(memory_budget.unknown_count_by_site[index]);
+        }
         self.wall_start = now_wall;
         self.cpu_start = now_cpu;
     }
@@ -345,7 +410,11 @@ impl EngineMetricsMonitor {
     /// Returns an error only if the metrics channel is permanently closed.
     /// A full channel is silently tolerated (non-blocking, try-send semantics).
     pub fn report(&mut self) -> Result<(), otap_df_telemetry::error::Error> {
-        self.reporter.report(&mut self.metrics)
+        self.reporter.report(&mut self.metrics)?;
+        for (_site, metric_set) in self.site_metrics.iter_mut() {
+            self.reporter.report(metric_set)?;
+        }
+        Ok(())
     }
 }
 
@@ -361,6 +430,11 @@ impl Drop for EngineMetricsMonitor {
         let _ = self
             .registry
             .unregister_metric_set(self.metrics.metric_set_key());
+        for (_site, metric_set) in &self.site_metrics {
+            let _ = self
+                .registry
+                .unregister_metric_set(metric_set.metric_set_key());
+        }
     }
 }
 
@@ -644,6 +718,126 @@ mod tests {
             engine_metric(&snapshot, "runtime.memory.budget.overshoot.bytes"),
             MetricValue::U64(15),
             "reported overshoot bytes should include bytes above floor plus leases"
+        );
+    }
+
+    #[test]
+    fn engine_metrics_expose_per_retention_site_attribution() {
+        let registry = TelemetryRegistryHandle::new();
+        let controller = ControllerContext::new(registry.clone());
+        controller.configure_memory_budget(
+            crate::memory_budget::RuntimeMemoryBudgetConfig {
+                mode: crate::memory_budget::BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: crate::memory_budget::MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 1_000,
+                    lease_step_bytes: 10,
+                    max_overshoot_per_runtime_bytes: 20,
+                    overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: 1_000,
+                runtime_count: 1,
+                enforcement: crate::memory_budget::MemoryBudgetEnforcement::default(),
+            },
+            None,
+        );
+        let handle = controller
+            .memory_budget_state()
+            .register_runtime_snapshot(crate::memory_budget::BudgetScopeId::default());
+        let account = handle.local_account().expect("budget should be configured");
+        let _batch = account
+            .charge_at(RetainedSiteKind::BatchPending, 50_u64)
+            .expect("batch charge should fit");
+        let _retry = account
+            .charge_at(RetainedSiteKind::RetryBuffer, 30_u64)
+            .expect("retry charge should fit");
+        account.flush_snapshot();
+
+        // The labeled metric set must declare the expected metric names.
+        let descriptor = RetainedSiteMetrics::default().descriptor();
+        assert!(
+            descriptor
+                .metrics
+                .iter()
+                .any(|f| f.name == "runtime.memory.budget.site.charged.bytes"),
+            "per-site charged-bytes metric must exist"
+        );
+        assert!(
+            descriptor
+                .metrics
+                .iter()
+                .any(|f| f.name == "runtime.memory.budget.site.unknown.count"),
+            "per-site unknown-count metric must exist"
+        );
+
+        let entity_key = controller.register_engine_entity();
+        let (rx, reporter) = MetricsReporter::create_new_and_receiver(64);
+        let mut monitor = EngineMetricsMonitor::new(
+            registry,
+            entity_key,
+            reporter,
+            controller.memory_pressure_state(),
+            controller.memory_budget_state(),
+        );
+        monitor.update();
+
+        // One labeled series per emitted site kind.
+        assert_eq!(
+            monitor.site_metrics.len(),
+            RetainedSiteKind::METRIC_SITES.len()
+        );
+        let site_charged = |site: RetainedSiteKind| -> u64 {
+            monitor
+                .site_metrics
+                .iter()
+                .find(|(s, _)| *s == site)
+                .map(|(_, m)| m.runtime_memory_budget_site_charged_bytes.get())
+                .expect("site metric set should exist")
+        };
+        assert_eq!(site_charged(RetainedSiteKind::BatchPending), 50);
+        assert_eq!(site_charged(RetainedSiteKind::RetryBuffer), 30);
+        assert_eq!(site_charged(RetainedSiteKind::FanoutInflight), 0);
+
+        // The aggregate gauge is unchanged, and the per-site series sum back to
+        // it: attribution is a breakdown, not an extra total.
+        assert_eq!(
+            monitor.metrics.runtime_memory_budget_charged_bytes.get(),
+            80
+        );
+        let per_site_sum: u64 = monitor
+            .site_metrics
+            .iter()
+            .map(|(_, m)| m.runtime_memory_budget_site_charged_bytes.get())
+            .sum();
+        assert_eq!(per_site_sum, 80);
+
+        // The batch_pending series is emitted to the reporting pipeline with the
+        // right value; match it by metric-set key so the assertion is robust.
+        let batch_key = monitor
+            .site_metrics
+            .iter()
+            .find(|(s, _)| *s == RetainedSiteKind::BatchPending)
+            .map(|(_, m)| m.metric_set_key())
+            .expect("batch_pending metric set");
+        let charged_index = descriptor
+            .metrics
+            .iter()
+            .position(|f| f.name == "runtime.memory.budget.site.charged.bytes")
+            .expect("charged-bytes metric index");
+
+        monitor.report().expect("report should succeed");
+        let mut batch_value = None;
+        while let Ok(snapshot) = rx.try_recv() {
+            if snapshot.key() == batch_key {
+                batch_value = Some(snapshot.get_metrics()[charged_index]);
+            }
+        }
+        assert_eq!(
+            batch_value,
+            Some(MetricValue::U64(50)),
+            "reported batch_pending site series should carry the charged bytes"
         );
     }
 }

@@ -21,7 +21,7 @@ use otap_df_config::error::Error as ConfigError;
 use otap_df_engine::control::{WakeupRevision, WakeupSlot};
 use otap_df_engine::local::processor::EffectHandler;
 use otap_df_engine::memory_budget::{
-    ChargedSize, LocalMemoryTicket, current_runtime_memory_budget,
+    ChargedSize, LocalMemoryTicket, RetainedSiteKind, current_runtime_memory_budget,
 };
 use otap_df_engine::{ProcessorRuntimeRequirements, WakeupError};
 use serde::{Deserialize, Serialize};
@@ -216,8 +216,8 @@ impl<PData, Meta> ExclusiveRouteScheduler<PData, Meta> {
                 // Charge the parked payload while it is retained in router-local
                 // state. The ticket rides inside the `PendingRoute` so every
                 // terminal path (admission, nack, drain, drop) releases it once.
-                let ticket =
-                    current_runtime_memory_budget().and_then(|budget| budget.charge(&data));
+                let ticket = current_runtime_memory_budget()
+                    .and_then(|budget| budget.charge_at(RetainedSiteKind::RouterParked, &data));
                 let pending = PendingRoute::new(port.clone(), data, meta, now, ticket);
                 let _ = self.pending_by_port.insert(port.clone(), pending);
                 if let Err(error) = self.sync_armed_wakeup(effect_handler) {
@@ -451,7 +451,8 @@ mod tests {
         );
 
         let now = Instant::now();
-        let ticket = current_runtime_memory_budget().and_then(|b| b.charge(SizedPayload(256)));
+        let ticket = current_runtime_memory_budget()
+            .and_then(|b| b.charge_at(RetainedSiteKind::RouterParked, SizedPayload(256)));
         assert!(ticket.is_some(), "parked payload must be charged");
         let pending = PendingRoute::new(PortName::from("out"), SizedPayload(256), (), now, ticket);
 
@@ -460,6 +461,11 @@ mod tests {
             state.snapshot().charged_bytes,
             256,
             "the parked route must be charged while retained"
+        );
+        assert_eq!(
+            state.snapshot().charged_bytes_by_site[RetainedSiteKind::RouterParked.index()],
+            256,
+            "a parked route must attribute its charge to the RouterParked site"
         );
 
         // Probe cycle: take the route apart and re-park it, carrying the ticket.
