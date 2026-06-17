@@ -258,25 +258,25 @@ impl Policies {
                     ));
                 }
             }
-            // Enforcement-flag gating honesty. `queue_publish` is the only
-            // enforcement path actually wired (at the owned topic-publish
-            // boundary), so it is accepted only with the `unstable-memory-
-            // enforcement` feature. `receiver_admission` and `reclaim_hooks` are
-            // carried for forward compatibility but are NOT wired to any runtime
-            // behavior yet: receiver admission is not driven by the runtime
-            // budget, and although a per-runtime reclaim registry is installed,
-            // no concrete reclaimer registers and no driver invokes reclaim.
-            // They are therefore rejected in *all* builds (including the unstable
-            // feature) until wired end to end, so enabling them cannot create a
+            // Enforcement-flag gating honesty. `queue_publish` (owned
+            // topic-publish boundary) and `reclaim_hooks` (component-driven
+            // memory pressure relief, e.g. the batch processor early flush) are
+            // wired enforcement paths, so each is accepted only with the
+            // `unstable-memory-enforcement` feature. `receiver_admission` is
+            // carried for forward compatibility but is NOT wired to any runtime
+            // behavior yet (receiver admission is not driven by the runtime
+            // budget), so it is rejected in *all* builds (including the unstable
+            // feature) until wired end to end, so enabling it cannot create a
             // false sense of enforcement.
             if memory_budget.enforcement.receiver_admission {
                 errors.push(format!(
                     "{budget_path}.enforcement.receiver_admission is not wired to runtime admission yet and cannot be enabled"
                 ));
             }
+            #[cfg(not(feature = "unstable-memory-enforcement"))]
             if memory_budget.enforcement.reclaim_hooks {
                 errors.push(format!(
-                    "{budget_path}.enforcement.reclaim_hooks is not wired yet (no concrete reclaimer registers and no driver invokes reclaim) and cannot be enabled"
+                    "{budget_path}.enforcement.reclaim_hooks requires the `unstable-memory-enforcement` build feature, which is disabled in production builds"
                 ));
             }
             #[cfg(not(feature = "unstable-memory-enforcement"))]
@@ -1492,28 +1492,30 @@ mod tests {
         ));
         assert_eq!(reclaim.len(), 1, "{reclaim:?}");
         assert!(
-            reclaim[0].contains("reclaim_hooks") && reclaim[0].contains("not wired"),
-            "default build rejects reclaim_hooks as not wired: {reclaim:?}"
+            reclaim[0].contains("reclaim_hooks")
+                && reclaim[0].contains("unstable-memory-enforcement"),
+            "default build rejects reclaim_hooks without the feature: {reclaim:?}"
         );
     }
 
     /// With the `unstable-memory-enforcement` build feature enabled, an
-    /// enforce-mode budget that enables only the wired `queue_publish` flag
-    /// validates cleanly. `receiver_admission` and `reclaim_hooks` stay rejected
-    /// even with the feature, because they are not wired to any runtime behavior.
+    /// enforce-mode budget that enables the wired `queue_publish` and
+    /// `reclaim_hooks` flags validates cleanly. `receiver_admission` stays
+    /// rejected even with the feature, because it is not wired to any runtime
+    /// behavior.
     #[cfg(feature = "unstable-memory-enforcement")]
     #[test]
-    fn unstable_enforcement_feature_accepts_only_wired_queue_publish() {
+    fn unstable_enforcement_feature_accepts_wired_flags() {
         let mut budget = budget_with_enforcement(super::MemoryBudgetEnforcementPolicy {
             receiver_admission: false,
             queue_publish: true,
-            reclaim_hooks: false,
+            reclaim_hooks: true,
         });
         budget.mode = super::MemoryBudgetMode::Enforce;
         let errors = budget_validation_errors(budget);
         assert!(
             errors.is_empty(),
-            "unstable feature accepts enforce mode with the wired queue_publish flag: {errors:?}"
+            "unstable feature accepts enforce mode with the wired queue_publish and reclaim_hooks flags: {errors:?}"
         );
     }
 
@@ -1536,22 +1538,21 @@ mod tests {
         );
     }
 
-    /// `reclaim_hooks` is not wired (no concrete reclaimer registers and no
-    /// driver invokes reclaim), so it is rejected even with the unstable feature.
+    /// `reclaim_hooks` is wired to component-driven memory pressure relief (the
+    /// batch processor early flush), so it is accepted with the unstable feature.
     #[cfg(feature = "unstable-memory-enforcement")]
     #[test]
-    fn unstable_enforcement_feature_rejects_reclaim_hooks() {
-        let errors = budget_validation_errors(budget_with_enforcement(
-            super::MemoryBudgetEnforcementPolicy {
-                receiver_admission: false,
-                queue_publish: false,
-                reclaim_hooks: true,
-            },
-        ));
-        assert_eq!(errors.len(), 1, "{errors:?}");
+    fn unstable_enforcement_feature_accepts_reclaim_hooks() {
+        let mut budget = budget_with_enforcement(super::MemoryBudgetEnforcementPolicy {
+            receiver_admission: false,
+            queue_publish: false,
+            reclaim_hooks: true,
+        });
+        budget.mode = super::MemoryBudgetMode::Enforce;
+        let errors = budget_validation_errors(budget);
         assert!(
-            errors[0].contains("reclaim_hooks") && errors[0].contains("not wired"),
-            "unstable feature still rejects unwired reclaim_hooks: {errors:?}"
+            errors.is_empty(),
+            "unstable feature accepts the wired reclaim_hooks flag: {errors:?}"
         );
     }
 

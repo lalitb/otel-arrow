@@ -1,0 +1,4 @@
+change_type: enhancement
+component: pipeline
+note: "Add unstable memory-budget pressure relief for the batch processor: when `enforcement.reclaim_hooks` is enabled and the runtime budget is under Soft/Hard pressure, pending batches flush early through the normal output path instead of being silently dropped."
+issues: []

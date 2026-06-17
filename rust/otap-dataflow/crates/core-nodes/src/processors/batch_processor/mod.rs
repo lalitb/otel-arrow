@@ -526,6 +526,12 @@ enum FlushReason {
     Size,
     Timer,
     Shutdown,
+    /// Early flush triggered by runtime memory-budget pressure relief (gated by
+    /// `enforcement.reclaim_hooks`). Flushes all pending input downstream
+    /// earlier than the size/time thresholds, releasing the buffered payloads
+    /// and their tickets through the normal flush handoff (no data loss, no
+    /// drop). Like `Shutdown`, it does not retain a partial last batch.
+    Pressure,
 }
 
 /// Minimal, essential metrics for the batch processor.
@@ -558,6 +564,10 @@ pub struct BatchProcessorMetrics {
     /// Number of flushes triggered by timer (all signals)
     #[metric(unit = "{flush}")]
     flushes_timer: Counter<u64>,
+    /// Number of flushes triggered early by runtime memory-budget pressure
+    /// relief (all signals)
+    #[metric(unit = "{flush}")]
+    flushes_pressure: Counter<u64>,
 
     /// Number of input requests pending at flush time
     #[metric(unit = "{request}")]
@@ -931,6 +941,24 @@ where
 
         // Flush based on size when the batch reaches the lower limit.
         if timeout != Duration::ZERO && pending_size < self.fmtcfg.lower_limit() {
+            // Memory pressure relief (gated by `enforcement.reclaim_hooks`):
+            // when the runtime budget is under Soft/Hard pressure, flush the
+            // pending batch downstream now instead of accumulating to the size
+            // threshold. This releases the buffered payloads and their tickets
+            // through the normal flush handoff (no data loss, no drop). The gate
+            // read is two cheap local `Cell` reads and only runs on the
+            // accumulating branch (the buffer is non-empty here because we just
+            // accepted an input), so it cannot spin on an empty buffer.
+            if current_runtime_memory_budget().is_some_and(|budget| budget.pressure_relief_active())
+            {
+                return self
+                    .flush_signal_impl(
+                        effect,
+                        arrival.unwrap_or_else(Instant::now),
+                        FlushReason::Pressure,
+                    )
+                    .await;
+            }
             if let Some(now) = arrival {
                 self.buffer
                     .set_arrival(self.signal, now, timeout, effect)
@@ -1012,6 +1040,7 @@ where
         match reason {
             FlushReason::Size => self.metrics.flushes_size.inc(),
             FlushReason::Timer => self.metrics.flushes_timer.inc(),
+            FlushReason::Pressure => self.metrics.flushes_pressure.inc(),
             FlushReason::Shutdown => {}
         }
 
@@ -3841,10 +3870,26 @@ mod tests {
         std::rc::Rc<otap_df_engine::memory_budget::RuntimeMemoryBudget>,
         otap_df_engine::memory_budget::RuntimeMemoryBudgetGuard,
     ) {
+        install_test_runtime_budget_with(
+            otap_df_engine::memory_budget::MemoryBudgetEnforcement::default(),
+        )
+    }
+
+    /// Installs a runtime memory budget for the current thread, allowing the
+    /// caller to choose the enforcement flags (e.g. enable `reclaim_hooks` to
+    /// exercise component-driven pressure relief). The budget floor is `1` byte
+    /// with no global lease pool, so any non-trivial known charge pushes the
+    /// account into `Soft` pressure.
+    fn install_test_runtime_budget_with(
+        enforcement: otap_df_engine::memory_budget::MemoryBudgetEnforcement,
+    ) -> (
+        otap_df_engine::memory_budget::MemoryBudgetState,
+        std::rc::Rc<otap_df_engine::memory_budget::RuntimeMemoryBudget>,
+        otap_df_engine::memory_budget::RuntimeMemoryBudgetGuard,
+    ) {
         use otap_df_engine::memory_budget::{
-            BudgetMode, BudgetScopeId, MemoryBudgetEnforcement, MemoryBudgetSizing,
-            MemoryBudgetState, RuntimeMemoryBudget, RuntimeMemoryBudgetConfig,
-            set_current_runtime_memory_budget,
+            BudgetMode, BudgetScopeId, MemoryBudgetSizing, MemoryBudgetState, RuntimeMemoryBudget,
+            RuntimeMemoryBudgetConfig, set_current_runtime_memory_budget,
         };
         let state = MemoryBudgetState::default();
         state.configure(
@@ -3861,7 +3906,7 @@ mod tests {
                 },
                 topic_default_limit_bytes: 100,
                 runtime_count: 1,
-                enforcement: MemoryBudgetEnforcement::default(),
+                enforcement,
             },
             None,
         );
@@ -3977,5 +4022,196 @@ mod tests {
             state.snapshot().unknown_count >= 1,
             "unknown-size retained inputs are tracked as unknown"
         );
+    }
+
+    /// Enforcement flags that enable only component-driven pressure relief.
+    fn reclaim_hooks_enforcement() -> otap_df_engine::memory_budget::MemoryBudgetEnforcement {
+        otap_df_engine::memory_budget::MemoryBudgetEnforcement {
+            receiver_admission: false,
+            queue_publish: false,
+            reclaim_hooks: true,
+        }
+    }
+
+    /// Config that buffers a single small input (min size 5 items) with a long
+    /// flush timeout, so without pressure relief the input stays pending and is
+    /// neither size- nor timer-flushed during the test.
+    fn buffering_logs_config() -> Value {
+        json!({
+            "otap": {
+                "min_size": 5,
+                "max_size": 10,
+                "sizer": "items",
+            },
+            "max_batch_duration": "1h"
+        })
+    }
+
+    /// With `reclaim_hooks` enabled and the runtime under `Soft` pressure, the
+    /// batch processor flushes its pending buffer downstream early (before the
+    /// size/time threshold), releasing the buffered input's ticket. No data is
+    /// dropped: the buffered batch is emitted to the output.
+    #[test]
+    fn pressure_relief_flushes_pending_batch_early() {
+        let (_telemetry_registry, _metrics_reporter, phase) =
+            setup_test_runtime(buffering_logs_config());
+
+        phase
+            .run_test(move |mut ctx| async move {
+                let (state, budget, _budget_guard) =
+                    install_test_runtime_budget_with(reclaim_hooks_enforcement());
+
+                // Simulate retained work elsewhere in the runtime pushing the
+                // account into Soft pressure (floor is 1 byte). Hold the ticket so
+                // the pressure persists across the buffered accept below.
+                let _pressure_ticket = budget.charge(1_000u64).expect("pre-charge to soft");
+                assert_eq!(
+                    budget.account().level(),
+                    otap_df_engine::memory_budget::BudgetLevel::Soft,
+                    "pre-charge should put the runtime under Soft pressure"
+                );
+                assert!(
+                    budget.pressure_relief_active(),
+                    "reclaim_hooks + Soft pressure should activate pressure relief"
+                );
+
+                let mut datagen = DataGenerator::new(1);
+                let logs = datagen.generate_logs();
+                let rec = encode_logs_otap_batch(&logs).expect("encode logs");
+                ctx.process(Message::PData(OtapPdata::new_default(rec.into())))
+                    .await
+                    .expect("process input");
+
+                let flushed = ctx.drain_pdata().await;
+                assert_eq!(
+                    flushed.len(),
+                    1,
+                    "pressure relief should flush the pending batch early (1 input < min size 5)"
+                );
+
+                // The buffered input's ticket is released by the flush; only the
+                // simulated external pre-charge remains.
+                budget.flush_snapshot();
+                assert_eq!(
+                    state.snapshot().unknown_count,
+                    0,
+                    "early flush must release the buffered input's ticket (no undercount)"
+                );
+                assert_eq!(
+                    state.snapshot().charged_bytes,
+                    1_000,
+                    "early flush releases only the buffered input, not the external charge"
+                );
+            })
+            .validate(|_| async {});
+    }
+
+    /// When `reclaim_hooks` is disabled, runtime pressure does not trigger an
+    /// early flush: the single small input stays buffered.
+    #[test]
+    fn pressure_relief_inactive_when_reclaim_hooks_disabled() {
+        let (_telemetry_registry, _metrics_reporter, phase) =
+            setup_test_runtime(buffering_logs_config());
+
+        phase
+            .run_test(move |mut ctx| async move {
+                let (state, budget, _budget_guard) = install_test_runtime_budget_with(
+                    otap_df_engine::memory_budget::MemoryBudgetEnforcement::default(),
+                );
+                let _pressure_ticket = budget.charge(1_000u64).expect("pre-charge to soft");
+                assert_eq!(
+                    budget.account().level(),
+                    otap_df_engine::memory_budget::BudgetLevel::Soft
+                );
+                assert!(
+                    !budget.pressure_relief_active(),
+                    "pressure relief must stay inactive when reclaim_hooks is disabled"
+                );
+
+                let mut datagen = DataGenerator::new(1);
+                let logs = datagen.generate_logs();
+                let rec = encode_logs_otap_batch(&logs).expect("encode logs");
+                ctx.process(Message::PData(OtapPdata::new_default(rec.into())))
+                    .await
+                    .expect("process input");
+
+                assert!(
+                    ctx.drain_pdata().await.is_empty(),
+                    "no early flush when reclaim_hooks is disabled: input stays buffered"
+                );
+                budget.flush_snapshot();
+                assert_eq!(
+                    state.snapshot().unknown_count,
+                    1,
+                    "the buffered input remains retained while pressure relief is off"
+                );
+            })
+            .validate(|_| async {});
+    }
+
+    /// With `reclaim_hooks` enabled but the runtime at `Normal` pressure, no
+    /// early flush occurs: the single small input stays buffered.
+    #[test]
+    fn pressure_relief_inactive_when_pressure_normal() {
+        let (_telemetry_registry, _metrics_reporter, phase) =
+            setup_test_runtime(buffering_logs_config());
+
+        phase
+            .run_test(move |mut ctx| async move {
+                let (state, budget, _budget_guard) =
+                    install_test_runtime_budget_with(reclaim_hooks_enforcement());
+                // No external pre-charge: the account stays at Normal.
+                assert_eq!(
+                    budget.account().level(),
+                    otap_df_engine::memory_budget::BudgetLevel::Normal
+                );
+                assert!(
+                    !budget.pressure_relief_active(),
+                    "pressure relief must stay inactive at Normal pressure"
+                );
+
+                let mut datagen = DataGenerator::new(1);
+                let logs = datagen.generate_logs();
+                let rec = encode_logs_otap_batch(&logs).expect("encode logs");
+                ctx.process(Message::PData(OtapPdata::new_default(rec.into())))
+                    .await
+                    .expect("process input");
+
+                assert!(
+                    ctx.drain_pdata().await.is_empty(),
+                    "no early flush at Normal pressure: input stays buffered"
+                );
+                budget.flush_snapshot();
+                assert_eq!(
+                    state.snapshot().unknown_count,
+                    1,
+                    "the buffered input remains retained while pressure is Normal"
+                );
+            })
+            .validate(|_| async {});
+    }
+
+    /// Without any runtime budget installed, the early-flush check is a no-op
+    /// (the gate read short-circuits on `None`) and the input stays buffered.
+    #[test]
+    fn pressure_relief_inactive_without_runtime_budget() {
+        let (_telemetry_registry, _metrics_reporter, phase) =
+            setup_test_runtime(buffering_logs_config());
+
+        phase
+            .run_test(move |mut ctx| async move {
+                let mut datagen = DataGenerator::new(1);
+                let logs = datagen.generate_logs();
+                let rec = encode_logs_otap_batch(&logs).expect("encode logs");
+                ctx.process(Message::PData(OtapPdata::new_default(rec.into())))
+                    .await
+                    .expect("process input");
+
+                assert!(
+                    ctx.drain_pdata().await.is_empty(),
+                    "no runtime budget installed: input stays buffered, no early flush"
+                );
+            })
+            .validate(|_| async {});
     }
 }

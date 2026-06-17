@@ -980,6 +980,9 @@ impl RuntimeMemorySnapshotHandle {
         // resolved `lease_step_bytes` default). This is a one-time runtime
         // initialization step, off the per-item hot path.
         account.set_drain_allowance_bytes(config.sizing.effective_drain_allowance_bytes());
+        // Carry the reclaim/pressure-relief gate so component-driven relief
+        // paths (e.g. batch early flush) can read it locally.
+        account.set_reclaim_hooks_enabled(config.enforcement.reclaim_hooks);
         Some(Rc::new(account))
     }
 }
@@ -1218,6 +1221,13 @@ pub struct RuntimeMemoryAccount {
     /// Each successful drain charge increments this and the matching ticket
     /// drop decrements it.
     drain_committed: Cell<u64>,
+    /// Whether the runtime-budget reclaim/pressure-relief gate
+    /// (`enforcement.reclaim_hooks`) is enabled for this runtime. Set once at
+    /// runtime initialization from the resolved config; defaults to `false`.
+    /// Read by component-driven pressure-relief paths (e.g. batch early flush)
+    /// to decide whether to act on `level()` pressure. A plain `Cell<bool>`
+    /// local read with no atomics, off the per-item charge path.
+    reclaim_hooks: Cell<bool>,
     published_level: Cell<BudgetLevel>,
     dirty: Cell<bool>,
     snapshot: Arc<RuntimeMemorySnapshot>,
@@ -1254,6 +1264,7 @@ impl RuntimeMemoryAccount {
             reconcile_debt: Cell::new(0),
             drain_allowance_bytes: Cell::new(lease_step_bytes),
             drain_committed: Cell::new(0),
+            reclaim_hooks: Cell::new(false),
             published_level: Cell::new(BudgetLevel::Normal),
             dirty: Cell::new(false),
             snapshot,
@@ -1278,6 +1289,25 @@ impl RuntimeMemoryAccount {
     #[must_use]
     pub fn drain_allowance_bytes(&self) -> u64 {
         self.drain_allowance_bytes.get()
+    }
+
+    /// Sets whether the runtime-budget reclaim/pressure-relief gate
+    /// (`enforcement.reclaim_hooks`) is enabled for this runtime.
+    ///
+    /// Intended for runtime initialization (controller-driven), off the per-item
+    /// hot path.
+    pub fn set_reclaim_hooks_enabled(&self, enabled: bool) {
+        self.reclaim_hooks.set(enabled);
+    }
+
+    /// Returns whether the reclaim/pressure-relief gate is enabled.
+    ///
+    /// Cheap local `Cell` read with no atomics. Component-driven pressure-relief
+    /// paths (e.g. batch early flush) read this together with [`Self::level`] to
+    /// decide whether to act on runtime memory pressure.
+    #[must_use]
+    pub fn reclaim_hooks_enabled(&self) -> bool {
+        self.reclaim_hooks.get()
     }
 
     /// Returns the current pressure level.
@@ -2530,6 +2560,21 @@ impl RuntimeMemoryBudget {
     #[must_use]
     pub fn scope(&self) -> &BudgetScopeId {
         self.account.scope()
+    }
+
+    /// Whether component-driven memory pressure relief should act right now.
+    ///
+    /// True only when the reclaim/pressure-relief gate
+    /// (`enforcement.reclaim_hooks`) is enabled for this runtime **and** the
+    /// account is under `Soft` or `Hard` pressure. Component-driven relief paths
+    /// (e.g. the batch processor early flush) read this on a safe component turn
+    /// (where they hold their `EffectHandler`) to decide whether to flush
+    /// retained work downstream earlier than the configured thresholds. Both
+    /// reads are cheap local `Cell` reads with no atomics, and this acquires no
+    /// budget.
+    #[must_use]
+    pub fn pressure_relief_active(&self) -> bool {
+        self.account.reclaim_hooks_enabled() && self.account.level() != BudgetLevel::Normal
     }
 
     /// Publishes pending local state to the shared snapshot. Convenience
@@ -4411,6 +4456,33 @@ mod tests {
         let _guard = set_current_runtime_memory_budget(Some(budget.clone()));
         let current = current_runtime_memory_budget().expect("budget should be installed");
         assert!(Rc::ptr_eq(&budget, &current));
+    }
+
+    #[test]
+    fn pressure_relief_active_requires_gate_and_pressure() {
+        let acct = account(100, 10, 20, 0);
+        let budget = rc_budget_from(acct.clone());
+
+        assert_eq!(budget.account().level(), BudgetLevel::Normal);
+        assert!(
+            !budget.pressure_relief_active(),
+            "normal pressure is not an active relief condition"
+        );
+
+        let _ticket = budget
+            .charge(150_u64)
+            .expect("observe-only charge succeeds");
+        assert_ne!(budget.account().level(), BudgetLevel::Normal);
+        assert!(
+            !budget.pressure_relief_active(),
+            "pressure alone is insufficient when reclaim_hooks is disabled"
+        );
+
+        acct.set_reclaim_hooks_enabled(true);
+        assert!(
+            budget.pressure_relief_active(),
+            "reclaim_hooks plus Soft/Hard pressure activates component relief"
+        );
     }
 
     #[test]
