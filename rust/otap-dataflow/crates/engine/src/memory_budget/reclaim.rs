@@ -145,6 +145,15 @@ impl ReclaimContext<'_> {
 /// yield to other tasks while the registry holds it borrowed, so there is no
 /// borrow-across-await hazard, and reclaim stays bounded, runtime-local, and
 /// budget-free. It must also tolerate being called again later.
+///
+/// By design, `reclaim` is given **no `EffectHandler`**: it can only release
+/// owners it already holds, not notify ack/nack or forward work downstream. A
+/// consequence (see the candidate audit in `docs/memory-limiter-phase2.md`) is
+/// that this trait can only safely shed retained work that has *no* downstream
+/// ack/nack obligation. Every co-located retention site audited so far holds
+/// *subscribed* work whose safe shedding needs a nack or an early flush (both
+/// requiring the `EffectHandler`), so none is a valid first reclaim site yet and
+/// `enforcement.reclaim_hooks` stays rejected at config validation.
 pub trait LocalMemoryReclaim {
     /// The ordering class for this reclaimer.
     fn reclaim_priority(&self) -> ReclaimPriority;
