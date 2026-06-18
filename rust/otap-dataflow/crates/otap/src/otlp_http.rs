@@ -26,7 +26,8 @@ use hyper_util::rt::TokioIo;
 use otap_df_config::SignalType;
 use otap_df_config::byte_units;
 use otap_df_config::transport_headers::TransportHeaders;
-use otap_df_engine::memory_limiter::SharedReceiverAdmissionState;
+use otap_df_engine::memory_budget::SharedRuntimeBudgetPressure;
+use otap_df_engine::memory_limiter::{ReceiverAdmissionDecision, SharedReceiverAdmissionState};
 use otap_df_engine::shared::receiver::EffectHandler;
 use otap_df_engine::{
     Interests, MessageSourceSharedEffectHandlerExtension, ProducerEffectHandlerExtension,
@@ -510,6 +511,11 @@ struct HttpHandler {
     metrics: Arc<Mutex<MetricSet<crate::otlp_metrics::OtlpReceiverMetrics>>>,
     settings: HttpServerSettings,
     admission_state: SharedReceiverAdmissionState,
+    /// Optional sendable view of this runtime's memory-budget pressure. Read on
+    /// the handler thread (which cannot touch the `!Send` runtime account) to
+    /// shed on runtime-budget `Hard` in addition to process `Hard`. `None` when
+    /// no runtime budget is installed, in which case admission is process-only.
+    runtime_budget_pressure: Option<SharedRuntimeBudgetPressure>,
     /// Optional global semaphore shared across protocols (e.g., gRPC + HTTP) to enforce
     /// receiver-wide backpressure tied to downstream capacity.
     global_semaphore: Option<Arc<Semaphore>>,
@@ -522,6 +528,23 @@ struct HttpHandler {
 }
 
 impl HttpHandler {
+    /// Evaluates the combined receiver-admission decision for this request from
+    /// process pressure plus (when installed) this runtime's shared
+    /// memory-budget pressure. Cheap atomic reads; no decode, no budget
+    /// acquisition. With no runtime budget pressure installed this is exactly
+    /// the Phase 1 process-only `should_shed_ingress()` for the reject case.
+    fn admission_decision(&self) -> ReceiverAdmissionDecision {
+        let (runtime_budget_level, runtime_budget_enforce) = match &self.runtime_budget_pressure {
+            Some(pressure) => (
+                Some(pressure.budget_level()),
+                pressure.receiver_admission_enforce(),
+            ),
+            None => (None, false),
+        };
+        self.admission_state
+            .evaluate(runtime_budget_level, runtime_budget_enforce)
+    }
+
     async fn handle(self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
         let Some(signal) = map_path_to_signal(req.uri().path()) else {
             return Ok(not_found());
@@ -548,7 +571,7 @@ impl HttpHandler {
         let permit_timeout = self.settings.timeout.unwrap_or(Duration::from_secs(5));
 
         let fut = async move {
-            if self.admission_state.should_shed_ingress() {
+            if self.admission_decision().is_reject() {
                 let mut metrics = self.metrics.lock();
                 metrics.rejected_requests.inc();
                 metrics.refused_memory_pressure.inc();
@@ -591,7 +614,7 @@ impl HttpHandler {
 
             // Re-check after potentially waiting for the global permit: pressure may have
             // escalated while this request was queued.
-            if self.admission_state.should_shed_ingress() {
+            if self.admission_decision().is_reject() {
                 let mut metrics = self.metrics.lock();
                 metrics.rejected_requests.inc();
                 metrics.refused_memory_pressure.inc();
@@ -631,7 +654,7 @@ impl HttpHandler {
             };
 
             // Re-check after waiting for the local permit.
-            if self.admission_state.should_shed_ingress() {
+            if self.admission_decision().is_reject() {
                 let mut metrics = self.metrics.lock();
                 metrics.rejected_requests.inc();
                 metrics.refused_memory_pressure.inc();
@@ -836,6 +859,7 @@ pub async fn serve(
     ack_registry: AckRegistry,
     metrics: Arc<Mutex<MetricSet<crate::otlp_metrics::OtlpReceiverMetrics>>>,
     admission_state: SharedReceiverAdmissionState,
+    runtime_budget_pressure: Option<SharedRuntimeBudgetPressure>,
     global_semaphore: Option<Arc<Semaphore>>,
     shutdown: CancellationToken,
 ) -> std::io::Result<()> {
@@ -891,6 +915,7 @@ pub async fn serve(
                     metrics: metrics.clone(),
                     settings: settings.clone(),
                     admission_state: admission_state.clone(),
+                    runtime_budget_pressure: runtime_budget_pressure.clone(),
                     global_semaphore: global_semaphore.clone(),
                     local_semaphore: local_semaphore.clone(),
                     peer_addr,
@@ -1044,6 +1069,7 @@ mod tests {
             metrics,
             SharedReceiverAdmissionState::default(),
             None,
+            None,
             shutdown.clone(),
         ));
 
@@ -1184,6 +1210,7 @@ mod tests {
             AckRegistry::new(None, None, None),
             metrics.clone(),
             admission_state.clone(),
+            None,
             Some(gate.clone()),
             shutdown.clone(),
         ));
@@ -1321,6 +1348,7 @@ mod tests {
             AckRegistry::new(None, None, None),
             metrics.clone(),
             admission_state.clone(),
+            None,
             Some(local_semaphore),
             shutdown.clone(),
         ));
@@ -1387,5 +1415,249 @@ mod tests {
             .await
             .expect("server finished");
         assert!(server_result.unwrap().is_ok());
+    }
+
+    /// Builds a shared runtime-budget pressure view pinned at `Hard`, with the
+    /// given budget mode and `receiver_admission` gate. Returns the sendable
+    /// view plus the keep-alive state/account/ticket the caller must hold for
+    /// the duration of the test (dropping the account resets the view to a safe
+    /// `Normal` default). A plain charge cannot exceed the authorized ceiling
+    /// under enforce, so `Hard` is reached via a post-hoc reconcile overdraw.
+    fn runtime_pressure_at_hard(
+        mode: otap_df_engine::memory_budget::BudgetMode,
+        receiver_admission: bool,
+    ) -> (
+        SharedRuntimeBudgetPressure,
+        otap_df_engine::memory_budget::MemoryBudgetState,
+        std::rc::Rc<otap_df_engine::memory_budget::RuntimeMemoryAccount>,
+        otap_df_engine::memory_budget::LocalMemoryTicket,
+    ) {
+        use otap_df_engine::memory_budget::{
+            BudgetLevel, BudgetScopeId, MemoryBudgetEnforcement, MemoryBudgetSizing,
+            MemoryBudgetState, RetainedSiteKind, RuntimeMemoryBudgetConfig,
+        };
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 1,
+                    lease_step_bytes: 1,
+                    max_overshoot_per_runtime_bytes: 1,
+                    overshoot_debt_limit_bytes: 0,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: 100,
+                runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement {
+                    receiver_admission,
+                    queue_publish: false,
+                    reclaim_hooks: false,
+                },
+            },
+            None,
+        );
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let pressure = handle.shared_budget_pressure();
+        let account = handle.local_account().expect("account");
+        let mut ticket = account
+            .charge_at(RetainedSiteKind::Unknown, 1_u64)
+            .expect("initial charge fits");
+        ticket.reconcile_size(10_000_000);
+        assert_eq!(account.level(), BudgetLevel::Hard);
+        (pressure, state, account, ticket)
+    }
+
+    /// Runs the OTLP HTTP server with process pressure at the default `Normal`
+    /// plus the supplied runtime-budget pressure view, sends one valid logs
+    /// request, and returns `(status, refused_memory_pressure_count, forwarded)`.
+    async fn run_http_once(
+        runtime_budget_pressure: Option<SharedRuntimeBudgetPressure>,
+    ) -> (StatusCode, u64, bool) {
+        use hyper::Method;
+        use hyper::client::conn::http1;
+        use hyper::header::{CONTENT_TYPE, HOST};
+        use hyper_util::rt::TokioIo;
+        use otap_df_engine::control::runtime_ctrl_msg_channel;
+        use otap_df_engine::shared::message::SharedSender;
+        use otap_df_engine::testing::test_node;
+        use otap_df_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest;
+        use otap_df_telemetry::registry::TelemetryRegistryHandle;
+        use otap_df_telemetry::reporter::MetricsReporter;
+        use tokio::net::TcpStream;
+        use tokio::sync::mpsc as tokio_mpsc;
+        use tokio_util::sync::CancellationToken;
+
+        let port = portpicker::pick_unused_port().expect("free port");
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+        let (msg_tx, mut msg_rx) = tokio_mpsc::channel(4);
+        let mut senders = HashMap::new();
+        let _ = senders.insert("default".into(), SharedSender::mpsc(msg_tx));
+        let (ctrl_tx, _ctrl_rx) = runtime_ctrl_msg_channel(4);
+        let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
+        let effect_handler = EffectHandler::new(
+            test_node("http_runtime_budget"),
+            senders,
+            None,
+            ctrl_tx,
+            metrics_reporter,
+        );
+
+        let settings = HttpServerSettings {
+            listening_addr: addr,
+            max_concurrent_requests: 4,
+            wait_for_result: false,
+            ..Default::default()
+        };
+        let shutdown = CancellationToken::new();
+
+        let metrics_registry_handle = TelemetryRegistryHandle::new();
+        let controller_ctx =
+            otap_df_engine::context::ControllerContext::new(metrics_registry_handle);
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        let metrics = Arc::new(Mutex::new(
+            pipeline_ctx.register_metrics::<crate::otlp_metrics::OtlpReceiverMetrics>(),
+        ));
+
+        // Process pressure stays at the default Normal; only the runtime budget
+        // pressure drives shedding in these tests.
+        let admission_state = SharedReceiverAdmissionState::default();
+        let server = tokio::spawn(serve(
+            effect_handler,
+            settings,
+            AckRegistry::new(None, None, None),
+            metrics.clone(),
+            admission_state,
+            runtime_budget_pressure,
+            None,
+            shutdown.clone(),
+        ));
+
+        let mut stream = None;
+        for _ in 0..10 {
+            match TcpStream::connect(addr).await {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+        let stream = stream.expect("Failed to connect to server");
+
+        let (mut sender, conn) = http1::handshake(TokioIo::new(stream)).await.unwrap();
+        drop(tokio::spawn(async move {
+            let _ = conn.await;
+        }));
+
+        let mut request_bytes = Vec::new();
+        ExportLogsServiceRequest::default()
+            .encode(&mut request_bytes)
+            .unwrap();
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/logs")
+            .header(HOST, "localhost")
+            .header(CONTENT_TYPE, PROTOBUF_CONTENT_TYPE)
+            .body(Full::new(Bytes::from(request_bytes)))
+            .unwrap();
+
+        let status = tokio::time::timeout(Duration::from_secs(2), sender.send_request(req))
+            .await
+            .expect("request completed")
+            .expect("request sent")
+            .status();
+
+        let refused = metrics.lock().refused_memory_pressure.get();
+        let forwarded = tokio::time::timeout(Duration::from_millis(200), msg_rx.recv())
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        (status, refused, forwarded)
+    }
+
+    #[tokio::test]
+    async fn runtime_budget_hard_enforced_rejects_http_request() {
+        let (pressure, _state, _account, _ticket) =
+            runtime_pressure_at_hard(otap_df_engine::memory_budget::BudgetMode::Enforce, true);
+        let (status, refused, forwarded) = run_http_once(Some(pressure)).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "enforced runtime-budget Hard must shed the HTTP request"
+        );
+        assert_eq!(
+            refused, 1,
+            "rejection must be attributed to memory pressure"
+        );
+        assert!(
+            !forwarded,
+            "a shed request must not be forwarded downstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_budget_hard_observe_only_does_not_reject_http_request() {
+        let (pressure, _state, _account, _ticket) =
+            runtime_pressure_at_hard(otap_df_engine::memory_budget::BudgetMode::ObserveOnly, true);
+        let (status, refused, forwarded) = run_http_once(Some(pressure)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "observe-only runtime budget must not shed"
+        );
+        assert_eq!(
+            refused, 0,
+            "observe-only must not count a memory-pressure refusal"
+        );
+        assert!(
+            forwarded,
+            "an admitted request must be forwarded downstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_budget_hard_gate_disabled_does_not_reject_http_request() {
+        // Enforce mode but the receiver_admission gate is off.
+        let (pressure, _state, _account, _ticket) =
+            runtime_pressure_at_hard(otap_df_engine::memory_budget::BudgetMode::Enforce, false);
+        let (status, refused, forwarded) = run_http_once(Some(pressure)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "gate-disabled runtime budget must not shed"
+        );
+        assert_eq!(
+            refused, 0,
+            "gate disabled must not count a memory-pressure refusal"
+        );
+        assert!(
+            forwarded,
+            "an admitted request must be forwarded downstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_runtime_budget_pressure_admits_http_request() {
+        let (status, refused, forwarded) = run_http_once(None).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "no runtime budget => process-only admit"
+        );
+        assert_eq!(refused, 0);
+        assert!(
+            forwarded,
+            "an admitted request must be forwarded downstream"
+        );
     }
 }

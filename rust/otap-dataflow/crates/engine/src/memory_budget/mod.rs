@@ -92,6 +92,18 @@ impl BudgetLevel {
             Self::Hard => 2,
         }
     }
+
+    /// Reconstructs a level from its `as_u64` encoding (`0=Normal`, `1=Soft`,
+    /// `2=Hard`); any other value maps to `Normal`. Used when reading a level
+    /// published into a shared atomic snapshot.
+    #[must_use]
+    pub const fn from_u64(value: u64) -> Self {
+        match value {
+            1 => Self::Soft,
+            2 => Self::Hard,
+            _ => Self::Normal,
+        }
+    }
 }
 
 /// Low-cardinality retained-work *site* attribution for local accounting.
@@ -316,6 +328,13 @@ pub struct RuntimeMemorySnapshot {
     /// Per-retention-site breakdown of `unknown_count`, indexed by
     /// [`RetainedSiteKind::index`].
     unknown_count_by_site: [AtomicU64; RetainedSiteKind::COUNT],
+    /// Whether runtime-budget receiver-admission enforcement is active for this
+    /// runtime (the account is in enforce mode **and** the `receiver_admission`
+    /// gate is enabled). Published once at runtime initialization and reset to
+    /// `false` on teardown. Read by shared receiver handlers through
+    /// [`SharedRuntimeBudgetPressure`] so they can shed on runtime-budget `Hard`
+    /// without touching the `!Send` runtime account.
+    receiver_admission_enforce: AtomicBool,
 }
 
 impl RuntimeMemorySnapshot {
@@ -437,6 +456,69 @@ impl RuntimeMemorySnapshot {
     #[must_use]
     pub fn level(&self) -> u64 {
         self.level.load(Ordering::Relaxed)
+    }
+
+    /// Returns the published pressure level as a [`BudgetLevel`].
+    #[must_use]
+    pub fn budget_level(&self) -> BudgetLevel {
+        BudgetLevel::from_u64(self.level.load(Ordering::Relaxed))
+    }
+
+    /// Returns whether runtime-budget receiver-admission enforcement is active
+    /// for this runtime (a cheap atomic load).
+    #[must_use]
+    pub fn receiver_admission_enforce(&self) -> bool {
+        self.receiver_admission_enforce.load(Ordering::Relaxed)
+    }
+
+    /// Publishes whether runtime-budget receiver-admission enforcement is active.
+    /// Called at runtime initialization and reset on teardown (coarse points).
+    fn set_receiver_admission_enforce(&self, active: bool) {
+        self.receiver_admission_enforce
+            .store(active, Ordering::Relaxed);
+    }
+
+    /// Stores only the pressure level, without recomputing the rest of the
+    /// snapshot. Used by runtime teardown to reset the shared level to a safe
+    /// default (`Normal`).
+    fn publish_level_only(&self, level: BudgetLevel) {
+        self.level.store(level.as_u64(), Ordering::Relaxed);
+    }
+}
+
+/// Sendable, read-only view of one runtime's budget pressure for shared
+/// receiver admission.
+///
+/// Shared receiver handlers (OTLP/OTAP gRPC/HTTP) run on tonic/axum/hyper pool
+/// threads, **not** the pinned pipeline runtime thread, so they cannot read the
+/// `!Send` [`RuntimeMemoryBudget`]/[`RuntimeMemoryAccount`]. This view is derived
+/// from the runtime's shared [`RuntimeMemorySnapshot`] (an `Arc` of atomics), so
+/// it is `Send + Sync + Clone` and safe to clone into handler threads. It
+/// deliberately exposes **only** the current budget level and whether receiver
+/// admission enforcement is active for the runtime; it carries no charge/refund
+/// API, no [`RuntimeMemoryAccount`], and no `Rc`.
+///
+/// Reads are cheap relaxed atomic loads. The publishing runtime updates the
+/// underlying snapshot only at coarse points (level transitions, snapshot
+/// flush, runtime init/teardown), never on the per-item charge path.
+#[derive(Debug, Clone)]
+pub struct SharedRuntimeBudgetPressure {
+    snapshot: Arc<RuntimeMemorySnapshot>,
+}
+
+impl SharedRuntimeBudgetPressure {
+    /// Returns the runtime's current budget pressure level (a relaxed load).
+    #[must_use]
+    pub fn budget_level(&self) -> BudgetLevel {
+        self.snapshot.budget_level()
+    }
+
+    /// Returns whether runtime-budget receiver-admission enforcement is active
+    /// for this runtime (a relaxed load). When `false`, shared receivers must
+    /// treat runtime-budget pressure as shadow-only and never drop on it.
+    #[must_use]
+    pub fn receiver_admission_enforce(&self) -> bool {
+        self.snapshot.receiver_admission_enforce()
     }
 }
 
@@ -1103,6 +1185,16 @@ impl RuntimeMemorySnapshotHandle {
         &self.scope
     }
 
+    /// Returns a sendable, read-only [`SharedRuntimeBudgetPressure`] view for
+    /// this runtime, suitable for shared receiver admission on handler threads
+    /// that cannot reach the `!Send` runtime account.
+    #[must_use]
+    pub fn shared_budget_pressure(&self) -> SharedRuntimeBudgetPressure {
+        SharedRuntimeBudgetPressure {
+            snapshot: self.snapshot.clone(),
+        }
+    }
+
     /// Creates a local runtime account from this snapshot handle.
     ///
     /// Returns `None` if memory budgeting is not configured, or if a runtime
@@ -1490,6 +1582,12 @@ impl RuntimeMemoryAccount {
     /// hot path.
     pub fn set_receiver_admission_enabled(&self, enabled: bool) {
         self.receiver_admission.set(enabled);
+        // Publish the resolved receiver-admission enforcement state into the
+        // shared snapshot so shared receiver handlers (which cannot read this
+        // `!Send` account) observe the gate. Set once at runtime init; a coarse
+        // point, not the per-item charge path.
+        self.snapshot
+            .set_receiver_admission_enforce(self.mode == BudgetMode::Enforce && enabled);
     }
 
     /// Returns whether the receiver-admission enforcement gate is enabled.
@@ -1919,6 +2017,18 @@ impl RuntimeMemoryAccount {
 
     fn publish(&self) {
         self.publish_level(self.level());
+    }
+}
+
+impl Drop for RuntimeMemoryAccount {
+    fn drop(&mut self) {
+        // Leave a safe default for any shared reader (e.g. a shared receiver
+        // still holding the `SharedRuntimeBudgetPressure` view) after the
+        // runtime tears down: `Normal` pressure with enforcement disabled, so a
+        // torn-down runtime can never keep shedding ingress. Drop is budget-free
+        // (only atomic stores into the already-shared snapshot).
+        self.snapshot.publish_level_only(BudgetLevel::Normal);
+        self.snapshot.set_receiver_admission_enforce(false);
     }
 }
 
@@ -3019,6 +3129,10 @@ mod tests {
     // The interned attribution handle travels with escrow, so it must be
     // sendable too.
     assert_impl_all!(BudgetScope: Send, Sync);
+    // The shared runtime-pressure view is read by shared receiver handler
+    // threads, so it must be Send + Sync (and must not leak the !Send account).
+    assert_impl_all!(SharedRuntimeBudgetPressure: Send, Sync);
+    assert_impl_all!(RuntimeMemorySnapshotHandle: Send, Sync, Clone);
 
     fn account_with_mode(
         mode: BudgetMode,
@@ -3408,6 +3522,103 @@ mod tests {
         assert_eq!(account.charged_bytes.get(), 0);
         assert_eq!(site_charged_sum(&account), 0);
         drop(escrow);
+    }
+
+    /// Configures a single-runtime budget state with the given mode and
+    /// `receiver_admission` gate, sized so that a reconcile can force `Hard`.
+    fn configure_state_for_shared_pressure(
+        mode: BudgetMode,
+        receiver_admission: bool,
+    ) -> MemoryBudgetState {
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 1,
+                    lease_step_bytes: 1,
+                    max_overshoot_per_runtime_bytes: 1,
+                    overshoot_debt_limit_bytes: 0,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: 100,
+                runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement {
+                    receiver_admission,
+                    queue_publish: false,
+                    reclaim_hooks: false,
+                },
+            },
+            None,
+        );
+        state
+    }
+
+    #[test]
+    fn shared_pressure_defaults_to_normal_and_no_enforcement() {
+        let state = configure_state_for_shared_pressure(BudgetMode::ObserveOnly, false);
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        // Before any account is created, the view reads safe defaults.
+        let pressure = handle.shared_budget_pressure();
+        assert_eq!(pressure.budget_level(), BudgetLevel::Normal);
+        assert!(!pressure.receiver_admission_enforce());
+    }
+
+    #[test]
+    fn shared_pressure_publishes_enforcement_and_level_and_resets_on_teardown() {
+        let state = configure_state_for_shared_pressure(BudgetMode::Enforce, true);
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let pressure = handle.shared_budget_pressure();
+        let account = handle.local_account().expect("account");
+
+        // Enforcement is published once at account init.
+        assert!(
+            pressure.receiver_admission_enforce(),
+            "enforce mode + receiver_admission gate must publish enforcement"
+        );
+        assert_eq!(pressure.budget_level(), BudgetLevel::Normal);
+
+        // Push the runtime to Hard; the level transition publishes to the
+        // shared snapshot the view reads.
+        let mut ticket = account
+            .charge_at(RetainedSiteKind::Unknown, 1_u64)
+            .expect("initial charge fits");
+        ticket.reconcile_size(10_000_000);
+        account.flush_snapshot();
+        assert_eq!(pressure.budget_level(), BudgetLevel::Hard);
+
+        // Teardown resets the shared view to a safe default so a torn-down
+        // runtime can never keep shedding ingress.
+        drop(ticket);
+        drop(account);
+        assert_eq!(pressure.budget_level(), BudgetLevel::Normal);
+        assert!(!pressure.receiver_admission_enforce());
+    }
+
+    #[test]
+    fn shared_pressure_enforcement_false_in_observe_only() {
+        let state = configure_state_for_shared_pressure(BudgetMode::ObserveOnly, true);
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let pressure = handle.shared_budget_pressure();
+        let _account = handle.local_account().expect("account");
+        assert!(
+            !pressure.receiver_admission_enforce(),
+            "observe-only mode is never enforcement, even with the gate enabled"
+        );
+    }
+
+    #[test]
+    fn shared_pressure_enforcement_false_when_gate_disabled() {
+        let state = configure_state_for_shared_pressure(BudgetMode::Enforce, false);
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let pressure = handle.shared_budget_pressure();
+        let _account = handle.local_account().expect("account");
+        assert!(
+            !pressure.receiver_admission_enforce(),
+            "enforce mode with the gate disabled is not receiver-admission enforcement"
+        );
     }
 
     #[test]

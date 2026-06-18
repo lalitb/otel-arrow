@@ -336,8 +336,34 @@ impl SharedReceiverAdmissionState {
     pub fn level(&self) -> MemoryPressureLevel {
         MemoryPressureLevel::from_u8(self.inner.level.load(Ordering::Relaxed))
     }
-}
 
+    /// Evaluates a combined receiver-admission decision from this (shared)
+    /// process-pressure snapshot plus the supplied runtime memory-budget
+    /// pressure inputs.
+    ///
+    /// Shared receivers (OTLP/OTAP gRPC/HTTP) hold this `Send` process-pressure
+    /// snapshot and a [`SharedRuntimeBudgetPressure`](crate::memory_budget::SharedRuntimeBudgetPressure)
+    /// view; they pass the runtime budget level and enforcement flag here to get
+    /// the same admission decision the local path computes. With
+    /// `runtime_budget_level == None` and `runtime_budget_enforce == false` the
+    /// reject result equals [`should_shed_ingress`](Self::should_shed_ingress),
+    /// preserving existing process-only shedding.
+    #[must_use]
+    pub fn evaluate(
+        &self,
+        runtime_budget_level: Option<crate::memory_budget::BudgetLevel>,
+        runtime_budget_enforce: bool,
+    ) -> ReceiverAdmissionDecision {
+        ReceiverAdmissionInputs {
+            process_level: MemoryPressureLevel::from_u8(self.inner.level.load(Ordering::Relaxed)),
+            process_enforce: self.inner.mode == MemoryLimiterMode::Enforce,
+            runtime_budget_level,
+            runtime_budget_enforce,
+            retry_after_secs: self.inner.retry_after_secs.load(Ordering::Relaxed),
+        }
+        .evaluate()
+    }
+}
 #[derive(Debug)]
 struct LocalReceiverAdmissionStateInner {
     generation: Cell<u64>,
@@ -1715,6 +1741,27 @@ mod tests {
             let decision = local.evaluate(Some(BudgetLevel::Soft), true);
             assert!(decision.is_admitted());
             assert_eq!(decision.source, ReceiverAdmissionSource::None);
+        }
+
+        #[test]
+        fn shared_state_evaluate_combines_process_and_runtime_budget() {
+            let process = MemoryPressureState::default(); // Normal, Enforce
+            let shared = SharedReceiverAdmissionState::from_process_state(&process);
+
+            // Process Normal, no runtime budget: admit (matches process-only).
+            assert!(shared.evaluate(None, false).is_admitted());
+            assert!(!shared.should_shed_ingress());
+
+            // Process Normal, enforced runtime-budget Hard: reject (runtime).
+            let decision = shared.evaluate(Some(BudgetLevel::Hard), true);
+            assert!(decision.is_reject());
+            assert_eq!(decision.source, ReceiverAdmissionSource::RuntimeBudgetHard);
+
+            // Gate disabled: shadow only, never an actual reject.
+            assert!(!shared.evaluate(Some(BudgetLevel::Hard), false).is_reject());
+
+            // Soft runtime budget admits.
+            assert!(shared.evaluate(Some(BudgetLevel::Soft), true).is_admitted());
         }
     }
 

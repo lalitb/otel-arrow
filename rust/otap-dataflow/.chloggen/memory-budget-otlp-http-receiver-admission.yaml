@@ -1,0 +1,7 @@
+change_type: enhancement
+
+component: pipeline
+
+note: "Wire runtime-budget receiver admission into the OTLP HTTP receiver, the first shared receiver to consume it. Because shared gRPC/HTTP handlers run off the pinned runtime thread and cannot read the `!Send` runtime account, a sendable `SharedRuntimeBudgetPressure` view is published from the runtime's shared `RuntimeMemorySnapshot` (an `Arc` of atomics): it exposes only the budget level (published at level transitions/flush) and whether receiver-admission enforcement is active (published once at runtime init, reset to a safe `Normal`/disabled default on teardown), with no charge/refund, no account, and no per-item hot-path atomics. The OTLP HTTP receiver evaluates the admission primitive at its existing pre-decode checkpoints: process `Hard` still returns `503` + `Retry-After` unchanged, and runtime-budget `Hard` additionally returns `503` + `Retry-After` only in enforce mode with `enforcement.receiver_admission` enabled. Observe-only mode and a disabled gate never drop (shadow only), `Soft` is advisory, process `Hard` outranks runtime `Hard`, rejection happens before body decode, acquires no budget, and reuses the existing memory-pressure refusal counters. `receiver_admission` remains accepted only under `unstable-memory-enforcement` (rejected in default builds). OTAP/OTLP gRPC and all other receivers still consult process pressure only and can reuse the shared snapshot in a follow-up."
+
+issues: [3272]
