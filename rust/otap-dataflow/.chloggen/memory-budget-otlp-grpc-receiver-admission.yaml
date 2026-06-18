@@ -1,0 +1,7 @@
+change_type: enhancement
+
+component: pipeline
+
+note: "Wire runtime-budget receiver admission into the OTLP gRPC receiver via its existing `MemoryPressureLayer` (tonic/tower middleware), reusing the `SharedRuntimeBudgetPressure` snapshot already used by the OTLP HTTP path. The layer fails fast with gRPC `ResourceExhausted` + `grpc-retry-pushback-ms` in `poll_ready`/`call` before tonic decodes the request body; it now evaluates the combined admission decision (`SharedReceiverAdmissionState::evaluate`), so runtime-budget `Hard` additionally rejects only in enforce mode with `enforcement.receiver_admission` enabled. Process `Hard` still rejects with the same response and takes precedence; observe-only mode and a disabled gate never reject (shadow only); `Soft` is advisory. Rejection stays pre-decode, acquires no budget, retains no payload, and reuses the existing rejection counters; the `!Send` runtime account never crosses a handler thread (the receiver attaches the sendable pressure view at construction via `MemoryPressureLayer::with_runtime_budget_pressure`). `receiver_admission` remains accepted only under `unstable-memory-enforcement` (rejected in default builds). The OTAP gRPC receiver and all other receivers still consult process pressure only and can reuse the same snapshot in a follow-up."
+
+issues: [3272]

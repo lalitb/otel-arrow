@@ -549,20 +549,26 @@ impl shared::Receiver<OtapPdata> for OTLPReceiver {
             let limit_layer = if let Some(global) = global_semaphore.clone() {
                 Either::Left(
                     ServiceBuilder::new()
-                        .layer(MemoryPressureLayer::with_otlp_metrics(
-                            self.admission_state.clone(),
-                            self.metrics.clone(),
-                        ))
+                        .layer(
+                            MemoryPressureLayer::with_otlp_metrics(
+                                self.admission_state.clone(),
+                                self.metrics.clone(),
+                            )
+                            .with_runtime_budget_pressure(self.runtime_budget_pressure.clone()),
+                        )
                         .layer(GlobalConcurrencyLimitLayer::new(grpc_max))
                         .layer(SharedConcurrencyLayer::new(global)),
                 )
             } else {
                 Either::Right(
                     ServiceBuilder::new()
-                        .layer(MemoryPressureLayer::with_otlp_metrics(
-                            self.admission_state.clone(),
-                            self.metrics.clone(),
-                        ))
+                        .layer(
+                            MemoryPressureLayer::with_otlp_metrics(
+                                self.admission_state.clone(),
+                                self.metrics.clone(),
+                            )
+                            .with_runtime_budget_pressure(self.runtime_budget_pressure.clone()),
+                        )
                         .layer(GlobalConcurrencyLimitLayer::new(grpc_max)),
                 )
             };
