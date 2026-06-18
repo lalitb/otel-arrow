@@ -1,0 +1,7 @@
+change_type: enhancement
+
+component: pipeline
+
+note: "Wire runtime-budget receiver admission into the syslog CEF receiver, the first receiver to consume the Phase 2 admission primitive. At each existing ingress shed point (UDP datagram, TCP accept, per-message TCP read) it now evaluates combined process + runtime memory-budget pressure instead of process pressure alone. Process `Hard` still sheds exactly as before; runtime-budget `Hard` additionally sheds only when the budget is in enforce mode with `enforcement.receiver_admission` enabled. Observe-only mode and a disabled gate never drop on runtime-budget pressure (shadow only), `Soft` is advisory, and process `Hard` outranks runtime-budget `Hard` for source attribution. Existing drop/close behavior and memory-pressure counters are preserved; the reject source is added to shed logs. Consequently `memory_budget.enforcement.receiver_admission` is now accepted at config validation under the `unstable-memory-enforcement` feature (still rejected in default/production builds), like `queue_publish` and `reclaim_hooks`. Only the syslog CEF receiver is wired; all other receivers still consult process pressure only, and shared gRPC/HTTP receivers remain future work."
+
+issues: [3272]

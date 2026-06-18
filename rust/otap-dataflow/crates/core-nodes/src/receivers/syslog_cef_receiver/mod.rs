@@ -8,7 +8,8 @@ use otap_df_config::node::NodeUserConfig;
 use otap_df_engine::config::ReceiverConfig;
 use otap_df_engine::context::PipelineContext;
 use otap_df_engine::control::NodeControlMsg;
-use otap_df_engine::memory_limiter::LocalReceiverAdmissionState;
+use otap_df_engine::memory_budget::{RuntimeMemoryBudget, current_runtime_memory_budget};
+use otap_df_engine::memory_limiter::{LocalReceiverAdmissionState, ReceiverAdmissionSource};
 use otap_df_engine::node::NodeId;
 use otap_df_engine::receiver::ReceiverWrapper;
 use otap_df_engine::terminal_state::TerminalState;
@@ -261,6 +262,31 @@ fn drop_syslog_batch(
         .add(items);
 }
 
+/// Combined receiver-admission shed check for the syslog CEF receiver.
+///
+/// Returns `Some(source)` when the incoming item must actually be shed (a
+/// `Reject` decision), or `None` to admit. Process-pressure inputs are read
+/// locally from `admission_state` (the Phase 1 snapshot); the runtime
+/// memory-budget level is read from the per-runtime budget captured once on the
+/// pinned pipeline thread (`None` when no budget is installed). `runtime_budget_enforce`
+/// is the precomputed runtime-budget admission gate.
+///
+/// Observe-only and gate-disabled runtime-budget pressure produce a shadow
+/// decision, not a reject, so this returns `None` for them and never drops data
+/// on their account. With no runtime budget and the gate off, this is exactly
+/// equivalent to the previous `should_shed_ingress()` check, preserving the
+/// existing process-`Hard` shedding behavior. The check is a few local `Cell`
+/// reads with no atomics, no allocation, and acquires no budget.
+fn admission_reject_source(
+    admission_state: &LocalReceiverAdmissionState,
+    runtime_budget: Option<&Rc<RuntimeMemoryBudget>>,
+    runtime_budget_enforce: bool,
+) -> Option<ReceiverAdmissionSource> {
+    let runtime_budget_level = runtime_budget.map(|budget| budget.level());
+    let decision = admission_state.evaluate(runtime_budget_level, runtime_budget_enforce);
+    decision.is_reject().then_some(decision.source)
+}
+
 /// Add the syslog receiver to the receiver factory
 #[allow(unsafe_code)]
 #[distributed_slice(OTAP_RECEIVER_FACTORIES)]
@@ -289,6 +315,16 @@ impl local::Receiver<OtapPdata> for SyslogCefReceiver {
         mut ctrl_chan: local::ControlChannel<OtapPdata>,
         effect_handler: local::EffectHandler<OtapPdata>,
     ) -> Result<TerminalState, Error> {
+        // Capture the per-runtime memory budget once on this pinned pipeline
+        // thread. Receiver admission reads its pressure level per ingress check
+        // through this cached handle (cheap local reads, no atomics, no clone
+        // per item). The enforcement gate is effectively constant for the
+        // runtime's life, so it is resolved once here. `None` when no runtime
+        // budget is installed (admission then behaves as process-pressure only).
+        let runtime_budget = current_runtime_memory_budget();
+        let runtime_budget_enforce = runtime_budget
+            .as_ref()
+            .is_some_and(|budget| budget.receiver_admission_active());
         match &self.config.protocol {
             Protocol::Tcp(tcp_config) => {
                 otel_info!(
@@ -396,7 +432,7 @@ impl local::Receiver<OtapPdata> for SyslogCefReceiver {
                         accept_result = listener.accept() => {
                             match accept_result {
                                 Ok((socket, peer_addr)) => {
-                                    if self.admission_state.should_shed_ingress() {
+                                    if admission_reject_source(&self.admission_state, runtime_budget.as_ref(), runtime_budget_enforce).is_some() {
                                         self.metrics
                                             .borrow_mut()
                                             .tcp_connections_rejected_memory_pressure
@@ -408,6 +444,12 @@ impl local::Receiver<OtapPdata> for SyslogCefReceiver {
                                     let effect_handler = effect_handler.clone();
                                     let metrics = self.metrics.clone();
                                     let admission_state = self.admission_state.clone();
+                                    // Carry the runtime-budget handle and the (constant) admission
+                                    // gate into the connection task so its per-message admission
+                                    // checks see runtime pressure too. The handle is an `Rc` clone
+                                    // (the task runs on this same pinned thread via spawn_local).
+                                    let task_runtime_budget = runtime_budget.clone();
+                                    let task_runtime_budget_enforce = runtime_budget_enforce;
 
                                     // Clone TLS acceptor for the spawned task
                                     let tls_acceptor = maybe_tls_acceptor.clone();
@@ -495,10 +537,11 @@ impl local::Receiver<OtapPdata> for SyslogCefReceiver {
                                                 break;
                                             }
 
-                                            if admission_state.should_shed_ingress() {
+                                            if let Some(source) = admission_reject_source(&admission_state, task_runtime_budget.as_ref(), task_runtime_budget_enforce) {
                                                 otel_warn!(
                                                     "syslog_cef_receiver.memory_pressure.disconnect",
                                                     peer = %peer_addr,
+                                                    source = source.as_str(),
                                                     message = "Closing TCP syslog connection due to memory pressure"
                                                 );
                                                 drop_syslog_batch(&metrics, &mut arrow_records_builder);
@@ -528,10 +571,11 @@ impl local::Receiver<OtapPdata> for SyslogCefReceiver {
                                                                 // Count total received at socket level before parsing
                                                                 metrics.borrow_mut().received_logs_total.inc();
 
-                                                                if admission_state.should_shed_ingress() {
+                                                                if let Some(source) = admission_reject_source(&admission_state, task_runtime_budget.as_ref(), task_runtime_budget_enforce) {
                                                                     otel_warn!(
                                                                         "syslog_cef_receiver.memory_pressure.disconnect",
                                                                         peer = %peer_addr,
+                                                                        source = source.as_str(),
                                                                         message = "Closing TCP syslog connection due to memory pressure"
                                                                     );
                                                                     // Count the current in-flight message (not yet in the builder)
@@ -606,10 +650,11 @@ impl local::Receiver<OtapPdata> for SyslogCefReceiver {
                                                             // Count total received at socket level before parsing
                                                             metrics.borrow_mut().received_logs_total.inc();
 
-                                                            if admission_state.should_shed_ingress() {
+                                                            if let Some(source) = admission_reject_source(&admission_state, task_runtime_budget.as_ref(), task_runtime_budget_enforce) {
                                                                 otel_warn!(
                                                                     "syslog_cef_receiver.memory_pressure.disconnect",
                                                                     peer = %peer_addr,
+                                                                    source = source.as_str(),
                                                                     message = "Closing TCP syslog connection due to memory pressure"
                                                                 );
                                                                 // Count the current in-flight message (not yet in the builder)
@@ -835,7 +880,7 @@ impl local::Receiver<OtapPdata> for SyslogCefReceiver {
                                     // Count total received at socket level before parsing
                                     self.metrics.borrow_mut().received_logs_total.inc();
 
-                                    if self.admission_state.should_shed_ingress() {
+                                    if admission_reject_source(&self.admission_state, runtime_budget.as_ref(), runtime_budget_enforce).is_some() {
                                         self.metrics
                                             .borrow_mut()
                                             .received_logs_rejected_memory_pressure
@@ -2383,6 +2428,237 @@ mod telemetry_tests {
                 0,
                 "tcp connection rejects == 0 for UDP"
             );
+        }));
+    }
+
+    /// Installs a runtime memory budget on the current pinned (LocalSet) thread,
+    /// configured with `mode` and the `receiver_admission` enforcement flag, and
+    /// pushes it to `Hard` pressure. Returns the state/budget/guard/ticket which
+    /// the caller must keep alive for the duration of the receiver run.
+    ///
+    /// A plain charge cannot exceed the authorized ceiling under enforce mode, so
+    /// `Hard` is reached by reconciling a small charge up to a post-hoc overdraw
+    /// (which pins the account to `Hard` via reconcile debt) - the receiver only
+    /// reads `level()`, so how `Hard` is reached does not matter.
+    fn install_runtime_budget_at_hard(
+        mode: otap_df_engine::memory_budget::BudgetMode,
+        receiver_admission: bool,
+    ) -> (
+        otap_df_engine::memory_budget::MemoryBudgetState,
+        Rc<RuntimeMemoryBudget>,
+        otap_df_engine::memory_budget::RuntimeMemoryBudgetGuard,
+        otap_df_engine::memory_budget::LocalMemoryTicket,
+    ) {
+        use otap_df_engine::memory_budget::{
+            BudgetLevel, BudgetScopeId, MemoryBudgetEnforcement, MemoryBudgetSizing,
+            MemoryBudgetState, RetainedSiteKind, RuntimeMemoryBudgetConfig,
+            set_current_runtime_memory_budget,
+        };
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 1,
+                    lease_step_bytes: 1,
+                    max_overshoot_per_runtime_bytes: 1,
+                    overshoot_debt_limit_bytes: 0,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: 100,
+                runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement {
+                    receiver_admission,
+                    queue_publish: false,
+                    reclaim_hooks: false,
+                },
+            },
+            None,
+        );
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let account = handle.local_account().expect("account should be available");
+        let budget = Rc::new(RuntimeMemoryBudget::new(account));
+        let guard = set_current_runtime_memory_budget(Some(budget.clone()));
+        let mut ticket = budget
+            .charge_at(RetainedSiteKind::Unknown, 1_u64)
+            .expect("initial charge fits within floor");
+        ticket.reconcile_size(10_000_000);
+        assert_eq!(
+            budget.account().level(),
+            BudgetLevel::Hard,
+            "test runtime budget must be at Hard pressure"
+        );
+        (state, budget, guard, ticket)
+    }
+
+    /// Runs the UDP syslog receiver against a single valid datagram and returns
+    /// `(received_total, forwarded, memory_pressure_dropped)` from the receiver
+    /// telemetry snapshot. The caller installs process pressure (on `pipeline`)
+    /// and/or a runtime budget (via the thread-local accessor) before calling.
+    async fn run_udp_once(pipeline: PipelineContext) -> (u64, u64, u64) {
+        let port = portpicker::pick_unused_port().expect("No free ports");
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+        let receiver = SyslogCefReceiver::with_pipeline(
+            pipeline,
+            Config {
+                protocol: Protocol::Udp(UdpConfig {
+                    listening_addr: addr,
+                }),
+                batch: Some(BatchConfig {
+                    max_batch_duration_ms: None,
+                    max_size: NonZeroU16::new(1),
+                }),
+            },
+        );
+
+        let (out_tx, mut _out_rx) = otap_df_channel::mpsc::Channel::new(8);
+        let mut senders = std::collections::HashMap::new();
+        let _ = senders.insert(
+            "".into(),
+            Sender::Local(otap_df_engine::local::message::LocalSender::mpsc(out_tx)),
+        );
+
+        let (pipe_tx, _pipe_rx) = otap_df_engine::control::runtime_ctrl_msg_channel(10);
+        let (metrics_rx, reporter) = MetricsReporter::create_new_and_receiver(4);
+        let eh = otap_df_engine::local::receiver::EffectHandler::new(
+            test_node("syslog_runtime_budget"),
+            senders,
+            None,
+            pipe_tx,
+            reporter.clone(),
+        );
+
+        let (ctrl_tx, ctrl_rx) = otap_df_channel::mpsc::Channel::new(16);
+        let ctrl_rx = otap_df_engine::message::Receiver::Local(
+            otap_df_engine::local::message::LocalReceiver::mpsc(ctrl_rx),
+        );
+        let ctrl_chan = otap_df_engine::local::receiver::ControlChannel::new(ctrl_rx);
+
+        let handle = tokio::task::spawn_local(async move {
+            let _ = Box::new(receiver).start(ctrl_chan, eh).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let _ = sock
+            .send_to(b"<34>1 2024-01-15T10:30:45.123Z host app - ID1 msg", addr)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let _ = ctrl_tx.send(NodeControlMsg::CollectTelemetry {
+            metrics_reporter: reporter.clone(),
+        });
+        let _ = ctrl_tx.send(NodeControlMsg::Shutdown {
+            deadline: Instant::now(),
+            reason: "test".into(),
+        });
+        let _ = handle.await;
+
+        let snap = metrics_rx.recv_async().await.unwrap();
+        let m = snap.get_metrics();
+        (
+            m[4].to_u64_lossy(),
+            m[0].to_u64_lossy(),
+            m[m.len() - 2].to_u64_lossy(),
+        )
+    }
+
+    /// Runtime budget at `Hard` + enforce mode + `receiver_admission` enabled,
+    /// with process pressure Normal: the receiver must shed the datagram on the
+    /// runtime-budget source alone.
+    #[test]
+    fn udp_sheds_under_enforced_runtime_budget_hard() {
+        let (rt, local) = setup_test_runtime();
+        rt.block_on(local.run_until(async move {
+            let telemetry_registry = TelemetryRegistryHandle::new();
+            let controller = ControllerContext::new(telemetry_registry.clone());
+            let pipeline = controller.pipeline_context_with(
+                otap_df_config::PipelineGroupId::from("grp".to_string()),
+                otap_df_config::PipelineId::from("pipe".to_string()),
+                0,
+                1,
+                0,
+            );
+            // Process pressure left at the default Normal; only the runtime
+            // budget drives shedding here.
+            let (_state, _budget, _guard, _ticket) = install_runtime_budget_at_hard(
+                otap_df_engine::memory_budget::BudgetMode::Enforce,
+                true,
+            );
+
+            let (total, forwarded, dropped) = run_udp_once(pipeline).await;
+            assert_eq!(total, 1, "datagram counted at socket level");
+            assert_eq!(
+                forwarded, 0,
+                "enforced runtime-budget Hard must not forward"
+            );
+            assert_eq!(dropped, 1, "enforced runtime-budget Hard must shed");
+        }));
+    }
+
+    /// Runtime budget at `Hard` but observe-only (gate inactive): the receiver
+    /// must NOT drop because of runtime budget pressure (shadow only).
+    #[test]
+    fn udp_does_not_shed_under_observe_only_runtime_budget_hard() {
+        let (rt, local) = setup_test_runtime();
+        rt.block_on(local.run_until(async move {
+            let telemetry_registry = TelemetryRegistryHandle::new();
+            let controller = ControllerContext::new(telemetry_registry.clone());
+            let pipeline = controller.pipeline_context_with(
+                otap_df_config::PipelineGroupId::from("grp".to_string()),
+                otap_df_config::PipelineId::from("pipe".to_string()),
+                0,
+                1,
+                0,
+            );
+            let (_state, _budget, _guard, _ticket) = install_runtime_budget_at_hard(
+                otap_df_engine::memory_budget::BudgetMode::ObserveOnly,
+                true,
+            );
+
+            let (total, forwarded, dropped) = run_udp_once(pipeline).await;
+            assert_eq!(total, 1, "datagram counted at socket level");
+            assert_eq!(
+                forwarded, 1,
+                "observe-only runtime budget must not drop: datagram forwarded"
+            );
+            assert_eq!(dropped, 0, "observe-only must not shed on runtime budget");
+        }));
+    }
+
+    /// Runtime budget at `Hard` in enforce mode but with the `receiver_admission`
+    /// gate disabled: the receiver must NOT drop because of runtime budget
+    /// pressure.
+    #[test]
+    fn udp_does_not_shed_under_runtime_budget_hard_when_gate_disabled() {
+        let (rt, local) = setup_test_runtime();
+        rt.block_on(local.run_until(async move {
+            let telemetry_registry = TelemetryRegistryHandle::new();
+            let controller = ControllerContext::new(telemetry_registry.clone());
+            let pipeline = controller.pipeline_context_with(
+                otap_df_config::PipelineGroupId::from("grp".to_string()),
+                otap_df_config::PipelineId::from("pipe".to_string()),
+                0,
+                1,
+                0,
+            );
+            let (_state, _budget, _guard, _ticket) = install_runtime_budget_at_hard(
+                otap_df_engine::memory_budget::BudgetMode::Enforce,
+                false,
+            );
+
+            let (total, forwarded, dropped) = run_udp_once(pipeline).await;
+            assert_eq!(total, 1, "datagram counted at socket level");
+            assert_eq!(
+                forwarded, 1,
+                "gate disabled must not drop on runtime budget: datagram forwarded"
+            );
+            assert_eq!(dropped, 0, "gate disabled must not shed on runtime budget");
         }));
     }
 }

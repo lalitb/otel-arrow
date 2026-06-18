@@ -1134,6 +1134,9 @@ impl RuntimeMemorySnapshotHandle {
         // Carry the reclaim/pressure-relief gate so component-driven relief
         // paths (e.g. batch early flush) can read it locally.
         account.set_reclaim_hooks_enabled(config.enforcement.reclaim_hooks);
+        // Carry the receiver-admission gate so wired receiver ingress paths
+        // (e.g. the syslog CEF receiver) can read it locally.
+        account.set_receiver_admission_enabled(config.enforcement.receiver_admission);
         Some(Rc::new(account))
     }
 }
@@ -1387,6 +1390,14 @@ pub struct RuntimeMemoryAccount {
     /// to decide whether to act on `level()` pressure. A plain `Cell<bool>`
     /// local read with no atomics, off the per-item charge path.
     reclaim_hooks: Cell<bool>,
+    /// Whether the runtime-budget receiver-admission enforcement gate
+    /// (`enforcement.receiver_admission`) is enabled for this runtime. Set once
+    /// at runtime initialization from the resolved config; defaults to `false`.
+    /// Read by wired receiver ingress paths (e.g. the syslog CEF receiver) to
+    /// decide whether runtime-budget `Hard` pressure should actually shed
+    /// ingress. A plain `Cell<bool>` local read with no atomics, off the
+    /// per-item charge path.
+    receiver_admission: Cell<bool>,
     published_level: Cell<BudgetLevel>,
     dirty: Cell<bool>,
     snapshot: Arc<RuntimeMemorySnapshot>,
@@ -1426,6 +1437,7 @@ impl RuntimeMemoryAccount {
             drain_allowance_bytes: Cell::new(lease_step_bytes),
             drain_committed: Cell::new(0),
             reclaim_hooks: Cell::new(false),
+            receiver_admission: Cell::new(false),
             published_level: Cell::new(BudgetLevel::Normal),
             dirty: Cell::new(false),
             snapshot,
@@ -1469,6 +1481,35 @@ impl RuntimeMemoryAccount {
     #[must_use]
     pub fn reclaim_hooks_enabled(&self) -> bool {
         self.reclaim_hooks.get()
+    }
+
+    /// Sets whether the runtime-budget receiver-admission enforcement gate
+    /// (`enforcement.receiver_admission`) is enabled for this runtime.
+    ///
+    /// Intended for runtime initialization (controller-driven), off the per-item
+    /// hot path.
+    pub fn set_receiver_admission_enabled(&self, enabled: bool) {
+        self.receiver_admission.set(enabled);
+    }
+
+    /// Returns whether the receiver-admission enforcement gate is enabled.
+    ///
+    /// Cheap local `Cell` read with no atomics.
+    #[must_use]
+    pub fn receiver_admission_enabled(&self) -> bool {
+        self.receiver_admission.get()
+    }
+
+    /// Returns whether runtime-budget receiver-admission enforcement is *active*:
+    /// the account is in enforce mode **and** the `receiver_admission` gate is
+    /// enabled. When this is `false`, runtime-budget `Hard` pressure must never
+    /// shed receiver ingress (observe-only and gate-disabled are shadow-only).
+    ///
+    /// Cheap local read (mode compare + one `Cell` read), no atomics, off the
+    /// per-item charge path.
+    #[must_use]
+    pub fn receiver_admission_active(&self) -> bool {
+        self.mode == BudgetMode::Enforce && self.receiver_admission.get()
     }
 
     /// Returns the current pressure level.
@@ -2847,6 +2888,25 @@ impl RuntimeMemoryBudget {
     #[must_use]
     pub fn pressure_relief_active(&self) -> bool {
         self.account.reclaim_hooks_enabled() && self.account.level() != BudgetLevel::Normal
+    }
+
+    /// Whether runtime-budget receiver-admission enforcement is active for this
+    /// runtime: the account is in enforce mode **and** the `receiver_admission`
+    /// gate is enabled. Wired receiver ingress paths read this once (it is
+    /// effectively constant for the runtime's life) to decide whether a
+    /// runtime-budget `Hard` level should actually shed ingress. When `false`,
+    /// runtime-budget pressure is shadow-only and never drops data. Cheap local
+    /// read, no atomics, acquires no budget.
+    #[must_use]
+    pub fn receiver_admission_active(&self) -> bool {
+        self.account.receiver_admission_active()
+    }
+
+    /// Returns the current runtime budget pressure level. Cheap local read used
+    /// by wired receiver admission to feed the admission primitive.
+    #[must_use]
+    pub fn level(&self) -> BudgetLevel {
+        self.account.level()
     }
 
     /// Publishes pending local state to the shared snapshot. Convenience

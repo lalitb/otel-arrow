@@ -259,18 +259,16 @@ impl Policies {
                 }
             }
             // Enforcement-flag gating honesty. `queue_publish` (owned
-            // topic-publish boundary) and `reclaim_hooks` (component-driven
-            // memory pressure relief, e.g. the batch processor early flush) are
-            // wired enforcement paths, so each is accepted only with the
-            // `unstable-memory-enforcement` feature. `receiver_admission` is
-            // carried for forward compatibility but is NOT wired to any runtime
-            // behavior yet (receiver admission is not driven by the runtime
-            // budget), so it is rejected in *all* builds (including the unstable
-            // feature) until wired end to end, so enabling it cannot create a
-            // false sense of enforcement.
+            // topic-publish boundary), `reclaim_hooks` (component-driven memory
+            // pressure relief, e.g. the batch processor early flush), and
+            // `receiver_admission` (runtime-budget-driven receiver shedding,
+            // currently wired for the syslog CEF receiver) are wired enforcement
+            // paths, so each is accepted only with the `unstable-memory-enforcement`
+            // feature and rejected in production builds.
+            #[cfg(not(feature = "unstable-memory-enforcement"))]
             if memory_budget.enforcement.receiver_admission {
                 errors.push(format!(
-                    "{budget_path}.enforcement.receiver_admission is not wired to runtime admission yet and cannot be enabled"
+                    "{budget_path}.enforcement.receiver_admission requires the `unstable-memory-enforcement` build feature, which is disabled in production builds"
                 ));
             }
             #[cfg(not(feature = "unstable-memory-enforcement"))]
@@ -1479,8 +1477,9 @@ mod tests {
         ));
         assert_eq!(receiver.len(), 1, "{receiver:?}");
         assert!(
-            receiver[0].contains("receiver_admission") && receiver[0].contains("not wired"),
-            "default build rejects receiver_admission as not wired: {receiver:?}"
+            receiver[0].contains("receiver_admission")
+                && receiver[0].contains("unstable-memory-enforcement"),
+            "default build rejects receiver_admission without the feature: {receiver:?}"
         );
 
         let reclaim = budget_validation_errors(budget_with_enforcement(
@@ -1499,15 +1498,13 @@ mod tests {
     }
 
     /// With the `unstable-memory-enforcement` build feature enabled, an
-    /// enforce-mode budget that enables the wired `queue_publish` and
-    /// `reclaim_hooks` flags validates cleanly. `receiver_admission` stays
-    /// rejected even with the feature, because it is not wired to any runtime
-    /// behavior.
+    /// enforce-mode budget that enables the wired `queue_publish`,
+    /// `reclaim_hooks`, and `receiver_admission` flags validates cleanly.
     #[cfg(feature = "unstable-memory-enforcement")]
     #[test]
     fn unstable_enforcement_feature_accepts_wired_flags() {
         let mut budget = budget_with_enforcement(super::MemoryBudgetEnforcementPolicy {
-            receiver_admission: false,
+            receiver_admission: true,
             queue_publish: true,
             reclaim_hooks: true,
         });
@@ -1515,26 +1512,25 @@ mod tests {
         let errors = budget_validation_errors(budget);
         assert!(
             errors.is_empty(),
-            "unstable feature accepts enforce mode with the wired queue_publish and reclaim_hooks flags: {errors:?}"
+            "unstable feature accepts enforce mode with the wired queue_publish, reclaim_hooks, and receiver_admission flags: {errors:?}"
         );
     }
 
-    /// `receiver_admission` is not wired to runtime admission, so it is rejected
-    /// even with the unstable feature enabled.
+    /// `receiver_admission` is wired to runtime-budget receiver shedding for the
+    /// syslog CEF receiver, so it is accepted with the unstable feature.
     #[cfg(feature = "unstable-memory-enforcement")]
     #[test]
-    fn unstable_enforcement_feature_rejects_receiver_admission() {
-        let errors = budget_validation_errors(budget_with_enforcement(
-            super::MemoryBudgetEnforcementPolicy {
-                receiver_admission: true,
-                queue_publish: false,
-                reclaim_hooks: false,
-            },
-        ));
-        assert_eq!(errors.len(), 1, "{errors:?}");
+    fn unstable_enforcement_feature_accepts_receiver_admission() {
+        let mut budget = budget_with_enforcement(super::MemoryBudgetEnforcementPolicy {
+            receiver_admission: true,
+            queue_publish: false,
+            reclaim_hooks: false,
+        });
+        budget.mode = super::MemoryBudgetMode::Enforce;
+        let errors = budget_validation_errors(budget);
         assert!(
-            errors[0].contains("receiver_admission") && errors[0].contains("not wired"),
-            "unstable feature still rejects unwired receiver_admission: {errors:?}"
+            errors.is_empty(),
+            "unstable feature accepts the wired receiver_admission flag: {errors:?}"
         );
     }
 

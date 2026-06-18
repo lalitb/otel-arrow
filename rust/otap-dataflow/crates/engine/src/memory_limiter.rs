@@ -400,8 +400,38 @@ impl LocalReceiverAdmissionState {
     pub fn level(&self) -> MemoryPressureLevel {
         self.inner.level.get()
     }
-}
 
+    /// Evaluates a combined receiver-admission decision from this process-pressure
+    /// snapshot plus the supplied runtime memory-budget pressure inputs.
+    ///
+    /// This is the integration point between the Phase 1 process-pressure
+    /// snapshot and the Phase 2 runtime-budget admission primitive
+    /// ([`ReceiverAdmissionInputs::evaluate`]). The caller supplies the runtime
+    /// budget level (or `None` when no runtime budget is installed / reachable)
+    /// and whether runtime-budget receiver-admission enforcement is active. The
+    /// process-side inputs (level, enforce mode, retry-after) are read locally
+    /// from this snapshot.
+    ///
+    /// With `runtime_budget_level == None` and `runtime_budget_enforce == false`
+    /// the result is exactly equivalent to [`should_shed_ingress`](Self::should_shed_ingress)
+    /// for the reject case, so existing process-only shedding behavior is
+    /// preserved.
+    #[must_use]
+    pub fn evaluate(
+        &self,
+        runtime_budget_level: Option<crate::memory_budget::BudgetLevel>,
+        runtime_budget_enforce: bool,
+    ) -> ReceiverAdmissionDecision {
+        ReceiverAdmissionInputs {
+            process_level: self.inner.level.get(),
+            process_enforce: self.inner.mode == MemoryLimiterMode::Enforce,
+            runtime_budget_level,
+            runtime_budget_enforce,
+            retry_after_secs: self.inner.retry_after_secs.get(),
+        }
+        .evaluate()
+    }
+}
 // ---------------------------------------------------------------------------
 // Receiver admission primitive (Phase 2)
 //
@@ -1632,6 +1662,59 @@ mod tests {
                 ReceiverAdmissionSource::EscrowOrTopicHard.as_str(),
                 "escrow_or_topic_hard"
             );
+        }
+
+        #[test]
+        fn local_state_evaluate_matches_process_shedding_without_runtime_budget() {
+            // With no runtime budget supplied, `evaluate(...).is_reject()` must
+            // agree with the Phase 1 `should_shed_ingress()` in every process
+            // pressure/mode combination, so existing behavior is preserved.
+            for (level, mode) in [
+                (MemoryPressureLevel::Normal, MemoryLimiterMode::Enforce),
+                (MemoryPressureLevel::Soft, MemoryLimiterMode::Enforce),
+                (MemoryPressureLevel::Hard, MemoryLimiterMode::Enforce),
+                (MemoryPressureLevel::Hard, MemoryLimiterMode::ObserveOnly),
+            ] {
+                let process = MemoryPressureState::default();
+                process.configure(MemoryPressureBehaviorConfig {
+                    retry_after_secs: 3,
+                    fail_readiness_on_hard: true,
+                    mode,
+                });
+                let local = LocalReceiverAdmissionState::from_process_state(&process);
+                local.apply(MemoryPressureChanged {
+                    generation: 1,
+                    level,
+                    retry_after_secs: 3,
+                    usage_bytes: 1,
+                });
+                let decision = local.evaluate(None, false);
+                assert_eq!(
+                    decision.is_reject(),
+                    local.should_shed_ingress(),
+                    "evaluate(None,false) must match should_shed_ingress for {level:?}/{mode:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn local_state_evaluate_rejects_on_enforced_runtime_budget_hard() {
+            let process = MemoryPressureState::default(); // Normal, Enforce
+            let local = LocalReceiverAdmissionState::from_process_state(&process);
+            // Process is Normal; only the enforced runtime-budget Hard rejects.
+            let decision = local.evaluate(Some(BudgetLevel::Hard), true);
+            assert!(decision.is_reject());
+            assert_eq!(decision.source, ReceiverAdmissionSource::RuntimeBudgetHard);
+
+            // Gate disabled: runtime-budget Hard is shadow-only, never rejects.
+            let decision = local.evaluate(Some(BudgetLevel::Hard), false);
+            assert!(!decision.is_reject());
+            assert!(decision.is_shadow_reject());
+
+            // Soft runtime budget never rejects.
+            let decision = local.evaluate(Some(BudgetLevel::Soft), true);
+            assert!(decision.is_admitted());
+            assert_eq!(decision.source, ReceiverAdmissionSource::None);
         }
     }
 
