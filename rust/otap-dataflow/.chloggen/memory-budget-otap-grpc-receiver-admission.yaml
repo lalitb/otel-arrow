@@ -1,0 +1,7 @@
+change_type: enhancement
+
+component: pipeline
+
+note: "Wire runtime-budget receiver admission into the OTAP gRPC receiver, reusing the `SharedRuntimeBudgetPressure` snapshot already used by the OTLP HTTP/gRPC paths. Both of the OTAP gRPC stream's existing pre-decode rejection points now evaluate the combined admission decision (`SharedReceiverAdmissionState::evaluate`): the stream-open check (gRPC `ResourceExhausted` + `grpc-retry-pushback-ms` error) and the per-batch check (`BatchStatus` with `ResourceExhausted`, before the Arrow batch is decoded). Runtime-budget `Hard` additionally sheds only in enforce mode with `enforcement.receiver_admission` enabled; process `Hard` still rejects with the same response and takes precedence; observe-only mode and a disabled gate never reject (shadow only); `Soft` is advisory. Rejection stays pre-decode, acquires no budget, retains no payload, and reuses the existing rejection counters; the OTAP receiver attaches the sendable pressure view (derived at construction from the pipeline runtime snapshot) into the stream settings, so the `!Send` runtime account never crosses a tonic handler thread. `receiver_admission` remains accepted only under `unstable-memory-enforcement` (rejected in default builds). Receiver admission is now wired for syslog CEF (local), OTLP HTTP, OTLP gRPC, and OTAP gRPC (shared); the remaining local/internal receivers still consult process pressure only."
+
+issues: [3272]

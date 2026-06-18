@@ -16,7 +16,8 @@ use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt as FuturesStreamExt};
 use otap_df_engine::{
     Interests, MessageSourceSharedEffectHandlerExtension, ProducerEffectHandlerExtension,
-    memory_limiter::SharedReceiverAdmissionState, shared::receiver as shared,
+    memory_budget::SharedRuntimeBudgetPressure, memory_limiter::SharedReceiverAdmissionState,
+    shared::receiver as shared,
 };
 use otap_df_pdata::{
     Consumer,
@@ -71,6 +72,11 @@ pub struct Settings {
     pub wait_for_result: bool,
     /// Receiver-local memory pressure admission state.
     pub admission_state: SharedReceiverAdmissionState,
+    /// Optional sendable view of this runtime's memory-budget pressure. Read on
+    /// the (tonic) handler threads, which cannot touch the `!Send` runtime
+    /// account, to shed on runtime-budget `Hard` in addition to process `Hard`.
+    /// `None` keeps admission process-pressure only.
+    pub runtime_budget_pressure: Option<SharedRuntimeBudgetPressure>,
     /// Shared rejection counters used by both stream-open and per-batch shedding.
     pub receiver_rejection_metrics: Option<Arc<dyn ReceiverRejectionMetrics>>,
 }
@@ -315,6 +321,7 @@ async fn handle_stream<T, F>(
 
         if reject_open_stream_for_memory_pressure(
             &settings.admission_state,
+            settings.runtime_budget_pressure.as_ref(),
             settings.receiver_rejection_metrics.as_deref(),
             &tx,
         )
@@ -344,6 +351,7 @@ async fn handle_stream<T, F>(
                     &effect_handler,
                     state.clone(),
                     &settings.admission_state,
+                    settings.runtime_budget_pressure.as_ref(),
                     settings.receiver_rejection_metrics.as_deref(),
                     &tx,
                     peer_addr,
@@ -374,12 +382,37 @@ async fn flush_ready_pending_responses(
     Ok(())
 }
 
+/// Combined receiver-admission shed check for the OTAP gRPC stream path.
+///
+/// Returns `true` when the request/stream must be shed, combining process
+/// pressure (`admission_state`) with this runtime's memory-budget pressure
+/// (`runtime_budget_pressure`, when installed). A few relaxed atomic loads, no
+/// allocation, no budget acquisition. With no runtime-budget pressure this is
+/// exactly the Phase 1 process-only `should_shed_ingress()`, so existing
+/// behavior is preserved.
+fn should_reject_for_memory_pressure(
+    admission_state: &SharedReceiverAdmissionState,
+    runtime_budget_pressure: Option<&SharedRuntimeBudgetPressure>,
+) -> bool {
+    let (runtime_budget_level, runtime_budget_enforce) = match runtime_budget_pressure {
+        Some(pressure) => (
+            Some(pressure.budget_level()),
+            pressure.receiver_admission_enforce(),
+        ),
+        None => (None, false),
+    };
+    admission_state
+        .evaluate(runtime_budget_level, runtime_budget_enforce)
+        .is_reject()
+}
+
 async fn reject_open_stream_for_memory_pressure(
     admission_state: &SharedReceiverAdmissionState,
+    runtime_budget_pressure: Option<&SharedRuntimeBudgetPressure>,
     rejection_metrics: Option<&dyn ReceiverRejectionMetrics>,
     tx: &tokio::sync::mpsc::Sender<Result<BatchStatus, Status>>,
 ) -> bool {
-    if !admission_state.should_shed_ingress() {
+    if !should_reject_for_memory_pressure(admission_state, runtime_budget_pressure) {
         return false;
     }
 
@@ -389,7 +422,7 @@ async fn reject_open_stream_for_memory_pressure(
 
     otel_warn!(
         "otap.stream.memory_pressure",
-        message = "Process memory pressure active while receiving an OTAP stream"
+        message = "Memory pressure active while receiving an OTAP stream"
     );
 
     let _ = tx
@@ -415,6 +448,7 @@ async fn accept_data<T: OtapBatchStore, F>(
     effect_handler: &shared::EffectHandler<OtapPdata>,
     state: Option<SharedState>,
     admission_state: &SharedReceiverAdmissionState,
+    runtime_budget_pressure: Option<&SharedRuntimeBudgetPressure>,
     rejection_metrics: Option<&dyn ReceiverRejectionMetrics>,
     tx: &tokio::sync::mpsc::Sender<Result<BatchStatus, Status>>,
     peer_addr: Option<SocketAddr>,
@@ -423,20 +457,20 @@ where
     F: Fn(T) -> OtapArrowRecords,
 {
     let batch_id = batch.batch_id;
-    if admission_state.should_shed_ingress() {
+    if should_reject_for_memory_pressure(admission_state, runtime_budget_pressure) {
         if let Some(metrics) = rejection_metrics {
             metrics.record_memory_pressure_rejection();
         }
 
         otel_warn!(
             "otap.request.memory_pressure",
-            message = "Process memory pressure active while receiving streamed batch"
+            message = "Memory pressure active while receiving streamed batch"
         );
 
         tx.send(Ok(BatchStatus {
             batch_id,
             status_code: StatusCode::ResourceExhausted as i32,
-            status_message: "Process memory pressure".to_string(),
+            status_message: "Memory pressure".to_string(),
         }))
         .await
         .map_err(|e| {
@@ -666,7 +700,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
         assert!(
-            reject_open_stream_for_memory_pressure(&local_state, Some(&metrics), &tx).await,
+            reject_open_stream_for_memory_pressure(&local_state, None, Some(&metrics), &tx).await,
             "hard pressure should reject an already-open stream before reading the next batch"
         );
 
@@ -681,6 +715,187 @@ mod tests {
             Some("3000")
         );
         assert_eq!(metrics.calls.load(Ordering::Relaxed), 1);
+    }
+
+    // ----- Runtime-budget admission (Phase 2) -----
+
+    use otap_df_engine::memory_budget::BudgetLevel;
+
+    /// Builds a sendable runtime-budget pressure view pinned at `target`, with
+    /// the given budget mode and `receiver_admission` gate. Returns the view plus
+    /// the keep-alive state/account/ticket the caller must hold for the test
+    /// (dropping the account resets the view to a safe `Normal` default).
+    fn runtime_pressure(
+        mode: otap_df_engine::memory_budget::BudgetMode,
+        receiver_admission: bool,
+        target: BudgetLevel,
+    ) -> (
+        SharedRuntimeBudgetPressure,
+        otap_df_engine::memory_budget::MemoryBudgetState,
+        std::rc::Rc<otap_df_engine::memory_budget::RuntimeMemoryAccount>,
+        Option<otap_df_engine::memory_budget::LocalMemoryTicket>,
+    ) {
+        use otap_df_engine::memory_budget::{
+            BudgetScopeId, MemoryBudgetEnforcement, MemoryBudgetSizing, MemoryBudgetState,
+            RetainedSiteKind, RuntimeMemoryBudgetConfig,
+        };
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 1,
+                    lease_step_bytes: 1,
+                    max_overshoot_per_runtime_bytes: 10,
+                    overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: 100,
+                runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement {
+                    receiver_admission,
+                    queue_publish: false,
+                    reclaim_hooks: false,
+                },
+            },
+            None,
+        );
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let pressure = handle.shared_budget_pressure();
+        let account = handle.local_account().expect("account");
+        let ticket = match target {
+            BudgetLevel::Normal => None,
+            BudgetLevel::Soft => Some(
+                account
+                    .charge_at(RetainedSiteKind::Unknown, 5_u64)
+                    .expect("soft charge fits within overshoot"),
+            ),
+            BudgetLevel::Hard => {
+                let mut ticket = account
+                    .charge_at(RetainedSiteKind::Unknown, 1_u64)
+                    .expect("initial charge fits");
+                ticket.reconcile_size(10_000_000);
+                Some(ticket)
+            }
+        };
+        assert_eq!(account.level(), target);
+        (pressure, state, account, ticket)
+    }
+
+    #[tokio::test]
+    async fn runtime_budget_hard_enforced_rejects_open_stream() {
+        // Process pressure Normal (default); only the enforced runtime budget at
+        // Hard drives the stream rejection.
+        let process_state = MemoryPressureState::default();
+        let local_state = SharedReceiverAdmissionState::from_process_state(&process_state);
+        let (pressure, _state, _account, _ticket) = runtime_pressure(
+            otap_df_engine::memory_budget::BudgetMode::Enforce,
+            true,
+            BudgetLevel::Hard,
+        );
+        let metrics = CountingReceiverRejectionMetrics::default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+        assert!(
+            reject_open_stream_for_memory_pressure(
+                &local_state,
+                Some(&pressure),
+                Some(&metrics),
+                &tx
+            )
+            .await,
+            "enforced runtime-budget Hard must reject the open stream"
+        );
+        let status = rx
+            .recv()
+            .await
+            .expect("rejection emitted")
+            .expect_err("rejection surfaces as a gRPC error");
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        assert!(status.metadata().get("grpc-retry-pushback-ms").is_some());
+        assert_eq!(metrics.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_budget_hard_observe_only_admits_open_stream() {
+        let process_state = MemoryPressureState::default();
+        let local_state = SharedReceiverAdmissionState::from_process_state(&process_state);
+        let (pressure, _state, _account, _ticket) = runtime_pressure(
+            otap_df_engine::memory_budget::BudgetMode::ObserveOnly,
+            true,
+            BudgetLevel::Hard,
+        );
+        let metrics = CountingReceiverRejectionMetrics::default();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+
+        assert!(
+            !reject_open_stream_for_memory_pressure(
+                &local_state,
+                Some(&pressure),
+                Some(&metrics),
+                &tx
+            )
+            .await,
+            "observe-only runtime budget must not reject"
+        );
+        assert_eq!(metrics.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn runtime_budget_admission_decision_matrix() {
+        let normal_process =
+            || SharedReceiverAdmissionState::from_process_state(&MemoryPressureState::default());
+
+        // Enforced runtime-budget Hard rejects (process Normal).
+        let (p, _s, _a, _t) = runtime_pressure(
+            otap_df_engine::memory_budget::BudgetMode::Enforce,
+            true,
+            BudgetLevel::Hard,
+        );
+        assert!(should_reject_for_memory_pressure(
+            &normal_process(),
+            Some(&p)
+        ));
+
+        // Gate disabled: shadow only, never rejects.
+        let (p, _s, _a, _t) = runtime_pressure(
+            otap_df_engine::memory_budget::BudgetMode::Enforce,
+            false,
+            BudgetLevel::Hard,
+        );
+        assert!(!should_reject_for_memory_pressure(
+            &normal_process(),
+            Some(&p)
+        ));
+
+        // Soft runtime budget admits.
+        let (p, _s, _a, _t) = runtime_pressure(
+            otap_df_engine::memory_budget::BudgetMode::Enforce,
+            true,
+            BudgetLevel::Soft,
+        );
+        assert!(!should_reject_for_memory_pressure(
+            &normal_process(),
+            Some(&p)
+        ));
+
+        // No runtime pressure installed + process Normal: admit (process-only).
+        assert!(!should_reject_for_memory_pressure(&normal_process(), None));
+
+        // Process Hard precedence: rejects regardless of runtime budget, and even
+        // with no runtime pressure (matches the old process-only behavior).
+        let process_hard = MemoryPressureState::default();
+        process_hard.set_level_for_tests(MemoryPressureLevel::Hard);
+        let hard_state = SharedReceiverAdmissionState::from_process_state(&process_hard);
+        let (p, _s, _a, _t) = runtime_pressure(
+            otap_df_engine::memory_budget::BudgetMode::Enforce,
+            true,
+            BudgetLevel::Hard,
+        );
+        assert!(should_reject_for_memory_pressure(&hard_state, Some(&p)));
+        assert!(should_reject_for_memory_pressure(&hard_state, None));
     }
 }
 

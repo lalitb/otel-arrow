@@ -31,6 +31,7 @@ use otap_df_engine::config::ReceiverConfig;
 use otap_df_engine::context::PipelineContext;
 use otap_df_engine::control::{AckMsg, NackMsg, NodeControlMsg};
 use otap_df_engine::error::{Error, ReceiverErrorKind, format_error_sources};
+use otap_df_engine::memory_budget::SharedRuntimeBudgetPressure;
 use otap_df_engine::memory_limiter::SharedReceiverAdmissionState;
 use otap_df_engine::node::NodeId;
 use otap_df_engine::receiver::ReceiverWrapper;
@@ -146,6 +147,12 @@ pub struct OTAPReceiver {
     metrics: MetricSet<OtapReceiverMetrics>,
     memory_pressure_metrics: Arc<SharedOtapMemoryPressureMetrics>,
     admission_state: SharedReceiverAdmissionState,
+    /// Sendable view of this runtime's memory-budget pressure, derived at
+    /// construction from the pipeline's runtime snapshot handle (never from the
+    /// `!Send` runtime account). Cloned into the gRPC stream settings so tonic
+    /// handlers can shed on runtime-budget `Hard`. `None` when the runtime
+    /// budget is disabled, in which case admission is process-pressure only.
+    runtime_budget_pressure: Option<SharedRuntimeBudgetPressure>,
 }
 
 /// Declares the OTAP receiver as a shared receiver factory
@@ -194,6 +201,12 @@ impl OTAPReceiver {
             admission_state: SharedReceiverAdmissionState::from_process_state(
                 &pipeline_ctx.memory_pressure_state(),
             ),
+            // Derive a sendable runtime-budget pressure view from the pipeline's
+            // runtime snapshot handle (registered on the pinned thread before
+            // node build). `None` when the runtime budget is disabled.
+            runtime_budget_pressure: pipeline_ctx
+                .memory_budget_snapshot()
+                .map(|handle| handle.shared_budget_pressure()),
         })
     }
 
@@ -364,6 +377,7 @@ impl shared::Receiver<OtapPdata> for OTAPReceiver {
                 .get(),
             wait_for_result: self.config.wait_for_result,
             admission_state: self.admission_state.clone(),
+            runtime_budget_pressure: self.runtime_budget_pressure.clone(),
             receiver_rejection_metrics: Some(self.memory_pressure_metrics.clone()),
         };
 
