@@ -402,6 +402,194 @@ impl LocalReceiverAdmissionState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Receiver admission primitive (Phase 2)
+//
+// Phase 1 receiver shedding (`should_shed_ingress`) only considers process-wide
+// pressure. Phase 2 layers a second pressure source on top: the runtime memory
+// budget. This primitive is a pure decision function over the combined pressure
+// inputs so it can be unit-tested without a real receiver and reused by any
+// receiver ingress point. It performs no allocation, no budget acquisition, and
+// no I/O; it is a `Copy`-in/`Copy`-out classifier only.
+//
+// Receiver admission is *not yet wired* to any production receiver path: this
+// primitive pins the API and semantics first. The `receiver_admission`
+// enforcement flag therefore remains config-rejected until a receiver consumes
+// this decision end to end.
+// ---------------------------------------------------------------------------
+
+/// Source of a receiver-admission rejection (or `None` when admitted).
+///
+/// Used as a low-cardinality, `Copy` metric/event attribute via
+/// [`as_str`](Self::as_str); it is never allocated per item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum ReceiverAdmissionSource {
+    /// No rejection: the item was admitted.
+    None = 0,
+    /// Process-wide Phase 1 hard memory pressure.
+    ProcessHard = 1,
+    /// Runtime memory-budget hard pressure.
+    RuntimeBudgetHard = 2,
+    /// Escrow/topic hard pressure. Reserved for a future slice; this primitive
+    /// accepts it as an input source but no caller supplies it yet.
+    EscrowOrTopicHard = 3,
+}
+
+impl ReceiverAdmissionSource {
+    /// Returns the static, low-cardinality label for this source.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::ProcessHard => "process_hard",
+            Self::RuntimeBudgetHard => "runtime_budget_hard",
+            Self::EscrowOrTopicHard => "escrow_or_topic_hard",
+        }
+    }
+}
+
+/// Outcome of a receiver-admission evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiverAdmissionOutcome {
+    /// Accept the incoming item.
+    Admit,
+    /// The item *would* be rejected under enforcement, but the relevant source
+    /// is observe-only (or its gate is disabled), so the item is still admitted.
+    /// Records a shadow decision for metrics without dropping any data.
+    ShadowReject,
+    /// Reject or backpressure the incoming item (enforcement is active).
+    Reject,
+}
+
+/// A receiver-admission decision: outcome, attributed source, and retry hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiverAdmissionDecision {
+    /// What the receiver should do with the item.
+    pub outcome: ReceiverAdmissionOutcome,
+    /// The dominant pressure source for this decision.
+    pub source: ReceiverAdmissionSource,
+    /// Retry-after hint (seconds) to advertise when rejecting/shadow-rejecting,
+    /// for protocols that support it. Zero when admitted.
+    pub retry_after_secs: u32,
+}
+
+impl ReceiverAdmissionDecision {
+    /// The "admit, nothing to do" decision.
+    #[must_use]
+    pub const fn admitted() -> Self {
+        Self {
+            outcome: ReceiverAdmissionOutcome::Admit,
+            source: ReceiverAdmissionSource::None,
+            retry_after_secs: 0,
+        }
+    }
+
+    /// Whether the receiver must actually reject/backpressure the item.
+    #[must_use]
+    pub const fn is_reject(self) -> bool {
+        matches!(self.outcome, ReceiverAdmissionOutcome::Reject)
+    }
+
+    /// Whether this is a shadow (observe-only) rejection: the item is admitted
+    /// but a would-reject was recorded.
+    #[must_use]
+    pub const fn is_shadow_reject(self) -> bool {
+        matches!(self.outcome, ReceiverAdmissionOutcome::ShadowReject)
+    }
+
+    /// Whether the item is admitted (either a clean admit or a shadow reject).
+    #[must_use]
+    pub const fn is_admitted(self) -> bool {
+        !self.is_reject()
+    }
+}
+
+/// Pressure inputs evaluated for a receiver-admission decision.
+///
+/// The caller is responsible for collecting each input cheaply at the receiver
+/// ingress point. Process inputs come from the receiver-local admission state
+/// (a snapshot of the process limiter); runtime-budget inputs come from
+/// `current_runtime_memory_budget()` when the ingress runs on the pinned
+/// pipeline runtime thread (otherwise `runtime_budget_level` is `None`).
+#[derive(Debug, Clone, Copy)]
+pub struct ReceiverAdmissionInputs {
+    /// Current process-wide pressure level.
+    pub process_level: MemoryPressureLevel,
+    /// Whether the process limiter is in enforce mode (so process Hard sheds).
+    pub process_enforce: bool,
+    /// Current runtime memory-budget level, when reachable on this thread.
+    pub runtime_budget_level: Option<crate::memory_budget::BudgetLevel>,
+    /// Whether runtime-budget receiver admission is enforced. The caller sets
+    /// this only when the `unstable-memory-enforcement` build feature is
+    /// active, the budget mode is enforce, and the `receiver_admission` gate is
+    /// enabled; otherwise `false` (shadow-only).
+    pub runtime_budget_enforce: bool,
+    /// Retry-after hint (seconds) to advertise on rejection.
+    pub retry_after_secs: u32,
+}
+
+impl ReceiverAdmissionInputs {
+    /// Evaluates a receiver-admission decision from the combined pressure inputs.
+    ///
+    /// Semantics:
+    /// - Only `Hard` pressure can reject; `Soft` is advisory and admits, `Normal`
+    ///   admits.
+    /// - A source rejects (`Reject`) only when it is `Hard` **and** its
+    ///   enforcement is active; otherwise a `Hard` source produces a
+    ///   `ShadowReject` (admit + recorded would-reject).
+    /// - Source precedence is process > runtime-budget > escrow/topic. When more
+    ///   than one source is `Hard`, the highest-precedence one that determines
+    ///   the outcome is attributed: the highest-precedence *enforced* `Hard`
+    ///   source for a `Reject`, else the highest-precedence `Hard` source for a
+    ///   `ShadowReject`.
+    /// - Pure and side-effect-free: it never acquires budget, allocates, or
+    ///   drops data. Cleanup/drop/nack/shutdown paths never call it.
+    #[must_use]
+    pub fn evaluate(self) -> ReceiverAdmissionDecision {
+        let process_hard = self.process_level == MemoryPressureLevel::Hard;
+        let runtime_hard =
+            self.runtime_budget_level == Some(crate::memory_budget::BudgetLevel::Hard);
+
+        // Reject candidates: a source that is Hard and whose enforcement is on.
+        // Precedence: process wins over runtime budget.
+        if process_hard && self.process_enforce {
+            return ReceiverAdmissionDecision {
+                outcome: ReceiverAdmissionOutcome::Reject,
+                source: ReceiverAdmissionSource::ProcessHard,
+                retry_after_secs: self.retry_after_secs,
+            };
+        }
+        if runtime_hard && self.runtime_budget_enforce {
+            return ReceiverAdmissionDecision {
+                outcome: ReceiverAdmissionOutcome::Reject,
+                source: ReceiverAdmissionSource::RuntimeBudgetHard,
+                retry_after_secs: self.retry_after_secs,
+            };
+        }
+
+        // No enforced rejection: a Hard source that is observe-only (or whose
+        // gate is disabled) records a shadow reject without dropping data.
+        if process_hard {
+            return ReceiverAdmissionDecision {
+                outcome: ReceiverAdmissionOutcome::ShadowReject,
+                source: ReceiverAdmissionSource::ProcessHard,
+                retry_after_secs: self.retry_after_secs,
+            };
+        }
+        if runtime_hard {
+            return ReceiverAdmissionDecision {
+                outcome: ReceiverAdmissionOutcome::ShadowReject,
+                source: ReceiverAdmissionSource::RuntimeBudgetHard,
+                retry_after_secs: self.retry_after_secs,
+            };
+        }
+
+        // Normal/Soft on every source: admit.
+        ReceiverAdmissionDecision::admitted()
+    }
+}
+
 /// Runtime source used for memory sampling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemorySampleSource {
@@ -1264,6 +1452,187 @@ mod tests {
         assert!(clone.should_shed_ingress());
         assert_eq!(clone.retry_after_secs(), 6);
         assert_eq!(clone.level(), MemoryPressureLevel::Hard);
+    }
+
+    mod receiver_admission {
+        use super::*;
+        use crate::memory_budget::BudgetLevel;
+
+        /// Builds and evaluates a decision with a fixed retry-after of 7s.
+        fn admit(
+            process_level: MemoryPressureLevel,
+            process_enforce: bool,
+            runtime_budget_level: Option<BudgetLevel>,
+            runtime_budget_enforce: bool,
+        ) -> ReceiverAdmissionDecision {
+            ReceiverAdmissionInputs {
+                process_level,
+                process_enforce,
+                runtime_budget_level,
+                runtime_budget_enforce,
+                retry_after_secs: 7,
+            }
+            .evaluate()
+        }
+
+        #[test]
+        fn normal_pressure_admits() {
+            let d = admit(
+                MemoryPressureLevel::Normal,
+                true,
+                Some(BudgetLevel::Normal),
+                true,
+            );
+            assert_eq!(d, ReceiverAdmissionDecision::admitted());
+            assert!(d.is_admitted());
+            assert!(!d.is_reject());
+            assert_eq!(d.source, ReceiverAdmissionSource::None);
+            assert_eq!(d.retry_after_secs, 0);
+        }
+
+        #[test]
+        fn soft_pressure_admits_without_shadow() {
+            // Soft is advisory on every source: a clean admit, not even a shadow.
+            let d = admit(
+                MemoryPressureLevel::Soft,
+                true,
+                Some(BudgetLevel::Soft),
+                true,
+            );
+            assert_eq!(d, ReceiverAdmissionDecision::admitted());
+        }
+
+        #[test]
+        fn process_hard_observe_only_shadow_rejects() {
+            let d = admit(MemoryPressureLevel::Hard, false, None, false);
+            assert_eq!(d.outcome, ReceiverAdmissionOutcome::ShadowReject);
+            assert_eq!(d.source, ReceiverAdmissionSource::ProcessHard);
+            assert!(d.is_shadow_reject());
+            assert!(d.is_admitted());
+            assert_eq!(d.retry_after_secs, 7);
+        }
+
+        #[test]
+        fn runtime_hard_observe_only_shadow_rejects() {
+            let d = admit(
+                MemoryPressureLevel::Normal,
+                true,
+                Some(BudgetLevel::Hard),
+                false,
+            );
+            assert_eq!(d.outcome, ReceiverAdmissionOutcome::ShadowReject);
+            assert_eq!(d.source, ReceiverAdmissionSource::RuntimeBudgetHard);
+            assert!(d.is_admitted());
+        }
+
+        #[test]
+        fn process_hard_enforce_rejects() {
+            let d = admit(MemoryPressureLevel::Hard, true, None, false);
+            assert_eq!(d.outcome, ReceiverAdmissionOutcome::Reject);
+            assert_eq!(d.source, ReceiverAdmissionSource::ProcessHard);
+            assert!(d.is_reject());
+            assert_eq!(d.retry_after_secs, 7);
+        }
+
+        #[test]
+        fn runtime_hard_enforce_rejects() {
+            let d = admit(
+                MemoryPressureLevel::Normal,
+                true,
+                Some(BudgetLevel::Hard),
+                true,
+            );
+            assert_eq!(d.outcome, ReceiverAdmissionOutcome::Reject);
+            assert_eq!(d.source, ReceiverAdmissionSource::RuntimeBudgetHard);
+        }
+
+        #[test]
+        fn process_hard_wins_over_runtime_hard_when_both_enforced() {
+            let d = admit(
+                MemoryPressureLevel::Hard,
+                true,
+                Some(BudgetLevel::Hard),
+                true,
+            );
+            assert_eq!(d.outcome, ReceiverAdmissionOutcome::Reject);
+            assert_eq!(
+                d.source,
+                ReceiverAdmissionSource::ProcessHard,
+                "process pressure takes precedence over runtime budget"
+            );
+        }
+
+        #[test]
+        fn enforced_runtime_hard_rejects_when_process_is_observe_only_hard() {
+            // Process is Hard but observe-only (not a reject candidate); the
+            // enforced runtime-budget Hard is what actually rejects.
+            let d = admit(
+                MemoryPressureLevel::Hard,
+                false,
+                Some(BudgetLevel::Hard),
+                true,
+            );
+            assert_eq!(d.outcome, ReceiverAdmissionOutcome::Reject);
+            assert_eq!(d.source, ReceiverAdmissionSource::RuntimeBudgetHard);
+        }
+
+        #[test]
+        fn gate_disabled_never_actual_rejects() {
+            // Both sources Hard, but neither enforcement is active: shadow only,
+            // never an actual reject. Process precedence applies to the source.
+            let d = admit(
+                MemoryPressureLevel::Hard,
+                false,
+                Some(BudgetLevel::Hard),
+                false,
+            );
+            assert_eq!(d.outcome, ReceiverAdmissionOutcome::ShadowReject);
+            assert_eq!(d.source, ReceiverAdmissionSource::ProcessHard);
+            assert!(!d.is_reject());
+        }
+
+        #[test]
+        fn missing_runtime_budget_level_uses_process_only() {
+            // No runtime budget reachable (e.g. shared receiver handler thread):
+            // only process pressure is considered.
+            let d = admit(MemoryPressureLevel::Hard, true, None, true);
+            assert_eq!(d.outcome, ReceiverAdmissionOutcome::Reject);
+            assert_eq!(d.source, ReceiverAdmissionSource::ProcessHard);
+
+            let d = admit(MemoryPressureLevel::Normal, true, None, true);
+            assert!(d.is_admitted());
+            assert_eq!(d.source, ReceiverAdmissionSource::None);
+        }
+
+        #[test]
+        fn retry_after_hint_is_carried_on_rejection() {
+            let d = ReceiverAdmissionInputs {
+                process_level: MemoryPressureLevel::Hard,
+                process_enforce: true,
+                runtime_budget_level: None,
+                runtime_budget_enforce: false,
+                retry_after_secs: 42,
+            }
+            .evaluate();
+            assert_eq!(d.retry_after_secs, 42);
+        }
+
+        #[test]
+        fn source_labels_are_stable() {
+            assert_eq!(ReceiverAdmissionSource::None.as_str(), "none");
+            assert_eq!(
+                ReceiverAdmissionSource::ProcessHard.as_str(),
+                "process_hard"
+            );
+            assert_eq!(
+                ReceiverAdmissionSource::RuntimeBudgetHard.as_str(),
+                "runtime_budget_hard"
+            );
+            assert_eq!(
+                ReceiverAdmissionSource::EscrowOrTopicHard.as_str(),
+                "escrow_or_topic_hard"
+            );
+        }
     }
 
     #[test]

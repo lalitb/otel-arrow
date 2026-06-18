@@ -1,0 +1,7 @@
+change_type: enhancement
+
+component: engine
+
+note: "Add an engine-level receiver-admission decision primitive (`ReceiverAdmissionInputs::evaluate` -> `ReceiverAdmissionDecision` with `ReceiverAdmissionOutcome` and `ReceiverAdmissionSource`) that classifies a receiver ingress item from combined process-wide and runtime memory-budget pressure. It is a pure, allocation-free, `Copy`-in/`Copy`-out function: only `Hard` pressure rejects, `Soft` is advisory, observe-only/gate-disabled sources produce a shadow reject (admit + recorded would-reject, no data dropped), process pressure takes precedence over runtime-budget pressure, and a retry-after hint is carried through. This pins the API and semantics for runtime-budget receiver admission. It is not yet wired to any receiver ingress path, so `memory_budget.enforcement.receiver_admission` remains rejected at config validation in all builds (including with `unstable-memory-enforcement`). The escrow/topic pressure source is reserved but not yet produced."
+
+issues: [3272]
