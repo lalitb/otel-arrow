@@ -511,6 +511,9 @@ impl ListenerGroupManager {
             .find(|key| key.bind_identity() == bind_identity)
             .cloned()
         {
+            if let Some(existing_slot) = state.get(&existing_key) {
+                existing_slot.cv.notify_all();
+            }
             let _ = state.remove(&existing_key);
             let _ = self
                 .inner
@@ -1371,6 +1374,54 @@ mod tests {
             elapsed < Duration::from_millis(100),
             "should not wait, got {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn duplicate_bind_identity_removal_wakes_materialising_waiters() {
+        let mgr = ListenerGroupManager::new();
+        let addr = ephemeral_addr();
+        let first = loopback_plan(addr, &[(0, 0, 0), (1, 1, 0)]);
+        let key = first.key.clone();
+        mgr.register_plan(first).unwrap();
+
+        let (hook_entered_tx, hook_entered_rx) = std::sync::mpsc::channel();
+        let (release_hook_tx, release_hook_rx) = std::sync::mpsc::channel();
+        let release_hook_rx = Arc::new(Mutex::new(release_hook_rx));
+        mgr.set_attach_hook(Arc::new(move |_plan, _handles| {
+            hook_entered_tx.send(()).unwrap();
+            release_hook_rx.lock().unwrap().recv().unwrap();
+            Ok(AttachOutcome::default())
+        }));
+
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
+        let mut handles = Vec::new();
+        for core_id in [0_u32, 1] {
+            let mgr = mgr.clone();
+            let key = key.clone();
+            let outcome_tx = outcome_tx.clone();
+            handles.push(thread::spawn(move || {
+                let outcome = mgr.acquire(&key, core_id, Duration::from_secs(30));
+                outcome_tx.send(outcome).unwrap();
+            }));
+        }
+        drop(outcome_tx);
+
+        hook_entered_rx.recv().unwrap();
+        let duplicate = plan_with_ids("pg-other", "recv", addr, &[(0, 2, 0)]);
+        assert_eq!(
+            mgr.register_plan(duplicate),
+            Err(PlanError::DuplicateBindIdentity)
+        );
+
+        let waiter_outcome = outcome_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(waiter_outcome, AcquireOutcome::NoPlan));
+
+        release_hook_tx.send(()).unwrap();
+        let materialiser_outcome = outcome_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(materialiser_outcome, AcquireOutcome::NoPlan));
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 
     #[test]

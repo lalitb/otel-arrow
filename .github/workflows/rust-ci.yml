@@ -466,6 +466,25 @@ jobs:
         run: cargo test -p otap-df-otap --tests --no-run
         working-directory: ./rust/${{ matrix.folder }}
 
+  reuseport_ebpf_check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: ./rust/otap-dataflow
+          cache-bin: false
+      - name: Install eBPF build dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libbpf-dev
+      - name: cargo check reuseport-ebpf feature
+        run: cargo check -p otap-df-engine --features reuseport-ebpf
+        working-directory: ./rust/otap-dataflow
+
   # Required builds for otap-dataflow: compile once per OS, create nextest archive.
   # Test binaries are uploaded as artifacts so test partitions don't re-compile.
   build_required:
@@ -1096,6 +1115,7 @@ jobs:
       - compile_proto
       - pest-fmt
       - no_default_features_check
+      - reuseport_ebpf_check
       - pipeline_perf_test
       - host-metrics-semconv
       - user_events_linux_smoke
@@ -1132,6 +1152,10 @@ jobs:
           fi
           if [[ "${{ needs.no_default_features_check.result }}" != "success" ]]; then
             echo "no_default_features_check failed or was cancelled"
+            exit 1
+          fi
+          if [[ "${{ needs.reuseport_ebpf_check.result }}" != "success" ]]; then
+            echo "reuseport_ebpf_check failed or was cancelled"
             exit 1
           fi
           if [[ "${{ needs.pipeline_perf_test.result }}" != "success" ]]; then

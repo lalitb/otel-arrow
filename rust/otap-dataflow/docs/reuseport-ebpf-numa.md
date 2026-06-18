@@ -332,6 +332,13 @@ open. The reuseport group also holds a kernel reference to the attached program;
 dropping `ReuseportEbpf` closes the userspace descriptors but does not detach
 the selector from sockets that remain open.
 
+The default loader embeds `reuseport_numa_kern.bpf.o` in the `df_engine`
+binary with `include_bytes!` and opens it from memory. This avoids a common
+container packaging failure where a multi-stage image copies only the final
+binary and omits Cargo's build-script `OUT_DIR` artifact. The path-based loader
+remains available for tests and diagnostics, but production startup does not
+depend on a runtime `.bpf.o` file being present on disk.
+
 ## Operational Requirements
 
 This prototype requires Linux with `BPF_PROG_TYPE_SK_REUSEPORT` and
@@ -365,6 +372,56 @@ cat /proc/interrupts
 cat /proc/irq/<irq>/smp_affinity_list
 ```
 
+### Kubernetes, AKS, and Docker
+
+There are two deployment tiers:
+
+- Coordinated plain `SO_REUSEPORT`: works in ordinary containers with no extra
+  privileges. Set `OTAP_DF_REUSEPORT_EBPF=1` without the eBPF feature or without
+  attach permissions and the engine still uses coordinated listener creation,
+  but the selector hook is a logged no-op or non-strict fallback.
+- eBPF NUMA selector: requires a Linux build with `reuseport-ebpf`, a supported
+  kernel, and enough privileges for `bpf()` plus `SO_ATTACH_REUSEPORT_EBPF`.
+
+For Docker, the least-broad useful shape on newer kernels is:
+
+```bash
+docker run --rm \
+  --cap-add=BPF \
+  --cap-add=NET_ADMIN \
+  --security-opt seccomp=unconfined \
+  -e OTAP_DF_REUSEPORT_EBPF=1 \
+  <df-engine-image>
+```
+
+On older kernels or runtimes whose seccomp profile still gates `bpf()` behind
+`CAP_SYS_ADMIN`, test with `--cap-add=SYS_ADMIN` or a privileged container.
+
+For Kubernetes / AKS, the equivalent pod security context is:
+
+```yaml
+securityContext:
+  capabilities:
+    add: ["BPF", "NET_ADMIN"]
+  seccompProfile:
+    type: Unconfined
+```
+
+Use `SYS_ADMIN` only for older kernels or runtimes that cannot use `BPF`.
+Clusters enforcing the `restricted` Pod Security Standard normally reject these
+capabilities and unconfined seccomp, so run this workload only in an explicitly
+trusted namespace or dedicated node pool. Sandboxed runtimes that do not pass
+`bpf()` through to the host kernel are out of scope.
+
+Getting the selector to attach gives per-core connection/datagram placement
+inside the pod's reuseport group. Getting the NUMA-locality benefit additionally
+requires a multi-NUMA node, stable CPU placement, and node-level NIC RSS / IRQ
+affinity alignment. On AKS that usually means a dedicated node pool with static
+CPU manager, single-NUMA topology manager, Guaranteed pods with integer CPU
+requests/limits, and separate node tuning for RSS/IRQ affinity. Ordinary
+multi-tenant AKS pods should be expected to run the fallback or per-core tier,
+not guaranteed NUMA-local placement.
+
 ## Current Limitation
 
 The selector influences kernel socket choice for TCP connections and UDP
@@ -384,6 +441,14 @@ exist and may be a better fit:
 - `SO_INCOMING_CPU` is **not** a safe alternative on most production
   kernels: it is broken between Linux 4.1 and 6.1 and only fixed from
   6.2 onward.
+- Aya could replace the C/libbpf-rs stack with a Rust eBPF program and remove
+  the clang / `vmlinux.h` / `bpf_helpers.h` build path. The tradeoff is that
+  Aya's eBPF crate workflow still requires a nightly Rust toolchain and
+  `build-std` for the BPF target, plus a separate `no_std` BPF crate and build
+  orchestration. This repo currently targets stable Rust with MSRV 1.87.0, and
+  this selector is intentionally tiny and does not read CO-RE-sensitive kernel
+  struct fields. The current implementation therefore uses libbpf-rs and keeps
+  the BPF object embedded in the binary to reduce container packaging friction.
 
 The eBPF selector remains justified when:
 

@@ -190,7 +190,7 @@ pub mod libbpf {
     use std::collections::HashSet;
     use std::error::Error;
     use std::mem::size_of_val;
-    use std::os::fd::{AsFd, AsRawFd, RawFd};
+    use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
     use std::path::Path;
     use std::sync::Arc;
 
@@ -217,7 +217,7 @@ pub mod libbpf {
     #[derive(Debug)]
     pub struct ReuseportEbpf {
         _object: Object,
-        sockarray_map_fd: RawFd,
+        sockarray_map_fd: Arc<OwnedFd>,
         listener_map_indices: Vec<(u32, u32)>,
     }
 
@@ -262,7 +262,7 @@ pub mod libbpf {
                 .map(|(listener_id, map_index)| {
                     let lease: Arc<dyn std::any::Any + Send + Sync> =
                         Arc::new(SockarrayEntryLease {
-                            map_fd: self.sockarray_map_fd,
+                            map_fd: Arc::clone(&self.sockarray_map_fd),
                             map_index: *map_index,
                         });
                     (*listener_id, lease)
@@ -272,25 +272,31 @@ pub mod libbpf {
     }
 
     /// Path to the BPF object compiled by this crate's build script.
+    ///
+    /// Exposed for diagnostics and tests only. The default runtime loader embeds
+    /// the object bytes in the binary so slim containers do not need to copy the
+    /// build-script `OUT_DIR` artifact.
     #[must_use]
     pub fn default_object_path() -> Option<&'static Path> {
         option_env!("OTAP_DF_REUSEPORT_EBPF_OBJECT").map(Path::new)
+    }
+
+    /// Embedded bytes for the build-script compiled BPF object.
+    #[must_use]
+    pub fn default_object_bytes() -> &'static [u8] {
+        include_bytes!(env!("OTAP_DF_REUSEPORT_EBPF_OBJECT"))
     }
 
     /// Loads the build-script compiled BPF object and attaches it to a reuseport group.
     ///
     /// # Errors
     ///
-    /// Returns an error when the feature was built without an object path, or
-    /// when [`load_and_attach`] fails.
+    /// Returns an error when loading or attaching the embedded BPF object fails.
     pub fn load_default_and_attach(
         listeners: &[ListenerFd],
         debug: bool,
     ) -> Result<ReuseportEbpf, Box<dyn Error + Send + Sync>> {
-        let object_path = default_object_path().ok_or(
-            "reuseport eBPF object path is unavailable; build on Linux with the `reuseport-ebpf` feature enabled",
-        )?;
-        load_and_attach(object_path, listeners, debug)
+        load_and_attach_bytes(default_object_bytes(), listeners, debug)
     }
 
     /// Loads the BPF object, populates maps, and attaches it to a reuseport group.
@@ -305,6 +311,27 @@ pub mod libbpf {
         listeners: &[ListenerFd],
         debug: bool,
     ) -> Result<ReuseportEbpf, Box<dyn Error + Send + Sync>> {
+        let open_object = ObjectBuilder::default()
+            .debug(debug)
+            .open_file(object_path.as_ref())?;
+        load_open_object(open_object, listeners)
+    }
+
+    fn load_and_attach_bytes(
+        object_bytes: &[u8],
+        listeners: &[ListenerFd],
+        debug: bool,
+    ) -> Result<ReuseportEbpf, Box<dyn Error + Send + Sync>> {
+        let open_object = ObjectBuilder::default()
+            .debug(debug)
+            .open_memory(object_bytes)?;
+        load_open_object(open_object, listeners)
+    }
+
+    fn load_open_object(
+        mut open_object: libbpf_rs::OpenObject,
+        listeners: &[ListenerFd],
+    ) -> Result<ReuseportEbpf, Box<dyn Error + Send + Sync>> {
         validate_listeners(listeners)?;
         let metadata: Vec<_> = listeners
             .iter()
@@ -315,10 +342,6 @@ pub mod libbpf {
             })
             .collect();
         let layout = build_numa_layout(&metadata)?;
-
-        let mut open_object = ObjectBuilder::default()
-            .debug(debug)
-            .open_file(object_path.as_ref())?;
 
         for mut program in open_object.progs_mut() {
             if program.name().to_string_lossy() == SELECTOR_PROGRAM {
@@ -334,9 +357,11 @@ pub mod libbpf {
         // selector sees a complete socket array.
         update_sockarray(&mut object, &layout.placements, listeners)?;
         attach_selector(&object, listeners)?;
-        let sockarray_map_fd = find_map_mut(&mut object, SOCKARRAY_MAP)?
-            .as_fd()
-            .as_raw_fd();
+        let sockarray_map_fd = Arc::new(
+            find_map_mut(&mut object, SOCKARRAY_MAP)?
+                .as_fd()
+                .try_clone_to_owned()?,
+        );
         let listener_map_indices = layout
             .placements
             .iter()
@@ -352,14 +377,14 @@ pub mod libbpf {
 
     #[derive(Debug)]
     struct SockarrayEntryLease {
-        map_fd: RawFd,
+        map_fd: Arc<OwnedFd>,
         map_index: u32,
     }
 
     impl Drop for SockarrayEntryLease {
         fn drop(&mut self) {
             let key = self.map_index.to_ne_bytes();
-            let _ = bpf_map_delete_elem(self.map_fd, key.as_ptr().cast());
+            let _ = bpf_map_delete_elem(self.map_fd.as_raw_fd(), key.as_ptr().cast());
         }
     }
 
