@@ -1554,8 +1554,10 @@ account never reaches a tonic handler thread. Rejection stays pre-decode,
 budget-free, payload-free, and reuses the existing rejection counters.
 
 This is shared *runtime pressure* publication only; shared-channel/shared-node
-retained-ownership adoption of `SharedEnvelope<T>` remains a separate, unstarted
-track.
+retained-ownership adoption of `SharedEnvelope<T>` is audited (see
+[Shared-boundary ownership audit](#shared-boundary-ownership-audit-audit-only-slice))
+but not wired: the one remaining production boundary needs a sendable
+escrow-minting handle that does not exist yet, so it stays a separate track.
 
 **Status:** the admission primitive is implemented and unit-tested and is wired
 end to end for **(1)** the syslog CEF local receiver, **(2)** the OTLP HTTP
@@ -2228,6 +2230,73 @@ not call it directly: `try_publish_owned` performs the equivalent conversion at
 the broker boundary (point-to-point escrow for balanced, ring-slot escrow for
 broadcast, and an all-or-nothing fanout of one owner per retained destination
 for mixed).
+
+### Shared-boundary ownership audit (audit-only slice)
+
+A direct code audit of every production boundary where retained telemetry can
+cross a `Send`/thread/runtime boundary. Each pipeline runs on its own pinned
+`current_thread` runtime plus `LocalSet` with one `!Send` `RuntimeMemoryBudget`
+(`controller/src/lib.rs` installs it; `runtime_pipeline.rs` builds the runtime),
+so a "shared" boundary is any edge that leaves that pinned thread.
+
+<!-- markdownlint-disable MD013 -->
+| Boundary | Files | Data | Retains after send? | Crosses thread/runtime? | Current owner | Escrow today? | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Topic balanced queue | `engine/src/topic/topic.rs` (`QueuedEnvelope`) | `Envelope<PData>` | Yes (bounded `async_channel`) | Yes | `EscrowSlot` in `QueuedEnvelope` | Yes | wired (reference) |
+| Topic broadcast ring | `engine/src/topic/topic.rs` (`BroadcastSlot`/`FastBroadcastRing`) | `Envelope<PData>` | Yes (bounded ring) | Yes | `EscrowSlot` in ring slot | Yes | wired (reference) |
+| Shared gRPC receiver -> downstream channel | `engine/src/lib.rs` (channel build), `engine/src/shared/message.rs`, `core-nodes/.../otlp_receiver`, `.../otap_receiver` | plain `PData` | Yes (flume/tokio mpsc buffer) | Yes (tonic threads -> pipeline thread) | none | No | gap, blocked (see below) |
+| Mixed local->shared wiring | `engine/src/message.rs` (`Sender::Shared`), `engine/src/lib.rs` | plain `PData` | Yes (same shared channels) | Yes | none | No | gap, blocked (same mechanism) |
+| Local inter-node channels | `engine/src/local/*`, `engine/src/message.rs` | `PData` | Yes (buffer) | No (same `LocalSet`, `!Send`) | n/a | n/a (local) | correctly local |
+| Fanout / routers | `core-nodes/.../fanout_processor`, `content_router`, `exclusive_router_admission`, `signal_type_router` | `PData` | Yes (parked / in-flight) | No (`local::Processor`) | `LocalMemoryTicket` (`FanoutInflight` / `RouterParked`) | n/a (local) | local, already accounted |
+<!-- markdownlint-enable MD013 -->
+
+Result: the only non-topic production shared boundary that retains `PData` is
+the **shared gRPC receiver -> downstream channel**. The only production shared
+nodes are the OTLP and OTAP gRPC receivers (`shared::Receiver`); there are no
+shared processors or exporters. Every other retained-work site is either the
+already-wired topic broker or a local (`!Send`) node that correctly uses
+`LocalMemoryTicket`.
+
+#### Blocker: why no narrow slice is wired
+
+This boundary cannot be wired in one narrow, safe slice:
+
+- The shared channel carries plain `PData` (`Sender<PData>` / `SharedSender<PData>`
+  built in `engine/src/lib.rs`). Attaching escrow means changing the channel
+  item type to `SharedEnvelope<PData>`, which ripples through the generic
+  `Sender`/`Receiver` interface and every node's send/recv loop -- a broad
+  refactor, explicitly out of scope for one slice.
+- The sender side runs on tonic handler threads, which have **no** runtime-local
+  budget, account, or `LocalMemoryTicket`. The existing
+  `LocalEnvelope::into_shared` conversion transfers an *existing* local ticket
+  into escrow; it does not apply when the producer holds no local owner.
+  Charging this boundary needs a **new** sendable escrow-minting handle bound to
+  the downstream runtime's budget (analogous to `SharedRuntimeBudgetPressure`,
+  but with a `try_charge_escrow` capability) -- infrastructure that does not
+  exist yet.
+- Therefore the ownership-acquisition point is undefined today, so the boundary
+  fails the "ownership acquisition/transfer/release points are clear" and
+  "change can be kept narrow" criteria. Forcing a narrow change would either
+  drop tickets while the payload stays retained, or half-wire `SharedEnvelope<T>`
+  into a path production does not use -- both disallowed.
+
+#### Smallest principled first step (future, multi-part)
+
+1. Add a sendable per-runtime escrow-minting handle so a shared receiver can
+   mint an `EscrowSlot` against the **downstream** runtime's budget / global
+   pool from a tonic thread (no `!Send` state crosses the boundary).
+2. Introduce an opt-in `SharedEnvelope<PData>`-carrying channel for exactly the
+   shared-receiver -> downstream edge, behind `unstable-memory-enforcement`,
+   observe-only by default, with explicit redemption (`EscrowTicket::redeem_into`)
+   in the downstream recv loop and release on close / drop / drain / full.
+3. Preserve all-or-nothing fanout, close-race safety, and budget-free cleanup,
+   mirroring the topic broker adoption.
+
+This is a coherent multi-part design, not a one-PR narrow slice, so no code is
+changed in this slice. `SharedEnvelope<T>` remains a primitive/foundation: it is
+verified across a real `Send`/thread boundary but is **not** production-adopted
+(the topic broker uses `EscrowSlot` directly; shared channels still carry plain
+`PData`).
 
 ### How to release, drop, drain, or abort
 
