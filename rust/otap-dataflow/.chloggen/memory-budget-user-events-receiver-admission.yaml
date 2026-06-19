@@ -1,0 +1,7 @@
+change_type: enhancement
+
+component: pipeline
+
+note: "Wire runtime-budget receiver admission into the contrib `user_events_receiver` (Linux), extending its existing process-pressure shed contract the same way as the syslog CEF receiver. The receiver runs on the pinned pipeline thread, so it reads `current_runtime_memory_budget()` directly; each of its three existing shed points (per-record drain before decode, the `DrainIngress` final-batch flush, and the periodic flush) now evaluates the combined admission decision via a single `admission_should_shed` helper (`LocalReceiverAdmissionState::evaluate(...).is_reject()`). Runtime-budget `Hard` additionally sheds only in enforce mode with `enforcement.receiver_admission` enabled; process `Hard` still sheds with precedence; observe-only mode and a disabled gate never drop (shadow only); `Soft` is advisory. Shedding drops already-drained userspace records before decode (the kernel perf ring is untouched), acquires no budget, retains no payload, and reuses the existing `dropped_memory_pressure` counter. `receiver_admission` remains accepted only under the off-by-default `unstable-memory-enforcement` feature (rejected in default builds). Receiver admission is now wired for syslog CEF (local), OTLP HTTP, OTLP gRPC, OTAP gRPC (shared), and `user_events` (contrib, local); the remaining local/internal receivers still consult process pressure only."
+
+issues: [3272]

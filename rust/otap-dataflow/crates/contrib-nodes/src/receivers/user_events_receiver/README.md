@@ -488,7 +488,7 @@ bounded by a specific config field. This diagram shows where the `drain.*`,
   +---------------------+      ok      -> forwarded_samples += n, flushed_batches++
   | downstream channel  |      full    -> receiver task waits for capacity
   |                     |      waiting -> downstream_send_blocked_ns += elapsed
-  +---------------------+      memory pressure (should_shed_ingress):
+  +---------------------+      memory pressure (admission_should_shed):
                                      records    -> dropped_memory_pressure++
                                      buffered batch on ctrl event -> drop_batch
 ```
@@ -523,8 +523,14 @@ TODO: Plumb corrupt perf event and corrupt perf buffer counters once
 
 ### Memory Pressure
 
-When process-wide memory pressure indicates ingress shedding, the receiver
-drops buffered batches rather than blocking on downstream flush.
+When memory pressure indicates ingress shedding, the receiver drops drained
+records before decode and drops buffered batches rather than blocking on
+downstream flush. The shed decision combines process-wide pressure with the
+per-runtime memory budget: process `Hard` sheds as before, and runtime-budget
+`Hard` additionally sheds only in enforce mode with the `receiver_admission`
+gate enabled (the off-by-default `unstable-memory-enforcement` build).
+Observe-only or a disabled gate never drops on runtime-budget pressure. Shed
+records and batches are counted by `dropped_memory_pressure`.
 
 ### Late Registration
 

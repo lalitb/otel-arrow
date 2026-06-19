@@ -19,6 +19,7 @@ use linkme::distributed_slice;
 use otap_df_config::node::NodeUserConfig;
 use otap_df_engine::config::ReceiverConfig;
 use otap_df_engine::context::PipelineContext;
+use otap_df_engine::memory_budget::{RuntimeMemoryBudget, current_runtime_memory_budget};
 use otap_df_engine::memory_limiter::LocalReceiverAdmissionState;
 use otap_df_engine::node::NodeId;
 use otap_df_engine::receiver::ReceiverWrapper;
@@ -419,10 +420,35 @@ async fn flush_batch(
     Ok(())
 }
 
+/// Combined receiver-admission shed decision for the user_events receiver.
+///
+/// The process-pressure component is read locally from `admission_state` (the
+/// Phase 1 snapshot, refreshed by `MemoryPressureChanged` control messages); the
+/// runtime memory-budget level is read live from the pinned pipeline thread's
+/// budget handle (`None` when no budget is installed). `runtime_budget_enforce`
+/// is the precomputed runtime-budget admission gate (true only under the
+/// `unstable-memory-enforcement` build + enforce mode + `receiver_admission`).
+/// With `None`/`false` the result equals the prior `should_shed_ingress()`
+/// check, so existing process-only shedding is preserved. Shedding drops
+/// already-drained records before decode/retain; the kernel ring is unaffected.
+#[must_use]
+fn admission_should_shed(
+    admission_state: &LocalReceiverAdmissionState,
+    runtime_budget: Option<&Rc<RuntimeMemoryBudget>>,
+    runtime_budget_enforce: bool,
+) -> bool {
+    let runtime_budget_level = runtime_budget.map(|budget| budget.level());
+    admission_state
+        .evaluate(runtime_budget_level, runtime_budget_enforce)
+        .is_reject()
+}
+
 async fn process_drained_records(
     effect_handler: &local::EffectHandler<OtapPdata>,
     subscriptions: &[SubscriptionConfig],
     admission_state: &LocalReceiverAdmissionState,
+    runtime_budget: Option<&Rc<RuntimeMemoryBudget>>,
+    runtime_budget_enforce: bool,
     metrics: &Rc<RefCell<MetricSet<UserEventsReceiverMetrics>>>,
     builder: &mut ArrowRecordsBuilder,
     drained_records: &mut Vec<RawUserEventsRecord>,
@@ -435,7 +461,7 @@ async fn process_drained_records(
 
     let mut drained = drained_records.drain(..);
     while let Some(raw) = drained.next() {
-        if admission_state.should_shed_ingress() {
+        if admission_should_shed(admission_state, runtime_budget, runtime_budget_enforce) {
             dropped_memory_pressure = dropped_memory_pressure.saturating_add(1);
             continue;
         }
@@ -538,6 +564,17 @@ impl local::Receiver<OtapPdata> for UserEventsReceiver {
             message = "Linux user_events receiver started"
         );
 
+        // Receiver admission runs on the pinned pipeline thread, so the runtime
+        // memory budget can be read directly (Rc, never sent across threads).
+        // The handle is fetched once; its level is re-read per shed check so
+        // live pressure changes are observed. The enforcement gate is
+        // config-constant. With no budget installed, admission stays
+        // process-pressure only, preserving existing behavior.
+        let runtime_budget = current_runtime_memory_budget();
+        let runtime_budget_enforce = runtime_budget
+            .as_ref()
+            .is_some_and(|budget| budget.receiver_admission_active());
+
         loop {
             tokio::select! {
                 // Control traffic is expected to be occasional, not per-drain
@@ -572,6 +609,8 @@ impl local::Receiver<OtapPdata> for UserEventsReceiver {
                                         &effect_handler,
                                         &self.subscriptions,
                                         &self.admission_state,
+                                        runtime_budget.as_ref(),
+                                        runtime_budget_enforce,
                                         &self.metrics,
                                         &mut builder,
                                         &mut drained_records,
@@ -581,7 +620,11 @@ impl local::Receiver<OtapPdata> for UserEventsReceiver {
                                     .await?;
                                 }
                             }
-                            if self.admission_state.should_shed_ingress() {
+                            if admission_should_shed(
+                                &self.admission_state,
+                                runtime_budget.as_ref(),
+                                runtime_budget_enforce,
+                            ) {
                                 drop_batch(&self.metrics, &mut builder);
                             } else {
                                 flush_batch(&effect_handler, &self.metrics, &mut builder).await?;
@@ -601,7 +644,11 @@ impl local::Receiver<OtapPdata> for UserEventsReceiver {
                 }
 
                 _ = flush_interval.tick() => {
-                    if self.admission_state.should_shed_ingress() {
+                    if admission_should_shed(
+                        &self.admission_state,
+                        runtime_budget.as_ref(),
+                        runtime_budget_enforce,
+                    ) {
                         drop_batch(&self.metrics, &mut builder);
                     } else {
                         flush_batch(&effect_handler, &self.metrics, &mut builder).await?;
@@ -671,6 +718,8 @@ impl local::Receiver<OtapPdata> for UserEventsReceiver {
                         &effect_handler,
                         &self.subscriptions,
                         &self.admission_state,
+                        runtime_budget.as_ref(),
+                        runtime_budget_enforce,
                         &self.metrics,
                         &mut builder,
                         &mut drained_records,
@@ -1047,6 +1096,10 @@ mod config_tests {
     use otap_df_config::SignalType;
     use otap_df_engine::control::runtime_ctrl_msg_channel;
     use otap_df_engine::local::message::LocalSender;
+    use otap_df_engine::memory_budget::{
+        BudgetLevel, BudgetMode, BudgetScopeId, LocalMemoryTicket, MemoryBudgetEnforcement,
+        MemoryBudgetSizing, MemoryBudgetState, RetainedSiteKind, RuntimeMemoryBudgetConfig,
+    };
     use otap_df_engine::memory_limiter::{
         MemoryPressureChanged, MemoryPressureLevel, MemoryPressureState,
     };
@@ -1132,6 +1185,210 @@ mod config_tests {
         state
     }
 
+    /// Builds a runtime memory budget (`Rc`, pinned-thread local) at `target`
+    /// pressure with the given mode and `receiver_admission` gate. Returns the
+    /// keep-alive state/ticket the caller must hold for the test (dropping the
+    /// account resets pressure to a safe `Normal` default). A plain charge
+    /// cannot exceed the authorized ceiling under enforce mode, so `Hard` is
+    /// reached by reconciling a small charge up to a post-hoc overdraw.
+    fn runtime_budget_at(
+        mode: BudgetMode,
+        receiver_admission: bool,
+        target: BudgetLevel,
+    ) -> (
+        MemoryBudgetState,
+        Rc<RuntimeMemoryBudget>,
+        Option<LocalMemoryTicket>,
+    ) {
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 1,
+                    lease_step_bytes: 1,
+                    max_overshoot_per_runtime_bytes: 10,
+                    overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: 100,
+                runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement {
+                    receiver_admission,
+                    queue_publish: false,
+                    reclaim_hooks: false,
+                },
+            },
+            None,
+        );
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let account = handle.local_account().expect("account should be available");
+        let budget = Rc::new(RuntimeMemoryBudget::new(account));
+        let ticket = match target {
+            BudgetLevel::Normal => None,
+            BudgetLevel::Soft => Some(
+                budget
+                    .charge_at(RetainedSiteKind::Unknown, 5_u64)
+                    .expect("soft charge fits within overshoot"),
+            ),
+            BudgetLevel::Hard => {
+                let mut ticket = budget
+                    .charge_at(RetainedSiteKind::Unknown, 1_u64)
+                    .expect("initial charge fits within floor");
+                ticket.reconcile_size(10_000_000);
+                Some(ticket)
+            }
+        };
+        assert_eq!(
+            budget.level(),
+            target,
+            "runtime budget must reach target level"
+        );
+        (state, budget, ticket)
+    }
+
+    #[test]
+    fn admission_should_shed_decision_matrix() {
+        // No runtime budget installed, process Normal -> admit (prior behavior).
+        assert!(!admission_should_shed(
+            &normal_admission_state(),
+            None,
+            false
+        ));
+        // No runtime budget installed, process Hard + enforce -> shed.
+        assert!(admission_should_shed(&hard_admission_state(), None, false));
+
+        let (_s_hard, hard, _t_hard) =
+            runtime_budget_at(BudgetMode::Enforce, true, BudgetLevel::Hard);
+        // Runtime Hard with the enforcement gate active -> shed.
+        assert!(admission_should_shed(
+            &normal_admission_state(),
+            Some(&hard),
+            true
+        ));
+        // Runtime Hard but the gate is disabled -> shadow only, no shed.
+        assert!(!admission_should_shed(
+            &normal_admission_state(),
+            Some(&hard),
+            false
+        ));
+
+        let (_s_obs, hard_obs, _t_obs) =
+            runtime_budget_at(BudgetMode::ObserveOnly, true, BudgetLevel::Hard);
+        // Observe-only mode never activates the gate -> no shed.
+        let obs_enforce = hard_obs.receiver_admission_active();
+        assert!(!obs_enforce);
+        assert!(!admission_should_shed(
+            &normal_admission_state(),
+            Some(&hard_obs),
+            obs_enforce
+        ));
+
+        let (_s_soft, soft, _t_soft) =
+            runtime_budget_at(BudgetMode::Enforce, true, BudgetLevel::Soft);
+        // Runtime Soft only advises; it admits even with the gate active.
+        assert!(!admission_should_shed(
+            &normal_admission_state(),
+            Some(&soft),
+            true
+        ));
+
+        let (_s_norm, normal_budget, _t_norm) =
+            runtime_budget_at(BudgetMode::Enforce, true, BudgetLevel::Normal);
+        // Process Hard + enforce wins even when the runtime budget is Normal.
+        assert!(admission_should_shed(
+            &hard_admission_state(),
+            Some(&normal_budget),
+            true
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_drained_records_drops_records_under_runtime_budget_hard_enforced() {
+        let (effect_handler, _rx) = test_effect_handler(4, false);
+        let subscriptions = vec![test_subscription()];
+        // Process pressure stays Normal; only the enforced runtime budget at Hard
+        // drives the shed.
+        let admission_state = normal_admission_state();
+        let (_state, budget, _ticket) =
+            runtime_budget_at(BudgetMode::Enforce, true, BudgetLevel::Hard);
+        let runtime_budget_enforce = budget.receiver_admission_active();
+        assert!(runtime_budget_enforce);
+        let metrics = test_metrics();
+        let mut builder = ArrowRecordsBuilder::new();
+        let mut drained_records = vec![test_raw_record(0), test_raw_record(0)];
+        let drain_stats = SessionDrainStats {
+            received_samples: 2,
+            ..Default::default()
+        };
+
+        process_drained_records(
+            &effect_handler,
+            &subscriptions,
+            &admission_state,
+            Some(&budget),
+            runtime_budget_enforce,
+            &metrics,
+            &mut builder,
+            &mut drained_records,
+            drain_stats,
+            &test_batch_config(10),
+        )
+        .await
+        .expect("drained records processed");
+
+        let metrics = metrics.borrow();
+        assert!(builder.is_empty(), "records must be shed before decode");
+        assert!(drained_records.is_empty());
+        assert_eq!(metrics.received_samples.get(), 2);
+        assert_eq!(metrics.dropped_memory_pressure.get(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_drained_records_admits_records_under_runtime_budget_observe_only() {
+        let (effect_handler, _rx) = test_effect_handler(4, false);
+        let subscriptions = vec![test_subscription()];
+        let admission_state = normal_admission_state();
+        // Hard runtime pressure but observe-only mode -> gate inactive -> shadow.
+        let (_state, budget, _ticket) =
+            runtime_budget_at(BudgetMode::ObserveOnly, true, BudgetLevel::Hard);
+        let runtime_budget_enforce = budget.receiver_admission_active();
+        assert!(!runtime_budget_enforce);
+        let metrics = test_metrics();
+        let mut builder = ArrowRecordsBuilder::new();
+        let mut drained_records = vec![test_raw_record(0), test_raw_record(0)];
+        let drain_stats = SessionDrainStats {
+            received_samples: 2,
+            ..Default::default()
+        };
+
+        process_drained_records(
+            &effect_handler,
+            &subscriptions,
+            &admission_state,
+            Some(&budget),
+            runtime_budget_enforce,
+            &metrics,
+            &mut builder,
+            &mut drained_records,
+            drain_stats,
+            &test_batch_config(10),
+        )
+        .await
+        .expect("drained records processed");
+
+        let metrics = metrics.borrow();
+        assert_eq!(
+            metrics.dropped_memory_pressure.get(),
+            0,
+            "observe-only runtime pressure must not shed"
+        );
+        assert_eq!(builder.len(), 2, "records must be decoded and buffered");
+        assert!(drained_records.is_empty());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn process_drained_records_drops_records_under_memory_pressure() {
         let (effect_handler, _rx) = test_effect_handler(4, false);
@@ -1151,6 +1408,8 @@ mod config_tests {
             &effect_handler,
             &subscriptions,
             &admission_state,
+            None,
+            false,
             &metrics,
             &mut builder,
             &mut drained_records,
@@ -1261,6 +1520,8 @@ mod config_tests {
             &effect_handler,
             &subscriptions,
             &admission_state,
+            None,
+            false,
             &metrics,
             &mut builder,
             &mut drained_records,
@@ -1297,6 +1558,8 @@ mod config_tests {
             &effect_handler,
             &subscriptions,
             &admission_state,
+            None,
+            false,
             &metrics,
             &mut builder,
             &mut drained_records,
@@ -1336,6 +1599,8 @@ mod config_tests {
             &effect_handler,
             &subscriptions,
             &admission_state,
+            None,
+            false,
             &metrics,
             &mut builder,
             &mut drained_records,

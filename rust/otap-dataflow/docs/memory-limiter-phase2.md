@@ -1424,24 +1424,70 @@ a few local `Cell` reads with no atomics, no allocation, and no budget
 acquisition. When no runtime budget is installed the receiver behaves exactly as
 the Phase 1 process-only path.
 
+#### Wired receiver: user_events (contrib)
+
+The Linux `user_events_receiver` (contrib) is a local receiver running on the
+pinned pipeline thread. It already shed ingress under process `Hard` pressure as
+its documented memory-pressure behavior (drop drained records / drop the buffered
+batch, counted by `dropped_memory_pressure`). This slice extends each of its
+three existing shed points to the combined admission primitive, exactly like
+syslog CEF:
+
+- It captures `current_runtime_memory_budget()` once at `start` and computes the
+  enforcement gate once; each shed check re-reads the budget `level()` so live
+  pressure changes are observed.
+- The per-record drain check (before decode/retain), the `DrainIngress`
+  final-batch check, and the periodic flush check now call one
+  `admission_should_shed(admission_state, runtime_budget, enforce)` helper that
+  returns `evaluate(runtime_level, enforce).is_reject()`. With no budget installed
+  (or the gate `false`) this is byte-for-byte the previous `should_shed_ingress()`
+  behavior, so existing process-pressure behavior and tests are unchanged.
+- Runtime-budget `Hard` additionally sheds **only** under enforce mode with
+  `enforcement.receiver_admission` enabled; observe-only and gate-disabled runtime
+  `Hard` are shadow decisions that drop nothing. `Soft` never sheds, and process
+  `Hard` keeps precedence.
+- Shedding drops already-drained userspace records before decode; the kernel perf
+  ring is untouched, the shed path acquires no budget, and the existing
+  `dropped_memory_pressure` counter is reused (no new high-cardinality labels).
+
 #### Receiver audit (first-wiring candidates)
 
 <!-- markdownlint-disable MD013 -->
 | Receiver | Trait | Reaches runtime budget? | Shed behavior today | Retry-after | Shed test | First-target risk |
 | --- | --- | --- | --- | --- | --- | --- |
-| `syslog_cef_receiver` | local | Yes (pipeline thread) | Drop UDP / close TCP conn, drop buffered batch | No | Yes (`udp_sheds_ingress_under_hard_memory_pressure`) | low |
-| `user_events_receiver` (contrib) | local | Yes (pipeline thread) | Drop drained records/batch | No | Yes (`process_drained_records_drops_records_under_memory_pressure`) | low |
-| `otlp_receiver` | shared | No (gRPC/HTTP handler threads) | HTTP 503 + `Retry-After`; gRPC `ResourceExhausted` + pushback | Yes | Yes (OTLP/OTAP stack) | high |
-| `otap_receiver` | shared | No (gRPC handler threads) | Stream `BatchStatus { ResourceExhausted }` + pushback | Yes | Yes | high |
-| `host_metrics`, `journald`, `internal_telemetry`, `topic`, `etw` | local | Yes | No admission today | n/a | No | medium (new admission point) |
-| `traffic_generator` | local | Yes | Generates/yields; no shedding | n/a | No | low (test/source receiver) |
+| `syslog_cef_receiver` | local | Yes (pipeline thread) | Drop UDP / close TCP conn, drop buffered batch | No | Yes (`udp_sheds_ingress_under_hard_memory_pressure`) | wired |
+| `user_events_receiver` (contrib) | local | Yes (pipeline thread) | Drop drained records/batch | No | Yes (`process_drained_records_drops_records_under_runtime_budget_hard_enforced`) | wired |
+| `otlp_receiver` | shared | No (gRPC/HTTP handler threads) | HTTP 503 + `Retry-After`; gRPC `ResourceExhausted` + pushback | Yes | Yes (OTLP/OTAP stack) | wired |
+| `otap_receiver` | shared | No (gRPC handler threads) | Stream `BatchStatus { ResourceExhausted }` + pushback | Yes | Yes | wired |
+| `host_metrics`, `internal_telemetry` | local | Yes | Poll/collect; no shed today | n/a | No | not safe (loses real observations) |
+| `journald`, `etw` (contrib) | local | Yes | Read OS event source; no shed today | n/a | No | not safe (event/buffer loss) |
+| `topic_receiver` | local | Yes | Internal topic consume; no shed today | n/a | No | needs shared-ownership track |
+| `traffic_generator` | local | Yes | Generates synthetic load; no shed today | n/a | No | safe but low value, deferred |
 
 <!-- markdownlint-enable MD013 -->
 
-The smallest clearly-safe first **local** wiring target was `syslog_cef_receiver`
-(wired, see above): a local receiver running on the pinned pipeline thread, so it
-reads `current_runtime_memory_budget()` directly. `user_events_receiver` is an
-equivalent contrib-side local candidate that remains future.
+`syslog_cef_receiver` (local) and `user_events_receiver` (contrib, local) are
+both wired: each runs on the pinned pipeline thread and reads
+`current_runtime_memory_budget()` directly, and each already had a documented
+process-pressure shed contract that Phase 2 extends with the runtime-budget
+source. The shared receivers (`otlp_receiver`, `otap_receiver`) are wired via the
+shared-pressure snapshot described below.
+
+The remaining receivers are intentionally **not** wired and need dedicated,
+per-receiver designs before they could shed safely:
+
+- `host_metrics` and `internal_telemetry` are pollers: dropping a scrape/collect
+  loses a real observation (and internal telemetry exactly when it is most needed
+  under pressure), so silent shedding is not acceptable.
+- `journald` and the contrib `etw_receiver` read external OS event sources;
+  pausing reads risks journal rotation / buffer loss and needs cursor- or
+  checkpoint-aware backpressure rather than a drop.
+- `topic_receiver` consumes an internal pipeline topic, not external ingress;
+  shedding there belongs to shared-channel/`SharedEnvelope<T>` ownership, a
+  separate track.
+- `traffic_generator` only emits synthetic load; pausing generation is safe but
+  low value, and is deferred so receiver-admission coverage is not implied to
+  span real ingress.
 
 #### Shared runtime-pressure snapshot and the OTLP HTTP receiver
 
@@ -1514,12 +1560,15 @@ track.
 **Status:** the admission primitive is implemented and unit-tested and is wired
 end to end for **(1)** the syslog CEF local receiver, **(2)** the OTLP HTTP
 shared receiver, **(3)** the OTLP gRPC shared receiver (via `MemoryPressureLayer`),
-and **(4)** the OTAP gRPC shared receiver (its stream-admission path).
+**(4)** the OTAP gRPC shared receiver (its stream-admission path), and **(5)** the
+contrib `user_events_receiver` (local).
 `enforcement.receiver_admission` is accepted at config validation **only** under
 the `unstable-memory-enforcement` build feature (rejected in default/production
 builds), exactly like `queue_publish` and `reclaim_hooks`. Other receivers (the
-remaining local/internal receivers) still consult process pressure only; their
-runtime-budget admission remains future work.
+remaining local/internal receivers: `host_metrics`, `internal_telemetry`,
+`journald`, `topic_receiver`, and the contrib `etw_receiver`, plus the synthetic
+`traffic_generator`) still consult process pressure only; their runtime-budget
+admission remains future work and needs the per-receiver designs noted above.
 
 ## NUMA Placement Appendix
 
@@ -1626,13 +1675,14 @@ Validation:
   - `enforcement.receiver_admission` gates runtime-budget receiver shedding,
     currently wired for the **syslog CEF receiver** (local), the **OTLP HTTP
     receiver** (shared), the **OTLP gRPC receiver** (shared, via its
-    `MemoryPressureLayer`), and the **OTAP gRPC receiver** (shared, via its
-    stream-admission path): with `mode = enforce` and `receiver_admission: true`,
-    those receivers shed ingress when the runtime budget is at `Hard` pressure
-    (in addition to the existing process-`Hard` shedding). It is rejected in
-    default builds and accepted only with the `unstable-memory-enforcement`
-    feature. Observe-only mode and a disabled gate never drop on runtime-budget
-    pressure, and the remaining receivers still consult process pressure only.
+    `MemoryPressureLayer`), the **OTAP gRPC receiver** (shared, via its
+    stream-admission path), and the contrib **`user_events_receiver`** (local):
+    with `mode = enforce` and `receiver_admission: true`, those receivers shed
+    ingress when the runtime budget is at `Hard` pressure (in addition to the
+    existing process-`Hard` shedding). It is rejected in default builds and
+    accepted only with the `unstable-memory-enforcement` feature. Observe-only
+    mode and a disabled gate never drop on runtime-budget pressure, and the
+    remaining receivers still consult process pressure only.
 - The wired `enforcement.queue_publish` path works at the owned topic-publish
   boundary: with `mode = enforce` and `queue_publish: true`, an owned publish
   whose payload exceeds the topic/per-boundary escrow bucket cap or the global
