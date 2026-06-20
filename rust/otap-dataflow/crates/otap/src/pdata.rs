@@ -21,6 +21,7 @@ use otap_df_config::PortName;
 use otap_df_config::{SignalFormat, SignalType};
 use otap_df_engine::control::{AckMsg, CallData, Frame, NackMsg, RouteData, nanos_since_birth};
 use otap_df_engine::error::{Error, TypedError};
+use otap_df_engine::memory_budget::{ChargedSize, EscrowSlot, SharedEscrowMinter};
 use otap_df_engine::processor::{FlowMetricEffectHandler, FlowMetricHook};
 use otap_df_engine::{
     ConsumerEffectHandlerExtension, FlowMetricAccumulation, Interests,
@@ -446,7 +447,7 @@ impl otap_df_engine::StampOutputPort for OtapPdata {
     }
 }
 
-impl otap_df_engine::memory_budget::ChargedSize for OtapPdata {
+impl ChargedSize for OtapPdata {
     fn charged_size(&self) -> Option<u64> {
         self.payload_ref()
             .num_bytes()
@@ -498,10 +499,21 @@ impl OtapPdata {
 }
 
 /// Context + container for telemetry data
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct OtapPdata {
     context: Context,
     payload: OtapPayload,
+    shared_escrow_owner: EscrowSlot,
+}
+
+impl Clone for OtapPdata {
+    fn clone(&self) -> Self {
+        Self {
+            context: self.context.clone(),
+            payload: self.payload.clone(),
+            shared_escrow_owner: EscrowSlot::empty(),
+        }
+    }
 }
 
 /* -------- Signal type -------- */
@@ -515,6 +527,7 @@ impl OtapPdata {
         Self {
             context: Context::default(),
             payload,
+            shared_escrow_owner: EscrowSlot::empty(),
         }
     }
 
@@ -525,13 +538,18 @@ impl OtapPdata {
         Self {
             context: Context::default(),
             payload,
+            shared_escrow_owner: EscrowSlot::empty(),
         }
     }
 
     /// Construct new OtapData with context and payload
     #[must_use]
     pub const fn new(context: Context, payload: OtapPayload) -> Self {
-        Self { context, payload }
+        Self {
+            context,
+            payload,
+            shared_escrow_owner: EscrowSlot::empty(),
+        }
     }
 
     /// Returns the type of signal represented by this `OtapPdata` instance.
@@ -593,6 +611,7 @@ impl OtapPdata {
                 flow_compute_ns: None,
             },
             payload: self.payload.clone(),
+            shared_escrow_owner: EscrowSlot::empty(),
         }
     }
 
@@ -600,6 +619,33 @@ impl OtapPdata {
     #[must_use]
     pub fn into_parts(self) -> (Context, OtapPayload) {
         (self.context, self.payload)
+    }
+
+    /// Attaches shared-boundary escrow ownership when this pdata is retained by
+    /// a shared receiver output channel.
+    ///
+    /// This stores only a sendable [`EscrowSlot`], never a runtime-local
+    /// ticket. Clones intentionally do not copy the owner, preserving the
+    /// one-owner invariant.
+    pub fn attach_shared_escrow_owner(&mut self, minter: &SharedEscrowMinter) {
+        if self.shared_escrow_owner.is_some() {
+            return;
+        }
+        if let Some(ticket) = minter.mint(&*self) {
+            self.shared_escrow_owner = EscrowSlot::new(ticket);
+        }
+    }
+
+    /// Returns whether this pdata currently owns shared-boundary escrow.
+    #[must_use]
+    pub fn has_shared_escrow_owner(&self) -> bool {
+        self.shared_escrow_owner.is_some()
+    }
+
+    /// Returns the shared-boundary escrow bytes owned by this pdata, if any.
+    #[must_use]
+    pub fn shared_escrow_owner_bytes(&self) -> Option<u64> {
+        self.shared_escrow_owner.bytes()
     }
 
     /// Returns a mutable reference to the context.
@@ -959,13 +1005,65 @@ impl_message_source_ext!(
     processor_id,
     with_hook
 );
-impl_message_source_ext!(
-    async_trait,
-    MessageSourceSharedEffectHandlerExtension,
-    otap_df_engine::shared::receiver::EffectHandler<OtapPdata>,
-    receiver_id,
-    no_hook
-);
+
+#[async_trait]
+impl MessageSourceSharedEffectHandlerExtension<OtapPdata>
+    for otap_df_engine::shared::receiver::EffectHandler<OtapPdata>
+{
+    async fn send_message_with_source_node(
+        &self,
+        mut data: OtapPdata,
+    ) -> Result<(), TypedError<OtapPdata>> {
+        data.prepare_source_send(self.node_interests(), self.receiver_id().index);
+        if let Some(minter) = self.default_shared_escrow_minter() {
+            data.attach_shared_escrow_owner(minter);
+        }
+        self.router.send_default_stamped(data).await
+    }
+
+    fn try_send_message_with_source_node(
+        &self,
+        mut data: OtapPdata,
+    ) -> Result<(), TypedError<OtapPdata>> {
+        data.prepare_source_send(self.node_interests(), self.receiver_id().index);
+        if let Some(minter) = self.default_shared_escrow_minter() {
+            data.attach_shared_escrow_owner(minter);
+        }
+        self.router.try_send_default_stamped(data)
+    }
+
+    async fn send_message_with_source_node_to<P>(
+        &self,
+        port: P,
+        mut data: OtapPdata,
+    ) -> Result<(), TypedError<OtapPdata>>
+    where
+        P: Into<PortName> + Send + 'static,
+    {
+        let port = port.into();
+        data.prepare_source_send(self.node_interests(), self.receiver_id().index);
+        if let Some(minter) = self.shared_escrow_minter_for_port(port.clone()) {
+            data.attach_shared_escrow_owner(minter);
+        }
+        self.router.send_to_stamped(port, data).await
+    }
+
+    fn try_send_message_with_source_node_to<P>(
+        &self,
+        port: P,
+        mut data: OtapPdata,
+    ) -> Result<(), TypedError<OtapPdata>>
+    where
+        P: Into<PortName> + Send + 'static,
+    {
+        let port = port.into();
+        data.prepare_source_send(self.node_interests(), self.receiver_id().index);
+        if let Some(minter) = self.shared_escrow_minter_for_port(port.clone()) {
+            data.attach_shared_escrow_owner(minter);
+        }
+        self.router.try_send_to_stamped(port, data)
+    }
+}
 
 /* -------- ReceivedAtNode implementation -------- */
 
@@ -992,6 +1090,10 @@ mod test {
     use otap_df_engine::local::message::LocalSender;
     use otap_df_engine::local::processor::EffectHandler as LocalProcessorEffectHandler;
     use otap_df_engine::local::receiver::EffectHandler as LocalReceiverEffectHandler;
+    use otap_df_engine::memory_budget::{
+        BudgetMode, BudgetScopeId, MemoryBudgetEnforcement, MemoryBudgetSizing, MemoryBudgetState,
+        RuntimeMemoryBudgetConfig,
+    };
     use otap_df_engine::message::Sender;
     use otap_df_engine::node::NodeId;
     use otap_df_engine::shared::exporter::EffectHandler as SharedExporterEffectHandler;
@@ -1002,10 +1104,38 @@ mod test {
     use pretty_assertions::assert_eq;
     use std::cell::Cell;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use tokio::sync::mpsc;
 
     fn create_test() -> (TestCallData, OtapPdata) {
         (TestCallData::default(), create_test_pdata())
+    }
+
+    fn configure_shared_receiver_escrow() -> MemoryBudgetState {
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 1,
+                    lease_step_bytes: 1,
+                    max_overshoot_per_runtime_bytes: 1,
+                    overshoot_debt_limit_bytes: 0,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: 1,
+                runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement {
+                    receiver_admission: false,
+                    queue_publish: false,
+                    reclaim_hooks: false,
+                },
+            },
+            Some(1_000_000),
+        );
+        state
     }
 
     struct FakeFlowMetricHandler {
@@ -1163,6 +1293,119 @@ mod test {
 
         let sent = rx.recv().await.expect("message received");
         assert_eq!(sent.get_source_node(), Some(10));
+    }
+
+    #[test]
+    fn shared_escrow_owner_is_not_cloned() {
+        let state = configure_shared_receiver_escrow();
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let minter = handle.shared_escrow_minter(Arc::<str>::from("receiver:clone"));
+        let mut pdata = create_test_pdata();
+        let bytes = pdata.charged_size().expect("known test size");
+
+        pdata.attach_shared_escrow_owner(&minter);
+        assert_eq!(pdata.shared_escrow_owner_bytes(), Some(bytes));
+        assert_eq!(state.snapshot().escrow_charged_bytes, bytes);
+
+        let cloned = pdata.clone();
+        assert!(!cloned.has_shared_escrow_owner());
+        drop(cloned);
+        assert_eq!(state.snapshot().escrow_charged_bytes, bytes);
+
+        drop(pdata);
+        assert_eq!(state.snapshot().escrow_charged_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn shared_receiver_send_attaches_escrow_until_queue_exit() {
+        let state = configure_shared_receiver_escrow();
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let minter = handle.shared_escrow_minter(Arc::<str>::from("receiver:out"));
+
+        let (tx, mut rx) = mpsc::channel::<OtapPdata>(4);
+        let mut senders = HashMap::new();
+        let _ = senders.insert("out".into(), SharedSender::mpsc(tx));
+
+        let (ctrl_tx, _ctrl_rx) = runtime_ctrl_msg_channel(4);
+        let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
+        let mut handler = SharedReceiverEffectHandler::new(
+            NodeId {
+                index: 10,
+                name: "recv_node".into(),
+            },
+            senders,
+            Some("out".into()),
+            ctrl_tx,
+            metrics_reporter,
+        );
+        let mut minters = HashMap::new();
+        let _ = minters.insert("out".into(), minter);
+        handler.set_shared_escrow_minters(minters);
+
+        let pdata = create_test_pdata();
+        let bytes = pdata.charged_size().expect("known test size");
+        handler
+            .send_message_with_source_node(pdata)
+            .await
+            .expect("send ok");
+
+        assert_eq!(state.snapshot().escrow_charged_bytes, bytes);
+        let sent = rx.recv().await.expect("message received");
+        assert_eq!(sent.shared_escrow_owner_bytes(), Some(bytes));
+        drop(sent);
+        assert_eq!(state.snapshot().escrow_charged_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn shared_receiver_failed_try_send_returns_escrow_owner() {
+        let state = configure_shared_receiver_escrow();
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let minter = handle.shared_escrow_minter(Arc::<str>::from("receiver:full"));
+
+        let (tx, mut rx) = mpsc::channel::<OtapPdata>(1);
+        let mut senders = HashMap::new();
+        let _ = senders.insert("out".into(), SharedSender::mpsc(tx));
+
+        let (ctrl_tx, _ctrl_rx) = runtime_ctrl_msg_channel(4);
+        let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
+        let mut handler = SharedReceiverEffectHandler::new(
+            NodeId {
+                index: 10,
+                name: "recv_node".into(),
+            },
+            senders,
+            Some("out".into()),
+            ctrl_tx,
+            metrics_reporter,
+        );
+        let mut minters = HashMap::new();
+        let _ = minters.insert("out".into(), minter);
+        handler.set_shared_escrow_minters(minters);
+
+        let first = create_test_pdata();
+        let bytes = first.charged_size().expect("known test size");
+        handler
+            .try_send_message_with_source_node(first)
+            .expect("first send fills queue");
+        assert_eq!(state.snapshot().escrow_charged_bytes, bytes);
+
+        let err = handler
+            .try_send_message_with_source_node(create_test_pdata())
+            .expect_err("second send must fail while queue is full");
+        let returned = match err {
+            TypedError::ChannelSendError(otap_df_channel::error::SendError::Full(data)) => data,
+            other => panic!("unexpected send error: {other:?}"),
+        };
+        assert_eq!(returned.shared_escrow_owner_bytes(), Some(bytes));
+        assert_eq!(
+            state.snapshot().escrow_charged_bytes,
+            bytes.saturating_mul(2)
+        );
+
+        drop(returned);
+        assert_eq!(state.snapshot().escrow_charged_bytes, bytes);
+        drop(rx.try_recv().expect("queued message"));
+        assert_eq!(state.snapshot().escrow_charged_bytes, 0);
     }
 
     #[tokio::test]

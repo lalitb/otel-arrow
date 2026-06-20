@@ -2648,7 +2648,7 @@ impl EscrowSlot {
     /// Creates an empty slot that owns nothing (the budget-disabled or
     /// uncharged case).
     #[must_use]
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self { ticket: None }
     }
 

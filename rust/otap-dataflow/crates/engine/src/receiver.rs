@@ -20,6 +20,7 @@ use crate::entity_context::NodeTelemetryGuard;
 use crate::error::{Error, ReceiverErrorKind};
 use crate::local::message::{LocalReceiver, LocalSender};
 use crate::local::receiver as local;
+use crate::memory_budget::SharedEscrowMinter;
 use crate::message::{Receiver, Sender};
 use crate::node::{Node, NodeId, NodeWithPDataSender};
 use crate::shared::message::{SharedReceiver, SharedSender};
@@ -83,6 +84,8 @@ pub enum ReceiverWrapper<PData> {
         /// Senders for PData messages per output port.
         /// Uses `SharedSender` to keep the shared receiver `Send` for multi-threaded execution.
         pdata_senders: HashMap<PortName, SharedSender<PData>>,
+        /// Shared-boundary escrow minters per output port.
+        shared_escrow_minters: HashMap<PortName, SharedEscrowMinter>,
         /// A receiver for pdata messages.
         pdata_receiver: Option<SharedReceiver<PData>>,
         /// Telemetry guard for node lifecycle cleanup.
@@ -157,6 +160,7 @@ impl<PData> ReceiverWrapper<PData> {
             control_sender: SharedSender::mpsc(control_sender),
             control_receiver: SharedReceiver::mpsc(control_receiver),
             pdata_senders: HashMap::new(),
+            shared_escrow_minters: HashMap::new(),
             pdata_receiver: None,
             telemetry: None,
             source_tag: SourceTagging::Disabled,
@@ -199,6 +203,7 @@ impl<PData> ReceiverWrapper<PData> {
                 control_sender,
                 control_receiver,
                 pdata_senders,
+                shared_escrow_minters,
                 pdata_receiver,
                 source_tag,
                 capture_policy,
@@ -211,6 +216,7 @@ impl<PData> ReceiverWrapper<PData> {
                 control_sender,
                 control_receiver,
                 pdata_senders,
+                shared_escrow_minters,
                 pdata_receiver,
                 telemetry: Some(guard),
                 source_tag,
@@ -280,6 +286,7 @@ impl<PData> ReceiverWrapper<PData> {
                 user_config,
                 receiver,
                 pdata_senders,
+                shared_escrow_minters,
                 pdata_receiver,
                 telemetry,
                 source_tag,
@@ -305,6 +312,7 @@ impl<PData> ReceiverWrapper<PData> {
                     control_sender,
                     control_receiver,
                     pdata_senders,
+                    shared_escrow_minters,
                     pdata_receiver,
                     telemetry,
                     source_tag,
@@ -370,6 +378,7 @@ impl<PData> ReceiverWrapper<PData> {
                     receiver,
                     control_receiver,
                     pdata_senders,
+                    shared_escrow_minters,
                     user_config,
                     source_tag,
                     capture_policy,
@@ -398,6 +407,7 @@ impl<PData> ReceiverWrapper<PData> {
                 );
                 effect_handler.set_source_tagging(source_tag);
                 effect_handler.set_capture_policy(capture_policy);
+                effect_handler.set_shared_escrow_minters(shared_escrow_minters);
                 effect_handler
                     .core
                     .set_pipeline_completion_msg_sender(pipeline_completion_msg_tx);
@@ -492,6 +502,16 @@ impl<PData> NodeWithPDataSender<PData> for ReceiverWrapper<PData> {
             ReceiverWrapper::Shared { source_tag, .. } => *source_tag = value,
         }
     }
+
+    fn set_shared_escrow_minter(&mut self, port: PortName, minter: SharedEscrowMinter) {
+        if let ReceiverWrapper::Shared {
+            shared_escrow_minters,
+            ..
+        } = self
+        {
+            let _ = shared_escrow_minters.insert(port, minter);
+        }
+    }
 }
 
 impl<PData> ReceiverWrapper<PData> {
@@ -532,6 +552,7 @@ impl<PData> ReceiverWrapper<PData> {
                 control_sender,
                 control_receiver,
                 pdata_senders,
+                shared_escrow_minters,
                 pdata_receiver,
                 telemetry,
                 source_tag,
@@ -544,6 +565,7 @@ impl<PData> ReceiverWrapper<PData> {
                 control_sender,
                 control_receiver,
                 pdata_senders,
+                shared_escrow_minters,
                 pdata_receiver,
                 telemetry,
                 source_tag,

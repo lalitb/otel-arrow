@@ -1,0 +1,4 @@
+change_type: enhancement
+component: engine
+note: "Add observe-only escrow ownership for shared receiver output channels in retained-work memory budgeting."
+issues: [3272]

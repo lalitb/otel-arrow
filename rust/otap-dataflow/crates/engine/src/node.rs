@@ -10,6 +10,7 @@
 use crate::control::NodeControlMsg;
 use crate::effect_handler::SourceTagging;
 use crate::error::Error;
+use crate::memory_budget::SharedEscrowMinter;
 use crate::message::{Receiver, Sender};
 use otap_df_channel::error::SendError;
 use otap_df_config::PortName;
@@ -74,6 +75,16 @@ pub trait NodeWithPDataSender<PData>: Node<PData> {
     /// Marks this node as needing to tag outgoing messages with the source node id.
     /// Called by the pipeline wiring when the destination node has multiple input sources.
     fn set_source_tagging(&mut self, source_tag: SourceTagging);
+
+    /// Installs a sendable shared-boundary escrow minter for the given output
+    /// port when the node's effect handler can attach shared ownership to
+    /// outgoing retained work.
+    ///
+    /// Most local nodes do not need this hook. Shared receivers that publish
+    /// `PData` into a cross-runtime channel use it to account work retained by
+    /// the channel without moving the runtime-local budget account across
+    /// threads.
+    fn set_shared_escrow_minter(&mut self, _port: PortName, _minter: SharedEscrowMinter) {}
 }
 
 /// Trait for nodes that can receive pdata.

@@ -17,6 +17,7 @@ use crate::{
     exporter::ExporterWrapper,
     extension::ExtensionBundle,
     local::message::{LocalReceiver, LocalSender},
+    memory_budget::SharedEscrowMinter,
     message::{Receiver, Sender},
     node::{Node, NodeDefs, NodeId, NodeName, NodeType},
     processor::{ProcessorWrapper, validate_local_wakeup_requirements},
@@ -2149,6 +2150,8 @@ struct HyperEdgeWiring<PData> {
     sources: Vec<NodeIdPortName>,
     /// The senders assigned to the sources.
     senders: Vec<Sender<PData>>,
+    /// Optional shared-boundary escrow minter per source endpoint.
+    shared_escrow_minters: Vec<Option<SharedEscrowMinter>>,
     /// The destinations and their assigned receivers.
     destinations: Vec<(NodeId, Receiver<PData>)>,
 }
@@ -2165,6 +2168,7 @@ where
         core_id: usize,
     ) -> Result<(), Error> {
         debug_assert_eq!(self.sources.len(), self.senders.len());
+        debug_assert_eq!(self.sources.len(), self.shared_escrow_minters.len());
 
         // When there are multiple sources sharing a channel to the same
         // destination(s), mark each source so it tags outgoing messages with
@@ -2172,7 +2176,12 @@ where
         // sent each message.
         let multi_source = self.sources.len() > 1;
 
-        for (source, sender) in self.sources.into_iter().zip(self.senders) {
+        for ((source, sender), shared_escrow_minter) in self
+            .sources
+            .into_iter()
+            .zip(self.senders)
+            .zip(self.shared_escrow_minters)
+        {
             let src_node = pipeline
                 .get_mut_node_with_pdata_sender(source.node_id.index)
                 .ok_or_else(|| Error::UnknownNode {
@@ -2189,7 +2198,11 @@ where
                 node_id = source.node_id.name.as_ref(),
                 port = source.port.as_ref(),
             );
+            let port = source.port.clone();
             src_node.set_pdata_sender(source.node_id, source.port, sender)?;
+            if let Some(minter) = shared_escrow_minter {
+                src_node.set_shared_escrow_minter(port, minter);
+            }
         }
         for (dest, receiver) in self.destinations {
             let dest_node = pipeline
@@ -2357,7 +2370,7 @@ impl ResolvedHyperEdgeRuntime {
             &source_nodes,
             &dest_nodes,
             buffer_size,
-            channel_id,
+            channel_id.clone(),
             &source_ports,
             &source_contexts,
             &source_telemetries,
@@ -2367,10 +2380,31 @@ impl ResolvedHyperEdgeRuntime {
             channel_metrics_enabled,
         )?;
 
+        let shared_escrow_minters = source_nodes
+            .iter()
+            .zip(source_contexts.iter())
+            .zip(source_ports.iter())
+            .zip(pdata_senders.iter())
+            .map(|(((source_node, source_context), source_port), sender)| {
+                if !source_node.is_shared() || !matches!(sender, Sender::Shared(_)) {
+                    return None;
+                }
+                let boundary = Arc::<str>::from(format!(
+                    "shared-edge:{}:{}",
+                    channel_id,
+                    source_port.as_ref()
+                ));
+                source_context
+                    .memory_budget_snapshot()
+                    .map(|handle| handle.shared_escrow_minter(boundary))
+            })
+            .collect();
+
         let destinations = destinations.into_iter().zip(pdata_receivers).collect();
         Ok(HyperEdgeWiring {
             sources,
             senders: pdata_senders,
+            shared_escrow_minters,
             destinations,
         })
     }
