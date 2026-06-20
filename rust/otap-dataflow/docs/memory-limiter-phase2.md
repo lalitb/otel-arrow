@@ -1558,11 +1558,11 @@ construction and threads it into the stream `Settings`, so the `!Send` runtime
 account never reaches a tonic handler thread. Rejection stays pre-decode,
 budget-free, payload-free, and reuses the existing rejection counters.
 
-This is shared *runtime pressure* publication only; shared-channel/shared-node
-retained-ownership adoption of `SharedEnvelope<T>` is audited (see
+Receiver admission and shared-boundary retained ownership are separate paths.
+Shared receiver output channel ownership for `OtapPdata` is audited (see
 [Shared-boundary ownership audit and primitive](#shared-boundary-ownership-audit-and-primitive))
-but not wired: the one remaining production boundary now has a sendable
-escrow-minting primitive, but still needs an owner-carrying channel shape.
+and now uses a sendable escrow owner on shared-receiver sends. Generic
+shared-channel/shared-node adoption remains future work.
 
 **Status:** the admission primitive is implemented and unit-tested and is wired
 end to end for **(1)** the syslog CEF local receiver, **(2)** the OTLP HTTP
@@ -1931,8 +1931,10 @@ conflating two ownership models):
   (`escrow.charged.bytes`, `escrow.active.bucket.count`,
   `escrow.max.bucket.bytes`, ...). When a local ticket converts to escrow its
   local per-site slot is decremented, so the two views never double-count.
-- **Shared channel** retention via `SharedEnvelope` is a primitive that is not
-  yet production-adopted, so it has no site variant yet.
+- **Shared receiver output channel** retention is owned by sendable escrow for
+  `OtapPdata` shared-receiver sends. It is reported through escrow bucket
+  gauges, not the local-ticket per-site counters. Generic shared channels and
+  shared-node state remain future work.
 - The aggregate `unknown.bytes` observe-only diagnostic is not split per site.
 
 This is per-*site* attribution only. Per-group, per-pipeline, and per-tenant
@@ -2226,15 +2228,15 @@ construction; the shared charge is held until the envelope is dropped (clean
 RAII release) or split with `into_parts` to hand the `EscrowSlot` to the
 boundary.
 
-`SharedEnvelope<T>` is currently a primitive: it is verified to cross a real
-`Send`/thread boundary and release exactly once, but the engine's shared
-channels still carry plain `PData` and do not yet attach it, so shared-channel
-and shared-node steady-state retention is **not** production-complete. New
-shared retention sites should adopt it as they are wired. Topic publishers do
-not call it directly: `try_publish_owned` performs the equivalent conversion at
-the broker boundary (point-to-point escrow for balanced, ring-slot escrow for
-broadcast, and an all-or-nothing fanout of one owner per retained destination
-for mixed).
+`SharedEnvelope<T>` remains a primitive: it is verified to cross a real
+`Send`/thread boundary and release exactly once, but generic shared channels
+still carry plain `PData`. The production shared receiver output edge for
+`OtapPdata` uses the same escrow-owner family by carrying an `EscrowSlot` in
+the message while it is retained by the shared channel. Topic publishers do not
+call `SharedEnvelope<T>` directly: `try_publish_owned` performs the equivalent
+conversion at the broker boundary (point-to-point escrow for balanced,
+ring-slot escrow for broadcast, and an all-or-nothing fanout of one owner per
+retained destination for mixed).
 
 Shared receivers are different from local producers: their handler threads do
 not own a `LocalMemoryTicket` to convert. The enabling primitive for that path
@@ -2245,7 +2247,9 @@ escrow bucket) and can mint an `EscrowTicket` or `SharedEnvelope<T>` on a
 tonic/hyper handler thread without moving the `!Send` runtime account. This
 minter is observe-only: it records shared-boundary escrow ownership and pool
 overshoot, but it deliberately does not reuse the topic `queue_publish`
-enforcement gate. A future shared-channel enforcement gate must be explicit.
+enforcement gate. Shared receiver sends attach the owner before enqueue and the
+owner is released on receive/drop or failed-send return. A future shared-channel
+enforcement gate must be explicit.
 
 ### Shared-boundary ownership audit and primitive
 
@@ -2260,55 +2264,35 @@ so a "shared" boundary is any edge that leaves that pinned thread.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Topic balanced queue | `engine/src/topic/topic.rs` (`QueuedEnvelope`) | `Envelope<PData>` | Yes (bounded `async_channel`) | Yes | `EscrowSlot` in `QueuedEnvelope` | Yes | wired (reference) |
 | Topic broadcast ring | `engine/src/topic/topic.rs` (`BroadcastSlot`/`FastBroadcastRing`) | `Envelope<PData>` | Yes (bounded ring) | Yes | `EscrowSlot` in ring slot | Yes | wired (reference) |
-| Shared gRPC receiver -> downstream channel | `engine/src/lib.rs` (channel build), `engine/src/shared/message.rs`, `core-nodes/.../otlp_receiver`, `.../otap_receiver` | plain `PData` | Yes (flume/tokio mpsc buffer) | Yes (tonic threads -> pipeline thread) | none in channel; `SharedEscrowMinter` can now mint owner | Primitive only | gap, channel adoption blocked (see below) |
+| Shared gRPC receiver -> downstream channel | `engine/src/lib.rs` (channel build), `engine/src/shared/message.rs`, `otap/src/pdata.rs`, `core-nodes/.../otlp_receiver`, `.../otap_receiver` | `OtapPdata` with optional `EscrowSlot` owner | Yes (flume/tokio mpsc buffer) | Yes (tonic threads -> pipeline thread) | sendable escrow owner attached by shared receiver send helper | Yes, for `OtapPdata` receiver sends | wired for shared receiver output edge |
 | Mixed local->shared wiring | `engine/src/message.rs` (`Sender::Shared`), `engine/src/lib.rs` | plain `PData` | Yes (same shared channels) | Yes | none | No | gap, blocked (same mechanism) |
 | Local inter-node channels | `engine/src/local/*`, `engine/src/message.rs` | `PData` | Yes (buffer) | No (same `LocalSet`, `!Send`) | n/a | n/a (local) | correctly local |
 | Fanout / routers | `core-nodes/.../fanout_processor`, `content_router`, `exclusive_router_admission`, `signal_type_router` | `PData` | Yes (parked / in-flight) | No (`local::Processor`) | `LocalMemoryTicket` (`FanoutInflight` / `RouterParked`) | n/a (local) | local, already accounted |
 <!-- markdownlint-enable MD013 -->
 
 Result: the only non-topic production shared boundary that retains `PData` is
-the **shared gRPC receiver -> downstream channel**. The only production shared
-nodes are the OTLP and OTAP gRPC receivers (`shared::Receiver`); there are no
-shared processors or exporters. Every other retained-work site is either the
-already-wired topic broker or a local (`!Send`) node that correctly uses
-`LocalMemoryTicket`.
+the **shared gRPC receiver -> downstream channel**. That edge now has
+observe-only escrow ownership for `OtapPdata`: pipeline wiring derives a
+`SharedEscrowMinter` from the downstream runtime snapshot, the shared receiver
+effect handler attaches one `EscrowSlot` before enqueue, and the slot releases
+on receive/drop or failed-send return. The owner is intentionally not cloned, so
+the one-owner invariant is preserved.
 
-#### Enabling primitive added; channel adoption still blocked
+The only production shared nodes are the OTLP and OTAP gRPC receivers
+(`shared::Receiver`); there are no shared processors or exporters. Every other
+retained-work site is either the already-wired topic broker or a local (`!Send`)
+node that correctly uses `LocalMemoryTicket`.
 
-The first enabling piece now exists: `SharedEscrowMinter` gives a shared
-receiver handler a sendable way to mint escrow ownership for known-size retained
-work against the downstream runtime's scope and shared-boundary bucket. The
-primitive is tested across a real thread boundary, releases through
-`SharedEnvelope<T>` drop, keeps unresolved escrow sticky in the abandoned-escrow
-view, and does not reject when topic `queue_publish` enforcement is enabled.
+#### Remaining shared-boundary gaps
 
-The production receiver channel is still not wired in one narrow, safe slice:
+Generic shared-channel and shared-node retention are still not complete:
 
-- The shared channel carries plain `PData` (`Sender<PData>` / `SharedSender<PData>`
-  built in `engine/src/lib.rs`). Attaching escrow means changing the channel
-  item type to `SharedEnvelope<PData>`, which ripples through the generic
-  `Sender`/`Receiver` interface and every node's send/recv loop -- a broad
-  refactor, explicitly out of scope for one slice.
-- The sender side can now mint ownership, but the channel still has nowhere to
-  store that owner while retaining `PData`.
-- Therefore the remaining acquisition point is defined, but the
-  retention-transfer and receive/drain/drop release points are not yet wired in
-  production. Forcing a narrow change would half-wire `SharedEnvelope<T>` into a
-  path production does not use, which is disallowed.
-
-#### Smallest principled next step (future)
-
-1. Introduce an opt-in `SharedEnvelope<PData>`-carrying channel for exactly the
-   shared-receiver -> downstream edge, behind `unstable-memory-enforcement`,
-   observe-only by default, with explicit redemption (`EscrowTicket::redeem_into`)
-   in the downstream recv loop and release on close / drop / drain / full.
-2. Preserve all-or-nothing fanout, close-race safety, and budget-free cleanup,
-   mirroring the topic broker adoption.
-
-`SharedEnvelope<T>` and `SharedEscrowMinter` remain primitives/foundation only:
-they are verified across real `Send`/thread boundaries but are **not**
-production-adopted by shared receiver channels (the topic broker uses
-`EscrowSlot` directly; shared channels still carry plain `PData`).
+- Shared processors/exporters are not production nodes today; if they retain
+  data later, they need an escrow-backed shared owner for their state.
+- Mixed local-to-shared wiring still needs a conversion point from local ticket
+  to escrow before crossing a shared channel.
+- `SharedEnvelope<T>` remains available for future channel shapes that should
+  keep the owner outside `PData`.
 
 ### How to release, drop, drain, or abort
 
