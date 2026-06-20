@@ -20,6 +20,7 @@ use otap_df_engine::control::{AckMsg, NackMsg, NodeControlMsg};
 use otap_df_engine::error::{Error, ExporterErrorKind, format_error_sources};
 use otap_df_engine::exporter::ExporterWrapper;
 use otap_df_engine::local::exporter as local;
+use otap_df_engine::memory_budget::{ChargedSize, EscrowSlot, SharedEscrowMinter};
 use otap_df_engine::message::{ExporterInbox, Message};
 use otap_df_engine::node::NodeId;
 use otap_df_engine::terminal_state::TerminalState;
@@ -61,9 +62,69 @@ pub struct OTAPExporter {
     pdata_metrics: MetricSet<ExporterPDataMetrics>,
     async_metrics: MetricSet<OtapGrpcAsyncMetrics>,
     export_latency_window: ExportLatencyWindow,
+    stream_pending_minter: Option<SharedEscrowMinter>,
+    stream_inflight_minter: Option<SharedEscrowMinter>,
 }
 
-type StreamBatch = (OtapPdata, OtapArrowRecords);
+struct StreamBatch {
+    pdata: OtapPdata,
+    records: OtapArrowRecords,
+    pending_escrow: EscrowSlot,
+}
+
+struct OtapArrowRecordsSize<'a>(&'a OtapArrowRecords);
+
+impl ChargedSize for OtapArrowRecordsSize<'_> {
+    fn charged_size(&self) -> Option<u64> {
+        let bytes = self
+            .0
+            .allowed_payload_types()
+            .iter()
+            .filter_map(|payload_type| self.0.get(*payload_type))
+            .try_fold(0_u64, |total, batch| {
+                total.checked_add(u64::try_from(batch.get_array_memory_size()).ok()?)
+            })?;
+        Some(bytes)
+    }
+}
+
+struct BatchArrowRecordsSize<'a>(&'a BatchArrowRecords);
+
+impl ChargedSize for BatchArrowRecordsSize<'_> {
+    fn charged_size(&self) -> Option<u64> {
+        let payload_bytes = self
+            .0
+            .arrow_payloads
+            .iter()
+            .try_fold(0_u64, |total, payload| {
+                let record_bytes = u64::try_from(payload.record.len()).ok()?;
+                let schema_bytes = u64::try_from(payload.schema_id.len()).ok()?;
+                total.checked_add(record_bytes)?.checked_add(schema_bytes)
+            })?;
+        payload_bytes.checked_add(u64::try_from(self.0.headers.len()).ok()?)
+    }
+}
+
+impl StreamBatch {
+    fn new(
+        pdata: OtapPdata,
+        records: OtapArrowRecords,
+        minter: Option<&SharedEscrowMinter>,
+    ) -> Self {
+        let pending_escrow = minter
+            .map(|minter| minter.mint_slot(OtapArrowRecordsSize(&records)))
+            .unwrap_or_default();
+        Self {
+            pdata,
+            records,
+            pending_escrow,
+        }
+    }
+
+    fn into_parts(self) -> (OtapPdata, OtapArrowRecords, EscrowSlot) {
+        (self.pdata, self.records, self.pending_escrow)
+    }
+}
 
 /// Async wait attribution for the OTAP gRPC export stream.
 #[metric_set(name = "otap.exporter.grpc.async")]
@@ -205,6 +266,12 @@ impl OTAPExporter {
             pdata_metrics,
             async_metrics,
             export_latency_window: ExportLatencyWindow::default(),
+            stream_pending_minter: pipeline_ctx.memory_budget_snapshot().map(|snapshot| {
+                snapshot.shared_escrow_minter(Arc::<str>::from("exporter:otap:stream_pending"))
+            }),
+            stream_inflight_minter: pipeline_ctx.memory_budget_snapshot().map(|snapshot| {
+                snapshot.shared_escrow_minter(Arc::<str>::from("exporter:otap:stream_inflight"))
+            }),
         }
     }
 
@@ -289,7 +356,11 @@ impl OTAPExporter {
             .stream_enqueue_depth
             .record(queue_depth as f64);
         let enqueue_start = Instant::now();
-        let mut pending = Some((pdata, message));
+        let mut pending = Some(StreamBatch::new(
+            pdata,
+            message,
+            self.stream_pending_minter.as_ref(),
+        ));
 
         loop {
             let item = pending
@@ -317,9 +388,11 @@ impl OTAPExporter {
                 permit = sender.reserve() => {
                     match permit {
                         Ok(permit) => {
-                            permit.send(pending
-                                .take()
-                                .expect("stream enqueue reserve must retain the pending batch"));
+                            permit.send(
+                                pending
+                                    .take()
+                                    .expect("stream enqueue reserve must retain the pending batch"),
+                            );
                             self.async_metrics
                                 .stream_enqueue_duration_ns
                                 .record(elapsed_nanos(enqueue_start));
@@ -469,6 +542,7 @@ impl local::Exporter<OtapPdata> for OTAPExporter {
             streams_per_signal,
             pdata_metrics_tx.clone(),
             shutdown_rx.clone(),
+            self.stream_inflight_minter.clone(),
         );
         let (metrics_senders, metrics_handles) = spawn_stream_workers(
             arrow_metrics_client,
@@ -478,6 +552,7 @@ impl local::Exporter<OtapPdata> for OTAPExporter {
             streams_per_signal,
             pdata_metrics_tx.clone(),
             shutdown_rx.clone(),
+            self.stream_inflight_minter.clone(),
         );
         let (traces_senders, traces_handles) = spawn_stream_workers(
             arrow_traces_client,
@@ -487,6 +562,7 @@ impl local::Exporter<OtapPdata> for OTAPExporter {
             streams_per_signal,
             pdata_metrics_tx.clone(),
             shutdown_rx.clone(),
+            self.stream_inflight_minter.clone(),
         );
 
         // Loop until a Shutdown event is received.
@@ -602,6 +678,7 @@ fn spawn_stream_workers<T>(
     streams_per_signal: usize,
     pdata_metrics_tx: Sender<PDataMetricsUpdate>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    stream_inflight_minter: Option<SharedEscrowMinter>,
 ) -> (Vec<Sender<StreamBatch>>, Vec<JoinHandle<()>>)
 where
     T: StreamingArrowService + Clone + 'static,
@@ -622,6 +699,7 @@ where
             receiver,
             pdata_metrics_tx.clone(),
             shutdown_rx.clone(),
+            stream_inflight_minter.clone(),
         )));
     }
 
@@ -690,15 +768,35 @@ struct CorrelatedPdata {
     batch_id: i64,
     pdata: OtapPdata,
     sent_at: Instant,
+    _inflight_escrow: EscrowSlot,
+}
+
+impl CorrelatedPdata {
+    fn new(
+        batch: &BatchArrowRecords,
+        pdata: OtapPdata,
+        minter: Option<&SharedEscrowMinter>,
+    ) -> Self {
+        let inflight_escrow = minter
+            .map(|minter| minter.mint_slot(BatchArrowRecordsSize(batch)))
+            .unwrap_or_default();
+        Self {
+            batch_id: batch.batch_id,
+            pdata,
+            sent_at: Instant::now(),
+            _inflight_escrow: inflight_escrow,
+        }
+    }
 }
 
 async fn stream_arrow_batches<T: StreamingArrowService>(
     mut client: T,
     signal_type: SignalType,
     ipc_compression: Option<arrow_ipc::CompressionType>,
-    otap_batches_rx: Receiver<(OtapPdata, OtapArrowRecords)>,
+    otap_batches_rx: Receiver<StreamBatch>,
     pdata_metrics_tx: Sender<PDataMetricsUpdate>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    stream_inflight_minter: Option<SharedEscrowMinter>,
 ) {
     let otap_batches_rx = Arc::new(tokio::sync::Mutex::new(otap_batches_rx));
     let mut shutdown = false;
@@ -716,8 +814,8 @@ async fn stream_arrow_batches<T: StreamingArrowService>(
             // wait to receive the first batch to create the streaming request
             first_batch = rx.recv() => {
                 drop(rx);
-                let (first_pdata, first_batch) = match first_batch {
-                    Some(f) => f,
+                let (first_pdata, first_batch, first_pending_escrow) = match first_batch {
+                    Some(f) => f.into_parts(),
 
                     None => {
                         // no more batches
@@ -737,11 +835,13 @@ async fn stream_arrow_batches<T: StreamingArrowService>(
                 let req_stream = create_req_stream(
                     first_pdata,
                     first_batch,
+                    first_pending_escrow,
                     otap_batches_rx.clone(),
                     signal_type,
                     ipc_compression,
                     pdata_metrics_tx.clone(),
                     correlation_tx.clone(),
+                    stream_inflight_minter.clone(),
                 );
                 match client.handle_req_stream(req_stream).await {
                     Ok(res) => {
@@ -813,11 +913,13 @@ async fn stream_arrow_batches<T: StreamingArrowService>(
 fn create_req_stream(
     first_pdata: OtapPdata,
     mut first_batch: OtapArrowRecords,
-    remaining_batches_rx: Arc<tokio::sync::Mutex<Receiver<(OtapPdata, OtapArrowRecords)>>>,
+    first_pending_escrow: EscrowSlot,
+    remaining_batches_rx: Arc<tokio::sync::Mutex<Receiver<StreamBatch>>>,
     signal_type: SignalType,
     ipc_compression: Option<arrow_ipc::CompressionType>,
     pdata_metrics_tx: Sender<PDataMetricsUpdate>,
     correlation_tx: Sender<CorrelatedPdata>,
+    stream_inflight_minter: Option<SharedEscrowMinter>,
 ) -> impl IntoStreamingRequest<Message = BatchArrowRecords> {
     stream! {
         let mut producer = Producer::new_with_options(ProducerOptions {
@@ -842,11 +944,13 @@ fn create_req_stream(
                                 duration_ns: elapsed_nanos(correlation_start),
                                 depth: correlation_depth,
                             });
-                        permit.send(CorrelatedPdata {
-                            batch_id: bar.batch_id,
-                            pdata: first_pdata,
-                            sent_at: Instant::now(),
-                        });
+                        drop(first_pending_escrow);
+                        let correlated = CorrelatedPdata::new(
+                            &bar,
+                            first_pdata,
+                            stream_inflight_minter.as_ref(),
+                        );
+                        permit.send(correlated);
                         yield bar;
                     }
                     Err(_) => {
@@ -867,7 +971,8 @@ fn create_req_stream(
 
         let mut rx = remaining_batches_rx.lock().await;
         // send the remaining batches
-        while let Some((pdata, mut otap_batch)) = rx.recv().await {
+        while let Some(batch) = rx.recv().await {
+            let (pdata, mut otap_batch, pending_escrow) = batch.into_parts();
             let encode_start = Instant::now();
             let bar_result = producer.produce_bar(&mut otap_batch);
             _ = pdata_metrics_tx.try_send(PDataMetricsUpdate::RecordStreamEncodeDuration(
@@ -886,11 +991,13 @@ fn create_req_stream(
                                     depth: correlation_depth,
                                 },
                             );
-                            permit.send(CorrelatedPdata {
-                                batch_id: bar.batch_id,
+                            drop(pending_escrow);
+                            let correlated = CorrelatedPdata::new(
+                                &bar,
                                 pdata,
-                                sent_at: Instant::now(),
-                            });
+                                stream_inflight_minter.as_ref(),
+                            );
+                            permit.send(correlated);
                             yield bar;
                         }
                         Err(_) => {
@@ -1052,9 +1159,13 @@ async fn fail_correlated_pdata(
 
 #[cfg(test)]
 mod tests {
+    use crate::exporters::otap_exporter::BatchArrowRecordsSize;
+    use crate::exporters::otap_exporter::CorrelatedPdata;
     use crate::exporters::otap_exporter::ExportLatencyWindow;
     use crate::exporters::otap_exporter::OTAP_EXPORTER_URN;
     use crate::exporters::otap_exporter::OTAPExporter;
+    use crate::exporters::otap_exporter::OtapArrowRecordsSize;
+    use crate::exporters::otap_exporter::StreamBatch;
     use crate::exporters::otap_exporter::config::ArrowPayloadCompression;
     use otap_df_otap::otap_mock::{
         ArrowLogsServiceMock, ArrowMetricsServiceMock, ArrowTracesServiceMock, create_otap_batch,
@@ -1077,6 +1188,7 @@ mod tests {
     use otap_df_engine::exporter::ExporterWrapper;
     use otap_df_engine::local::message::LocalReceiver;
     use otap_df_engine::local::message::LocalSender;
+    use otap_df_engine::memory_budget::ChargedSize;
     use otap_df_engine::message::Receiver;
     use otap_df_engine::message::Sender;
     use otap_df_engine::node::NodeWithPDataReceiver;
@@ -1089,7 +1201,7 @@ mod tests {
     use otap_df_pdata::TryIntoWithOptions;
     use otap_df_pdata::otap::OtapArrowRecords;
     use otap_df_pdata::proto::opentelemetry::arrow::v1::{
-        ArrowPayloadType, BatchArrowRecords, BatchStatus, StatusCode,
+        ArrowPayload, ArrowPayloadType, BatchArrowRecords, BatchStatus, StatusCode,
         arrow_logs_service_server::ArrowLogsServiceServer,
         arrow_metrics_service_server::ArrowMetricsServiceServer,
         arrow_traces_service_server::ArrowTracesServiceServer,
@@ -1132,6 +1244,102 @@ mod tests {
         assert_eq!(ExportLatencyWindow::quantile_sorted(&samples, 0.50), 3.0);
         assert_eq!(ExportLatencyWindow::quantile_sorted(&samples, 0.90), 100.0);
         assert_eq!(ExportLatencyWindow::quantile_sorted(&samples, 0.99), 100.0);
+    }
+
+    fn install_test_escrow_minter(
+        boundary: &'static str,
+    ) -> (
+        otap_df_engine::memory_budget::MemoryBudgetState,
+        otap_df_engine::memory_budget::SharedEscrowMinter,
+    ) {
+        use otap_df_engine::memory_budget::{
+            BudgetScopeId, MemoryBudgetEnforcement, MemoryBudgetSizing, RuntimeMemoryBudgetConfig,
+        };
+
+        let registry = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(registry);
+        let state = controller_ctx.memory_budget_state();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: otap_df_engine::memory_budget::BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 1,
+                    lease_step_bytes: 1,
+                    max_overshoot_per_runtime_bytes: 1_000_000,
+                    overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: 1_000_000,
+                runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement::default(),
+            },
+            None,
+        );
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let minter = handle.shared_escrow_minter(Arc::<str>::from(boundary));
+        (state, minter)
+    }
+
+    #[test]
+    fn stream_batch_charges_pending_escrow_and_releases_on_drop() {
+        let (state, minter) = install_test_escrow_minter("test:otap:pending");
+        let message = create_otap_batch(LOG_BATCH_ID, ArrowPayloadType::Logs);
+        let pdata = OtapPdata::new_default(message.into());
+        let records = pdata.clone().payload().try_into_with_default().unwrap();
+        let expected = OtapArrowRecordsSize(&records)
+            .charged_size()
+            .expect("test OTAP records have known retained size");
+        assert!(expected > 0);
+
+        let batch = StreamBatch::new(pdata, records, Some(&minter));
+        assert_eq!(
+            state.snapshot().escrow_charged_bytes,
+            expected,
+            "OTAP stream queue retention must be visible as escrow"
+        );
+
+        drop(batch);
+        assert_eq!(
+            state.snapshot().escrow_charged_bytes,
+            0,
+            "dropping the queued batch must release its pending escrow"
+        );
+    }
+
+    #[test]
+    fn correlated_pdata_charges_inflight_escrow_and_releases_on_drop() {
+        let (state, minter) = install_test_escrow_minter("test:otap:inflight");
+        let message = create_otap_batch(LOG_BATCH_ID, ArrowPayloadType::Logs);
+        let pdata = OtapPdata::new_default(message.into());
+        let batch = BatchArrowRecords {
+            batch_id: 42,
+            arrow_payloads: vec![ArrowPayload {
+                schema_id: "schema-a".to_string(),
+                r#type: ArrowPayloadType::Logs as i32,
+                record: b"encoded-arrow-record".to_vec(),
+            }],
+            headers: b"headers".to_vec(),
+        };
+        let expected = BatchArrowRecordsSize(&batch)
+            .charged_size()
+            .expect("test batch has known retained size");
+        assert!(expected > 0);
+
+        let correlated = CorrelatedPdata::new(&batch, pdata, Some(&minter));
+        assert_eq!(
+            state.snapshot().escrow_charged_bytes,
+            expected,
+            "OTAP response-correlation retention must be visible as escrow"
+        );
+
+        drop(correlated);
+        assert_eq!(
+            state.snapshot().escrow_charged_bytes,
+            0,
+            "dropping correlated pdata must release its in-flight escrow"
+        );
     }
 
     /// Test closure that simulates a typical test scenario by sending timer ticks, config,
@@ -1737,7 +1945,7 @@ mod tests {
     /// correlation channel and reported as Failed.
     #[tokio::test]
     async fn test_stream_arrow_batches_drain_correlation_on_error() {
-        use super::{PDataMetricsUpdate, stream_arrow_batches};
+        use super::{PDataMetricsUpdate, StreamBatch, stream_arrow_batches};
 
         let (batches_tx, batches_rx) = tokio::sync::mpsc::channel(4);
         let (metrics_tx, mut metrics_rx) = tokio::sync::mpsc::channel(4);
@@ -1747,7 +1955,11 @@ mod tests {
         let pdata = OtapPdata::new_default(log_message.into());
         let payload = pdata.clone();
         batches_tx
-            .send((pdata, payload.payload().try_into_with_default().unwrap()))
+            .send(StreamBatch::new(
+                pdata,
+                payload.payload().try_into_with_default().unwrap(),
+                None,
+            ))
             .await
             .unwrap();
         // Drop sender so the function exits after processing
@@ -1760,6 +1972,7 @@ mod tests {
             batches_rx,
             metrics_tx,
             shutdown_rx,
+            None,
         )
         .await;
 
@@ -1796,7 +2009,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_arrow_batches_shutdown_interrupts_retry_backoff() {
-        use super::{PDataMetricsUpdate, stream_arrow_batches};
+        use super::{PDataMetricsUpdate, StreamBatch, stream_arrow_batches};
 
         let (batches_tx, batches_rx) = tokio::sync::mpsc::channel(8);
         let (metrics_tx, mut metrics_rx) = tokio::sync::mpsc::channel(8);
@@ -1807,7 +2020,11 @@ mod tests {
             let pdata = OtapPdata::new_default(log_message.into());
             let payload = pdata.clone();
             batches_tx
-                .send((pdata, payload.payload().try_into_with_default().unwrap()))
+                .send(StreamBatch::new(
+                    pdata,
+                    payload.payload().try_into_with_default().unwrap(),
+                    None,
+                ))
                 .await
                 .unwrap();
         }
@@ -1819,6 +2036,7 @@ mod tests {
             batches_rx,
             metrics_tx,
             shutdown_rx,
+            None,
         ));
 
         for attempt in 0..4 {

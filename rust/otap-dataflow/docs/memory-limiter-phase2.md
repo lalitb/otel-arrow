@@ -1713,6 +1713,11 @@ Validation:
     request body, released on completion success/partial-success/error/nack, on
     shutdown drain, and on early teardown; this exporter has no separate
     backpressure-parked pending request);
+  - the OTAP streaming exporter's bounded per-stream queue and response
+    correlation state (sendable escrow owner per retained `OtapArrowRecords`
+    batch while queued, and per yielded `BatchArrowRecords` while awaiting the
+    matching server status; released on enqueue failure, stream setup failure,
+    status success/failure, response stream error, shutdown drain, or task drop);
   - the exclusive-router processors (content router and signal-type router)
     backpressure-parked routes (local ticket per parked message, carried across
     probe/re-park cycles and released on downstream admission, route-closed nack,
@@ -1739,9 +1744,11 @@ Validation:
 - Exporter retained-work coverage is **not** complete across all exporters. The
   topic exporter's retained work is the topic queue, already accounted by the
   topic/per-boundary escrow buckets (and enforced via `queue_publish`). The OTAP
-  (streaming) and parquet exporters retain in-flight/buffered work that is **not
-  yet** charged and remains an open gap. The console, perf, noop, and error
-  exporters hand off synchronously and have no retained pending request.
+  streaming exporter is accounted through internal escrow because its tonic
+  request stream is a `Send` boundary and cannot carry `LocalMemoryTicket`.
+  Parquet exporter buffering remains an open coverage gap. The console, perf,
+  noop, and error exporters hand off synchronously and have no retained pending
+  request.
 - `reserve` must be smaller than the process hard limit when a hard limit is
   known.
 - `runtime_count` is the total resolved runtime instances in the process.
@@ -1942,6 +1949,10 @@ conflating two ownership models):
   Unknown-size shared items carry a zero-byte unknown owner and increment the
   escrow unknown-count gauge while retained. Generic shared-node state remains
   future work.
+- **OTAP streaming exporter queue/correlation** retention is owned by sendable
+  escrow because the request-stream path must be `Send`. Those bytes are visible
+  in escrow gauges rather than in the local-ticket `exporter_pending` or
+  `exporter_inflight` site counters.
 - The aggregate `unknown.bytes` observe-only diagnostic is not split per site.
 
 This is per-*site* attribution only. Per-group, per-pipeline, and per-tenant

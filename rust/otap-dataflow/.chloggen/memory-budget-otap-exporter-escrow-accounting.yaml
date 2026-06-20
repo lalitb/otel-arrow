@@ -1,0 +1,4 @@
+change_type: enhancement
+component: pipeline
+note: "Account OTAP streaming exporter retained queue and response-correlation work in observe-only memory-budget escrow metrics."
+issues: [3272]
