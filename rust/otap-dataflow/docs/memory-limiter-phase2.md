@@ -1559,10 +1559,11 @@ account never reaches a tonic handler thread. Rejection stays pre-decode,
 budget-free, payload-free, and reuses the existing rejection counters.
 
 Receiver admission and shared-boundary retained ownership are separate paths.
-Shared receiver output channel ownership for `OtapPdata` is audited (see
+Shared output channel ownership for `OtapPdata` is audited (see
 [Shared-boundary ownership audit and primitive](#shared-boundary-ownership-audit-and-primitive))
-and now uses a sendable escrow owner on shared-receiver sends. Generic
-shared-channel/shared-node adoption remains future work.
+and now uses a sendable escrow owner when a shared receiver or local source
+sends into a shared output channel. Generic shared-channel/shared-node state
+remains future work.
 
 **Status:** the admission primitive is implemented and unit-tested and is wired
 end to end for **(1)** the syslog CEF local receiver, **(2)** the OTLP HTTP
@@ -1931,10 +1932,11 @@ conflating two ownership models):
   (`escrow.charged.bytes`, `escrow.active.bucket.count`,
   `escrow.max.bucket.bytes`, ...). When a local ticket converts to escrow its
   local per-site slot is decremented, so the two views never double-count.
-- **Shared receiver output channel** retention is owned by sendable escrow for
-  `OtapPdata` shared-receiver sends. It is reported through escrow bucket
-  gauges, not the local-ticket per-site counters. Generic shared channels and
-  shared-node state remain future work.
+- **Shared output channel** retention is owned by sendable escrow for
+  `OtapPdata` sends that enter a shared channel from a shared receiver or from a
+  local source wired to `Sender::Shared`. It is reported through escrow bucket
+  gauges, not the local-ticket per-site counters. Generic shared-node state
+  remains future work.
 - The aggregate `unknown.bytes` observe-only diagnostic is not split per site.
 
 This is per-*site* attribution only. Per-group, per-pipeline, and per-tenant
@@ -2265,18 +2267,18 @@ so a "shared" boundary is any edge that leaves that pinned thread.
 | Topic balanced queue | `engine/src/topic/topic.rs` (`QueuedEnvelope`) | `Envelope<PData>` | Yes (bounded `async_channel`) | Yes | `EscrowSlot` in `QueuedEnvelope` | Yes | wired (reference) |
 | Topic broadcast ring | `engine/src/topic/topic.rs` (`BroadcastSlot`/`FastBroadcastRing`) | `Envelope<PData>` | Yes (bounded ring) | Yes | `EscrowSlot` in ring slot | Yes | wired (reference) |
 | Shared gRPC receiver -> downstream channel | `engine/src/lib.rs` (channel build), `engine/src/shared/message.rs`, `otap/src/pdata.rs`, `core-nodes/.../otlp_receiver`, `.../otap_receiver` | `OtapPdata` with optional `EscrowSlot` owner | Yes (flume/tokio mpsc buffer) | Yes (tonic threads -> pipeline thread) | sendable escrow owner attached by shared receiver send helper | Yes, for `OtapPdata` receiver sends | wired for shared receiver output edge |
-| Mixed local->shared wiring | `engine/src/message.rs` (`Sender::Shared`), `engine/src/lib.rs` | plain `PData` | Yes (same shared channels) | Yes | none | No | gap, blocked (same mechanism) |
+| Mixed local->shared wiring | `engine/src/message.rs` (`Sender::Shared`), `engine/src/lib.rs`, `engine/src/local/*`, `otap/src/pdata.rs` | `OtapPdata` with optional `EscrowSlot` owner | Yes (same shared channels) | Yes (pipeline thread -> shared channel) | sendable escrow owner attached by local receiver/processor send helper | Yes, for `OtapPdata` local-source sends | wired for mixed local-to-shared output edge |
 | Local inter-node channels | `engine/src/local/*`, `engine/src/message.rs` | `PData` | Yes (buffer) | No (same `LocalSet`, `!Send`) | n/a | n/a (local) | correctly local |
 | Fanout / routers | `core-nodes/.../fanout_processor`, `content_router`, `exclusive_router_admission`, `signal_type_router` | `PData` | Yes (parked / in-flight) | No (`local::Processor`) | `LocalMemoryTicket` (`FanoutInflight` / `RouterParked`) | n/a (local) | local, already accounted |
 <!-- markdownlint-enable MD013 -->
 
-Result: the only non-topic production shared boundary that retains `PData` is
-the **shared gRPC receiver -> downstream channel**. That edge now has
-observe-only escrow ownership for `OtapPdata`: pipeline wiring derives a
-`SharedEscrowMinter` from the downstream runtime snapshot, the shared receiver
-effect handler attaches one `EscrowSlot` before enqueue, and the slot releases
-on receive/drop or failed-send return. The owner is intentionally not cloned, so
-the one-owner invariant is preserved.
+Result: the production shared output-channel boundaries that retain `OtapPdata`
+now have observe-only escrow ownership. Pipeline wiring derives a
+`SharedEscrowMinter` from the downstream runtime snapshot for each actual
+`Sender::Shared` edge. Shared receiver effect handlers and local
+receiver/processor effect handlers attach one `EscrowSlot` before enqueue, and
+the slot releases on receive/drop or failed-send return. The owner is
+intentionally not cloned, so the one-owner invariant is preserved.
 
 The only production shared nodes are the OTLP and OTAP gRPC receivers
 (`shared::Receiver`); there are no shared processors or exporters. Every other
@@ -2289,8 +2291,8 @@ Generic shared-channel and shared-node retention are still not complete:
 
 - Shared processors/exporters are not production nodes today; if they retain
   data later, they need an escrow-backed shared owner for their state.
-- Mixed local-to-shared wiring still needs a conversion point from local ticket
-  to escrow before crossing a shared channel.
+- Future non-`OtapPdata` shared payload shapes need their own owner attachment
+  strategy before they can retain data across a shared channel.
 - `SharedEnvelope<T>` remains available for future channel shapes that should
   keep the owner outside `PData`.
 
