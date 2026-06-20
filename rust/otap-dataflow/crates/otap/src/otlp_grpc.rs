@@ -25,7 +25,7 @@ use otap_df_pdata::proto::opentelemetry::collector::{
     },
 };
 
-use otap_df_engine::shared::receiver as shared;
+use otap_df_engine::{processor::FlowMetricHook, shared::receiver as shared};
 use tonic::{Request, Response, Status};
 
 /// struct that implements the Log Service trait
@@ -156,3 +156,5 @@ pub enum OTLPData {
     /// Profiles Object
     Profiles(ExportProfilesServiceRequest),
 }
+
+impl FlowMetricHook for OTLPData {}

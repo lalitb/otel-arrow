@@ -555,21 +555,40 @@ impl SharedEscrowMinter {
             .try_observe_escrow_owner_in_bucket(bytes, &self.scope, &self.bucket)
     }
 
-    /// Wraps `payload` in a [`SharedEnvelope`] with an escrow owner when the
-    /// payload has a known size and memory budgeting is configured.
+    /// Mints one sendable escrow slot for shared-boundary retained work.
     ///
-    /// The payload is always returned inside an envelope; when no owner can be
-    /// minted because budgeting is disabled or the size is unknown, the
-    /// envelope carries an empty escrow slot.
+    /// Known-size work receives a normal escrow ticket. Unknown-size work
+    /// receives a zero-byte unknown owner so observe-only coverage records that
+    /// a retained item crossed the shared boundary without guessing a size.
+    #[must_use]
+    pub fn mint_slot(&self, size: impl ChargedSize) -> EscrowSlot {
+        match size.charged_size() {
+            Some(bytes) => self
+                .state
+                .try_observe_escrow_owner_in_bucket(bytes, &self.scope, &self.bucket)
+                .map(EscrowSlot::new)
+                .unwrap_or_default(),
+            None => self
+                .state
+                .try_observe_unknown_escrow_owner()
+                .map(EscrowSlot::unknown)
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Wraps `payload` in a [`SharedEnvelope`] with a shared-boundary owner
+    /// when memory budgeting is configured.
+    ///
+    /// Known-size payloads carry a byte-owning escrow ticket. Unknown-size
+    /// payloads carry a zero-byte unknown owner. When budgeting is disabled,
+    /// the envelope carries an empty escrow slot.
     #[must_use]
     pub fn envelope<T>(&self, payload: T) -> SharedEnvelope<T>
     where
         T: ChargedSize,
     {
-        match self.mint(&payload) {
-            Some(ticket) => SharedEnvelope::new(payload, EscrowSlot::new(ticket)),
-            None => SharedEnvelope::without_owner(payload),
-        }
+        let slot = self.mint_slot(&payload);
+        SharedEnvelope::new(payload, slot)
     }
 }
 
@@ -620,6 +639,8 @@ pub struct MemoryBudgetSnapshot {
     pub reaped_escrow_bytes: u64,
     /// Escrow tickets currently owning logical retained bytes.
     pub escrow_ticket_count: u64,
+    /// Shared-boundary retained items whose exact size is unknown.
+    pub escrow_unknown_count: u64,
     /// Escrow bytes currently owning logical retained bytes.
     pub escrow_charged_bytes: u64,
     /// Number of escrow buckets with currently charged bytes.
@@ -679,6 +700,7 @@ struct MemoryBudgetStateInner {
     reaped_escrow_count: AtomicU64,
     reaped_escrow_bytes: AtomicU64,
     escrow_ticket_count: AtomicU64,
+    escrow_unknown_count: AtomicU64,
     escrow_charged_bytes: AtomicU64,
     escrow_buckets: Mutex<HashMap<Arc<str>, EscrowBucket>>,
     /// Sum of bytes the escrow pool currently holds against the global spare
@@ -885,6 +907,7 @@ impl MemoryBudgetState {
             reaped_escrow_count: self.inner.reaped_escrow_count.load(Ordering::Relaxed),
             reaped_escrow_bytes: self.inner.reaped_escrow_bytes.load(Ordering::Relaxed),
             escrow_ticket_count: self.inner.escrow_ticket_count.load(Ordering::Relaxed),
+            escrow_unknown_count: self.inner.escrow_unknown_count.load(Ordering::Relaxed),
             escrow_charged_bytes: self.inner.escrow_charged_bytes.load(Ordering::Relaxed),
             escrow_pool_held_bytes: self.inner.escrow_pool_held_bytes.load(Ordering::Relaxed),
             escrow_pool_overshoot_bytes: self
@@ -1035,6 +1058,27 @@ impl MemoryBudgetState {
                 message = "unresolved escrow dropped; charge remains sticky until an explicit reaper policy is configured",
             );
         }
+    }
+
+    fn try_observe_unknown_escrow_owner(&self) -> Option<EscrowUnknownOwner> {
+        if !self.inner.escrow_enabled.load(Ordering::Acquire) {
+            return None;
+        }
+        let _ = self
+            .inner
+            .escrow_unknown_count
+            .fetch_add(1, Ordering::Relaxed);
+        Some(EscrowUnknownOwner {
+            state: self.clone(),
+            resolved: false,
+        })
+    }
+
+    fn release_unknown_escrow(&self) {
+        let _ = self
+            .inner
+            .escrow_unknown_count
+            .fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Configures the abandoned-escrow reaper threshold.
@@ -2638,6 +2682,38 @@ impl Drop for EscrowTicket {
     }
 }
 
+/// Zero-byte owner for shared-boundary retained work whose exact logical size
+/// is unknown.
+///
+/// This keeps unknown-size shared retention visible in observe-only mode
+/// without guessing a byte size. It is intentionally not routed to the
+/// abandoned-escrow graveyard because it has no byte charge to preserve; losing
+/// the owner would only overstate the active unknown count, so `Drop` releases
+/// it exactly once.
+#[derive(Debug)]
+pub struct EscrowUnknownOwner {
+    state: MemoryBudgetState,
+    resolved: bool,
+}
+
+impl EscrowUnknownOwner {
+    fn release(mut self) {
+        if !self.resolved {
+            self.state.release_unknown_escrow();
+            self.resolved = true;
+        }
+    }
+}
+
+impl Drop for EscrowUnknownOwner {
+    fn drop(&mut self) {
+        if !self.resolved {
+            self.state.release_unknown_escrow();
+            self.resolved = true;
+        }
+    }
+}
+
 /// RAII holder for an escrow owner stored inside a shared-boundary queue slot.
 ///
 /// A queued item at a shared boundary (such as a balanced topic queue entry)
@@ -2653,6 +2729,7 @@ impl Drop for EscrowTicket {
 #[derive(Debug, Default)]
 pub struct EscrowSlot {
     ticket: Option<EscrowTicket>,
+    unknown_owner: Option<EscrowUnknownOwner>,
 }
 
 impl EscrowSlot {
@@ -2661,6 +2738,16 @@ impl EscrowSlot {
     pub fn new(ticket: EscrowTicket) -> Self {
         Self {
             ticket: Some(ticket),
+            unknown_owner: None,
+        }
+    }
+
+    /// Creates a slot owning an unknown-size shared-boundary item.
+    #[must_use]
+    pub fn unknown(owner: EscrowUnknownOwner) -> Self {
+        Self {
+            ticket: None,
+            unknown_owner: Some(owner),
         }
     }
 
@@ -2668,13 +2755,16 @@ impl EscrowSlot {
     /// uncharged case).
     #[must_use]
     pub const fn empty() -> Self {
-        Self { ticket: None }
+        Self {
+            ticket: None,
+            unknown_owner: None,
+        }
     }
 
     /// Returns whether this slot owns an escrow ticket.
     #[must_use]
     pub fn is_some(&self) -> bool {
-        self.ticket.is_some()
+        self.ticket.is_some() || self.unknown_owner.is_some()
     }
 
     /// Returns the escrow bytes owned by this slot, if any.
@@ -2692,15 +2782,23 @@ impl EscrowSlot {
     pub fn take(&mut self) -> Option<EscrowTicket> {
         self.ticket.take()
     }
+
+    /// Releases any owner held by this slot.
+    pub fn release(&mut self) {
+        if let Some(ticket) = self.ticket.take() {
+            ticket.release();
+        }
+        if let Some(owner) = self.unknown_owner.take() {
+            owner.release();
+        }
+    }
 }
 
 impl Drop for EscrowSlot {
     fn drop(&mut self) {
-        if let Some(ticket) = self.ticket.take() {
-            // Uniform clean release on every queue-exit path (delivery, close,
-            // drain, eviction, drop-on-full). Not the abandoned graveyard.
-            ticket.release();
-        }
+        // Uniform clean release on every queue-exit path (delivery, close,
+        // drain, eviction, drop-on-full). Not the abandoned graveyard.
+        self.release();
     }
 }
 
@@ -3779,6 +3877,25 @@ mod tests {
     }
 
     #[test]
+    fn shared_escrow_minter_unknown_size_tracks_active_unknown_owner() {
+        let state = configure_state_for_shared_escrow(BudgetMode::ObserveOnly, false, 1_000, 1_000);
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let minter = handle.shared_escrow_minter(Arc::<str>::from("receiver:arrow"));
+
+        let envelope = minter.envelope(UnknownSize);
+        assert!(envelope.has_owner());
+        let snap = state.snapshot();
+        assert_eq!(snap.escrow_charged_bytes, 0);
+        assert_eq!(snap.escrow_unknown_count, 1);
+
+        drop(envelope);
+        let snap = state.snapshot();
+        assert_eq!(snap.escrow_charged_bytes, 0);
+        assert_eq!(snap.escrow_unknown_count, 0);
+        assert_eq!(snap.abandoned_escrow_count, 0);
+    }
+
+    #[test]
     fn shared_escrow_minter_mints_from_real_send_boundary_and_releases_on_drop() {
         let state = configure_state_for_shared_escrow(BudgetMode::ObserveOnly, false, 1_000, 1_000);
         let handle = state.register_runtime_snapshot(BudgetScopeId {
@@ -3837,15 +3954,18 @@ mod tests {
     }
 
     #[test]
-    fn shared_escrow_minter_unknown_size_returns_ownerless_envelope() {
+    fn shared_escrow_minter_unknown_size_envelope_tracks_unknown_owner() {
         let state = configure_state_for_shared_escrow(BudgetMode::ObserveOnly, false, 1_000, 1_000);
         let handle = state.register_runtime_snapshot(BudgetScopeId::default());
         let minter = handle.shared_escrow_minter(Arc::<str>::from("receiver:unknown"));
 
         assert!(minter.mint(UnknownSize).is_none());
         let envelope = minter.envelope(UnknownSize);
-        assert!(!envelope.has_owner());
+        assert!(envelope.has_owner());
+        assert_eq!(state.snapshot().escrow_unknown_count, 1);
+        drop(envelope);
         assert_eq!(state.snapshot().escrow_charged_bytes, 0);
+        assert_eq!(state.snapshot().escrow_unknown_count, 0);
     }
 
     #[test]

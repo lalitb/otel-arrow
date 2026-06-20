@@ -43,6 +43,7 @@ use crate::flow_metrics::{
     EndFlowMetrics, FlowDurationMetrics, FlowSignalsIncomingMetrics, FlowSignalsOutgoingMetrics,
     IncomingFlowMetrics, SharedFlowMetricState, nanos_u64,
 };
+use crate::memory_budget::SharedEscrowMinter;
 use crate::message::Message;
 use crate::node::NodeId;
 use crate::output_router::OutputRouter;
@@ -129,6 +130,8 @@ pub struct EffectHandler<PData> {
     pub(crate) core: EffectHandlerCore<PData>,
     /// Output-port router.
     pub router: OutputRouter<SharedSender<PData>>,
+    /// Per-output-port shared escrow minters for shared-boundary retention.
+    shared_escrow_minters: HashMap<PortName, SharedEscrowMinter>,
     /// Per-handler flow_metric state. See [`SharedFlowMetricState`] /
     /// [`EndFlowMetrics`] for field-level documentation.
     ///
@@ -154,6 +157,7 @@ impl<PData> EffectHandler<PData> {
         EffectHandler {
             core,
             router,
+            shared_escrow_minters: HashMap::new(),
             flow: SharedFlowMetricState::default(),
         }
     }
@@ -180,6 +184,29 @@ impl<PData> EffectHandler<PData> {
     #[must_use]
     pub fn connected_ports(&self) -> Vec<PortName> {
         self.router.connected_ports()
+    }
+
+    /// Installs shared-boundary escrow minters for shared output ports.
+    pub fn set_shared_escrow_minters(&mut self, minters: HashMap<PortName, SharedEscrowMinter>) {
+        self.shared_escrow_minters = minters;
+    }
+
+    /// Returns the escrow minter for the default output port, if configured.
+    #[must_use]
+    pub fn default_shared_escrow_minter(&self) -> Option<&SharedEscrowMinter> {
+        self.router
+            .default_port()
+            .and_then(|port| self.shared_escrow_minters.get(&port))
+    }
+
+    /// Returns the escrow minter for a named output port, if configured.
+    #[must_use]
+    pub fn shared_escrow_minter_for_port<P>(&self, port: P) -> Option<&SharedEscrowMinter>
+    where
+        P: Into<PortName>,
+    {
+        let port = port.into();
+        self.shared_escrow_minters.get(&port)
     }
 
     /// Returns the selected default output port name, if one exists.
@@ -349,6 +376,9 @@ impl<PData> EffectHandler<PData> {
     where
         PData: crate::processor::FlowMetricHook + Send,
     {
+        if let Some(minter) = self.default_shared_escrow_minter() {
+            data.attach_shared_escrow_owner(minter);
+        }
         data.before_processor_send(self);
         self.router.send_default(data).await
     }
@@ -368,6 +398,9 @@ impl<PData> EffectHandler<PData> {
     where
         PData: crate::processor::FlowMetricHook + Send,
     {
+        if let Some(minter) = self.default_shared_escrow_minter() {
+            data.attach_shared_escrow_owner(minter);
+        }
         data.before_processor_send(self);
         self.router.try_send_default(data)
     }
@@ -383,6 +416,10 @@ impl<PData> EffectHandler<PData> {
         P: Into<PortName>,
         PData: crate::processor::FlowMetricHook + Send,
     {
+        let port = port.into();
+        if let Some(minter) = self.shared_escrow_minter_for_port(port.clone()) {
+            data.attach_shared_escrow_owner(minter);
+        }
         data.before_processor_send(self);
         self.router.send_to(port, data).await
     }
@@ -403,6 +440,10 @@ impl<PData> EffectHandler<PData> {
         P: Into<PortName>,
         PData: crate::processor::FlowMetricHook + Send,
     {
+        let port = port.into();
+        if let Some(minter) = self.shared_escrow_minter_for_port(port.clone()) {
+            data.attach_shared_escrow_owner(minter);
+        }
         data.before_processor_send(self);
         self.router.try_send_to(port, data)
     }

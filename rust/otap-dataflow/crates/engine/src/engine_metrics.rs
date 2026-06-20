@@ -147,6 +147,10 @@ pub struct EngineMetrics {
     #[metric(unit = "{ticket}")]
     pub runtime_memory_budget_escrow_ticket_count: Gauge<u64>,
 
+    /// Shared-boundary retained items whose exact logical size is unknown.
+    #[metric(unit = "{item}")]
+    pub runtime_memory_budget_escrow_unknown_count: Gauge<u64>,
+
     /// Escrow bytes currently owning logical retained bytes.
     #[metric(unit = "{By}")]
     pub runtime_memory_budget_escrow_charged_bytes: Gauge<u64>,
@@ -366,6 +370,9 @@ impl EngineMetricsMonitor {
         self.metrics
             .runtime_memory_budget_escrow_ticket_count
             .set(memory_budget.escrow_ticket_count);
+        self.metrics
+            .runtime_memory_budget_escrow_unknown_count
+            .set(memory_budget.escrow_unknown_count);
         self.metrics
             .runtime_memory_budget_escrow_charged_bytes
             .set(memory_budget.escrow_charged_bytes);
@@ -599,6 +606,15 @@ mod tests {
             .try_into_escrow(&controller.memory_budget_state())
             .expect("observe-only abandoned escrow should fit");
         drop(abandoned_escrow);
+        struct UnknownSize;
+        impl crate::memory_budget::ChargedSize for UnknownSize {
+            fn charged_size(&self) -> Option<u64> {
+                None
+            }
+        }
+        let unknown_shared = handle
+            .shared_escrow_minter("metrics:unknown".into())
+            .mint_slot(UnknownSize);
         // The charge crossed a level threshold (Normal -> Soft) which publishes
         // automatically, but a final flush keeps the test resilient to future
         // changes that defer the transition publish.
@@ -631,6 +647,13 @@ mod tests {
                 .runtime_memory_budget_escrow_charged_bytes
                 .get(),
             42
+        );
+        assert_eq!(
+            monitor
+                .metrics
+                .runtime_memory_budget_escrow_unknown_count
+                .get(),
+            1
         );
         assert_eq!(
             monitor
@@ -719,6 +742,12 @@ mod tests {
             MetricValue::U64(15),
             "reported overshoot bytes should include bytes above floor plus leases"
         );
+        assert_eq!(
+            engine_metric(&snapshot, "runtime.memory.budget.escrow.unknown.count"),
+            MetricValue::U64(1),
+            "reported escrow unknown count should include active shared unknown owners"
+        );
+        drop(unknown_shared);
     }
 
     #[test]

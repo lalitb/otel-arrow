@@ -82,14 +82,12 @@ pub trait FlowMetricEffectHandler {
 /// per-`PData` behavior through this trait. PData types with nothing to
 /// do can simply write `impl FlowMetricHook for MyPData {}`.
 ///
-/// NOTE: This trait currently lives in `processor.rs` and only fires from
-/// processor run loops / processor effect handlers because processors are
-/// the only nodes that need pre-process and pre-send hooks today (for
-/// flow_metric flow metric). If receivers or exporters ever need
-/// analogous `before_*` / `after_*` hooks on PData, this trait should be
-/// hoisted to a more generic location (e.g. a top-level `flow_hook` module
-/// or `crate::lib`) and its `H: FlowMetricEffectHandler` bound generalized
-/// so it can be invoked from receiver/exporter handlers as well.
+/// NOTE: This trait currently lives in `processor.rs` because it started as
+/// the flow_metric hook surface. It also carries shared-escrow attach hooks for
+/// receiver/processor send helpers so generic sends cannot bypass shared-edge
+/// ownership. If more non-processor hooks are added, move it to a neutral
+/// module and split the processor-specific handler bounds from the generic
+/// payload ownership hooks.
 pub trait FlowMetricHook: Sized {
     /// Invoked once per message immediately before the processor handler
     /// forwards it to the output router.
@@ -206,6 +204,8 @@ pub enum ProcessorWrapper<PData> {
         /// Senders for PData messages per output port.
         /// Uses `SharedSender` to keep the shared processor `Send` for multi-threaded execution.
         pdata_senders: HashMap<PortName, SharedSender<PData>>,
+        /// Shared-boundary escrow minters per shared output port.
+        shared_escrow_minters: HashMap<PortName, SharedEscrowMinter>,
         /// A receiver for pdata messages.
         pdata_receiver: Option<SharedReceiver<PData>>,
         /// Telemetry guard for node lifecycle cleanup.
@@ -294,6 +294,7 @@ impl<PData> ProcessorWrapper<PData> {
             control_sender: SharedSender::mpsc(control_sender),
             control_receiver: SharedReceiver::mpsc(control_receiver),
             pdata_senders: HashMap::new(),
+            shared_escrow_minters: HashMap::new(),
             pdata_receiver: None,
             telemetry: None,
             source_tag: SourceTagging::Disabled,
@@ -335,6 +336,7 @@ impl<PData> ProcessorWrapper<PData> {
                 control_sender,
                 control_receiver,
                 pdata_senders,
+                shared_escrow_minters,
                 pdata_receiver,
                 source_tag,
                 ..
@@ -346,6 +348,7 @@ impl<PData> ProcessorWrapper<PData> {
                 control_sender,
                 control_receiver,
                 pdata_senders,
+                shared_escrow_minters,
                 pdata_receiver,
                 telemetry: Some(guard),
                 source_tag,
@@ -420,6 +423,7 @@ impl<PData> ProcessorWrapper<PData> {
                 user_config,
                 processor,
                 pdata_senders,
+                shared_escrow_minters,
                 pdata_receiver,
                 telemetry,
                 source_tag,
@@ -443,6 +447,7 @@ impl<PData> ProcessorWrapper<PData> {
                     control_sender,
                     control_receiver,
                     pdata_senders,
+                    shared_escrow_minters,
                     pdata_receiver,
                     telemetry,
                     source_tag,
@@ -515,6 +520,7 @@ impl<PData> ProcessorWrapper<PData> {
                 processor,
                 control_receiver,
                 pdata_senders,
+                shared_escrow_minters,
                 pdata_receiver,
                 user_config,
                 source_tag,
@@ -551,6 +557,7 @@ impl<PData> ProcessorWrapper<PData> {
                     metrics_reporter,
                 );
                 effect_handler.set_source_tagging(source_tag);
+                effect_handler.set_shared_escrow_minters(shared_escrow_minters);
                 effect_handler.core.set_local_scheduler(local_scheduler);
                 Ok(ProcessorWrapperRuntime::Shared {
                     processor,
@@ -841,12 +848,17 @@ impl<PData> NodeWithPDataSender<PData> for ProcessorWrapper<PData> {
     }
 
     fn set_shared_escrow_minter(&mut self, port: PortName, minter: SharedEscrowMinter) {
-        if let ProcessorWrapper::Local {
-            shared_escrow_minters,
-            ..
-        } = self
-        {
-            let _ = shared_escrow_minters.insert(port, minter);
+        match self {
+            ProcessorWrapper::Local {
+                shared_escrow_minters,
+                ..
+            }
+            | ProcessorWrapper::Shared {
+                shared_escrow_minters,
+                ..
+            } => {
+                let _ = shared_escrow_minters.insert(port, minter);
+            }
         }
     }
 }

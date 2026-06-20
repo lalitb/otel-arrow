@@ -1850,6 +1850,7 @@ item that has no owner.
 | `engine.runtime.memory.budget.unknown.bytes` | Retained bytes excluded from enforcement because exact logical size is unknown. |
 | `engine.runtime.memory.budget.uncovered.retained.bytes` | Retained bytes observed without a ticket owner. |
 | `engine.runtime.memory.budget.escrow.charged.bytes` | Logical bytes owned by an escrow boundary. |
+| `engine.runtime.memory.budget.escrow.unknown.count` | Shared-boundary retained items whose exact logical size is unknown. |
 | `engine.runtime.memory.budget.escrow.pool.held.bytes` | Escrow bytes backed by an explicit borrow against the global spare pool. |
 | `engine.runtime.memory.budget.escrow.pool.overshoot.bytes` | Escrow bytes not backed by a pool borrow, tolerated only in observe-only mode. |
 | `engine.runtime.memory.budget.escrow.ring.occupancy.bytes` | Broadcast or mixed-topic ring-slot escrow bytes. |
@@ -1936,9 +1937,11 @@ conflating two ownership models):
   local per-site slot is decremented, so the two views never double-count.
 - **Shared output channel** retention is owned by sendable escrow for
   `OtapPdata` sends that enter a shared channel from a shared receiver or from a
-  local source wired to `Sender::Shared`. It is reported through escrow bucket
-  gauges, not the local-ticket per-site counters. Generic shared-node state
-  remains future work.
+  local/shared source wired to a shared output channel. Known-size items are
+  reported through escrow bucket gauges, not the local-ticket per-site counters.
+  Unknown-size shared items carry a zero-byte unknown owner and increment the
+  escrow unknown-count gauge while retained. Generic shared-node state remains
+  future work.
 - The aggregate `unknown.bytes` observe-only diagnostic is not split per site.
 
 This is per-*site* attribution only. Per-group, per-pipeline, and per-tenant
@@ -2235,13 +2238,15 @@ boundary.
 
 `SharedEnvelope<T>` remains a primitive: it is verified to cross a real
 `Send`/thread boundary and release exactly once, but generic shared channels
-still carry plain `PData`. The production shared receiver output edge for
-`OtapPdata` uses the same escrow-owner family by carrying an `EscrowSlot` in
-the message while it is retained by the shared channel. Topic publishers do not
-call `SharedEnvelope<T>` directly: `try_publish_owned` performs the equivalent
-conversion at the broker boundary (point-to-point escrow for balanced,
-ring-slot escrow for broadcast, and an all-or-nothing fanout of one owner per
-retained destination for mixed).
+still carry plain `PData`. The production `OtapPdata` shared-output edge uses
+the same escrow-owner family by carrying an `EscrowSlot` in the message while it
+is retained by the shared channel. The engine installs shared-edge minters on
+generic local/shared receiver and processor send helpers so `OtapPdata` does not
+depend on source-node extension methods for this ownership. Topic publishers do
+not call `SharedEnvelope<T>` directly: `try_publish_owned` performs the
+equivalent conversion at the broker boundary (point-to-point escrow for
+balanced, ring-slot escrow for broadcast, and an all-or-nothing fanout of one
+owner per retained destination for mixed).
 
 Shared receivers are different from local producers: their handler threads do
 not own a `LocalMemoryTicket` to convert. The enabling primitive for that path
@@ -2421,7 +2426,9 @@ who require placement can choose `unsupported: error`.
 - Validate charged bytes, resident bytes, and process samples side by side.
 - Add observe-only coverage metrics for charged, uncovered, and unknown-size
   retained paths.
-- Add shadow-rejection counters for runtime and escrow decisions.
+- Add shadow-rejection counters for runtime and escrow decisions. Receiver
+  admission state records shadow decisions for wired receiver paths; an engine
+  rollup of all shadow-decision counters remains future work.
 - Continue observe-only.
 
 ### Phase 2b: Ticket Ownership

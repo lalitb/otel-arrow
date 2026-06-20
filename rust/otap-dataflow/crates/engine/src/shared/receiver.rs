@@ -41,6 +41,7 @@ use crate::error::{Error, TypedError};
 use crate::memory_budget::SharedEscrowMinter;
 use crate::node::NodeId;
 use crate::output_router::OutputRouter;
+use crate::processor::FlowMetricHook;
 use crate::shared::message::{SharedReceiver, SharedSender};
 use crate::terminal_state::TerminalState;
 use async_trait::async_trait;
@@ -209,7 +210,13 @@ impl<PData> EffectHandler<PData> {
     ///
     /// Returns an [`Error::ReceiverError`] if the message could not be routed to a port.
     #[inline]
-    pub async fn send_message(&self, data: PData) -> Result<(), TypedError<PData>> {
+    pub async fn send_message(&self, mut data: PData) -> Result<(), TypedError<PData>>
+    where
+        PData: FlowMetricHook,
+    {
+        if let Some(minter) = self.default_shared_escrow_minter() {
+            data.attach_shared_escrow_owner(minter);
+        }
         self.router.send_default(data).await
     }
 
@@ -224,16 +231,31 @@ impl<PData> EffectHandler<PData> {
     /// channel is full, or [`SendError::Closed`] if the channel is closed.
     /// Returns a [`TypedError::Error`] if no default port is configured.
     #[inline]
-    pub fn try_send_message(&self, data: PData) -> Result<(), TypedError<PData>> {
+    pub fn try_send_message(&self, mut data: PData) -> Result<(), TypedError<PData>>
+    where
+        PData: FlowMetricHook,
+    {
+        if let Some(minter) = self.default_shared_escrow_minter() {
+            data.attach_shared_escrow_owner(minter);
+        }
         self.router.try_send_default(data)
     }
 
     /// Sends a message to a specific named output port.
     #[inline]
-    pub async fn send_message_to<P>(&self, port: P, data: PData) -> Result<(), TypedError<PData>>
+    pub async fn send_message_to<P>(
+        &self,
+        port: P,
+        mut data: PData,
+    ) -> Result<(), TypedError<PData>>
     where
         P: Into<PortName>,
+        PData: FlowMetricHook,
     {
+        let port = port.into();
+        if let Some(minter) = self.shared_escrow_minter_for_port(port.clone()) {
+            data.attach_shared_escrow_owner(minter);
+        }
         self.router.send_to(port, data).await
     }
 
@@ -248,10 +270,15 @@ impl<PData> EffectHandler<PData> {
     /// channel is full, or [`SendError::Closed`] if the channel is closed.
     /// Returns a [`TypedError::Error`] if the port does not exist.
     #[inline]
-    pub fn try_send_message_to<P>(&self, port: P, data: PData) -> Result<(), TypedError<PData>>
+    pub fn try_send_message_to<P>(&self, port: P, mut data: PData) -> Result<(), TypedError<PData>>
     where
         P: Into<PortName>,
+        PData: FlowMetricHook,
     {
+        let port = port.into();
+        if let Some(minter) = self.shared_escrow_minter_for_port(port.clone()) {
+            data.attach_shared_escrow_owner(minter);
+        }
         self.router.try_send_to(port, data)
     }
 

@@ -1,0 +1,4 @@
+change_type: bug_fix
+component: engine
+note: "Improve observe-only retained-work memory accounting for shared-channel sends, unknown-size shared payloads, and receiver-admission shadow decisions."
+issues: [3272]

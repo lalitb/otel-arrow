@@ -266,6 +266,7 @@ struct SharedReceiverAdmissionStateInner {
     level: AtomicU8,
     retry_after_secs: AtomicU32,
     usage_bytes: AtomicU64,
+    shadow_rejection_count: AtomicU64,
     mode: MemoryLimiterMode,
 }
 
@@ -291,6 +292,7 @@ impl SharedReceiverAdmissionState {
                 level: AtomicU8::new(state.level() as u8),
                 retry_after_secs: AtomicU32::new(state.retry_after_secs()),
                 usage_bytes: AtomicU64::new(state.usage_bytes()),
+                shadow_rejection_count: AtomicU64::new(0),
                 mode: state.mode(),
             }),
         }
@@ -337,6 +339,13 @@ impl SharedReceiverAdmissionState {
         MemoryPressureLevel::from_u8(self.inner.level.load(Ordering::Relaxed))
     }
 
+    /// Returns the number of observe-only/gate-disabled receiver admission
+    /// decisions that would have rejected but were admitted.
+    #[must_use]
+    pub fn shadow_rejection_count(&self) -> u64 {
+        self.inner.shadow_rejection_count.load(Ordering::Relaxed)
+    }
+
     /// Evaluates a combined receiver-admission decision from this (shared)
     /// process-pressure snapshot plus the supplied runtime memory-budget
     /// pressure inputs.
@@ -354,14 +363,21 @@ impl SharedReceiverAdmissionState {
         runtime_budget_level: Option<crate::memory_budget::BudgetLevel>,
         runtime_budget_enforce: bool,
     ) -> ReceiverAdmissionDecision {
-        ReceiverAdmissionInputs {
+        let decision = ReceiverAdmissionInputs {
             process_level: MemoryPressureLevel::from_u8(self.inner.level.load(Ordering::Relaxed)),
             process_enforce: self.inner.mode == MemoryLimiterMode::Enforce,
             runtime_budget_level,
             runtime_budget_enforce,
             retry_after_secs: self.inner.retry_after_secs.load(Ordering::Relaxed),
         }
-        .evaluate()
+        .evaluate();
+        if decision.is_shadow_reject() {
+            let _ = self
+                .inner
+                .shadow_rejection_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        decision
     }
 }
 #[derive(Debug)]
@@ -370,6 +386,7 @@ struct LocalReceiverAdmissionStateInner {
     level: Cell<MemoryPressureLevel>,
     retry_after_secs: Cell<u32>,
     usage_bytes: Cell<u64>,
+    shadow_rejection_count: Cell<u64>,
     mode: MemoryLimiterMode,
 }
 
@@ -389,6 +406,7 @@ impl LocalReceiverAdmissionState {
                 level: Cell::new(state.level()),
                 retry_after_secs: Cell::new(state.retry_after_secs()),
                 usage_bytes: Cell::new(state.usage_bytes()),
+                shadow_rejection_count: Cell::new(0),
                 mode: state.mode(),
             }),
         }
@@ -427,6 +445,13 @@ impl LocalReceiverAdmissionState {
         self.inner.level.get()
     }
 
+    /// Returns the number of observe-only/gate-disabled receiver admission
+    /// decisions that would have rejected but were admitted.
+    #[must_use]
+    pub fn shadow_rejection_count(&self) -> u64 {
+        self.inner.shadow_rejection_count.get()
+    }
+
     /// Evaluates a combined receiver-admission decision from this process-pressure
     /// snapshot plus the supplied runtime memory-budget pressure inputs.
     ///
@@ -448,14 +473,20 @@ impl LocalReceiverAdmissionState {
         runtime_budget_level: Option<crate::memory_budget::BudgetLevel>,
         runtime_budget_enforce: bool,
     ) -> ReceiverAdmissionDecision {
-        ReceiverAdmissionInputs {
+        let decision = ReceiverAdmissionInputs {
             process_level: self.inner.level.get(),
             process_enforce: self.inner.mode == MemoryLimiterMode::Enforce,
             runtime_budget_level,
             runtime_budget_enforce,
             retry_after_secs: self.inner.retry_after_secs.get(),
         }
-        .evaluate()
+        .evaluate();
+        if decision.is_shadow_reject() {
+            self.inner
+                .shadow_rejection_count
+                .set(self.inner.shadow_rejection_count.get().saturating_add(1));
+        }
+        decision
     }
 }
 // ---------------------------------------------------------------------------
@@ -1736,11 +1767,21 @@ mod tests {
             let decision = local.evaluate(Some(BudgetLevel::Hard), false);
             assert!(!decision.is_reject());
             assert!(decision.is_shadow_reject());
+            assert_eq!(
+                local.shadow_rejection_count(),
+                1,
+                "local admission records the observe-only would-reject"
+            );
 
             // Soft runtime budget never rejects.
             let decision = local.evaluate(Some(BudgetLevel::Soft), true);
             assert!(decision.is_admitted());
             assert_eq!(decision.source, ReceiverAdmissionSource::None);
+            assert_eq!(
+                local.shadow_rejection_count(),
+                1,
+                "clean admits do not increment shadow rejections"
+            );
         }
 
         #[test]
@@ -1759,9 +1800,19 @@ mod tests {
 
             // Gate disabled: shadow only, never an actual reject.
             assert!(!shared.evaluate(Some(BudgetLevel::Hard), false).is_reject());
+            assert_eq!(
+                shared.shadow_rejection_count(),
+                1,
+                "shared admission records the observe-only would-reject"
+            );
 
             // Soft runtime budget admits.
             assert!(shared.evaluate(Some(BudgetLevel::Soft), true).is_admitted());
+            assert_eq!(
+                shared.shadow_rejection_count(),
+                1,
+                "clean admits do not increment shadow rejections"
+            );
         }
     }
 

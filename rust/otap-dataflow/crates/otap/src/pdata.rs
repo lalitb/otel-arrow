@@ -631,9 +631,7 @@ impl OtapPdata {
         if self.shared_escrow_owner.is_some() {
             return;
         }
-        if let Some(ticket) = minter.mint(&*self) {
-            self.shared_escrow_owner = EscrowSlot::new(ticket);
-        }
+        self.shared_escrow_owner = minter.mint_slot(&*self);
     }
 
     /// Releases shared-channel escrow ownership when this pdata is delivered
@@ -643,9 +641,7 @@ impl OtapPdata {
     /// leaves that channel, downstream retained sites must account for any new
     /// retention with their own local tickets.
     pub fn release_shared_escrow_owner_on_delivery(&mut self) {
-        if let Some(ticket) = self.shared_escrow_owner.take() {
-            ticket.release();
-        }
+        self.shared_escrow_owner.release();
     }
 
     /// Returns whether this pdata currently owns shared-boundary escrow.
@@ -1481,6 +1477,43 @@ mod test {
     }
 
     #[tokio::test]
+    async fn shared_receiver_plain_send_attaches_escrow_until_queue_exit() {
+        let state = configure_shared_receiver_escrow();
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let minter = handle.shared_escrow_minter(Arc::<str>::from("receiver:plain"));
+
+        let (tx, mut rx) = mpsc::channel::<OtapPdata>(4);
+        let mut senders = HashMap::new();
+        let _ = senders.insert("out".into(), SharedSender::mpsc(tx));
+
+        let (ctrl_tx, _ctrl_rx) = runtime_ctrl_msg_channel(4);
+        let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
+        let mut handler = SharedReceiverEffectHandler::new(
+            NodeId {
+                index: 13,
+                name: "shared_recv_plain".into(),
+            },
+            senders,
+            Some("out".into()),
+            ctrl_tx,
+            metrics_reporter,
+        );
+        let mut minters = HashMap::new();
+        let _ = minters.insert("out".into(), minter);
+        handler.set_shared_escrow_minters(minters);
+
+        let pdata = create_test_pdata();
+        let bytes = pdata.charged_size().expect("known test size");
+        handler.send_message(pdata).await.expect("send ok");
+
+        assert_eq!(state.snapshot().escrow_charged_bytes, bytes);
+        let sent = rx.recv().await.expect("message received");
+        assert_eq!(sent.shared_escrow_owner_bytes(), Some(bytes));
+        drop(sent);
+        assert_eq!(state.snapshot().escrow_charged_bytes, 0);
+    }
+
+    #[tokio::test]
     async fn shared_receiver_delivery_releases_escrow_owner() {
         let state = configure_shared_receiver_escrow();
         let handle = state.register_runtime_snapshot(BudgetScopeId::default());
@@ -1605,6 +1638,43 @@ mod test {
             .send_message_with_source_node(pdata)
             .await
             .expect("send ok");
+
+        assert_eq!(state.snapshot().escrow_charged_bytes, bytes);
+        let sent = rx.recv().await.expect("message received");
+        assert_eq!(sent.shared_escrow_owner_bytes(), Some(bytes));
+        drop(sent);
+        assert_eq!(state.snapshot().escrow_charged_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn local_receiver_plain_shared_send_attaches_escrow() {
+        let state = configure_shared_receiver_escrow();
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let minter = handle.shared_escrow_minter(Arc::<str>::from("local-receiver:plain"));
+
+        let (tx, mut rx) = mpsc::channel::<OtapPdata>(4);
+        let mut senders = HashMap::new();
+        let _ = senders.insert("out".into(), Sender::Shared(SharedSender::mpsc(tx)));
+
+        let (ctrl_tx, _ctrl_rx) = runtime_ctrl_msg_channel(4);
+        let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
+        let mut handler = LocalReceiverEffectHandler::new(
+            NodeId {
+                index: 12,
+                name: "local_recv_plain".into(),
+            },
+            senders,
+            Some("out".into()),
+            ctrl_tx,
+            metrics_reporter,
+        );
+        let mut minters = HashMap::new();
+        let _ = minters.insert("out".into(), minter);
+        handler.set_shared_escrow_minters(minters);
+
+        let pdata = create_test_pdata();
+        let bytes = pdata.charged_size().expect("known test size");
+        handler.send_message(pdata).await.expect("send ok");
 
         assert_eq!(state.snapshot().escrow_charged_bytes, bytes);
         let sent = rx.recv().await.expect("message received");
