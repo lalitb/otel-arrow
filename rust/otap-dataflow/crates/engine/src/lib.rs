@@ -2380,13 +2380,12 @@ impl ResolvedHyperEdgeRuntime {
             channel_metrics_enabled,
         )?;
 
-        let shared_escrow_minters = source_nodes
+        let shared_escrow_minters = source_contexts
             .iter()
-            .zip(source_contexts.iter())
             .zip(source_ports.iter())
             .zip(pdata_senders.iter())
-            .map(|(((source_node, source_context), source_port), sender)| {
-                if !source_node.is_shared() || !matches!(sender, Sender::Shared(_)) {
+            .map(|((source_context, source_port), sender)| {
+                if !matches!(sender, Sender::Shared(_)) {
                     return None;
                 }
                 let boundary = Arc::<str>::from(format!(

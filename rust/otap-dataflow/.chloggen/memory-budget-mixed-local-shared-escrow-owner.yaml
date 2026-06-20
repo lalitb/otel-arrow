@@ -1,0 +1,4 @@
+change_type: enhancement
+component: engine
+note: Account observe-only escrow ownership for mixed local-to-shared OTAP dataflow output channels.
+issues: [3272]

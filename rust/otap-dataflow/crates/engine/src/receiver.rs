@@ -58,6 +58,8 @@ pub enum ReceiverWrapper<PData> {
         /// Uses the generic `Sender` so local receivers can still target shared channels when
         /// mixed local/shared wiring requires it.
         pdata_senders: HashMap<PortName, Sender<PData>>,
+        /// Shared-boundary escrow minters per shared output port.
+        shared_escrow_minters: HashMap<PortName, SharedEscrowMinter>,
         /// A receiver for pdata messages.
         pdata_receiver: Option<LocalReceiver<PData>>,
         /// Telemetry guard for node lifecycle cleanup.
@@ -132,6 +134,7 @@ impl<PData> ReceiverWrapper<PData> {
             control_sender: LocalSender::mpsc(control_sender),
             control_receiver: LocalReceiver::mpsc(control_receiver),
             pdata_senders: HashMap::new(),
+            shared_escrow_minters: HashMap::new(),
             pdata_receiver: None,
             telemetry: None,
             source_tag: SourceTagging::Disabled,
@@ -178,6 +181,7 @@ impl<PData> ReceiverWrapper<PData> {
                 control_sender,
                 control_receiver,
                 pdata_senders,
+                shared_escrow_minters,
                 pdata_receiver,
                 source_tag,
                 capture_policy,
@@ -190,6 +194,7 @@ impl<PData> ReceiverWrapper<PData> {
                 control_sender,
                 control_receiver,
                 pdata_senders,
+                shared_escrow_minters,
                 pdata_receiver,
                 telemetry: Some(guard),
                 source_tag,
@@ -247,6 +252,7 @@ impl<PData> ReceiverWrapper<PData> {
                 user_config,
                 receiver,
                 pdata_senders,
+                shared_escrow_minters,
                 pdata_receiver,
                 telemetry,
                 source_tag,
@@ -272,6 +278,7 @@ impl<PData> ReceiverWrapper<PData> {
                     control_sender,
                     control_receiver,
                     pdata_senders,
+                    shared_escrow_minters,
                     pdata_receiver,
                     telemetry,
                     source_tag,
@@ -338,6 +345,7 @@ impl<PData> ReceiverWrapper<PData> {
                     receiver,
                     control_receiver,
                     pdata_senders,
+                    shared_escrow_minters,
                     user_config,
                     source_tag,
                     capture_policy,
@@ -366,6 +374,7 @@ impl<PData> ReceiverWrapper<PData> {
                 );
                 effect_handler.set_source_tagging(source_tag);
                 effect_handler.set_capture_policy(capture_policy);
+                effect_handler.set_shared_escrow_minters(shared_escrow_minters);
                 effect_handler
                     .core
                     .set_pipeline_completion_msg_sender(pipeline_completion_msg_tx);
@@ -504,12 +513,17 @@ impl<PData> NodeWithPDataSender<PData> for ReceiverWrapper<PData> {
     }
 
     fn set_shared_escrow_minter(&mut self, port: PortName, minter: SharedEscrowMinter) {
-        if let ReceiverWrapper::Shared {
-            shared_escrow_minters,
-            ..
-        } = self
-        {
-            let _ = shared_escrow_minters.insert(port, minter);
+        match self {
+            ReceiverWrapper::Local {
+                shared_escrow_minters,
+                ..
+            }
+            | ReceiverWrapper::Shared {
+                shared_escrow_minters,
+                ..
+            } => {
+                let _ = shared_escrow_minters.insert(port, minter);
+            }
         }
     }
 }
@@ -527,6 +541,7 @@ impl<PData> ReceiverWrapper<PData> {
                 control_sender,
                 control_receiver,
                 pdata_senders,
+                shared_escrow_minters,
                 pdata_receiver,
                 telemetry,
                 source_tag,
@@ -539,6 +554,7 @@ impl<PData> ReceiverWrapper<PData> {
                 control_sender,
                 control_receiver,
                 pdata_senders,
+                shared_escrow_minters,
                 pdata_receiver,
                 telemetry,
                 source_tag,

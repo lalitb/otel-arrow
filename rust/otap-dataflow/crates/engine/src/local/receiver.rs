@@ -38,6 +38,7 @@ use crate::effect_handler::{
     EffectHandlerCore, SourceTagging, TelemetryTimerCancelHandle, TimerCancelHandle,
 };
 use crate::error::{Error, TypedError};
+use crate::memory_budget::SharedEscrowMinter;
 use crate::message::Sender;
 use crate::node::NodeId;
 use crate::output_router::OutputRouter;
@@ -135,6 +136,8 @@ pub struct EffectHandler<PData> {
     pub(crate) core: EffectHandlerCore<PData>,
     /// Output-port router.
     pub router: OutputRouter<Sender<PData>>,
+    /// Per-output-port shared escrow minters for mixed local-to-shared retention.
+    shared_escrow_minters: HashMap<PortName, SharedEscrowMinter>,
     /// Capture policy for extracting transport headers from inbound metadata.
     /// `None` when no capture policy is configured (zero overhead).
     capture_policy: Option<HeaderCapturePolicy>,
@@ -157,6 +160,7 @@ impl<PData> EffectHandler<PData> {
         EffectHandler {
             core,
             router,
+            shared_escrow_minters: HashMap::new(),
             capture_policy: None,
         }
     }
@@ -183,6 +187,29 @@ impl<PData> EffectHandler<PData> {
     #[must_use]
     pub fn connected_ports(&self) -> Vec<PortName> {
         self.router.connected_ports()
+    }
+
+    /// Installs shared-boundary escrow minters for shared output ports.
+    pub fn set_shared_escrow_minters(&mut self, minters: HashMap<PortName, SharedEscrowMinter>) {
+        self.shared_escrow_minters = minters;
+    }
+
+    /// Returns the escrow minter for the default output port, if configured.
+    #[must_use]
+    pub fn default_shared_escrow_minter(&self) -> Option<&SharedEscrowMinter> {
+        self.router
+            .default_port()
+            .and_then(|port| self.shared_escrow_minters.get(&port))
+    }
+
+    /// Returns the escrow minter for a named output port, if configured.
+    #[must_use]
+    pub fn shared_escrow_minter_for_port<P>(&self, port: P) -> Option<&SharedEscrowMinter>
+    where
+        P: Into<PortName>,
+    {
+        let port = port.into();
+        self.shared_escrow_minters.get(&port)
     }
 
     /// Returns the precomputed node interests.

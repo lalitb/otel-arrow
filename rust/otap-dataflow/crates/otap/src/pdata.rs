@@ -622,7 +622,7 @@ impl OtapPdata {
     }
 
     /// Attaches shared-boundary escrow ownership when this pdata is retained by
-    /// a shared receiver output channel.
+    /// a shared output channel.
     ///
     /// This stores only a sendable [`EscrowSlot`], never a runtime-local
     /// ticket. Clones intentionally do not copy the owner, preserving the
@@ -903,6 +903,10 @@ impl FlowMetricHook for OtapPdata {
         flow_accumulate(handler, self);
     }
 
+    fn attach_shared_escrow_owner(&mut self, minter: &SharedEscrowMinter) {
+        Self::attach_shared_escrow_owner(self, minter);
+    }
+
     /// At the flow_metric start node, count items *entering* the range —
     /// i.e. before `process()` runs and may filter or drop them. This
     /// gives the true input volume to compare against the end-node
@@ -930,7 +934,6 @@ macro_rules! maybe_processor_send_hook {
     (with_hook, $handler:expr, $data:expr) => {
         $data.before_processor_send($handler);
     };
-    (no_hook, $handler:expr, $data:expr) => {};
 }
 
 macro_rules! impl_message_source_ext {
@@ -984,20 +987,128 @@ macro_rules! impl_message_source_ext {
     };
 }
 
-impl_message_source_ext!(
-    async_trait(?Send),
-    MessageSourceLocalEffectHandlerExtension,
-    otap_df_engine::local::processor::EffectHandler<OtapPdata>,
-    processor_id,
-    with_hook
-);
-impl_message_source_ext!(
-    async_trait(?Send),
-    MessageSourceLocalEffectHandlerExtension,
-    otap_df_engine::local::receiver::EffectHandler<OtapPdata>,
-    receiver_id,
-    no_hook
-);
+#[async_trait(?Send)]
+impl MessageSourceLocalEffectHandlerExtension<OtapPdata>
+    for otap_df_engine::local::processor::EffectHandler<OtapPdata>
+{
+    async fn send_message_with_source_node(
+        &self,
+        mut data: OtapPdata,
+    ) -> Result<(), TypedError<OtapPdata>> {
+        data.prepare_source_send(self.node_interests(), self.processor_id().index);
+        if let Some(minter) = self.default_shared_escrow_minter() {
+            data.attach_shared_escrow_owner(minter);
+        }
+        data.before_processor_send(self);
+        self.router.send_default_stamped(data).await
+    }
+
+    fn try_send_message_with_source_node(
+        &self,
+        mut data: OtapPdata,
+    ) -> Result<(), TypedError<OtapPdata>> {
+        data.prepare_source_send(self.node_interests(), self.processor_id().index);
+        if let Some(minter) = self.default_shared_escrow_minter() {
+            data.attach_shared_escrow_owner(minter);
+        }
+        data.before_processor_send(self);
+        self.router.try_send_default_stamped(data)
+    }
+
+    async fn send_message_with_source_node_to<P>(
+        &self,
+        port: P,
+        mut data: OtapPdata,
+    ) -> Result<(), TypedError<OtapPdata>>
+    where
+        P: Into<PortName> + Send + 'static,
+    {
+        let port = port.into();
+        data.prepare_source_send(self.node_interests(), self.processor_id().index);
+        if let Some(minter) = self.shared_escrow_minter_for_port(port.clone()) {
+            data.attach_shared_escrow_owner(minter);
+        }
+        data.before_processor_send(self);
+        self.router.send_to_stamped(port, data).await
+    }
+
+    fn try_send_message_with_source_node_to<P>(
+        &self,
+        port: P,
+        mut data: OtapPdata,
+    ) -> Result<(), TypedError<OtapPdata>>
+    where
+        P: Into<PortName> + Send + 'static,
+    {
+        let port = port.into();
+        data.prepare_source_send(self.node_interests(), self.processor_id().index);
+        if let Some(minter) = self.shared_escrow_minter_for_port(port.clone()) {
+            data.attach_shared_escrow_owner(minter);
+        }
+        data.before_processor_send(self);
+        self.router.try_send_to_stamped(port, data)
+    }
+}
+
+#[async_trait(?Send)]
+impl MessageSourceLocalEffectHandlerExtension<OtapPdata>
+    for otap_df_engine::local::receiver::EffectHandler<OtapPdata>
+{
+    async fn send_message_with_source_node(
+        &self,
+        mut data: OtapPdata,
+    ) -> Result<(), TypedError<OtapPdata>> {
+        data.prepare_source_send(self.node_interests(), self.receiver_id().index);
+        if let Some(minter) = self.default_shared_escrow_minter() {
+            data.attach_shared_escrow_owner(minter);
+        }
+        self.router.send_default_stamped(data).await
+    }
+
+    fn try_send_message_with_source_node(
+        &self,
+        mut data: OtapPdata,
+    ) -> Result<(), TypedError<OtapPdata>> {
+        data.prepare_source_send(self.node_interests(), self.receiver_id().index);
+        if let Some(minter) = self.default_shared_escrow_minter() {
+            data.attach_shared_escrow_owner(minter);
+        }
+        self.router.try_send_default_stamped(data)
+    }
+
+    async fn send_message_with_source_node_to<P>(
+        &self,
+        port: P,
+        mut data: OtapPdata,
+    ) -> Result<(), TypedError<OtapPdata>>
+    where
+        P: Into<PortName> + Send + 'static,
+    {
+        let port = port.into();
+        data.prepare_source_send(self.node_interests(), self.receiver_id().index);
+        if let Some(minter) = self.shared_escrow_minter_for_port(port.clone()) {
+            data.attach_shared_escrow_owner(minter);
+        }
+        self.router.send_to_stamped(port, data).await
+    }
+
+    fn try_send_message_with_source_node_to<P>(
+        &self,
+        port: P,
+        mut data: OtapPdata,
+    ) -> Result<(), TypedError<OtapPdata>>
+    where
+        P: Into<PortName> + Send + 'static,
+    {
+        let port = port.into();
+        data.prepare_source_send(self.node_interests(), self.receiver_id().index);
+        if let Some(minter) = self.shared_escrow_minter_for_port(port.clone()) {
+            data.attach_shared_escrow_owner(minter);
+        }
+        self.router.try_send_to_stamped(port, data)
+    }
+}
+
 impl_message_source_ext!(
     async_trait,
     MessageSourceSharedEffectHandlerExtension,
@@ -1391,6 +1502,131 @@ mod test {
 
         let err = handler
             .try_send_message_with_source_node(create_test_pdata())
+            .expect_err("second send must fail while queue is full");
+        let returned = match err {
+            TypedError::ChannelSendError(otap_df_channel::error::SendError::Full(data)) => data,
+            other => panic!("unexpected send error: {other:?}"),
+        };
+        assert_eq!(returned.shared_escrow_owner_bytes(), Some(bytes));
+        assert_eq!(
+            state.snapshot().escrow_charged_bytes,
+            bytes.saturating_mul(2)
+        );
+
+        drop(returned);
+        assert_eq!(state.snapshot().escrow_charged_bytes, bytes);
+        drop(rx.try_recv().expect("queued message"));
+        assert_eq!(state.snapshot().escrow_charged_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn local_receiver_shared_sender_attaches_escrow_until_queue_exit() {
+        let state = configure_shared_receiver_escrow();
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let minter = handle.shared_escrow_minter(Arc::<str>::from("local-receiver:out"));
+
+        let (tx, mut rx) = mpsc::channel::<OtapPdata>(4);
+        let mut senders = HashMap::new();
+        let _ = senders.insert("out".into(), Sender::Shared(SharedSender::mpsc(tx)));
+
+        let (ctrl_tx, _ctrl_rx) = runtime_ctrl_msg_channel(4);
+        let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
+        let mut handler = LocalReceiverEffectHandler::new(
+            NodeId {
+                index: 11,
+                name: "local_recv".into(),
+            },
+            senders,
+            Some("out".into()),
+            ctrl_tx,
+            metrics_reporter,
+        );
+        let mut minters = HashMap::new();
+        let _ = minters.insert("out".into(), minter);
+        handler.set_shared_escrow_minters(minters);
+
+        let pdata = create_test_pdata();
+        let bytes = pdata.charged_size().expect("known test size");
+        handler
+            .send_message_with_source_node(pdata)
+            .await
+            .expect("send ok");
+
+        assert_eq!(state.snapshot().escrow_charged_bytes, bytes);
+        let sent = rx.recv().await.expect("message received");
+        assert_eq!(sent.shared_escrow_owner_bytes(), Some(bytes));
+        drop(sent);
+        assert_eq!(state.snapshot().escrow_charged_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn local_processor_plain_shared_send_attaches_escrow() {
+        let state = configure_shared_receiver_escrow();
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let minter = handle.shared_escrow_minter(Arc::<str>::from("local-processor:out"));
+
+        let (tx, mut rx) = mpsc::channel::<OtapPdata>(4);
+        let mut senders = HashMap::new();
+        let _ = senders.insert("out".into(), Sender::Shared(SharedSender::mpsc(tx)));
+
+        let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
+        let mut handler = LocalProcessorEffectHandler::new(
+            NodeId {
+                index: 12,
+                name: "local_proc".into(),
+            },
+            senders,
+            Some("out".into()),
+            metrics_reporter,
+        );
+        let mut minters = HashMap::new();
+        let _ = minters.insert("out".into(), minter);
+        handler.set_shared_escrow_minters(minters);
+
+        let pdata = create_test_pdata();
+        let bytes = pdata.charged_size().expect("known test size");
+        handler.try_send_message(pdata).expect("try_send ok");
+
+        assert_eq!(state.snapshot().escrow_charged_bytes, bytes);
+        let sent = rx.try_recv().expect("message received");
+        assert_eq!(sent.shared_escrow_owner_bytes(), Some(bytes));
+        drop(sent);
+        assert_eq!(state.snapshot().escrow_charged_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn local_processor_failed_try_send_returns_escrow_owner() {
+        let state = configure_shared_receiver_escrow();
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let minter = handle.shared_escrow_minter(Arc::<str>::from("local-processor:full"));
+
+        let (tx, mut rx) = mpsc::channel::<OtapPdata>(1);
+        let mut senders = HashMap::new();
+        let _ = senders.insert("out".into(), Sender::Shared(SharedSender::mpsc(tx)));
+
+        let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
+        let mut handler = LocalProcessorEffectHandler::new(
+            NodeId {
+                index: 12,
+                name: "local_proc".into(),
+            },
+            senders,
+            Some("out".into()),
+            metrics_reporter,
+        );
+        let mut minters = HashMap::new();
+        let _ = minters.insert("out".into(), minter);
+        handler.set_shared_escrow_minters(minters);
+
+        let first = create_test_pdata();
+        let bytes = first.charged_size().expect("known test size");
+        handler
+            .try_send_message(first)
+            .expect("first send fills queue");
+        assert_eq!(state.snapshot().escrow_charged_bytes, bytes);
+
+        let err = handler
+            .try_send_message(create_test_pdata())
             .expect_err("second send must fail while queue is full");
         let returned = match err {
             TypedError::ChannelSendError(otap_df_channel::error::SendError::Full(data)) => data,
