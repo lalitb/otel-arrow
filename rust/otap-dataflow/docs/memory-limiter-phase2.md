@@ -1676,10 +1676,11 @@ Validation:
     path. It is rejected in default builds and accepted only with the
     `unstable-memory-enforcement` feature.
   - `enforcement.reclaim_hooks` currently gates component-driven pressure relief
-    for the batch processor: when the runtime budget is at `Soft` or `Hard`
-    pressure, the batch processor can flush its pending buffer early through its
-    normal `EffectHandler` path. It is rejected in default builds and accepted
-    only with the `unstable-memory-enforcement` feature.
+    for the batch processor in enforce mode: when the runtime budget is at
+    `Soft` or `Hard` pressure, the batch processor can flush its pending buffer
+    early through its normal `EffectHandler` path. It is rejected in default
+    builds and accepted only with the `unstable-memory-enforcement` feature.
+    Observe-only mode remains passive and never changes batch timing.
   - `enforcement.receiver_admission` gates runtime-budget receiver shedding,
     currently wired for the **syslog CEF receiver** (local), the **OTLP HTTP
     receiver** (shared), the **OTLP gRPC receiver** (shared, via its
@@ -1725,11 +1726,12 @@ Validation:
     the buffer on internal drain and are released when the batches leave for
     output on flush, or on processor drop. Known-size OTLP-bytes inputs charge
     their byte length; unknown-size OTAP arrow inputs are tracked as unknown).
-    With `enforcement.reclaim_hooks` enabled in an unstable build, runtime
-    `Soft`/`Hard` pressure triggers an early flush of this pending buffer through
-    the normal flush path. This is pressure relief, not silent dropping: buffered
-    telemetry is sent downstream and the parallel tickets are released by the
-    existing handoff.
+    With `mode = enforce` and `enforcement.reclaim_hooks` enabled in an
+    unstable build, runtime `Soft`/`Hard` pressure triggers an early flush of
+    this pending buffer through the normal flush path. This is pressure relief,
+    not silent dropping: buffered telemetry is sent downstream and the parallel
+    tickets are released by the existing handoff. In observe-only mode this path
+    remains passive and does not change batch boundaries or timing.
   These exporter/processor sites are accounting points, not admission points:
   under `mode = enforce` a rejected charge yields no ticket and the work still
   proceeds, so they never drop data. Admission/enforcement of retained work
@@ -2052,9 +2054,9 @@ call, so registered reclaimers are never all borrowed at once and a reclaimer ma
 register or unregister others mid-pass (changes apply to the next pass). Dropping
 the [`ReclaimRegistration`] removes the reclaimer automatically when the site is
 torn down. The registry is the *mechanism*: registering concrete site reclaimers
-and triggering reclaim from admission/pressure stays gated behind
-`enforcement.reclaim_hooks`, which the config layer rejects until that wiring
-exists, and is wired site by site.
+and triggering registry reclaim from admission/pressure stays future work and
+must stay gated behind `enforcement.reclaim_hooks` when it is wired site by
+site.
 
 The per-runtime registry is reachable the same way as the runtime memory budget:
 the controller installs a fresh `ReclaimRegistry` on each pinned pipeline thread
@@ -2066,11 +2068,12 @@ the registry mechanism is present but inert and installing it is a no-op for
 budget behavior.
 
 The first live `reclaim_hooks` behavior is intentionally **component-driven
-pressure relief**, not registry-driven reclaim: the batch processor checks the
-current runtime budget on its own `process()` turn, where its `EffectHandler` is
-available, and flushes its pending buffer early when the runtime is at `Soft` or
-`Hard` pressure. This releases retained payloads and tickets together through
-the normal flush handoff and does not drop telemetry. Registry reclaim remains a
+pressure relief**, not registry-driven reclaim: in enforce mode, the batch
+processor checks the current runtime budget on its own `process()` turn, where
+its `EffectHandler` is available, and flushes its pending buffer early when the
+runtime is at `Soft` or `Hard` pressure. This releases retained payloads and
+tickets together through the normal flush handoff and does not drop telemetry.
+Observe-only mode does not trigger this early flush. Registry reclaim remains a
 foundation for future sites that can safely release retained owners without
 component-side effects.
 
@@ -2097,8 +2100,8 @@ Consequently a retry "reclaimer" could only drop tickets. That would lower
 `charged_bytes` **without** freeing the retained `OtapPdata` (it still resumes
 and is processed) and without shedding any telemetry, undercounting retained
 memory and silently violating the reclaim contract ("release only by dropping
-the owners already held"). We therefore do **not** wire it, and keep
-`reclaim_hooks` rejected at config validation.
+the owners already held"). We therefore do **not** wire retry as a registry
+reclaimer.
 
 A valid first reclaim site requires one of the following future fixes:
 
@@ -2249,9 +2252,11 @@ escrow bucket) and can mint an `EscrowTicket` or `SharedEnvelope<T>` on a
 tonic/hyper handler thread without moving the `!Send` runtime account. This
 minter is observe-only: it records shared-boundary escrow ownership and pool
 overshoot, but it deliberately does not reuse the topic `queue_publish`
-enforcement gate. Shared receiver sends attach the owner before enqueue and the
-owner is released on receive/drop or failed-send return. A future shared-channel
-enforcement gate must be explicit.
+enforcement gate. Shared receiver sends attach the owner before enqueue; node
+delivery releases that shared-channel owner before downstream retained sites
+charge their own local tickets. Failed-send return and drop paths still release
+the owner exactly once. A future shared-channel enforcement gate must be
+explicit.
 
 ### Shared-boundary ownership audit and primitive
 
@@ -2277,8 +2282,10 @@ now have observe-only escrow ownership. Pipeline wiring derives a
 `SharedEscrowMinter` from the downstream runtime snapshot for each actual
 `Sender::Shared` edge. Shared receiver effect handlers and local
 receiver/processor effect handlers attach one `EscrowSlot` before enqueue, and
-the slot releases on receive/drop or failed-send return. The owner is
-intentionally not cloned, so the one-owner invariant is preserved.
+the slot releases on node delivery, failed-send return, or drop. The owner is
+intentionally not cloned, so the one-owner invariant is preserved, and
+downstream retained sites do not overlap their local tickets with the
+shared-channel escrow owner.
 
 The only production shared nodes are the OTLP and OTAP gRPC receivers
 (`shared::Receiver`); there are no shared processors or exporters. Every other
@@ -2474,8 +2481,9 @@ who require placement can choose `unsupported: error`.
   runtime thread and reachable through `current_reclaim_registry()`. **Done.**
 - Add component-driven pressure relief for sites that need their own
   `EffectHandler`: the batch processor flushes its pending input buffer early
-  under runtime `Soft`/`Hard` pressure when `enforcement.reclaim_hooks` is
-  enabled in an unstable build. **Done for batch pending buffer only.**
+  under runtime `Soft`/`Hard` pressure when `mode = enforce` and
+  `enforcement.reclaim_hooks` are enabled in an unstable build. **Done for batch
+  pending buffer only; observe-only remains passive.**
 - Register concrete site reclaimers (batch/retry/durable/queue/stream) and
   trigger reclaim from pressure/admission, gated behind
   `enforcement.reclaim_hooks`. **Pending for the registry path:** no concrete
