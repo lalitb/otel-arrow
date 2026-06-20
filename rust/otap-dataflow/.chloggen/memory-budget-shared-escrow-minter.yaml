@@ -1,0 +1,4 @@
+change_type: enhancement
+component: engine
+note: "Add a sendable shared-boundary escrow minting primitive for retained-work memory accounting."
+issues: [3272]

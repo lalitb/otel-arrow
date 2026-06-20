@@ -522,6 +522,57 @@ impl SharedRuntimeBudgetPressure {
     }
 }
 
+/// Sendable escrow minting handle for shared-boundary retained work.
+///
+/// Shared receiver handlers run outside the pinned pipeline runtime and cannot
+/// hold the `!Send` [`RuntimeMemoryBudget`] or mint a [`LocalMemoryTicket`].
+/// This handle carries only sendable state (`MemoryBudgetState`, interned scope,
+/// and a pre-interned boundary bucket) so a shared handler can create escrow
+/// ownership for work it is about to retain in a shared channel.
+///
+/// This is an observe-only ownership primitive. It deliberately does not use the
+/// topic-publish enforcement gate: `queue_publish` applies to the topic broker,
+/// not to generic shared receiver channels. Future shared-channel enforcement
+/// must add an explicit gate before this handle rejects admission.
+#[derive(Debug, Clone)]
+pub struct SharedEscrowMinter {
+    state: MemoryBudgetState,
+    scope: BudgetScope,
+    bucket: EscrowBucket,
+}
+
+impl SharedEscrowMinter {
+    /// Mints one sendable escrow owner for a known-size retained item.
+    ///
+    /// Returns `None` when memory budgeting is not configured or when `size`
+    /// has no known retained byte size. Observe-only minting never rejects for
+    /// pressure; if the global pool cannot back the escrow, the overshoot is
+    /// recorded in the escrow overshoot counters instead.
+    #[must_use]
+    pub fn mint(&self, size: impl ChargedSize) -> Option<EscrowTicket> {
+        let bytes = size.charged_size()?;
+        self.state
+            .try_observe_escrow_owner_in_bucket(bytes, &self.scope, &self.bucket)
+    }
+
+    /// Wraps `payload` in a [`SharedEnvelope`] with an escrow owner when the
+    /// payload has a known size and memory budgeting is configured.
+    ///
+    /// The payload is always returned inside an envelope; when no owner can be
+    /// minted because budgeting is disabled or the size is unknown, the
+    /// envelope carries an empty escrow slot.
+    #[must_use]
+    pub fn envelope<T>(&self, payload: T) -> SharedEnvelope<T>
+    where
+        T: ChargedSize,
+    {
+        match self.mint(&payload) {
+            Some(ticket) => SharedEnvelope::new(payload, EscrowSlot::new(ticket)),
+            None => SharedEnvelope::without_owner(payload),
+        }
+    }
+}
+
 /// Aggregated runtime memory-budget snapshot.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MemoryBudgetSnapshot {
@@ -1059,13 +1110,13 @@ impl MemoryBudgetState {
     }
 
     /// Outcome of [`MemoryBudgetState::try_charge_escrow`].
-    fn try_charge_escrow(&self, bytes: u64, bucket: &EscrowBucket) -> Option<EscrowChargeAck> {
+    fn try_charge_escrow(
+        &self,
+        bytes: u64,
+        bucket: &EscrowBucket,
+        enforce: bool,
+    ) -> Option<EscrowChargeAck> {
         let config = self.config()?;
-        // The escrow boundary is the queue/topic publish admission point, so it
-        // only rejects when enforce mode is active AND the per-path
-        // `queue_publish` gate is enabled. With enforce mode but `queue_publish`
-        // off (or in observe-only) it records pressure without rejecting.
-        let enforce = config.mode == BudgetMode::Enforce && config.enforcement.queue_publish;
         // Step 1: bound the topic/boundary bucket occupancy (enforce only).
         let _activated_bucket = bucket.reserve(bytes, config.topic_default_limit_bytes, enforce)?;
         let _ = self
@@ -1146,7 +1197,30 @@ impl MemoryBudgetState {
         scope: &BudgetScope,
         bucket: &EscrowBucket,
     ) -> Option<EscrowTicket> {
-        let ack = self.try_charge_escrow(bytes, bucket)?;
+        // The topic-owned publish path is the only production path currently
+        // wired to the `queue_publish` enforcement gate.
+        let config = self.config()?;
+        let enforce = config.mode == BudgetMode::Enforce && config.enforcement.queue_publish;
+        self.try_charge_escrow_owner_in_bucket_with_enforcement(bytes, scope, bucket, enforce)
+    }
+
+    fn try_observe_escrow_owner_in_bucket(
+        &self,
+        bytes: u64,
+        scope: &BudgetScope,
+        bucket: &EscrowBucket,
+    ) -> Option<EscrowTicket> {
+        self.try_charge_escrow_owner_in_bucket_with_enforcement(bytes, scope, bucket, false)
+    }
+
+    fn try_charge_escrow_owner_in_bucket_with_enforcement(
+        &self,
+        bytes: u64,
+        scope: &BudgetScope,
+        bucket: &EscrowBucket,
+        enforce: bool,
+    ) -> Option<EscrowTicket> {
+        let ack = self.try_charge_escrow(bytes, bucket, enforce)?;
         Some(EscrowTicket {
             bytes,
             pool_backed: ack.pool_backed,
@@ -1192,6 +1266,21 @@ impl RuntimeMemorySnapshotHandle {
     pub fn shared_budget_pressure(&self) -> SharedRuntimeBudgetPressure {
         SharedRuntimeBudgetPressure {
             snapshot: self.snapshot.clone(),
+        }
+    }
+
+    /// Creates a sendable escrow minter for a shared receiver/channel boundary.
+    ///
+    /// `boundary` must be a low-cardinality, precomputed boundary identifier
+    /// such as a receiver output edge id. It is interned in the state once and
+    /// then carried by cheap `Arc`/bucket clones, so minting per retained item
+    /// does not allocate or clone strings.
+    #[must_use]
+    pub fn shared_escrow_minter(&self, boundary: Arc<str>) -> SharedEscrowMinter {
+        SharedEscrowMinter {
+            bucket: self.state.escrow_bucket(&boundary),
+            state: self.state.clone(),
+            scope: self.scope.clone(),
         }
     }
 
@@ -3132,6 +3221,9 @@ mod tests {
     // The shared runtime-pressure view is read by shared receiver handler
     // threads, so it must be Send + Sync (and must not leak the !Send account).
     assert_impl_all!(SharedRuntimeBudgetPressure: Send, Sync);
+    // Shared receiver handlers use this handle from Send contexts to mint
+    // escrow owners without reaching into the !Send runtime account.
+    assert_impl_all!(SharedEscrowMinter: Send, Sync, Clone);
     assert_impl_all!(RuntimeMemorySnapshotHandle: Send, Sync, Clone);
 
     fn account_with_mode(
@@ -3556,6 +3648,38 @@ mod tests {
         state
     }
 
+    fn configure_state_for_shared_escrow(
+        mode: BudgetMode,
+        queue_publish: bool,
+        topic_limit: u64,
+        spare: u64,
+    ) -> MemoryBudgetState {
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 1,
+                    lease_step_bytes: 1,
+                    max_overshoot_per_runtime_bytes: 1,
+                    overshoot_debt_limit_bytes: 0,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: topic_limit,
+                runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement {
+                    receiver_admission: false,
+                    queue_publish,
+                    reclaim_hooks: false,
+                },
+            },
+            Some(spare),
+        );
+        state
+    }
+
     #[test]
     fn shared_pressure_defaults_to_normal_and_no_enforcement() {
         let state = configure_state_for_shared_pressure(BudgetMode::ObserveOnly, false);
@@ -3619,6 +3743,105 @@ mod tests {
             !pressure.receiver_admission_enforce(),
             "enforce mode with the gate disabled is not receiver-admission enforcement"
         );
+    }
+
+    #[test]
+    fn shared_escrow_minter_defaults_to_ownerless_without_config() {
+        let state = MemoryBudgetState::default();
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let minter = handle.shared_escrow_minter(Arc::<str>::from("receiver:out"));
+
+        assert!(minter.mint(64_u64).is_none());
+        let envelope = minter.envelope(64_u64);
+        assert!(!envelope.has_owner());
+        assert_eq!(state.snapshot().escrow_charged_bytes, 0);
+    }
+
+    #[test]
+    fn shared_escrow_minter_mints_from_real_send_boundary_and_releases_on_drop() {
+        let state = configure_state_for_shared_escrow(BudgetMode::ObserveOnly, false, 1_000, 1_000);
+        let handle = state.register_runtime_snapshot(BudgetScopeId {
+            topic_or_boundary: Some("receiver:otlp_grpc:default".to_owned()),
+            ..BudgetScopeId::default()
+        });
+        let minter = handle.shared_escrow_minter(Arc::<str>::from("receiver:otlp_grpc:default"));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let envelope = minter.envelope(64_u64);
+            assert!(envelope.has_owner());
+            tx.send(envelope).expect("send shared envelope");
+        })
+        .join()
+        .expect("thread joins");
+
+        let envelope = rx.recv().expect("receive shared envelope");
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.escrow_charged_bytes, 64);
+        assert_eq!(
+            state.escrow_bucket_charged_bytes("receiver:otlp_grpc:default"),
+            Some(64)
+        );
+
+        drop(envelope);
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.escrow_charged_bytes, 0);
+        assert_eq!(snapshot.abandoned_escrow_count, 0);
+        assert_eq!(
+            state.escrow_bucket_charged_bytes("receiver:otlp_grpc:default"),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn shared_escrow_minter_is_observe_only_even_when_topic_publish_enforces() {
+        let state = configure_state_for_shared_escrow(BudgetMode::Enforce, true, 1, 0);
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let minter = handle.shared_escrow_minter(Arc::<str>::from("receiver:shared"));
+
+        let envelope = minter.envelope(64_u64);
+        assert!(
+            envelope.has_owner(),
+            "shared minter must not reuse the topic queue_publish rejection gate"
+        );
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.escrow_charged_bytes, 64);
+        assert_eq!(snapshot.escrow_pool_overshoot_bytes, 64);
+
+        drop(envelope);
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.escrow_charged_bytes, 0);
+        assert_eq!(snapshot.escrow_pool_overshoot_bytes, 0);
+        assert_eq!(snapshot.abandoned_escrow_count, 0);
+    }
+
+    #[test]
+    fn shared_escrow_minter_unknown_size_returns_ownerless_envelope() {
+        let state = configure_state_for_shared_escrow(BudgetMode::ObserveOnly, false, 1_000, 1_000);
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let minter = handle.shared_escrow_minter(Arc::<str>::from("receiver:unknown"));
+
+        assert!(minter.mint(UnknownSize).is_none());
+        let envelope = minter.envelope(UnknownSize);
+        assert!(!envelope.has_owner());
+        assert_eq!(state.snapshot().escrow_charged_bytes, 0);
+    }
+
+    #[test]
+    fn unresolved_shared_minted_escrow_remains_sticky_abandoned() {
+        let state = configure_state_for_shared_escrow(BudgetMode::ObserveOnly, false, 1_000, 1_000);
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let minter = handle.shared_escrow_minter(Arc::<str>::from("receiver:leak"));
+
+        let ticket = minter.mint(32_u64).expect("mint escrow");
+        assert_eq!(state.snapshot().escrow_charged_bytes, 32);
+        drop(ticket);
+
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.escrow_charged_bytes, 32);
+        assert_eq!(snapshot.abandoned_escrow_count, 1);
+        assert_eq!(snapshot.abandoned_escrow_bytes, 32);
+        assert_eq!(state.escrow_bucket_charged_bytes("receiver:leak"), Some(32));
     }
 
     #[test]
