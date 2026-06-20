@@ -26,6 +26,9 @@ use otap_df_engine::control::{
 };
 use otap_df_engine::error::{Error, ProcessorErrorKind};
 use otap_df_engine::local::processor as local;
+use otap_df_engine::memory_budget::{
+    LocalMemoryTicket, RetainedSiteKind, current_runtime_memory_budget,
+};
 use otap_df_engine::message::Message;
 use otap_df_engine::node::NodeId;
 use otap_df_engine::processor::{ProcessorRuntimeRequirements, ProcessorWrapper};
@@ -247,6 +250,13 @@ pub struct TemporalReaggregationProcessor {
     /// every flush alongside the builder.
     aggregated_peer: PeerAddrMerger,
 
+    /// Tickets for aggregated inputs whose subscriber tracker was removed
+    /// before the aggregate flushed, or whose input had no subscriber tracker.
+    ///
+    /// These inputs still contributed bytes to the in-progress builder, so the
+    /// accounting owner must live until that builder is flushed/reset.
+    aggregation_tickets_without_tracker: Vec<LocalMemoryTicket>,
+
     /// A map of all passthrough and aggregated batches sent by this processor.
     /// The CallData returned to this processor in ack/nack messages can be
     /// casted to a [SlotKey] and points into this map.
@@ -259,6 +269,9 @@ pub struct TemporalReaggregationProcessor {
 struct InboundTracker {
     // Original request context
     ctx: Context,
+    // Logical retained-work owner for this input's contribution to the
+    // in-progress aggregate.
+    ticket: Option<LocalMemoryTicket>,
     // Number of pending acks that we're waiting for
     pending_acks: usize,
     // Whether the batch containing the corresponding input data has been flushed
@@ -361,6 +374,7 @@ impl TemporalReaggregationProcessor {
             pending_flush: Vec::new(),
             outbound_batches: SlotState::new(config.outbound_request_limit.get()),
             aggregated_peer: PeerAddrMerger::new(),
+            aggregation_tickets_without_tracker: Vec::new(),
         })
     }
 
@@ -521,6 +535,12 @@ impl TemporalReaggregationProcessor {
                 continue;
             };
 
+            if !tracker.flushed
+                && let Some(ticket) = tracker.ticket.take()
+            {
+                self.aggregation_tickets_without_tracker.push(ticket);
+            }
+
             let payload = OtapPayload::empty(SignalType::Metrics);
             let pdata = OtapPdata::new(std::mem::take(&mut tracker.ctx), payload);
             effect_handler
@@ -643,6 +663,7 @@ impl TemporalReaggregationProcessor {
                     Ok(effect_handler.send_message_with_source_node(pdata).await?)
                 }
                 AggregationResult::SomeAggregations(records) => {
+                    let ticket = charge_temporal_aggregation(&pdata);
                     // The aggregated portion of this input has been folded into
                     // the in-progress builder; remember its peer_addr so the
                     // next flush can compute the merged output peer_addr.
@@ -652,6 +673,9 @@ impl TemporalReaggregationProcessor {
                     let (inbound_ctx, _) = pdata.into_parts();
                     if !inbound_ctx.has_subscribers() {
                         self.ensure_wakeup_scheduled(effect_handler)?;
+                        if let Some(ticket) = ticket {
+                            self.aggregation_tickets_without_tracker.push(ticket);
+                        }
                         let pt_pdata =
                             OtapPdata::new(inbound_ctx, OtapPayload::OtapArrowRecords(records));
 
@@ -669,6 +693,7 @@ impl TemporalReaggregationProcessor {
                     // when we actually flush the batch.
                     let tracker = InboundTracker {
                         ctx: inbound_ctx,
+                        ticket,
                         pending_acks: 1,
                         flushed: false,
                     };
@@ -702,6 +727,7 @@ impl TemporalReaggregationProcessor {
                         .await?)
                 }
                 AggregationResult::AllAggregated => {
+                    let ticket = charge_temporal_aggregation(&pdata);
                     // The full input was folded into the in-progress builder;
                     // remember its peer_addr for the next flush.
                     self.aggregated_peer.push(pdata.peer_addr());
@@ -711,6 +737,9 @@ impl TemporalReaggregationProcessor {
                     let (inbound_ctx, _) = pdata.into_parts();
                     if !inbound_ctx.has_subscribers() {
                         self.ensure_wakeup_scheduled(effect_handler)?;
+                        if let Some(ticket) = ticket {
+                            self.aggregation_tickets_without_tracker.push(ticket);
+                        }
                         return Ok(());
                     }
 
@@ -718,6 +747,7 @@ impl TemporalReaggregationProcessor {
                     // we flush we can bump the ref count
                     let tracker = InboundTracker {
                         ctx: inbound_ctx,
+                        ticket,
                         pending_acks: 0,
                         flushed: false,
                     };
@@ -769,6 +799,7 @@ impl TemporalReaggregationProcessor {
         self.cancel_current_wakeup(effect_handler);
 
         if records.is_empty() {
+            self.aggregation_tickets_without_tracker.clear();
             return Ok(());
         }
 
@@ -782,6 +813,7 @@ impl TemporalReaggregationProcessor {
                 pdata.set_peer_addr(addr);
             }
             effect_handler.send_message_with_source_node(pdata).await?;
+            self.aggregation_tickets_without_tracker.clear();
             return Ok(());
         }
 
@@ -815,6 +847,7 @@ impl TemporalReaggregationProcessor {
         );
 
         effect_handler.send_message_with_source_node(pdata).await?;
+        self.aggregation_tickets_without_tracker.clear();
         Ok(())
     }
 
@@ -1359,6 +1392,11 @@ impl TemporalReaggregationProcessor {
     }
 }
 
+fn charge_temporal_aggregation(pdata: &OtapPdata) -> Option<LocalMemoryTicket> {
+    current_runtime_memory_budget()
+        .and_then(|budget| budget.charge_at(RetainedSiteKind::TemporalReaggregationState, pdata))
+}
+
 /// Allocate the next u16 ID from a counter, returning an error on overflow.
 fn next_id_16(counter: &mut u16) -> Result<u16, AggregationError> {
     let id = *counter;
@@ -1425,7 +1463,13 @@ mod tests {
     use std::future::Future;
     use std::net::SocketAddr;
 
+    use otap_df_engine::memory_budget::{
+        BudgetMode, BudgetScopeId, MemoryBudgetEnforcement, MemoryBudgetSizing, MemoryBudgetState,
+        RetainedSiteKind, RuntimeMemoryBudget, RuntimeMemoryBudgetConfig,
+        set_current_runtime_memory_budget,
+    };
     use otap_df_engine::testing::processor::TestContext;
+    use otap_df_otap::testing::TestCallData;
     use otap_df_pdata::otap::OtapBatchStore;
     use otap_df_pdata::otlp::metrics::MetricType;
     use otap_df_pdata::proto::opentelemetry::common::v1::{AnyValue, KeyValue};
@@ -1434,6 +1478,41 @@ mod tests {
     use otap_df_pdata::{metrics, record_batch};
     use serde_json::json;
     use smallvec::smallvec;
+
+    fn install_test_runtime_budget() -> (
+        MemoryBudgetState,
+        std::rc::Rc<RuntimeMemoryBudget>,
+        otap_df_engine::memory_budget::RuntimeMemoryBudgetGuard,
+    ) {
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 1,
+                    lease_step_bytes: 1,
+                    max_overshoot_per_runtime_bytes: 10_000_000,
+                    overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: 100,
+                runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement::default(),
+            },
+            None,
+        );
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let account = handle.local_account().expect("account should be available");
+        let budget = std::rc::Rc::new(RuntimeMemoryBudget::new(account));
+        let guard = set_current_runtime_memory_budget(Some(budget.clone()));
+        (state, budget, guard)
+    }
+
+    fn temporal_site_bytes(state: &MemoryBudgetState) -> u64 {
+        state.snapshot().charged_bytes_by_site[RetainedSiteKind::TemporalReaggregationState.index()]
+    }
 
     #[test]
     fn test_default_config_parsing() {
@@ -1477,6 +1556,92 @@ mod tests {
         });
         test_config(json!({ "period": "100ms" }), |result| {
             assert!(result.is_ok(), "100ms period should pass validation");
+        });
+    }
+
+    #[test]
+    fn temporal_aggregation_charges_until_no_subscriber_flush() {
+        run_processor_test(json!({}), |mut ctx| async move {
+            let (state, budget, _guard) = install_test_runtime_budget();
+            let pdata = make_otlp_bytes_pdata(MetricsData::new(vec![ResourceMetrics::new(
+                Resource::build().finish(),
+                vec![ScopeMetrics::new(
+                    InstrumentationScope::build().finish(),
+                    vec![
+                        Metric::build()
+                            .name("cpu")
+                            .data_gauge(Gauge::new(vec![
+                                NumberDataPoint::build()
+                                    .time_unix_nano(1000u64)
+                                    .value_double(10.0f64)
+                                    .finish(),
+                            ]))
+                            .finish(),
+                    ],
+                )],
+            )]));
+
+            ctx.process(Message::PData(pdata)).await.unwrap();
+            budget.flush_snapshot();
+            assert!(
+                temporal_site_bytes(&state) > 0,
+                "aggregated temporal state must be charged while retained"
+            );
+
+            let _ = ctx.fire_wakeup().await.unwrap();
+            let output = ctx.drain_pdata().await;
+            assert_eq!(output.len(), 1);
+            budget.flush_snapshot();
+            assert_eq!(
+                temporal_site_bytes(&state),
+                0,
+                "no-subscriber temporal state must release after flush"
+            );
+        });
+    }
+
+    #[test]
+    fn temporal_aggregation_keeps_charge_after_subscribed_flush_until_terminal() {
+        run_processor_test(json!({}), |mut ctx| async move {
+            let (state, budget, _guard) = install_test_runtime_budget();
+            let pdata = make_otlp_bytes_pdata(MetricsData::new(vec![ResourceMetrics::new(
+                Resource::build().finish(),
+                vec![ScopeMetrics::new(
+                    InstrumentationScope::build().finish(),
+                    vec![
+                        Metric::build()
+                            .name("cpu")
+                            .data_gauge(Gauge::new(vec![
+                                NumberDataPoint::build()
+                                    .time_unix_nano(1000u64)
+                                    .value_double(10.0f64)
+                                    .finish(),
+                            ]))
+                            .finish(),
+                    ],
+                )],
+            )]))
+            .test_subscribe_to(
+                Interests::ACKS | Interests::NACKS,
+                TestCallData::new_with(1, 0).into(),
+                1,
+            );
+
+            ctx.process(Message::PData(pdata)).await.unwrap();
+            budget.flush_snapshot();
+            assert!(
+                temporal_site_bytes(&state) > 0,
+                "subscribed temporal state must be charged before flush"
+            );
+
+            let _ = ctx.fire_wakeup().await.unwrap();
+            let output = ctx.drain_pdata().await;
+            assert_eq!(output.len(), 1);
+            budget.flush_snapshot();
+            assert!(
+                temporal_site_bytes(&state) > 0,
+                "subscribed temporal state must stay charged until ack/nack"
+            );
         });
     }
 

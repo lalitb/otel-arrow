@@ -1,0 +1,4 @@
+change_type: enhancement
+component: pipeline
+note: "Account temporal reaggregation and Parquet retained work in memory budgeting."
+issues: [3272]

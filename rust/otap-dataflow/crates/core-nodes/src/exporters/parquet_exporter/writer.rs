@@ -11,6 +11,9 @@ use arrow::datatypes::SchemaRef;
 use futures::stream::FuturesUnordered;
 use futures::{StreamExt, TryStreamExt};
 use object_store::ObjectStore;
+use otap_df_engine::memory_budget::{
+    LocalMemoryTicket, RetainedSiteKind, current_runtime_memory_budget,
+};
 use otap_df_pdata::otap::child_payload_types;
 use otap_df_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 use parquet::arrow::AsyncArrowWriter;
@@ -349,7 +352,7 @@ impl WriterManager {
             // Drain all in-flight closes so per-file success/failure metrics are complete.
             let mut closes = flushable
                 .drain(..)
-                .map(|fw| fw.writer.close())
+                .map(FileWriter::close)
                 .collect::<FuturesUnordered<_>>();
             let mut first_error = None;
 
@@ -461,6 +464,7 @@ struct FileWriter {
     writer: AsyncArrowWriter<ParquetObjectWriter>,
     rows_written: usize,
     scheduled_batches: Vec<RecordBatch>,
+    retained_tickets: Vec<LocalMemoryTicket>,
 }
 
 impl FileWriter {
@@ -472,10 +476,14 @@ impl FileWriter {
             writer,
             rows_written: 0,
             scheduled_batches: Vec::new(),
+            retained_tickets: Vec::new(),
         }
     }
 
     fn schedule_write(&mut self, record_batch: &RecordBatch) {
+        if let Some(ticket) = charge_parquet_record_batch(record_batch) {
+            self.retained_tickets.push(ticket);
+        }
         self.scheduled_batches.push(record_batch.clone());
     }
 
@@ -496,6 +504,16 @@ impl FileWriter {
 
         Ok(())
     }
+
+    async fn close(self) -> Result<(), ParquetError> {
+        self.writer.close().await.map(|_| ())
+    }
+}
+
+fn charge_parquet_record_batch(record_batch: &RecordBatch) -> Option<LocalMemoryTicket> {
+    let bytes = record_batch.get_array_memory_size();
+    current_runtime_memory_budget()
+        .and_then(|budget| budget.charge_at(RetainedSiteKind::ParquetWriterBuffer, bytes as u64))
 }
 
 struct UnflushedBatchState {
@@ -584,6 +602,46 @@ mod test {
     };
     use crate::exporters::parquet_exporter::partition::PartitionAttributeValue;
     use crate::exporters::parquet_exporter::records::OtapParquetRecords;
+    use otap_df_engine::memory_budget::{
+        BudgetMode, BudgetScopeId, MemoryBudgetEnforcement, MemoryBudgetSizing, MemoryBudgetState,
+        RetainedSiteKind, RuntimeMemoryBudget, RuntimeMemoryBudgetConfig,
+        set_current_runtime_memory_budget,
+    };
+
+    fn install_test_runtime_budget() -> (
+        MemoryBudgetState,
+        std::rc::Rc<RuntimeMemoryBudget>,
+        otap_df_engine::memory_budget::RuntimeMemoryBudgetGuard,
+    ) {
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 1,
+                    lease_step_bytes: 1,
+                    max_overshoot_per_runtime_bytes: 10_000_000,
+                    overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: 100,
+                runtime_count: 1,
+                enforcement: MemoryBudgetEnforcement::default(),
+            },
+            None,
+        );
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let account = handle.local_account().expect("account should be available");
+        let budget = std::rc::Rc::new(RuntimeMemoryBudget::new(account));
+        let guard = set_current_runtime_memory_budget(Some(budget.clone()));
+        (state, budget, guard)
+    }
+
+    fn parquet_site_bytes(state: &MemoryBudgetState) -> u64 {
+        state.snapshot().charged_bytes_by_site[RetainedSiteKind::ParquetWriterBuffer.index()]
+    }
 
     fn to_logs_record_batch(mut bar: BatchArrowRecords) -> OtapParquetRecords {
         let mut consumer = Consumer::default();
@@ -756,6 +814,35 @@ mod test {
             // assert there's no extra data there
             assert!(reader.next().await.is_none())
         }
+    }
+
+    #[tokio::test]
+    async fn writer_buffers_charge_until_files_close() {
+        let (state, budget, _guard) = install_test_runtime_budget();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let object_store = Arc::new(LocalFileSystem::new_with_prefix(temp_dir.path()).unwrap());
+        let mut writer = WriterManager::new(object_store, WriterOptions::default());
+        let otap_batch = to_logs_record_batch(create_simple_logs_arrow_record_batches(
+            SimpleDataGenOptions::default(),
+        ));
+
+        let _ = writer
+            .write(&[WriteBatch::new(0, &otap_batch, None)])
+            .await
+            .expect("write should succeed");
+        budget.flush_snapshot();
+        assert!(
+            parquet_site_bytes(&state) > 0,
+            "parquet writer buffers must be charged while files remain open"
+        );
+
+        let _ = writer.flush_all().await.expect("flush all should succeed");
+        budget.flush_snapshot();
+        assert_eq!(
+            parquet_site_bytes(&state),
+            0,
+            "closing parquet writers must release retained buffer charges"
+        );
     }
 
     #[tokio::test]

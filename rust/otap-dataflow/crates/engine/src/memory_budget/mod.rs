@@ -123,8 +123,8 @@ impl BudgetLevel {
 /// - Topic queue/ring retention is owned by **escrow buckets**, which already
 ///   have their own per-boundary aggregate metrics; it is intentionally not
 ///   folded into these local-ticket counters.
-/// - Shared-channel retention via `SharedEnvelope` is a primitive that is not
-///   yet production-adopted, so it has no variant here yet.
+/// - Shared-channel retention via escrow owners is surfaced by the escrow
+///   bucket rollups, so it is not folded into these local-ticket counters.
 /// - The drain/redemption allowance path attributes to [`Self::Unknown`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -145,11 +145,15 @@ pub enum RetainedSiteKind {
     ExporterPending = 5,
     /// Exporter request retained while in flight (encoded body awaiting ack).
     ExporterInflight = 6,
+    /// Temporal reaggregation state retained across processor turns.
+    TemporalReaggregationState = 7,
+    /// Parquet exporter writer buffers retained until object files are closed.
+    ParquetWriterBuffer = 8,
 }
 
 impl RetainedSiteKind {
     /// Number of attributed site kinds. Indexes a fixed-size counter array.
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 9;
 
     /// Site kinds exposed as labeled metric series. Every entry is a site that
     /// this slice actually attributes, so no always-zero series are emitted.
@@ -161,6 +165,8 @@ impl RetainedSiteKind {
         Self::RouterParked,
         Self::ExporterPending,
         Self::ExporterInflight,
+        Self::TemporalReaggregationState,
+        Self::ParquetWriterBuffer,
     ];
 
     /// Returns the fixed array index for this site kind.
@@ -185,6 +191,8 @@ impl RetainedSiteKind {
             Self::RouterParked => "router_parked",
             Self::ExporterPending => "exporter_pending",
             Self::ExporterInflight => "exporter_inflight",
+            Self::TemporalReaggregationState => "temporal_reaggregation_state",
+            Self::ParquetWriterBuffer => "parquet_writer_buffer",
         }
     }
 
@@ -199,6 +207,8 @@ impl RetainedSiteKind {
             4 => Some(Self::RouterParked),
             5 => Some(Self::ExporterPending),
             6 => Some(Self::ExporterInflight),
+            7 => Some(Self::TemporalReaggregationState),
+            8 => Some(Self::ParquetWriterBuffer),
             _ => None,
         }
     }

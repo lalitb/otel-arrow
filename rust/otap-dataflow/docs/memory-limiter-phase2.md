@@ -1737,6 +1737,18 @@ Validation:
     not silent dropping: buffered telemetry is sent downstream and the parallel
     tickets are released by the existing handoff. In observe-only mode this path
     remains passive and does not change batch boundaries or timing.
+  - the temporal reaggregation processor's retained aggregation contributions
+    (local ticket per input that contributes to the in-progress aggregate,
+    attributed to `temporal_reaggregation_state`; tracked until the aggregate is
+    flushed and, for subscribed inputs, until downstream ack/nack terminally
+    handles the contribution. Inputs that lose their subscriber tracker before
+    flush keep an orphan accounting owner until the builder flushes, matching the
+    processor's existing data lifecycle rather than dropping only the ticket);
+  - the Parquet exporter's writer buffers (local ticket per scheduled
+    `RecordBatch`, attributed to `parquet_writer_buffer`; tickets are carried by
+    the per-file writer while batches are scheduled, written into the async
+    parquet writer, queued for flush, and held by the close future; closing or
+    dropping the file writer releases the charge).
   These exporter/processor sites are accounting points, not admission points:
   under `mode = enforce` a rejected charge yields no ticket and the work still
   proceeds, so they never drop data. Admission/enforcement of retained work
@@ -1746,9 +1758,9 @@ Validation:
   topic/per-boundary escrow buckets (and enforced via `queue_publish`). The OTAP
   streaming exporter is accounted through internal escrow because its tonic
   request stream is a `Send` boundary and cannot carry `LocalMemoryTicket`.
-  Parquet exporter buffering remains an open coverage gap. The console, perf,
-  noop, and error exporters hand off synchronously and have no retained pending
-  request.
+  Parquet exporter writer buffering is accounted by local tickets. The console,
+  perf, noop, and error exporters hand off synchronously and have no retained
+  pending request.
 - `reserve` must be smaller than the process hard limit when a hard limit is
   known.
 - `runtime_count` is the total resolved runtime instances in the process.
@@ -1931,6 +1943,8 @@ Sites attributed in this slice (local-ticket retention):
 | `router_parked` | Router (exclusive/content) backpressure-parked route. |
 | `exporter_pending` | Exporter request parked before send (e.g. OTLP gRPC pending). |
 | `exporter_inflight` | Exporter request retained while in flight (OTLP gRPC/HTTP encoded body). |
+| `temporal_reaggregation_state` | Temporal reaggregation contributions retained across processor turns. |
+| `parquet_writer_buffer` | Parquet exporter record batches retained by open file writers. |
 | `unknown` | Fallback for `charge`, the drain/redemption allowance path, and any not-yet-attributed local charge. |
 <!-- markdownlint-enable MD013 -->
 
@@ -2453,6 +2467,8 @@ who require placement can choose `unsupported: error`.
 - Add cross-runtime `EscrowTicket` for topics and queues.
 - Model shared-node steady-state retention as scoped shared escrow when needed.
 - Add topic escrow release-cause metrics before topic enforcement.
+- Add observe-only ticket coverage for temporal reaggregation state and Parquet
+  writer buffers.
 - Continue observe-only.
 
 ### Phase 2c: Receiver Enforcement
