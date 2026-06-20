@@ -3892,14 +3892,28 @@ mod tests {
         std::rc::Rc<otap_df_engine::memory_budget::RuntimeMemoryBudget>,
         otap_df_engine::memory_budget::RuntimeMemoryBudgetGuard,
     ) {
+        install_test_runtime_budget_with_mode(
+            otap_df_engine::memory_budget::BudgetMode::ObserveOnly,
+            enforcement,
+        )
+    }
+
+    fn install_test_runtime_budget_with_mode(
+        mode: otap_df_engine::memory_budget::BudgetMode,
+        enforcement: otap_df_engine::memory_budget::MemoryBudgetEnforcement,
+    ) -> (
+        otap_df_engine::memory_budget::MemoryBudgetState,
+        std::rc::Rc<otap_df_engine::memory_budget::RuntimeMemoryBudget>,
+        otap_df_engine::memory_budget::RuntimeMemoryBudgetGuard,
+    ) {
         use otap_df_engine::memory_budget::{
-            BudgetMode, BudgetScopeId, MemoryBudgetSizing, MemoryBudgetState, RuntimeMemoryBudget,
+            BudgetScopeId, MemoryBudgetSizing, MemoryBudgetState, RuntimeMemoryBudget,
             RuntimeMemoryBudgetConfig, set_current_runtime_memory_budget,
         };
         let state = MemoryBudgetState::default();
         state.configure(
             RuntimeMemoryBudgetConfig {
-                mode: BudgetMode::ObserveOnly,
+                mode,
                 retry_after_secs: 1,
                 sizing: MemoryBudgetSizing {
                     reserve_bytes: 0,
@@ -4059,10 +4073,11 @@ mod tests {
         })
     }
 
-    /// With `reclaim_hooks` enabled and the runtime under `Soft` pressure, the
-    /// batch processor flushes its pending buffer downstream early (before the
-    /// size/time threshold), releasing the buffered input's ticket. No data is
-    /// dropped: the buffered batch is emitted to the output.
+    /// With `reclaim_hooks` enabled in enforce mode and the runtime under
+    /// `Soft` pressure, the batch processor flushes its pending buffer
+    /// downstream early (before the size/time threshold), releasing the buffered
+    /// input's ticket. No data is dropped: the buffered batch is emitted to the
+    /// output.
     #[test]
     fn pressure_relief_flushes_pending_batch_early() {
         let (_telemetry_registry, _metrics_reporter, phase) =
@@ -4070,17 +4085,20 @@ mod tests {
 
         phase
             .run_test(move |mut ctx| async move {
-                let (state, budget, _budget_guard) =
-                    install_test_runtime_budget_with(reclaim_hooks_enforcement());
+                let (state, budget, _budget_guard) = install_test_runtime_budget_with_mode(
+                    otap_df_engine::memory_budget::BudgetMode::Enforce,
+                    reclaim_hooks_enforcement(),
+                );
 
                 // Simulate retained work elsewhere in the runtime pushing the
                 // account into Soft pressure (floor is 1 byte). Hold the ticket so
                 // the pressure persists across the buffered accept below.
-                let _pressure_ticket = budget.charge(1_000u64).expect("pre-charge to soft");
-                assert_eq!(
+                let mut pressure_ticket = budget.charge(1u64).expect("pre-charge fits");
+                pressure_ticket.reconcile_size(1_000);
+                assert_ne!(
                     budget.account().level(),
-                    otap_df_engine::memory_budget::BudgetLevel::Soft,
-                    "pre-charge should put the runtime under Soft pressure"
+                    otap_df_engine::memory_budget::BudgetLevel::Normal,
+                    "pre-charge should put the runtime under pressure"
                 );
                 assert!(
                     budget.pressure_relief_active(),
@@ -4113,6 +4131,49 @@ mod tests {
                     state.snapshot().charged_bytes,
                     1_000,
                     "early flush releases only the buffered input, not the external charge"
+                );
+            })
+            .validate(|_| async {});
+    }
+
+    /// Observe-only mode remains passive even when the experimental
+    /// `reclaim_hooks` gate is enabled: it records pressure but must not change
+    /// batch boundaries or timing.
+    #[test]
+    fn pressure_relief_inactive_in_observe_only_when_reclaim_hooks_enabled() {
+        let (_telemetry_registry, _metrics_reporter, phase) =
+            setup_test_runtime(buffering_logs_config());
+
+        phase
+            .run_test(move |mut ctx| async move {
+                let (state, budget, _budget_guard) =
+                    install_test_runtime_budget_with(reclaim_hooks_enforcement());
+                let _pressure_ticket = budget.charge(1_000u64).expect("pre-charge to soft");
+                assert_eq!(
+                    budget.account().level(),
+                    otap_df_engine::memory_budget::BudgetLevel::Soft
+                );
+                assert!(
+                    !budget.pressure_relief_active(),
+                    "observe-only pressure relief must stay inactive"
+                );
+
+                let mut datagen = DataGenerator::new(1);
+                let logs = datagen.generate_logs();
+                let rec = encode_logs_otap_batch(&logs).expect("encode logs");
+                ctx.process(Message::PData(OtapPdata::new_default(rec.into())))
+                    .await
+                    .expect("process input");
+
+                assert!(
+                    ctx.drain_pdata().await.is_empty(),
+                    "observe-only must not flush early: input stays buffered"
+                );
+                budget.flush_snapshot();
+                assert_eq!(
+                    state.snapshot().unknown_count,
+                    1,
+                    "the buffered input remains retained while observe-only relief is off"
                 );
             })
             .validate(|_| async {});

@@ -1,0 +1,4 @@
+change_type: bug_fix
+component: engine
+note: Fix observe-only retained-work accounting fidelity for shared-channel escrow and pressure relief.
+issues: [3272]

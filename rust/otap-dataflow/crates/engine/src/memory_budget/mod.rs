@@ -658,6 +658,9 @@ pub struct MemoryBudgetSnapshot {
 #[derive(Debug, Default)]
 struct MemoryBudgetStateInner {
     config: Mutex<Option<RuntimeMemoryBudgetConfig>>,
+    escrow_enabled: AtomicBool,
+    escrow_topic_default_limit_bytes: AtomicU64,
+    escrow_queue_publish_enforce: AtomicBool,
     pool: GlobalLeasePool,
     snapshots: Mutex<Vec<Weak<RuntimeMemorySnapshot>>>,
     // Phase 2e leak detection keeps a bounded, low-cardinality sticky view:
@@ -795,6 +798,14 @@ impl MemoryBudgetState {
             .overshoot_debt_limit_bytes
             .saturating_mul(config.runtime_count as u64);
         self.inner.pool.set_overshoot_debt(allowed_overshoot);
+        self.inner
+            .escrow_topic_default_limit_bytes
+            .store(config.topic_default_limit_bytes, Ordering::Relaxed);
+        self.inner.escrow_queue_publish_enforce.store(
+            config.mode == BudgetMode::Enforce && config.enforcement.queue_publish,
+            Ordering::Relaxed,
+        );
+        self.inner.escrow_enabled.store(true, Ordering::Release);
         *self
             .inner
             .config
@@ -1116,9 +1127,15 @@ impl MemoryBudgetState {
         bucket: &EscrowBucket,
         enforce: bool,
     ) -> Option<EscrowChargeAck> {
-        let config = self.config()?;
+        if !self.inner.escrow_enabled.load(Ordering::Acquire) {
+            return None;
+        }
+        let limit = self
+            .inner
+            .escrow_topic_default_limit_bytes
+            .load(Ordering::Relaxed);
         // Step 1: bound the topic/boundary bucket occupancy (enforce only).
-        let _activated_bucket = bucket.reserve(bytes, config.topic_default_limit_bytes, enforce)?;
+        let _activated_bucket = bucket.reserve(bytes, limit, enforce)?;
         let _ = self
             .inner
             .escrow_charged_bytes
@@ -1199,8 +1216,10 @@ impl MemoryBudgetState {
     ) -> Option<EscrowTicket> {
         // The topic-owned publish path is the only production path currently
         // wired to the `queue_publish` enforcement gate.
-        let config = self.config()?;
-        let enforce = config.mode == BudgetMode::Enforce && config.enforcement.queue_publish;
+        let enforce = self
+            .inner
+            .escrow_queue_publish_enforce
+            .load(Ordering::Relaxed);
         self.try_charge_escrow_owner_in_bucket_with_enforcement(bytes, scope, bucket, enforce)
     }
 
@@ -3076,17 +3095,19 @@ impl RuntimeMemoryBudget {
 
     /// Whether component-driven memory pressure relief should act right now.
     ///
-    /// True only when the reclaim/pressure-relief gate
-    /// (`enforcement.reclaim_hooks`) is enabled for this runtime **and** the
-    /// account is under `Soft` or `Hard` pressure. Component-driven relief paths
-    /// (e.g. the batch processor early flush) read this on a safe component turn
-    /// (where they hold their `EffectHandler`) to decide whether to flush
-    /// retained work downstream earlier than the configured thresholds. Both
-    /// reads are cheap local `Cell` reads with no atomics, and this acquires no
-    /// budget.
+    /// True only when this runtime is in enforce mode, the
+    /// `enforcement.reclaim_hooks` gate is enabled, and the account is under
+    /// `Soft` or `Hard` pressure. Component-driven relief paths (e.g. the batch
+    /// processor early flush) read this on a safe component turn (where they
+    /// hold their `EffectHandler`) to decide whether to flush retained work
+    /// downstream earlier than the configured thresholds. Observe-only mode must
+    /// remain passive and never change batch timing. The reads are cheap local
+    /// state reads with no atomics, and this acquires no budget.
     #[must_use]
     pub fn pressure_relief_active(&self) -> bool {
-        self.account.reclaim_hooks_enabled() && self.account.level() != BudgetLevel::Normal
+        self.account.mode == BudgetMode::Enforce
+            && self.account.reclaim_hooks_enabled()
+            && self.account.level() != BudgetLevel::Normal
     }
 
     /// Whether runtime-budget receiver-admission enforcement is active for this
@@ -5536,7 +5557,7 @@ mod tests {
 
     #[test]
     fn pressure_relief_active_requires_gate_and_pressure() {
-        let acct = account(100, 10, 20, 0);
+        let acct = account_with_mode(BudgetMode::Enforce, 100, 10, 20, 0);
         let budget = rc_budget_from(acct.clone());
 
         assert_eq!(budget.account().level(), BudgetLevel::Normal);
@@ -5545,9 +5566,8 @@ mod tests {
             "normal pressure is not an active relief condition"
         );
 
-        let _ticket = budget
-            .charge(150_u64)
-            .expect("observe-only charge succeeds");
+        let mut ticket = budget.charge(1_u64).expect("initial charge fits");
+        ticket.reconcile_size(150);
         assert_ne!(budget.account().level(), BudgetLevel::Normal);
         assert!(
             !budget.pressure_relief_active(),
@@ -5557,7 +5577,23 @@ mod tests {
         acct.set_reclaim_hooks_enabled(true);
         assert!(
             budget.pressure_relief_active(),
-            "reclaim_hooks plus Soft/Hard pressure activates component relief"
+            "enforce mode plus reclaim_hooks plus Soft/Hard pressure activates component relief"
+        );
+    }
+
+    #[test]
+    fn pressure_relief_inactive_in_observe_only_even_with_gate_and_pressure() {
+        let acct = account_with_mode(BudgetMode::ObserveOnly, 100, 10, 20, 0);
+        let budget = rc_budget_from(acct.clone());
+        let _ticket = budget
+            .charge(150_u64)
+            .expect("observe-only charge succeeds");
+        acct.set_reclaim_hooks_enabled(true);
+
+        assert_ne!(budget.account().level(), BudgetLevel::Normal);
+        assert!(
+            !budget.pressure_relief_active(),
+            "observe-only mode must not change batch timing even when reclaim_hooks is enabled"
         );
     }
 
