@@ -1,0 +1,7 @@
+change_type: enhancement
+
+component: engine
+
+note: "Round out observe-only retained-work memory-budget visibility with four low-cardinality, hot-path-free additions. (1) Local same-runtime channels now expose explicit uncovered occupancy via a `channel.receiver.queue.depth` gauge sampled from the channel buffer (item count, size deliberately unknown), so local-queue retention is visible rather than silent without storing a `LocalMemoryTicket` in `PData` or making local channels `Send`. (2) Per-pipeline/per-scope attribution: one `runtime_memory_budget_scope_*` series per live runtime labeled by interned `pipeline_group_id`/`pipeline_id`/`core_id`/`deployment_generation`, summing back to the aggregates. (3) Per-escrow-boundary metrics: each escrow bucket retains its boundary id and a boundary-scoped unknown count, surfaced as `runtime_memory_budget_escrow_boundary_charged_bytes`/`_unknown_count` labeled by `boundary`. (4) Abandoned-escrow metadata tracking is now bounded (compacting excess entries, which are never reaped) with a new `runtime_memory_budget_abandoned_escrow_compacted_count` metric so leaks stay visible without unbounded growth. Observe-only remains default and traffic behavior is unchanged."
+
+issues: [3272]

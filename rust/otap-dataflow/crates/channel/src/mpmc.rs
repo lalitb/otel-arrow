@@ -348,6 +348,17 @@ impl<T> Receiver<T> {
         state.buffer.is_empty()
     }
 
+    /// Returns the number of messages currently buffered in the channel.
+    ///
+    /// This is the exact current occupancy (queue depth) of the channel, read
+    /// from the buffer. It is used for observe-only retained-work accounting of
+    /// items still in transit through a local channel.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        let state = self.channel.state.borrow();
+        state.buffer.len()
+    }
+
     /// Checks whether the channel has been closed and will accept no further
     /// sends.
     #[must_use]
@@ -486,6 +497,25 @@ mod tests {
                 Err(SendError::Full(2)) => (),
                 _ => panic!("Expected Full error"),
             }
+        });
+
+        rt.block_on(local);
+        rt.block_on(handle).expect("Test task failed");
+    }
+
+    #[test]
+    fn test_len_reports_buffered_count() {
+        let rt = create_test_runtime();
+        let local = tokio::task::LocalSet::new();
+
+        let handle = local.spawn_local(async {
+            let (tx, rx) = Channel::new(NonZeroUsize::new(4).unwrap());
+            assert_eq!(rx.len(), 0);
+            tx.send(1).unwrap();
+            tx.send(2).unwrap();
+            assert_eq!(rx.len(), 2, "len reflects buffered items");
+            let _ = rx.try_recv().unwrap();
+            assert_eq!(rx.len(), 1, "len decreases as items are received");
         });
 
         rt.block_on(local);

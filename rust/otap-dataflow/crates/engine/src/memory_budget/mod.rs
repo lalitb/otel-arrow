@@ -14,7 +14,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::marker::PhantomData;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -31,7 +31,7 @@ static DEFAULT_ESCROW_BUCKET: LazyLock<Arc<str>> = LazyLock::new(|| Arc::<str>::
 /// the account `Rc` they already hold (local tickets) or clone the cheap
 /// reference-counted handle at shared boundaries (escrow). No `String` is
 /// allocated when a [`LocalMemoryTicket`] or [`EscrowTicket`] is created.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct BudgetScopeId {
     /// Pipeline group owning or attributing the retained bytes.
     pub pipeline_group_id: Option<String>,
@@ -580,7 +580,7 @@ impl SharedEscrowMinter {
                 .unwrap_or_default(),
             None => self
                 .state
-                .try_observe_unknown_escrow_owner()
+                .try_observe_unknown_escrow_owner_in_bucket(Some(self.bucket.clone()))
                 .map(EscrowSlot::unknown)
                 .unwrap_or_default(),
         }
@@ -637,6 +637,12 @@ pub struct MemoryBudgetSnapshot {
     pub abandoned_escrow_oldest_age_millis: u64,
     /// Number of bounded abandoned-escrow alarms emitted by this state.
     pub abandoned_escrow_alarm_count: u64,
+    /// Cumulative count of abandoned-escrow entries whose per-entry metadata was
+    /// compacted (dropped) because the bounded deque was full when they were
+    /// abandoned. These remain counted in `abandoned_escrow_count`/`bytes` but
+    /// can no longer be reaped, so a non-zero value signals reduced reaping
+    /// precision (the leak stays visible, the reclamation handle is gone).
+    pub abandoned_escrow_compacted_count: u64,
     /// Cumulative count of abandoned-escrow entries reclaimed by the reaper.
     ///
     /// Reaping returns a leaked escrow charge's bytes to the global pool once it
@@ -686,6 +692,50 @@ pub struct MemoryBudgetSnapshot {
     pub unknown_count_by_site: [u64; RetainedSiteKind::COUNT],
 }
 
+/// Per-boundary escrow snapshot for low-cardinality metric attribution.
+///
+/// One value per registered escrow boundary (topic name or shared edge id).
+/// The boundary set is bounded by the pipeline configuration, so this is a
+/// low-cardinality attribution view of the aggregate `escrow_charged_bytes` and
+/// `escrow_unknown_count` gauges, not an additional total.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EscrowBucketSnapshot {
+    /// Interned boundary identifier (topic name or shared edge id).
+    pub boundary: Arc<str>,
+    /// Logical bytes currently owned by this boundary's escrow bucket.
+    pub charged_bytes: u64,
+    /// Unknown-size shared items currently retained against this boundary.
+    pub unknown_count: u64,
+}
+
+/// Per-runtime/per-scope memory-budget snapshot for low-cardinality attribution.
+///
+/// One value per live runtime snapshot, labeled by its interned
+/// [`BudgetScopeId`] (pipeline group, pipeline, core, deployment generation).
+/// These are bounded, stable labels (one runtime per pinned core), so this is a
+/// scope attribution view of the aggregate runtime counters, not an additional
+/// total: summing `charged_bytes` across scopes reproduces the aggregate
+/// `charged_bytes`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeScopeSnapshot {
+    /// Interned attribution scope (bounded labels only).
+    pub scope: BudgetScope,
+    /// Known logical retained bytes charged to this runtime.
+    pub charged_bytes: u64,
+    /// Retained bytes observed without a known logical size.
+    pub unknown_bytes: u64,
+    /// Retained item count observed without a known logical size.
+    pub unknown_count: u64,
+    /// Bytes borrowed from the global lease pool by this runtime.
+    pub borrowed_bytes: u64,
+    /// Bytes above this runtime's floor plus leases.
+    pub overshoot_bytes: u64,
+    /// Reconciliation-debt bytes for this runtime.
+    pub reconcile_debt_bytes: u64,
+    /// Pressure level encoded as `0=normal`, `1=soft`, `2=hard`.
+    pub level: u64,
+}
+
 #[derive(Debug, Default)]
 struct MemoryBudgetStateInner {
     config: Mutex<Option<RuntimeMemoryBudgetConfig>>,
@@ -693,7 +743,11 @@ struct MemoryBudgetStateInner {
     escrow_topic_default_limit_bytes: AtomicU64,
     escrow_queue_publish_enforce: AtomicBool,
     pool: GlobalLeasePool,
-    snapshots: Mutex<Vec<Weak<RuntimeMemorySnapshot>>>,
+    /// Live per-runtime snapshots, each paired with its interned attribution
+    /// scope so per-scope metric series can be derived off the hot path. The
+    /// `Weak` lets a dropped runtime's snapshot fall out of the aggregate; the
+    /// `BudgetScope` is a cheap `Arc` clone taken once at registration.
+    snapshots: Mutex<Vec<(BudgetScope, Weak<RuntimeMemorySnapshot>)>>,
     // Phase 2e leak detection keeps a bounded, low-cardinality sticky view:
     // count/bytes/oldest age. It intentionally does not store per-scope strings.
     abandoned_escrow: Mutex<VecDeque<AbandonedEscrowEntry>>,
@@ -701,6 +755,21 @@ struct MemoryBudgetStateInner {
     abandoned_escrow_bytes: AtomicU64,
     abandoned_escrow_alarm_count: AtomicU64,
     abandoned_escrow_alarm_fired: AtomicBool,
+    /// Bound on how many [`AbandonedEscrowEntry`] metadata records the deque
+    /// retains. `0` (the `Default`) means the [`DEFAULT_ABANDONED_ESCROW_CAPACITY`]
+    /// conservative default is used. When the deque is full, newly abandoned
+    /// escrow metadata is compacted (dropped) rather than stored, so the deque
+    /// cannot grow without bound if a future bare-escrow path leaks many tickets.
+    /// The cumulative count/bytes counters still record every abandonment, so the
+    /// leak stays observable; only the per-entry metadata needed for *reaping* is
+    /// shed, which is why compacted entries are intentionally never reaped.
+    abandoned_escrow_capacity: AtomicUsize,
+    /// Cumulative count of abandoned-escrow entries whose per-entry metadata was
+    /// compacted (dropped) because the bounded deque was already full. These
+    /// entries remain counted in the cumulative abandoned totals but cannot be
+    /// reaped (their bucket/pool metadata is gone), so the value is the loss of
+    /// reaping precision an operator should know about.
+    abandoned_escrow_compacted_count: AtomicU64,
     /// Reaper threshold in milliseconds. `0` (the default) disables reaping, so
     /// abandoned escrow stays sticky indefinitely. When non-zero, abandoned
     /// entries older than this are reclaimed (their bytes returned to the pool)
@@ -737,6 +806,14 @@ struct AbandonedEscrowEntry {
     bucket: EscrowBucket,
 }
 
+/// Conservative default bound on retained abandoned-escrow metadata entries.
+///
+/// Abandoned escrow only accumulates on a leak path (an [`EscrowTicket`] dropped
+/// without resolution), so a few hundred entries is already an alarming amount.
+/// The bound keeps the in-memory deque from growing without limit while leaving
+/// plenty of headroom for the oldest-age and reaper views to stay useful.
+const DEFAULT_ABANDONED_ESCROW_CAPACITY: usize = 1024;
+
 /// Shared runtime memory-budget state.
 #[derive(Debug, Clone, Default)]
 pub struct MemoryBudgetState {
@@ -755,22 +832,51 @@ pub struct EscrowBucket {
 
 #[derive(Debug)]
 struct EscrowBucketInner {
+    /// Interned boundary identifier (topic name or shared edge id). Cloned only
+    /// at metric-collection time, never on the per-item charge path.
+    boundary: Arc<str>,
     charged_bytes: AtomicU64,
+    /// Count of unknown-size shared items currently retained against this
+    /// boundary. Mirrors the global `escrow_unknown_count` but scoped to the
+    /// boundary so operators can attribute size-unknown retention.
+    unknown_count: AtomicU64,
 }
 
 impl EscrowBucket {
-    fn new() -> Self {
+    fn new(boundary: Arc<str>) -> Self {
         Self {
             inner: Arc::new(EscrowBucketInner {
+                boundary,
                 charged_bytes: AtomicU64::new(0),
+                unknown_count: AtomicU64::new(0),
             }),
         }
+    }
+
+    /// Returns the interned boundary identifier for this bucket.
+    #[must_use]
+    pub fn boundary(&self) -> &Arc<str> {
+        &self.inner.boundary
     }
 
     /// Returns charged bytes currently held by this bucket.
     #[must_use]
     pub fn charged_bytes(&self) -> u64 {
         self.inner.charged_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Returns the count of unknown-size shared items retained by this bucket.
+    #[must_use]
+    pub fn unknown_count(&self) -> u64 {
+        self.inner.unknown_count.load(Ordering::Relaxed)
+    }
+
+    fn incr_unknown(&self) {
+        let _ = self.inner.unknown_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn decr_unknown(&self) {
+        let _ = self.inner.unknown_count.fetch_sub(1, Ordering::Relaxed);
     }
 
     fn reserve(&self, bytes: u64, limit: u64, enforce: bool) -> Option<bool> {
@@ -866,18 +972,20 @@ impl MemoryBudgetState {
         if self.config().is_some() {
             snapshot.publish(0, 0, 0, 0, 0, 0, 0, 0, BudgetLevel::Normal);
         }
+        // Intern the attribution once per runtime so every ticket and escrow
+        // owner derived from this handle shares it without cloning strings on
+        // the per-item path. The same `Arc` is also retained in the snapshots
+        // registry so per-scope metric series can be derived off the hot path.
+        let scope = Arc::new(scope);
         self.inner
             .snapshots
             .lock()
             .expect("memory budget snapshots poisoned")
-            .push(Arc::downgrade(&snapshot));
+            .push((Arc::clone(&scope), Arc::downgrade(&snapshot)));
         RuntimeMemorySnapshotHandle {
             snapshot,
             state: self.clone(),
-            // Intern the attribution once per runtime so every ticket and
-            // escrow owner derived from this handle shares it without cloning
-            // strings on the per-item path.
-            scope: Arc::new(scope),
+            scope,
             account_taken: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -904,8 +1012,11 @@ impl MemoryBudgetState {
             .snapshots
             .lock()
             .expect("memory budget snapshots poisoned");
-        let live_snapshots: Vec<_> = snapshots.iter().filter_map(Weak::upgrade).collect();
-        snapshots.retain(|snapshot| snapshot.strong_count() > 0);
+        let live_snapshots: Vec<_> = snapshots
+            .iter()
+            .filter_map(|(_scope, weak)| weak.upgrade())
+            .collect();
+        snapshots.retain(|(_scope, weak)| weak.strong_count() > 0);
         let mut snapshot = MemoryBudgetSnapshot {
             runtime_count: live_snapshots.len() as u64,
             abandoned_escrow_count: self.inner.abandoned_escrow_count.load(Ordering::Relaxed),
@@ -913,6 +1024,10 @@ impl MemoryBudgetState {
             abandoned_escrow_alarm_count: self
                 .inner
                 .abandoned_escrow_alarm_count
+                .load(Ordering::Relaxed),
+            abandoned_escrow_compacted_count: self
+                .inner
+                .abandoned_escrow_compacted_count
                 .load(Ordering::Relaxed),
             reaped_escrow_count: self.inner.reaped_escrow_count.load(Ordering::Relaxed),
             reaped_escrow_bytes: self.inner.reaped_escrow_bytes.load(Ordering::Relaxed),
@@ -997,6 +1112,39 @@ impl MemoryBudgetState {
         snapshot
     }
 
+    /// Returns a per-runtime/per-scope snapshot for low-cardinality attribution.
+    ///
+    /// One entry per live runtime, labeled by its interned [`BudgetScope`]. The
+    /// runtime set is bounded (one per pinned core) and dropped runtimes are
+    /// pruned, so this is bounded and never accumulates stale series. Off the
+    /// per-item hot path: the scope label is a cheap `Arc` clone and the values
+    /// are atomic reads of the already-published snapshot.
+    #[must_use]
+    pub fn runtime_scope_snapshots(&self) -> Vec<RuntimeScopeSnapshot> {
+        let mut snapshots = self
+            .inner
+            .snapshots
+            .lock()
+            .expect("memory budget snapshots poisoned");
+        snapshots.retain(|(_scope, weak)| weak.strong_count() > 0);
+        snapshots
+            .iter()
+            .filter_map(|(scope, weak)| {
+                let runtime = weak.upgrade()?;
+                Some(RuntimeScopeSnapshot {
+                    scope: Arc::clone(scope),
+                    charged_bytes: runtime.charged_bytes(),
+                    unknown_bytes: runtime.unknown_bytes(),
+                    unknown_count: runtime.unknown_count(),
+                    borrowed_bytes: runtime.borrowed_bytes(),
+                    overshoot_bytes: runtime.overshoot_bytes(),
+                    reconcile_debt_bytes: runtime.reconcile_debt_bytes(),
+                    level: runtime.level(),
+                })
+            })
+            .collect()
+    }
+
     /// Stable identity for lightweight per-handle caches.
     #[must_use]
     pub(crate) fn cache_id(&self) -> usize {
@@ -1016,7 +1164,7 @@ impl MemoryBudgetState {
             .expect("memory budget escrow buckets poisoned");
         buckets
             .entry(Arc::clone(boundary))
-            .or_insert_with(EscrowBucket::new)
+            .or_insert_with(|| EscrowBucket::new(Arc::clone(boundary)))
             .clone()
     }
 
@@ -1031,17 +1179,71 @@ impl MemoryBudgetState {
             .map(EscrowBucket::charged_bytes)
     }
 
-    fn abandon_escrow(&self, bytes: u64, pool_backed: bool, bucket: &EscrowBucket) {
-        self.inner
-            .abandoned_escrow
+    /// Returns a bounded per-boundary escrow snapshot for metric collection.
+    ///
+    /// One entry per registered escrow boundary (topic name or shared edge id),
+    /// which is bounded by the pipeline configuration. The boundary label is a
+    /// cheap `Arc<str>` clone taken off the per-item path. Buckets that have
+    /// never charged bytes and hold no unknown owners are skipped so idle
+    /// boundaries do not emit series.
+    #[must_use]
+    pub fn escrow_bucket_snapshots(&self) -> Vec<EscrowBucketSnapshot> {
+        let buckets = self
+            .inner
+            .escrow_buckets
             .lock()
-            .expect("memory budget abandoned escrow poisoned")
-            .push_back(AbandonedEscrowEntry {
-                abandoned_at: Instant::now(),
-                bytes,
-                pool_backed,
-                bucket: bucket.clone(),
-            });
+            .expect("memory budget escrow buckets poisoned");
+        buckets
+            .values()
+            .filter_map(|bucket| {
+                let charged_bytes = bucket.charged_bytes();
+                let unknown_count = bucket.unknown_count();
+                if charged_bytes == 0 && unknown_count == 0 {
+                    return None;
+                }
+                Some(EscrowBucketSnapshot {
+                    boundary: Arc::clone(bucket.boundary()),
+                    charged_bytes,
+                    unknown_count,
+                })
+            })
+            .collect()
+    }
+
+    fn abandon_escrow(&self, bytes: u64, pool_backed: bool, bucket: &EscrowBucket) {
+        // Bound the retained per-entry metadata. When the deque is already at
+        // capacity we keep the existing (older) entries — so the oldest-age view
+        // stays meaningful and already-stored entries remain reapable — and
+        // compact the newly abandoned entry: its metadata is dropped but its
+        // charge is still recorded in the cumulative counters below. A compacted
+        // entry is therefore intentionally never reaped (its bucket/pool
+        // metadata is gone), which is the safe choice: we never pretend a charge
+        // was reclaimed when we can no longer reverse it precisely.
+        let capacity = self.abandoned_escrow_capacity();
+        let compacted = {
+            let mut abandoned = self
+                .inner
+                .abandoned_escrow
+                .lock()
+                .expect("memory budget abandoned escrow poisoned");
+            if abandoned.len() >= capacity {
+                true
+            } else {
+                abandoned.push_back(AbandonedEscrowEntry {
+                    abandoned_at: Instant::now(),
+                    bytes,
+                    pool_backed,
+                    bucket: bucket.clone(),
+                });
+                false
+            }
+        };
+        if compacted {
+            let _ = self
+                .inner
+                .abandoned_escrow_compacted_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let count = self
             .inner
             .abandoned_escrow_count
@@ -1070,7 +1272,31 @@ impl MemoryBudgetState {
         }
     }
 
-    fn try_observe_unknown_escrow_owner(&self) -> Option<EscrowUnknownOwner> {
+    /// Returns the configured abandoned-escrow metadata bound, falling back to
+    /// [`DEFAULT_ABANDONED_ESCROW_CAPACITY`] when unset (the `Default`).
+    fn abandoned_escrow_capacity(&self) -> usize {
+        match self.inner.abandoned_escrow_capacity.load(Ordering::Relaxed) {
+            0 => DEFAULT_ABANDONED_ESCROW_CAPACITY,
+            n => n,
+        }
+    }
+
+    /// Overrides the abandoned-escrow metadata bound (minimum 1).
+    ///
+    /// Coarse, runtime-initialization-time knob; not on any per-item path. A
+    /// value of `0` restores the [`DEFAULT_ABANDONED_ESCROW_CAPACITY`].
+    pub fn set_abandoned_escrow_capacity(&self, capacity: usize) {
+        self.inner
+            .abandoned_escrow_capacity
+            .store(capacity, Ordering::Relaxed);
+    }
+
+    /// Observes an unknown-size shared item, optionally attributing it to an
+    /// escrow boundary bucket so per-boundary unknown counts stay accurate.
+    fn try_observe_unknown_escrow_owner_in_bucket(
+        &self,
+        bucket: Option<EscrowBucket>,
+    ) -> Option<EscrowUnknownOwner> {
         if !self.inner.escrow_enabled.load(Ordering::Acquire) {
             return None;
         }
@@ -1078,17 +1304,24 @@ impl MemoryBudgetState {
             .inner
             .escrow_unknown_count
             .fetch_add(1, Ordering::Relaxed);
+        if let Some(bucket) = &bucket {
+            bucket.incr_unknown();
+        }
         Some(EscrowUnknownOwner {
             state: self.clone(),
+            bucket,
             resolved: false,
         })
     }
 
-    fn release_unknown_escrow(&self) {
+    fn release_unknown_escrow(&self, bucket: Option<&EscrowBucket>) {
         let _ = self
             .inner
             .escrow_unknown_count
             .fetch_sub(1, Ordering::Relaxed);
+        if let Some(bucket) = bucket {
+            bucket.decr_unknown();
+        }
     }
 
     /// Configures the abandoned-escrow reaper threshold.
@@ -2703,13 +2936,16 @@ impl Drop for EscrowTicket {
 #[derive(Debug)]
 pub struct EscrowUnknownOwner {
     state: MemoryBudgetState,
+    /// Boundary bucket this unknown owner is attributed to, when minted through
+    /// a [`SharedEscrowMinter`]. `None` for boundary-less observation.
+    bucket: Option<EscrowBucket>,
     resolved: bool,
 }
 
 impl EscrowUnknownOwner {
     fn release(mut self) {
         if !self.resolved {
-            self.state.release_unknown_escrow();
+            self.state.release_unknown_escrow(self.bucket.as_ref());
             self.resolved = true;
         }
     }
@@ -2718,7 +2954,7 @@ impl EscrowUnknownOwner {
 impl Drop for EscrowUnknownOwner {
     fn drop(&mut self) {
         if !self.resolved {
-            self.state.release_unknown_escrow();
+            self.state.release_unknown_escrow(self.bucket.as_ref());
             self.resolved = true;
         }
     }
@@ -3702,6 +3938,120 @@ mod tests {
     }
 
     #[test]
+    fn runtime_scope_snapshots_attribute_charged_bytes_per_scope() {
+        // Two runtimes with distinct scopes report independent per-scope values;
+        // their sum equals the aggregate charged bytes.
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 1_000,
+                    lease_step_bytes: 10,
+                    max_overshoot_per_runtime_bytes: 20,
+                    overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: 1_000,
+                runtime_count: 2,
+                enforcement: MemoryBudgetEnforcement::default(),
+            },
+            None,
+        );
+        let scope1 = BudgetScopeId {
+            pipeline_group_id: Some("grp".to_owned()),
+            pipeline_id: Some("pipe-1".to_owned()),
+            core_id: Some(0),
+            runtime_generation: Some(7),
+            topic_or_boundary: None,
+        };
+        let scope2 = BudgetScopeId {
+            pipeline_id: Some("pipe-2".to_owned()),
+            core_id: Some(1),
+            ..scope1.clone()
+        };
+        let h1 = state.register_runtime_snapshot(scope1);
+        let h2 = state.register_runtime_snapshot(scope2);
+        let a1 = h1.local_account().expect("runtime 1 account");
+        let a2 = h2.local_account().expect("runtime 2 account");
+
+        let _t1 = a1.charge(40_u64).expect("fits");
+        let _t2 = a2.charge(25_u64).expect("fits");
+        a1.flush_snapshot();
+        a2.flush_snapshot();
+
+        let scopes = state.runtime_scope_snapshots();
+        assert_eq!(scopes.len(), 2, "one entry per live runtime scope");
+        let bytes_for = |pipeline: &str| -> u64 {
+            scopes
+                .iter()
+                .find(|s| s.scope.pipeline_id.as_deref() == Some(pipeline))
+                .map_or(0, |s| s.charged_bytes)
+        };
+        assert_eq!(bytes_for("pipe-1"), 40);
+        assert_eq!(bytes_for("pipe-2"), 25);
+
+        // Per-scope values sum back to the aggregate charged bytes.
+        let scope_sum: u64 = scopes.iter().map(|s| s.charged_bytes).sum();
+        assert_eq!(scope_sum, state.snapshot().charged_bytes);
+        assert_eq!(scope_sum, 65);
+    }
+
+    #[test]
+    fn runtime_scope_snapshots_drop_dropped_runtimes() {
+        // A dropped runtime stops contributing a per-scope series.
+        let state = MemoryBudgetState::default();
+        state.configure(
+            RuntimeMemoryBudgetConfig {
+                mode: BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 1_000,
+                    lease_step_bytes: 10,
+                    max_overshoot_per_runtime_bytes: 20,
+                    overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: 1_000,
+                runtime_count: 2,
+                enforcement: MemoryBudgetEnforcement::default(),
+            },
+            None,
+        );
+        let h1 = state.register_runtime_snapshot(BudgetScopeId {
+            pipeline_id: Some("keep".to_owned()),
+            core_id: Some(0),
+            ..BudgetScopeId::default()
+        });
+        let a1 = h1.local_account().expect("runtime 1 account");
+        let _t1 = a1.charge(40_u64).expect("fits");
+        a1.flush_snapshot();
+
+        {
+            let h2 = state.register_runtime_snapshot(BudgetScopeId {
+                pipeline_id: Some("transient".to_owned()),
+                core_id: Some(1),
+                ..BudgetScopeId::default()
+            });
+            let a2 = h2.local_account().expect("runtime 2 account");
+            let t2 = a2.charge(25_u64).expect("fits");
+            a2.flush_snapshot();
+            assert_eq!(state.runtime_scope_snapshots().len(), 2);
+            // Drop every holder of runtime 2's snapshot Arc.
+            drop(t2);
+            drop(a2);
+            drop(h2);
+        }
+
+        let scopes = state.runtime_scope_snapshots();
+        assert_eq!(scopes.len(), 1, "the dropped runtime stops contributing");
+        assert_eq!(scopes[0].scope.pipeline_id.as_deref(), Some("keep"));
+    }
+
+    #[test]
     fn escrow_conversion_decrements_local_site() {
         let state = MemoryBudgetState::default();
         state.configure(
@@ -3807,6 +4157,24 @@ mod tests {
             Some(spare),
         );
         state
+    }
+
+    /// Returns the charged bytes for `boundary` in a per-boundary escrow snapshot
+    /// list, or 0 when the boundary is not present (idle).
+    fn bucket_bytes(snaps: &[EscrowBucketSnapshot], boundary: &str) -> u64 {
+        snaps
+            .iter()
+            .find(|s| &*s.boundary == boundary)
+            .map_or(0, |s| s.charged_bytes)
+    }
+
+    /// Returns the unknown-size count for `boundary` in a per-boundary escrow
+    /// snapshot list, or 0 when the boundary is not present (idle).
+    fn bucket_unknown(snaps: &[EscrowBucketSnapshot], boundary: &str) -> u64 {
+        snaps
+            .iter()
+            .find(|s| &*s.boundary == boundary)
+            .map_or(0, |s| s.unknown_count)
     }
 
     #[test]
@@ -3938,6 +4306,70 @@ mod tests {
         assert_eq!(
             state.escrow_bucket_charged_bytes("receiver:otlp_grpc:default"),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn escrow_bucket_snapshots_attribute_bytes_per_boundary() {
+        // Two boundaries owning escrow report independent per-boundary bytes; the
+        // aggregate equals their sum, and releasing one leaves the other intact.
+        let state = configure_state_for_shared_escrow(BudgetMode::ObserveOnly, false, 1_000, 1_000);
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let minter_a = handle.shared_escrow_minter(Arc::<str>::from("topic:a"));
+        let minter_b = handle.shared_escrow_minter(Arc::<str>::from("topic:b"));
+
+        let owner_a = minter_a.mint(40_u64).expect("mint a");
+        let owner_b = minter_b.mint(25_u64).expect("mint b");
+
+        let snaps = state.escrow_bucket_snapshots();
+        assert_eq!(snaps.len(), 2, "one entry per active boundary");
+        assert_eq!(bucket_bytes(&snaps, "topic:a"), 40);
+        assert_eq!(bucket_bytes(&snaps, "topic:b"), 25);
+        assert_eq!(
+            state.snapshot().escrow_charged_bytes,
+            65,
+            "aggregate equals the per-boundary sum"
+        );
+
+        owner_a.release();
+        let snaps = state.escrow_bucket_snapshots();
+        assert_eq!(
+            bucket_bytes(&snaps, "topic:b"),
+            25,
+            "releasing one boundary does not affect the other"
+        );
+        assert!(
+            !snaps.iter().any(|s| &*s.boundary == "topic:a"),
+            "the released boundary is idle and not emitted"
+        );
+        assert_eq!(state.snapshot().escrow_charged_bytes, 25);
+        owner_b.release();
+    }
+
+    #[test]
+    fn escrow_bucket_unknown_count_is_boundary_scoped() {
+        // An unknown-size shared item increments both the global and the
+        // per-boundary unknown count, and decrements both on release.
+        let state = configure_state_for_shared_escrow(BudgetMode::ObserveOnly, false, 1_000, 1_000);
+        let handle = state.register_runtime_snapshot(BudgetScopeId::default());
+        let minter = handle.shared_escrow_minter(Arc::<str>::from("receiver:arrow"));
+
+        let envelope = minter.envelope(UnknownSize);
+        assert!(envelope.has_owner());
+
+        let snaps = state.escrow_bucket_snapshots();
+        assert_eq!(bucket_unknown(&snaps, "receiver:arrow"), 1);
+        assert_eq!(
+            state.snapshot().escrow_unknown_count,
+            1,
+            "global unknown count mirrors the boundary unknown count"
+        );
+
+        drop(envelope);
+        assert_eq!(state.snapshot().escrow_unknown_count, 0);
+        assert!(
+            state.escrow_bucket_snapshots().is_empty(),
+            "the boundary is idle once the unknown owner is released"
         );
     }
 
@@ -4602,6 +5034,105 @@ mod tests {
         assert_eq!(
             snap.escrow_charged_bytes, 0,
             "explicit release already returned the charge"
+        );
+        assert_eq!(
+            snap.abandoned_escrow_compacted_count, 0,
+            "explicit release never compacts abandoned metadata"
+        );
+    }
+
+    /// Abandon `count` escrow charges of `bytes` each through the public
+    /// charge -> escrow -> drop path, so each records exactly one abandonment.
+    fn abandon_n_escrows(
+        state: &MemoryBudgetState,
+        acct: &Rc<RuntimeMemoryAccount>,
+        count: usize,
+        bytes: u64,
+    ) {
+        for _ in 0..count {
+            let escrow = acct
+                .charge(bytes)
+                .expect("local charge should fit")
+                .try_into_escrow(state)
+                .expect("escrow conversion should succeed in observe-only");
+            drop(escrow); // unresolved -> abandoned
+        }
+    }
+
+    #[test]
+    fn abandoned_escrow_deque_is_bounded_and_counts_compaction() {
+        // With a small bound, abandoning more entries than the bound keeps the
+        // deque from growing without limit: older entries are retained (so the
+        // oldest-age and reaper views stay useful) and excess newer metadata is
+        // compacted. The cumulative count/bytes still record every abandonment.
+        let (state, acct) = pool_backed_escrow_state_and_account();
+        state.set_abandoned_escrow_capacity(2);
+
+        abandon_n_escrows(&state, &acct, 5, 5);
+
+        let retained = state.inner.abandoned_escrow.lock().expect("deque").len();
+        assert_eq!(retained, 2, "deque is bounded to the configured capacity");
+
+        let snap = state.snapshot();
+        assert_eq!(
+            snap.abandoned_escrow_count, 5,
+            "cumulative abandoned count records every abandonment"
+        );
+        assert_eq!(
+            snap.abandoned_escrow_bytes, 25,
+            "cumulative abandoned bytes record every abandonment"
+        );
+        assert_eq!(
+            snap.abandoned_escrow_compacted_count, 3,
+            "entries beyond the bound are compacted (5 abandoned - 2 retained)"
+        );
+        assert!(
+            snap.abandoned_escrow_oldest_age_millis >= 1,
+            "oldest-age still reports the oldest retained metadata entry"
+        );
+        assert_eq!(
+            snap.abandoned_escrow_alarm_count, 1,
+            "the bounded alarm still fires exactly once"
+        );
+    }
+
+    #[test]
+    fn compacted_abandoned_escrow_is_not_reaped_but_retained_entries_are() {
+        // Compacted entries lose the bucket/pool metadata needed to reverse their
+        // charge, so they are intentionally never reaped (their charge stays
+        // sticky and observable). Retained entries are still reaped normally.
+        let (state, acct) = pool_backed_escrow_state_and_account();
+        state.set_abandoned_escrow_capacity(1);
+        state.set_abandoned_escrow_reap_after(Some(Duration::from_millis(50)));
+
+        abandon_n_escrows(&state, &acct, 3, 5); // 1 retained, 2 compacted
+
+        let before = state.snapshot();
+        assert_eq!(before.abandoned_escrow_compacted_count, 2);
+        assert_eq!(
+            before.escrow_charged_bytes, 15,
+            "all three abandoned charges are sticky before reaping"
+        );
+
+        std::thread::sleep(Duration::from_millis(70));
+        let after = state.snapshot(); // runs the reaper
+
+        assert_eq!(
+            after.reaped_escrow_count, 1,
+            "only the single retained entry is reaped"
+        );
+        assert_eq!(after.reaped_escrow_bytes, 5);
+        assert_eq!(
+            after.escrow_charged_bytes, 10,
+            "the two compacted charges remain sticky (unreapable)"
+        );
+        assert_eq!(
+            after.abandoned_escrow_compacted_count, 2,
+            "compacted count is preserved across the reaper pass"
+        );
+        assert_eq!(
+            after.abandoned_escrow_count, 3,
+            "cumulative abandoned total is never decremented"
         );
     }
 

@@ -437,6 +437,18 @@ that pairs the existing payload with its ticket. Enforce mode should not rely on
 out-of-band ownership unless the side table has the same drop, send-error, and
 drain guarantees as an envelope.
 
+Until exact local-channel ticket ownership is adopted, the observe-only build
+keeps local same-runtime channel retention **visible rather than silent**
+through explicit *uncovered* accounting: each local channel receiver exposes its
+exact current occupancy (`channel.receiver.queue.depth`, an item count) sampled
+from the channel buffer on the runtime thread. For PData channels this is the
+count of retained telemetry items in transit whose logical byte size the memory
+budget does not yet own (size deliberately reported as unknown, never guessed).
+This adds no per-item work and cannot drift (it reads the live buffer), does not
+store a `LocalMemoryTicket` in `PData`, does not make local channels `Send`, and
+does not change traffic behavior. Exact per-item local ticket ownership via
+`LocalEnvelope<Message<PData>>` remains the future "best" outcome.
+
 Attachment rules:
 
 - Local channels may carry a local envelope that pairs `PData` with
@@ -1149,6 +1161,19 @@ that can never otherwise be resolved. A normal abort, eviction, or tracked
 negative outcome should release escrow explicitly before drop. Explicit abort
 releases escrow inline; only bypassing the explicit abort, evict, redeem, or
 release path routes the ticket to the graveyard.
+
+The graveyard's per-entry metadata deque is bounded (a conservative default of
+1024 entries; abandonment only happens on a leak path, so this is already a large
+amount). When the deque is full, newly abandoned entries are *compacted*: their
+per-entry metadata is dropped while the cumulative abandoned count/bytes still
+record them, so the leak stays visible and the oldest-age view stays meaningful
+(older entries are retained). Because a compacted entry no longer carries the
+bucket/pool metadata the reaper needs to reverse its charge, compacted entries
+are intentionally **never reaped**: the engine never pretends to reclaim a
+charge it can no longer reverse precisely. The
+`engine.runtime.memory.budget.escrow.abandoned.compacted.count` metric surfaces
+how much reaping precision was shed so operators can detect a runaway leak that
+outran the bound.
 
 Existing channel `SendError<T>` shapes should be reused where possible by
 making `T` the local or escrow envelope. Phase 2 should not introduce a
@@ -1877,6 +1902,7 @@ item that has no owner.
 | `engine.runtime.memory.budget.escrow.abandoned.count` | Escrow tickets moved to the leak-detection graveyard. |
 | `engine.runtime.memory.budget.escrow.abandoned.oldest_age_ms` | Oldest abandoned escrow age retained for leak detection. |
 | `engine.runtime.memory.budget.escrow.abandoned.alarms` | Bounded abandoned-escrow alarms emitted by the engine. |
+| `engine.runtime.memory.budget.escrow.abandoned.compacted.count` | Abandoned-escrow entries whose metadata was compacted because the bounded tracking deque was full (cumulative). Non-zero means reduced reaping precision; the leak stays counted. |
 | `engine.runtime.memory.budget.escrow.reaped.count` | Abandoned-escrow entries reclaimed by the reaper (cumulative). |
 | `engine.runtime.memory.budget.escrow.reaped.bytes` | Bytes reclaimed from abandoned escrow by the reaper (cumulative). |
 | `engine.runtime.memory.budget.escrow.rejections` | Publish or redemption failures by escrow. |
@@ -1884,6 +1910,16 @@ item that has no owner.
 | `engine.runtime.memory.budget.spare.available.bytes` | Remaining global spare pool. |
 | `engine.runtime.memory.budget.site.charged.bytes` | Known logical retained bytes charged to one retention site (selected by the `site` attribute). Summing across all `site` values reproduces `charged.bytes`. |
 | `engine.runtime.memory.budget.site.unknown.count` | Unknown-size retained item count for one retention site (selected by the `site` attribute). Summing across all `site` values reproduces `unknown.count`. |
+| `engine.runtime.memory.budget.escrow.boundary.charged.bytes` | Logical bytes owned by one escrow boundary (selected by the `boundary` attribute: topic name or shared edge id). Summing across all active boundaries reproduces `escrow.charged.bytes`. |
+| `engine.runtime.memory.budget.escrow.boundary.unknown.count` | Unknown-size shared items retained against one escrow boundary (selected by the `boundary` attribute). Summing across all active boundaries reproduces `escrow.unknown.count`. |
+| `engine.runtime.memory.budget.scope.charged.bytes` | Known logical retained bytes charged to one runtime scope (selected by the `pipeline_group_id`/`pipeline_id`/`core_id`/`deployment_generation` attributes). Summing across all scopes reproduces `charged.bytes`. |
+| `engine.runtime.memory.budget.scope.unknown.bytes` | Unknown-size retained bytes for one runtime scope. |
+| `engine.runtime.memory.budget.scope.unknown.count` | Unknown-size retained item count for one runtime scope. |
+| `engine.runtime.memory.budget.scope.borrowed.bytes` | Lease bytes borrowed by one runtime scope. |
+| `engine.runtime.memory.budget.scope.overshoot.bytes` | Overshoot bytes for one runtime scope. |
+| `engine.runtime.memory.budget.scope.reconcile.debt.bytes` | Reconciliation-debt bytes for one runtime scope. |
+| `engine.runtime.memory.budget.scope.level` | Pressure level for one runtime scope. |
+| `channel.receiver.queue.depth` | Current buffered item count (occupancy) of a local channel. For PData channels this is the observe-only count of retained telemetry items in transit whose logical size is uncovered (unknown). |
 | `engine.numa.node.id` | NUMA node assigned to the runtime core. |
 | `engine.allocator.arena.resident.bytes` | Optional jemalloc arena resident bytes. |
 <!-- markdownlint-enable MD013 -->
@@ -1897,6 +1933,7 @@ Metric attributes should include:
 - `numa_node_id`, when known
 - `site`, for low-cardinality charge sites such as receiver, queue, topic,
   batch, retry, durable_buffer, stream, or delayed_work
+- `boundary`, for per-escrow-boundary series (topic name or shared edge id)
 - `release_cause`, for escrow release paths such as redeemed, evicted, aborted,
   disconnected, dropped, or graveyard
 - `source`, for rejection and pressure source metrics
@@ -1969,9 +2006,36 @@ conflating two ownership models):
   `exporter_inflight` site counters.
 - The aggregate `unknown.bytes` observe-only diagnostic is not split per site.
 
-This is per-*site* attribution only. Per-group, per-pipeline, and per-tenant
-attribution (and any enforcement keyed off these metrics, such as receiver
-admission) remain future work.
+This is per-*site* attribution. It is complemented by two additional
+low-cardinality observe-only attribution views (below). Per-*tenant* attribution
+and any *enforcement* keyed off these metrics (such as receiver admission) remain
+future work.
+
+#### Per-scope attribution
+
+Operators also need to know *which runtime/pipeline* is holding memory, not just
+which kind of site. Each runtime snapshot is registered with its interned
+[`BudgetScopeId`] (pipeline group, pipeline, core, deployment generation), and
+the engine emits one `engine.runtime.memory.budget.scope.*` series per live
+runtime, labeled by those four bounded, stable attributes. The labels are
+interned once per runtime (no per-item string cloning), the values are read from
+the already-published per-runtime snapshots at report time, and dropped runtimes
+are pruned so the series set never accumulates stale entries. The per-scope
+`charged.bytes` sum back to the aggregate `charged.bytes`; the aggregate gauges
+are kept unchanged.
+
+#### Per-escrow-boundary attribution
+
+The aggregate escrow gauges (`escrow.charged.bytes`, `escrow.unknown.count`,
+`escrow.active.bucket.count`, `escrow.max.bucket.bytes`) tell an operator that
+escrow pressure exists but not *which* topic or shared edge owns it. Each escrow
+bucket now retains its interned boundary id and a boundary-scoped unknown-owner
+count, and the engine emits one `engine.runtime.memory.budget.escrow.boundary.*`
+series per active boundary, labeled by the `boundary` attribute (topic name or
+shared edge id, bounded by the pipeline configuration). Unknown-size shared
+owners increment both the global and the owning boundary's unknown count and
+decrement both on release. The per-boundary `charged.bytes` and `unknown.count`
+sum back to the aggregate escrow gauges; idle boundaries are not emitted.
 
 ## Structured Events
 
@@ -2303,7 +2367,7 @@ so a "shared" boundary is any edge that leaves that pinned thread.
 | Topic broadcast ring | `engine/src/topic/topic.rs` (`BroadcastSlot`/`FastBroadcastRing`) | `Envelope<PData>` | Yes (bounded ring) | Yes | `EscrowSlot` in ring slot | Yes | wired (reference) |
 | Shared gRPC receiver -> downstream channel | `engine/src/lib.rs` (channel build), `engine/src/shared/message.rs`, `otap/src/pdata.rs`, `core-nodes/.../otlp_receiver`, `.../otap_receiver` | `OtapPdata` with optional `EscrowSlot` owner | Yes (flume/tokio mpsc buffer) | Yes (tonic threads -> pipeline thread) | sendable escrow owner attached by shared receiver send helper | Yes, for `OtapPdata` receiver sends | wired for shared receiver output edge |
 | Mixed local->shared wiring | `engine/src/message.rs` (`Sender::Shared`), `engine/src/lib.rs`, `engine/src/local/*`, `otap/src/pdata.rs` | `OtapPdata` with optional `EscrowSlot` owner | Yes (same shared channels) | Yes (pipeline thread -> shared channel) | sendable escrow owner attached by local receiver/processor send helper | Yes, for `OtapPdata` local-source sends | wired for mixed local-to-shared output edge |
-| Local inter-node channels | `engine/src/local/*`, `engine/src/message.rs` | `PData` | Yes (buffer) | No (same `LocalSet`, `!Send`) | n/a | n/a (local) | correctly local |
+| Local inter-node channels | `engine/src/local/*`, `engine/src/message.rs` | `PData` | Yes (buffer) | No (same `LocalSet`, `!Send`) | n/a | n/a (local) | correctly local; observe-only uncovered occupancy via `channel.receiver.queue.depth` |
 | Fanout / routers | `core-nodes/.../fanout_processor`, `content_router`, `exclusive_router_admission`, `signal_type_router` | `PData` | Yes (parked / in-flight) | No (`local::Processor`) | `LocalMemoryTicket` (`FanoutInflight` / `RouterParked`) | n/a (local) | local, already accounted |
 <!-- markdownlint-enable MD013 -->
 

@@ -343,6 +343,17 @@ impl<T> Receiver<T> {
         state.buffer.is_empty()
     }
 
+    /// Returns the number of messages currently buffered in the channel.
+    ///
+    /// This is the exact current occupancy (queue depth) of the channel, read
+    /// from the buffer. It is used for observe-only retained-work accounting of
+    /// items still in transit through a local channel.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        let state = self.channel.state.borrow();
+        state.buffer.len()
+    }
+
     /// Checks whether the channel has been closed and will accept no further
     /// sends.
     #[must_use]

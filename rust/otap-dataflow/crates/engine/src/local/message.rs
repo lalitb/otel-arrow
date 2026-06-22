@@ -207,6 +207,20 @@ impl<T> LocalReceiver<T> {
         }
     }
 
+    /// Returns the number of messages currently buffered in this channel.
+    ///
+    /// Exact current occupancy read from the channel buffer. For local PData
+    /// channels this is the observe-only count of retained telemetry items in
+    /// transit whose logical byte size the memory budget does not own.
+    #[must_use]
+    pub fn pending_items(&self) -> u64 {
+        let len = match &self.inner {
+            LocalReceiverInner::Mpsc(receiver) => receiver.len(),
+            LocalReceiverInner::Mpmc(receiver) => receiver.len(),
+        };
+        len as u64
+    }
+
     /// Receives a message from the channel.
     pub async fn recv(&mut self) -> Result<T, RecvError> {
         let result = match &mut self.inner {
@@ -215,12 +229,14 @@ impl<T> LocalReceiver<T> {
         };
 
         if let Some(metrics) = &self.metrics {
+            let depth = self.pending_items();
             if let Ok(mut metrics) = metrics.try_borrow_mut() {
                 match &result {
                     Ok(_) => metrics.record_recv_ok(),
                     Err(RecvError::Empty) => metrics.record_recv_error_empty(),
                     Err(RecvError::Closed) => metrics.record_recv_error_closed(),
                 }
+                metrics.record_queue_depth(depth);
             }
         }
 
@@ -235,12 +251,14 @@ impl<T> LocalReceiver<T> {
         };
 
         if let Some(metrics) = &self.metrics {
+            let depth = self.pending_items();
             if let Ok(mut metrics) = metrics.try_borrow_mut() {
                 match &result {
                     Ok(_) => metrics.record_recv_ok(),
                     Err(RecvError::Empty) => metrics.record_recv_error_empty(),
                     Err(RecvError::Closed) => metrics.record_recv_error_closed(),
                 }
+                metrics.record_queue_depth(depth);
             }
         }
 

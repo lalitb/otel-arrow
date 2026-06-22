@@ -65,10 +65,15 @@ pub struct ChannelReceiverMetrics {
     // TODO: Populate in a future PR when message sizes are tracked.
     // #[metric(name = "recv.bytes", unit = "{By}")]
     // pub recv_bytes: Counter<u64>,
-    // Current number of buffered messages.
-    // TODO: Populate in a future PR when queue depth is tracked.
-    // #[metric(name = "queue.depth", unit = "{message}")]
-    // pub queue_depth: Gauge<u64>,
+    /// Current number of buffered messages (queue depth / occupancy).
+    ///
+    /// For local PData channels this is the observe-only retained-work view:
+    /// the count of telemetry items still in transit through the channel whose
+    /// logical byte size is not owned by a memory-budget ticket (size unknown).
+    /// It is sampled from the actual channel buffer on the runtime thread, so it
+    /// adds no per-item cost and never drifts.
+    #[metric(name = "queue.depth", unit = "{message}")]
+    pub queue_depth: Gauge<u64>,
     /// Maximum channel capacity (buffer size).
     #[metric(name = "capacity", unit = "{message}")]
     pub capacity: Gauge<u64>,
@@ -191,6 +196,16 @@ impl ChannelReceiverMetricsState {
     #[inline]
     pub(crate) fn record_recv_error_closed(&mut self) {
         self.metrics.recv_error_closed.inc();
+    }
+
+    /// Publishes the current channel occupancy (queue depth) gauge.
+    ///
+    /// Called from the receive path on the runtime thread with the channel's
+    /// actual buffered-item count, so the gauge reflects exact current occupancy
+    /// without any per-item tracking state that could drift.
+    #[inline]
+    pub(crate) fn record_queue_depth(&mut self, depth: u64) {
+        self.metrics.queue_depth.set(depth);
     }
 
     #[inline]
@@ -380,5 +395,97 @@ mod tests {
             .position(|field| field.name == "capacity")
             .expect("capacity metric not found");
         assert_eq!(snapshot.get_metrics()[capacity_index].to_u64_lossy(), 1);
+    }
+
+    #[test]
+    fn local_channel_queue_depth_tracks_occupancy_on_recv() {
+        // Observe-only retained-work accounting for a local channel: the exact
+        // current occupancy is visible, and a successful receive lowers it and
+        // refreshes the queue-depth gauge.
+        let pipeline_ctx = test_context();
+        let mut registry = ChannelMetricsRegistry::default();
+        let (sender, receiver) = mpsc::Channel::new(4);
+        let sender = LocalSender::mpsc(sender);
+        let channel_entity_key = pipeline_ctx.register_node_channel_entity(
+            "receiver:occupancy".into(),
+            "input".into(),
+            CHANNEL_KIND_PDATA,
+            CHANNEL_MODE_LOCAL,
+            CHANNEL_TYPE_MPSC,
+            CHANNEL_IMPL_INTERNAL,
+        );
+        let receiver_metrics = pipeline_ctx
+            .register_metric_set_for_entity::<ChannelReceiverMetrics>(channel_entity_key);
+        let mut receiver =
+            LocalReceiver::mpsc_with_metrics(receiver, &mut registry, receiver_metrics, 4);
+
+        // Three queued items: the exact retained occupancy is visible.
+        sender.try_send(1).unwrap();
+        sender.try_send(2).unwrap();
+        sender.try_send(3).unwrap();
+        assert_eq!(receiver.pending_items(), 3, "send queues are observable");
+
+        // A successful receive lowers occupancy and refreshes the depth gauge.
+        assert!(matches!(receiver.try_recv(), Ok(1)));
+        assert_eq!(receiver.pending_items(), 2);
+
+        let handles = registry.into_handles();
+        let receiver_handle = take_local_receiver_handle(&handles);
+        assert_eq!(
+            receiver_handle.borrow().metrics.queue_depth.get(),
+            2,
+            "queue-depth gauge reflects post-receive occupancy"
+        );
+    }
+
+    #[test]
+    fn local_channel_failed_send_does_not_change_occupancy() {
+        // A failed (full) send must not create retained-work accounting.
+        let (sender, receiver) = mpsc::Channel::new(1);
+        let sender = LocalSender::mpsc(sender);
+        let receiver = LocalReceiver::mpsc(receiver);
+
+        sender.try_send(1).unwrap();
+        assert!(matches!(sender.try_send(2), Err(SendError::Full(_))));
+        assert_eq!(
+            receiver.pending_items(),
+            1,
+            "a full (failed) send does not enqueue retained work"
+        );
+    }
+
+    #[test]
+    fn local_channel_depth_returns_to_zero_after_drain() {
+        // Draining the channel returns the occupancy view to zero.
+        let pipeline_ctx = test_context();
+        let mut registry = ChannelMetricsRegistry::default();
+        let (sender, receiver) = mpsc::Channel::new(4);
+        let sender = LocalSender::mpsc(sender);
+        let channel_entity_key = pipeline_ctx.register_node_channel_entity(
+            "receiver:drain".into(),
+            "input".into(),
+            CHANNEL_KIND_PDATA,
+            CHANNEL_MODE_LOCAL,
+            CHANNEL_TYPE_MPSC,
+            CHANNEL_IMPL_INTERNAL,
+        );
+        let receiver_metrics = pipeline_ctx
+            .register_metric_set_for_entity::<ChannelReceiverMetrics>(channel_entity_key);
+        let mut receiver =
+            LocalReceiver::mpsc_with_metrics(receiver, &mut registry, receiver_metrics, 4);
+
+        sender.try_send(1).unwrap();
+        sender.try_send(2).unwrap();
+        assert!(matches!(receiver.try_recv(), Ok(1)));
+        assert!(matches!(receiver.try_recv(), Ok(2)));
+        assert_eq!(receiver.pending_items(), 0);
+
+        let handles = registry.into_handles();
+        let receiver_handle = take_local_receiver_handle(&handles);
+        assert_eq!(
+            receiver_handle.borrow().metrics.queue_depth.get(),
+            0,
+            "queue-depth gauge is zero once the channel is drained"
+        );
     }
 }

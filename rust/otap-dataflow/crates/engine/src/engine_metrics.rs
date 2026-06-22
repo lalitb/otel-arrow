@@ -34,7 +34,7 @@
 //!   TODO: Also emit a cumulative `cpu_time` counter (like the Go Collector's
 //!   `process_cpu_seconds_total`) for users who prefer query-time computation.
 
-use crate::memory_budget::{MemoryBudgetState, RetainedSiteKind};
+use crate::memory_budget::{BudgetScope, MemoryBudgetState, RetainedSiteKind};
 use crate::memory_limiter::MemoryPressureState;
 use cpu_time::ProcessTime;
 use otap_df_telemetry::instrument::{Gauge, ObserveUpDownCounter};
@@ -43,6 +43,8 @@ use otap_df_telemetry::registry::{EntityKey, TelemetryRegistryHandle};
 use otap_df_telemetry::reporter::MetricsReporter;
 use otap_df_telemetry_macros::{attribute_set, metric_set};
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Engine-wide metrics emitted once per engine instance.
@@ -135,6 +137,12 @@ pub struct EngineMetrics {
     #[metric(unit = "{alarm}")]
     pub runtime_memory_budget_abandoned_escrow_alarm_count: Gauge<u64>,
 
+    /// Abandoned-escrow entries whose metadata was compacted because the bounded
+    /// tracking deque was full (cumulative). Non-zero means reaping precision was
+    /// reduced; the leak remains counted in the abandoned totals.
+    #[metric(unit = "{ticket}")]
+    pub runtime_memory_budget_abandoned_escrow_compacted_count: Gauge<u64>,
+
     /// Abandoned-escrow entries reclaimed by the reaper (cumulative).
     #[metric(unit = "{ticket}")]
     pub runtime_memory_budget_reaped_escrow_count: Gauge<u64>,
@@ -222,6 +230,109 @@ pub struct RetainedSiteAttributeSet {
     pub site: Cow<'static, str>,
 }
 
+/// Per-escrow-boundary attribution, emitted as one low-cardinality labeled
+/// series per escrow boundary (selected by the `boundary` attribute).
+///
+/// This is a breakdown of the aggregate `runtime_memory_budget_escrow_charged_bytes`
+/// and `runtime_memory_budget_escrow_unknown_count` gauges: summing a field
+/// across all `boundary` values reproduces the aggregate (modulo boundaries that
+/// are momentarily idle and therefore not emitted). It lets operators tell apart
+/// which topic or shared edge owns escrowed retained work. The boundary set is
+/// bounded by the pipeline configuration (topic names and shared edge ids), and
+/// the values are read from a per-boundary snapshot at report time, so there is
+/// no per-item metric work.
+#[metric_set(name = "engine")]
+#[derive(Debug, Default, Clone)]
+pub struct EscrowBoundaryMetrics {
+    /// Logical bytes currently owned by this boundary's escrow bucket.
+    #[metric(unit = "{By}")]
+    pub runtime_memory_budget_escrow_boundary_charged_bytes: Gauge<u64>,
+
+    /// Unknown-size shared items currently retained against this boundary.
+    #[metric(unit = "{item}")]
+    pub runtime_memory_budget_escrow_boundary_unknown_count: Gauge<u64>,
+}
+
+/// Attribute set scoping an [`EscrowBoundaryMetrics`] series to one boundary.
+///
+/// The `boundary` value is an interned topic name or shared edge id, bounded by
+/// the pipeline configuration. It is an owned label constructed once per
+/// boundary when the series is first registered, never on the per-item path.
+#[attribute_set(name = "engine.escrow.boundary.attrs")]
+#[derive(Debug, Clone, Default, Hash)]
+pub struct EscrowBoundaryAttributeSet {
+    /// Low-cardinality escrow-boundary label (e.g. `topic:logs` or
+    /// `receiver:otlp_grpc:default`).
+    #[attribute(key = "boundary")]
+    pub boundary: Cow<'static, str>,
+}
+
+/// Per-runtime/per-scope memory-budget attribution, emitted as one labeled
+/// series per live runtime scope (pipeline group, pipeline, core, deployment
+/// generation).
+///
+/// This is a scope breakdown of the aggregate runtime gauges
+/// (`runtime_memory_budget_charged_bytes`, ...): summing a field across all
+/// scopes reproduces the aggregate. It lets operators attribute retained memory
+/// to a specific pipeline/runtime. The labels are bounded and stable (one
+/// runtime per pinned core) and the values are read from per-runtime snapshots
+/// at report time, so there is no per-item metric work and no per-item string
+/// cloning.
+#[metric_set(name = "engine")]
+#[derive(Debug, Default, Clone)]
+pub struct RuntimeScopeMetrics {
+    /// Known logical retained bytes charged to this runtime scope.
+    #[metric(unit = "{By}")]
+    pub runtime_memory_budget_scope_charged_bytes: Gauge<u64>,
+
+    /// Retained bytes observed without a known logical size in this scope.
+    #[metric(unit = "{By}")]
+    pub runtime_memory_budget_scope_unknown_bytes: Gauge<u64>,
+
+    /// Retained item count observed without a known logical size in this scope.
+    #[metric(unit = "{item}")]
+    pub runtime_memory_budget_scope_unknown_count: Gauge<u64>,
+
+    /// Bytes borrowed from the global lease pool by this runtime scope.
+    #[metric(unit = "{By}")]
+    pub runtime_memory_budget_scope_borrowed_bytes: Gauge<u64>,
+
+    /// Bytes above the runtime floor plus leases in this scope.
+    #[metric(unit = "{By}")]
+    pub runtime_memory_budget_scope_overshoot_bytes: Gauge<u64>,
+
+    /// Reconciliation-debt bytes for this runtime scope.
+    #[metric(unit = "{By}")]
+    pub runtime_memory_budget_scope_reconcile_debt_bytes: Gauge<u64>,
+
+    /// Pressure level for this scope (`0=normal`, `1=soft`, `2=hard`).
+    #[metric(unit = "{state}")]
+    pub runtime_memory_budget_scope_level: Gauge<u64>,
+}
+
+/// Attribute set scoping a [`RuntimeScopeMetrics`] series to one runtime scope.
+///
+/// All four labels are bounded by the deployment topology (pipeline group,
+/// pipeline, core, deployment generation). They are owned labels constructed
+/// once per scope when the series is first registered, never on the per-item
+/// path.
+#[attribute_set(name = "engine.budget.scope.attrs")]
+#[derive(Debug, Clone, Default, Hash)]
+pub struct RuntimeScopeAttributeSet {
+    /// Pipeline group owning the retained bytes.
+    #[attribute(key = "pipeline_group_id")]
+    pub pipeline_group_id: Cow<'static, str>,
+    /// Pipeline owning the retained bytes.
+    #[attribute(key = "pipeline_id")]
+    pub pipeline_id: Cow<'static, str>,
+    /// Core id of the runtime owning the retained bytes.
+    #[attribute(key = "core_id")]
+    pub core_id: Cow<'static, str>,
+    /// Runtime deployment generation owning the retained bytes.
+    #[attribute(key = "deployment_generation")]
+    pub deployment_generation: Cow<'static, str>,
+}
+
 /// Monitors and reports engine-wide metrics.
 ///
 /// Created by the controller and driven by a periodic timer in a dedicated
@@ -232,6 +343,13 @@ pub struct EngineMetricsMonitor {
     /// One labeled metric set per attributed retention site, paired with the
     /// site kind it reports. Updated from the per-site snapshot rollup.
     site_metrics: Vec<(RetainedSiteKind, MetricSet<RetainedSiteMetrics>)>,
+    /// One labeled metric set per escrow boundary, registered lazily the first
+    /// time a boundary reports activity and then reused. The boundary set is
+    /// bounded by the pipeline configuration, so the map size is bounded.
+    escrow_boundary_metrics: HashMap<Arc<str>, MetricSet<EscrowBoundaryMetrics>>,
+    /// One labeled metric set per live runtime scope, registered lazily and
+    /// pruned when the runtime is gone. Bounded by the number of runtimes.
+    runtime_scope_metrics: HashMap<BudgetScope, MetricSet<RuntimeScopeMetrics>>,
     reporter: MetricsReporter,
     registry: TelemetryRegistryHandle,
     /// Wall-clock anchor for the current measurement interval.
@@ -279,6 +397,8 @@ impl EngineMetricsMonitor {
         Self {
             metrics,
             site_metrics,
+            escrow_boundary_metrics: HashMap::new(),
+            runtime_scope_metrics: HashMap::new(),
             reporter,
             registry,
             wall_start: Instant::now(),
@@ -362,6 +482,9 @@ impl EngineMetricsMonitor {
             .runtime_memory_budget_abandoned_escrow_alarm_count
             .set(memory_budget.abandoned_escrow_alarm_count);
         self.metrics
+            .runtime_memory_budget_abandoned_escrow_compacted_count
+            .set(memory_budget.abandoned_escrow_compacted_count);
+        self.metrics
             .runtime_memory_budget_reaped_escrow_count
             .set(memory_budget.reaped_escrow_count);
         self.metrics
@@ -408,8 +531,101 @@ impl EngineMetricsMonitor {
                 .runtime_memory_budget_site_unknown_count
                 .set(memory_budget.unknown_count_by_site[index]);
         }
+        self.update_escrow_boundary_metrics();
+        self.update_runtime_scope_metrics();
         self.wall_start = now_wall;
         self.cpu_start = now_cpu;
+    }
+
+    /// Refreshes the per-escrow-boundary labeled series from the boundary
+    /// snapshot. Boundaries that have gone idle since the last sample are zeroed
+    /// (their cached series is retained but reports `0`), and newly active
+    /// boundaries register a series lazily. Bounded by the pipeline's boundary
+    /// set, so the cache and per-update work stay bounded.
+    fn update_escrow_boundary_metrics(&mut self) {
+        // Zero all cached series first so boundaries absent from this round's
+        // snapshot report 0 rather than a stale value.
+        for metric_set in self.escrow_boundary_metrics.values_mut() {
+            metric_set
+                .runtime_memory_budget_escrow_boundary_charged_bytes
+                .set(0);
+            metric_set
+                .runtime_memory_budget_escrow_boundary_unknown_count
+                .set(0);
+        }
+        // Disjoint field borrows: the registration closure only touches
+        // `registry`, while the entry borrows `escrow_boundary_metrics`.
+        let registry = &self.registry;
+        let boundary_metrics = &mut self.escrow_boundary_metrics;
+        for snapshot in self.memory_budget_state.escrow_bucket_snapshots() {
+            let metric_set = boundary_metrics
+                .entry(Arc::clone(&snapshot.boundary))
+                .or_insert_with(|| {
+                    registry.register_metric_set::<EscrowBoundaryMetrics>(
+                        EscrowBoundaryAttributeSet {
+                            boundary: Cow::Owned(snapshot.boundary.to_string()),
+                        },
+                    )
+                });
+            metric_set
+                .runtime_memory_budget_escrow_boundary_charged_bytes
+                .set(snapshot.charged_bytes);
+            metric_set
+                .runtime_memory_budget_escrow_boundary_unknown_count
+                .set(snapshot.unknown_count);
+        }
+    }
+
+    /// Refreshes the per-runtime/per-scope labeled series from the scope
+    /// snapshot. Scopes whose runtime has gone away are unregistered and dropped
+    /// from the cache so it stays bounded by the live runtime count; live scopes
+    /// register a series lazily and report their current values. The aggregate
+    /// runtime gauges are emitted separately and unchanged.
+    fn update_runtime_scope_metrics(&mut self) {
+        let scope_snapshots = self.memory_budget_state.runtime_scope_snapshots();
+        // Prune cached series for scopes whose runtime is no longer live so the
+        // cache never accumulates stale per-scope series across redeployments.
+        let registry = &self.registry;
+        self.runtime_scope_metrics.retain(|scope, metric_set| {
+            let live = scope_snapshots.iter().any(|s| &s.scope == scope);
+            if !live {
+                let _ = registry.unregister_metric_set(metric_set.metric_set_key());
+            }
+            live
+        });
+        // Disjoint field borrows: the registration closure only touches
+        // `registry`, while the entry borrows `runtime_scope_metrics`.
+        let scope_metrics = &mut self.runtime_scope_metrics;
+        for snapshot in &scope_snapshots {
+            let metric_set = scope_metrics
+                .entry(Arc::clone(&snapshot.scope))
+                .or_insert_with(|| {
+                    registry.register_metric_set::<RuntimeScopeMetrics>(scope_attribute_set(
+                        &snapshot.scope,
+                    ))
+                });
+            metric_set
+                .runtime_memory_budget_scope_charged_bytes
+                .set(snapshot.charged_bytes);
+            metric_set
+                .runtime_memory_budget_scope_unknown_bytes
+                .set(snapshot.unknown_bytes);
+            metric_set
+                .runtime_memory_budget_scope_unknown_count
+                .set(snapshot.unknown_count);
+            metric_set
+                .runtime_memory_budget_scope_borrowed_bytes
+                .set(snapshot.borrowed_bytes);
+            metric_set
+                .runtime_memory_budget_scope_overshoot_bytes
+                .set(snapshot.overshoot_bytes);
+            metric_set
+                .runtime_memory_budget_scope_reconcile_debt_bytes
+                .set(snapshot.reconcile_debt_bytes);
+            metric_set
+                .runtime_memory_budget_scope_level
+                .set(snapshot.level);
+        }
     }
 
     /// Flushes sampled metrics to the reporting pipeline.
@@ -419,6 +635,12 @@ impl EngineMetricsMonitor {
     pub fn report(&mut self) -> Result<(), otap_df_telemetry::error::Error> {
         self.reporter.report(&mut self.metrics)?;
         for (_site, metric_set) in self.site_metrics.iter_mut() {
+            self.reporter.report(metric_set)?;
+        }
+        for metric_set in self.escrow_boundary_metrics.values_mut() {
+            self.reporter.report(metric_set)?;
+        }
+        for metric_set in self.runtime_scope_metrics.values_mut() {
             self.reporter.report(metric_set)?;
         }
         Ok(())
@@ -432,12 +654,47 @@ fn get_rss_bytes() -> u64 {
         .unwrap_or(0)
 }
 
+/// Builds the owned, bounded attribute set for a runtime scope series.
+///
+/// Missing labels map to an empty string. Constructed once per scope when the
+/// series is first registered, never on the per-item path.
+fn scope_attribute_set(scope: &BudgetScope) -> RuntimeScopeAttributeSet {
+    RuntimeScopeAttributeSet {
+        pipeline_group_id: scope
+            .pipeline_group_id
+            .clone()
+            .map_or(Cow::Borrowed(""), Cow::Owned),
+        pipeline_id: scope
+            .pipeline_id
+            .clone()
+            .map_or(Cow::Borrowed(""), Cow::Owned),
+        core_id: scope
+            .core_id
+            .map_or(Cow::Borrowed(""), |id| Cow::Owned(id.to_string())),
+        deployment_generation: scope
+            .runtime_generation
+            .map_or(Cow::Borrowed(""), |generation| {
+                Cow::Owned(generation.to_string())
+            }),
+    }
+}
+
 impl Drop for EngineMetricsMonitor {
     fn drop(&mut self) {
         let _ = self
             .registry
             .unregister_metric_set(self.metrics.metric_set_key());
         for (_site, metric_set) in &self.site_metrics {
+            let _ = self
+                .registry
+                .unregister_metric_set(metric_set.metric_set_key());
+        }
+        for metric_set in self.escrow_boundary_metrics.values() {
+            let _ = self
+                .registry
+                .unregister_metric_set(metric_set.metric_set_key());
+        }
+        for metric_set in self.runtime_scope_metrics.values() {
             let _ = self
                 .registry
                 .unregister_metric_set(metric_set.metric_set_key());
@@ -868,5 +1125,143 @@ mod tests {
             Some(MetricValue::U64(50)),
             "reported batch_pending site series should carry the charged bytes"
         );
+    }
+
+    #[test]
+    fn engine_metrics_expose_per_scope_attribution() {
+        let registry = TelemetryRegistryHandle::new();
+        let controller = ControllerContext::new(registry.clone());
+        controller.configure_memory_budget(
+            crate::memory_budget::RuntimeMemoryBudgetConfig {
+                mode: crate::memory_budget::BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: crate::memory_budget::MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 1_000,
+                    lease_step_bytes: 10,
+                    max_overshoot_per_runtime_bytes: 20,
+                    overshoot_debt_limit_bytes: 10,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: 1_000,
+                runtime_count: 1,
+                enforcement: crate::memory_budget::MemoryBudgetEnforcement::default(),
+            },
+            None,
+        );
+        let handle = controller.memory_budget_state().register_runtime_snapshot(
+            crate::memory_budget::BudgetScopeId {
+                pipeline_group_id: Some("grp".to_owned()),
+                pipeline_id: Some("pipe-a".to_owned()),
+                core_id: Some(0),
+                runtime_generation: Some(3),
+                topic_or_boundary: None,
+            },
+        );
+        let account = handle.local_account().expect("budget should be configured");
+        let _batch = account
+            .charge_at(RetainedSiteKind::BatchPending, 64_u64)
+            .expect("charge should fit");
+        account.flush_snapshot();
+
+        // The labeled metric set declares the expected stable metric names.
+        let descriptor = RuntimeScopeMetrics::default().descriptor();
+        assert!(
+            descriptor
+                .metrics
+                .iter()
+                .any(|f| f.name == "runtime.memory.budget.scope.charged.bytes"),
+            "per-scope charged-bytes metric must exist"
+        );
+
+        let entity_key = controller.register_engine_entity();
+        let (_rx, reporter) = MetricsReporter::create_new_and_receiver(64);
+        let mut monitor = EngineMetricsMonitor::new(
+            registry,
+            entity_key,
+            reporter,
+            controller.memory_pressure_state(),
+            controller.memory_budget_state(),
+        );
+        monitor.update();
+
+        assert_eq!(
+            monitor.runtime_scope_metrics.len(),
+            1,
+            "one labeled series per live runtime scope"
+        );
+        let scope_charged: u64 = monitor
+            .runtime_scope_metrics
+            .values()
+            .map(|m| m.runtime_memory_budget_scope_charged_bytes.get())
+            .sum();
+        assert_eq!(scope_charged, 64);
+        // The aggregate is unchanged and the per-scope series sum back to it.
+        assert_eq!(
+            scope_charged,
+            monitor.metrics.runtime_memory_budget_charged_bytes.get()
+        );
+        monitor.report().expect("report should succeed");
+    }
+
+    #[test]
+    fn engine_metrics_expose_per_boundary_escrow_attribution() {
+        let registry = TelemetryRegistryHandle::new();
+        let controller = ControllerContext::new(registry.clone());
+        controller.configure_memory_budget(
+            crate::memory_budget::RuntimeMemoryBudgetConfig {
+                mode: crate::memory_budget::BudgetMode::ObserveOnly,
+                retry_after_secs: 1,
+                sizing: crate::memory_budget::MemoryBudgetSizing {
+                    reserve_bytes: 0,
+                    floor_per_runtime_bytes: 1,
+                    lease_step_bytes: 1,
+                    max_overshoot_per_runtime_bytes: 1,
+                    overshoot_debt_limit_bytes: 0,
+                    drain_allowance_bytes: 0,
+                },
+                topic_default_limit_bytes: 1_000,
+                runtime_count: 1,
+                enforcement: crate::memory_budget::MemoryBudgetEnforcement::default(),
+            },
+            Some(1_000),
+        );
+        let handle = controller
+            .memory_budget_state()
+            .register_runtime_snapshot(crate::memory_budget::BudgetScopeId::default());
+        let minter = handle.shared_escrow_minter(Arc::<str>::from("topic:logs"));
+        let _owner = minter.mint(48_u64).expect("escrow mint should succeed");
+
+        let entity_key = controller.register_engine_entity();
+        let (_rx, reporter) = MetricsReporter::create_new_and_receiver(64);
+        let mut monitor = EngineMetricsMonitor::new(
+            registry,
+            entity_key,
+            reporter,
+            controller.memory_pressure_state(),
+            controller.memory_budget_state(),
+        );
+        monitor.update();
+
+        assert_eq!(
+            monitor.escrow_boundary_metrics.len(),
+            1,
+            "one labeled series for the single active boundary"
+        );
+        let boundary_charged: u64 = monitor
+            .escrow_boundary_metrics
+            .values()
+            .map(|m| m.runtime_memory_budget_escrow_boundary_charged_bytes.get())
+            .sum();
+        assert_eq!(boundary_charged, 48);
+        // The aggregate escrow gauge is unchanged and equals the per-boundary sum.
+        assert_eq!(
+            boundary_charged,
+            monitor
+                .metrics
+                .runtime_memory_budget_escrow_charged_bytes
+                .get()
+        );
+        monitor.report().expect("report should succeed");
     }
 }
