@@ -25,12 +25,16 @@ both exporters and servers.
 
 ## Key Challenges
 
+<!-- markdownlint-disable MD013 -->
+
 | #   | Challenge                               | Symptoms                                                                                                                       | Root Cause                                                                                                                                                                  |
 | --- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 1   | **Skewed listener utilization**         | All (or most) exporter TCP connections land on the same reuseport listener => one core saturated, others idle                  | Too few distinct TCP 4-tuples (e.g. single long-lived gRPC channel) means the kernel's reuseport hash has little entropy; distribution collapses statistically.             |
 | 2   | **In-stream vs connection imbalance**   | Recycling an OTAP _stream_ clears state but stays on the same TCP connection, so work remains pinned to the same listener/core | gRPC stream lifetime != TCP connection lifetime; reuseport selection happens once per connection handshake. To move work you must rotate the connection or rebalance at L7. |
 | 3   | **Dictionary / stream-state growth**    | High-cardinality attributes inflate Arrow dictionary & per-stream memory                                                       | Stateful OTAP encoding accumulates per-stream dictionaries until recycled or bounded by receiver memory/admission limits.                                                   |
 | 4   | **Single accept listener anti-pattern** | One thread does all `accept()` => CPU hotspot, lock contention, cache/NUMA misses, global back-pressure                        | Shared accept queues can become contended and distribute unevenly; `SO_REUSEPORT` (per-socket queues) improves scalability but has fairness/latency trade-offs.             |
+
+<!-- markdownlint-enable MD013 -->
 
 **Table notes:**
 
@@ -49,12 +53,16 @@ both exporters and servers.
 
 ### 1. Client-Side Techniques (Exporter)
 
+<!-- markdownlint-disable MD013 -->
+
 | Technique                                                                | Purpose                                                                                                                                                                                                                           | Considerations                                                                                                                        |
 | ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
 | **Increase connection fan-out** (`num_streams` / multiple gRPC channels) | Create multiple concurrent TCP connections so reuseport has entropy; improves distribution and concurrency headroom. Start near `max(1, CPUs/2)` (current `otelarrowexporter` default) and tune; cap for TLS / resource overhead. | More channels consume sockets, TLS handshakes, and exporter CPU; too many can hurt compression efficiency because state is sharded.   |
 | **Client-side gRPC load-balancing policy** (`round_robin`, etc.)         | Ensure channels spread across backend endpoints (or front-end L7 proxies) instead of `pick_first` pinning. OTEL-Arrow exporter defaults to `round_robin`.                                                                         | Requires name resolution / endpoint list; risk of thundering herd on endpoint change if misconfigured.                                |
 | **Stream lifetime control** (`max_stream_lifetime`)                      | Periodically recycle OTAP streams to bound dictionary growth and help downstream rebalancers shed load; default 30s in current Go exporter (tunable).                                                                             | Recycling forces resending schemas/dictionaries; shorter lifetimes reduce compression efficiency; coordinate with server `keepalive`. |
 | **Back-pressure aware retries**                                          | Honor exporter/receiver back-pressure signals so clients can open additional channels or shed load when a stream saturates.                                                                                                       | Requires instrumentation and retry logic; careless retries can amplify load.                                                          |
+
+<!-- markdownlint-enable MD013 -->
 
 > **Important note:** Do not trust uncooperative or malicious clients to recycle
 > streams or limit dictionary growth => enforce server-side caps.
@@ -67,6 +75,11 @@ An eBPF program (`SO_ATTACH_REUSEPORT_EBPF` / `BPF_PROG_TYPE_SK_REUSEPORT`) can
 be attached to influence kernel listener selection within a reuseport group.
 Practical uses include adding randomization, weighting sockets, or leveraging
 additional header information to mitigate distribution skew.
+
+For the df-engine NUMA-local selector design proposal, see
+[NUMA-Local Reuseport Load Balancing](reuseport-ebpf-numa.md). For the engine
+placement model that the selector consumes, see
+[NUMA-Aware Execution Engine](numa-aware-exec-engine.md).
 
 #### 2.b. Front-End **L7 (HTTP/2-aware) Load Balancer**
 
