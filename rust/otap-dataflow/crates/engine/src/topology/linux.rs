@@ -232,23 +232,16 @@ fn read_sched_affinity() -> io::Result<BTreeSet<u32>> {
 
 #[cfg(target_os = "linux")]
 fn read_sched_affinity_impl() -> io::Result<BTreeSet<u32>> {
-    let mut set = std::mem::MaybeUninit::<libc::cpu_set_t>::zeroed();
-    let size = std::mem::size_of::<libc::cpu_set_t>();
-    // SAFETY: `set` points to a valid cpu_set_t buffer of `size` bytes and
-    // pid 0 asks the kernel for the current process's affinity mask.
-    let rc = unsafe { libc::sched_getaffinity(0, size, set.as_mut_ptr()) };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: sched_getaffinity initialized the cpu_set_t buffer on success.
-    let set = unsafe { set.assume_init() };
+    use nix::sched::{CpuSet, sched_getaffinity};
+    use nix::unistd::Pid;
+
+    let set = sched_getaffinity(Pid::from_raw(0)).map_err(io::Error::other)?;
 
     let mut cpus = BTreeSet::new();
-    for cpu in 0..libc::CPU_SETSIZE {
-        // SAFETY: `set` is an initialized cpu_set_t returned by the kernel.
-        if unsafe { libc::CPU_ISSET(cpu, &set) } {
+    for cpu in 0..CpuSet::count() {
+        if set.is_set(cpu).map_err(io::Error::other)? {
             let Ok(cpu) = u32::try_from(cpu) else {
-                continue;
+                break;
             };
             _ = cpus.insert(cpu);
         }
