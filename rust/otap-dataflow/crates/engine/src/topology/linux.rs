@@ -183,15 +183,25 @@ enum CgroupCpuDiscovery {
 }
 
 fn read_cgroup_v2_effective_cpus(cgroup_root: &Path) -> CgroupCpuDiscovery {
+    let root_cpuset_path = cgroup_root.join("cpuset.cpus.effective");
     let cpuset_path = current_cgroup_v2_relative_path()
         .map(|relative| cgroup_root.join(relative).join("cpuset.cpus.effective"))
-        .unwrap_or_else(|| cgroup_root.join("cpuset.cpus.effective"));
+        .unwrap_or_else(|| root_cpuset_path.clone());
 
     match fs::read_to_string(cpuset_path) {
         Ok(raw) => match parse_cpu_list(&raw) {
             Ok(cpus) => CgroupCpuDiscovery::Known(cpus),
             Err(_) => CgroupCpuDiscovery::Degraded,
         },
+        Err(error) if error.kind() == io::ErrorKind::NotFound && root_cpuset_path.exists() => {
+            match fs::read_to_string(root_cpuset_path) {
+                Ok(raw) => match parse_cpu_list(&raw) {
+                    Ok(cpus) => CgroupCpuDiscovery::Known(cpus),
+                    Err(_) => CgroupCpuDiscovery::Degraded,
+                },
+                Err(_) => CgroupCpuDiscovery::Degraded,
+            }
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => CgroupCpuDiscovery::Unavailable,
         Err(_) => CgroupCpuDiscovery::Degraded,
     }
