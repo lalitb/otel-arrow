@@ -54,6 +54,7 @@ use otap_df_config::extension::{ExtensionUrn, ExtensionUserConfig};
 use otap_df_config::node::{NodeKind, NodeUserConfig};
 use otap_df_config::pipeline::telemetry::AttributeValue;
 use otap_df_config::pipeline_group::PipelineGroupConfig;
+use otap_df_config::policy::LoadBalancingPolicy;
 use otap_df_config::policy::MemoryLimiterMode;
 use otap_df_config::policy::{
     ChannelCapacityPolicy, CoreAllocation, CoreAllocationStrategy, TelemetryPolicy,
@@ -89,6 +90,7 @@ use otap_df_engine::topic::{
     InMemoryBackend, PipelineTopicBinding, TopicBroker, TopicOptions, TopicPublishOutcomeConfig,
     TopicSet,
 };
+use otap_df_engine::topology::{DefaultNumaTopologyProvider, NumaTopology, NumaTopologyProvider};
 use otap_df_state::store::{ObservedStateHandle, ObservedStateStore};
 use otap_df_telemetry::event::{EngineEvent, ErrorSummary, ObservedEventReporter};
 use otap_df_telemetry::registry::TelemetryRegistryHandle;
@@ -108,6 +110,8 @@ use std::thread;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+use placement::{CorePlacement, PipelinePlacement, PlacementSnapshot};
+
 pub use linkme::distributed_slice;
 
 /// Built-in controller-level extensions.
@@ -115,6 +119,7 @@ pub mod controller_monitor;
 /// Error types and helpers for the controller module.
 pub mod error;
 mod live_control;
+mod placement;
 /// Reusable startup helpers (validation, CLI overrides, system info).
 pub mod startup;
 /// Utilities to spawn async tasks on dedicated threads with graceful shutdown.
@@ -1513,8 +1518,9 @@ impl<
                 pipeline.policies.health.clone(),
             );
         }
-        let planned_core_assignments =
-            Self::preflight_pipeline_core_allocations(&pipelines, &all_cores)?;
+        let topology = DefaultNumaTopologyProvider::default().discover();
+        let placement_snapshot =
+            Self::preflight_pipeline_placement(&pipelines, &all_cores, &topology)?;
 
         let runtime = Arc::new(ControllerRuntime::new(
             self.pipeline_factory,
@@ -1670,9 +1676,11 @@ impl<
             runtime.register_launched_instance(launched);
         }
 
-        for (pipeline_entry, requested_cores) in pipelines.iter().zip(planned_core_assignments) {
+        for (pipeline_entry, pipeline_placement) in
+            pipelines.iter().zip(placement_snapshot.pipelines.iter())
+        {
             runtime.register_committed_pipeline(pipeline_entry.clone(), 0);
-            let num_cores = requested_cores.len();
+            let num_cores = pipeline_placement.core_count();
 
             let core_allocation = pipeline_entry
                 .policies
@@ -1687,7 +1695,8 @@ impl<
                 core_allocation = core_allocation
             );
 
-            for core_id in &requested_cores {
+            for core_placement in &pipeline_placement.cores {
+                let core_id = core_placement.core_id;
                 // Pass a Weak runtime handle into each pipeline thread. The thread upgrades it
                 // only when it needs to report Success/Error/Panic on exit, and silently skips
                 // that late report if shutdown has already dropped the runtime.
@@ -1699,12 +1708,13 @@ impl<
                         core_id: core_id.id,
                         deployment_generation: 0,
                     },
-                    *core_id,
+                    core_id,
                     num_cores,
                     pipeline_entry.pipeline.clone(),
                     pipeline_entry.policies.channel_capacity.clone(),
                     pipeline_entry.policies.telemetry.clone(),
                     pipeline_entry.policies.transport_headers.clone(),
+                    pipeline_placement.load_balancing.clone(),
                     controller_ctx.clone(),
                     metrics_reporter.clone(),
                     engine_evt_reporter.clone(),
@@ -2103,6 +2113,29 @@ impl<
             .collect()
     }
 
+    /// Produces the controller-owned placement snapshot for startup generation 0.
+    fn preflight_pipeline_placement(
+        pipelines: &[ResolvedPipelineConfig],
+        available_core_ids: &[CoreId],
+        topology: &NumaTopology,
+    ) -> Result<PlacementSnapshot, Error> {
+        let assignments = Self::preflight_pipeline_core_allocations(pipelines, available_core_ids)?;
+        let placements = pipelines
+            .iter()
+            .zip(assignments)
+            .map(|(pipeline_entry, cores)| PipelinePlacement {
+                pipeline_group_id: pipeline_entry.pipeline_group_id.clone(),
+                pipeline_id: pipeline_entry.pipeline_id.clone(),
+                load_balancing: pipeline_entry.policies.load_balancing.clone(),
+                cores: cores
+                    .into_iter()
+                    .map(|core_id| CorePlacement::from_core_id(core_id, topology))
+                    .collect(),
+            })
+            .collect();
+        Ok(PlacementSnapshot::from_assignments(0, placements))
+    }
+
     fn internal_pipeline_key(core_id: CoreId) -> DeployedPipelineKey {
         DeployedPipelineKey {
             pipeline_group_id: SYSTEM_PIPELINE_GROUP_ID.into(),
@@ -2128,6 +2161,7 @@ impl<
         channel_capacity_policy: ChannelCapacityPolicy,
         telemetry_policy: TelemetryPolicy,
         transport_headers_policy: Option<TransportHeadersPolicy>,
+        load_balancing_policy: LoadBalancingPolicy,
         controller_ctx: ControllerContext,
         metrics_reporter: MetricsReporter,
         engine_evt_reporter: ObservedEventReporter,
@@ -2143,13 +2177,14 @@ impl<
             std_mpsc::SyncSender<Result<(), EngineError>>,
         )>,
     ) -> Result<LaunchedPipelineThread<PData>, Error> {
-        let mut pipeline_ctx = controller_ctx.pipeline_context_with_generation(
+        let mut pipeline_ctx = controller_ctx.pipeline_context_with_generation_and_load_balancing(
             pipeline_key.pipeline_group_id.clone(),
             pipeline_key.pipeline_id.clone(),
             pipeline_key.core_id,
             num_cores,
             thread_id,
             pipeline_key.deployment_generation,
+            load_balancing_policy,
         );
         let topic_set = Self::build_pipeline_topic_set(
             config,
@@ -2294,6 +2329,7 @@ impl<
             channel_capacity_policy,
             telemetry_policy,
             None,
+            LoadBalancingPolicy::default(),
             controller_ctx.clone(),
             metrics_reporter.clone(),
             engine_evt_reporter.clone(),
@@ -2462,7 +2498,10 @@ mod tests {
     use super::*;
     use otap_df_config::engine::{ResolvedPipelineConfig, ResolvedPipelineRole};
     use otap_df_config::policy::{CoreRange, ResolvedPolicies, ResourcesPolicy};
+    use otap_df_config::policy::{LoadBalancingPolicy, LoadBalancingStrategy};
     use otap_df_config::topic::{TopicAckPropagationMode, TopicBroadcastOnLagPolicy};
+    use otap_df_engine::topology::{NumaTopology, TopologyCompleteness};
+    use std::collections::BTreeMap;
 
     fn available_core_ids() -> Vec<CoreId> {
         vec![
@@ -2691,6 +2730,43 @@ groups: {{}}
             .map(|c| c.id)
             .collect();
         assert_eq!(to_ids(&result), expected_ids);
+    }
+
+    #[test]
+    fn preflight_pipeline_placement_adds_numa_metadata_and_policy() {
+        let mut pipeline =
+            resolved_pipeline_with_core_allocation("g1", "p1", CoreAllocation::core_count(2));
+        pipeline.policies.load_balancing = LoadBalancingPolicy {
+            strategy: LoadBalancingStrategy::EbpfNuma,
+            strict: true,
+        };
+        let topology = NumaTopology::new(
+            BTreeMap::from([(0, 0), (1, 0), (2, 1), (3, 1)]),
+            TopologyCompleteness::Complete,
+        );
+
+        let snapshot = Controller::<()>::preflight_pipeline_placement(
+            &[pipeline],
+            &available_core_ids(),
+            &topology,
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.generation, 0);
+        assert_eq!(snapshot.pipelines.len(), 1);
+        let placement = &snapshot.pipelines[0];
+        assert_eq!(placement.pipeline_group_id.as_ref(), "g1");
+        assert_eq!(placement.pipeline_id.as_ref(), "p1");
+        assert_eq!(
+            placement.load_balancing.strategy,
+            LoadBalancingStrategy::EbpfNuma
+        );
+        assert!(placement.load_balancing.strict);
+        assert_eq!(placement.core_count(), 2);
+        assert_eq!(placement.cores[0].core_id.id, 0);
+        assert_eq!(placement.cores[0].numa_node, 0);
+        assert_eq!(placement.cores[1].core_id.id, 1);
+        assert_eq!(placement.cores[1].numa_node, 0);
     }
 
     #[test]

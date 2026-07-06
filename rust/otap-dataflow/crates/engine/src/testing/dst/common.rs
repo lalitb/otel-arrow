@@ -126,6 +126,7 @@ pub(super) fn build_manager<PData>(
         core_id: 0,
         num_cores: 1,
         thread_id: 0,
+        load_balancing: Default::default(),
     };
     let pipeline_context = PipelineContext::new(controller_context, pipeline_context_params);
     let pipeline_entity_key = pipeline_context.register_pipeline_entity();

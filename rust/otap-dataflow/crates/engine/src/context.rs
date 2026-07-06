@@ -14,6 +14,7 @@ use crate::memory_limiter::MemoryPressureState;
 use crate::node::NodeId as EngineNodeId;
 use otap_df_config::node::NodeKind;
 use otap_df_config::pipeline::telemetry::TelemetryAttribute;
+use otap_df_config::policy::LoadBalancingPolicy;
 use otap_df_config::{NodeId as ConfigNodeId, NodeUrn, PipelineGroupId, PipelineId};
 use otap_df_telemetry::InternalTelemetrySettings;
 use otap_df_telemetry::metrics::{MetricSet, MetricSetHandler};
@@ -123,6 +124,8 @@ pub struct PipelineContextParams {
     pub num_cores: usize,
     /// Thread ID for the current pipeline execution context.
     pub thread_id: usize,
+    /// Resolved receiver/listener load-balancing policy for this pipeline.
+    pub load_balancing: LoadBalancingPolicy,
 }
 
 /// A lightweight/cloneable pipeline context.
@@ -225,6 +228,35 @@ impl ControllerContext {
                 core_id,
                 num_cores,
                 thread_id,
+                load_balancing: LoadBalancingPolicy::default(),
+            },
+            deployment_generation,
+        )
+    }
+
+    /// Returns a new pipeline context with an explicit deployment generation
+    /// and resolved load-balancing policy.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn pipeline_context_with_generation_and_load_balancing(
+        &self,
+        pipeline_group_id: PipelineGroupId,
+        pipeline_id: PipelineId,
+        core_id: usize,
+        num_cores: usize,
+        thread_id: usize,
+        deployment_generation: u64,
+        load_balancing: LoadBalancingPolicy,
+    ) -> PipelineContext {
+        PipelineContext::new_with_generation(
+            self.clone(),
+            PipelineContextParams {
+                pipeline_group_id,
+                pipeline_id,
+                core_id,
+                num_cores,
+                thread_id,
+                load_balancing,
             },
             deployment_generation,
         )
@@ -336,6 +368,12 @@ impl PipelineContext {
     #[must_use]
     pub const fn num_cores(&self) -> usize {
         self.pipeline_context_params.num_cores
+    }
+
+    /// Returns the resolved receiver/listener load-balancing policy.
+    #[must_use]
+    pub const fn load_balancing(&self) -> &LoadBalancingPolicy {
+        &self.pipeline_context_params.load_balancing
     }
 
     /// Sets the internal telemetry settings for the Internal Telemetry Receiver.
