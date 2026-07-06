@@ -43,13 +43,10 @@ data-encoding = { workspace = true }
 prost = { workspace = true }
 cpu-time = { workspace = true }
 memory-stats = { workspace = true }
-nix = { workspace = true, features = ["resource"] }
+nix = { workspace = true, features = ["resource", "sched"] }
 parking_lot = { workspace = true }
 futures-core = { workspace = true }
 async-channel = { workspace = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = { workspace = true }
 
 [target.'cfg(not(windows))'.dependencies]
 tikv-jemalloc-ctl = { workspace = true, optional = true }

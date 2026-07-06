@@ -6414,7 +6414,6 @@ dependencies = [
  "flume",
  "futures",
  "futures-core",
- "libc",
  "linkme",
  "memory-stats",
  "nix 0.31.3",
