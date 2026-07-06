@@ -63,6 +63,8 @@ This proposal is primarily asking for feedback on:
   concrete cores.
 - Support multiple pipeline groups and pipelines in one engine process, each
   with its own placement requirements.
+- Expose placement and listener-group metadata through a strategy-agnostic
+  contract so multiple balancing mechanisms can build on it.
 - Provide a listener-group placement contract that optional socket-level
   features, including a reuseport eBPF selector, can consume without owning
   topology discovery.
@@ -75,8 +77,8 @@ This proposal is primarily asking for feedback on:
   policy configuration model.
 - Guaranteeing NUMA locality when the host, container runtime, or scheduler
   does not provide stable CPU placement.
-- Defining the eBPF `sk_reuseport` selector itself. That design is covered by
-  [NUMA-Local Reuseport Load Balancing](reuseport-ebpf-numa.md).
+- Defining the eBPF `sk_reuseport` selector itself. That companion design is
+  covered by the separate reuseport load-balancing proposal.
 
 ## Background
 
@@ -238,6 +240,31 @@ If receiver configuration later exposes device binding, `bind_device` can
 participate in logical identity, but the kernel grouping semantics must still be
 handled explicitly.
 
+### Balancing Strategy Extensibility
+
+The listener-group contract should be strategy-agnostic. It is the API between
+controller placement and balancing mechanisms; individual strategies consume
+that metadata but do not own topology discovery or placement.
+
+Known consumers include:
+
+- the kernel's default reuseport hash, which needs no extra engine metadata;
+- a NUMA-local eBPF selector, covered by the companion reuseport
+  load-balancing proposal;
+- an engine-level policy aligned with the engine configuration model;
+- a future `sk_lookup`-based listener migration strategy.
+
+A future configuration shape could look like:
+
+```yaml
+load_balancing:
+  strategy: kernel # kernel | ebpf_numa | engine
+```
+
+This proposal does not define arbitrary third-party strategy loading. The near
+term goal is to keep the contract narrow and make the balancing backend
+swappable without changing the placement model.
+
 ## Operational Requirements
 
 NUMA-aware placement only helps when deployment gives the engine stable CPU
@@ -260,9 +287,8 @@ failing startup.
 
 ## Relationship to Reuseport eBPF Load Balancing
 
-This proposal is a prerequisite for
-[NUMA-Local Reuseport Load Balancing](reuseport-ebpf-numa.md), but it is not
-limited to that feature.
+This proposal is a prerequisite for the companion NUMA-local reuseport
+load-balancing proposal, but it is not limited to that feature.
 
 The execution engine owns topology discovery, placement planning, and
 listener-group metadata. The reuseport eBPF design uses that metadata to choose
