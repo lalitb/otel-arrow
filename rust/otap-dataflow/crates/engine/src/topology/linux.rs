@@ -36,6 +36,20 @@ impl LinuxNumaTopologyProvider {
         Self::default()
     }
 
+    /// Discovers topology from a synthetic sysfs root without process filtering.
+    pub(crate) fn from_sysfs_root_for_test(root: &Path) -> NumaTopology {
+        let DiscoveryResult {
+            cpu_to_node,
+            partial,
+        } = discover_sysfs_topology(root);
+        let completeness = if partial {
+            TopologyCompleteness::Partial
+        } else {
+            TopologyCompleteness::Complete
+        };
+        NumaTopology::new(cpu_to_node, completeness)
+    }
+
     #[cfg(test)]
     fn for_test(node_root: PathBuf, cgroup_root: PathBuf, affinity_reader: AffinityReader) -> Self {
         Self {

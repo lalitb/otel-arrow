@@ -47,6 +47,11 @@ pub struct Policies {
     /// (the feature is entirely opt-in).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) transport_headers: Option<TransportHeadersPolicy>,
+    /// Receiver/listener load-balancing policy.
+    ///
+    /// When absent, receivers keep their existing bind behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) load_balancing: Option<LoadBalancingPolicy>,
 }
 
 impl Policies {
@@ -69,6 +74,7 @@ impl Policies {
         let mut telemetry = None;
         let mut resources = None;
         let mut transport_headers = None;
+        let mut load_balancing = None;
         for scope in scopes {
             if channel_capacity.is_none() {
                 channel_capacity = scope.channel_capacity.as_ref();
@@ -85,6 +91,9 @@ impl Policies {
             if transport_headers.is_none() {
                 transport_headers = scope.transport_headers.as_ref();
             }
+            if load_balancing.is_none() {
+                load_balancing = scope.load_balancing.as_ref();
+            }
         }
         ResolvedPolicies {
             channel_capacity: channel_capacity.cloned().unwrap_or_default(),
@@ -92,6 +101,7 @@ impl Policies {
             telemetry: telemetry.cloned().unwrap_or_default(),
             resources: resources.cloned().unwrap_or_default(),
             transport_headers: transport_headers.cloned(),
+            load_balancing: load_balancing.cloned().unwrap_or_default(),
         }
     }
 
@@ -209,6 +219,8 @@ pub struct ResolvedPolicies {
     /// Transport headers policy. `None` when the feature is not configured
     /// (opt-in only -- no headers are captured or propagated by default).
     pub transport_headers: Option<TransportHeadersPolicy>,
+    /// Resolved receiver/listener load-balancing policy.
+    pub load_balancing: LoadBalancingPolicy,
 }
 
 impl ResolvedPolicies {
@@ -222,6 +234,7 @@ impl ResolvedPolicies {
             telemetry: self_telemetry,
             resources: _,
             transport_headers: self_transport_headers,
+            load_balancing: self_load_balancing,
         } = self;
         let Self {
             channel_capacity: other_channel_capacity,
@@ -229,14 +242,50 @@ impl ResolvedPolicies {
             telemetry: other_telemetry,
             resources: _,
             transport_headers: other_transport_headers,
+            load_balancing: other_load_balancing,
         } = other;
 
         self_channel_capacity == other_channel_capacity
             && self_health == other_health
             && self_telemetry == other_telemetry
             && self_transport_headers == other_transport_headers
+            && self_load_balancing == other_load_balancing
     }
 }
+
+/// Pipeline-level receiver/listener load-balancing policy.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LoadBalancingPolicy {
+    /// Strategy used for eligible receiver listeners.
+    #[serde(default)]
+    pub strategy: LoadBalancingStrategy,
+    /// Whether strategy setup failures should fail startup instead of falling
+    /// back to the existing independent bind behavior.
+    #[serde(default)]
+    pub strict: bool,
+}
+
+impl Default for LoadBalancingPolicy {
+    fn default() -> Self {
+        Self {
+            strategy: LoadBalancingStrategy::Kernel,
+            strict: false,
+        }
+    }
+}
+
+/// Receiver/listener load-balancing strategy.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadBalancingStrategy {
+    /// Preserve the existing independent bind path and kernel defaults.
+    #[default]
+    Kernel,
+    /// Coordinate eligible reuseport listeners and attach the Linux eBPF NUMA selector.
+    EbpfNuma,
+}
+
 /// instrumentation overhead.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
@@ -700,7 +749,10 @@ const fn default_pdata_channel_capacity() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{MemoryLimiterMode, MemoryLimiterPolicy, MemoryLimiterSource, Policies};
+    use super::{
+        LoadBalancingStrategy, MemoryLimiterMode, MemoryLimiterPolicy, MemoryLimiterSource,
+        Policies,
+    };
     use std::time::Duration;
 
     #[test]
@@ -756,6 +808,31 @@ mod tests {
             super::CoreAllocation::all_cores()
         );
         assert_eq!(defaults.health, crate::health::HealthPolicy::default());
+        assert_eq!(
+            defaults.load_balancing.strategy,
+            LoadBalancingStrategy::Kernel
+        );
+        assert!(!defaults.load_balancing.strict);
+    }
+
+    #[test]
+    fn load_balancing_policy_parses_and_resolves() {
+        let policies: Policies = serde_yaml::from_str(
+            r#"
+load_balancing:
+  strategy: ebpf_numa
+  strict: true
+"#,
+        )
+        .expect("load balancing policy should parse");
+
+        let resolved = Policies::resolve([&policies]);
+
+        assert_eq!(
+            resolved.load_balancing.strategy,
+            LoadBalancingStrategy::EbpfNuma
+        );
+        assert!(resolved.load_balancing.strict);
     }
 
     #[test]

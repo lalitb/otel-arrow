@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::Path;
 use std::sync::Arc;
 
 #[cfg(any(target_os = "linux", test))]
@@ -36,6 +37,9 @@ pub struct NumaTopology {
     inner: Arc<NumaTopologyInner>,
 }
 
+/// Backward-compatible name for the prototype listener-group code.
+pub type CpuTopology = NumaTopology;
+
 #[derive(Debug)]
 struct NumaTopologyInner {
     cpu_to_node: BTreeMap<u32, u32>,
@@ -51,10 +55,63 @@ impl Default for NumaTopology {
 }
 
 impl NumaTopology {
+    /// Builds an unknown topology with no visible CPU mapping.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::unknown()
+    }
+
     /// Creates an unknown topology with no visible CPU mapping.
     #[must_use]
     pub fn unknown() -> Self {
         Self::new(BTreeMap::new(), TopologyCompleteness::Unknown)
+    }
+
+    /// Detects NUMA topology using the platform default provider.
+    #[must_use]
+    pub fn detect() -> Self {
+        DefaultNumaTopologyProvider::default().discover()
+    }
+
+    /// Detects Linux NUMA topology under an arbitrary sysfs root.
+    ///
+    /// On non-Linux platforms this returns an unknown topology.
+    #[must_use]
+    pub fn from_sysfs_root(root: &Path) -> Self {
+        Self::from_sysfs_root_impl(root)
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn from_sysfs_root_impl(root: &Path) -> Self {
+        linux::LinuxNumaTopologyProvider::from_sysfs_root_for_test(root)
+    }
+
+    #[cfg(not(any(target_os = "linux", test)))]
+    fn from_sysfs_root_impl(_root: &Path) -> Self {
+        Self::unknown()
+    }
+
+    /// Builds a topology from in-memory `(node_id, cpulist)` pairs.
+    #[must_use]
+    pub fn from_node_cpulists(entries: &[(u32, String)]) -> Self {
+        let mut cpu_to_node = BTreeMap::new();
+        let mut partial = false;
+        for (node_id, cpulist) in entries {
+            match parse_cpu_list(cpulist) {
+                Ok(cpus) => {
+                    for cpu in cpus {
+                        _ = cpu_to_node.insert(cpu, *node_id);
+                    }
+                }
+                Err(_) => partial = true,
+            }
+        }
+        let completeness = if partial {
+            TopologyCompleteness::Partial
+        } else {
+            TopologyCompleteness::Complete
+        };
+        Self::new(cpu_to_node, completeness)
     }
 
     /// Creates a topology from a CPU to NUMA-node map.
@@ -104,6 +161,16 @@ impl NumaTopology {
         &self.inner.visible_nodes
     }
 
+    /// Returns the highest visible NUMA node id plus one.
+    #[must_use]
+    pub fn node_count(&self) -> u32 {
+        self.inner
+            .visible_nodes
+            .iter()
+            .next_back()
+            .map_or(0, |node| node.saturating_add(1))
+    }
+
     /// Completeness of the discovery result.
     #[must_use]
     pub fn completeness(&self) -> TopologyCompleteness {
@@ -114,6 +181,12 @@ impl NumaTopology {
     #[must_use]
     pub fn is_unknown(&self) -> bool {
         self.inner.completeness == TopologyCompleteness::Unknown
+    }
+
+    /// Returns `true` when no CPU mapping is available.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner.cpu_to_node.is_empty()
     }
 }
 

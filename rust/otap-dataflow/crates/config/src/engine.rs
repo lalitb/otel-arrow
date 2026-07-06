@@ -165,6 +165,7 @@ impl EngineObservabilityPolicies {
             telemetry: self.telemetry,
             resources: None,
             transport_headers: None,
+            load_balancing: None,
         }
     }
 
