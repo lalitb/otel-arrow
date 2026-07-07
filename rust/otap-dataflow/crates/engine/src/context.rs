@@ -205,9 +205,10 @@ impl ControllerContext {
 
     /// Returns the listener-group manager.
     ///
-    /// In the current phase the manager is scaffolding only and is not
-    /// consulted by `EffectHandler::tcp_listener`. The controller can
-    /// pre-register plans here in preparation for Phase 2.5 wiring.
+    /// The controller registers and materialises configured listener-group
+    /// plans before launching pipeline threads. Receiver effect handlers then
+    /// use the corresponding per-pipeline handle to claim pre-bound listeners
+    /// without blocking startup.
     #[must_use]
     pub fn listener_group_manager(&self) -> &ListenerGroupManager {
         &self.listener_group_manager

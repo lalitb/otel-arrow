@@ -1590,6 +1590,27 @@ impl<
                     otap_df_engine::listener_group::metrics::ListenerGroupMetricEvent::GroupReady,
                 );
             }
+            for key in &materialisation_report.selector_attached {
+                listener_group_metrics.record(
+                    key,
+                    otap_df_engine::listener_group::metrics::ListenerGroupMetricEvent::SelectorAttached,
+                );
+            }
+            for key in &materialisation_report.selector_fallback {
+                listener_group_metrics.record(
+                    key,
+                    otap_df_engine::listener_group::metrics::ListenerGroupMetricEvent::SelectorFallback,
+                );
+                let bind_addr = key.addr.to_string();
+                otel_warn!(
+                    "listener_group.selector.fallback",
+                    pipeline_group_id = key.pipeline_group_id.as_str(),
+                    pipeline_id = key.pipeline_id.as_str(),
+                    receiver_node_id = key.receiver_node_id.as_str(),
+                    bind_addr = bind_addr.as_str(),
+                    protocol = key.protocol.as_str(),
+                );
+            }
             for key in &materialisation_report.materialisation_failed {
                 listener_group_metrics.record(
                     key,

@@ -39,18 +39,19 @@ pub struct ListenerGroupMetrics {
     /// Number of plans registered with the manager.
     #[metric(unit = "{plan}")]
     pub plans_registered: Counter<u64>,
-    /// Number of groups that reached quorum (all expected members
-    /// acquired their listener).
+    /// Number of groups that were materialised and ready for receiver acquire.
     #[metric(unit = "{group}")]
     pub groups_ready: Counter<u64>,
+    /// Number of ready groups with a selector attached.
+    #[metric(unit = "{group}")]
+    pub selector_attached: Counter<u64>,
+    /// Number of ready groups that degraded to plain `SO_REUSEPORT`.
+    #[metric(unit = "{group}")]
+    pub selector_fallback: Counter<u64>,
     /// Number of groups that fell back to independent listener
     /// creation for any reason.
     #[metric(unit = "{group}")]
     pub fallback_total: Counter<u64>,
-    /// Number of lazy-path groups that timed out waiting for quorum
-    /// and fell back to independent listener creation.
-    #[metric(unit = "{group}")]
-    pub fallback_timeout: Counter<u64>,
     /// Number of groups whose materialisation (eager bind/listen)
     /// failed and surfaced as an `io::Error` to the first acquirer.
     #[metric(unit = "{group}")]
@@ -64,6 +65,10 @@ pub enum ListenerGroupMetricEvent {
     PlanRegistered,
     /// Eager materialisation produced a ready group.
     GroupReady,
+    /// A ready group has the eBPF selector attached.
+    SelectorAttached,
+    /// A ready group degraded to plain `SO_REUSEPORT`.
+    SelectorFallback,
     /// Group fell back to independent binds.
     Fallback,
     /// Bind/listen/attach materialisation failed.
@@ -123,6 +128,8 @@ impl ListenerGroupMetricsEmitter {
         match event {
             ListenerGroupMetricEvent::PlanRegistered => metrics.plans_registered.inc(),
             ListenerGroupMetricEvent::GroupReady => metrics.groups_ready.inc(),
+            ListenerGroupMetricEvent::SelectorAttached => metrics.selector_attached.inc(),
+            ListenerGroupMetricEvent::SelectorFallback => metrics.selector_fallback.inc(),
             ListenerGroupMetricEvent::Fallback => metrics.fallback_total.inc(),
             ListenerGroupMetricEvent::MaterialisationFailed => metrics.materialisation_failed.inc(),
         }

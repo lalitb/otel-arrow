@@ -72,7 +72,10 @@ impl NumaTopologyProvider for LinuxNumaTopologyProvider {
         }
 
         let allowed = match self.allowed_cpus() {
-            AllowedCpuDiscovery::Known(cpus) => Some(cpus),
+            AllowedCpuDiscovery::Known { cpus, degraded } => {
+                partial |= degraded;
+                Some(cpus)
+            }
             AllowedCpuDiscovery::Unavailable => {
                 partial = true;
                 None
@@ -123,7 +126,10 @@ impl LinuxNumaTopologyProvider {
         if allowed.is_empty() && partial {
             AllowedCpuDiscovery::Unavailable
         } else {
-            AllowedCpuDiscovery::Known(allowed)
+            AllowedCpuDiscovery::Known {
+                cpus: allowed,
+                degraded: partial,
+            }
         }
     }
 }
@@ -186,7 +192,7 @@ fn parse_node_dir(path: &Path) -> Option<u32> {
 }
 
 enum AllowedCpuDiscovery {
-    Known(BTreeSet<u32>),
+    Known { cpus: BTreeSet<u32>, degraded: bool },
     Unavailable,
 }
 
@@ -365,6 +371,24 @@ mod tests {
 
         assert_eq!(topology.completeness(), TopologyCompleteness::Partial);
         assert_eq!(topology.visible_cpus(), &BTreeSet::from([0, 1, 2, 3]));
+    }
+
+    #[test]
+    fn marks_partial_when_affinity_degrades_but_cgroup_is_known() {
+        let sysfs = tempfile::tempdir().unwrap();
+        let cgroup = tempfile::tempdir().unwrap();
+        write_node(sysfs.path(), 0, "0-3");
+        fs::write(cgroup.path().join("cpuset.cpus.effective"), "1-2").unwrap();
+
+        let provider = LinuxNumaTopologyProvider::for_test(
+            sysfs.path().to_path_buf(),
+            cgroup.path().to_path_buf(),
+            affinity_error,
+        );
+        let topology = provider.discover();
+
+        assert_eq!(topology.completeness(), TopologyCompleteness::Partial);
+        assert_eq!(topology.visible_cpus(), &BTreeSet::from([1, 2]));
     }
 
     #[test]

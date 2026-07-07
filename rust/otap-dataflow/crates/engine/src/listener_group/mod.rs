@@ -21,9 +21,8 @@
 //! With no plans registered, the manager is inert and existing
 //! per-receiver bind behaviour is preserved exactly.
 //!
-//! The lifecycle metrics in [`metrics`] are likewise prepared types,
-//! not yet emitted; counter increments will land with the Phase 2.5
-//! wiring.
+//! The lifecycle metrics in [`metrics`] are emitted from controller startup
+//! paths so no receiver listener hot path pays reporting overhead.
 
 pub mod extraction;
 pub mod metrics;
@@ -237,6 +236,10 @@ pub struct ListenerGroupPlan {
 pub struct ListenerGroupMaterialisationReport {
     /// Groups successfully materialised and ready for receiver acquire.
     pub ready: Vec<ListenerGroupKey>,
+    /// Ready groups that have the eBPF selector attached.
+    pub selector_attached: Vec<ListenerGroupKey>,
+    /// Ready groups that degraded to coordinated plain `SO_REUSEPORT`.
+    pub selector_fallback: Vec<ListenerGroupKey>,
     /// Groups that fell back to independent binds in non-strict mode.
     pub fallback: Vec<ListenerGroupKey>,
     /// Groups whose bind/listen/attach materialisation failed.
@@ -393,6 +396,8 @@ pub struct AttachOutcome {
     pub keepalive: Option<Arc<dyn Any + Send + Sync>>,
     /// Optional per-core cleanup guards handed to acquirers.
     pub listener_leases: HashMap<u32, ListenerGroupLease>,
+    /// Whether the optional selector backend attached successfully.
+    pub selector_attached: bool,
 }
 
 /// Optional attach hook invoked by the manager after the listeners
@@ -453,6 +458,8 @@ struct GroupSlot {
     /// that has already received its listener.
     #[allow(dead_code)]
     attach_keepalive: Option<Arc<dyn Any + Send + Sync>>,
+    /// Whether the optional selector backend attached for this group.
+    selector_attached: bool,
 }
 
 impl std::fmt::Debug for GroupSlot {
@@ -461,6 +468,7 @@ impl std::fmt::Debug for GroupSlot {
             .field("plan", &self.plan)
             .field("state", &self.state)
             .field("attach_keepalive_set", &self.attach_keepalive.is_some())
+            .field("selector_attached", &self.selector_attached)
             .finish()
     }
 }
@@ -579,6 +587,7 @@ impl ListenerGroupManager {
                 cv: Arc::new(Condvar::new()),
                 state: GroupState::Planned,
                 attach_keepalive: None,
+                selector_attached: false,
             },
         );
         Ok(())
@@ -716,11 +725,22 @@ impl ListenerGroupManager {
                 }
                 self.force_fallback(&key);
                 report.fallback.push(key);
+            } else if self.selector_attached(&key) {
+                report.selector_attached.push(key.clone());
+                report.ready.push(key);
             } else {
+                report.selector_fallback.push(key.clone());
                 report.ready.push(key);
             }
         }
         Ok(report)
+    }
+
+    fn selector_attached(&self, key: &ListenerGroupKey) -> bool {
+        match self.inner.state.lock() {
+            Ok(state) => state.get(key).is_some_and(|slot| slot.selector_attached),
+            Err(_) => false,
+        }
     }
 
     /// Acquires the listener pre-allocated for `(key, core_id)`.
@@ -897,6 +917,7 @@ impl ListenerGroupManager {
 
         match result {
             Ok((sockets, attach)) => {
+                slot.selector_attached = attach.selector_attached;
                 slot.attach_keepalive = attach.keepalive;
                 slot.state = GroupState::Ready {
                     sockets,
@@ -945,19 +966,11 @@ impl ListenerGroupManager {
 /// `reuseport_ebpf::libbpf::load_default_and_attach(...)` against the
 /// listeners in a freshly-materialised group. On non-Linux or when
 /// the `reuseport-ebpf` feature is not compiled in, returns a no-op
-/// hook (empty [`AttachOutcome`]) and emits a one-shot warning so the controller
-/// can call this unconditionally without `cfg`-gating.
+/// hook (empty [`AttachOutcome`]) so the controller can call this
+/// unconditionally without `cfg`-gating.
 ///
 /// `debug` controls libbpf verbosity. Strict fail-startup behavior is read
 /// from the per-group [`ListenerGroupPlan`].
-///
-/// The eprintln calls are startup-only fallbacks: the engine has no
-/// in-process structured-log facility reachable from the listener-group
-/// crate today. The controller emits matching `otel_info!` /
-/// `otel_warn!` events for the install path; future Phase 2.6 work
-/// can replace these with the prepared `ListenerGroupMetrics`
-/// counters once metric reporter wiring lands.
-#[allow(clippy::print_stderr)]
 #[must_use]
 pub fn ebpf_attach_hook(debug: bool) -> AttachHook {
     let _ = debug; // referenced inside cfg branch below
@@ -993,6 +1006,7 @@ pub fn ebpf_attach_hook(debug: bool) -> AttachHook {
                         Ok(AttachOutcome {
                             keepalive: Some(keepalive),
                             listener_leases,
+                            selector_attached: true,
                         })
                     }
                     Err(error) => {
@@ -1001,9 +1015,6 @@ pub fn ebpf_attach_hook(debug: bool) -> AttachHook {
                                 "eBPF attach failed (strict): {error}"
                             )))
                         } else {
-                            eprintln!(
-                                "listener_group: eBPF attach failed (continuing without selector): {error}"
-                            );
                             Ok(AttachOutcome::default())
                         }
                     }
@@ -1013,18 +1024,12 @@ pub fn ebpf_attach_hook(debug: bool) -> AttachHook {
     }
     #[cfg(not(all(target_os = "linux", feature = "reuseport-ebpf")))]
     {
-        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
         Arc::new(|plan, _handles| {
             if plan.strict {
                 return Err(std::io::Error::other(
                     "eBPF attach failed (strict): reuseport-ebpf feature is not compiled in or target is not Linux",
                 ));
             }
-            WARN_ONCE.call_once(|| {
-                eprintln!(
-                    "listener_group: ebpf_numa requested but reuseport-ebpf feature is not compiled in or target is not Linux; continuing with plain SO_REUSEPORT"
-                );
-            });
             Ok(AttachOutcome::default())
         })
     }
@@ -1706,6 +1711,32 @@ mod tests {
             matches!(outcome, AcquireOutcome::Listener(_)),
             "{outcome:?}"
         );
+    }
+
+    #[test]
+    fn eager_report_distinguishes_selector_attached_from_plain_ready() {
+        let mgr = ListenerGroupManager::new();
+        let selector_addr = ephemeral_addr();
+        let plain_addr = ephemeral_addr();
+        let selector_key = ListenerGroupKey::tcp("pg", "pipe", "selector", selector_addr);
+        let plain_key = ListenerGroupKey::tcp("pg", "pipe", "plain", plain_addr);
+        mgr.register_plan(plan_with_ids("pg", "selector", selector_addr, &[(0, 0, 0)]))
+            .unwrap();
+        mgr.register_plan(plan_with_ids("pg", "plain", plain_addr, &[(0, 1, 0)]))
+            .unwrap();
+        mgr.set_attach_hook(Arc::new(|plan, _| {
+            Ok(AttachOutcome {
+                selector_attached: plan.key.receiver_node_id == "selector",
+                ..AttachOutcome::default()
+            })
+        }));
+
+        let report = mgr.materialise_registered_plans().unwrap();
+
+        assert!(report.ready.contains(&selector_key));
+        assert!(report.ready.contains(&plain_key));
+        assert_eq!(report.selector_attached, vec![selector_key]);
+        assert_eq!(report.selector_fallback, vec![plain_key]);
     }
 
     #[test]
