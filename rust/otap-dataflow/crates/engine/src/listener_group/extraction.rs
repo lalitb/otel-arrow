@@ -80,22 +80,18 @@ fn extract_listener_addresses(config: &serde_json::Value) -> Vec<(ListenerProtoc
     out
 }
 
-/// Returns one [`ListenerGroupPlan`] per recognised receiver in the
-/// pipeline that exposes a TCP or UDP `listening_addr`. Members are
-/// constructed from `cores`, with `numa_node` looked up via
-/// [`NumaTopology::numa_node`] and `listener_id` assigned
-/// stably as the position of the core within `cores`.
+/// Returns every listener-group key declared by recognised receivers
+/// in `pipeline`.
+///
+/// This is policy-neutral: the controller uses it both to build full
+/// coordinated plans for `ebpf_numa` pipelines and to reserve bind
+/// identities for non-coordinated pipelines so mixed policies cannot
+/// accidentally share one kernel reuseport group.
 #[must_use]
-pub fn extract_plans_for_pipeline(
+pub fn extract_listener_keys_for_pipeline(
     pipeline: &ResolvedPipelineConfig,
-    cores: &[u32],
-    topology: &NumaTopology,
-) -> Vec<ListenerGroupPlan> {
-    let mut plans = Vec::new();
-    if cores.is_empty() {
-        return plans;
-    }
-
+) -> Vec<ListenerGroupKey> {
+    let mut keys = Vec::new();
     let pipeline_group_id = pipeline.pipeline_group_id.as_ref().to_string();
     let pipeline_id = pipeline.pipeline_id.as_ref().to_string();
 
@@ -115,15 +111,6 @@ pub fn extract_plans_for_pipeline(
         // in the receiver_node_id; multiple addresses on the same
         // receiver simply produce multiple keyed plans.
         for (protocol, addr) in extract_listener_addresses(&node_cfg.config) {
-            let members = cores
-                .iter()
-                .enumerate()
-                .map(|(idx, core_id)| ListenerGroupMember {
-                    listener_id: idx as u32,
-                    core_id: *core_id,
-                    numa_node: topology.numa_node(*core_id),
-                })
-                .collect::<Vec<_>>();
             let key = match protocol {
                 ListenerProtocol::Tcp => ListenerGroupKey::tcp_for_receiver(
                     pipeline_group_id.clone(),
@@ -138,14 +125,45 @@ pub fn extract_plans_for_pipeline(
                     addr,
                 ),
             };
-            plans.push(ListenerGroupPlan {
-                key,
-                expected_members: members,
-                strict: pipeline.policies.load_balancing.strict,
-            });
+            keys.push(key);
         }
     }
-    plans
+    keys
+}
+
+/// Returns one [`ListenerGroupPlan`] per recognised receiver in the
+/// pipeline that exposes a TCP or UDP `listening_addr`. Members are
+/// constructed from `cores`, with `numa_node` looked up via
+/// [`NumaTopology::numa_node`] and `listener_id` assigned
+/// stably as the position of the core within `cores`.
+#[must_use]
+pub fn extract_plans_for_pipeline(
+    pipeline: &ResolvedPipelineConfig,
+    cores: &[u32],
+    topology: &NumaTopology,
+) -> Vec<ListenerGroupPlan> {
+    if cores.is_empty() {
+        return Vec::new();
+    }
+
+    let members = cores
+        .iter()
+        .enumerate()
+        .map(|(idx, core_id)| ListenerGroupMember {
+            listener_id: idx as u32,
+            core_id: *core_id,
+            numa_node: topology.numa_node(*core_id),
+        })
+        .collect::<Vec<_>>();
+
+    extract_listener_keys_for_pipeline(pipeline)
+        .into_iter()
+        .map(|key| ListenerGroupPlan {
+            key,
+            expected_members: members.clone(),
+            strict: pipeline.policies.load_balancing.strict,
+        })
+        .collect::<Vec<_>>()
 }
 
 #[cfg(test)]

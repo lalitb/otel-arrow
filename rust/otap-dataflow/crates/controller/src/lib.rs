@@ -86,7 +86,7 @@ use otap_df_engine::topic::{
     InMemoryBackend, PipelineTopicBinding, TopicBroker, TopicOptions, TopicPublishOutcomeConfig,
     TopicSet,
 };
-use otap_df_engine::topology::{DefaultNumaTopologyProvider, NumaTopology, NumaTopologyProvider};
+use otap_df_engine::topology::NumaTopology;
 use otap_df_state::store::{ObservedStateHandle, ObservedStateStore};
 use otap_df_telemetry::event::{EngineEvent, ErrorSummary, ObservedEventReporter};
 use otap_df_telemetry::registry::TelemetryRegistryHandle;
@@ -1228,15 +1228,19 @@ impl<
 
         let metrics_dispatcher = telemetry_system.dispatcher();
         let metrics_reporter = telemetry_system.reporter();
-        let controller_ctx = ControllerContext::new(telemetry_system.registry());
+        let topology = NumaTopology::detect();
+        let controller_ctx =
+            ControllerContext::with_topology(telemetry_system.registry(), topology);
+
+        let has_ebpf_numa_pipeline = pipelines.iter().any(|pipeline| {
+            pipeline.policies.load_balancing.strategy == LoadBalancingStrategy::EbpfNuma
+        });
 
         // Phase 3: install the optional eBPF NUMA-reuseport selector
         // hook once when at least one resolved pipeline requests
         // `load_balancing.strategy: ebpf_numa`. Strictness is carried
         // per ListenerGroupPlan so mixed policy scopes behave correctly.
-        if pipelines.iter().any(|pipeline| {
-            pipeline.policies.load_balancing.strategy == LoadBalancingStrategy::EbpfNuma
-        }) {
+        if has_ebpf_numa_pipeline {
             controller_ctx
                 .listener_group_manager()
                 .set_attach_hook(otap_df_engine::listener_group::ebpf_attach_hook(false));
@@ -1363,9 +1367,8 @@ impl<
                 pipeline.policies.health.clone(),
             );
         }
-        let topology = DefaultNumaTopologyProvider.discover();
         let placement_snapshot =
-            Self::preflight_pipeline_placement(&pipelines, &all_cores, &topology)?;
+            Self::preflight_pipeline_placement(&pipelines, &all_cores, controller_ctx.topology())?;
 
         let runtime = Arc::new(ControllerRuntime::new(
             self.pipeline_factory,
@@ -1507,53 +1510,99 @@ impl<
             runtime.register_launched_instance(launched);
         }
 
-        for (pipeline_entry, pipeline_placement) in
-            pipelines.iter().zip(placement_snapshot.pipelines.iter())
-        {
-            if pipeline_placement.load_balancing.strategy != LoadBalancingStrategy::EbpfNuma {
-                continue;
-            }
-            let plan_cores: Vec<u32> = pipeline_placement
-                .cores
-                .iter()
-                .filter_map(|placement| u32::try_from(placement.core_id.id).ok())
-                .collect();
-            let plans = otap_df_engine::listener_group::extraction::extract_plans_for_pipeline(
-                pipeline_entry,
-                &plan_cores,
-                controller_ctx.topology(),
-            );
-            for plan in plans {
-                let key = plan.key.clone();
-                let bind_addr = key.addr.to_string();
-                if let Err(error) = controller_ctx.listener_group_manager().register_plan(plan) {
-                    let error = error.to_string();
-                    otel_warn!(
-                        "listener_group.plan.register_failed",
-                        pipeline_group_id = key.pipeline_group_id.as_str(),
-                        pipeline_id = key.pipeline_id.as_str(),
-                        receiver_node_id = key.receiver_node_id.as_str(),
-                        bind_addr = bind_addr.as_str(),
-                        error = error.as_str(),
-                    );
+        if has_ebpf_numa_pipeline {
+            let mut listener_group_metrics =
+                otap_df_engine::listener_group::metrics::ListenerGroupMetricsEmitter::new(
+                    controller_ctx.telemetry_registry(),
+                    metrics_reporter.clone(),
+                );
+            for (pipeline_entry, pipeline_placement) in
+                pipelines.iter().zip(placement_snapshot.pipelines.iter())
+            {
+                let plan_cores: Vec<u32> = pipeline_placement
+                    .cores
+                    .iter()
+                    .filter_map(|placement| u32::try_from(placement.core_id.id).ok())
+                    .collect();
+                if pipeline_placement.load_balancing.strategy == LoadBalancingStrategy::EbpfNuma {
+                    let plans =
+                        otap_df_engine::listener_group::extraction::extract_plans_for_pipeline(
+                            pipeline_entry,
+                            &plan_cores,
+                            controller_ctx.topology(),
+                        );
+                    for plan in plans {
+                        let key = plan.key.clone();
+                        let bind_addr = key.addr.to_string();
+                        if let Err(error) =
+                            controller_ctx.listener_group_manager().register_plan(plan)
+                        {
+                            let error = error.to_string();
+                            otel_warn!(
+                                "listener_group.plan.register_failed",
+                                pipeline_group_id = key.pipeline_group_id.as_str(),
+                                pipeline_id = key.pipeline_id.as_str(),
+                                receiver_node_id = key.receiver_node_id.as_str(),
+                                bind_addr = bind_addr.as_str(),
+                                error = error.as_str(),
+                            );
+                        } else {
+                            listener_group_metrics.record(
+                                &key,
+                                otap_df_engine::listener_group::metrics::ListenerGroupMetricEvent::PlanRegistered,
+                            );
+                            otel_info!(
+                                "listener_group.plan.registered",
+                                pipeline_group_id = key.pipeline_group_id.as_str(),
+                                pipeline_id = key.pipeline_id.as_str(),
+                                receiver_node_id = key.receiver_node_id.as_str(),
+                                bind_addr = bind_addr.as_str(),
+                                members = plan_cores.len() as i64,
+                            );
+                        }
+                    }
                 } else {
-                    otel_info!(
-                        "listener_group.plan.registered",
-                        pipeline_group_id = key.pipeline_group_id.as_str(),
-                        pipeline_id = key.pipeline_id.as_str(),
-                        receiver_node_id = key.receiver_node_id.as_str(),
-                        bind_addr = bind_addr.as_str(),
-                        members = plan_cores.len() as i64,
-                    );
+                    for key in otap_df_engine::listener_group::extraction::extract_listener_keys_for_pipeline(pipeline_entry) {
+                        let bind_addr = key.addr.to_string();
+                        if let Err(error) = controller_ctx.listener_group_manager().block_bind_identity(&key) {
+                            let error = error.to_string();
+                            otel_warn!(
+                                "listener_group.plan.blocked_by_unmanaged_bind",
+                                pipeline_group_id = key.pipeline_group_id.as_str(),
+                                pipeline_id = key.pipeline_id.as_str(),
+                                receiver_node_id = key.receiver_node_id.as_str(),
+                                bind_addr = bind_addr.as_str(),
+                                error = error.as_str(),
+                            );
+                        }
+                    }
                 }
             }
+            let materialisation_report = controller_ctx
+                .listener_group_manager()
+                .materialise_registered_plans()
+                .map_err(|source| Error::PipelineRuntimeError {
+                    source: Box::new(source),
+                })?;
+            for key in &materialisation_report.ready {
+                listener_group_metrics.record(
+                    key,
+                    otap_df_engine::listener_group::metrics::ListenerGroupMetricEvent::GroupReady,
+                );
+            }
+            for key in &materialisation_report.materialisation_failed {
+                listener_group_metrics.record(
+                    key,
+                    otap_df_engine::listener_group::metrics::ListenerGroupMetricEvent::MaterialisationFailed,
+                );
+            }
+            for key in &materialisation_report.fallback {
+                listener_group_metrics.record(
+                    key,
+                    otap_df_engine::listener_group::metrics::ListenerGroupMetricEvent::Fallback,
+                );
+            }
         }
-        controller_ctx
-            .listener_group_manager()
-            .materialise_registered_plans()
-            .map_err(|source| Error::PipelineRuntimeError {
-                source: Box::new(source),
-            })?;
 
         for (pipeline_entry, pipeline_placement) in
             pipelines.iter().zip(placement_snapshot.pipelines.iter())

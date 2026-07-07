@@ -144,6 +144,7 @@ fn topic_exporter_to_topic_receiver_transfers_pdata() {
                     receiver_completion_tx,
                     receiver_metrics,
                     Interests::empty(),
+                    None,
                 )
                 .await
         });
@@ -296,6 +297,7 @@ fn topic_receiver_applies_source_tag_when_enabled() {
                     receiver_completion_tx,
                     receiver_metrics,
                     Interests::empty(),
+                    None,
                 )
                 .await
         });

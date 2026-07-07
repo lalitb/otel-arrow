@@ -484,6 +484,9 @@ jobs:
       - name: cargo check reuseport-ebpf feature
         run: cargo check -p otap-df-engine --features reuseport-ebpf
         working-directory: ./rust/otap-dataflow
+      - name: cargo test reuseport-ebpf feature
+        run: cargo test -p otap-df-engine --features reuseport-ebpf
+        working-directory: ./rust/otap-dataflow
 
   # Required builds for otap-dataflow: compile once per OS, create nextest archive.
   # Test binaries are uploaded as artifacts so test partitions don't re-compile.

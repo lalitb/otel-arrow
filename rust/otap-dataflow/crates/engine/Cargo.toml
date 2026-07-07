@@ -54,7 +54,7 @@ tikv-jemalloc-ctl = { workspace = true, optional = true }
 tikv-jemalloc-sys = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libbpf-rs = { version = "0.26.2", optional = true }
+libbpf-rs = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
 
 [dev-dependencies]

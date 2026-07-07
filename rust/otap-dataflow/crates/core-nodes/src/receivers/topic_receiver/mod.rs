@@ -866,6 +866,7 @@ mod tests {
                         pipeline_completion_tx,
                         metrics_reporter,
                         otap_df_engine::Interests::empty(),
+                        None,
                     )
                     .await
             });
@@ -965,6 +966,7 @@ mod tests {
                         pipeline_completion_tx,
                         metrics_reporter,
                         otap_df_engine::Interests::empty(),
+                        None,
                     )
                     .await
             });
@@ -1068,6 +1070,7 @@ mod tests {
                         pipeline_completion_tx,
                         metrics_reporter,
                         otap_df_engine::Interests::empty(),
+                        None,
                     )
                     .await
             });
@@ -1162,6 +1165,7 @@ mod tests {
                         pipeline_completion_tx,
                         metrics_reporter,
                         otap_df_engine::Interests::empty(),
+                        None,
                     )
                     .await
             });
@@ -1283,6 +1287,7 @@ mod tests {
                         pipeline_completion_tx,
                         metrics_reporter,
                         otap_df_engine::Interests::empty(),
+                        None,
                     )
                     .await
             });

@@ -3,14 +3,14 @@
 
 //! Phase 2: coordinated listener-group manager (engine scaffolding).
 //!
-//! `ListenerGroupManager` lets the controller (or pipeline-assembly
-//! layer) declare a planned set of listener sockets that should bind to
-//! the same address with `SO_REUSEPORT` and be handed out to receivers
-//! pinned to specific cores. Each receiver "acquires" its listener by
-//! `(group_key, core_id)`; the *last* expected member to arrive
-//! triggers eager creation of all listeners in the group so the entire
-//! reuseport group exists in the kernel atomically before any of them
-//! starts accepting connections.
+//! `ListenerGroupManager` lets the controller declare a planned set of
+//! listener sockets that should bind to the same address with
+//! `SO_REUSEPORT` and be handed out to receivers pinned to specific
+//! cores. In production, the controller materialises registered plans
+//! before pipeline threads launch, so receiver startup performs only a
+//! synchronous lookup for its pre-bound socket. A legacy lazy acquire
+//! path remains for focused manager tests and defensive fallback, but it
+//! is not used by configured listener groups during normal startup.
 //!
 //! The manager intentionally hands back standard-library TCP/UDP sockets
 //! rather than Tokio sockets so the acquiring receiver can register the fd
@@ -230,6 +230,17 @@ pub struct ListenerGroupPlan {
     /// Whether setup failures for this group should fail startup instead of
     /// falling back to independent binds.
     pub strict: bool,
+}
+
+/// Summary of eager listener-group materialisation.
+#[derive(Debug, Default)]
+pub struct ListenerGroupMaterialisationReport {
+    /// Groups successfully materialised and ready for receiver acquire.
+    pub ready: Vec<ListenerGroupKey>,
+    /// Groups that fell back to independent binds in non-strict mode.
+    pub fallback: Vec<ListenerGroupKey>,
+    /// Groups whose bind/listen/attach materialisation failed.
+    pub materialisation_failed: Vec<ListenerGroupKey>,
 }
 
 /// Errors returned by [`ListenerGroupManager::register_plan`].
@@ -500,8 +511,8 @@ impl ListenerGroupManager {
     }
 
     /// Registers a plan. Validates structure but does not bind any
-    /// sockets; binding is deferred until the *last* expected member
-    /// calls [`Self::acquire`].
+    /// sockets; production startup binds later via
+    /// [`Self::materialise_registered_plans`].
     ///
     /// # Errors
     ///
@@ -573,6 +584,62 @@ impl ListenerGroupManager {
         Ok(())
     }
 
+    /// Blocks coordinated planning for the effective bind identity of
+    /// `key`.
+    ///
+    /// The controller uses this for receivers whose resolved policy is
+    /// not `ebpf_numa`. They still bind independently, but their
+    /// effective `(address, protocol)` must be visible during preflight
+    /// so a selector is never attached to a kernel reuseport group that
+    /// also contains unmanaged sockets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlanError::DuplicateBindIdentity`] when an existing
+    /// coordinated plan or reserved identity is ambiguous with `key`.
+    pub fn block_bind_identity(&self, key: &ListenerGroupKey) -> Result<(), PlanError> {
+        if key.addr.port() == 0 {
+            return Err(PlanError::EphemeralPortUnsupported);
+        }
+
+        let bind_identity = key.bind_identity();
+        let mut state = self.inner.state.lock().expect("listener-group state mutex");
+        if let Some(existing_key) = state
+            .keys()
+            .find(|existing| bind_identities_ambiguous(existing.bind_identity(), bind_identity))
+            .cloned()
+        {
+            let existing_bind_identity = existing_key.bind_identity();
+            if let Some(existing_slot) = state.get(&existing_key) {
+                existing_slot.cv.notify_all();
+            }
+            let _ = state.remove(&existing_key);
+            let mut disabled = self
+                .inner
+                .disabled_bind_identities
+                .lock()
+                .expect("listener-group disabled bind identity mutex");
+            let _ = disabled.insert(existing_bind_identity);
+            let _ = disabled.insert(bind_identity);
+            return Err(PlanError::DuplicateBindIdentity);
+        }
+        drop(state);
+
+        let mut disabled = self
+            .inner
+            .disabled_bind_identities
+            .lock()
+            .expect("listener-group disabled bind identity mutex");
+        if disabled
+            .iter()
+            .any(|disabled| bind_identities_ambiguous(*disabled, bind_identity))
+        {
+            return Err(PlanError::DuplicateBindIdentity);
+        }
+        let _ = disabled.insert(bind_identity);
+        Ok(())
+    }
+
     /// Returns whether a plan covering `key` has been registered.
     #[must_use]
     pub fn has_plan(&self, key: &ListenerGroupKey) -> bool {
@@ -618,7 +685,10 @@ impl ListenerGroupManager {
     /// # Errors
     ///
     /// Returns the first strict materialization or attach error.
-    pub fn materialise_registered_plans(&self) -> std::io::Result<()> {
+    pub fn materialise_registered_plans(
+        &self,
+    ) -> std::io::Result<ListenerGroupMaterialisationReport> {
+        let mut report = ListenerGroupMaterialisationReport::default();
         let plans: Vec<(ListenerGroupKey, Arc<Condvar>, ListenerGroupPlan)> = {
             let mut state = self.inner.state.lock().expect("listener-group state mutex");
             state
@@ -640,13 +710,17 @@ impl ListenerGroupManager {
             let strict = plan.strict;
             let hook = self.current_attach_hook();
             if let Err(error) = self.materialise_and_publish(&key, &cv, plan, hook) {
+                report.materialisation_failed.push(key.clone());
                 if strict {
                     return Err(error);
                 }
                 self.force_fallback(&key);
+                report.fallback.push(key);
+            } else {
+                report.ready.push(key);
             }
         }
-        Ok(())
+        Ok(report)
     }
 
     /// Acquires the listener pre-allocated for `(key, core_id)`.
@@ -1344,6 +1418,41 @@ mod tests {
     }
 
     #[test]
+    fn blocked_bind_identity_rejects_later_plan() {
+        let mgr = ListenerGroupManager::new();
+        let addr = ephemeral_addr();
+        let unmanaged_key = ListenerGroupKey::tcp("pg-kernel", "pipe", "recv", addr);
+        mgr.block_bind_identity(&unmanaged_key).unwrap();
+
+        assert_eq!(
+            mgr.register_plan(plan_with_ids("pg-ebpf", "recv", addr, &[(0, 0, 0)])),
+            Err(PlanError::DuplicateBindIdentity)
+        );
+        assert_eq!(mgr.plan_count(), 0);
+    }
+
+    #[test]
+    fn blocked_bind_identity_removes_existing_plan() {
+        let mgr = ListenerGroupManager::new();
+        let addr = ephemeral_addr();
+        let plan = plan_with_ids("pg-ebpf", "recv", addr, &[(0, 0, 0)]);
+        let planned_key = plan.key.clone();
+        mgr.register_plan(plan).unwrap();
+
+        let unmanaged_key = ListenerGroupKey::tcp("pg-kernel", "pipe", "recv", addr);
+        assert_eq!(
+            mgr.block_bind_identity(&unmanaged_key),
+            Err(PlanError::DuplicateBindIdentity)
+        );
+
+        assert_eq!(mgr.plan_count(), 0);
+        assert!(matches!(
+            mgr.acquire(&planned_key, 0, Duration::from_millis(1)),
+            AcquireOutcome::NoPlan
+        ));
+    }
+
+    #[test]
     fn wildcard_and_specific_ipv4_bind_identity_is_ambiguous() {
         let mgr = ListenerGroupManager::new();
         let wildcard: SocketAddr = "0.0.0.0:18080".parse().unwrap();
@@ -1585,7 +1694,7 @@ mod tests {
         mgr.register_plan(loopback_plan(addr, &[(0, 0, 0), (1, 1, 0)]))
             .unwrap();
 
-        mgr.materialise_registered_plans().unwrap();
+        let _ = mgr.materialise_registered_plans().unwrap();
 
         let start = Instant::now();
         let outcome = mgr.acquire(&key, 0, Duration::from_secs(60));
@@ -1613,7 +1722,7 @@ mod tests {
             ))
         }));
 
-        mgr.materialise_registered_plans().unwrap();
+        let _ = mgr.materialise_registered_plans().unwrap();
 
         assert!(matches!(
             mgr.acquire(&key, 0, Duration::from_secs(60)),

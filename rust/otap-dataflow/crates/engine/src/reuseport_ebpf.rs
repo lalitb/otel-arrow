@@ -196,11 +196,12 @@ pub mod libbpf {
         ListenerSocket, NUMA_RANGES_MAP, SELECTOR_PROGRAM, SOCKARRAY_MAP, TOTAL_SOCKETS_MAP,
         build_numa_layout,
     };
-    use libbpf_rs::{MapCore, MapFlags, Object, ObjectBuilder, ProgramAttachType, ProgramType};
+    use libbpf_rs::{
+        MapCore, MapFlags, MapHandle, Object, ObjectBuilder, ProgramAttachType, ProgramType,
+    };
     use std::collections::HashSet;
     use std::error::Error;
-    use std::mem::size_of_val;
-    use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
+    use std::os::fd::{AsRawFd, RawFd};
     use std::path::Path;
     use std::sync::Arc;
 
@@ -227,7 +228,7 @@ pub mod libbpf {
     #[derive(Debug)]
     pub struct ReuseportEbpf {
         _object: Object,
-        sockarray_map_fd: Arc<OwnedFd>,
+        sockarray_map: Arc<MapHandle>,
         listener_map_indices: Vec<(u32, u32)>,
     }
 
@@ -272,7 +273,7 @@ pub mod libbpf {
                 .map(|(listener_id, map_index)| {
                     let lease: Arc<dyn std::any::Any + Send + Sync> =
                         Arc::new(SockarrayEntryLease {
-                            map_fd: Arc::clone(&self.sockarray_map_fd),
+                            map: Arc::clone(&self.sockarray_map),
                             map_index: *map_index,
                         });
                     (*listener_id, lease)
@@ -367,11 +368,10 @@ pub mod libbpf {
         // selector sees a complete socket array.
         update_sockarray(&mut object, &layout.placements, listeners)?;
         attach_selector(&object, listeners)?;
-        let sockarray_map_fd = Arc::new(
-            find_map_mut(&mut object, SOCKARRAY_MAP)?
-                .as_fd()
-                .try_clone_to_owned()?,
-        );
+        let sockarray_map = {
+            let map = find_map_mut(&mut object, SOCKARRAY_MAP)?;
+            Arc::new(MapHandle::try_from(&map)?)
+        };
         let listener_map_indices = layout
             .placements
             .iter()
@@ -380,58 +380,25 @@ pub mod libbpf {
 
         Ok(ReuseportEbpf {
             _object: object,
-            sockarray_map_fd,
+            sockarray_map,
             listener_map_indices,
         })
     }
 
     #[derive(Debug)]
     struct SockarrayEntryLease {
-        map_fd: Arc<OwnedFd>,
+        map: Arc<MapHandle>,
         map_index: u32,
     }
 
     impl Drop for SockarrayEntryLease {
         fn drop(&mut self) {
             let key = self.map_index.to_ne_bytes();
-            let _ = bpf_map_delete_elem(self.map_fd.as_raw_fd(), key.as_ptr().cast());
-        }
-    }
-
-    #[repr(C)]
-    struct BpfMapElemAttr {
-        map_fd: u32,
-        _pad: u32,
-        key: u64,
-        value: u64,
-        flags: u64,
-    }
-
-    #[allow(unsafe_code)]
-    fn bpf_map_delete_elem(map_fd: RawFd, key: *const libc::c_void) -> std::io::Result<()> {
-        const BPF_MAP_DELETE_ELEM: libc::c_uint = 3;
-        let attr = BpfMapElemAttr {
-            map_fd: map_fd as u32,
-            _pad: 0,
-            key: key as u64,
-            value: 0,
-            flags: 0,
-        };
-        // SAFETY: `attr` follows the leading layout of `union bpf_attr`
-        // for BPF_MAP_DELETE_ELEM, and `key` points to the map key bytes
-        // for the duration of the syscall.
-        let rc = unsafe {
-            libc::syscall(
-                libc::SYS_bpf,
-                BPF_MAP_DELETE_ELEM,
-                std::ptr::from_ref(&attr),
-                size_of_val(&attr),
-            )
-        };
-        if rc < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(())
+            // The kernel also evicts closed sockets from
+            // REUSEPORT_SOCKARRAY maps; this explicit delete keeps the
+            // userspace lifecycle tidy but is best-effort during
+            // shutdown.
+            let _ = self.map.delete(&key);
         }
     }
 
