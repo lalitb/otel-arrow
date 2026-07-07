@@ -1553,15 +1553,17 @@ impl<
                 );
                 for plan in plans {
                     let key = plan.key.clone();
+                    let bind_addr = key.addr.to_string();
                     if let Err(error) = controller_ctx.listener_group_manager().register_plan(plan)
                     {
+                        let error = error.to_string();
                         otel_warn!(
                             "listener_group.plan.register_failed",
                             pipeline_group_id = key.pipeline_group_id.as_str(),
                             pipeline_id = key.pipeline_id.as_str(),
                             receiver_node_id = key.receiver_node_id.as_str(),
-                            bind_addr = key.addr.to_string().as_str(),
-                            error = error.to_string().as_str(),
+                            bind_addr = bind_addr.as_str(),
+                            error = error.as_str(),
                         );
                     } else {
                         otel_info!(
@@ -1569,7 +1571,7 @@ impl<
                             pipeline_group_id = key.pipeline_group_id.as_str(),
                             pipeline_id = key.pipeline_id.as_str(),
                             receiver_node_id = key.receiver_node_id.as_str(),
-                            bind_addr = key.addr.to_string().as_str(),
+                            bind_addr = bind_addr.as_str(),
                             members = plan_cores.len() as i64,
                         );
                     }

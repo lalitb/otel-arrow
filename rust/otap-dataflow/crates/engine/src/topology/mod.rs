@@ -191,7 +191,6 @@ impl NumaTopology {
 }
 
 /// Parses a Linux cpulist such as `0-3,8,10-12`.
-#[cfg(any(target_os = "linux", test))]
 pub(crate) fn parse_cpu_list(input: &str) -> Result<BTreeSet<u32>, ParseCpuListError> {
     let input = input.trim();
     if input.is_empty() {
@@ -233,7 +232,6 @@ pub(crate) fn parse_cpu_list(input: &str) -> Result<BTreeSet<u32>, ParseCpuListE
 }
 
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
-#[cfg(any(target_os = "linux", test))]
 pub(crate) enum ParseCpuListError {
     #[error("empty cpulist")]
     Empty,
