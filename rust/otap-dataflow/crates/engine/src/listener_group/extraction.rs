@@ -444,10 +444,12 @@ mod tests {
                       listening_addr: "127.0.0.1:18014"
         "#;
         let pipeline = PipelineConfig::from_yaml("pg".into(), "pipe".into(), yaml).unwrap();
-        let mut policies = ResolvedPolicies::default();
-        policies.load_balancing = LoadBalancingPolicy {
-            strategy: LoadBalancingStrategy::EbpfNuma,
-            strict: true,
+        let policies = ResolvedPolicies {
+            load_balancing: LoadBalancingPolicy {
+                strategy: LoadBalancingStrategy::EbpfNuma,
+                strict: true,
+            },
+            ..ResolvedPolicies::default()
         };
         let resolved = ResolvedPipelineConfig {
             pipeline_group_id: "pg".into(),

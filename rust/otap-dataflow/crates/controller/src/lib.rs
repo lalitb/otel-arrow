@@ -1363,7 +1363,7 @@ impl<
                 pipeline.policies.health.clone(),
             );
         }
-        let topology = DefaultNumaTopologyProvider::default().discover();
+        let topology = DefaultNumaTopologyProvider.discover();
         let placement_snapshot =
             Self::preflight_pipeline_placement(&pipelines, &all_cores, &topology)?;
 
@@ -1510,6 +1510,54 @@ impl<
         for (pipeline_entry, pipeline_placement) in
             pipelines.iter().zip(placement_snapshot.pipelines.iter())
         {
+            if pipeline_placement.load_balancing.strategy != LoadBalancingStrategy::EbpfNuma {
+                continue;
+            }
+            let plan_cores: Vec<u32> = pipeline_placement
+                .cores
+                .iter()
+                .filter_map(|placement| u32::try_from(placement.core_id.id).ok())
+                .collect();
+            let plans = otap_df_engine::listener_group::extraction::extract_plans_for_pipeline(
+                pipeline_entry,
+                &plan_cores,
+                controller_ctx.topology(),
+            );
+            for plan in plans {
+                let key = plan.key.clone();
+                let bind_addr = key.addr.to_string();
+                if let Err(error) = controller_ctx.listener_group_manager().register_plan(plan) {
+                    let error = error.to_string();
+                    otel_warn!(
+                        "listener_group.plan.register_failed",
+                        pipeline_group_id = key.pipeline_group_id.as_str(),
+                        pipeline_id = key.pipeline_id.as_str(),
+                        receiver_node_id = key.receiver_node_id.as_str(),
+                        bind_addr = bind_addr.as_str(),
+                        error = error.as_str(),
+                    );
+                } else {
+                    otel_info!(
+                        "listener_group.plan.registered",
+                        pipeline_group_id = key.pipeline_group_id.as_str(),
+                        pipeline_id = key.pipeline_id.as_str(),
+                        receiver_node_id = key.receiver_node_id.as_str(),
+                        bind_addr = bind_addr.as_str(),
+                        members = plan_cores.len() as i64,
+                    );
+                }
+            }
+        }
+        controller_ctx
+            .listener_group_manager()
+            .materialise_registered_plans()
+            .map_err(|source| Error::PipelineRuntimeError {
+                source: Box::new(source),
+            })?;
+
+        for (pipeline_entry, pipeline_placement) in
+            pipelines.iter().zip(placement_snapshot.pipelines.iter())
+        {
             runtime.register_committed_pipeline(pipeline_entry.clone(), 0);
             let num_cores = pipeline_placement.core_count();
 
@@ -1525,49 +1573,6 @@ impl<
                 num_cores = num_cores,
                 core_allocation = core_allocation
             );
-
-            // When the resolved pipeline policy selects `ebpf_numa`,
-            // register one `ListenerGroupPlan` per recognised receiver
-            // in this pipeline before launching its threads. With
-            // `kernel`, no plans are registered and receivers keep the
-            // existing independent bind path.
-            let plan_cores: Vec<u32> = pipeline_placement
-                .cores
-                .iter()
-                .filter_map(|placement| u32::try_from(placement.core_id.id).ok())
-                .collect();
-            if pipeline_placement.load_balancing.strategy == LoadBalancingStrategy::EbpfNuma {
-                let plans = otap_df_engine::listener_group::extraction::extract_plans_for_pipeline(
-                    pipeline_entry,
-                    &plan_cores,
-                    controller_ctx.topology(),
-                );
-                for plan in plans {
-                    let key = plan.key.clone();
-                    let bind_addr = key.addr.to_string();
-                    if let Err(error) = controller_ctx.listener_group_manager().register_plan(plan)
-                    {
-                        let error = error.to_string();
-                        otel_warn!(
-                            "listener_group.plan.register_failed",
-                            pipeline_group_id = key.pipeline_group_id.as_str(),
-                            pipeline_id = key.pipeline_id.as_str(),
-                            receiver_node_id = key.receiver_node_id.as_str(),
-                            bind_addr = bind_addr.as_str(),
-                            error = error.as_str(),
-                        );
-                    } else {
-                        otel_info!(
-                            "listener_group.plan.registered",
-                            pipeline_group_id = key.pipeline_group_id.as_str(),
-                            pipeline_id = key.pipeline_id.as_str(),
-                            receiver_node_id = key.receiver_node_id.as_str(),
-                            bind_addr = bind_addr.as_str(),
-                            members = plan_cores.len() as i64,
-                        );
-                    }
-                }
-            }
 
             for core_placement in &pipeline_placement.cores {
                 let core_id = core_placement.core_id;

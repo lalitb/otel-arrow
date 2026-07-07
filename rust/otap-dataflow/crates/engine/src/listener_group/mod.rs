@@ -32,7 +32,10 @@ use crate::topology::NumaTopology;
 use std::any::Any;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{SocketAddr, TcpListener, UdpSocket};
+#[cfg(unix)]
 use std::os::fd::RawFd;
+#[cfg(not(unix))]
+type RawFd = i32;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -184,7 +187,7 @@ fn bind_identities_ambiguous(left: BindIdentity, right: BindIdentity) -> bool {
         }
         (SocketAddr::V4(left), SocketAddr::V6(right))
         | (SocketAddr::V6(right), SocketAddr::V4(left)) => {
-            right.ip().is_unspecified() && left.ip().is_unspecified()
+            right.ip().is_unspecified() || left.ip().is_unspecified()
         }
     }
 }
@@ -346,8 +349,15 @@ impl AcquiredListener {
 
     #[cfg(test)]
     fn as_raw_fd(&self) -> RawFd {
-        use std::os::fd::AsRawFd;
-        self.listener.as_raw_fd()
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            self.listener.as_raw_fd()
+        }
+        #[cfg(not(unix))]
+        {
+            -1
+        }
     }
 }
 
@@ -536,16 +546,18 @@ impl ListenerGroupManager {
             .find(|key| bind_identities_ambiguous(key.bind_identity(), bind_identity))
             .cloned()
         {
+            let existing_bind_identity = existing_key.bind_identity();
             if let Some(existing_slot) = state.get(&existing_key) {
                 existing_slot.cv.notify_all();
             }
             let _ = state.remove(&existing_key);
-            let _ = self
+            let mut disabled = self
                 .inner
                 .disabled_bind_identities
                 .lock()
-                .expect("listener-group disabled bind identity mutex")
-                .insert(bind_identity);
+                .expect("listener-group disabled bind identity mutex");
+            let _ = disabled.insert(existing_bind_identity);
+            let _ = disabled.insert(bind_identity);
             return Err(PlanError::DuplicateBindIdentity);
         }
         let key = plan.key.clone();
@@ -590,6 +602,51 @@ impl ListenerGroupManager {
             .lock()
             .expect("listener-group attach-hook mutex")
             .clone()
+    }
+
+    /// Materializes every currently registered plan before receiver
+    /// tasks are launched.
+    ///
+    /// This is the production path for configured listener groups:
+    /// receivers later call [`Self::acquire`] and perform only a
+    /// non-blocking lookup into the ready or fallback state. If a
+    /// non-strict group fails to bind or attach, it is marked as
+    /// fallback so receivers keep the independent bind behavior. A
+    /// strict failure is returned to the controller so startup fails
+    /// before any pipeline thread is spawned.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first strict materialization or attach error.
+    pub fn materialise_registered_plans(&self) -> std::io::Result<()> {
+        let plans: Vec<(ListenerGroupKey, Arc<Condvar>, ListenerGroupPlan)> = {
+            let mut state = self.inner.state.lock().expect("listener-group state mutex");
+            state
+                .iter_mut()
+                .filter_map(|(key, slot)| {
+                    if matches!(slot.state, GroupState::Planned | GroupState::Fallback) {
+                        let plan = slot.plan.clone();
+                        let cv = Arc::clone(&slot.cv);
+                        slot.state = GroupState::Materialising;
+                        Some((key.clone(), cv, plan))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        for (key, cv, plan) in plans {
+            let strict = plan.strict;
+            let hook = self.current_attach_hook();
+            if let Err(error) = self.materialise_and_publish(&key, &cv, plan, hook) {
+                if strict {
+                    return Err(error);
+                }
+                self.force_fallback(&key);
+            }
+        }
+        Ok(())
     }
 
     /// Acquires the listener pre-allocated for `(key, core_id)`.
@@ -882,15 +939,18 @@ pub fn ebpf_attach_hook(debug: bool) -> AttachHook {
     }
     #[cfg(not(all(target_os = "linux", feature = "reuseport-ebpf")))]
     {
+        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
         Arc::new(|plan, _handles| {
             if plan.strict {
                 return Err(std::io::Error::other(
                     "eBPF attach failed (strict): reuseport-ebpf feature is not compiled in or target is not Linux",
                 ));
             }
-            eprintln!(
-                "listener_group: ebpf_numa requested but reuseport-ebpf feature is not compiled in or target is not Linux; continuing with plain SO_REUSEPORT"
-            );
+            WARN_ONCE.call_once(|| {
+                eprintln!(
+                    "listener_group: ebpf_numa requested but reuseport-ebpf feature is not compiled in or target is not Linux; continuing with plain SO_REUSEPORT"
+                );
+            });
             Ok(AttachOutcome::default())
         })
     }
@@ -1072,23 +1132,36 @@ fn invoke_attach_hook(
     sockets: &HashMap<u32, GroupSocket>,
     hook: Option<&AttachHook>,
 ) -> std::io::Result<AttachOutcome> {
-    use std::os::fd::AsRawFd;
     let Some(hook) = hook else {
         return Ok(AttachOutcome::default());
     };
-    let mut members = plan.expected_members.clone();
-    members.sort_by_key(|m| m.listener_id);
-    let mut handles: Vec<(u32, RawFd, u32, Option<u32>)> = Vec::with_capacity(members.len());
-    for m in &members {
-        if let Some(socket) = sockets.get(&m.core_id) {
-            let fd = match socket {
-                GroupSocket::Tcp(listener) => listener.as_raw_fd(),
-                GroupSocket::Udp(socket) => socket.as_raw_fd(),
-            };
-            handles.push((m.listener_id, fd, m.core_id, m.numa_node));
+    #[cfg(not(unix))]
+    {
+        let _ = (sockets, hook);
+        if plan.strict {
+            return Err(std::io::Error::other(
+                "eBPF attach failed (strict): file descriptors are unavailable on this platform",
+            ));
         }
+        return Ok(AttachOutcome::default());
     }
-    hook(plan, &handles)
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let mut members = plan.expected_members.clone();
+        members.sort_by_key(|m| m.listener_id);
+        let mut handles: Vec<(u32, RawFd, u32, Option<u32>)> = Vec::with_capacity(members.len());
+        for m in &members {
+            if let Some(socket) = sockets.get(&m.core_id) {
+                let fd = match socket {
+                    GroupSocket::Tcp(listener) => listener.as_raw_fd(),
+                    GroupSocket::Udp(socket) => socket.as_raw_fd(),
+                };
+                handles.push((m.listener_id, fd, m.core_id, m.numa_node));
+            }
+        }
+        hook(plan, &handles)
+    }
 }
 
 fn build_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
@@ -1321,6 +1394,21 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_wildcard_and_ipv4_specific_same_port_are_ambiguous() {
+        let mgr = ListenerGroupManager::new();
+        let wildcard_v6: SocketAddr = "[::]:18083".parse().unwrap();
+        let specific_v4: SocketAddr = "127.0.0.1:18083".parse().unwrap();
+        mgr.register_plan(plan_with_ids("pg-a", "recv", wildcard_v6, &[(0, 0, 0)]))
+            .unwrap();
+
+        assert_eq!(
+            mgr.register_plan(plan_with_ids("pg-b", "recv", specific_v4, &[(0, 1, 0)])),
+            Err(PlanError::DuplicateBindIdentity)
+        );
+        assert_eq!(mgr.plan_count(), 0);
+    }
+
+    #[test]
     fn duplicate_full_key_is_rejected() {
         let mgr = ListenerGroupManager::new();
         let addr = ephemeral_addr();
@@ -1487,6 +1575,71 @@ mod tests {
         assert_eq!(l_a.local_addr().unwrap().port(), addr.port());
         assert_eq!(l_b.local_addr().unwrap().port(), addr.port());
         assert_ne!(l_a.as_raw_fd(), l_b.as_raw_fd());
+    }
+
+    #[test]
+    fn eager_materialisation_makes_acquire_nonblocking() {
+        let mgr = ListenerGroupManager::new();
+        let addr = ephemeral_addr();
+        let key = ListenerGroupKey::tcp("pg", "pipe", "recv", addr);
+        mgr.register_plan(loopback_plan(addr, &[(0, 0, 0), (1, 1, 0)]))
+            .unwrap();
+
+        mgr.materialise_registered_plans().unwrap();
+
+        let start = Instant::now();
+        let outcome = mgr.acquire(&key, 0, Duration::from_secs(60));
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "eager acquire should not wait"
+        );
+        assert!(
+            matches!(outcome, AcquireOutcome::Listener(_)),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn eager_non_strict_materialisation_failure_falls_back() {
+        let mgr = ListenerGroupManager::new();
+        let addr = ephemeral_addr();
+        let key = ListenerGroupKey::tcp("pg", "pipe", "recv", addr);
+        mgr.register_plan(loopback_plan(addr, &[(0, 0, 0)]))
+            .unwrap();
+        mgr.set_attach_hook(Arc::new(|_, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "simulated attach failure",
+            ))
+        }));
+
+        mgr.materialise_registered_plans().unwrap();
+
+        assert!(matches!(
+            mgr.acquire(&key, 0, Duration::from_secs(60)),
+            AcquireOutcome::FallbackToIndependent
+        ));
+    }
+
+    #[test]
+    fn eager_strict_materialisation_failure_returns_error() {
+        let mgr = ListenerGroupManager::new();
+        let addr = ephemeral_addr();
+        let mut plan = loopback_plan(addr, &[(0, 0, 0)]);
+        plan.strict = true;
+        mgr.register_plan(plan).unwrap();
+        mgr.set_attach_hook(Arc::new(|_, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "simulated attach failure",
+            ))
+        }));
+
+        let error = mgr
+            .materialise_registered_plans()
+            .expect_err("strict materialisation should fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[test]

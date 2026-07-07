@@ -14,6 +14,11 @@ struct numa_range {
     __u32 len;
 };
 
+struct selection_counter {
+    __u32 value;
+    __u8 pad[60];
+};
+
 struct {
     __uint(type, BPF_MAP_TYPE_REUSEPORT_SOCKARRAY);
     __uint(max_entries, MAX_REUSEPORT_SOCKS);
@@ -37,18 +42,16 @@ struct {
 
 /*
  * Per-NUMA round-robin counters at keys 0..MAX_NUMA_NODES-1, plus a single
- * global-fallback counter at key MAX_NUMA_NODES. A shared `BPF_MAP_TYPE_ARRAY`
- * with an atomic fetch-add gives true global per-NUMA round-robin: every new
- * connection landing on the same NUMA node advances the same counter and
- * picks the next listener in that node's range, regardless of which RX CPU
- * the packet arrived on. Values start at 0 because BPF array entries are
- * zero-initialised by the kernel; the loader does not need to seed this map.
+ * global-fallback counter at key MAX_NUMA_NODES. Each value occupies one
+ * 64-byte cache line to avoid false sharing between counters for different
+ * NUMA nodes. Values start at 0 because BPF array entries are zero-initialised
+ * by the kernel; the loader does not need to seed this map.
  */
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, MAX_NUMA_NODES + 1);
     __type(key, __u32);
-    __type(value, __u32);
+    __type(value, struct selection_counter);
 } selection_counters SEC(".maps");
 
 /*
@@ -57,16 +60,15 @@ struct {
  * a safe in-range index for any non-empty range; the caller is responsible
  * for not invoking the helper with len == 0 against a real range.
  *
- * `__sync_fetch_and_add` lowers to BPF_ATOMIC_FETCH_ADD and therefore
- * requires BPF ISA v3 (clang `-mcpu=v3`) and Linux >= 5.12. The build script
- * passes `-mcpu=v3` for this object.
+ * `__sync_fetch_and_add` lowers to a BPF atomic instruction and therefore
+ * requires Linux >= 5.12. The build script passes `-mcpu=v3` for this object.
  */
 static __always_inline __u32 next_index(__u32 counter_key, __u32 len)
 {
-    __u32 *counter = bpf_map_lookup_elem(&selection_counters, &counter_key);
+    struct selection_counter *counter = bpf_map_lookup_elem(&selection_counters, &counter_key);
     if (!counter || len == 0)
         return 0;
-    __u32 idx = __sync_fetch_and_add(counter, 1);
+    __u32 idx = __sync_fetch_and_add(&counter->value, 1);
     return idx % len;
 }
 
@@ -104,4 +106,4 @@ int select_numa_reuseport(struct sk_reuseport_md *ctx)
     return SK_PASS;
 }
 
-char LICENSE[] SEC("license") = "GPL";
+char LICENSE[] SEC("license") = "Apache-2.0";

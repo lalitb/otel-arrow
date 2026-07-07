@@ -30,10 +30,10 @@ pub const TOTAL_SOCKETS_MAP: &str = "total_sockets";
 ///
 /// Keys `0..MAX_NUMA_NODES` are the per-NUMA counters, key `MAX_NUMA_NODES`
 /// is the global fallback counter. Implemented as a shared
-/// `BPF_MAP_TYPE_ARRAY` updated via `__sync_fetch_and_add` so every new
-/// connection landing on the same NUMA node advances the same counter and
-/// rotates across that node's listeners. The loader does not seed it because
-/// BPF array entries are zero-initialised by the kernel.
+/// `BPF_MAP_TYPE_ARRAY` with one 64-byte-padded counter per entry so every new
+/// connection landing on the same NUMA node advances the same counter without
+/// false-sharing with adjacent NUMA-node counters. The loader does not seed it
+/// because BPF array entries are zero-initialised by the kernel.
 pub const SELECTION_COUNTERS_MAP: &str = "selection_counters";
 
 /// Name of the BPF selector program.
