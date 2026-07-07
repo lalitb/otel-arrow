@@ -37,9 +37,6 @@ pub struct NumaTopology {
     inner: Arc<NumaTopologyInner>,
 }
 
-/// Backward-compatible name for the prototype listener-group code.
-pub type CpuTopology = NumaTopology;
-
 #[derive(Debug)]
 struct NumaTopologyInner {
     cpu_to_node: BTreeMap<u32, u32>,

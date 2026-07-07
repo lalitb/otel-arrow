@@ -12,7 +12,7 @@ use crate::entity_context::{current_node_telemetry_handle, node_entity_key};
 use crate::listener_group::ListenerGroupManager;
 use crate::memory_limiter::MemoryPressureState;
 use crate::node::NodeId as EngineNodeId;
-use crate::topology::CpuTopology;
+use crate::topology::NumaTopology;
 use otap_df_config::node::NodeKind;
 use otap_df_config::pipeline::telemetry::TelemetryAttribute;
 use otap_df_config::policy::LoadBalancingPolicy;
@@ -107,7 +107,7 @@ pub struct ControllerContext {
     /// CPU id -> NUMA node id mapping discovered from sysfs.
     /// Empty on non-Linux or unreadable sysfs; lookups for unknown CPUs
     /// fall back to NUMA node `0` to preserve pre-Phase-1 behaviour.
-    topology: CpuTopology,
+    topology: NumaTopology,
     /// Coordinated listener-group manager (Phase 2 scaffolding).
     /// Default state has no plans registered, so the manager is inert
     /// and existing per-receiver bind behaviour is preserved. The
@@ -171,7 +171,7 @@ impl ControllerContext {
             // Detect NUMA topology from sysfs once at startup. Non-Linux
             // and unreadable-sysfs hosts get an empty mapping; callers
             // that need a concrete value fall back to node 0 below.
-            topology: CpuTopology::detect(),
+            topology: NumaTopology::detect(),
             listener_group_manager: ListenerGroupManager::new(),
             memory_pressure_state: MemoryPressureState::default(),
         }
@@ -184,7 +184,7 @@ impl ControllerContext {
     #[must_use]
     pub fn with_topology(
         telemetry_registry_handle: TelemetryRegistryHandle,
-        topology: CpuTopology,
+        topology: NumaTopology,
     ) -> Self {
         Self {
             telemetry_registry_handle,
@@ -199,7 +199,7 @@ impl ControllerContext {
 
     /// Returns the discovered CPU/NUMA topology.
     #[must_use]
-    pub fn topology(&self) -> &CpuTopology {
+    pub fn topology(&self) -> &NumaTopology {
         &self.topology
     }
 

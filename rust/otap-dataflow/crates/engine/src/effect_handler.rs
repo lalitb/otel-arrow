@@ -13,8 +13,7 @@ use crate::control::{
 };
 use crate::error::Error;
 use crate::listener_group::{
-    AcquireOutcome, ListenerGroupHandle, ListenerGroupLease, QUORUM_TIMEOUT, manager_active,
-    reuseport_ebpf_strict,
+    AcquireOutcome, ListenerGroupHandle, ListenerGroupLease, QUORUM_TIMEOUT,
 };
 use crate::node::NodeId;
 use crate::node_local_scheduler::NodeLocalSchedulerHandle;
@@ -189,8 +188,8 @@ impl<PData> EffectHandlerCore<PData> {
     /// listeners via this method to ensure the scalability and the serviceability of the pipeline.
     ///
     /// When the controller has registered a coordinated reuseport
-    /// plan covering this receiver and `OTAP_DF_REUSEPORT_EBPF=1`
-    /// is set, this method consults
+    /// plan covering this receiver and the resolved pipeline policy
+    /// selected `ebpf_numa`, this method consults
     /// [`crate::listener_group::ListenerGroupManager`] to obtain a
     /// listener that is part of a pre-materialised reuseport group.
     /// On `NoPlan`, `FallbackToIndependent`, or when coordination is
@@ -212,73 +211,70 @@ impl<PData> EffectHandlerCore<PData> {
             error,
         };
 
-        // Coordinated reuseport path: only active when the single
-        // user-facing env switch (`OTAP_DF_REUSEPORT_EBPF=1`) is on
-        // and the controller wired a handle on this effect handler.
+        // Coordinated reuseport path: only active when the controller
+        // wired a policy-derived handle on this effect handler.
         // Falls through silently otherwise so production behaviour
-        // matches `main`.
-        if manager_active() {
-            if let Some(handle) = self.listener_group_handle.as_ref() {
-                let key = handle.tcp_key(addr);
-                let outcome = handle
-                    .manager()
-                    .acquire(&key, handle.core_id(), QUORUM_TIMEOUT);
-                match outcome {
-                    AcquireOutcome::Listener(acquired) => {
-                        let (std_listener, lease) = acquired.into_parts();
-                        if let Some(lease) = lease {
-                            self.listener_group_leases
-                                .lock()
-                                .expect("listener-group leases mutex")
-                                .push(lease);
-                        }
-                        // The acquiring receiver must register the fd
-                        // with its own current-thread runtime; doing
-                        // so here keeps the seam sync.
-                        return TcpListener::from_std(std_listener).map_err(into_engine_error);
+        // matches the independent bind path.
+        if let Some(handle) = self.listener_group_handle.as_ref() {
+            let key = handle.tcp_key(addr);
+            let outcome = handle
+                .manager()
+                .acquire(&key, handle.core_id(), QUORUM_TIMEOUT);
+            match outcome {
+                AcquireOutcome::Listener(acquired) => {
+                    let (std_listener, lease) = acquired.into_parts();
+                    if let Some(lease) = lease {
+                        self.listener_group_leases
+                            .lock()
+                            .expect("listener-group leases mutex")
+                            .push(lease);
                     }
-                    AcquireOutcome::DatagramSocket(_) => {
-                        return Err(into_engine_error(std::io::Error::other(format!(
-                            "coordinated reuseport manager returned a UDP socket for TCP listener {addr}"
-                        ))));
+                    // The acquiring receiver must register the fd
+                    // with its own current-thread runtime; doing
+                    // so here keeps the seam sync.
+                    return TcpListener::from_std(std_listener).map_err(into_engine_error);
+                }
+                AcquireOutcome::DatagramSocket(_) => {
+                    return Err(into_engine_error(std::io::Error::other(format!(
+                        "coordinated reuseport manager returned a UDP socket for TCP listener {addr}"
+                    ))));
+                }
+                AcquireOutcome::MaterialisationFailed(error) => {
+                    if handle.strict() {
+                        return Err(into_engine_error(error));
                     }
-                    AcquireOutcome::MaterialisationFailed(error) => {
-                        if reuseport_ebpf_strict() {
-                            return Err(into_engine_error(error));
-                        }
-                        otel_warn!(
-                            "listener_group.tcp.materialisation_failed.fallback",
-                            receiver = receiver_id.name.as_ref(),
-                            addr = addr.to_string(),
-                            error = error.to_string(),
-                        );
-                        // Non-strict mode treats coordinated
-                        // materialisation failures the same as other
-                        // coordinated fallback cases: bind this
-                        // receiver independently below.
-                    }
-                    AcquireOutcome::AlreadyAcquired => {
-                        // H1: refuse to silently rebind a fresh
-                        // independent listener -- doing so would
-                        // defeat the coordinated-reuseport guarantee
-                        // and silently mask a caller bug. The
-                        // receiver must call tcp_listener at most
-                        // once per (addr, core) within a startup.
-                        return Err(into_engine_error(std::io::Error::new(
-                            std::io::ErrorKind::AlreadyExists,
-                            format!(
-                                "listener for {addr} on core {} was already \
+                    otel_warn!(
+                        "listener_group.tcp.materialisation_failed.fallback",
+                        receiver = receiver_id.name.as_ref(),
+                        addr = addr.to_string(),
+                        error = error.to_string(),
+                    );
+                    // Non-strict mode treats coordinated
+                    // materialisation failures the same as other
+                    // coordinated fallback cases: bind this
+                    // receiver independently below.
+                }
+                AcquireOutcome::AlreadyAcquired => {
+                    // H1: refuse to silently rebind a fresh
+                    // independent listener -- doing so would
+                    // defeat the coordinated-reuseport guarantee
+                    // and silently mask a caller bug. The
+                    // receiver must call tcp_listener at most
+                    // once per (addr, core) within a startup.
+                    return Err(into_engine_error(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!(
+                            "listener for {addr} on core {} was already \
                                  acquired from the coordinated reuseport \
                                  manager; tcp_listener must not be called \
                                  more than once for the same (addr, core)",
-                                handle.core_id()
-                            ),
-                        )));
-                    }
-                    AcquireOutcome::NoPlan | AcquireOutcome::FallbackToIndependent => {
-                        // Fall through to the independent-bind path
-                        // below.
-                    }
+                            handle.core_id()
+                        ),
+                    )));
+                }
+                AcquireOutcome::NoPlan | AcquireOutcome::FallbackToIndependent => {
+                    // Fall through to the independent-bind path
+                    // below.
                 }
             }
         }
@@ -335,56 +331,54 @@ impl<PData> EffectHandlerCore<PData> {
             error,
         };
 
-        if manager_active() {
-            if let Some(handle) = self.listener_group_handle.as_ref() {
-                let key = handle.udp_key(addr);
-                let outcome = handle
-                    .manager()
-                    .acquire(&key, handle.core_id(), QUORUM_TIMEOUT);
-                match outcome {
-                    AcquireOutcome::DatagramSocket(acquired) => {
-                        let (std_socket, lease) = acquired.into_parts();
-                        if let Some(lease) = lease {
-                            self.listener_group_leases
-                                .lock()
-                                .expect("listener-group leases mutex")
-                                .push(lease);
-                        }
-                        return UdpSocket::from_std(std_socket).map_err(into_engine_error);
+        if let Some(handle) = self.listener_group_handle.as_ref() {
+            let key = handle.udp_key(addr);
+            let outcome = handle
+                .manager()
+                .acquire(&key, handle.core_id(), QUORUM_TIMEOUT);
+            match outcome {
+                AcquireOutcome::DatagramSocket(acquired) => {
+                    let (std_socket, lease) = acquired.into_parts();
+                    if let Some(lease) = lease {
+                        self.listener_group_leases
+                            .lock()
+                            .expect("listener-group leases mutex")
+                            .push(lease);
                     }
-                    AcquireOutcome::MaterialisationFailed(error) => {
-                        if reuseport_ebpf_strict() {
-                            return Err(into_engine_error(error));
-                        }
-                        otel_warn!(
-                            "listener_group.udp.materialisation_failed.fallback",
-                            receiver = receiver_id.name.as_ref(),
-                            addr = addr.to_string(),
-                            error = error.to_string(),
-                        );
-                        // Fall through to the independent-bind path
-                        // below.
+                    return UdpSocket::from_std(std_socket).map_err(into_engine_error);
+                }
+                AcquireOutcome::MaterialisationFailed(error) => {
+                    if handle.strict() {
+                        return Err(into_engine_error(error));
                     }
-                    AcquireOutcome::AlreadyAcquired => {
-                        return Err(into_engine_error(std::io::Error::new(
-                            std::io::ErrorKind::AlreadyExists,
-                            format!(
-                                "UDP socket for {addr} on core {} was already \
+                    otel_warn!(
+                        "listener_group.udp.materialisation_failed.fallback",
+                        receiver = receiver_id.name.as_ref(),
+                        addr = addr.to_string(),
+                        error = error.to_string(),
+                    );
+                    // Fall through to the independent-bind path
+                    // below.
+                }
+                AcquireOutcome::AlreadyAcquired => {
+                    return Err(into_engine_error(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!(
+                            "UDP socket for {addr} on core {} was already \
                                  acquired from the coordinated reuseport manager; \
                                  udp_socket must not be called more than once for \
                                  the same (addr, core)",
-                                handle.core_id()
-                            ),
-                        )));
-                    }
-                    AcquireOutcome::Listener(_) => {
-                        return Err(into_engine_error(std::io::Error::other(format!(
-                            "coordinated reuseport manager returned a TCP listener for UDP socket {addr}"
-                        ))));
-                    }
-                    AcquireOutcome::NoPlan | AcquireOutcome::FallbackToIndependent => {
-                        // Fall through to the independent-bind path below.
-                    }
+                            handle.core_id()
+                        ),
+                    )));
+                }
+                AcquireOutcome::Listener(_) => {
+                    return Err(into_engine_error(std::io::Error::other(format!(
+                        "coordinated reuseport manager returned a TCP listener for UDP socket {addr}"
+                    ))));
+                }
+                AcquireOutcome::NoPlan | AcquireOutcome::FallbackToIndependent => {
+                    // Fall through to the independent-bind path below.
                 }
             }
         }

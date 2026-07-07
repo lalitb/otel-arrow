@@ -488,7 +488,9 @@ impl<PData: 'static + Debug + Clone + ReceivedAtNode + Unwindable + FlowMetricHo
             // `ListenerGroupHandle::for_receiver` so the runtime key
             // shares the same stringification as
             // `ListenerGroupKey::tcp_for_receiver` (controller side).
-            let listener_group_handle =
+            let listener_group_handle = if pipeline_context.load_balancing().strategy
+                == otap_df_config::policy::LoadBalancingStrategy::EbpfNuma
+            {
                 u32::try_from(pipeline_context.core_id())
                     .ok()
                     .map(|core_id| {
@@ -498,8 +500,12 @@ impl<PData: 'static + Debug + Clone + ReceivedAtNode + Unwindable + FlowMetricHo
                             pipeline_context.pipeline_id().to_string(),
                             &node_id.name,
                             core_id,
+                            pipeline_context.load_balancing().strict,
                         )
-                    });
+                    })
+            } else {
+                None
+            };
             let fut = async move {
                 let result = receiver
                     .start(

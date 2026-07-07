@@ -284,6 +284,12 @@ pub enum LoadBalancingStrategy {
     Kernel,
     /// Coordinate eligible reuseport listeners and attach the Linux eBPF NUMA selector.
     EbpfNuma,
+    /// Reserved for a future engine-owned userspace strategy.
+    ///
+    /// The value is accepted by config parsing so documents can describe the
+    /// intended strategy set, but the current controller treats it as
+    /// not implemented and leaves listeners on the existing bind path.
+    Engine,
 }
 
 /// instrumentation overhead.
@@ -833,6 +839,24 @@ load_balancing:
             LoadBalancingStrategy::EbpfNuma
         );
         assert!(resolved.load_balancing.strict);
+    }
+
+    #[test]
+    fn load_balancing_policy_accepts_reserved_engine_strategy() {
+        let policies: Policies = serde_yaml::from_str(
+            r#"
+load_balancing:
+  strategy: engine
+"#,
+        )
+        .expect("reserved engine load balancing strategy should parse");
+
+        let resolved = Policies::resolve([&policies]);
+
+        assert_eq!(
+            resolved.load_balancing.strategy,
+            LoadBalancingStrategy::Engine
+        );
     }
 
     #[test]

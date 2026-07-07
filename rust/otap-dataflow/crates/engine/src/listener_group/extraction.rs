@@ -23,7 +23,7 @@
 use crate::listener_group::{
     ListenerGroupKey, ListenerGroupMember, ListenerGroupPlan, Protocol as ListenerProtocol,
 };
-use crate::topology::CpuTopology;
+use crate::topology::NumaTopology;
 use otap_df_config::engine::ResolvedPipelineConfig;
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -83,13 +83,13 @@ fn extract_listener_addresses(config: &serde_json::Value) -> Vec<(ListenerProtoc
 /// Returns one [`ListenerGroupPlan`] per recognised receiver in the
 /// pipeline that exposes a TCP or UDP `listening_addr`. Members are
 /// constructed from `cores`, with `numa_node` looked up via
-/// [`CpuTopology::numa_node_or_zero`] and `listener_id` assigned
+/// [`NumaTopology::numa_node`] and `listener_id` assigned
 /// stably as the position of the core within `cores`.
 #[must_use]
 pub fn extract_plans_for_pipeline(
     pipeline: &ResolvedPipelineConfig,
     cores: &[u32],
-    topology: &CpuTopology,
+    topology: &NumaTopology,
 ) -> Vec<ListenerGroupPlan> {
     let mut plans = Vec::new();
     if cores.is_empty() {
@@ -121,7 +121,7 @@ pub fn extract_plans_for_pipeline(
                 .map(|(idx, core_id)| ListenerGroupMember {
                     listener_id: idx as u32,
                     core_id: *core_id,
-                    numa_node: topology.numa_node_or_zero(*core_id),
+                    numa_node: topology.numa_node(*core_id),
                 })
                 .collect::<Vec<_>>();
             let key = match protocol {
@@ -141,6 +141,7 @@ pub fn extract_plans_for_pipeline(
             plans.push(ListenerGroupPlan {
                 key,
                 expected_members: members,
+                strict: pipeline.policies.load_balancing.strict,
             });
         }
     }
@@ -242,7 +243,7 @@ mod tests {
             role: ResolvedPipelineRole::Regular,
         };
 
-        let topo = CpuTopology::empty();
+        let topo = NumaTopology::empty();
         let cores = vec![0u32, 1];
         let plans = extract_plans_for_pipeline(&resolved, &cores, &topo);
         assert_eq!(plans.len(), 1, "expected one plan for the OTLP receiver");
@@ -252,7 +253,8 @@ mod tests {
         // `runtime_pipeline.rs` does, then compare keys.
         let manager = ListenerGroupManager::new();
         let addr = plan.key.addr;
-        let handle = ListenerGroupHandle::new(manager.clone(), "pg", "pipe", "otlp_receiver", 0);
+        let handle =
+            ListenerGroupHandle::new(manager.clone(), "pg", "pipe", "otlp_receiver", 0, false);
         assert_eq!(handle.tcp_key(addr), plan.key);
     }
 
@@ -297,7 +299,7 @@ mod tests {
             role: ResolvedPipelineRole::Regular,
         };
 
-        let topo = CpuTopology::empty();
+        let topo = NumaTopology::empty();
         let cores = vec![0u32, 1u32];
         let plans = extract_plans_for_pipeline(&resolved, &cores, &topo);
         assert_eq!(plans.len(), 1);
@@ -314,7 +316,14 @@ mod tests {
             let bar = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
                 let _ = bar.wait();
-                let h = ListenerGroupHandle::new(mgr.clone(), "pg", "pipe", "otlp_receiver", core);
+                let h = ListenerGroupHandle::new(
+                    mgr.clone(),
+                    "pg",
+                    "pipe",
+                    "otlp_receiver",
+                    core,
+                    false,
+                );
                 mgr.acquire(&h.tcp_key(addr), core, Duration::from_secs(2))
             }));
         }
@@ -363,7 +372,7 @@ mod tests {
             role: ResolvedPipelineRole::Regular,
         };
 
-        let topo = CpuTopology::empty();
+        let topo = NumaTopology::empty();
         let cores = vec![0u32, 1];
         let key_a = extract_plans_for_pipeline(&resolved_a, &cores, &topo)
             .into_iter()
@@ -379,5 +388,78 @@ mod tests {
         assert_ne!(key_a, key_b);
         assert_eq!(key_a.pipeline_id, "pipe-a");
         assert_eq!(key_b.pipeline_id, "pipe-b");
+    }
+
+    #[test]
+    fn extracted_plan_preserves_unknown_numa_nodes() {
+        use otap_df_config::engine::{ResolvedPipelineConfig, ResolvedPipelineRole};
+        use otap_df_config::pipeline::PipelineConfig;
+        use otap_df_config::policy::ResolvedPolicies;
+        use std::collections::BTreeMap;
+
+        let yaml = r#"
+            nodes:
+              receiver:
+                type: "urn:otel:receiver:otlp"
+                config:
+                  protocols:
+                    grpc:
+                      listening_addr: "127.0.0.1:18013"
+        "#;
+        let pipeline = PipelineConfig::from_yaml("pg".into(), "pipe".into(), yaml).unwrap();
+        let resolved = ResolvedPipelineConfig {
+            pipeline_group_id: "pg".into(),
+            pipeline_id: "pipe".into(),
+            pipeline,
+            policies: ResolvedPolicies::default(),
+            role: ResolvedPipelineRole::Regular,
+        };
+        let topology = NumaTopology::new(
+            BTreeMap::from([(0, 0)]),
+            crate::topology::TopologyCompleteness::Partial,
+        );
+
+        let plans = extract_plans_for_pipeline(&resolved, &[0, 99], &topology);
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].expected_members[0].numa_node, Some(0));
+        assert_eq!(plans[0].expected_members[1].numa_node, None);
+    }
+
+    #[test]
+    fn extracted_plan_carries_strict_policy() {
+        use otap_df_config::engine::{ResolvedPipelineConfig, ResolvedPipelineRole};
+        use otap_df_config::pipeline::PipelineConfig;
+        use otap_df_config::policy::{
+            LoadBalancingPolicy, LoadBalancingStrategy, ResolvedPolicies,
+        };
+
+        let yaml = r#"
+            nodes:
+              receiver:
+                type: "urn:otel:receiver:otlp"
+                config:
+                  protocols:
+                    grpc:
+                      listening_addr: "127.0.0.1:18014"
+        "#;
+        let pipeline = PipelineConfig::from_yaml("pg".into(), "pipe".into(), yaml).unwrap();
+        let mut policies = ResolvedPolicies::default();
+        policies.load_balancing = LoadBalancingPolicy {
+            strategy: LoadBalancingStrategy::EbpfNuma,
+            strict: true,
+        };
+        let resolved = ResolvedPipelineConfig {
+            pipeline_group_id: "pg".into(),
+            pipeline_id: "pipe".into(),
+            pipeline,
+            policies,
+            role: ResolvedPipelineRole::Regular,
+        };
+
+        let plans = extract_plans_for_pipeline(&resolved, &[0], &NumaTopology::empty());
+
+        assert_eq!(plans.len(), 1);
+        assert!(plans[0].strict);
     }
 }

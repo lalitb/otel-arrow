@@ -28,7 +28,7 @@
 pub mod extraction;
 pub mod metrics;
 
-use crate::topology::CpuTopology;
+use crate::topology::NumaTopology;
 use std::any::Any;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{SocketAddr, TcpListener, UdpSocket};
@@ -168,6 +168,27 @@ impl ListenerGroupKey {
     }
 }
 
+fn bind_identities_ambiguous(left: BindIdentity, right: BindIdentity) -> bool {
+    if left.protocol != right.protocol || left.addr.port() != right.addr.port() {
+        return false;
+    }
+    if left.addr == right.addr {
+        return true;
+    }
+    match (left.addr, right.addr) {
+        (SocketAddr::V4(left), SocketAddr::V4(right)) => {
+            left.ip().is_unspecified() || right.ip().is_unspecified()
+        }
+        (SocketAddr::V6(left), SocketAddr::V6(right)) => {
+            left.ip().is_unspecified() || right.ip().is_unspecified()
+        }
+        (SocketAddr::V4(left), SocketAddr::V6(right))
+        | (SocketAddr::V6(right), SocketAddr::V4(left)) => {
+            right.ip().is_unspecified() && left.ip().is_unspecified()
+        }
+    }
+}
+
 /// Effective kernel reuseport-group identity used by the current
 /// materialisation path.
 ///
@@ -188,8 +209,8 @@ pub struct ListenerGroupMember {
     pub listener_id: u32,
     /// CPU core that owns the receiver pipeline thread for this listener.
     pub core_id: u32,
-    /// NUMA node for `core_id`.
-    pub numa_node: u32,
+    /// NUMA node for `core_id`, if topology discovery knew it.
+    pub numa_node: Option<u32>,
 }
 
 /// A planned listener group declared by the controller.
@@ -203,6 +224,9 @@ pub struct ListenerGroupPlan {
     pub key: ListenerGroupKey,
     /// One entry per expected listener.
     pub expected_members: Vec<ListenerGroupMember>,
+    /// Whether setup failures for this group should fail startup instead of
+    /// falling back to independent binds.
+    pub strict: bool,
 }
 
 /// Errors returned by [`ListenerGroupManager::register_plan`].
@@ -364,7 +388,7 @@ pub struct AttachOutcome {
 /// `Err(io::Error)` aborts materialisation and surfaces as
 /// `MaterialisationFailed` on the first acquirer.
 pub type AttachHook = Arc<
-    dyn Fn(&ListenerGroupPlan, &[(u32, RawFd, u32, u32)]) -> std::io::Result<AttachOutcome>
+    dyn Fn(&ListenerGroupPlan, &[(u32, RawFd, u32, Option<u32>)]) -> std::io::Result<AttachOutcome>
         + Send
         + Sync,
 >;
@@ -497,7 +521,8 @@ impl ListenerGroupManager {
             .disabled_bind_identities
             .lock()
             .expect("listener-group disabled bind identity mutex")
-            .contains(&bind_identity)
+            .iter()
+            .any(|disabled| bind_identities_ambiguous(*disabled, bind_identity))
         {
             return Err(PlanError::DuplicateBindIdentity);
         }
@@ -508,7 +533,7 @@ impl ListenerGroupManager {
         }
         if let Some(existing_key) = state
             .keys()
-            .find(|key| key.bind_identity() == bind_identity)
+            .find(|key| bind_identities_ambiguous(key.bind_identity(), bind_identity))
             .cloned()
         {
             if let Some(existing_slot) = state.get(&existing_key) {
@@ -792,8 +817,8 @@ impl ListenerGroupManager {
 /// hook (empty [`AttachOutcome`]) and emits a one-shot warning so the controller
 /// can call this unconditionally without `cfg`-gating.
 ///
-/// `debug` controls libbpf verbosity; `strict` selects fail-startup
-/// vs. log-and-continue on attach error.
+/// `debug` controls libbpf verbosity. Strict fail-startup behavior is read
+/// from the per-group [`ListenerGroupPlan`].
 ///
 /// The eprintln calls are startup-only fallbacks: the engine has no
 /// in-process structured-log facility reachable from the listener-group
@@ -803,13 +828,13 @@ impl ListenerGroupManager {
 /// counters once metric reporter wiring lands.
 #[allow(clippy::print_stderr)]
 #[must_use]
-pub fn ebpf_attach_hook(debug: bool, strict: bool) -> AttachHook {
-    let _ = (debug, strict); // referenced inside cfg branch below
+pub fn ebpf_attach_hook(debug: bool) -> AttachHook {
+    let _ = debug; // referenced inside cfg branch below
     #[cfg(all(target_os = "linux", feature = "reuseport-ebpf"))]
     {
         use crate::reuseport_ebpf::libbpf::{ListenerFd, load_default_and_attach};
         Arc::new(
-            move |_plan: &ListenerGroupPlan, handles: &[(u32, RawFd, u32, u32)]| {
+            move |plan: &ListenerGroupPlan, handles: &[(u32, RawFd, u32, Option<u32>)]| {
                 let listeners: Vec<ListenerFd> = handles
                     .iter()
                     .map(|(listener_id, fd, core_id, numa_node)| ListenerFd {
@@ -840,7 +865,7 @@ pub fn ebpf_attach_hook(debug: bool, strict: bool) -> AttachHook {
                         })
                     }
                     Err(error) => {
-                        if strict {
+                        if plan.strict {
                             Err(std::io::Error::other(format!(
                                 "eBPF attach failed (strict): {error}"
                             )))
@@ -857,9 +882,14 @@ pub fn ebpf_attach_hook(debug: bool, strict: bool) -> AttachHook {
     }
     #[cfg(not(all(target_os = "linux", feature = "reuseport-ebpf")))]
     {
-        Arc::new(|_plan, _handles| {
+        Arc::new(|plan, _handles| {
+            if plan.strict {
+                return Err(std::io::Error::other(
+                    "eBPF attach failed (strict): reuseport-ebpf feature is not compiled in or target is not Linux",
+                ));
+            }
             eprintln!(
-                "listener_group: OTAP_DF_REUSEPORT_EBPF requested but reuseport-ebpf feature is not compiled in or target is not Linux; continuing with plain SO_REUSEPORT"
+                "listener_group: ebpf_numa requested but reuseport-ebpf feature is not compiled in or target is not Linux; continuing with plain SO_REUSEPORT"
             );
             Ok(AttachOutcome::default())
         })
@@ -873,15 +903,17 @@ pub fn ebpf_attach_hook(debug: bool, strict: bool) -> AttachHook {
 #[must_use]
 pub fn validate_against_topology(
     plan: &ListenerGroupPlan,
-    topology: &CpuTopology,
+    topology: &NumaTopology,
 ) -> (Vec<u32>, Vec<(u32, u32, u32)>) {
     let mut unknown = Vec::new();
     let mut mismatched = Vec::new();
     for member in &plan.expected_members {
         match topology.numa_node(member.core_id) {
             None => unknown.push(member.core_id),
-            Some(actual) if actual != member.numa_node => {
-                mismatched.push((member.core_id, member.numa_node, actual));
+            Some(actual) if Some(actual) != member.numa_node => {
+                if let Some(expected) = member.numa_node {
+                    mismatched.push((member.core_id, expected, actual));
+                }
             }
             _ => {}
         }
@@ -897,76 +929,6 @@ pub fn validate_against_topology(
 /// future acquirers.
 pub const QUORUM_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Pure predicate over an environment-variable-style value. Treats
-/// `Some("1")`, `Some("true")`, and `Some("TRUE")` as on; anything
-/// else (including `None`) as off. Exposed for test isolation:
-/// callers can exercise the predicate without mutating process env.
-#[must_use]
-pub fn env_flag_enabled(value: Option<&str>) -> bool {
-    matches!(value, Some("1") | Some("true") | Some("TRUE"))
-}
-
-/// Single user-facing switch for the experimental NUMA reuseport
-/// stack. When `OTAP_DF_REUSEPORT_EBPF=1`:
-///
-/// * coordinated listener-group planning + manager acquire is
-///   activated end-to-end, and
-/// * the eBPF NUMA selector attach hook is installed (Linux +
-///   `reuseport-ebpf` feature). On non-Linux / no-feature builds the
-///   hook is a logged no-op so coordinated plain `SO_REUSEPORT`
-///   continues to work.
-///
-/// Unset means the engine behaves identically to `main`: each
-/// receiver binds independently in `EffectHandler::tcp_listener` or
-/// `EffectHandler::udp_socket`.
-#[must_use]
-pub fn reuseport_ebpf_enabled() -> bool {
-    env_flag_enabled(std::env::var("OTAP_DF_REUSEPORT_EBPF").ok().as_deref())
-}
-
-/// When `OTAP_DF_REUSEPORT_EBPF_STRICT=1`, eBPF attach failures abort
-/// startup. Default behaviour is log-and-continue with coordinated
-/// plain `SO_REUSEPORT`. Has no effect unless
-/// [`reuseport_ebpf_enabled`] is also true.
-#[must_use]
-pub fn reuseport_ebpf_strict() -> bool {
-    env_flag_enabled(
-        std::env::var("OTAP_DF_REUSEPORT_EBPF_STRICT")
-            .ok()
-            .as_deref(),
-    )
-}
-
-/// Internal/debug-only switch to activate the coordinated listener
-/// manager *without* the eBPF attach hook. Production users should set
-/// [`reuseport_ebpf_enabled`] instead. This exists to let tests
-/// exercise the manager-only path on hosts where loading eBPF is not
-/// possible, and is compiled out of normal production builds.
-#[must_use]
-#[cfg(any(test, feature = "test-utils"))]
-pub fn manager_only_debug_enabled() -> bool {
-    env_flag_enabled(
-        std::env::var("OTAP_DF_REUSEPORT_MANAGER_ONLY")
-            .ok()
-            .as_deref(),
-    )
-}
-
-/// Production builds do not honor the internal manager-only switch.
-#[must_use]
-#[cfg(not(any(test, feature = "test-utils")))]
-pub fn manager_only_debug_enabled() -> bool {
-    false
-}
-
-/// Returns `true` when any path in the engine should consult the
-/// listener-group manager: the user-facing eBPF env switch is on, or a
-/// test build has enabled the manager-only debug switch.
-#[must_use]
-pub fn manager_active() -> bool {
-    cfg!(unix) && (reuseport_ebpf_enabled() || manager_only_debug_enabled())
-}
-
 /// Lightweight per-receiver handle into the controller's listener
 /// group manager. Carried in `EffectHandlerCore` so
 /// `tcp_listener(addr)` and `udp_socket(addr)` can build a full [`ListenerGroupKey`] and call
@@ -978,6 +940,7 @@ pub struct ListenerGroupHandle {
     pipeline_id: String,
     receiver_node_id: String,
     core_id: u32,
+    strict: bool,
 }
 
 impl ListenerGroupHandle {
@@ -990,6 +953,7 @@ impl ListenerGroupHandle {
         pipeline_id: impl Into<String>,
         receiver_node_id: impl Into<String>,
         core_id: u32,
+        strict: bool,
     ) -> Self {
         Self {
             manager,
@@ -997,6 +961,7 @@ impl ListenerGroupHandle {
             pipeline_id: pipeline_id.into(),
             receiver_node_id: receiver_node_id.into(),
             core_id,
+            strict,
         }
     }
 
@@ -1013,6 +978,7 @@ impl ListenerGroupHandle {
         pipeline_id: impl Into<String>,
         node_id: &N,
         core_id: u32,
+        strict: bool,
     ) -> Self
     where
         P: Into<String>,
@@ -1024,6 +990,7 @@ impl ListenerGroupHandle {
             pipeline_id,
             node_id.to_string(),
             core_id,
+            strict,
         )
     }
 
@@ -1062,6 +1029,12 @@ impl ListenerGroupHandle {
     #[must_use]
     pub fn core_id(&self) -> u32 {
         self.core_id
+    }
+
+    /// Whether failures for this receiver's coordinated group should fail startup.
+    #[must_use]
+    pub fn strict(&self) -> bool {
+        self.strict
     }
 }
 
@@ -1105,7 +1078,7 @@ fn invoke_attach_hook(
     };
     let mut members = plan.expected_members.clone();
     members.sort_by_key(|m| m.listener_id);
-    let mut handles: Vec<(u32, RawFd, u32, u32)> = Vec::with_capacity(members.len());
+    let mut handles: Vec<(u32, RawFd, u32, Option<u32>)> = Vec::with_capacity(members.len());
     for m in &members {
         if let Some(socket) = sockets.get(&m.core_id) {
             let fd = match socket {
@@ -1186,9 +1159,10 @@ mod tests {
                 .map(|(listener_id, core_id, numa_node)| ListenerGroupMember {
                     listener_id: *listener_id,
                     core_id: *core_id,
-                    numa_node: *numa_node,
+                    numa_node: Some(*numa_node),
                 })
                 .collect(),
+            strict: false,
         }
     }
 
@@ -1291,6 +1265,56 @@ mod tests {
         let third = plan_with_pipeline_ids("pg-a", "pipe-other", "recv-other", addr, &[(0, 2, 0)]);
         assert_eq!(
             mgr.register_plan(third),
+            Err(PlanError::DuplicateBindIdentity)
+        );
+        assert_eq!(mgr.plan_count(), 0);
+    }
+
+    #[test]
+    fn wildcard_and_specific_ipv4_bind_identity_is_ambiguous() {
+        let mgr = ListenerGroupManager::new();
+        let wildcard: SocketAddr = "0.0.0.0:18080".parse().unwrap();
+        let specific: SocketAddr = "127.0.0.1:18080".parse().unwrap();
+        let first = plan_with_ids("pg-a", "recv", wildcard, &[(0, 0, 0)]);
+        let first_key = first.key.clone();
+        mgr.register_plan(first).unwrap();
+
+        assert_eq!(
+            mgr.register_plan(plan_with_ids("pg-b", "recv", specific, &[(0, 1, 0)])),
+            Err(PlanError::DuplicateBindIdentity)
+        );
+        assert_eq!(mgr.plan_count(), 0);
+        assert!(matches!(
+            mgr.acquire(&first_key, 0, Duration::from_millis(1)),
+            AcquireOutcome::NoPlan
+        ));
+    }
+
+    #[test]
+    fn wildcard_and_specific_ipv6_bind_identity_is_ambiguous() {
+        let mgr = ListenerGroupManager::new();
+        let wildcard: SocketAddr = "[::]:18081".parse().unwrap();
+        let specific: SocketAddr = "[::1]:18081".parse().unwrap();
+        mgr.register_plan(plan_with_ids("pg-a", "recv", wildcard, &[(0, 0, 0)]))
+            .unwrap();
+
+        assert_eq!(
+            mgr.register_plan(plan_with_ids("pg-b", "recv", specific, &[(0, 1, 0)])),
+            Err(PlanError::DuplicateBindIdentity)
+        );
+        assert_eq!(mgr.plan_count(), 0);
+    }
+
+    #[test]
+    fn dual_stack_wildcards_on_same_port_are_ambiguous() {
+        let mgr = ListenerGroupManager::new();
+        let wildcard_v4: SocketAddr = "0.0.0.0:18082".parse().unwrap();
+        let wildcard_v6: SocketAddr = "[::]:18082".parse().unwrap();
+        mgr.register_plan(plan_with_ids("pg-a", "recv", wildcard_v4, &[(0, 0, 0)]))
+            .unwrap();
+
+        assert_eq!(
+            mgr.register_plan(plan_with_ids("pg-b", "recv", wildcard_v6, &[(0, 1, 0)])),
             Err(PlanError::DuplicateBindIdentity)
         );
         assert_eq!(mgr.plan_count(), 0);
@@ -1610,7 +1634,7 @@ mod tests {
     #[test]
     fn validate_against_topology_flags_unknown_and_mismatched() {
         let topo =
-            CpuTopology::from_node_cpulists(&[(0, "0-1".to_string()), (1, "2-3".to_string())]);
+            NumaTopology::from_node_cpulists(&[(0, "0-1".to_string()), (1, "2-3".to_string())]);
         let plan = loopback_plan(
             ephemeral_addr(),
             &[
@@ -1732,28 +1756,6 @@ mod tests {
     }
 
     #[test]
-    fn env_flag_predicate_parses_known_values() {
-        // Pure helper; no process-env mutation, parallel-safe.
-        assert!(env_flag_enabled(Some("1")));
-        assert!(env_flag_enabled(Some("true")));
-        assert!(env_flag_enabled(Some("TRUE")));
-        assert!(!env_flag_enabled(Some("0")));
-        assert!(!env_flag_enabled(Some("yes")));
-        assert!(!env_flag_enabled(Some("")));
-        assert!(!env_flag_enabled(None));
-    }
-
-    #[test]
-    fn env_switches_default_off() {
-        // Just exercise the helpers; env contents are out of our
-        // control in the test runner.
-        let _ = reuseport_ebpf_enabled();
-        let _ = reuseport_ebpf_strict();
-        let _ = manager_only_debug_enabled();
-        let _ = manager_active();
-    }
-
-    #[test]
     fn tcp_for_receiver_matches_handle_tcp_key() {
         // H2 regression: extraction-side and runtime-side helpers
         // must produce the *exact* same key for the same logical
@@ -1764,7 +1766,7 @@ mod tests {
             ListenerGroupKey::tcp_for_receiver("pg", "pipe", "otlp_receiver", addr);
         let manager = ListenerGroupManager::new();
         let from_runtime =
-            ListenerGroupHandle::for_receiver(manager, "pg", "pipe", "otlp_receiver", 0)
+            ListenerGroupHandle::for_receiver(manager, "pg", "pipe", "otlp_receiver", 0, false)
                 .tcp_key(addr);
         assert_eq!(from_extraction, from_runtime);
     }

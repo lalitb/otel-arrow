@@ -46,8 +46,8 @@ pub struct ListenerSocket {
     pub listener_id: u32,
     /// CPU core that owns the listener's pipeline thread.
     pub core_id: u32,
-    /// NUMA node for `core_id`.
-    pub numa_node: u32,
+    /// NUMA node for `core_id`, if topology discovery knew it.
+    pub numa_node: Option<u32>,
 }
 
 /// Compact BPF map placement for one listener.
@@ -59,8 +59,8 @@ pub struct SocketPlacement {
     pub listener_id: u32,
     /// CPU core that owns the listener's pipeline thread.
     pub core_id: u32,
-    /// NUMA node for `core_id`.
-    pub numa_node: u32,
+    /// NUMA node for `core_id`, if topology discovery knew it.
+    pub numa_node: Option<u32>,
 }
 
 /// Inclusive start and length of socket-array entries for one NUMA node.
@@ -103,19 +103,19 @@ pub fn build_numa_layout(
 
     let mut by_numa: Vec<(u32, Vec<ListenerSocket>)> = Vec::new();
     for socket in sockets {
-        if socket.numa_node as usize >= MAX_NUMA_NODES {
+        let Some(numa_node) = socket.numa_node else {
+            continue;
+        };
+        if numa_node as usize >= MAX_NUMA_NODES {
             return Err(NumaLayoutError::NumaNodeOutOfRange {
-                numa_node: socket.numa_node,
+                numa_node,
                 max: MAX_NUMA_NODES,
             });
         }
 
-        match by_numa
-            .iter_mut()
-            .find(|(numa_node, _)| *numa_node == socket.numa_node)
-        {
+        match by_numa.iter_mut().find(|(node, _)| *node == numa_node) {
             Some((_, entries)) => entries.push(*socket),
-            None => by_numa.push((socket.numa_node, vec![*socket])),
+            None => by_numa.push((numa_node, vec![*socket])),
         }
     }
     by_numa.sort_by_key(|(numa_node, _)| *numa_node);
@@ -136,6 +136,16 @@ pub fn build_numa_layout(
                 numa_node: socket.numa_node,
             });
         }
+    }
+
+    for socket in sockets.iter().filter(|socket| socket.numa_node.is_none()) {
+        let map_index = u32::try_from(placements.len()).expect("socket count fits in u32");
+        placements.push(SocketPlacement {
+            map_index,
+            listener_id: socket.listener_id,
+            core_id: socket.core_id,
+            numa_node: None,
+        });
     }
 
     Ok(NumaReuseportLayout { placements, ranges })
@@ -204,7 +214,7 @@ pub mod libbpf {
         /// CPU core that owns the listener's pipeline thread.
         pub core_id: u32,
         /// NUMA node for `core_id`.
-        pub numa_node: u32,
+        pub numa_node: Option<u32>,
     }
 
     /// Loaded and attached reuseport eBPF selector.
@@ -552,17 +562,17 @@ mod tests {
             ListenerSocket {
                 listener_id: 0,
                 core_id: 8,
-                numa_node: 1,
+                numa_node: Some(1),
             },
             ListenerSocket {
                 listener_id: 1,
                 core_id: 0,
-                numa_node: 0,
+                numa_node: Some(0),
             },
             ListenerSocket {
                 listener_id: 2,
                 core_id: 9,
-                numa_node: 1,
+                numa_node: Some(1),
             },
         ])
         .expect("layout");
@@ -574,19 +584,19 @@ mod tests {
                     map_index: 0,
                     listener_id: 1,
                     core_id: 0,
-                    numa_node: 0,
+                    numa_node: Some(0),
                 },
                 SocketPlacement {
                     map_index: 1,
                     listener_id: 0,
                     core_id: 8,
-                    numa_node: 1,
+                    numa_node: Some(1),
                 },
                 SocketPlacement {
                     map_index: 2,
                     listener_id: 2,
                     core_id: 9,
-                    numa_node: 1,
+                    numa_node: Some(1),
                 },
             ]
         );
@@ -599,7 +609,7 @@ mod tests {
         let err = build_numa_layout(&[ListenerSocket {
             listener_id: 0,
             core_id: 0,
-            numa_node: MAX_NUMA_NODES as u32,
+            numa_node: Some(MAX_NUMA_NODES as u32),
         }])
         .expect_err("out of range NUMA node should fail");
 
@@ -609,6 +619,42 @@ mod tests {
                 numa_node: MAX_NUMA_NODES as u32,
                 max: MAX_NUMA_NODES,
             }
+        );
+    }
+
+    #[test]
+    fn build_layout_keeps_unknown_numa_out_of_local_ranges() {
+        let layout = build_numa_layout(&[
+            ListenerSocket {
+                listener_id: 0,
+                core_id: 0,
+                numa_node: Some(0),
+            },
+            ListenerSocket {
+                listener_id: 1,
+                core_id: 99,
+                numa_node: None,
+            },
+        ])
+        .expect("layout");
+
+        assert_eq!(layout.ranges[0], NumaRange { start: 0, len: 1 });
+        assert_eq!(
+            layout.placements,
+            vec![
+                SocketPlacement {
+                    map_index: 0,
+                    listener_id: 0,
+                    core_id: 0,
+                    numa_node: Some(0),
+                },
+                SocketPlacement {
+                    map_index: 1,
+                    listener_id: 1,
+                    core_id: 99,
+                    numa_node: None,
+                },
+            ]
         );
     }
 }

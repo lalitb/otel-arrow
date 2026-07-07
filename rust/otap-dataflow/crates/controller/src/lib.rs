@@ -50,11 +50,11 @@ use otap_df_config::engine::{
     SYSTEM_OBSERVABILITY_PIPELINE_ID, SYSTEM_PIPELINE_GROUP_ID,
 };
 use otap_df_config::node::{NodeKind, NodeUserConfig};
-use otap_df_config::policy::LoadBalancingPolicy;
 use otap_df_config::policy::MemoryLimiterMode;
 use otap_df_config::policy::{
     ChannelCapacityPolicy, CoreAllocation, CoreAllocationStrategy, TelemetryPolicy,
 };
+use otap_df_config::policy::{LoadBalancingPolicy, LoadBalancingStrategy};
 use otap_df_config::topic::{
     TopicAckPropagationMode, TopicBackendKind, TopicBroadcastOnLagPolicy, TopicImplSelectionPolicy,
     TopicSpec,
@@ -1231,19 +1231,16 @@ impl<
         let controller_ctx = ControllerContext::new(telemetry_system.registry());
 
         // Phase 3: install the optional eBPF NUMA-reuseport selector
-        // hook on the listener-group manager when the operator has
-        // set `OTAP_DF_REUSEPORT_EBPF=1`. The engine's
-        // `ebpf_attach_hook` returns a no-op on non-Linux or when the
-        // `reuseport-ebpf` feature is not compiled in, so the controller
-        // can call this unconditionally. The hook fires exactly once
-        // per listener group, after materialisation, and before any
-        // acquirer receives its listener.
-        if otap_df_engine::listener_group::reuseport_ebpf_enabled() {
-            let strict = otap_df_engine::listener_group::reuseport_ebpf_strict();
-            controller_ctx.listener_group_manager().set_attach_hook(
-                otap_df_engine::listener_group::ebpf_attach_hook(false, strict),
-            );
-            otel_info!("listener_group.ebpf_hook.installed", strict = strict,);
+        // hook once when at least one resolved pipeline requests
+        // `load_balancing.strategy: ebpf_numa`. Strictness is carried
+        // per ListenerGroupPlan so mixed policy scopes behave correctly.
+        if pipelines.iter().any(|pipeline| {
+            pipeline.policies.load_balancing.strategy == LoadBalancingStrategy::EbpfNuma
+        }) {
+            controller_ctx
+                .listener_group_manager()
+                .set_attach_hook(otap_df_engine::listener_group::ebpf_attach_hook(false));
+            otel_info!("listener_group.ebpf_hook.installed");
         }
 
         let memory_pressure_state = controller_ctx.memory_pressure_state();
@@ -1529,23 +1526,17 @@ impl<
                 core_allocation = core_allocation
             );
 
-            // Phase 2.5: when coordinated reuseport is enabled via
-            // `OTAP_DF_REUSEPORT_EBPF=1`, register one
-            // `ListenerGroupPlan` per recognised receiver
-            // (`urn:otel:receiver:{otlp,otap,syslog_cef}`) in this
-            // pipeline before launching its threads. With no plans
-            // registered the manager stays inert and the receiver
-            // path falls back to today's independent bind.
-            // Plan registration (and the runtime acquire) activate
-            // when `OTAP_DF_REUSEPORT_EBPF=1` is set. Test builds can
-            // additionally exercise the manager-only path without the
-            // eBPF hook.
+            // When the resolved pipeline policy selects `ebpf_numa`,
+            // register one `ListenerGroupPlan` per recognised receiver
+            // in this pipeline before launching its threads. With
+            // `kernel`, no plans are registered and receivers keep the
+            // existing independent bind path.
             let plan_cores: Vec<u32> = pipeline_placement
                 .cores
                 .iter()
                 .filter_map(|placement| u32::try_from(placement.core_id.id).ok())
                 .collect();
-            if otap_df_engine::listener_group::manager_active() {
+            if pipeline_placement.load_balancing.strategy == LoadBalancingStrategy::EbpfNuma {
                 let plans = otap_df_engine::listener_group::extraction::extract_plans_for_pipeline(
                     pipeline_entry,
                     &plan_cores,
@@ -2403,9 +2394,9 @@ connections:
         assert!(placement.load_balancing.strict);
         assert_eq!(placement.core_count(), 2);
         assert_eq!(placement.cores[0].core_id.id, 0);
-        assert_eq!(placement.cores[0].numa_node, 0);
+        assert_eq!(placement.cores[0].numa_node, Some(0));
         assert_eq!(placement.cores[1].core_id.id, 1);
-        assert_eq!(placement.cores[1].numa_node, 0);
+        assert_eq!(placement.cores[1].numa_node, Some(0));
     }
 
     #[test]
