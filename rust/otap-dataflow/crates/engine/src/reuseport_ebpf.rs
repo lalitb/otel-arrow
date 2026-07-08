@@ -201,7 +201,7 @@ pub mod libbpf {
     };
     use std::collections::HashSet;
     use std::error::Error;
-    use std::os::fd::{AsRawFd, RawFd};
+    use std::os::fd::{AsFd, AsRawFd, RawFd};
     use std::path::Path;
     use std::sync::Arc;
 
