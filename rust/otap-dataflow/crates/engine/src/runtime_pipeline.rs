@@ -481,10 +481,9 @@ impl<PData: 'static + Debug + Clone + ReceivedAtNode + Unwindable + FlowMetricHo
             let final_metrics_reporter = metrics_reporter.clone();
             // Build the optional listener-group handle for this
             // (pipeline_group, pipeline, receiver_node, core) instance. When
-            // coordinated reuseport is disabled, or no plan covers the
-            // receiver, the handle is harmless: the manager returns
-            // `NoPlan` and the EffectHandler falls back to its
-            // existing per-receiver bind path. Built via
+            // coordinated reuseport is disabled, no handle is built.
+            // A receiver with an `ebpf_numa` handle but no matching
+            // plan is treated as a planning/runtime identity bug. Built via
             // `ListenerGroupHandle::for_receiver` so the runtime key
             // shares the same stringification as
             // `ListenerGroupKey::tcp_for_receiver` (controller side).

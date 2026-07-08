@@ -1516,6 +1516,8 @@ impl<
                     controller_ctx.telemetry_registry(),
                     metrics_reporter.clone(),
                 );
+            let mut ebpf_plans = Vec::new();
+            let mut unmanaged_keys = Vec::new();
             for (pipeline_entry, pipeline_placement) in
                 pipelines.iter().zip(placement_snapshot.pipelines.iter())
             {
@@ -1525,103 +1527,100 @@ impl<
                     .filter_map(|placement| u32::try_from(placement.core_id.id).ok())
                     .collect();
                 if pipeline_placement.load_balancing.strategy == LoadBalancingStrategy::EbpfNuma {
-                    let plans =
+                    ebpf_plans.extend(
                         otap_df_engine::listener_group::extraction::extract_plans_for_pipeline(
                             pipeline_entry,
                             &plan_cores,
                             controller_ctx.topology(),
-                        );
-                    for plan in plans {
-                        let key = plan.key.clone();
-                        let bind_addr = key.addr.to_string();
-                        if let Err(error) =
-                            controller_ctx.listener_group_manager().register_plan(plan)
-                        {
-                            let error = error.to_string();
-                            otel_warn!(
-                                "listener_group.plan.register_failed",
-                                pipeline_group_id = key.pipeline_group_id.as_str(),
-                                pipeline_id = key.pipeline_id.as_str(),
-                                receiver_node_id = key.receiver_node_id.as_str(),
-                                bind_addr = bind_addr.as_str(),
-                                error = error.as_str(),
-                            );
-                        } else {
-                            listener_group_metrics.record(
-                                &key,
-                                otap_df_engine::listener_group::metrics::ListenerGroupMetricEvent::PlanRegistered,
-                            );
-                            otel_info!(
-                                "listener_group.plan.registered",
-                                pipeline_group_id = key.pipeline_group_id.as_str(),
-                                pipeline_id = key.pipeline_id.as_str(),
-                                receiver_node_id = key.receiver_node_id.as_str(),
-                                bind_addr = bind_addr.as_str(),
-                                members = plan_cores.len() as i64,
-                            );
-                        }
-                    }
+                        ),
+                    );
                 } else {
-                    for key in otap_df_engine::listener_group::extraction::extract_listener_keys_for_pipeline(pipeline_entry) {
-                        let bind_addr = key.addr.to_string();
-                        if let Err(error) = controller_ctx.listener_group_manager().block_bind_identity(&key) {
-                            let error = error.to_string();
-                            otel_warn!(
-                                "listener_group.plan.blocked_by_unmanaged_bind",
-                                pipeline_group_id = key.pipeline_group_id.as_str(),
-                                pipeline_id = key.pipeline_id.as_str(),
-                                receiver_node_id = key.receiver_node_id.as_str(),
-                                bind_addr = bind_addr.as_str(),
-                                error = error.as_str(),
-                            );
-                        }
-                    }
+                    unmanaged_keys.extend(
+                        otap_df_engine::listener_group::extraction::extract_listener_keys_for_pipeline(
+                            pipeline_entry,
+                        ),
+                    );
                 }
             }
-            let materialisation_report = controller_ctx
-                .listener_group_manager()
-                .materialise_registered_plans()
-                .map_err(|source| Error::PipelineRuntimeError {
-                    source: Box::new(source),
-                })?;
-            for key in &materialisation_report.ready {
-                listener_group_metrics.record(
-                    key,
-                    otap_df_engine::listener_group::metrics::ListenerGroupMetricEvent::GroupReady,
-                );
+
+            for (idx, plan) in ebpf_plans.iter().enumerate() {
+                if unmanaged_keys
+                    .iter()
+                    .any(|key| plan.key.conflicts_effective_bind_identity(key))
+                    && plan.strict
+                {
+                    return Err(Error::PipelineRuntimeError {
+                        source: Box::new(std::io::Error::other(format!(
+                            "strict ebpf_numa listener group {} conflicts with an unmanaged listener bind identity",
+                            plan.key.addr
+                        ))),
+                    });
+                }
+                if ebpf_plans.iter().skip(idx + 1).any(|other| {
+                    plan.key.conflicts_effective_bind_identity(&other.key)
+                        && (plan.strict || other.strict)
+                }) {
+                    return Err(Error::PipelineRuntimeError {
+                        source: Box::new(std::io::Error::other(format!(
+                            "strict ebpf_numa listener group {} conflicts with another listener group bind identity",
+                            plan.key.addr
+                        ))),
+                    });
+                }
             }
-            for key in &materialisation_report.selector_attached {
-                listener_group_metrics.record(
-                    key,
-                    otap_df_engine::listener_group::metrics::ListenerGroupMetricEvent::SelectorAttached,
-                );
-            }
-            for key in &materialisation_report.selector_fallback {
-                listener_group_metrics.record(
-                    key,
-                    otap_df_engine::listener_group::metrics::ListenerGroupMetricEvent::SelectorFallback,
-                );
+
+            for key in unmanaged_keys {
                 let bind_addr = key.addr.to_string();
-                otel_warn!(
-                    "listener_group.selector.fallback",
-                    pipeline_group_id = key.pipeline_group_id.as_str(),
-                    pipeline_id = key.pipeline_id.as_str(),
-                    receiver_node_id = key.receiver_node_id.as_str(),
-                    bind_addr = bind_addr.as_str(),
-                    protocol = key.protocol.as_str(),
-                );
+                if let Err(error) = controller_ctx
+                    .listener_group_manager()
+                    .block_bind_identity(&key)
+                {
+                    let error = error.to_string();
+                    otel_warn!(
+                        "listener_group.plan.blocked_by_unmanaged_bind",
+                        pipeline_group_id = key.pipeline_group_id.as_str(),
+                        pipeline_id = key.pipeline_id.as_str(),
+                        receiver_node_id = key.receiver_node_id.as_str(),
+                        bind_addr = bind_addr.as_str(),
+                        error = error.as_str(),
+                    );
+                }
             }
-            for key in &materialisation_report.materialisation_failed {
-                listener_group_metrics.record(
-                    key,
-                    otap_df_engine::listener_group::metrics::ListenerGroupMetricEvent::MaterialisationFailed,
-                );
-            }
-            for key in &materialisation_report.fallback {
-                listener_group_metrics.record(
-                    key,
-                    otap_df_engine::listener_group::metrics::ListenerGroupMetricEvent::Fallback,
-                );
+
+            for plan in ebpf_plans {
+                let key = plan.key.clone();
+                let bind_addr = key.addr.to_string();
+                let strict = plan.strict;
+                if let Err(error) = controller_ctx.listener_group_manager().register_plan(plan) {
+                    let error = error.to_string();
+                    otel_warn!(
+                        "listener_group.plan.register_failed",
+                        pipeline_group_id = key.pipeline_group_id.as_str(),
+                        pipeline_id = key.pipeline_id.as_str(),
+                        receiver_node_id = key.receiver_node_id.as_str(),
+                        bind_addr = bind_addr.as_str(),
+                        error = error.as_str(),
+                    );
+                    if strict {
+                        return Err(Error::PipelineRuntimeError {
+                            source: Box::new(std::io::Error::other(format!(
+                                "strict ebpf_numa listener group registration failed for {bind_addr}: {error}"
+                            ))),
+                        });
+                    }
+                } else {
+                    listener_group_metrics.record(
+                        &key,
+                        otap_df_engine::listener_group::metrics::ListenerGroupMetricEvent::PlanRegistered,
+                    );
+                    otel_info!(
+                        "listener_group.plan.registered",
+                        pipeline_group_id = key.pipeline_group_id.as_str(),
+                        pipeline_id = key.pipeline_id.as_str(),
+                        receiver_node_id = key.receiver_node_id.as_str(),
+                        bind_addr = bind_addr.as_str(),
+                    );
+                }
             }
         }
 

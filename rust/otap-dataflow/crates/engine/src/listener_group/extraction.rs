@@ -105,11 +105,12 @@ pub fn extract_listener_keys_for_pipeline(
         // in the key MUST match what `runtime_pipeline.rs` builds when
         // constructing the per-receiver `ListenerGroupHandle` (plain
         // `node_id.name.to_string()`) -- otherwise the runtime's
-        // `acquire(...)` returns `NoPlan` and silently falls through
-        // to the independent bind path. The bind address is already
-        // part of `ListenerGroupKey`, so it does not need to appear
-        // in the receiver_node_id; multiple addresses on the same
-        // receiver simply produce multiple keyed plans.
+        // `acquire(...)` returns `NoPlan` and the effect-handler seam
+        // fails startup instead of silently rebinding. The bind
+        // address is already part of `ListenerGroupKey`, so it does
+        // not need to appear in the receiver_node_id; multiple
+        // addresses on the same receiver simply produce multiple
+        // keyed plans.
         for (protocol, addr) in extract_listener_addresses(&node_cfg.config) {
             let key = match protocol {
                 ListenerProtocol::Tcp => ListenerGroupKey::tcp_for_receiver(

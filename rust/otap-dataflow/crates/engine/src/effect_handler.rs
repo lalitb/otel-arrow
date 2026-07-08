@@ -192,8 +192,10 @@ impl<PData> EffectHandlerCore<PData> {
     /// selected `ebpf_numa`, this method consults
     /// [`crate::listener_group::ListenerGroupManager`] to obtain a
     /// listener that is part of a pre-materialised reuseport group.
-    /// On `NoPlan`, `FallbackToIndependent`, or when coordination is
-    /// disabled, the existing per-receiver bind path is used.
+    /// On `FallbackToIndependent`, or when coordination is disabled,
+    /// the existing per-receiver bind path is used. `NoPlan` is an
+    /// error when the controller selected `ebpf_numa`, because it
+    /// means planning and runtime receiver identity drifted.
     ///
     /// # Errors
     ///
@@ -272,7 +274,16 @@ impl<PData> EffectHandlerCore<PData> {
                         ),
                     )));
                 }
-                AcquireOutcome::NoPlan | AcquireOutcome::FallbackToIndependent => {
+                AcquireOutcome::NoPlan => {
+                    return Err(into_engine_error(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!(
+                            "no coordinated reuseport plan was registered for TCP listener {addr} on core {}; ebpf_numa must not silently fall back to an independent bind",
+                            handle.core_id()
+                        ),
+                    )));
+                }
+                AcquireOutcome::FallbackToIndependent => {
                     // Fall through to the independent-bind path
                     // below.
                 }
@@ -377,7 +388,16 @@ impl<PData> EffectHandlerCore<PData> {
                         "coordinated reuseport manager returned a TCP listener for UDP socket {addr}"
                     ))));
                 }
-                AcquireOutcome::NoPlan | AcquireOutcome::FallbackToIndependent => {
+                AcquireOutcome::NoPlan => {
+                    return Err(into_engine_error(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!(
+                            "no coordinated reuseport plan was registered for UDP socket {addr} on core {}; ebpf_numa must not silently fall back to an independent bind",
+                            handle.core_id()
+                        ),
+                    )));
+                }
+                AcquireOutcome::FallbackToIndependent => {
                     // Fall through to the independent-bind path below.
                 }
             }

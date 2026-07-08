@@ -168,6 +168,13 @@ impl ListenerGroupKey {
             protocol: self.protocol,
         }
     }
+
+    /// Returns true when two logical listener-group keys target the
+    /// same effective kernel reuseport bind identity.
+    #[must_use]
+    pub fn conflicts_effective_bind_identity(&self, other: &Self) -> bool {
+        bind_identities_ambiguous(self.bind_identity(), other.bind_identity())
+    }
 }
 
 fn bind_identities_ambiguous(left: BindIdentity, right: BindIdentity) -> bool {
@@ -400,23 +407,33 @@ pub struct AttachOutcome {
     pub selector_attached: bool,
 }
 
+/// File descriptor and placement metadata passed to an attach hook.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ListenerGroupFd {
+    /// Stable per-listener identifier within the controller plan.
+    pub listener_id: u32,
+    /// Raw socket file descriptor.
+    pub raw_fd: RawFd,
+    /// CPU core that owns the receiver pipeline thread for this listener.
+    pub core_id: u32,
+    /// NUMA node for `core_id`, if topology discovery knew it.
+    pub numa_node: Option<u32>,
+}
+
 /// Optional attach hook invoked by the manager after the listeners
 /// for a group have been materialised, but before any acquirer
 /// receives its listener. Used by Phase 3 to call
 /// `reuseport_ebpf::libbpf::load_default_and_attach(...)` exactly
 /// once per group.
 ///
-/// The hook receives the plan and a slice of
-/// `(listener_id, raw_fd, core_id, numa_node)` tuples **sorted by
+/// The hook receives the plan and a slice of descriptors **sorted by
 /// `listener_id`** so the eBPF map population is deterministic.
 /// Returning an [`AttachOutcome`] stores any group keepalive in the
 /// group state and hands per-core cleanup guards to acquirers. Returning
 /// `Err(io::Error)` aborts materialisation and surfaces as
 /// `MaterialisationFailed` on the first acquirer.
 pub type AttachHook = Arc<
-    dyn Fn(&ListenerGroupPlan, &[(u32, RawFd, u32, Option<u32>)]) -> std::io::Result<AttachOutcome>
-        + Send
-        + Sync,
+    dyn Fn(&ListenerGroupPlan, &[ListenerGroupFd]) -> std::io::Result<AttachOutcome> + Send + Sync,
 >;
 
 /// Coordinated listener-group manager.
@@ -743,6 +760,16 @@ impl ListenerGroupManager {
         }
     }
 
+    fn bind_identity_disabled(&self, key: &ListenerGroupKey) -> bool {
+        let bind_identity = key.bind_identity();
+        match self.inner.disabled_bind_identities.lock() {
+            Ok(disabled) => disabled
+                .iter()
+                .any(|disabled| bind_identities_ambiguous(*disabled, bind_identity)),
+            Err(_) => false,
+        }
+    }
+
     /// Acquires the listener pre-allocated for `(key, core_id)`.
     ///
     /// Behaviour:
@@ -767,7 +794,13 @@ impl ListenerGroupManager {
         let (cv, expected_count) = {
             let state = self.inner.state.lock().expect("listener-group state mutex");
             match state.get(key) {
-                None => return AcquireOutcome::NoPlan,
+                None => {
+                    drop(state);
+                    if self.bind_identity_disabled(key) {
+                        return AcquireOutcome::FallbackToIndependent;
+                    }
+                    return AcquireOutcome::NoPlan;
+                }
                 Some(slot) => {
                     if !slot
                         .plan
@@ -978,14 +1011,14 @@ pub fn ebpf_attach_hook(debug: bool) -> AttachHook {
     {
         use crate::reuseport_ebpf::libbpf::{ListenerFd, load_default_and_attach};
         Arc::new(
-            move |plan: &ListenerGroupPlan, handles: &[(u32, RawFd, u32, Option<u32>)]| {
+            move |plan: &ListenerGroupPlan, handles: &[ListenerGroupFd]| {
                 let listeners: Vec<ListenerFd> = handles
                     .iter()
-                    .map(|(listener_id, fd, core_id, numa_node)| ListenerFd {
-                        fd: *fd,
-                        listener_id: *listener_id,
-                        core_id: *core_id,
-                        numa_node: *numa_node,
+                    .map(|handle| ListenerFd {
+                        fd: handle.raw_fd,
+                        listener_id: handle.listener_id,
+                        core_id: handle.core_id,
+                        numa_node: handle.numa_node,
                     })
                     .collect();
                 match load_default_and_attach(&listeners, debug) {
@@ -1229,14 +1262,19 @@ fn invoke_attach_hook(
         use std::os::fd::AsRawFd;
         let mut members = plan.expected_members.clone();
         members.sort_by_key(|m| m.listener_id);
-        let mut handles: Vec<(u32, RawFd, u32, Option<u32>)> = Vec::with_capacity(members.len());
+        let mut handles: Vec<ListenerGroupFd> = Vec::with_capacity(members.len());
         for m in &members {
             if let Some(socket) = sockets.get(&m.core_id) {
                 let fd = match socket {
                     GroupSocket::Tcp(listener) => listener.as_raw_fd(),
                     GroupSocket::Udp(socket) => socket.as_raw_fd(),
                 };
-                handles.push((m.listener_id, fd, m.core_id, m.numa_node));
+                handles.push(ListenerGroupFd {
+                    listener_id: m.listener_id,
+                    raw_fd: fd,
+                    core_id: m.core_id,
+                    numa_node: m.numa_node,
+                });
             }
         }
         hook(plan, &handles)
@@ -1411,7 +1449,7 @@ mod tests {
         assert_eq!(mgr.plan_count(), 0);
         assert!(matches!(
             mgr.acquire(&first_key, 0, Duration::from_millis(1)),
-            AcquireOutcome::NoPlan
+            AcquireOutcome::FallbackToIndependent
         ));
 
         let third = plan_with_pipeline_ids("pg-a", "pipe-other", "recv-other", addr, &[(0, 2, 0)]);
@@ -1453,7 +1491,7 @@ mod tests {
         assert_eq!(mgr.plan_count(), 0);
         assert!(matches!(
             mgr.acquire(&planned_key, 0, Duration::from_millis(1)),
-            AcquireOutcome::NoPlan
+            AcquireOutcome::FallbackToIndependent
         ));
     }
 
@@ -1473,7 +1511,7 @@ mod tests {
         assert_eq!(mgr.plan_count(), 0);
         assert!(matches!(
             mgr.acquire(&first_key, 0, Duration::from_millis(1)),
-            AcquireOutcome::NoPlan
+            AcquireOutcome::FallbackToIndependent
         ));
     }
 
@@ -1964,9 +2002,9 @@ mod tests {
         mgr.set_attach_hook(Arc::new(move |_plan, handles| {
             attach_called_clone.store(true, AOrdering::Relaxed);
             let mut sink = observed_clone.lock().unwrap();
-            for (lid, fd, _core, _numa) in handles {
-                assert!(*fd >= 0, "expected positive fd");
-                sink.push(*lid);
+            for handle in handles {
+                assert!(handle.raw_fd >= 0, "expected positive fd");
+                sink.push(handle.listener_id);
             }
             Ok(AttachOutcome::default())
         }));

@@ -328,6 +328,9 @@ jobs:
         with:
           workspaces: ./rust/${{ matrix.folder }}
           cache-bin: false
+      - name: Install eBPF build dependencies (Linux)
+        if: runner.os == 'Linux' && matrix.folder == 'otap-dataflow'
+        run: sudo apt-get update && sudo apt-get install -y clang libbpf-dev
       - name: cargo clippy ${{ matrix.folder }}
         run: |
           cargo clippy --all-targets --all-features --workspace -- -D warnings
@@ -524,6 +527,9 @@ jobs:
           if (Test-Path "C:\Android") { Remove-Item -Recurse -Force "C:\Android" }
           if (Test-Path "C:\SeleniumWebDrivers") { Remove-Item -Recurse -Force "C:\SeleniumWebDrivers" }
           if (Test-Path "C:\imagemagick") { Remove-Item -Recurse -Force "C:\imagemagick" }
+      - name: Install eBPF build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang libbpf-dev
       - name: install nextest
         uses: taiki-e/install-action@51cd0b8c0499559d9a4d75c0f5c67bec3a894ec8 # v2.75.28
         with:
@@ -625,6 +631,8 @@ jobs:
           sudo rm -rf /usr/lib/jvm /usr/share/dotnet /usr/share/swift /usr/local/.ghcup
           sudo rm -rf /usr/local/julia* /usr/local/lib/android /usr/local/share/chromium
           sudo rm -rf /opt/microsoft /opt/google /opt/az /usr/local/share/powershell
+      - name: Install eBPF build dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libbpf-dev
       - name: install cargo-llvm-cov and nextest
         uses: taiki-e/install-action@51cd0b8c0499559d9a4d75c0f5c67bec3a894ec8 # v2.75.28
         with:
@@ -687,6 +695,9 @@ jobs:
         with:
           workspaces: ./rust/${{ matrix.folder }}
           cache-bin: false
+      - name: Install eBPF build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang libbpf-dev
       - name: Install OpenSSL (Windows)
         if: runner.os == 'Windows'
         # Required for the crypto-openssl feature (rustls-openssl -> openssl-sys).

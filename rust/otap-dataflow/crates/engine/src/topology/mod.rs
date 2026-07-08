@@ -67,7 +67,15 @@ impl NumaTopology {
     /// Detects NUMA topology using the platform default provider.
     #[must_use]
     pub fn detect() -> Self {
-        DefaultNumaTopologyProvider::default().discover()
+        #[cfg(target_os = "linux")]
+        {
+            return DefaultNumaTopologyProvider::default().discover();
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            DefaultNumaTopologyProvider.discover()
+        }
     }
 
     /// Detects Linux NUMA topology under an arbitrary sysfs root.
