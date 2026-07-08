@@ -40,6 +40,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::Builder;
 use tokio::sync::watch;
@@ -490,6 +491,12 @@ impl<PData: 'static + Debug + Clone + ReceivedAtNode + Unwindable + FlowMetricHo
             let listener_group_handle = if pipeline_context.load_balancing().strategy
                 == otap_df_config::policy::LoadBalancingStrategy::EbpfNuma
             {
+                let lifecycle_metrics = Arc::new(Mutex::new(
+                    crate::listener_group::metrics::ListenerGroupMetricsEmitter::new(
+                        pipeline_context.metrics_registry(),
+                        metrics_reporter.clone(),
+                    ),
+                ));
                 u32::try_from(pipeline_context.core_id())
                     .ok()
                     .map(|core_id| {
@@ -501,6 +508,7 @@ impl<PData: 'static + Debug + Clone + ReceivedAtNode + Unwindable + FlowMetricHo
                             core_id,
                             pipeline_context.load_balancing().strict,
                         )
+                        .with_lifecycle_metrics(lifecycle_metrics)
                     })
             } else {
                 None

@@ -14,6 +14,7 @@ use crate::control::{
 use crate::error::Error;
 use crate::listener_group::{
     AcquireOutcome, ListenerGroupHandle, ListenerGroupLease, QUORUM_TIMEOUT,
+    metrics::ListenerGroupMetricEvent,
 };
 use crate::node::NodeId;
 use crate::node_local_scheduler::NodeLocalSchedulerHandle;
@@ -21,8 +22,8 @@ use crate::{WakeupError, WakeupSetOutcome};
 use otap_df_channel::error::SendError;
 use otap_df_telemetry::error::Error as TelemetryError;
 use otap_df_telemetry::metrics::{MetricSet, MetricSetHandler};
-use otap_df_telemetry::otel_warn;
 use otap_df_telemetry::reporter::MetricsReporter;
+use otap_df_telemetry::{otel_info, otel_warn};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -152,6 +153,33 @@ impl<PData> EffectHandlerCore<PData> {
         self.node_interests = interests;
     }
 
+    fn record_listener_group_lifecycle(
+        &self,
+        handle: &ListenerGroupHandle,
+        key: &crate::listener_group::ListenerGroupKey,
+    ) {
+        for event in handle.record_lifecycle_events(key) {
+            let bind_addr = key.addr.to_string();
+            let event_name = match event {
+                ListenerGroupMetricEvent::PlanRegistered => "plan_registered",
+                ListenerGroupMetricEvent::GroupReady => "group_ready",
+                ListenerGroupMetricEvent::SelectorAttached => "selector_attached",
+                ListenerGroupMetricEvent::SelectorFallback => "selector_fallback",
+                ListenerGroupMetricEvent::Fallback => "fallback",
+                ListenerGroupMetricEvent::MaterialisationFailed => "materialisation_failed",
+            };
+            otel_info!(
+                "listener_group.lifecycle",
+                pipeline_group_id = key.pipeline_group_id.as_str(),
+                pipeline_id = key.pipeline_id.as_str(),
+                receiver_node_id = key.receiver_node_id.as_str(),
+                bind_addr = bind_addr.as_str(),
+                protocol = key.protocol.as_str(),
+                event = event_name,
+            );
+        }
+    }
+
     /// Returns the precomputed node interests.
     ///
     /// Includes SOURCE_TAGGING when source tagging is enabled.
@@ -191,7 +219,8 @@ impl<PData> EffectHandlerCore<PData> {
     /// plan covering this receiver and the resolved pipeline policy
     /// selected `ebpf_numa`, this method consults
     /// [`crate::listener_group::ListenerGroupManager`] to obtain a
-    /// listener that is part of a pre-materialised reuseport group.
+    /// listener that belongs to the receiver group's coordinated
+    /// reuseport sockets once startup quorum materialises them.
     /// On `FallbackToIndependent`, or when coordination is disabled,
     /// the existing per-receiver bind path is used. `NoPlan` is an
     /// error when the controller selected `ebpf_numa`, because it
@@ -222,6 +251,7 @@ impl<PData> EffectHandlerCore<PData> {
             let outcome = handle
                 .manager()
                 .acquire(&key, handle.core_id(), QUORUM_TIMEOUT);
+            self.record_listener_group_lifecycle(handle, &key);
             match outcome {
                 AcquireOutcome::Listener(acquired) => {
                     let (std_listener, lease) = acquired.into_parts();
@@ -284,6 +314,15 @@ impl<PData> EffectHandlerCore<PData> {
                     )));
                 }
                 AcquireOutcome::FallbackToIndependent => {
+                    if handle.strict() {
+                        return Err(into_engine_error(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "strict ebpf_numa TCP listener group for {addr} on core {} fell back to independent bind",
+                                handle.core_id()
+                            ),
+                        )));
+                    }
                     // Fall through to the independent-bind path
                     // below.
                 }
@@ -347,6 +386,7 @@ impl<PData> EffectHandlerCore<PData> {
             let outcome = handle
                 .manager()
                 .acquire(&key, handle.core_id(), QUORUM_TIMEOUT);
+            self.record_listener_group_lifecycle(handle, &key);
             match outcome {
                 AcquireOutcome::DatagramSocket(acquired) => {
                     let (std_socket, lease) = acquired.into_parts();
@@ -398,6 +438,15 @@ impl<PData> EffectHandlerCore<PData> {
                     )));
                 }
                 AcquireOutcome::FallbackToIndependent => {
+                    if handle.strict() {
+                        return Err(into_engine_error(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "strict ebpf_numa UDP listener group for {addr} on core {} fell back to independent bind",
+                                handle.core_id()
+                            ),
+                        )));
+                    }
                     // Fall through to the independent-bind path below.
                 }
             }

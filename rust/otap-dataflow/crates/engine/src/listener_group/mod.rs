@@ -6,11 +6,12 @@
 //! `ListenerGroupManager` lets the controller declare a planned set of
 //! listener sockets that should bind to the same address with
 //! `SO_REUSEPORT` and be handed out to receivers pinned to specific
-//! cores. In production, the controller materialises registered plans
-//! before pipeline threads launch, so receiver startup performs only a
-//! synchronous lookup for its pre-bound socket. A legacy lazy acquire
-//! path remains for focused manager tests and defensive fallback, but it
-//! is not used by configured listener groups during normal startup.
+//! cores. In production, the controller registers plans before pipeline
+//! threads launch. Receiver startup then reaches quorum through
+//! [`ListenerGroupManager::acquire`]; the last expected receiver
+//! materialises the group, attaches the optional selector, and wakes the
+//! other receivers. This avoids publishing sockets before their receiver
+//! tasks are ready to accept traffic.
 //!
 //! The manager intentionally hands back standard-library TCP/UDP sockets
 //! rather than Tokio sockets so the acquiring receiver can register the fd
@@ -21,15 +22,18 @@
 //! With no plans registered, the manager is inert and existing
 //! per-receiver bind behaviour is preserved exactly.
 //!
-//! The lifecycle metrics in [`metrics`] are emitted from controller startup
-//! paths so no receiver listener hot path pays reporting overhead.
+//! Plan-registration metrics are emitted from controller startup. Lazy
+//! materialisation lifecycle events are de-duplicated here and emitted by
+//! the acquiring receiver after
+//! [`ListenerGroupManager::take_lifecycle_events`].
 
 pub mod extraction;
 pub mod metrics;
 
 use crate::topology::NumaTopology;
+use metrics::ListenerGroupMetricEvent;
 use std::any::Any;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::{SocketAddr, TcpListener, UdpSocket};
 #[cfg(unix)]
 use std::os::fd::RawFd;
@@ -239,6 +243,7 @@ pub struct ListenerGroupPlan {
 }
 
 /// Summary of eager listener-group materialisation.
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct ListenerGroupMaterialisationReport {
     /// Groups successfully materialised and ready for receiver acquire.
@@ -320,9 +325,10 @@ pub enum AcquireOutcome {
     /// `EffectHandler::tcp_listener` more than once for the same
     /// address/core within a single startup.
     AlreadyAcquired,
-    /// The group's eager materialisation hit an `io::Error` (e.g.
-    /// address-in-use without SO_REUSEPORT). Surfaced to the *first*
-    /// acquirer; subsequent acquirers see the cached error.
+    /// Group materialisation hit an `io::Error` (e.g.
+    /// address-in-use without SO_REUSEPORT) or strict quorum timed out.
+    /// Surfaced to the *first* acquirer; subsequent acquirers see the
+    /// cached error.
     MaterialisationFailed(std::io::Error),
 }
 
@@ -449,6 +455,8 @@ struct ManagerInner {
     state: Mutex<HashMap<ListenerGroupKey, GroupSlot>>,
     disabled_bind_identities: Mutex<HashSet<BindIdentity>>,
     attach_hook: Mutex<Option<AttachHook>>,
+    reported_events: Mutex<HashSet<(ListenerGroupKey, ListenerGroupMetricEvent)>>,
+    pending_events: Mutex<HashMap<ListenerGroupKey, VecDeque<ListenerGroupMetricEvent>>>,
 }
 
 impl std::fmt::Debug for ManagerInner {
@@ -536,8 +544,8 @@ impl ListenerGroupManager {
     }
 
     /// Registers a plan. Validates structure but does not bind any
-    /// sockets; production startup binds later via
-    /// [`Self::materialise_registered_plans`].
+    /// sockets; production startup binds lazily when receiver acquire
+    /// reaches quorum.
     ///
     /// # Errors
     ///
@@ -700,17 +708,18 @@ impl ListenerGroupManager {
     /// Materializes every currently registered plan before receiver
     /// tasks are launched.
     ///
-    /// This is the production path for configured listener groups:
-    /// receivers later call [`Self::acquire`] and perform only a
-    /// non-blocking lookup into the ready or fallback state. If a
-    /// non-strict group fails to bind or attach, it is marked as
-    /// fallback so receivers keep the independent bind behavior. A
-    /// strict failure is returned to the controller so startup fails
-    /// before any pipeline thread is spawned.
+    /// Production startup uses lazy quorum materialisation through
+    /// [`Self::acquire`]. This helper remains available for focused
+    /// manager tests and any future startup mode that deliberately wants
+    /// pre-spawn materialisation. If a non-strict group fails to bind or
+    /// attach, it is marked as fallback so receivers keep the
+    /// independent bind behavior. A strict failure is returned to the
+    /// caller.
     ///
     /// # Errors
     ///
     /// Returns the first strict materialization or attach error.
+    #[cfg(test)]
     pub fn materialise_registered_plans(
         &self,
     ) -> std::io::Result<ListenerGroupMaterialisationReport> {
@@ -753,6 +762,7 @@ impl ListenerGroupManager {
         Ok(report)
     }
 
+    #[cfg(test)]
     fn selector_attached(&self, key: &ListenerGroupKey) -> bool {
         match self.inner.state.lock() {
             Ok(state) => state.get(key).is_some_and(|slot| slot.selector_attached),
@@ -768,6 +778,41 @@ impl ListenerGroupManager {
                 .any(|disabled| bind_identities_ambiguous(*disabled, bind_identity)),
             Err(_) => false,
         }
+    }
+
+    fn record_lifecycle_events(
+        &self,
+        key: &ListenerGroupKey,
+        events: impl IntoIterator<Item = ListenerGroupMetricEvent>,
+    ) {
+        let mut reported = self
+            .inner
+            .reported_events
+            .lock()
+            .expect("listener-group reported-events mutex");
+        let mut pending = self
+            .inner
+            .pending_events
+            .lock()
+            .expect("listener-group pending-events mutex");
+        for event in events {
+            if reported.insert((key.clone(), event)) {
+                pending.entry(key.clone()).or_default().push_back(event);
+            }
+        }
+    }
+
+    /// Takes lifecycle events produced by the most recent lazy acquire
+    /// transition for `key`.
+    #[must_use]
+    pub fn take_lifecycle_events(&self, key: &ListenerGroupKey) -> Vec<ListenerGroupMetricEvent> {
+        self.inner
+            .pending_events
+            .lock()
+            .expect("listener-group pending-events mutex")
+            .remove(key)
+            .map(|events| events.into_iter().collect())
+            .unwrap_or_default()
     }
 
     /// Acquires the listener pre-allocated for `(key, core_id)`.
@@ -797,6 +842,7 @@ impl ListenerGroupManager {
                 None => {
                     drop(state);
                     if self.bind_identity_disabled(key) {
+                        self.record_lifecycle_events(key, [ListenerGroupMetricEvent::Fallback]);
                         return AcquireOutcome::FallbackToIndependent;
                     }
                     return AcquireOutcome::NoPlan;
@@ -865,8 +911,30 @@ impl ListenerGroupManager {
                     // Drop into the wait-or-timeout path below.
                     let now = Instant::now();
                     if now >= *deadline {
+                        let strict = slot.plan.strict;
+                        let error = std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "listener-group quorum for {} on {} did not complete within {timeout:?}",
+                                key.addr,
+                                key.protocol.as_str()
+                            ),
+                        );
+                        if strict {
+                            let replay = std::io::Error::new(error.kind(), error.to_string());
+                            slot.state = GroupState::Failed { error: replay };
+                            cv.notify_all();
+                            drop(guard);
+                            self.record_lifecycle_events(
+                                key,
+                                [ListenerGroupMetricEvent::MaterialisationFailed],
+                            );
+                            return AcquireOutcome::MaterialisationFailed(error);
+                        }
                         slot.state = GroupState::Fallback;
                         cv.notify_all();
+                        drop(guard);
+                        self.record_lifecycle_events(key, [ListenerGroupMetricEvent::Fallback]);
                         return AcquireOutcome::FallbackToIndependent;
                     }
                     let remaining = *deadline - now;
@@ -950,6 +1018,7 @@ impl ListenerGroupManager {
 
         match result {
             Ok((sockets, attach)) => {
+                let selector_attached = attach.selector_attached;
                 slot.selector_attached = attach.selector_attached;
                 slot.attach_keepalive = attach.keepalive;
                 slot.state = GroupState::Ready {
@@ -958,6 +1027,18 @@ impl ListenerGroupManager {
                     distributed: BTreeSet::new(),
                 };
                 cv.notify_all();
+                drop(state);
+                self.record_lifecycle_events(
+                    key,
+                    [
+                        ListenerGroupMetricEvent::GroupReady,
+                        if selector_attached {
+                            ListenerGroupMetricEvent::SelectorAttached
+                        } else {
+                            ListenerGroupMetricEvent::SelectorFallback
+                        },
+                    ],
+                );
                 Ok(())
             }
             Err(error) => {
@@ -967,6 +1048,11 @@ impl ListenerGroupManager {
                 );
                 slot.state = GroupState::Failed { error: replay };
                 cv.notify_all();
+                drop(state);
+                self.record_lifecycle_events(
+                    key,
+                    [ListenerGroupMetricEvent::MaterialisationFailed],
+                );
                 Err(error)
             }
         }
@@ -1105,7 +1191,7 @@ pub const QUORUM_TIMEOUT: Duration = Duration::from_secs(5);
 /// group manager. Carried in `EffectHandlerCore` so
 /// `tcp_listener(addr)` and `udp_socket(addr)` can build a full [`ListenerGroupKey`] and call
 /// [`ListenerGroupManager::acquire`] without changing its signature.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ListenerGroupHandle {
     manager: ListenerGroupManager,
     pipeline_group_id: String,
@@ -1113,6 +1199,21 @@ pub struct ListenerGroupHandle {
     receiver_node_id: String,
     core_id: u32,
     strict: bool,
+    lifecycle_metrics: Option<Arc<Mutex<metrics::ListenerGroupMetricsEmitter>>>,
+}
+
+impl std::fmt::Debug for ListenerGroupHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ListenerGroupHandle")
+            .field("manager", &self.manager)
+            .field("pipeline_group_id", &self.pipeline_group_id)
+            .field("pipeline_id", &self.pipeline_id)
+            .field("receiver_node_id", &self.receiver_node_id)
+            .field("core_id", &self.core_id)
+            .field("strict", &self.strict)
+            .field("lifecycle_metrics", &self.lifecycle_metrics.is_some())
+            .finish()
+    }
 }
 
 impl ListenerGroupHandle {
@@ -1134,6 +1235,7 @@ impl ListenerGroupHandle {
             receiver_node_id: receiver_node_id.into(),
             core_id,
             strict,
+            lifecycle_metrics: None,
         }
     }
 
@@ -1207,6 +1309,35 @@ impl ListenerGroupHandle {
     #[must_use]
     pub fn strict(&self) -> bool {
         self.strict
+    }
+
+    /// Attaches a low-frequency lifecycle metrics emitter used for
+    /// lazy materialisation events.
+    #[must_use]
+    pub fn with_lifecycle_metrics(
+        mut self,
+        lifecycle_metrics: Arc<Mutex<metrics::ListenerGroupMetricsEmitter>>,
+    ) -> Self {
+        self.lifecycle_metrics = Some(lifecycle_metrics);
+        self
+    }
+
+    /// Records lifecycle events that the manager de-duplicated for this
+    /// group key and returns the recorded events for structured logs.
+    #[must_use]
+    pub fn record_lifecycle_events(&self, key: &ListenerGroupKey) -> Vec<ListenerGroupMetricEvent> {
+        let events = self.manager.take_lifecycle_events(key);
+        if events.is_empty() {
+            return events;
+        }
+        if let Some(emitter) = self.lifecycle_metrics.as_ref() {
+            if let Ok(mut emitter) = emitter.lock() {
+                for event in &events {
+                    emitter.record(key, *event);
+                }
+            }
+        }
+        events
     }
 }
 
@@ -1778,6 +1909,54 @@ mod tests {
     }
 
     #[test]
+    fn lazy_materialisation_reports_selector_attached_once() {
+        let mgr = ListenerGroupManager::new();
+        let addr = ephemeral_addr();
+        let key = ListenerGroupKey::tcp("pg", "pipe", "recv", addr);
+        mgr.register_plan(loopback_plan(addr, &[(0, 0, 0)]))
+            .unwrap();
+        mgr.set_attach_hook(Arc::new(|_, _| {
+            Ok(AttachOutcome {
+                selector_attached: true,
+                ..AttachOutcome::default()
+            })
+        }));
+
+        let outcome = mgr.acquire(&key, 0, Duration::from_secs(2));
+
+        assert!(matches!(outcome, AcquireOutcome::Listener(_)));
+        assert_eq!(
+            mgr.take_lifecycle_events(&key),
+            vec![
+                ListenerGroupMetricEvent::GroupReady,
+                ListenerGroupMetricEvent::SelectorAttached,
+            ]
+        );
+        assert!(mgr.take_lifecycle_events(&key).is_empty());
+    }
+
+    #[test]
+    fn lazy_materialisation_reports_selector_fallback_once() {
+        let mgr = ListenerGroupManager::new();
+        let addr = ephemeral_addr();
+        let key = ListenerGroupKey::tcp("pg", "pipe", "recv", addr);
+        mgr.register_plan(loopback_plan(addr, &[(0, 0, 0)]))
+            .unwrap();
+
+        let outcome = mgr.acquire(&key, 0, Duration::from_secs(2));
+
+        assert!(matches!(outcome, AcquireOutcome::Listener(_)));
+        assert_eq!(
+            mgr.take_lifecycle_events(&key),
+            vec![
+                ListenerGroupMetricEvent::GroupReady,
+                ListenerGroupMetricEvent::SelectorFallback,
+            ]
+        );
+        assert!(mgr.take_lifecycle_events(&key).is_empty());
+    }
+
+    #[test]
     fn eager_non_strict_materialisation_failure_falls_back() {
         let mgr = ListenerGroupManager::new();
         let addr = ephemeral_addr();
@@ -1912,6 +2091,10 @@ mod tests {
             matches!(outcome, AcquireOutcome::FallbackToIndependent),
             "got {outcome:?}"
         );
+        assert_eq!(
+            mgr.take_lifecycle_events(&key),
+            vec![ListenerGroupMetricEvent::Fallback]
+        );
         assert!(
             elapsed >= Duration::from_millis(45),
             "should wait near-deadline, waited {elapsed:?}"
@@ -1920,6 +2103,33 @@ mod tests {
         // Subsequent arrivals also see fallback.
         let late = mgr.acquire(&key, 1, Duration::from_millis(1));
         assert!(matches!(late, AcquireOutcome::FallbackToIndependent));
+        assert!(mgr.take_lifecycle_events(&key).is_empty());
+    }
+
+    #[test]
+    fn strict_timeout_returns_materialisation_failed() {
+        let mgr = ListenerGroupManager::new();
+        let addr = ephemeral_addr();
+        let key = ListenerGroupKey::tcp("pg", "pipe", "recv", addr);
+        let mut plan = loopback_plan(addr, &[(0, 0, 0), (1, 1, 0)]);
+        plan.strict = true;
+        mgr.register_plan(plan).unwrap();
+
+        let outcome = mgr.acquire(&key, 0, Duration::from_millis(50));
+
+        let error = match outcome {
+            AcquireOutcome::MaterialisationFailed(error) => error,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(
+            mgr.take_lifecycle_events(&key),
+            vec![ListenerGroupMetricEvent::MaterialisationFailed]
+        );
+
+        let late = mgr.acquire(&key, 1, Duration::from_millis(1));
+        assert!(matches!(late, AcquireOutcome::MaterialisationFailed(_)));
+        assert!(mgr.take_lifecycle_events(&key).is_empty());
     }
 
     #[test]

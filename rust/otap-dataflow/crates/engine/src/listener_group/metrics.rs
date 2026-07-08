@@ -59,7 +59,7 @@ pub struct ListenerGroupMetrics {
 }
 
 /// Listener-group lifecycle event recorded by the controller.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ListenerGroupMetricEvent {
     /// Plan registration succeeded.
     PlanRegistered,

@@ -68,6 +68,20 @@ be attached to influence kernel listener selection within a reuseport group.
 Practical uses include adding randomization, weighting sockets, or leveraging
 additional header information to mitigate distribution skew.
 
+For `ebpf_numa`, the controller validates listener plans before pipeline threads
+start, but sockets are materialised lazily by the receiver group during startup.
+Each expected receiver calls into the listener-group manager; when all expected
+members reach quorum, the last arrival binds the reuseport sockets, attaches the
+selector when available, and wakes the other receivers. This avoids publishing a
+socket before its receiver task can accept traffic.
+
+If quorum is not reached before the startup timeout, non-strict groups fall back
+to independent binds so the receiver can still serve traffic. In strict mode,
+registration conflicts, quorum timeout, bind/listen failure, and selector attach
+failure are startup errors rather than silent fallback. Because strict failures
+can now surface from the acquiring receiver thread, the engine startup path must
+treat that receiver error as a pipeline startup failure.
+
 #### 2.b. Front-End **L7 (HTTP/2-aware) Load Balancer**
 
 Deploying an HTTP/2-aware proxy (e.g. Envoy, NGINX) that terminates HTTP/2/TLS
