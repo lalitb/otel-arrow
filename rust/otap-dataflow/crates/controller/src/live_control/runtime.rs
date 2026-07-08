@@ -375,7 +375,7 @@ impl<
     /// later instances from receiving shutdown. It is also idempotent at the
     /// dispatch boundary: instances that already accepted shutdown have released
     /// their retained control sender and are skipped by later calls.
-    pub(super) fn request_shutdown_all(&self, timeout_secs: u64) -> Result<(), ControlPlaneError> {
+    pub(crate) fn request_shutdown_all(&self, timeout_secs: u64) -> Result<(), ControlPlaneError> {
         // Snapshot under the state lock, then send outside the lock so runtime
         // callbacks can report exits while shutdown dispatch is in progress.
         // Only active instances with a retained sender are eligible; a missing
@@ -495,5 +495,28 @@ impl<
             .map(|message| Error::PipelineRuntimeError {
                 source: Box::new(io::Error::other(message.clone())),
             })
+    }
+
+    /// Waits until a watched pipeline reports a runtime error, or until the
+    /// startup deadline expires.
+    pub(crate) fn wait_for_runtime_error_until(&self, deadline: Instant) -> Option<Error> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if let Some(message) = state.first_error.as_ref() {
+                return Some(Error::PipelineRuntimeError {
+                    source: Box::new(io::Error::other(message.clone())),
+                });
+            }
+
+            let remaining = deadline.checked_duration_since(Instant::now())?;
+            let (next_state, _) = self
+                .state_changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next_state;
+        }
     }
 }

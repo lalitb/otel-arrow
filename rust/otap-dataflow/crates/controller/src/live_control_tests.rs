@@ -2473,6 +2473,31 @@ fn register_launched_instance_reconciles_early_exit_without_leaking_active_count
     assert!(!state.runtime_instances.contains_key(&deployed_key));
 }
 
+/// Scenario: the static startup path needs to detect strict listener-group
+/// failures that are reported by already-launched pipeline threads.
+/// Guarantees: startup can observe the first runtime error through the shared
+/// runtime state instead of parking the main thread with a dead pipeline.
+#[test]
+fn wait_for_runtime_error_until_returns_reported_error() {
+    let config = engine_config_with_pipeline(simple_pipeline_yaml());
+    let runtime = test_runtime(&config);
+    register_existing_pipeline(&runtime, &config);
+
+    let deployed_key = deployed_key("g1", "p1", 0, 0);
+    runtime.register_launched_instance(launched_runtime_instance("g1", "p1", 0, 0));
+    runtime.note_instance_exit(
+        deployed_key,
+        RuntimeInstanceExit::Error(RuntimeInstanceError::runtime(
+            "strict listener setup failed".to_owned(),
+        )),
+    );
+
+    let error = runtime
+        .wait_for_runtime_error_until(Instant::now() + Duration::from_secs(1))
+        .expect("runtime error should be observed");
+    assert!(error.to_string().contains("strict listener setup failed"));
+}
+
 /// Scenario: a completed rollout has advanced the committed active generation,
 /// but observed state still contains the older generation for the same core.
 /// Guarantees: controller cleanup compacts observed state to the selected

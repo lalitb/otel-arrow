@@ -101,7 +101,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use placement::{CorePlacement, PipelinePlacement, PlacementSnapshot};
 
@@ -1240,6 +1240,7 @@ impl<
         // hook once when at least one resolved pipeline requests
         // `load_balancing.strategy: ebpf_numa`. Strictness is carried
         // per ListenerGroupPlan so mixed policy scopes behave correctly.
+        let mut has_strict_ebpf_numa_pipeline = false;
         if has_ebpf_numa_pipeline {
             controller_ctx
                 .listener_group_manager()
@@ -1527,6 +1528,7 @@ impl<
                     .filter_map(|placement| u32::try_from(placement.core_id.id).ok())
                     .collect();
                 if pipeline_placement.load_balancing.strategy == LoadBalancingStrategy::EbpfNuma {
+                    has_strict_ebpf_numa_pipeline |= pipeline_placement.load_balancing.strict;
                     ebpf_plans.extend(
                         otap_df_engine::listener_group::extraction::extract_plans_for_pipeline(
                             pipeline_entry,
@@ -1701,6 +1703,39 @@ impl<
 
         if run_mode == RunMode::ShutdownWhenDone {
             runtime.wait_until_all_instances_exit();
+        }
+
+        if run_mode == RunMode::ParkMainThread && has_strict_ebpf_numa_pipeline {
+            let startup_deadline = Instant::now()
+                + otap_df_engine::listener_group::QUORUM_TIMEOUT
+                + Duration::from_secs(1);
+            if let Some(err) = runtime.wait_for_runtime_error_until(startup_deadline) {
+                otel_error!(
+                    "controller.strict_listener_group_startup_failed",
+                    error = %err,
+                    message = "Strict ebpf_numa listener setup failed during startup"
+                );
+                if let Err(shutdown_err) = runtime.request_shutdown_all(5) {
+                    otel_warn!(
+                        "controller.strict_listener_group_startup_shutdown_failed",
+                        error = format!("{shutdown_err:?}"),
+                    );
+                }
+                runtime.wait_until_all_instances_exit();
+
+                engine_metrics_handle.shutdown_and_join()?;
+                if let Some(handle) = memory_limiter_handle {
+                    handle.shutdown_and_join()?;
+                }
+                admin_server_handle.shutdown_and_join()?;
+                metrics_agg_handle.shutdown_and_join()?;
+                if let Some(handle) = metrics_dispatcher_handle {
+                    handle.shutdown_and_join()?;
+                }
+                obs_state_join_handle.shutdown_and_join()?;
+                telemetry_system.shutdown_otel()?;
+                return Err(err);
+            }
         }
 
         // In standard engine mode we keep the main thread parked after startup.
