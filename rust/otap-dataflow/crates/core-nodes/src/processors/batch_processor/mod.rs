@@ -42,6 +42,9 @@ use otap_df_engine::{
     control::{AckMsg, CallData, NackMsg, NodeControlMsg, WakeupSlot},
     error::{Error as EngineError, ProcessorErrorKind},
     local::processor as local,
+    memory_budget::{
+        ChargedSize, LocalMemoryTicket, RetainedSiteKind, current_runtime_memory_account,
+    },
     message::Message,
     node::NodeId,
     processor::ProcessorWrapper,
@@ -424,6 +427,9 @@ struct BatchPortion {
 struct Inputs<T: OtapPayloadHelpers> {
     /// Input batches.
     pending: Vec<T>,
+
+    /// Observe-only tickets owning pending input batches.
+    tickets: Vec<Option<LocalMemoryTicket>>,
 
     /// Waiter context
     context: Vec<BatchPortion>,
@@ -1316,6 +1322,7 @@ impl<T: OtapPayloadHelpers> Default for Inputs<T> {
     fn default() -> Self {
         Self {
             pending: Vec::new(),
+            tickets: Vec::new(),
             context: Vec::new(),
             weight: 0,
         }
@@ -1365,6 +1372,7 @@ impl<T: OtapPayloadHelpers> Inputs<T> {
     fn drain(&mut self) -> Self {
         Self {
             pending: self.pending.drain(..).collect(),
+            tickets: self.tickets.drain(..).collect(),
             context: self.context.drain(..).collect(),
             weight: std::mem::take(&mut self.weight),
         }
@@ -1392,18 +1400,39 @@ impl<T: OtapPayloadHelpers> Inputs<T> {
     }
 
     fn accept(&mut self, batch: T, part: BatchPortion) {
+        self.tickets.push(charge_batch_pending(&batch));
         self.weight += part.weight;
         self.pending.push(batch);
         self.context.push(part);
     }
 
     fn take_pending(&mut self) -> Vec<T> {
+        // Pending inputs are leaving this retained buffer; dropping the tickets
+        // refunds the observe-only charge.
+        self.tickets.clear();
         std::mem::take(&mut self.pending)
     }
 
     fn take_context(&mut self) -> MultiContext {
         MultiContext::new(std::mem::take(&mut self.context))
     }
+}
+
+struct BatchRetainedSize(Option<u64>);
+
+impl ChargedSize for BatchRetainedSize {
+    fn charged_size(&self) -> Option<u64> {
+        self.0
+    }
+}
+
+fn charge_batch_pending<T: OtapPayloadHelpers>(batch: &T) -> Option<LocalMemoryTicket> {
+    current_runtime_memory_account().map(|account| {
+        account.charge_at(
+            RetainedSiteKind::BatchPending,
+            BatchRetainedSize(batch.num_bytes().map(|bytes| bytes as u64)),
+        )
+    })
 }
 
 fn known_total_bytes<T: OtapPayloadHelpers>(payloads: &[T]) -> Option<usize> {
@@ -3170,6 +3199,37 @@ mod tests {
                 // 1 input consumed; 1 batch produced by the byte-size flush.
                 verify_batch_metrics(&telemetry_registry, SignalType::Logs, (1, 1));
             });
+    }
+
+    #[test]
+    fn batch_pending_charges_on_accept_and_releases_on_flush() {
+        let account =
+            std::rc::Rc::new(otap_df_engine::memory_budget::RuntimeMemoryAccount::default());
+        let _guard = otap_df_engine::memory_budget::set_current_runtime_memory_account(Some(
+            account.clone(),
+        ));
+        let mut inputs: Inputs<OtlpProtoBytes> = Inputs::default();
+
+        inputs.accept(
+            OtlpProtoBytes::ExportLogsRequest(Bytes::from_static(&[1, 2, 3, 4])),
+            BatchPortion::new(None, None, 4),
+        );
+
+        let snapshot = account.snapshot();
+        assert_eq!(snapshot.charged_bytes, 4);
+        assert_eq!(
+            snapshot.charged_bytes_by_site[RetainedSiteKind::BatchPending.index()],
+            4
+        );
+
+        let flushed = inputs.take_pending();
+        assert_eq!(flushed.len(), 1);
+        let snapshot = account.snapshot();
+        assert_eq!(snapshot.charged_bytes, 0);
+        assert_eq!(
+            snapshot.charged_bytes_by_site[RetainedSiteKind::BatchPending.index()],
+            0
+        );
     }
 
     /// A zero-byte OTLP request is acked immediately and never reaches the

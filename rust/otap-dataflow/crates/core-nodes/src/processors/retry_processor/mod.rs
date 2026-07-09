@@ -28,6 +28,9 @@ use otap_df_engine::{
     control::{AckMsg, CallData, NackMsg, NodeControlMsg},
     error::{Error, TypedError},
     local::processor::{EffectHandler, Processor},
+    memory_budget::{
+        ChargedSize, LocalMemoryTicket, RetainedSiteKind, current_runtime_memory_account,
+    },
     message::Message,
     node::NodeId,
     processor::ProcessorWrapper,
@@ -36,6 +39,7 @@ use otap_df_telemetry::instrument::Counter;
 use otap_df_telemetry::metrics::MetricSet;
 use otap_df_telemetry_macros::metric_set;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -342,6 +346,7 @@ pub struct RetryProcessor {
 
     config: RetryConfig,
     metrics: MetricSet<RetryProcessorMetrics>,
+    retry_budget_tickets: VecDeque<(Instant, LocalMemoryTicket)>,
 }
 
 /// Factory function to create a SignalTypeRouter processor
@@ -447,7 +452,18 @@ impl RetryProcessor {
             delays,
             config,
             metrics,
+            retry_budget_tickets: VecDeque::new(),
         })
+    }
+
+    fn release_retry_budget_ticket(&mut self, when: Instant) {
+        if let Some(index) = self
+            .retry_budget_tickets
+            .iter()
+            .position(|(ticket_when, _)| *ticket_when == when)
+        {
+            let _ = self.retry_budget_tickets.remove(index);
+        }
     }
 
     async fn handle_ack(
@@ -547,10 +563,24 @@ impl RetryProcessor {
 
         self.metrics.increment_retry_attempts(signal);
 
+        let budget_ticket = current_runtime_memory_account().map(|account| {
+            account.charge_at(
+                RetainedSiteKind::RetryBuffer,
+                PdataRetainedSize(rereq.payload_ref().num_bytes().map(|bytes| bytes as u64)),
+            )
+        });
+
         // Requeue the data onto this node, we'll continue in the DelayedData branch next.
         match effect_handler.requeue_later(next_retry_time_i, rereq) {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                if let Some(ticket) = budget_ticket {
+                    self.retry_budget_tickets
+                        .push_back((next_retry_time_i, ticket));
+                }
+                Ok(())
+            }
             Err(refused) => {
+                drop(budget_ticket);
                 effect_handler
                     .notify_nack(NackMsg::new("cannot requeue", refused))
                     .await?;
@@ -630,6 +660,7 @@ impl Processor<OtapPdata> for RetryProcessor {
                 NodeControlMsg::DelayedData { when, data } => {
                     if let Some(calldata) = data.source_route() {
                         let rstate: RetryState = calldata.calldata.try_into()?;
+                        self.release_retry_budget_ticket(when);
                         let _ = self
                             .handle_delayed(when, data, effect_handler, rstate.num_items)
                             .await?;
@@ -661,6 +692,14 @@ impl Processor<OtapPdata> for RetryProcessor {
     }
 }
 
+struct PdataRetainedSize(Option<u64>);
+
+impl ChargedSize for PdataRetainedSize {
+    fn charged_size(&self) -> Option<u64> {
+        self.0
+    }
+}
+
 impl RetryProcessor {
     /// Creates a new RetryProcessor with the specified configuration
     #[must_use]
@@ -676,6 +715,7 @@ impl RetryProcessor {
             delays,
             config,
             metrics,
+            retry_budget_tickets: VecDeque::new(),
         }
     }
 }
@@ -688,6 +728,9 @@ mod test {
     use otap_df_engine::control::{
         AckMsg, NackMsg, NodeControlMsg, PipelineCompletionMsg, pipeline_completion_msg_channel,
     };
+    use otap_df_engine::memory_budget::{
+        RetainedSiteKind, RuntimeMemoryAccount, set_current_runtime_memory_account,
+    };
     use otap_df_engine::testing::liveness::next_completion;
     use otap_df_engine::testing::node::test_node;
     use otap_df_engine::testing::processor::TestRuntime;
@@ -696,6 +739,7 @@ mod test {
     use otap_df_otap::testing::{TestCallData, create_test_pdata, next_ack, next_nack};
     use otap_df_telemetry::registry::TelemetryRegistryHandle;
     use serde_json::json;
+    use std::rc::Rc;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -1007,6 +1051,76 @@ mod test {
                     }
                     other => panic!("expected terminal nack, got {other:?}"),
                 }
+            })
+            .validate(|ctx| async move {
+                ctx.counters().assert(0, 0, 0, 0);
+            });
+    }
+
+    #[test]
+    fn retry_buffer_charges_on_delay_and_releases_on_resume() {
+        let pipeline_ctx = create_test_pipeline_context();
+        let node = test_node("retry-processor-memory-budget-poc");
+        let rt: TestRuntime<OtapPdata> = TestRuntime::new();
+
+        let mut node_config = NodeUserConfig::new_processor_config(RETRY_PROCESSOR_URN);
+        node_config.config = create_test_config();
+
+        let proc = crate::processors::retry_processor::create_retry_processor(
+            pipeline_ctx,
+            node,
+            Arc::new(node_config),
+            rt.config(),
+            &otap_df_engine::capability::registry::Capabilities::empty(),
+        )
+        .expect("create processor");
+
+        rt.set_processor(proc)
+            .run_test(move |mut ctx| async move {
+                let account = Rc::new(RuntimeMemoryAccount::default());
+                let _guard = set_current_runtime_memory_account(Some(account.clone()));
+
+                let pdata_in = create_test_pdata().test_subscribe_to(
+                    Interests::ACKS | Interests::NACKS | Interests::RETURN_DATA,
+                    TestCallData::default().into(),
+                    4444,
+                );
+
+                ctx.process(Message::PData(pdata_in))
+                    .await
+                    .expect("process initial message");
+                let mut output = ctx.drain_pdata().await;
+                assert_eq!(output.len(), 1);
+
+                let nack = NackMsg::new("simulated downstream failure", output.remove(0));
+                let (_, nack_msg) = next_nack(nack).expect("expected nack subscriber");
+                ctx.process(Message::nack_ctrl_msg(nack_msg))
+                    .await
+                    .expect("process nack");
+
+                let snapshot = account.snapshot();
+                assert!(
+                    snapshot.charged_bytes_by_site[RetainedSiteKind::RetryBuffer.index()] > 0,
+                    "delayed retry should charge the retry buffer while scheduled"
+                );
+
+                let when = ctx
+                    .next_local_control_deadline()
+                    .expect("retry should be scheduled");
+                let control = ctx
+                    .take_due_local_control(when)
+                    .expect("scheduled local control");
+                assert!(matches!(control, NodeControlMsg::DelayedData { .. }));
+                ctx.process(Message::Control(control))
+                    .await
+                    .expect("process delayed retry");
+
+                let snapshot = account.snapshot();
+                assert_eq!(
+                    snapshot.charged_bytes_by_site[RetainedSiteKind::RetryBuffer.index()],
+                    0,
+                    "retry buffer charge should release when delayed data resumes"
+                );
             })
             .validate(|ctx| async move {
                 ctx.counters().assert(0, 0, 0, 0);
