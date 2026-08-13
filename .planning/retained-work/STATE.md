@@ -6,13 +6,16 @@ Updated: 2026-08-12
 
 PR: A - stable delayed-work `LocalResumeId`
 
-Branch: not created
+Branch: `lalitb/retained-work-local-resume-id`
 
-Worktree: not created
+Worktree:
+`/Users/lalitb/work/obs/otel/rust/lalitb/otel-arrow-retained-work-pr-a`
 
-Base: current `origin/main`
+Base: `f2b0348342bd6f0aae619c950dfc93b1f1bb1052` (`origin/main`)
 
-Status: PR A source plan complete; awaiting approval to implement
+Head: `80ac2a86ffd8dba690e973a7380b758c3e1b1445`
+
+Status: PR A implemented and committed locally; implementation branch not pushed
 
 ## Completed
 
@@ -22,15 +25,72 @@ Status: PR A source plan complete; awaiting approval to implement
 - Fable architecture decision completed.
 - Final decision: constrained pilot with a clean implementation.
 - Dedicated coordination worktree and branch created.
+- Approved PR A plan committed and pushed on the coordination branch as
+  `1337bffbc` without entering the implementation branch ancestry.
+- PR A implemented as one atomic commit on a worktree created directly from
+  current `origin/main`.
+
+## Implementation Result
+
+Commit `80ac2a86f` changes nine Rust files with 175 insertions and 55 deletions:
+
+- `crates/engine/src/control.rs`
+- `crates/engine/src/node_local_scheduler.rs`
+- `crates/engine/src/effect_handler.rs`
+- `crates/engine/src/local/processor.rs`
+- `crates/engine/src/shared/processor.rs`
+- `crates/engine/src/pipeline_ctrl.rs`
+- `crates/engine/src/message.rs`
+- `crates/core-nodes/src/processors/retry_processor/mod.rs`
+- `crates/core-nodes/src/processors/batch_processor/mod.rs`
+
+The implementation adds the opaque node-local ID, returns it only for accepted
+local scheduling, preserves it through due and shutdown delivery, emits `None`
+for all runtime-global delayed delivery, and migrates every exact constructor
+and pattern. It does not add memory accounting, metrics, configuration, tenant
+behavior, enforcement, or unrelated Phase 2 code.
 
 ## Validation
 
-No implementation has been built or tested as part of this planning work.
+Passed:
 
-Planning inspection used refreshed `origin/main` at `f2b034834`. Before this
-planning edit, the coordination worktree had no uncommitted changes. Its branch
-was one local planning commit ahead of `origin/planning/retained-work-pilot`.
-Current Rust source had no diff from `origin/main`.
+- `cargo fmt --all`
+- `cargo fmt --all -- --check`
+- `cargo check -p otap-df-engine`
+- `cargo check -p otap-df-core-nodes`
+- `cargo test -p otap-df-engine node_local_scheduler::tests` - 15 passed
+- `cargo test -p otap-df-engine processor_inbox_emits_due_delayed_resume_as_control_message`
+  - 1 passed
+- `cargo test -p otap-df-engine processor_inbox_returns_pending_delayed_resumes_on_shutdown_latch`
+  - 1 passed
+- `cargo test -p otap-df-engine test_delay_data_integration` - 1 passed
+- `cargo test -p otap-df-engine test_new_delay_data_returned_immediately_during_draining`
+  - 1 passed
+- `cargo test -p otap-df-engine test_queued_delayed_data_flushed_when_draining_begins`
+  - 1 passed
+- `cargo test -p otap-df-core-nodes test_retry_processor_nacks_then_success_time`
+  - 1 passed
+- `cargo clippy -p otap-df-engine -p otap-df-core-nodes --all-targets -- -D warnings`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace`
+- `python3 tools/sanitycheck.py`
+- `git diff --check` and `git diff --cached --check`
+
+The first focused scheduler-test compile exposed two ignored
+`Result<LocalResumeId, _>` values under `-D unused-results`. Those call sites
+were corrected, and the recorded focused and workspace test runs above passed.
+
+`cargo xtask check` was run but did not pass. It stopped at the initial
+component-inventory gate because current `origin/main` is missing an inventory
+annotation at
+`crates/contrib-extensions/src/oauth2_client_auth/mod.rs:100`
+(`OTAP_EXTENSION_FACTORIES`). The failure is outside the PR A diff, and the
+command did not reach its format, clippy, or test stages. The equivalent full
+workspace clippy and test commands were therefore run separately and passed.
+
+As an additional review aid, `scripts/check-async-blocking.sh` exited 1 for
+repository-wide existing `std::io`, `std::fs`, and thread-sleep findings. None
+is in a PR A changed file.
 
 ## PR A Source Inventory
 
@@ -154,32 +214,26 @@ Every new or modified test declaration must retain specific `Scenario:` and
   It is practically unreachable, but the uniqueness claim should remain true
   by construction.
 
+Residual risk is limited to this intentional source API migration for external
+exact constructors, patterns, and callers that require `Result<(), PData>`.
+`LocalResumeId` is deliberately opaque and scheduler-local; consumers must not
+treat it as globally unique. The repository-required wrapper remains blocked by
+the unrelated current-main component-inventory issue even though its underlying
+workspace clippy and test stages pass independently.
+
 Estimated size is about 120-180 changed lines across nine Rust files, including
 tests. This is an internal generic engine API change with no user-facing
 behavior, configuration, or telemetry change, so no changelog entry is planned;
 the eventual PR title should include `chore` unless review establishes a
 user-facing impact.
 
-## Planned Validation After Approval
-
-Run only after implementation is approved:
-
-1. `cargo fmt --all -- --check`
-2. `cargo check -p otap-df-engine`
-3. `cargo check -p otap-df-core-nodes`
-4. Focused engine scheduler, inbox, and pipeline-control tests plus the retry
-   processor tests changed by the migration.
-5. `cargo xtask check` as the required final Rust validation.
-6. `python3 tools/sanitycheck.py` from the repository root, including the
-   ASCII-only Rust-source check.
-
-No build, test, or implementation validation has been run during planning.
-
 ## Next Exact Action
 
-Obtain user approval for this PR A plan. After approval, create an implementation
-branch and worktree from refreshed `origin/main`; do not base implementation on
-this coordination branch.
+Obtain explicit user authorization to push
+`lalitb/retained-work-local-resume-id`. After authorization, push the existing
+implementation commit without rebasing it onto the coordination branch. Do not
+open a GitHub PR, post comments, or request review without separate explicit
+authorization.
 
 ## Session Handoff
 
