@@ -269,6 +269,9 @@ impl fmt::Display for AnyValue {
                     }
                     write!(f, "")?;
                 }
+                Value::StringValueStrindex(index) => {
+                    write!(f, "<string_table[{index}]>")?;
+                }
             }
         } else {
             write!(f, "")?;

@@ -4224,6 +4224,7 @@ mod test {
             .map(|(i, val)| KeyValue {
                 key: format!("{i:?}"),
                 value: Some(val),
+                key_strindex: 0,
             })
             .collect::<Vec<_>>();
 
@@ -4231,6 +4232,7 @@ mod test {
         attributes.push(KeyValue {
             key: "noneval".to_string(),
             value: None,
+            key_strindex: 0,
         });
 
         LogsData::new(vec![ResourceLogs {

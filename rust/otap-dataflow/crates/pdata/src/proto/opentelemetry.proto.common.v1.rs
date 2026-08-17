@@ -3,7 +3,7 @@
 #[derive(crate::otlp::Message)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AnyValue {
-    #[prost(oneof = "any_value::Value", tags = "1, 2, 3, 4, 5, 6, 7")]
+    #[prost(oneof = "any_value::Value", tags = "1, 2, 3, 4, 5, 6, 7, 8")]
     pub value: ::core::option::Option<any_value::Value>,
 }
 /// Nested message and enum types in `AnyValue`.
@@ -24,6 +24,8 @@ pub mod any_value {
         KvlistValue(super::KeyValueList),
         #[prost(bytes, tag = "7")]
         BytesValue(::prost::alloc::vec::Vec<u8>),
+        #[prost(int32, tag = "8")]
+        StringValueStrindex(i32),
     }
 }
 #[crate::otlp::qualified("opentelemetry.proto.common.v1.ArrayValue")]
@@ -48,6 +50,8 @@ pub struct KeyValue {
     pub key: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "2")]
     pub value: ::core::option::Option<AnyValue>,
+    #[prost(int32, tag = "3")]
+    pub key_strindex: i32,
 }
 #[crate::otlp::qualified("opentelemetry.proto.common.v1.InstrumentationScope")]
 #[derive(crate::otlp::Message)]

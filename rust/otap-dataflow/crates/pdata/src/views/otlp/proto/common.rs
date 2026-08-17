@@ -190,7 +190,9 @@ impl From<&any_value::Value> for ValueType {
             any_value::Value::DoubleValue(_) => ValueType::Double,
             any_value::Value::IntValue(_) => ValueType::Int64,
             any_value::Value::KvlistValue(_) => ValueType::KeyValueList,
-            any_value::Value::StringValue(_) => ValueType::String,
+            any_value::Value::StringValue(_) | any_value::Value::StringValueStrindex(_) => {
+                ValueType::String
+            }
         }
     }
 }

@@ -105,7 +105,7 @@ pub static REQUIRED_PARAMS: LazyLock<HashMap<&'static str, ParamConfig>> = LazyL
         ),
         (
             "opentelemetry.proto.common.v1.KeyValue",
-            simple(vec!["key", "value"]),
+            some_simple(vec!["key", "value"], vec!["key_strindex"]),
         ),
         (
             "opentelemetry.proto.common.v1.KeyValueList",
@@ -338,6 +338,13 @@ pub static ONEOF_MAPPINGS: LazyLock<HashMap<String, Vec<OneofCase>>> = LazyLock:
                     "any_value::Value::BytesValue",
                     7,
                     "bytes",
+                ),
+                oneof(
+                    "string_value_strindex",
+                    "i32",
+                    "any_value::Value::StringValueStrindex",
+                    8,
+                    "int32",
                 ),
             ],
         ),

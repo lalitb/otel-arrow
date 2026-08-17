@@ -306,6 +306,56 @@ mod tests {
     use crate::proto::opentelemetry::resource::v1::Resource;
     use crate::proto::opentelemetry::trace::v1::{ResourceSpans, ScopeSpans, Span, TracesData};
 
+    /// Scenario: Profiles payload declarations occupy the reserved contiguous range 50 through 63.
+    /// Guarantees: Every declared wire number and protobuf name remains stable for OTAP peers.
+    #[test]
+    fn profiles_payload_type_declarations_are_stable() {
+        use crate::proto::opentelemetry::arrow::v1::ArrowPayloadType;
+
+        let declarations = [
+            (ArrowPayloadType::Profiles, 50, "PROFILES"),
+            (
+                ArrowPayloadType::ProfileValueTypes,
+                51,
+                "PROFILE_VALUE_TYPES",
+            ),
+            (ArrowPayloadType::Samples, 52, "SAMPLES"),
+            (ArrowPayloadType::Stacks, 53, "STACKS"),
+            (ArrowPayloadType::StackLocations, 54, "STACK_LOCATIONS"),
+            (ArrowPayloadType::ProfileLocations, 55, "PROFILE_LOCATIONS"),
+            (
+                ArrowPayloadType::ProfileLocationLines,
+                56,
+                "PROFILE_LOCATION_LINES",
+            ),
+            (ArrowPayloadType::ProfileFunctions, 57, "PROFILE_FUNCTIONS"),
+            (ArrowPayloadType::ProfileMappings, 58, "PROFILE_MAPPINGS"),
+            (ArrowPayloadType::ProfileLinks, 59, "PROFILE_LINKS"),
+            (ArrowPayloadType::ProfileAttrs, 60, "PROFILE_ATTRS"),
+            (
+                ArrowPayloadType::ProfileSampleAttrs,
+                61,
+                "PROFILE_SAMPLE_ATTRS",
+            ),
+            (
+                ArrowPayloadType::ProfileMappingAttrs,
+                62,
+                "PROFILE_MAPPING_ATTRS",
+            ),
+            (
+                ArrowPayloadType::ProfileLocationAttrs,
+                63,
+                "PROFILE_LOCATION_ATTRS",
+            ),
+        ];
+
+        for (payload_type, number, name) in declarations {
+            assert_eq!(payload_type as i32, number);
+            assert_eq!(payload_type.as_str_name(), name);
+            assert_eq!(ArrowPayloadType::from_str_name(name), Some(payload_type));
+        }
+    }
+
     #[test]
     fn test_logs_num_items() {
         let logs = LogsData::new(vec![

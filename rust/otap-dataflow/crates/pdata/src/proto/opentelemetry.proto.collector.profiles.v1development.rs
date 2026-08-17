@@ -3,6 +3,8 @@
 pub struct ExportProfilesServiceRequest {
     #[prost(message, repeated, tag = "1")]
     pub resource_profiles: ::prost::alloc::vec::Vec<super::super::super::profiles::v1development::ResourceProfiles>,
+    #[prost(message, optional, tag = "2")]
+    pub dictionary: ::core::option::Option<super::super::super::profiles::v1development::ProfilesDictionary>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExportProfilesServiceResponse {

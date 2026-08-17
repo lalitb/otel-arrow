@@ -134,10 +134,12 @@ fn test_key_value() {
     let kv1_value = KeyValue {
         key: k1.clone(),
         value: Some(v1.clone()),
+        key_strindex: 0,
     };
     let kv2_value = KeyValue {
         key: k2.clone(),
         value: Some(v2.clone()),
+        key_strindex: 0,
     };
 
     let kv1_test1 = KeyValue::new("k1", v1.clone());
