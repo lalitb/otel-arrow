@@ -284,6 +284,7 @@ mod tests {
                                                 value: Some(AnyValue {
                                                     value: Some(any_value::Value::BoolValue(true)),
                                                 }),
+                                                ..Default::default()
                                             }],
                                         })),
                                     },

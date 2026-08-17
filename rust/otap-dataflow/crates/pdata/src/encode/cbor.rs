@@ -174,12 +174,14 @@ mod test {
                             value: Some(AnyValue {
                                 value: Some(any_value::Value::StringValue("bar".to_string())),
                             }),
+                            key_strindex: 0,
                         },
                         KeyValue {
                             key: "baz".to_string(),
                             value: Some(AnyValue {
                                 value: Some(any_value::Value::IntValue(123)),
                             }),
+                            key_strindex: 0,
                         },
                     ],
                 }),
@@ -219,12 +221,14 @@ mod test {
                         value: Some(AnyValue {
                             value: Some(any_value::Value::StringValue("bar".to_string())),
                         }),
+                        key_strindex: 0,
                     },
                     KeyValue {
                         key: "baz".to_string(),
                         value: Some(AnyValue {
                             value: Some(any_value::Value::IntValue(123)),
                         }),
+                        key_strindex: 0,
                     },
                 ],
             ),
@@ -233,6 +237,7 @@ mod test {
                     KeyValue {
                         key: "empty".to_string(),
                         value: None,
+                        key_strindex: 0,
                     },
                     KeyValue::new("bool", AnyValue::new_bool(false)),
                 ],
@@ -240,12 +245,14 @@ mod test {
                     KeyValue {
                         key: "empty".to_string(),
                         value: Some(AnyValue { value: None }),
+                        key_strindex: 0,
                     },
                     KeyValue {
                         key: "bool".to_string(),
                         value: Some(AnyValue {
                             value: Some(any_value::Value::BoolValue(false)),
                         }),
+                        key_strindex: 0,
                     },
                 ],
             ),

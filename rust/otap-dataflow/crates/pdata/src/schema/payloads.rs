@@ -14,7 +14,21 @@ use crate::schema::consts::*;
 #[must_use]
 pub fn get(typ: ArrowPayloadType) -> &'static Schema {
     match typ {
-        ArrowPayloadType::Unknown => &Schema::EMPTY,
+        ArrowPayloadType::Unknown
+        | ArrowPayloadType::Profiles
+        | ArrowPayloadType::ProfileValueTypes
+        | ArrowPayloadType::Samples
+        | ArrowPayloadType::Stacks
+        | ArrowPayloadType::StackLocations
+        | ArrowPayloadType::ProfileLocations
+        | ArrowPayloadType::ProfileLocationLines
+        | ArrowPayloadType::ProfileFunctions
+        | ArrowPayloadType::ProfileMappings
+        | ArrowPayloadType::ProfileLinks
+        | ArrowPayloadType::ProfileAttrs
+        | ArrowPayloadType::ProfileSampleAttrs
+        | ArrowPayloadType::ProfileMappingAttrs
+        | ArrowPayloadType::ProfileLocationAttrs => &Schema::EMPTY,
 
         // Logs
         ArrowPayloadType::Logs => &logs::SCHEMA,

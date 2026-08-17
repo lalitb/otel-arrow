@@ -48,6 +48,25 @@ use super::util::{
 
 mod attributes;
 
+macro_rules! profile_payload_types {
+    () => {
+        ArrowPayloadType::Profiles
+            | ArrowPayloadType::ProfileValueTypes
+            | ArrowPayloadType::Samples
+            | ArrowPayloadType::Stacks
+            | ArrowPayloadType::StackLocations
+            | ArrowPayloadType::ProfileLocations
+            | ArrowPayloadType::ProfileLocationLines
+            | ArrowPayloadType::ProfileFunctions
+            | ArrowPayloadType::ProfileMappings
+            | ArrowPayloadType::ProfileLinks
+            | ArrowPayloadType::ProfileAttrs
+            | ArrowPayloadType::ProfileSampleAttrs
+            | ArrowPayloadType::ProfileMappingAttrs
+            | ArrowPayloadType::ProfileLocationAttrs
+    };
+}
+
 /// identifier for column encoding
 #[derive(Clone, Copy)]
 pub(crate) enum Encoding {
@@ -232,7 +251,7 @@ const fn get_column_encodings(
                 encoding: Encoding::DeltaRemapped,
             },
         ],
-        ArrowPayloadType::Unknown => &[],
+        ArrowPayloadType::Unknown | profile_payload_types!() => &[],
     }
 }
 
@@ -289,7 +308,7 @@ const fn get_sort_column_paths(payload_type: &ArrowPayloadType) -> &'static [&'s
             consts::METRIC_TYPE,
             consts::NAME,
         ],
-        ArrowPayloadType::Unknown => &[],
+        ArrowPayloadType::Unknown | profile_payload_types!() => &[],
     }
 }
 
@@ -734,7 +753,8 @@ fn remove_parent_id_column_encoding(
         | ArrowPayloadType::UnivariateMetrics
         | ArrowPayloadType::MultivariateMetrics
         | ArrowPayloadType::Spans
-        | ArrowPayloadType::Unknown => {
+        | ArrowPayloadType::Unknown
+        | profile_payload_types!() => {
             // nothing to do b/c there are no parent ID field for these payload types
             Ok(record_batch.clone())
         }
@@ -1010,7 +1030,7 @@ pub fn remove_transport_optimized_encodings(
             materialize_parent_id_for_exemplars::<u32>(&rb)
         }
 
-        ArrowPayloadType::Unknown => {
+        ArrowPayloadType::Unknown | profile_payload_types!() => {
             // do nothing
             Ok(record_batch.clone())
         }

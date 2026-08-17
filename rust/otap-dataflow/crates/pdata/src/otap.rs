@@ -1091,6 +1091,20 @@ pub const fn parent_payload_type(payload_type: ArrowPayloadType) -> Option<Paren
         | ArrowPayloadType::Spans
         | ArrowPayloadType::UnivariateMetrics
         | ArrowPayloadType::MultivariateMetrics
+        | ArrowPayloadType::Profiles
+        | ArrowPayloadType::ProfileValueTypes
+        | ArrowPayloadType::Samples
+        | ArrowPayloadType::Stacks
+        | ArrowPayloadType::StackLocations
+        | ArrowPayloadType::ProfileLocations
+        | ArrowPayloadType::ProfileLocationLines
+        | ArrowPayloadType::ProfileFunctions
+        | ArrowPayloadType::ProfileMappings
+        | ArrowPayloadType::ProfileLinks
+        | ArrowPayloadType::ProfileAttrs
+        | ArrowPayloadType::ProfileSampleAttrs
+        | ArrowPayloadType::ProfileMappingAttrs
+        | ArrowPayloadType::ProfileLocationAttrs
         | ArrowPayloadType::Unknown => None,
         ArrowPayloadType::ResourceAttrs
         | ArrowPayloadType::ScopeAttrs
