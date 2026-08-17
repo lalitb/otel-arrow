@@ -635,6 +635,7 @@ mod test {
                             value: Some(AnyValue {
                                 value: Some(Value::StringValue(format!("val{i}"))),
                             }),
+                            ..Default::default()
                         })
                     }
 
@@ -647,6 +648,7 @@ mod test {
                         value: Some(AnyValue {
                             value: Some(Value::StringValue("val1".to_string())),
                         }),
+                        ..Default::default()
                     }]);
 
                     ctx.send_pdata(pdata2).await.unwrap();
@@ -662,6 +664,7 @@ mod test {
                             value: Some(AnyValue {
                                 value: Some(Value::StringValue(format!("val{i}"))),
                             }),
+                            ..Default::default()
                         })
                     }
                     let pdata3 = fixtures::create_single_logs_pdata_with_attrs(attrs3).payload();
@@ -740,6 +743,7 @@ mod test {
                         fixtures::create_single_logs_pdata_with_attrs(vec![KeyValue {
                             key: "strkey".to_string(),
                             value: Some(AnyValue::new_string("terry")),
+                            ..Default::default()
                         }])
                         .payload()
                         .try_into_with_default()
@@ -749,6 +753,7 @@ mod test {
                         fixtures::create_single_logs_pdata_with_attrs(vec![KeyValue {
                             key: "intkey".to_string(),
                             value: Some(AnyValue::new_int(418)),
+                            ..Default::default()
                         }])
                         .payload()
                         .try_into_with_default()

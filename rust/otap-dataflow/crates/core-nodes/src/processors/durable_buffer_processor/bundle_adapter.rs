@@ -1248,6 +1248,8 @@ mod tests {
     // Edge case and boundary tests
     // -------------------------------------------------------------------------
 
+    /// Scenario: Slot IDs in protobuf enum gaps are decoded by the durable buffer adapter.
+    /// Guarantees: Gaps are rejected without being assigned a signal or payload type.
     #[test]
     fn test_invalid_slot_ids_return_none() {
         // Test that gap/invalid slot IDs are handled correctly
@@ -1261,8 +1263,8 @@ mod tests {
             32, // Just after LOG_ATTRS (31)
             39, // Just before SPANS (40)
             46, // Just after SPAN_LINK_ATTRS (45)
-            50, // Well outside any range
-            59, // Just before OTLP range
+            47, // Gap before the Profiles range
+            49, // Just before PROFILES (50)
         ];
 
         for raw in invalid_slots {
@@ -1289,8 +1291,8 @@ mod tests {
                 || raw == 32
                 || raw == 39
                 || raw == 46
-                || raw == 50
-                || raw == 59
+                || raw == 47
+                || raw == 49
             {
                 assert!(
                     slot_to_payload_type(slot).is_none(),

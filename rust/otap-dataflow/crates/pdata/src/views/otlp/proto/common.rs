@@ -190,9 +190,8 @@ impl From<&any_value::Value> for ValueType {
             any_value::Value::DoubleValue(_) => ValueType::Double,
             any_value::Value::IntValue(_) => ValueType::Int64,
             any_value::Value::KvlistValue(_) => ValueType::KeyValueList,
-            any_value::Value::StringValue(_) | any_value::Value::StringValueStrindex(_) => {
-                ValueType::String
-            }
+            any_value::Value::StringValue(_) => ValueType::String,
+            any_value::Value::StringValueStrindex(_) => ValueType::Empty,
         }
     }
 }
@@ -270,4 +269,22 @@ pub(crate) fn parse_trace_id(data: &[u8]) -> Option<&TraceId> {
 pub(crate) fn parse_span_id(data: &[u8]) -> Option<&SpanId> {
     let span_id: &SpanId = data.try_into().ok()?;
     (span_id != &[0; 8]).then_some(span_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Scenario: A non-Profiles proto object contains a Profiles string-table reference.
+    /// Guarantees: The shared view treats the unresolved reference as empty instead of panicking.
+    #[test]
+    fn unresolved_profile_string_reference_is_empty() {
+        let value = AnyValue {
+            value: Some(any_value::Value::StringValueStrindex(1)),
+        };
+        let view = ObjAny::new(&value);
+
+        assert_eq!(view.value_type(), ValueType::Empty);
+        assert!(view.as_string().is_none());
+    }
 }

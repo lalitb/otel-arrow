@@ -40,6 +40,7 @@ fn create_logs_data() -> LogsData {
         .map(|(i, val)| KeyValue {
             key: format!("{i:?}"),
             value: Some(val),
+            ..Default::default()
         })
         .collect::<Vec<_>>();
 
@@ -47,6 +48,7 @@ fn create_logs_data() -> LogsData {
     log_attributes.push(KeyValue {
         key: "noneval".to_string(),
         value: None,
+        ..Default::default()
     });
 
     LogsData::new(

@@ -12,14 +12,16 @@ review. That package is explicitly unstable. Implementation must pin a specific
 upstream protobuf revision and repeat the compatibility analysis before schemas
 or payload type numbers are committed.
 
-The generated Profiles types currently checked into the Rust dataflow tree
-predate the current `ProfilesDictionary` envelope. They are useful evidence of
-protocol evolution, but must not be treated as the source of truth for an
-implementation of this proposal.
+Implementation step 1 pins `opentelemetry-proto` commit
+`7c63f7b8b69e83bdda071a70898cd8a9f4ec77a2` and regenerates the Rust Profiles
+types from that revision. The compatibility analysis below records the drift
+from the previously checked-in generated types; every listed row is resolved by
+that pin. Supporting an older Collector-compatible revision still requires an
+explicit compatibility layer.
 
-The drift is material:
+The resolved drift was material:
 
-| Checked-in generated type | Current upstream model |
+| Previously checked-in generated type | Pinned upstream model |
 |---|---|
 | repeated `Profile.sample_type` | singular `Profile.sample_type` |
 | `Profile.location_indices` | removed; replaced by the stack dictionary |
@@ -35,9 +37,8 @@ The drift is material:
 | optional `Location.mapping_index` | zero-index-means-null `mapping_index` |
 | no `Stack` message | `Stack` and `ProfilesDictionary.stack_table` |
 
-This proposal follows the current upstream column on the right. Supporting an
-older Collector-compatible revision requires an explicit compatibility layer,
-not a schema that combines fields from different revisions.
+The proposed schemas follow the pinned upstream column on the right and must
+not combine fields from different revisions.
 
 ## Goals
 

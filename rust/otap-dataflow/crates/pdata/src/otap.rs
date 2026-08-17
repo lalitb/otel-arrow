@@ -1092,20 +1092,27 @@ pub const fn parent_payload_type(payload_type: ArrowPayloadType) -> Option<Paren
         | ArrowPayloadType::UnivariateMetrics
         | ArrowPayloadType::MultivariateMetrics
         | ArrowPayloadType::Profiles
-        | ArrowPayloadType::ProfileValueTypes
-        | ArrowPayloadType::Samples
         | ArrowPayloadType::Stacks
-        | ArrowPayloadType::StackLocations
         | ArrowPayloadType::ProfileLocations
-        | ArrowPayloadType::ProfileLocationLines
         | ArrowPayloadType::ProfileFunctions
         | ArrowPayloadType::ProfileMappings
         | ArrowPayloadType::ProfileLinks
-        | ArrowPayloadType::ProfileAttrs
-        | ArrowPayloadType::ProfileSampleAttrs
-        | ArrowPayloadType::ProfileMappingAttrs
-        | ArrowPayloadType::ProfileLocationAttrs
         | ArrowPayloadType::Unknown => None,
+        ArrowPayloadType::ProfileValueTypes
+        | ArrowPayloadType::Samples
+        | ArrowPayloadType::ProfileAttrs => Some(ParentPayloadType::Root),
+        ArrowPayloadType::StackLocations => {
+            Some(ParentPayloadType::NonRoot(ArrowPayloadType::Stacks))
+        }
+        ArrowPayloadType::ProfileLocationLines | ArrowPayloadType::ProfileLocationAttrs => Some(
+            ParentPayloadType::NonRoot(ArrowPayloadType::ProfileLocations),
+        ),
+        ArrowPayloadType::ProfileSampleAttrs => {
+            Some(ParentPayloadType::NonRoot(ArrowPayloadType::Samples))
+        }
+        ArrowPayloadType::ProfileMappingAttrs => Some(ParentPayloadType::NonRoot(
+            ArrowPayloadType::ProfileMappings,
+        )),
         ArrowPayloadType::ResourceAttrs
         | ArrowPayloadType::ScopeAttrs
         | ArrowPayloadType::LogAttrs

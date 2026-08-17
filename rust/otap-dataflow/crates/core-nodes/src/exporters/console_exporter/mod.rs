@@ -733,6 +733,7 @@ mod tests {
         KeyValue {
             key: key.to_string(),
             value: Some(any_value(value)),
+            ..Default::default()
         }
     }
 
@@ -1508,6 +1509,7 @@ mod tests {
                         KeyValue {
                             key: "removed".to_string(),
                             value: None,
+                            ..Default::default()
                         },
                     ],
                 }),
@@ -1515,10 +1517,12 @@ mod tests {
             KeyValue {
                 key: "empty".to_string(),
                 value: Some(AnyValue { value: None }),
+                ..Default::default()
             },
             KeyValue {
                 key: "missing".to_string(),
                 value: None,
+                ..Default::default()
             },
             attribute(
                 "duplicate",
@@ -1535,6 +1539,7 @@ mod tests {
             KeyValue {
                 key: "removed".to_string(),
                 value: None,
+                ..Default::default()
             },
         ];
         let logs_data = LogsData {
