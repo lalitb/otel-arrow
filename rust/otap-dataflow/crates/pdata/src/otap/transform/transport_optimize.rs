@@ -753,9 +753,12 @@ fn remove_parent_id_column_encoding(
         | ArrowPayloadType::UnivariateMetrics
         | ArrowPayloadType::MultivariateMetrics
         | ArrowPayloadType::Spans
-        | ArrowPayloadType::Unknown
-        | profile_payload_types!() => {
+        | ArrowPayloadType::Unknown => {
             // nothing to do b/c there are no parent ID field for these payload types
+            Ok(record_batch.clone())
+        }
+        profile_payload_types!() => {
+            // TODO: Apply the Profiles parent-ID rules when its schemas land.
             Ok(record_batch.clone())
         }
     }
@@ -1030,8 +1033,12 @@ pub fn remove_transport_optimized_encodings(
             materialize_parent_id_for_exemplars::<u32>(&rb)
         }
 
-        ArrowPayloadType::Unknown | profile_payload_types!() => {
+        ArrowPayloadType::Unknown => {
             // do nothing
+            Ok(record_batch.clone())
+        }
+        profile_payload_types!() => {
+            // TODO: Decode Profiles transport encodings when its schemas land.
             Ok(record_batch.clone())
         }
     }

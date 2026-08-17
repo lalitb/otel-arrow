@@ -2563,12 +2563,14 @@ mod telemetry_tests {
                                     value: Some(AnyValue {
                                         value: Some(AnyVal::StringValue("v".into())),
                                     }),
+                                    ..Default::default()
                                 },
                                 KeyValue {
                                     key: "x".to_string(), // ensure at least one deletion occurs
                                     value: Some(AnyValue {
                                         value: Some(AnyVal::StringValue("to_delete".into())),
                                     }),
+                                    ..Default::default()
                                 },
                             ],
                             severity_number: SeverityNumber::Info as i32,

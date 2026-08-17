@@ -216,6 +216,27 @@ A `type` MUST NOT be sent as `UNKNOWN` (value 0).
 | RESOURCE_ATTRS   | Resource attributes   | SPANS               |
 | SCOPE_ATTRS      | Scope attributes      | SPANS               |
 
+#### 3.1.4 Profiles Allowed Payload Types
+
+| Payload Type           | Description                     | Parent Payload Type |
+| ---------------------- | ------------------------------- | ------------------- |
+| PROFILES               | Core profile data (Root)        | -                   |
+| PROFILE_VALUE_TYPES    | Profile sample and period types | PROFILES            |
+| SAMPLES                | Profile samples                 | PROFILES            |
+| STACKS                 | BAR-scoped stack dimension      | -                   |
+| STACK_LOCATIONS        | Ordered locations in a stack    | STACKS              |
+| PROFILE_LOCATIONS      | BAR-scoped location dimension   | -                   |
+| PROFILE_LOCATION_LINES | Ordered lines for a location    | PROFILE_LOCATIONS   |
+| PROFILE_FUNCTIONS      | BAR-scoped function dimension   | -                   |
+| PROFILE_MAPPINGS       | BAR-scoped mapping dimension    | -                   |
+| PROFILE_LINKS          | BAR-scoped trace link dimension | -                   |
+| PROFILE_ATTRS          | Profile attributes              | PROFILES            |
+| PROFILE_SAMPLE_ATTRS   | Sample attributes               | SAMPLES             |
+| PROFILE_MAPPING_ATTRS  | Mapping attributes              | PROFILE_MAPPINGS    |
+| PROFILE_LOCATION_ATTRS | Location attributes             | PROFILE_LOCATIONS   |
+| RESOURCE_ATTRS         | Resource attributes             | PROFILES            |
+| SCOPE_ATTRS            | Scope attributes                | PROFILES            |
+
 ### 3.2 BatchStatus Acknowledgment
 
 The `BatchStatus` message provides feedback from server to client about the

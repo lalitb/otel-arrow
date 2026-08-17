@@ -81,6 +81,9 @@ pub const POSITION_LOOKUP: &[usize] = &[
 // Constants -- type masks and counts for each signal type
 // ---------------------------------------------------------------------------
 
+// Payload-type masks use one bit per protobuf enum value. Values above 63
+// require replacing this u64 representation before they can be declared.
+
 /// Bitmask of valid [`ArrowPayloadType`] values for the Logs signal.
 pub const LOGS_TYPE_MASK: u64 = (1 << ArrowPayloadType::ResourceAttrs as u64)
     + (1 << ArrowPayloadType::ScopeAttrs as u64)

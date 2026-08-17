@@ -274,6 +274,7 @@ fn keyvalue_to_proto(kv: &KeyValue) -> Option<ProtoKeyValue> {
     anyvalue_to_proto(&kv.value).map(|val| ProtoKeyValue {
         key: kv.key.clone(),
         value: Some(val),
+        ..Default::default()
     })
 }
 
@@ -315,6 +316,7 @@ mod tests {
                 value: Some(ProtoValue {
                     value: Some(ProtoAnyValue::StringValue(val.into())),
                 }),
+                ..Default::default()
             }
         }
 
@@ -379,6 +381,7 @@ mod tests {
                 value: Some(ProtoValue {
                     value: Some(ProtoAnyValue::StringValue(val.into())),
                 }),
+                ..Default::default()
             }
         }
 
@@ -441,6 +444,7 @@ mod tests {
                 value: Some(ProtoValue {
                     value: Some(ProtoAnyValue::StringValue(val.into())),
                 }),
+                ..Default::default()
             }
         }
         let logs = LogsData {

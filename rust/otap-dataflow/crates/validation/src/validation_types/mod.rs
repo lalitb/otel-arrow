@@ -315,6 +315,7 @@ mod tests {
                             value: Some(ProtoAny {
                                 value: Some(ProtoVal::StringValue("bar".into())),
                             }),
+                            ..Default::default()
                         }],
                         ..Default::default()
                     }],
@@ -346,6 +347,7 @@ mod tests {
                             value: Some(ProtoAny {
                                 value: Some(ProtoVal::StringValue("x".into())),
                             }),
+                            ..Default::default()
                         }],
                         ..Default::default()
                     }],
@@ -378,12 +380,14 @@ mod tests {
                                 value: Some(ProtoAny {
                                     value: Some(ProtoVal::StringValue("a".into())),
                                 }),
+                                ..Default::default()
                             },
                             ProtoKV {
                                 key: "dup".into(),
                                 value: Some(ProtoAny {
                                     value: Some(ProtoVal::StringValue("b".into())),
                                 }),
+                                ..Default::default()
                             },
                         ],
                         ..Default::default()
