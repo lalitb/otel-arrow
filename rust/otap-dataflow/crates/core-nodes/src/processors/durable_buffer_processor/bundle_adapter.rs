@@ -19,6 +19,7 @@
 //! | Metrics | UNIVARIATE_METRICS (10) through METRIC_ATTRS (26)           | 17          |
 //! | Logs    | LOGS (30), LOG_ATTRS (31)                                   | 2           |
 //! | Traces  | SPANS (40) through SPAN_LINK_ATTRS (45)                     | 6           |
+//! | Profiles| Reserved internal slots 46 through 59                       | 14          |
 //!
 //! Total tables per signal (including shared RESOURCE_ATTRS and SCOPE_ATTRS):
 //! - Logs: 4 tables (LOGS, LOG_ATTRS, RESOURCE_ATTRS, SCOPE_ATTRS)
@@ -32,6 +33,10 @@
 //! - Slot 60: OTLP Logs
 //! - Slot 61: OTLP Traces
 //! - Slot 62: OTLP Metrics
+//! - Slot 63: reserved for OTLP Profiles
+//!
+//! Profiles Arrow slots 46-59 being near Profiles wire values 50-63 is
+//! coincidental. Code must always use the explicit mapping functions below.
 //!
 //! Note: Slots identify payload *types*, not schemas. Within each slot, Quiver
 //! supports many different schemas via `(slot_id, schema_fingerprint)` pairs
@@ -80,17 +85,24 @@ mod otlp_slots {
     pub const OTLP_LOGS: u16 = 60;
     pub const OTLP_TRACES: u16 = 61;
     pub const OTLP_METRICS: u16 = 62;
+    // Reserved until SignalType::Profiles and opaque Profiles storage exist.
+    #[cfg(test)]
+    pub const OTLP_PROFILES: u16 = 63;
 }
 
 #[derive(Clone, Copy)]
 enum PayloadSignal {
     Shared,
     Signal(SignalType),
+    Reserved,
 }
 
 macro_rules! payload_signal {
     (Shared) => {
         PayloadSignal::Shared
+    };
+    (Reserved) => {
+        PayloadSignal::Reserved
     };
     ($signal:ident) => {
         PayloadSignal::Signal(SignalType::$signal)
@@ -162,6 +174,20 @@ define_arrow_wal_slots! {
     SpanLinks => (43, Traces),
     SpanEventAttrs => (44, Traces),
     SpanLinkAttrs => (45, Traces),
+    Profiles => (46, Reserved),
+    ProfileValueTypes => (47, Reserved),
+    Samples => (48, Reserved),
+    Stacks => (49, Reserved),
+    StackLocations => (50, Reserved),
+    ProfileLocations => (51, Reserved),
+    ProfileLocationLines => (52, Reserved),
+    ProfileFunctions => (53, Reserved),
+    ProfileMappings => (54, Reserved),
+    ProfileLinks => (55, Reserved),
+    ProfileAttrs => (56, Reserved),
+    ProfileSampleAttrs => (57, Reserved),
+    ProfileMappingAttrs => (58, Reserved),
+    ProfileLocationAttrs => (59, Reserved),
 }
 
 /// Convert signal type to OTLP slot ID (for opaque binary storage)
@@ -181,6 +207,18 @@ const fn is_otlp_slot(slot: SlotId) -> Option<SignalType> {
         otlp_slots::OTLP_METRICS => Some(SignalType::Metrics),
         _ => None,
     }
+}
+
+/// Whether a slot is reserved for an opaque OTLP payload, including Profiles.
+#[cfg(test)]
+const fn is_reserved_otlp_slot(slot: SlotId) -> bool {
+    matches!(
+        slot.raw(),
+        otlp_slots::OTLP_LOGS
+            | otlp_slots::OTLP_TRACES
+            | otlp_slots::OTLP_METRICS
+            | otlp_slots::OTLP_PROFILES
+    )
 }
 
 /// Determine signal type from a slot ID (works for both Arrow and OTLP slots).
@@ -218,11 +256,13 @@ const fn is_shared_slot(slot: SlotId) -> bool {
 /// # Returns
 /// - `Some((signal_type, payload_type))` for signal-specific slots
 /// - `None` for shared slots (RESOURCE_ATTRS, SCOPE_ATTRS) since they're used by all signals
-/// - `None` for OTLP opaque slots (60-62) or invalid slot IDs
+/// - `None` for reserved Profiles slots until Profiles engine integration
+/// - `None` for OTLP opaque slots or invalid slot IDs
 fn from_slot_id(slot: SlotId) -> Option<(SignalType, ArrowPayloadType)> {
     let payload_type = slot_to_payload_type(slot)?;
     let signal_type = match payload_signal_type(payload_type)? {
         PayloadSignal::Shared => return None,
+        PayloadSignal::Reserved => return None,
         PayloadSignal::Signal(signal_type) => signal_type,
     };
 
@@ -687,7 +727,7 @@ mod tests {
     }
 
     /// Scenario: Every assigned Arrow WAL slot is decoded and encoded again.
-    /// Guarantees: The explicit mapping is bijective for all 27 usable payload types.
+    /// Guarantees: The explicit mapping is bijective for all 41 usable Arrow payload types.
     #[test]
     fn test_arrow_slot_mapping_is_bijective() {
         let mut mapped_count = 0;
@@ -704,7 +744,7 @@ mod tests {
             }
         }
 
-        assert_eq!(mapped_count, 27);
+        assert_eq!(mapped_count, 41);
     }
 
     /// Scenario: An unknown Arrow payload type is presented for WAL persistence.
@@ -716,7 +756,7 @@ mod tests {
     }
 
     /// Scenario: Existing Arrow payloads are mapped after storage decoupling.
-    /// Guarantees: Every persisted WAL assignment remains byte-for-byte compatible.
+    /// Guarantees: Every pre-Profiles WAL assignment remains byte-for-byte compatible.
     #[test]
     fn test_existing_arrow_slot_assignments_are_stable() {
         let expected = [
@@ -756,17 +796,48 @@ mod tests {
         }
     }
 
-    /// Scenario: Arrow and opaque OTLP payloads share the WAL slot bitmap.
-    /// Guarantees: Current allocations are in range, unique, and never overlap.
+    /// Scenario: Profiles payloads are assigned storage slots before engine integration.
+    /// Guarantees: The 14 tables occupy exactly slots 46-59 in declaration order.
     #[test]
-    fn test_arrow_and_otlp_slot_allocations_do_not_collide() {
+    fn test_profiles_arrow_slots_are_reserved_contiguously() {
+        let profiles = [
+            ArrowPayloadType::Profiles,
+            ArrowPayloadType::ProfileValueTypes,
+            ArrowPayloadType::Samples,
+            ArrowPayloadType::Stacks,
+            ArrowPayloadType::StackLocations,
+            ArrowPayloadType::ProfileLocations,
+            ArrowPayloadType::ProfileLocationLines,
+            ArrowPayloadType::ProfileFunctions,
+            ArrowPayloadType::ProfileMappings,
+            ArrowPayloadType::ProfileLinks,
+            ArrowPayloadType::ProfileAttrs,
+            ArrowPayloadType::ProfileSampleAttrs,
+            ArrowPayloadType::ProfileMappingAttrs,
+            ArrowPayloadType::ProfileLocationAttrs,
+        ];
+
+        for (offset, payload_type) in profiles.into_iter().enumerate() {
+            let raw = 46 + offset as u16;
+            assert_eq!(to_slot_id(SignalType::Logs, payload_type).raw(), raw);
+            assert_eq!(slot_to_payload_type(SlotId::new(raw)), Some(payload_type));
+            assert!(from_slot_id(SlotId::new(raw)).is_none());
+        }
+    }
+
+    /// Scenario: Arrow and opaque OTLP allocations share the 64-slot WAL bitmap.
+    /// Guarantees: All assignments plus unavailable slot zero are unique, leaving 18 free slots.
+    #[test]
+    fn test_wal_slot_allocations_do_not_collide() {
         let mut occupied = [false; WAL_SLOT_COUNT as usize];
+        // Slot zero corresponds to UNKNOWN and is intentionally unavailable.
+        occupied[0] = true;
+        let mut occupied_count = 1;
 
         for raw in 0..WAL_SLOT_COUNT {
             if slot_to_payload_type(SlotId::new(raw)).is_some() {
-                let index = raw as usize;
-                assert!(!occupied[index], "duplicate Arrow WAL slot {raw}");
-                occupied[index] = true;
+                occupied[raw as usize] = true;
+                occupied_count += 1;
             }
         }
 
@@ -774,15 +845,20 @@ mod tests {
             otlp_slots::OTLP_LOGS,
             otlp_slots::OTLP_TRACES,
             otlp_slots::OTLP_METRICS,
+            otlp_slots::OTLP_PROFILES,
         ] {
             assert!(raw < WAL_SLOT_COUNT);
             let index = raw as usize;
             assert!(
                 !occupied[index],
-                "opaque OTLP slot {raw} collides with Arrow"
+                "opaque slot {raw} collides with Arrow data"
             );
             occupied[index] = true;
+            occupied_count += 1;
         }
+
+        assert_eq!(occupied_count, 46);
+        assert_eq!(occupied.iter().filter(|used| !**used).count(), 18);
     }
 
     #[test]
@@ -1262,9 +1338,6 @@ mod tests {
             29, // Just before LOGS (30)
             32, // Just after LOG_ATTRS (31)
             39, // Just before SPANS (40)
-            46, // Just after SPAN_LINK_ATTRS (45)
-            47, // Gap before the Profiles range
-            49, // Just before PROFILES (50)
         ];
 
         for raw in invalid_slots {
@@ -1284,16 +1357,7 @@ mod tests {
 
             // slot_to_payload_type depends on whether prost accepts the value
             // For truly invalid values (gaps), it should return None
-            if raw == 3
-                || raw == 9
-                || raw == 27
-                || raw == 29
-                || raw == 32
-                || raw == 39
-                || raw == 46
-                || raw == 47
-                || raw == 49
-            {
+            if raw == 3 || raw == 9 || raw == 27 || raw == 29 || raw == 32 || raw == 39 {
                 assert!(
                     slot_to_payload_type(slot).is_none(),
                     "slot {} should return None from slot_to_payload_type",
@@ -1428,14 +1492,19 @@ mod tests {
         }
     }
 
+    /// Scenario: Reserved opaque OTLP slots are inspected as Arrow storage slots.
+    /// Guarantees: Slots 60-63 never decode as Arrow payloads or shared slots.
     #[test]
     fn test_otlp_slots_are_not_arrow_slots() {
-        // OTLP slots (60-62) should not be treated as Arrow payload slots
-        for raw in [60, 61, 62] {
+        for raw in [60, 61, 62, 63] {
             let slot = SlotId::new(raw);
 
-            // Should be identified as OTLP slot
-            assert!(is_otlp_slot(slot).is_some(), "slot {} should be OTLP", raw);
+            assert!(is_reserved_otlp_slot(slot), "slot {raw} should be reserved");
+            if raw < 63 {
+                assert!(is_otlp_slot(slot).is_some(), "slot {raw} should be active");
+            } else {
+                assert!(is_otlp_slot(slot).is_none(), "slot 63 is reserved only");
+            }
 
             // Should NOT be an Arrow payload type
             assert!(
