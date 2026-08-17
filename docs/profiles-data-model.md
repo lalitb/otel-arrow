@@ -822,9 +822,20 @@ then recheck each output and the concurrent aggregate against configured limits.
 
 ## Transport, Batching, and Schema Evolution
 
-Profiles requires new Arrow payload type identifiers for the root and related
-batches. Those numeric assignments belong in a protocol change after this data
-model is approved.
+Profiles uses the Arrow payload type identifiers declared by implementation
+step 1. Protocol enum values are wire identifiers and must not be used directly
+as internal durable-buffer positions.
+
+The durable buffer uses an explicit, global slot mapping. Existing assignments
+remain unchanged for persisted-segment compatibility. Profiles Arrow tables
+reserve the contiguous internal slots 46 through 59, and internal slot 63 is
+reserved for future opaque OTLP Profiles storage. The proximity of Profiles
+wire values 50 through 63 to internal slots 46 through 59 is coincidental.
+Slots 60 through 62 retain their existing opaque OTLP Logs, Traces, and Metrics
+meanings. Of the 64 bitmap positions, slot zero is unavailable, 41 hold usable
+Arrow payloads, four are opaque OTLP reservations, and 18 remain free. Slot
+reservation alone does not provide usable Profiles persistence; durable
+reconstruction is added with Profiles engine and payload integration.
 
 Each payload type uses its own Arrow IPC stream and `schema_id`, consistent with
 the existing OTAP protocol. Adaptive schemas may omit absent optional columns.
@@ -997,16 +1008,20 @@ After design approval, use small dependent changes:
 
 1. Pin or update the Profiles protobuf revision and add payload type
    declarations without conversion behavior.
-2. Add Arrow schema definitions, typed views, and graph validation.
-3. Add OTLP Profiles -> OTAP encoding.
-4. Add OTAP -> OTLP Profiles decoding.
-5. Add semantic equivalence fixtures, fuzzing, and benchmarks.
-6. Add `SignalType::Profiles` and Profiles payload integration to the dataflow
-   engine.
-7. Add OTLP Profiles receiver and exporter support.
-8. Add OTAP Profiles transport and batching behavior.
-9. Add native profile attribute and redaction kernels.
-10. Expose selected semantic kernels through the experimental Wasm host.
+2. Decouple internal durable-buffer slots from protocol enum values, preserve
+   existing assignments, and reserve Profiles slots without enabling Profiles
+   reconstruction.
+3. Add Arrow schema definitions, typed views, and graph validation.
+4. Add `SignalType::Profiles`, `OtapArrowRecords::Profiles`, memory accounting,
+   batching primitives, and durable-buffer reconstruction.
+5. Add OTLP Profiles -> OTAP encoding.
+6. Add OTAP -> OTLP Profiles decoding.
+7. Add semantic equivalence fixtures, real profiling datasets, fuzzing, and
+   benchmarks.
+8. Add OTLP Profiles receiver and exporter support.
+9. Add OTAP Profiles transport and batching behavior.
+10. Add native profile attribute and redaction kernels.
+11. Expose selected semantic kernels through the experimental Wasm host.
 
 Each layer should compile independently, include its own focused tests, and
 state unsupported behavior explicitly. A tracking issue should record the

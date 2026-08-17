@@ -80,17 +80,23 @@ mod otlp_slots {
     pub const OTLP_LOGS: u16 = 60;
     pub const OTLP_TRACES: u16 = 61;
     pub const OTLP_METRICS: u16 = 62;
+    // Reserved until Profiles is integrated with SignalType and opaque storage.
+    pub const OTLP_PROFILES: u16 = 63;
 }
 
 #[derive(Clone, Copy)]
 enum PayloadSignal {
     Shared,
+    Reserved,
     Signal(SignalType),
 }
 
 macro_rules! payload_signal {
     (Shared) => {
         PayloadSignal::Shared
+    };
+    (ProfilesReserved) => {
+        PayloadSignal::Reserved
     };
     ($signal:ident) => {
         PayloadSignal::Signal(SignalType::$signal)
@@ -162,6 +168,20 @@ define_arrow_wal_slots! {
     SpanLinks => (43, Traces),
     SpanEventAttrs => (44, Traces),
     SpanLinkAttrs => (45, Traces),
+    Profiles => (46, ProfilesReserved),
+    ProfileValueTypes => (47, ProfilesReserved),
+    Samples => (48, ProfilesReserved),
+    Stacks => (49, ProfilesReserved),
+    StackLocations => (50, ProfilesReserved),
+    ProfileLocations => (51, ProfilesReserved),
+    ProfileLocationLines => (52, ProfilesReserved),
+    ProfileFunctions => (53, ProfilesReserved),
+    ProfileMappings => (54, ProfilesReserved),
+    ProfileLinks => (55, ProfilesReserved),
+    ProfileAttrs => (56, ProfilesReserved),
+    ProfileSampleAttrs => (57, ProfilesReserved),
+    ProfileMappingAttrs => (58, ProfilesReserved),
+    ProfileLocationAttrs => (59, ProfilesReserved),
 }
 
 /// Convert signal type to OTLP slot ID (for opaque binary storage)
@@ -222,7 +242,7 @@ const fn is_shared_slot(slot: SlotId) -> bool {
 fn from_slot_id(slot: SlotId) -> Option<(SignalType, ArrowPayloadType)> {
     let payload_type = slot_to_payload_type(slot)?;
     let signal_type = match payload_signal_type(payload_type)? {
-        PayloadSignal::Shared => return None,
+        PayloadSignal::Shared | PayloadSignal::Reserved => return None,
         PayloadSignal::Signal(signal_type) => signal_type,
     };
 
@@ -704,7 +724,7 @@ mod tests {
             }
         }
 
-        assert_eq!(mapped_count, 27);
+        assert_eq!(mapped_count, 41);
     }
 
     /// Scenario: An unknown Arrow payload type is presented for WAL persistence.
@@ -774,6 +794,7 @@ mod tests {
             otlp_slots::OTLP_LOGS,
             otlp_slots::OTLP_TRACES,
             otlp_slots::OTLP_METRICS,
+            otlp_slots::OTLP_PROFILES,
         ] {
             assert!(raw < WAL_SLOT_COUNT);
             let index = raw as usize;
@@ -1262,9 +1283,6 @@ mod tests {
             29, // Just before LOGS (30)
             32, // Just after LOG_ATTRS (31)
             39, // Just before SPANS (40)
-            46, // Just after SPAN_LINK_ATTRS (45)
-            47, // Gap before the Profiles range
-            49, // Just before PROFILES (50)
         ];
 
         for raw in invalid_slots {
@@ -1284,16 +1302,7 @@ mod tests {
 
             // slot_to_payload_type depends on whether prost accepts the value
             // For truly invalid values (gaps), it should return None
-            if raw == 3
-                || raw == 9
-                || raw == 27
-                || raw == 29
-                || raw == 32
-                || raw == 39
-                || raw == 46
-                || raw == 47
-                || raw == 49
-            {
+            if raw == 3 || raw == 9 || raw == 27 || raw == 29 || raw == 32 || raw == 39 {
                 assert!(
                     slot_to_payload_type(slot).is_none(),
                     "slot {} should return None from slot_to_payload_type",
