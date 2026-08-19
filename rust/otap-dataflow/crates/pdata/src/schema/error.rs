@@ -38,4 +38,11 @@ pub enum Error {
         /// The actual Arrow data type found.
         actual: DataType,
     },
+
+    /// A Profiles table graph violates a cross-batch invariant.
+    #[error("Invalid Profiles graph: {reason}")]
+    InvalidProfilesGraph {
+        /// Human-readable validation failure.
+        reason: String,
+    },
 }

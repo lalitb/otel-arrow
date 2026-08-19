@@ -13,6 +13,7 @@ use std::sync::Arc;
 pub mod consts;
 pub mod error;
 pub mod payloads;
+pub mod profiles;
 #[allow(clippy::module_inception)]
 pub mod schema;
 
