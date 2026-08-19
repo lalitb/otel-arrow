@@ -19,6 +19,7 @@ pub fn make_item_batches(
         SignalType::Logs => RecordsGroup::separate_logs(records),
         SignalType::Metrics => RecordsGroup::separate_metrics(records),
         SignalType::Traces => RecordsGroup::separate_traces(records),
+        SignalType::Profiles => RecordsGroup::separate_profiles(records),
     }?;
 
     // Split large batches so they can be reassembled into

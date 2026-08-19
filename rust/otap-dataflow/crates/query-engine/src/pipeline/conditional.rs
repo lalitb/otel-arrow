@@ -19,7 +19,8 @@ use otap_df_pdata::otap::filter::{IdBitmapPool, filter_otap_batch};
 
 use crate::error::Result;
 use crate::pipeline::concat::{
-    concatenate_attrs_record_batches, concatenate_logs, concatenate_metrics, concatenate_traces,
+    concatenate_attrs_record_batches, concatenate_logs, concatenate_metrics, concatenate_profiles,
+    concatenate_traces,
 };
 use crate::pipeline::expr::{DataScope, ScopedExpr};
 use crate::pipeline::filter::{align_selection_to_root, scoped_value_to_boolean_array};
@@ -243,6 +244,7 @@ impl PipelineStage for ConditionalPipelineStage {
             OtapArrowRecords::Logs(_) => concatenate_logs(&mut branch_results),
             OtapArrowRecords::Metrics(_) => concatenate_metrics(&mut branch_results),
             OtapArrowRecords::Traces(_) => concatenate_traces(&mut branch_results),
+            OtapArrowRecords::Profiles(_) => concatenate_profiles(&mut branch_results),
         }
     }
 

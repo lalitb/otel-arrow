@@ -66,6 +66,7 @@ fn static_partitions_from_schema_metadata(
             }
         }
         OtapParquetRecords::Traces(_) => otap_batch.get(ArrowPayloadType::Spans),
+        OtapParquetRecords::Profiles(_) => otap_batch.get(ArrowPayloadType::Profiles),
     };
     match main_record_batch {
         None => vec![],

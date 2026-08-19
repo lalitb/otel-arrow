@@ -93,6 +93,7 @@ pub fn route_ack_response(states: &AckRegistry, ack: AckMsg<OtapPdata>) -> Route
         SignalType::Logs => states.logs.as_ref(),
         SignalType::Metrics => states.metrics.as_ref(),
         SignalType::Traces => states.traces.as_ref(),
+        SignalType::Profiles => None,
     };
 
     state
@@ -110,6 +111,7 @@ pub fn route_nack_response(states: &AckRegistry, mut nack: NackMsg<OtapPdata>) -
         SignalType::Logs => states.logs.as_ref(),
         SignalType::Metrics => states.metrics.as_ref(),
         SignalType::Traces => states.traces.as_ref(),
+        SignalType::Profiles => None,
     };
 
     state

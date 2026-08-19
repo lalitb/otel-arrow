@@ -41,7 +41,7 @@ use crate::effect_handler::{
 };
 use crate::error::{Error, TypedError};
 use crate::flow_metrics::{
-    ConsumedFlowMetrics, DecisionFlowMetrics, EndFlowMetrics, FLOW_SIGNALS,
+    ConsumedFlowMetrics, DecisionFlowMetrics, EndFlowMetrics, FLOW_SIGNAL_COUNT, FLOW_SIGNALS,
     FlowConsumedItemsMetrics, FlowDroppedItemsMetrics, FlowDurationMetrics,
     FlowProducedItemsMetrics, LocalFlowMetricState, flow_signal_index, nanos_u64,
 };
@@ -244,14 +244,18 @@ impl<PData> EffectHandler<PData> {
         self.flow.active = flow_metrics_active;
         self.flow.needs_timing = flow_needs_timing;
         self.flow.consumed = ConsumedFlowMetrics {
-            consumed_items: consumed_items_metric.map(|metrics| (metrics, Cell::new([0; 3]))),
+            consumed_items: consumed_items_metric
+                .map(|metrics| (metrics, Cell::new([0; FLOW_SIGNAL_COUNT]))),
         };
         self.flow.end = EndFlowMetrics {
-            duration: duration_metric.map(|metrics| (metrics, Cell::new([Mmsc::default(); 3]))),
-            produced_items: produced_items_metric.map(|metrics| (metrics, Cell::new([0; 3]))),
+            duration: duration_metric
+                .map(|metrics| (metrics, Cell::new([Mmsc::default(); FLOW_SIGNAL_COUNT]))),
+            produced_items: produced_items_metric
+                .map(|metrics| (metrics, Cell::new([0; FLOW_SIGNAL_COUNT]))),
         };
         self.flow.decision = DecisionFlowMetrics {
-            dropped_items: dropped_items_metric.map(|metrics| (metrics, Cell::new([0; 3]))),
+            dropped_items: dropped_items_metric
+                .map(|metrics| (metrics, Cell::new([0; FLOW_SIGNAL_COUNT]))),
         };
     }
 
@@ -331,7 +335,7 @@ impl<PData> EffectHandler<PData> {
     /// shutdown -- the same cadence as `ComputeDuration::report`.
     pub(crate) fn report_flow_metrics(&mut self) {
         if let Some((metrics, acc_cell)) = self.flow.consumed.consumed_items.as_mut() {
-            let drained = acc_cell.replace([0; 3]);
+            let drained = acc_cell.replace([0; FLOW_SIGNAL_COUNT]);
             for signal in FLOW_SIGNALS {
                 let count = drained[flow_signal_index(signal)];
                 if count != 0 {
@@ -344,7 +348,7 @@ impl<PData> EffectHandler<PData> {
             let _ = self.core.metrics_reporter.report_measurement(metrics);
         }
         if let Some((metrics, acc_cell)) = self.flow.end.duration.as_mut() {
-            let drained = acc_cell.replace([Mmsc::default(); 3]);
+            let drained = acc_cell.replace([Mmsc::default(); FLOW_SIGNAL_COUNT]);
             for signal in FLOW_SIGNALS {
                 let duration = drained[flow_signal_index(signal)];
                 if duration.get().count != 0 {
@@ -357,7 +361,7 @@ impl<PData> EffectHandler<PData> {
             let _ = self.core.metrics_reporter.report_measurement(metrics);
         }
         if let Some((metrics, acc_cell)) = self.flow.end.produced_items.as_mut() {
-            let drained = acc_cell.replace([0; 3]);
+            let drained = acc_cell.replace([0; FLOW_SIGNAL_COUNT]);
             for signal in FLOW_SIGNALS {
                 let count = drained[flow_signal_index(signal)];
                 if count != 0 {
@@ -370,7 +374,7 @@ impl<PData> EffectHandler<PData> {
             let _ = self.core.metrics_reporter.report_measurement(metrics);
         }
         if let Some((metrics, acc_cell)) = self.flow.decision.dropped_items.as_mut() {
-            let drained = acc_cell.replace([0; 3]);
+            let drained = acc_cell.replace([0; FLOW_SIGNAL_COUNT]);
             for signal in FLOW_SIGNALS {
                 let count = drained[flow_signal_index(signal)];
                 if count != 0 {
@@ -394,7 +398,7 @@ impl<PData> EffectHandler<PData> {
     ) -> Result<(), TelemetryError> {
         let reporter = self.core.metrics_reporter.clone();
         if let Some((metrics, acc_cell)) = self.flow.consumed.consumed_items.as_mut() {
-            let drained = acc_cell.replace([0; 3]);
+            let drained = acc_cell.replace([0; FLOW_SIGNAL_COUNT]);
             for signal in FLOW_SIGNALS {
                 let count = drained[flow_signal_index(signal)];
                 if count != 0 {
@@ -409,7 +413,7 @@ impl<PData> EffectHandler<PData> {
                 .await?;
         }
         if let Some((metrics, acc_cell)) = self.flow.end.duration.as_mut() {
-            let drained = acc_cell.replace([Mmsc::default(); 3]);
+            let drained = acc_cell.replace([Mmsc::default(); FLOW_SIGNAL_COUNT]);
             for signal in FLOW_SIGNALS {
                 let duration = drained[flow_signal_index(signal)];
                 if duration.get().count != 0 {
@@ -424,7 +428,7 @@ impl<PData> EffectHandler<PData> {
                 .await?;
         }
         if let Some((metrics, acc_cell)) = self.flow.end.produced_items.as_mut() {
-            let drained = acc_cell.replace([0; 3]);
+            let drained = acc_cell.replace([0; FLOW_SIGNAL_COUNT]);
             for signal in FLOW_SIGNALS {
                 let count = drained[flow_signal_index(signal)];
                 if count != 0 {
@@ -439,7 +443,7 @@ impl<PData> EffectHandler<PData> {
                 .await?;
         }
         if let Some((metrics, acc_cell)) = self.flow.decision.dropped_items.as_mut() {
-            let drained = acc_cell.replace([0; 3]);
+            let drained = acc_cell.replace([0; FLOW_SIGNAL_COUNT]);
             for signal in FLOW_SIGNALS {
                 let count = drained[flow_signal_index(signal)];
                 if count != 0 {
@@ -1197,7 +1201,7 @@ mod tests {
         let start_acc = eh.flow.consumed.consumed_items.as_ref().unwrap().1.get();
         assert_eq!(
             start_acc,
-            [0, 20, 10],
+            [0, 20, 10, 0],
             "start items should accumulate by signal"
         );
 
@@ -1208,7 +1212,7 @@ mod tests {
         let produced_acc = eh.flow.end.produced_items.as_ref().unwrap().1.get();
         assert_eq!(
             produced_acc,
-            [0, 8, 7],
+            [0, 8, 7, 0],
             "produced items should accumulate by signal"
         );
 
@@ -1233,7 +1237,7 @@ mod tests {
         // Accumulators should be drained.
         let start_acc_after = eh.flow.consumed.consumed_items.as_ref().unwrap().1.get();
         assert_eq!(
-            start_acc_after, [0; 3],
+            start_acc_after, [0; FLOW_SIGNAL_COUNT],
             "start accumulator should be drained"
         );
         let acc_after = eh.flow.end.duration.as_ref().unwrap().1.get();
@@ -1244,7 +1248,7 @@ mod tests {
         );
         let produced_acc_after = eh.flow.end.produced_items.as_ref().unwrap().1.get();
         assert_eq!(
-            produced_acc_after, [0; 3],
+            produced_acc_after, [0; FLOW_SIGNAL_COUNT],
             "stop item accumulator should be drained"
         );
 

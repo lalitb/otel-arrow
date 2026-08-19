@@ -58,7 +58,7 @@ use otap_df_pdata::TryIntoWithOptions;
 use otap_df_pdata::{
     OtapArrowRecords, OtapPayload, OtapPayloadHelpers, OtlpProtoBytes,
     error::Error as PDataError,
-    otap::batching::make_item_batches,
+    otap::{Profiles, batching::make_item_batches},
     otlp::batching::{BytesBatches, make_bytes_batches_owned},
 };
 use otap_df_telemetry::instrument::{Counter, Mmsc};
@@ -93,12 +93,13 @@ const LOG_MSG_BATCHING_FAILED_SUFFIX: &str = "; dropping";
 const fn wakeup_slot(format: SignalFormat, signal: SignalType) -> WakeupSlot {
     let format_base = match format {
         SignalFormat::OtapRecords => 0,
-        SignalFormat::OtlpBytes => 3,
+        SignalFormat::OtlpBytes => 4,
     };
     let signal_offset = match signal {
         SignalType::Logs => 0,
         SignalType::Metrics => 1,
         SignalType::Traces => 2,
+        SignalType::Profiles => 3,
     };
     WakeupSlot(format_base + signal_offset)
 }
@@ -108,9 +109,11 @@ const fn signal_from_wakeup_slot(slot: WakeupSlot) -> Option<(SignalFormat, Sign
         0 => Some((SignalFormat::OtapRecords, SignalType::Logs)),
         1 => Some((SignalFormat::OtapRecords, SignalType::Metrics)),
         2 => Some((SignalFormat::OtapRecords, SignalType::Traces)),
-        3 => Some((SignalFormat::OtlpBytes, SignalType::Logs)),
-        4 => Some((SignalFormat::OtlpBytes, SignalType::Metrics)),
-        5 => Some((SignalFormat::OtlpBytes, SignalType::Traces)),
+        3 => Some((SignalFormat::OtapRecords, SignalType::Profiles)),
+        4 => Some((SignalFormat::OtlpBytes, SignalType::Logs)),
+        5 => Some((SignalFormat::OtlpBytes, SignalType::Metrics)),
+        6 => Some((SignalFormat::OtlpBytes, SignalType::Traces)),
+        7 => Some((SignalFormat::OtlpBytes, SignalType::Profiles)),
         _ => None,
     }
 }
@@ -496,6 +499,7 @@ struct SignalBatches<T: OtapPayloadHelpers> {
     logs: SignalBuffer<T>,
     metrics: SignalBuffer<T>,
     traces: SignalBuffer<T>,
+    profiles: SignalBuffer<T>,
 }
 
 /// Per-input wait context, including the arriving request's context.
@@ -853,6 +857,7 @@ where
                 SignalType::Logs => &mut self.signals.logs,
                 SignalType::Traces => &mut self.signals.traces,
                 SignalType::Metrics => &mut self.signals.metrics,
+                SignalType::Profiles => &mut self.signals.profiles,
             },
             metrics: self.metrics,
         }
@@ -890,6 +895,7 @@ impl Batcher<OtapArrowRecords> for SignalBuffer<OtapArrowRecords> {
                 OtapArrowRecords::Metrics(otap_df_pdata::otap::Metrics::default())
             }
             SignalType::Traces => OtapArrowRecords::Traces(otap_df_pdata::otap::Traces::default()),
+            SignalType::Profiles => OtapArrowRecords::Profiles(Profiles::default()),
         }
     }
 
@@ -928,6 +934,7 @@ impl Batcher<OtlpProtoBytes> for SignalBuffer<OtlpProtoBytes> {
             SignalType::Logs => OtlpProtoBytes::ExportLogsRequest(Bytes::new()),
             SignalType::Metrics => OtlpProtoBytes::ExportMetricsRequest(Bytes::new()),
             SignalType::Traces => OtlpProtoBytes::ExportTracesRequest(Bytes::new()),
+            SignalType::Profiles => OtlpProtoBytes::ExportProfilesRequest(Bytes::new()),
         }
     }
 
@@ -1458,6 +1465,7 @@ where
             logs: SignalBuffer::new(config),
             traces: SignalBuffer::new(config),
             metrics: SignalBuffer::new(config),
+            profiles: SignalBuffer::new(config),
         }
     }
 }
@@ -2053,6 +2061,7 @@ mod tests {
                                     encode_logs_otap_batch(l).expect("encode logs")
                                 }
                                 OtlpProtoMessage::Metrics(_) => unimplemented!("metrics"),
+                                OtlpProtoMessage::Profiles(_) => unimplemented!("profiles"),
                             };
 
                             let pdata = OtapPdata::new_default(rec.into());

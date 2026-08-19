@@ -201,8 +201,8 @@ impl local::Processor<OtapPdata> for LogSamplingProcessor {
             Message::PData(pdata) => {
                 match pdata.signal_type() {
                     SignalType::Logs => self.process_logs(pdata, effect_handler).await,
-                    // Metrics and traces pass through unchanged
-                    SignalType::Metrics | SignalType::Traces => {
+                    // Non-log signals pass through unchanged.
+                    SignalType::Metrics | SignalType::Traces | SignalType::Profiles => {
                         effect_handler.send_message_with_source_node(pdata).await?;
                         Ok(())
                     }

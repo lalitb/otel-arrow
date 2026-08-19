@@ -57,7 +57,7 @@ use quiver::segment::ReconstructedBundle;
 
 use otap_df_config::SignalType;
 use otap_df_pdata::otap::schema::SchemaIdBuilder;
-use otap_df_pdata::otap::{Logs, Metrics, OtapArrowRecords, OtapBatchStore, Traces};
+use otap_df_pdata::otap::{Logs, Metrics, OtapArrowRecords, OtapBatchStore, Profiles, Traces};
 use otap_df_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 use otap_df_pdata::{OtapPayload, OtapPayloadHelpers, OtlpProtoBytes};
 
@@ -86,7 +86,6 @@ mod otlp_slots {
     pub const OTLP_TRACES: u16 = 61;
     pub const OTLP_METRICS: u16 = 62;
     // Reserved until SignalType::Profiles and opaque Profiles storage exist.
-    #[cfg(test)]
     pub const OTLP_PROFILES: u16 = 63;
 }
 
@@ -94,15 +93,11 @@ mod otlp_slots {
 enum PayloadSignal {
     Shared,
     Signal(SignalType),
-    Reserved,
 }
 
 macro_rules! payload_signal {
     (Shared) => {
         PayloadSignal::Shared
-    };
-    (Reserved) => {
-        PayloadSignal::Reserved
     };
     ($signal:ident) => {
         PayloadSignal::Signal(SignalType::$signal)
@@ -119,7 +114,7 @@ macro_rules! define_arrow_wal_slots {
             _signal_type: SignalType,
             payload_type: ArrowPayloadType,
         ) -> SlotId {
-            let raw = match payload_type {
+    let raw = match payload_type {
                 // Bundle descriptors only iterate signal-specific allowed payload types,
                 // which exclude Unknown. Reaching this arm is an internal invariant violation.
                 ArrowPayloadType::Unknown => {
@@ -174,20 +169,20 @@ define_arrow_wal_slots! {
     SpanLinks => (43, Traces),
     SpanEventAttrs => (44, Traces),
     SpanLinkAttrs => (45, Traces),
-    Profiles => (46, Reserved),
-    ProfileValueTypes => (47, Reserved),
-    Samples => (48, Reserved),
-    Stacks => (49, Reserved),
-    StackLocations => (50, Reserved),
-    ProfileLocations => (51, Reserved),
-    ProfileLocationLines => (52, Reserved),
-    ProfileFunctions => (53, Reserved),
-    ProfileMappings => (54, Reserved),
-    ProfileLinks => (55, Reserved),
-    ProfileAttrs => (56, Reserved),
-    ProfileSampleAttrs => (57, Reserved),
-    ProfileMappingAttrs => (58, Reserved),
-    ProfileLocationAttrs => (59, Reserved),
+    Profiles => (46, Profiles),
+    ProfileValueTypes => (47, Profiles),
+    Samples => (48, Profiles),
+    Stacks => (49, Profiles),
+    StackLocations => (50, Profiles),
+    ProfileLocations => (51, Profiles),
+    ProfileLocationLines => (52, Profiles),
+    ProfileFunctions => (53, Profiles),
+    ProfileMappings => (54, Profiles),
+    ProfileLinks => (55, Profiles),
+    ProfileAttrs => (56, Profiles),
+    ProfileSampleAttrs => (57, Profiles),
+    ProfileMappingAttrs => (58, Profiles),
+    ProfileLocationAttrs => (59, Profiles),
 }
 
 /// Convert signal type to OTLP slot ID (for opaque binary storage)
@@ -196,6 +191,7 @@ pub(crate) const fn to_otlp_slot_id(signal_type: SignalType) -> SlotId {
         SignalType::Logs => otlp_slots::OTLP_LOGS,
         SignalType::Traces => otlp_slots::OTLP_TRACES,
         SignalType::Metrics => otlp_slots::OTLP_METRICS,
+        SignalType::Profiles => otlp_slots::OTLP_PROFILES,
     })
 }
 
@@ -205,20 +201,9 @@ const fn is_otlp_slot(slot: SlotId) -> Option<SignalType> {
         otlp_slots::OTLP_LOGS => Some(SignalType::Logs),
         otlp_slots::OTLP_TRACES => Some(SignalType::Traces),
         otlp_slots::OTLP_METRICS => Some(SignalType::Metrics),
+        otlp_slots::OTLP_PROFILES => Some(SignalType::Profiles),
         _ => None,
     }
-}
-
-/// Whether a slot is reserved for an opaque OTLP payload, including Profiles.
-#[cfg(test)]
-const fn is_reserved_otlp_slot(slot: SlotId) -> bool {
-    matches!(
-        slot.raw(),
-        otlp_slots::OTLP_LOGS
-            | otlp_slots::OTLP_TRACES
-            | otlp_slots::OTLP_METRICS
-            | otlp_slots::OTLP_PROFILES
-    )
 }
 
 /// Determine signal type from a slot ID (works for both Arrow and OTLP slots).
@@ -256,13 +241,11 @@ const fn is_shared_slot(slot: SlotId) -> bool {
 /// # Returns
 /// - `Some((signal_type, payload_type))` for signal-specific slots
 /// - `None` for shared slots (RESOURCE_ATTRS, SCOPE_ATTRS) since they're used by all signals
-/// - `None` for reserved Profiles slots until Profiles engine integration
 /// - `None` for OTLP opaque slots or invalid slot IDs
 fn from_slot_id(slot: SlotId) -> Option<(SignalType, ArrowPayloadType)> {
     let payload_type = slot_to_payload_type(slot)?;
     let signal_type = match payload_signal_type(payload_type)? {
         PayloadSignal::Shared => return None,
-        PayloadSignal::Reserved => return None,
         PayloadSignal::Signal(signal_type) => signal_type,
     };
 
@@ -275,6 +258,7 @@ fn slot_label(signal_type: SignalType, payload_type: ArrowPayloadType) -> Cow<'s
         SignalType::Logs => "Log",
         SignalType::Traces => "Trace",
         SignalType::Metrics => "Metric",
+        SignalType::Profiles => "Profile",
     };
     Cow::Owned(format!("{}:{}", signal_prefix, payload_type.as_str_name()))
 }
@@ -285,6 +269,7 @@ const fn otlp_slot_label(signal_type: SignalType) -> Cow<'static, str> {
         SignalType::Logs => "OtlpLogs",
         SignalType::Traces => "OtlpTraces",
         SignalType::Metrics => "OtlpMetrics",
+        SignalType::Profiles => "OtlpProfiles",
     })
 }
 
@@ -325,7 +310,7 @@ fn compute_schema_fingerprint(batch: &RecordBatch) -> SchemaFingerprint {
 pub struct OtapRecordBundleAdapter {
     /// The underlying OTAP arrow records
     records: OtapArrowRecords,
-    /// The signal type (Logs, Traces, or Metrics)
+    /// The signal type (Logs, Traces, Metrics, or Profiles)
     signal_type: SignalType,
     /// Cached bundle descriptor
     descriptor: BundleDescriptor,
@@ -341,6 +326,7 @@ impl OtapRecordBundleAdapter {
             OtapArrowRecords::Logs(_) => SignalType::Logs,
             OtapArrowRecords::Traces(_) => SignalType::Traces,
             OtapArrowRecords::Metrics(_) => SignalType::Metrics,
+            OtapArrowRecords::Profiles(_) => SignalType::Profiles,
         };
         let descriptor = Self::build_descriptor(&records, signal_type);
         Self {
@@ -423,7 +409,7 @@ impl RecordBundle for OtapRecordBundleAdapter {
 pub struct OtlpBytesAdapter {
     /// The original OTLP bytes (preserved for recovery on NACK)
     bytes: OtlpProtoBytes,
-    /// The signal type (Logs, Traces, or Metrics)
+    /// The signal type (Logs, Traces, Metrics, or Profiles)
     signal_type: SignalType,
     /// The record batch containing the binary data
     batch: RecordBatch,
@@ -449,6 +435,7 @@ impl OtlpBytesAdapter {
             OtlpProtoBytes::ExportLogsRequest(_) => SignalType::Logs,
             OtlpProtoBytes::ExportMetricsRequest(_) => SignalType::Metrics,
             OtlpProtoBytes::ExportTracesRequest(_) => SignalType::Traces,
+            OtlpProtoBytes::ExportProfilesRequest(_) => SignalType::Profiles,
         };
 
         // Create a record batch with a single binary column containing the OTLP bytes.
@@ -643,6 +630,7 @@ pub fn recover_item_count(bundle: &dyn RecordBundle) -> Option<u64> {
         SignalType::Logs => create_records::<Logs>(&payloads).ok()?,
         SignalType::Traces => create_records::<Traces>(&payloads).ok()?,
         SignalType::Metrics => create_records::<Metrics>(&payloads).ok()?,
+        SignalType::Profiles => create_records::<Profiles>(&payloads).ok()?,
     };
     Some(records.num_items() as u64)
 }
@@ -675,6 +663,7 @@ pub fn convert_bundle_to_pdata(
         SignalType::Logs => create_records::<Logs>(payloads)?,
         SignalType::Traces => create_records::<Traces>(payloads)?,
         SignalType::Metrics => create_records::<Metrics>(payloads)?,
+        SignalType::Profiles => create_records::<Profiles>(payloads)?,
     };
 
     // Wrap in OtapPayload and OtapPdata
@@ -708,7 +697,10 @@ where
         }
     }
 
-    Ok(store.into())
+    Ok(store
+        .validate()
+        .map_err(|e| BundleConversionError::RecordBatchCreationError(e.to_string()))?
+        .into())
 }
 
 #[cfg(test)]
@@ -796,7 +788,7 @@ mod tests {
         }
     }
 
-    /// Scenario: Profiles payloads are assigned storage slots before engine integration.
+    /// Scenario: Profiles payloads are assigned storage slots for durable buffering.
     /// Guarantees: The 14 tables occupy exactly slots 46-59 in declaration order.
     #[test]
     fn test_profiles_arrow_slots_are_reserved_contiguously() {
@@ -821,7 +813,10 @@ mod tests {
             let raw = 46 + offset as u16;
             assert_eq!(to_slot_id(SignalType::Logs, payload_type).raw(), raw);
             assert_eq!(slot_to_payload_type(SlotId::new(raw)), Some(payload_type));
-            assert!(from_slot_id(SlotId::new(raw)).is_none());
+            assert_eq!(
+                from_slot_id(SlotId::new(raw)),
+                Some((SignalType::Profiles, payload_type))
+            );
         }
     }
 
@@ -1179,6 +1174,45 @@ mod tests {
         }
     }
 
+    /// Scenario: A Profiles Arrow bundle is persisted into WAL slots and reconstructed.
+    /// Guarantees: Slot 46 reconstructs Profiles records with the original root row count.
+    #[test]
+    fn test_profiles_bundle_roundtrip() {
+        let mut profiles = Profiles::default();
+        profiles
+            .set(
+                ArrowPayloadType::Profiles,
+                record_batch!(
+                    ("id", UInt32, [1u32, 2, 3]),
+                    ("time_unix_nano", UInt64, [100u64, 200, 300]),
+                    ("duration_nano", UInt64, [10u64, 20, 30])
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let records = OtapArrowRecords::Profiles(profiles);
+        let adapter = OtapRecordBundleAdapter::new(records);
+
+        let mut recovered_payloads: HashMap<SlotId, RecordBatch> = HashMap::new();
+        for slot_desc in &adapter.descriptor().slots {
+            if let Some(payload) = adapter.payload(slot_desc.id) {
+                let _ = recovered_payloads.insert(slot_desc.id, payload.batch.clone());
+            }
+        }
+
+        assert_eq!(recovered_payloads.len(), 1);
+        assert!(recovered_payloads.contains_key(&SlotId::new(46)));
+        assert_eq!(
+            determine_signal_type(&recovered_payloads).unwrap(),
+            SignalType::Profiles
+        );
+
+        let reconstructed = create_records::<Profiles>(&recovered_payloads).unwrap();
+        assert_eq!(reconstructed.signal_type(), SignalType::Profiles);
+        assert_eq!(reconstructed.num_items(), 3);
+        assert!(matches!(reconstructed, OtapArrowRecords::Profiles(_)));
+    }
+
     #[test]
     fn test_metrics_bundle_with_shared_slots_roundtrip() {
         // Metrics bundle with shared slots
@@ -1492,19 +1526,14 @@ mod tests {
         }
     }
 
-    /// Scenario: Reserved opaque OTLP slots are inspected as Arrow storage slots.
+    /// Scenario: Opaque OTLP slots are inspected as Arrow storage slots.
     /// Guarantees: Slots 60-63 never decode as Arrow payloads or shared slots.
     #[test]
     fn test_otlp_slots_are_not_arrow_slots() {
         for raw in [60, 61, 62, 63] {
             let slot = SlotId::new(raw);
 
-            assert!(is_reserved_otlp_slot(slot), "slot {raw} should be reserved");
-            if raw < 63 {
-                assert!(is_otlp_slot(slot).is_some(), "slot {raw} should be active");
-            } else {
-                assert!(is_otlp_slot(slot).is_none(), "slot 63 is reserved only");
-            }
+            assert!(is_otlp_slot(slot).is_some(), "slot {raw} should be active");
 
             // Should NOT be an Arrow payload type
             assert!(

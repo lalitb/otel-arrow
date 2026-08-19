@@ -10,9 +10,10 @@ use datafusion::{
 };
 use otap_df_pdata::{
     OtapArrowRecords, OtapPayloadHelpers,
-    otap::{Logs, Metrics, Traces},
+    otap::{Logs, Metrics, Profiles, Traces},
 };
 
+use crate::error::Error;
 use crate::pipeline::{BoxedPipelineStage, PipelineStage, state::ExecutionState};
 use crate::{
     error::Result,
@@ -94,6 +95,7 @@ impl PipelineStage for ForkPipelineStage {
                 OtapArrowRecords::Logs(_) => OtapArrowRecords::Logs(Logs::default()),
                 OtapArrowRecords::Metrics(_) => OtapArrowRecords::Metrics(Metrics::default()),
                 OtapArrowRecords::Traces(_) => OtapArrowRecords::Traces(Traces::default()),
+                OtapArrowRecords::Profiles(_) => OtapArrowRecords::Profiles(Profiles::default()),
             }),
 
             // only one branch returned a non-empty result, simply return this
@@ -113,6 +115,9 @@ impl PipelineStage for ForkPipelineStage {
                     reindex_traces(&mut self.branch_results)?;
                     concatenate_traces(&mut self.branch_results)
                 }
+                OtapArrowRecords::Profiles(_) => Err(Error::NotYetSupportedError {
+                    message: "forking Profiles requires profile graph reindexing".into(),
+                }),
             },
         }
     }

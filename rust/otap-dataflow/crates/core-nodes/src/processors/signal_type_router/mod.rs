@@ -4,7 +4,7 @@
 //! Signal type router processor for OTAP pipelines.
 //!
 //! Routes OTAP payloads to well-known named output ports based on signal type:
-//! `logs`, `metrics`, and `traces`.
+//! `logs`, `metrics`, `traces`, and `profiles`.
 //!
 //! The router prefers the signal-type-specific named output when that port is
 //! connected. If the named port is not wired, it falls back to the node default
@@ -88,6 +88,8 @@ pub const PORT_TRACES: &str = "traces";
 pub const PORT_METRICS: &str = "metrics";
 /// Name of the output port used for log signals
 pub const PORT_LOGS: &str = "logs";
+/// Name of the output port used for profile signals
+pub const PORT_PROFILES: &str = "profiles";
 
 /// Specific reasons for SignalTypeRouter outcomes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, AttributeEnum)]
@@ -263,6 +265,7 @@ impl SignalTypeRouter {
             PortName::from(PORT_LOGS),
             PortName::from(PORT_METRICS),
             PortName::from(PORT_TRACES),
+            PortName::from(PORT_PROFILES),
         ];
         let default_reachable = named_ports.iter().any(|port| !connected.contains(port));
 
@@ -529,6 +532,7 @@ impl local::Processor<OtapPdata> for SignalTypeRouter {
                     otap_df_config::SignalType::Traces => PORT_TRACES,
                     otap_df_config::SignalType::Metrics => PORT_METRICS,
                     otap_df_config::SignalType::Logs => PORT_LOGS,
+                    otap_df_config::SignalType::Profiles => PORT_PROFILES,
                 };
 
                 // Probe wiring first so send failures on the named port stay
@@ -1210,7 +1214,7 @@ mod tests {
         use otap_df_engine::testing::setup_test_runtime;
         use otap_df_otap::pdata::OtapPdata;
         use otap_df_otap::testing::{TestCallData, next_nack};
-        use otap_df_pdata::otap::{Logs, OtapArrowRecords};
+        use otap_df_pdata::otap::{Logs, OtapArrowRecords, Profiles};
         use otap_df_telemetry::InternalTelemetrySystem;
         use otap_df_telemetry::registry::TelemetryRegistryHandle;
         use otap_df_telemetry::reporter::MetricsReporter;
@@ -1288,6 +1292,7 @@ mod tests {
                 otap_df_config::SignalType::Logs => "logs",
                 otap_df_config::SignalType::Metrics => "metrics",
                 otap_df_config::SignalType::Traces => "traces",
+                otap_df_config::SignalType::Profiles => "profiles",
             }
         }
 
@@ -1298,6 +1303,9 @@ mod tests {
                     OtapArrowRecords::Metrics(Default::default())
                 }
                 otap_df_config::SignalType::Traces => OtapArrowRecords::Traces(Default::default()),
+                otap_df_config::SignalType::Profiles => {
+                    OtapArrowRecords::Profiles(Profiles::default())
+                }
             }
         }
 
@@ -1306,6 +1314,7 @@ mod tests {
                 otap_df_config::SignalType::Logs => PORT_LOGS,
                 otap_df_config::SignalType::Metrics => PORT_METRICS,
                 otap_df_config::SignalType::Traces => PORT_TRACES,
+                otap_df_config::SignalType::Profiles => PORT_PROFILES,
             }
         }
 

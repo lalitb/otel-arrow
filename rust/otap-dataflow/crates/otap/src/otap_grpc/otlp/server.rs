@@ -26,6 +26,7 @@ use otap_df_pdata::OtapPayload;
 use otap_df_pdata::OtlpProtoBytes;
 use otap_df_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceResponse;
 use otap_df_pdata::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceResponse;
+use otap_df_pdata::proto::opentelemetry::collector::profiles::v1development::ExportProfilesServiceResponse;
 use otap_df_pdata::proto::opentelemetry::collector::trace::v1::ExportTraceServiceResponse;
 use prost::Message;
 use prost::bytes::Buf;
@@ -187,6 +188,12 @@ impl Encoder for OtlpResponseEncoder {
                 };
                 response.encode(dst)
             }
+            SignalType::Profiles => {
+                let response = ExportProfilesServiceResponse {
+                    partial_success: None,
+                };
+                response.encode(dst)
+            }
         }
         .map_err(|e| Status::internal(format!("unexpected error encoding response: {e}")))
     }
@@ -215,6 +222,7 @@ impl Decoder for OtlpBytesDecoder {
             SignalType::Logs => OtlpProtoBytes::ExportLogsRequest(bytes),
             SignalType::Metrics => OtlpProtoBytes::ExportMetricsRequest(bytes),
             SignalType::Traces => OtlpProtoBytes::ExportTracesRequest(bytes),
+            SignalType::Profiles => OtlpProtoBytes::ExportProfilesRequest(bytes),
         };
         src.advance(buf.len());
         Ok(Some(OtapPdata::new(Context::default(), result.into())))

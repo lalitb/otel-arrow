@@ -110,7 +110,7 @@ pub struct FlowAttributeSet {
 /// Index of a flow_metric within the pipeline's flow_metric table.
 pub type FlowMetricId = usize;
 
-pub(crate) const FLOW_SIGNAL_COUNT: usize = 3;
+pub(crate) const FLOW_SIGNAL_COUNT: usize = 4;
 pub(crate) type FlowItemAccumulator = [u64; FLOW_SIGNAL_COUNT];
 pub(crate) type FlowDurationAccumulator = [Mmsc; FLOW_SIGNAL_COUNT];
 
@@ -120,11 +120,16 @@ pub(crate) const fn flow_signal_index(signal: SignalType) -> usize {
         SignalType::Traces => 0,
         SignalType::Metrics => 1,
         SignalType::Logs => 2,
+        SignalType::Profiles => 3,
     }
 }
 
-pub(crate) const FLOW_SIGNALS: [SignalType; FLOW_SIGNAL_COUNT] =
-    [SignalType::Traces, SignalType::Metrics, SignalType::Logs];
+pub(crate) const FLOW_SIGNALS: [SignalType; FLOW_SIGNAL_COUNT] = [
+    SignalType::Traces,
+    SignalType::Metrics,
+    SignalType::Logs,
+    SignalType::Profiles,
+];
 
 /// Per-pipeline flow_metric state.
 ///

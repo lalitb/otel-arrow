@@ -35,6 +35,7 @@ fn test_batching(inputs_otlp: impl Iterator<Item = OtlpProtoMessage>) {
             OtlpProtoMessage::Logs(data) => data.resource_logs.len(),
             OtlpProtoMessage::Metrics(data) => data.resource_metrics.len(),
             OtlpProtoMessage::Traces(data) => data.resource_spans.len(),
+            OtlpProtoMessage::Profiles(data) => data.resource_profiles.len(),
         })
         .sum();
 

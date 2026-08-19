@@ -9,11 +9,12 @@
 use arrow::array::RecordBatch;
 use otap_df_pdata::OtapArrowRecords;
 use otap_df_pdata::otap::raw_batch_store::{
-    LOGS_TYPE_MASK, METRICS_TYPE_MASK, POSITION_LOOKUP, RawBatchStore, TRACES_TYPE_MASK,
+    LOGS_TYPE_MASK, METRICS_TYPE_MASK, POSITION_LOOKUP, PROFILES_TYPE_MASK, RawBatchStore,
+    TRACES_TYPE_MASK,
 };
 use otap_df_pdata::otap::transform::concatenate::concatenate;
 use otap_df_pdata::otap::transform::reindex::reindex;
-use otap_df_pdata::otap::{Logs, Metrics, OtapBatchStore, Traces};
+use otap_df_pdata::otap::{Logs, Metrics, OtapBatchStore, Profiles, Traces};
 use otap_df_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 
 use crate::error::{Error, Result};
@@ -56,6 +57,12 @@ pub(crate) fn concatenate_traces(
     branch_results: &mut Vec<OtapArrowRecords>,
 ) -> Result<OtapArrowRecords> {
     concat_generic::<Traces, { TRACES_TYPE_MASK }, { Traces::COUNT }>(branch_results)
+}
+
+pub(crate) fn concatenate_profiles(
+    branch_results: &mut Vec<OtapArrowRecords>,
+) -> Result<OtapArrowRecords> {
+    concat_generic::<Profiles, { PROFILES_TYPE_MASK }, { Profiles::COUNT }>(branch_results)
 }
 
 pub(crate) fn concatenate_attrs_record_batches(

@@ -102,6 +102,8 @@ pub enum OtlpProtoMessage {
     Metrics(opentelemetry::metrics::v1::MetricsData),
     /// Traces data. This is equivalent to ExportTraceServiceRequest.
     Traces(opentelemetry::trace::v1::TracesData),
+    /// Profiles data. This is equivalent to ExportProfilesServiceRequest.
+    Profiles(opentelemetry::profiles::v1development::ProfilesData),
 }
 
 impl OtlpProtoMessage {
@@ -122,6 +124,7 @@ impl OtlpProtoMessage {
             Self::Metrics(data) => metrics_num_items(data),
             Self::Logs(data) => logs_num_items(data),
             Self::Traces(data) => traces_num_items(data),
+            Self::Profiles(data) => profiles_num_items(data),
         }
     }
 
@@ -133,6 +136,7 @@ impl OtlpProtoMessage {
             Self::Logs(_) => SignalType::Logs,
             Self::Metrics(_) => SignalType::Metrics,
             Self::Traces(_) => SignalType::Traces,
+            Self::Profiles(_) => SignalType::Profiles,
         }
     }
 
@@ -143,6 +147,7 @@ impl OtlpProtoMessage {
             Self::Logs(l) => l.encode(out),
             Self::Metrics(m) => m.encode(out),
             Self::Traces(t) => t.encode(out),
+            Self::Profiles(p) => p.encode(out),
         }
     }
 }
@@ -179,6 +184,15 @@ fn metrics_num_items(metrics: &opentelemetry::metrics::v1::MetricsData) -> usize
             Some(Data::Summary(summary)) => summary.data_points.len(),
             None => 0,
         })
+        .sum()
+}
+
+fn profiles_num_items(profiles: &opentelemetry::profiles::v1development::ProfilesData) -> usize {
+    profiles
+        .resource_profiles
+        .iter()
+        .flat_map(|rp| &rp.scope_profiles)
+        .map(|sp| sp.profiles.len())
         .sum()
 }
 
@@ -268,6 +282,12 @@ impl From<opentelemetry::trace::v1::TracesData> for OtlpProtoMessage {
     }
 }
 
+impl From<opentelemetry::profiles::v1development::ProfilesData> for OtlpProtoMessage {
+    fn from(data: opentelemetry::profiles::v1development::ProfilesData) -> Self {
+        Self::Profiles(data)
+    }
+}
+
 // This would be #[cfg(test)] because it's an expensive operation we
 // never expect in production, except we can't because ... (not sure)
 impl TryFrom<crate::otlp::OtlpProtoBytes> for OtlpProtoMessage {
@@ -277,6 +297,7 @@ impl TryFrom<crate::otlp::OtlpProtoBytes> for OtlpProtoMessage {
         use crate::otlp::OtlpProtoBytes;
         use crate::proto::opentelemetry::logs::v1::LogsData;
         use crate::proto::opentelemetry::metrics::v1::MetricsData;
+        use crate::proto::opentelemetry::profiles::v1development::ProfilesData;
         use crate::proto::opentelemetry::trace::v1::TracesData;
         use prost::Message;
 
@@ -289,6 +310,9 @@ impl TryFrom<crate::otlp::OtlpProtoBytes> for OtlpProtoMessage {
             }
             OtlpProtoBytes::ExportMetricsRequest(b) => {
                 OtlpProtoMessage::Metrics(MetricsData::decode(b.as_ref())?)
+            }
+            OtlpProtoBytes::ExportProfilesRequest(b) => {
+                OtlpProtoMessage::Profiles(ProfilesData::decode(b.as_ref())?)
             }
         })
     }

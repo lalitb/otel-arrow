@@ -74,6 +74,7 @@ pub fn assert_equivalent(left: &[OtlpProtoMessage], right: &[OtlpProtoMessage]) 
             &left.iter().map(otap_to_otlp_traces).collect::<Vec<_>>(),
             &right.iter().map(otap_to_otlp_traces).collect::<Vec<_>>(),
         ),
+        SignalType::Profiles => panic!("Profiles OTLP equivalence is not supported yet"),
     }
 }
 
@@ -101,5 +102,6 @@ pub fn validate_equivalent(left: &[OtlpProtoMessage], right: &[OtlpProtoMessage]
             &left.iter().map(otap_to_otlp_traces).collect::<Vec<_>>(),
             &right.iter().map(otap_to_otlp_traces).collect::<Vec<_>>(),
         ),
+        SignalType::Profiles => false,
     }
 }

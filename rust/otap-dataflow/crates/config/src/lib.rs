@@ -64,6 +64,8 @@ pub enum SignalType {
     Metrics,
     /// Signal representing a stream of logs.
     Logs,
+    /// Signal representing a stream of profiles.
+    Profiles,
 }
 
 /// Signal formats

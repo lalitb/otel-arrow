@@ -12,8 +12,8 @@
 use arrow::array::RecordBatch;
 use otap_df_pdata::{
     otap::{
-        Logs, Metrics, OtapArrowRecords, OtapBatchStore, Traces,
-        raw_batch_store::{RawLogsStore, RawMetricsStore, RawTracesStore},
+        Logs, Metrics, OtapArrowRecords, OtapBatchStore, Profiles, Traces,
+        raw_batch_store::{RawLogsStore, RawMetricsStore, RawProfilesStore, RawTracesStore},
     },
     proto::opentelemetry::arrow::v1::ArrowPayloadType,
 };
@@ -30,6 +30,8 @@ pub enum OtapParquetRecords {
     Metrics(RawMetricsStore),
     /// Traces signal batches.
     Traces(RawTracesStore),
+    /// Profiles signal batches.
+    Profiles(RawProfilesStore),
 }
 
 impl From<OtapArrowRecords> for OtapParquetRecords {
@@ -38,6 +40,7 @@ impl From<OtapArrowRecords> for OtapParquetRecords {
             OtapArrowRecords::Logs(l) => Self::Logs(l.into_raw()),
             OtapArrowRecords::Metrics(m) => Self::Metrics(m.into_raw()),
             OtapArrowRecords::Traces(t) => Self::Traces(t.into_raw()),
+            OtapArrowRecords::Profiles(p) => Self::Profiles(p.into_raw()),
         }
     }
 }
@@ -50,6 +53,7 @@ impl OtapParquetRecords {
             Self::Logs(s) => s.get(payload_type),
             Self::Metrics(s) => s.get(payload_type),
             Self::Traces(s) => s.get(payload_type),
+            Self::Profiles(s) => s.get(payload_type),
         }
     }
 
@@ -61,6 +65,7 @@ impl OtapParquetRecords {
             Self::Logs(s) => s.set(payload_type, record_batch),
             Self::Metrics(s) => s.set(payload_type, record_batch),
             Self::Traces(s) => s.set(payload_type, record_batch),
+            Self::Profiles(s) => s.set(payload_type, record_batch),
         }
     }
 
@@ -71,6 +76,7 @@ impl OtapParquetRecords {
             Self::Logs(_) => Logs::allowed_payload_types(),
             Self::Metrics(_) => Metrics::allowed_payload_types(),
             Self::Traces(_) => Traces::allowed_payload_types(),
+            Self::Profiles(_) => Profiles::allowed_payload_types(),
         }
     }
 }

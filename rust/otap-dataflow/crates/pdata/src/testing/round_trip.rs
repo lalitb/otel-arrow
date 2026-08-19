@@ -27,6 +27,9 @@ pub fn otlp_to_otap(msg: &OtlpProtoMessage) -> OtapArrowRecords {
         OtlpProtoMessage::Logs(logs) => encode_logs(logs),
         OtlpProtoMessage::Metrics(metrics) => encode_metrics(metrics),
         OtlpProtoMessage::Traces(traces) => encode_traces(traces),
+        OtlpProtoMessage::Profiles(_) => {
+            panic!("Profiles OTLP to OTAP conversion is not supported yet")
+        }
     }
 }
 
@@ -40,6 +43,7 @@ pub fn otlp_message_to_bytes(msg: &OtlpProtoMessage) -> OtlpProtoBytes {
         OtlpProtoMessage::Logs(_) => OtlpProtoBytes::ExportLogsRequest(buf.into()),
         OtlpProtoMessage::Metrics(_) => OtlpProtoBytes::ExportMetricsRequest(buf.into()),
         OtlpProtoMessage::Traces(_) => OtlpProtoBytes::ExportTracesRequest(buf.into()),
+        OtlpProtoMessage::Profiles(_) => OtlpProtoBytes::ExportProfilesRequest(buf.into()),
     }
 }
 
@@ -58,6 +62,9 @@ pub fn otlp_bytes_to_message(msg: OtlpProtoBytes) -> OtlpProtoMessage {
         OtlpProtoBytes::ExportTracesRequest(b) => {
             let td = TracesData::decode(b).expect("decode should not fail");
             OtlpProtoMessage::Traces(td)
+        }
+        OtlpProtoBytes::ExportProfilesRequest(_) => {
+            panic!("Profiles OTLP byte decoding is not supported by this test helper yet")
         }
     }
 }
@@ -78,6 +85,9 @@ pub fn otap_to_otlp(otap: &OtapArrowRecords) -> OtlpProtoMessage {
         }
         OtlpProtoBytes::ExportMetricsRequest(bytes) => {
             MetricsData::decode(bytes.as_ref()).map(OtlpProtoMessage::Metrics)
+        }
+        OtlpProtoBytes::ExportProfilesRequest(_) => {
+            panic!("Profiles OTAP to OTLP conversion is not supported yet")
         }
     }
     .expect("decode ok")

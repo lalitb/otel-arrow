@@ -153,19 +153,22 @@ impl FileExporterConfig {
             logs: self.render_path("logs", core_id, deployment_generation),
             metrics: self.render_path("metrics", core_id, deployment_generation),
             traces: self.render_path("traces", core_id, deployment_generation),
+            profiles: self.render_path("profiles", core_id, deployment_generation),
         };
         let normalized = [
             normalize_lexically(&paths.logs),
             normalize_lexically(&paths.metrics),
             normalize_lexically(&paths.traces),
+            normalize_lexically(&paths.profiles),
         ];
-        if normalized[0] == normalized[1]
-            || normalized[0] == normalized[2]
-            || normalized[1] == normalized[2]
-        {
-            return Err(invalid(
-                "file.path resolves multiple signals to the same path",
-            ));
+        for left in 0..normalized.len() {
+            for right in (left + 1)..normalized.len() {
+                if normalized[left] == normalized[right] {
+                    return Err(invalid(
+                        "file.path resolves multiple signals to the same path",
+                    ));
+                }
+            }
         }
         Ok(paths)
     }
@@ -233,6 +236,7 @@ pub struct RenderedPaths {
     logs: PathBuf,
     metrics: PathBuf,
     traces: PathBuf,
+    profiles: PathBuf,
 }
 
 impl RenderedPaths {
@@ -242,6 +246,7 @@ impl RenderedPaths {
             SignalType::Logs => &self.logs,
             SignalType::Metrics => &self.metrics,
             SignalType::Traces => &self.traces,
+            SignalType::Profiles => &self.profiles,
         }
     }
 }

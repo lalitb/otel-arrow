@@ -384,6 +384,7 @@ impl local::Processor<OtapPdata> for DebugProcessor {
                             self.process_trace(req, debug_output.as_mut()).await?;
                         }
                     }
+                    OtlpProtoBytes::ExportProfilesRequest(_) => {}
                 }
                 Ok(())
             }

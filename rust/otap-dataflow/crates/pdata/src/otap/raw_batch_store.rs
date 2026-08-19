@@ -6,7 +6,7 @@
 //!
 //! [`RawBatchStore`] is the inner storage type used by the validated
 //! [`OtapBatchStore`](super::OtapBatchStore) implementations (`Logs`, `Metrics`,
-//! `Traces`). It can also be used directly by terminal consumers (e.g. the
+//! `Traces`, `Profiles`). It can also be used directly by terminal consumers (e.g. the
 //! Parquet exporter) that legitimately transform batches in ways that may not
 //! conform to the OTAP wire-protocol schema.
 
@@ -69,12 +69,31 @@ pub const POSITION_LOOKUP: &[usize] = &[
     UNUSED_INDEX, // 38
     UNUSED_INDEX, // 39
     // traces:
-    2, // Spans = 40,
-    3, // SpanAttrs = 41,
-    4, // SpanEvents = 42,
-    5, // SpanLinks = 43,
-    6, // SpanEventAttrs = 44,
-    7, // SpanLinkAttrs = 45,
+    2,            // Spans = 40,
+    3,            // SpanAttrs = 41,
+    4,            // SpanEvents = 42,
+    5,            // SpanLinks = 43,
+    6,            // SpanEventAttrs = 44,
+    7,            // SpanLinkAttrs = 45,
+    UNUSED_INDEX, // 46
+    UNUSED_INDEX, // 47
+    UNUSED_INDEX, // 48
+    UNUSED_INDEX, // 49
+    // profiles:
+    2,  // Profiles = 50,
+    3,  // ProfileValueTypes = 51,
+    4,  // Samples = 52,
+    5,  // Stacks = 53,
+    6,  // StackLocations = 54,
+    7,  // ProfileLocations = 55,
+    8,  // ProfileLocationLines = 56,
+    9,  // ProfileFunctions = 57,
+    10, // ProfileMappings = 58,
+    11, // ProfileLinks = 59,
+    12, // ProfileAttrs = 60,
+    13, // ProfileSampleAttrs = 61,
+    14, // ProfileMappingAttrs = 62,
+    15, // ProfileLocationAttrs = 63,
 ];
 
 // ---------------------------------------------------------------------------
@@ -130,6 +149,27 @@ pub const TRACES_TYPE_MASK: u64 = (1 << ArrowPayloadType::ResourceAttrs as u64)
 /// Number of payload slots for the Traces signal.
 pub const TRACES_COUNT: usize = 8;
 
+/// Bitmask of valid [`ArrowPayloadType`] values for the Profiles signal.
+pub const PROFILES_TYPE_MASK: u64 = (1 << ArrowPayloadType::ResourceAttrs as u64)
+    + (1 << ArrowPayloadType::ScopeAttrs as u64)
+    + (1 << ArrowPayloadType::Profiles as u64)
+    + (1 << ArrowPayloadType::ProfileValueTypes as u64)
+    + (1 << ArrowPayloadType::Samples as u64)
+    + (1 << ArrowPayloadType::Stacks as u64)
+    + (1 << ArrowPayloadType::StackLocations as u64)
+    + (1 << ArrowPayloadType::ProfileLocations as u64)
+    + (1 << ArrowPayloadType::ProfileLocationLines as u64)
+    + (1 << ArrowPayloadType::ProfileFunctions as u64)
+    + (1 << ArrowPayloadType::ProfileMappings as u64)
+    + (1 << ArrowPayloadType::ProfileLinks as u64)
+    + (1 << ArrowPayloadType::ProfileAttrs as u64)
+    + (1 << ArrowPayloadType::ProfileSampleAttrs as u64)
+    + (1 << ArrowPayloadType::ProfileMappingAttrs as u64)
+    + (1 << ArrowPayloadType::ProfileLocationAttrs as u64);
+
+/// Number of payload slots for the Profiles signal.
+pub const PROFILES_COUNT: usize = 16;
+
 // ---------------------------------------------------------------------------
 // Type aliases
 // ---------------------------------------------------------------------------
@@ -142,6 +182,9 @@ pub type RawMetricsStore = RawBatchStore<METRICS_TYPE_MASK, METRICS_COUNT>;
 
 /// Raw (unvalidated) batch store for the Traces signal.
 pub type RawTracesStore = RawBatchStore<TRACES_TYPE_MASK, TRACES_COUNT>;
+
+/// Raw (unvalidated) batch store for the Profiles signal.
+pub type RawProfilesStore = RawBatchStore<PROFILES_TYPE_MASK, PROFILES_COUNT>;
 
 // ---------------------------------------------------------------------------
 // RawBatchStore
@@ -290,7 +333,7 @@ mod tests {
     /// and `false` for every other known payload type.
     #[test]
     fn type_mask_matches_allowed_payload_types() {
-        use crate::otap::{Logs, Metrics, OtapBatchStore, Traces};
+        use crate::otap::{Logs, Metrics, OtapBatchStore, Profiles, Traces};
         use std::collections::HashSet;
 
         // Union of all known payload types across all signals, plus Unknown.
@@ -298,6 +341,7 @@ mod tests {
             .chain(Logs::allowed_payload_types().iter().copied())
             .chain(Metrics::allowed_payload_types().iter().copied())
             .chain(Traces::allowed_payload_types().iter().copied())
+            .chain(Profiles::allowed_payload_types().iter().copied())
             .collect();
 
         let cases: &[(&str, fn(ArrowPayloadType) -> bool, &[ArrowPayloadType])] = &[
@@ -315,6 +359,11 @@ mod tests {
                 "Traces",
                 RawTracesStore::is_valid_type,
                 Traces::allowed_payload_types(),
+            ),
+            (
+                "Profiles",
+                RawProfilesStore::is_valid_type,
+                Profiles::allowed_payload_types(),
             ),
         ];
 
@@ -341,5 +390,8 @@ mod tests {
 
         let store = RawTracesStore::new();
         assert_eq!(store.into_batches().len(), TRACES_COUNT);
+
+        let store = RawProfilesStore::new();
+        assert_eq!(store.into_batches().len(), PROFILES_COUNT);
     }
 }

@@ -40,7 +40,7 @@ use crate::effect_handler::{
 };
 use crate::error::{Error, TypedError};
 use crate::flow_metrics::{
-    ConsumedFlowMetrics, DecisionFlowMetrics, EndFlowMetrics, FLOW_SIGNALS,
+    ConsumedFlowMetrics, DecisionFlowMetrics, EndFlowMetrics, FLOW_SIGNAL_COUNT, FLOW_SIGNALS,
     FlowConsumedItemsMetrics, FlowDroppedItemsMetrics, FlowDurationMetrics,
     FlowProducedItemsMetrics, SharedFlowMetricState, flow_signal_index, nanos_u64,
 };
@@ -215,17 +215,21 @@ impl<PData> EffectHandler<PData> {
         self.flow.needs_timing = flow_needs_timing;
         self.flow.consumed = ConsumedFlowMetrics {
             consumed_items: consumed_items_metric
-                .map(|metrics| (metrics, Arc::new(Mutex::new([0; 3])))),
+                .map(|metrics| (metrics, Arc::new(Mutex::new([0; FLOW_SIGNAL_COUNT])))),
         };
         self.flow.end = EndFlowMetrics {
-            duration: duration_metric
-                .map(|metrics| (metrics, Arc::new(Mutex::new([Mmsc::default(); 3])))),
+            duration: duration_metric.map(|metrics| {
+                (
+                    metrics,
+                    Arc::new(Mutex::new([Mmsc::default(); FLOW_SIGNAL_COUNT])),
+                )
+            }),
             produced_items: produced_items_metric
-                .map(|metrics| (metrics, Arc::new(Mutex::new([0; 3])))),
+                .map(|metrics| (metrics, Arc::new(Mutex::new([0; FLOW_SIGNAL_COUNT])))),
         };
         self.flow.decision = DecisionFlowMetrics {
             dropped_items: dropped_items_metric
-                .map(|metrics| (metrics, Arc::new(Mutex::new([0; 3])))),
+                .map(|metrics| (metrics, Arc::new(Mutex::new([0; FLOW_SIGNAL_COUNT])))),
         };
     }
 
@@ -948,7 +952,7 @@ mod tests {
             .1
             .lock()
             .unwrap();
-        assert_eq!(*start_before_report, [0, 20, 10]);
+        assert_eq!(*start_before_report, [0, 20, 10, 0]);
 
         let before_report = eh.flow.end.duration.as_ref().unwrap().1.lock().unwrap();
         assert_eq!(before_report[2].get().count, 3);
@@ -963,7 +967,7 @@ mod tests {
             .1
             .lock()
             .unwrap();
-        assert_eq!(*produced_before_report, [0, 8, 7]);
+        assert_eq!(*produced_before_report, [0, 8, 7, 0]);
 
         drop(start_before_report);
         drop(produced_before_report);
@@ -979,7 +983,7 @@ mod tests {
             .lock()
             .unwrap();
         assert_eq!(
-            *start_drained, [0; 3],
+            *start_drained, [0; FLOW_SIGNAL_COUNT],
             "start accumulator should be drained"
         );
 
@@ -999,7 +1003,7 @@ mod tests {
             .lock()
             .unwrap();
         assert_eq!(
-            *produced_drained, [0; 3],
+            *produced_drained, [0; FLOW_SIGNAL_COUNT],
             "stop item accumulator should be drained"
         );
 

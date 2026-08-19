@@ -36,6 +36,7 @@ use otap_df_pdata::OtapPayload;
 use otap_df_pdata::OtlpProtoBytes;
 use otap_df_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceResponse;
 use otap_df_pdata::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceResponse;
+use otap_df_pdata::proto::opentelemetry::collector::profiles::v1development::ExportProfilesServiceResponse;
 use otap_df_pdata::proto::opentelemetry::collector::trace::v1::ExportTraceServiceResponse;
 use otap_df_telemetry::common_attributes::ReceiverRejectionErrorType;
 use parking_lot::Mutex;
@@ -173,6 +174,7 @@ fn precomputed_response(signal: SignalType) -> &'static [u8] {
     static LOGS: OnceLock<Bytes> = OnceLock::new();
     static METRICS: OnceLock<Bytes> = OnceLock::new();
     static TRACES: OnceLock<Bytes> = OnceLock::new();
+    static PROFILES: OnceLock<Bytes> = OnceLock::new();
 
     match signal {
         SignalType::Logs => LOGS
@@ -183,6 +185,9 @@ fn precomputed_response(signal: SignalType) -> &'static [u8] {
             .as_ref(),
         SignalType::Traces => TRACES
             .get_or_init(encode_response::<ExportTraceServiceResponse>)
+            .as_ref(),
+        SignalType::Profiles => PROFILES
+            .get_or_init(encode_response::<ExportProfilesServiceResponse>)
             .as_ref(),
     }
 }
@@ -303,6 +308,7 @@ impl Decoder for OtlpBytesDecoder {
             SignalType::Logs => OtlpProtoBytes::ExportLogsRequest(bytes),
             SignalType::Metrics => OtlpProtoBytes::ExportMetricsRequest(bytes),
             SignalType::Traces => OtlpProtoBytes::ExportTracesRequest(bytes),
+            SignalType::Profiles => OtlpProtoBytes::ExportProfilesRequest(bytes),
         };
         let context = if self.preallocate_frame {
             // Pre-reserve a single frame since wait_for_result uses one slot.

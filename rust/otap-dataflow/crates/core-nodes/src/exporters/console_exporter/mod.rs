@@ -264,6 +264,7 @@ impl ConsoleExporter {
             SignalType::Logs => self.export_logs(payload).await,
             SignalType::Traces => self.unsupported_signal("traces"),
             SignalType::Metrics => self.unsupported_signal("metrics"),
+            SignalType::Profiles => self.unsupported_signal("profiles"),
         }
     }
 

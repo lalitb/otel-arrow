@@ -723,6 +723,19 @@ impl local::Exporter<OtapPdata> for OTAPExporter {
                             }
                         };
 
+                        if signal_type == SignalType::Profiles {
+                            self.metrics.record_failure(
+                                signal_type,
+                                OtapExporterErrorType::PayloadConversion,
+                                export_started_at.elapsed(),
+                            );
+                            let mut nack =
+                                NackMsg::new("OTAP Profiles export is not supported yet", pdata);
+                            nack.permanent = true;
+                            effect_handler.notify_nack(nack).await?;
+                            continue;
+                        }
+
                         // Route each batch to the stream with the smallest
                         // local backlog. This is intentionally based on queue
                         // occupancy, not response latency: queue depth is the
@@ -731,6 +744,9 @@ impl local::Exporter<OtapPdata> for OTAPExporter {
                             SignalType::Logs => least_loaded_stream_sender(&logs_senders),
                             SignalType::Metrics => least_loaded_stream_sender(&metrics_senders),
                             SignalType::Traces => least_loaded_stream_sender(&traces_senders),
+                            SignalType::Profiles => {
+                                unreachable!("Profiles export is rejected before stream selection")
+                            }
                         };
 
                         // Try to enqueue. If the stream queue is full, store the item
