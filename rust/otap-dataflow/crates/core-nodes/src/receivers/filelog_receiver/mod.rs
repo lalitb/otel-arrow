@@ -20,6 +20,10 @@
 //!   generation selection and recovery, WAL appends and sync policy,
 //!   atomic compaction, and retention -- specified in
 //!   `docs/filelog-receiver.md` Appendix B.
+//! - The process-local runtime-locator lease registry ([`lease`]), which
+//!   gives each receiver a preallocated, bounded ownership scope and prevents
+//!   two filelog readers in one engine process from controlling the same live
+//!   file.
 //!
 //! Runtime receiver wiring -- discovery, framing, identity/recovery
 //! matching, the read/checkpoint thread that drives the store, and component
@@ -41,6 +45,7 @@
 pub mod checkpoint;
 
 mod config;
+mod lease;
 
 pub use config::{
     BatchConfig, CheckpointConfig, Config, DiscoveryConfig, Encoding, FILELOG_RECEIVER_URN,

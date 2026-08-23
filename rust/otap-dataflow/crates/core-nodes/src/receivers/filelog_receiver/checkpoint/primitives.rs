@@ -111,7 +111,7 @@ impl LifecycleState {
 /// Normalized, platform-neutral runtime locator. Never a native `stat` or
 /// `FILE_ID_INFO` structure; only the specific integer/byte-array values
 /// needed for equality comparison, copied out explicitly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Locator {
     /// No runtime locator recorded (for example, Windows identity
     /// unavailable).
