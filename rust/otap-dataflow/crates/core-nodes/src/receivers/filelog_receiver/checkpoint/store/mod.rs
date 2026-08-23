@@ -335,6 +335,48 @@ fn sync_policy_for(operations: &[Operation]) -> SyncPolicy {
     SyncPolicy::Interval
 }
 
+fn pack_atomic_groups(
+    groups: Vec<Vec<Operation>>,
+) -> Result<(Vec<Operation>, Vec<usize>), StoreError> {
+    if groups.is_empty() {
+        return Err(StoreError::EmptyTransaction);
+    }
+
+    let maximum = WAL_MAX_OPS_PER_TX as usize;
+    let operation_count = groups.iter().try_fold(0usize, |count, group| {
+        count
+            .checked_add(group.len())
+            .ok_or(StoreError::CounterOverflow {
+                counter: "grouped checkpoint operations",
+                value: count as u64,
+            })
+    })?;
+    let mut operations = Vec::with_capacity(operation_count);
+    let mut transaction_lengths = Vec::new();
+    let mut current_len = 0usize;
+    for group in groups {
+        if group.is_empty() {
+            return Err(StoreError::EmptyTransaction);
+        }
+        if group.len() > maximum {
+            return Err(StoreError::TransactionTooLarge {
+                operations: group.len(),
+                max: WAL_MAX_OPS_PER_TX,
+            });
+        }
+        if current_len > maximum - group.len() {
+            transaction_lengths.push(current_len);
+            current_len = 0;
+        }
+        current_len += group.len();
+        operations.extend(group);
+    }
+    if current_len != 0 {
+        transaction_lengths.push(current_len);
+    }
+    Ok((operations, transaction_lengths))
+}
+
 /// Refuses the reserved reason code the format forbids an encoder from
 /// writing (`docs/filelog-checkpoint-format.md`, "Reason codes"): `0x0000`
 /// is reserved for both `quarantine_file.reason_code` and
@@ -1296,6 +1338,38 @@ impl CheckpointStore {
         Ok(outcomes)
     }
 
+    /// Appends a bounded logical batch without splitting any caller-defined
+    /// atomic group across WAL transactions.
+    ///
+    /// The complete plan is preflighted before the first write. Groups are
+    /// greedily packed into format-bounded transactions, but a group such as
+    /// `register_file` plus its mandatory quarantine transition always
+    /// remains in one transaction. A filesystem failure may persist an
+    /// earlier complete transaction; it can never persist only part of one
+    /// atomic group.
+    pub(crate) fn append_atomic_groups(
+        &mut self,
+        groups: Vec<Vec<Operation>>,
+    ) -> Result<Vec<AppendOutcome>, StoreError> {
+        self.ensure_usable("append grouped checkpoint transactions")?;
+        let (operations, transaction_lengths) = pack_atomic_groups(groups)?;
+        let mut offset = 0usize;
+        let transaction_slices = transaction_lengths.iter().map(|length| {
+            let start = offset;
+            offset += *length;
+            &operations[start..offset]
+        });
+        self.preflight_transactions(&operations, transaction_slices)?;
+
+        let mut outcomes = Vec::with_capacity(transaction_lengths.len());
+        let mut operations = operations.into_iter();
+        for length in transaction_lengths {
+            let transaction: Vec<Operation> = operations.by_ref().take(length).collect();
+            outcomes.push(self.append(transaction)?);
+        }
+        Ok(outcomes)
+    }
+
     /// Registers newly discovered files. Every registration in one call is
     /// batched into as few synced transactions as the format allows, and is
     /// durable before this call returns, so the receiver never reads a file
@@ -1758,6 +1832,14 @@ impl CheckpointStore {
     /// transition failures must not return an error after an earlier chunk
     /// has already consumed durable tracked-file or WAL capacity.
     fn preflight_batched(&self, operations: &[Operation]) -> Result<(), StoreError> {
+        self.preflight_transactions(operations, operations.chunks(WAL_MAX_OPS_PER_TX as usize))
+    }
+
+    fn preflight_transactions<'a>(
+        &self,
+        operations: &[Operation],
+        transactions: impl IntoIterator<Item = &'a [Operation]>,
+    ) -> Result<(), StoreError> {
         reject_reserved_reason_codes(operations)?;
         Self::ensure_fingerprint_capacity_for(operations, self.fingerprint_bytes)?;
         Self::ensure_tracked_capacity_for(
@@ -1779,7 +1861,7 @@ impl CheckpointStore {
         let mut projected_wal_transactions = self.wal_transactions;
         let mut projected_unsynced_transactions = self.unsynced_transactions;
         let mut projected_syncs = self.syncs;
-        for chunk in operations.chunks(WAL_MAX_OPS_PER_TX as usize) {
+        for chunk in transactions {
             projected_wal_transactions =
                 projected_wal_transactions
                     .checked_add(1)

@@ -23,7 +23,13 @@ use super::error::DecodeError;
 pub const FORMAT_VERSION: u16 = 1;
 
 /// Canonical-serialization/digest recipe version for the framing profile.
-pub const FRAMING_PROFILE_VERSION: u16 = 1;
+///
+/// Version 2 also binds the identity-evidence profile so a receiver cannot
+/// resume durable state after an unacknowledged fingerprint-window or
+/// ignored-header change.
+pub const FRAMING_PROFILE_VERSION: u16 = 2;
+/// Current raw-prefix fingerprint algorithm/profile.
+pub const FINGERPRINT_PROFILE_VERSION: u16 = 1;
 
 /// Magic bytes for the `CURRENT` marker file.
 pub const CURRENT_MAGIC: &[u8; 8] = b"FLOGCUR\0";
@@ -53,6 +59,9 @@ pub const TRUNCATE_RESET_REASON_READ_NEW: u16 = 0x0001;
 
 /// Reserved reason-code value that an encoder MUST NOT produce.
 pub const REASON_CODE_RESERVED: u16 = 0x0000;
+/// Quarantine reason: recovery evidence existed but could not be inherited
+/// unambiguously and the configured policy was `fail`.
+pub const QUARANTINE_REASON_RECOVERY_MISMATCH: u16 = 0x0003;
 
 /// `update_metadata` presence bit: a runtime locator value is present.
 pub const METADATA_LOCATOR_PRESENT: u8 = 0x01;
@@ -125,8 +134,8 @@ pub enum Locator {
     },
     /// Normalized Windows `(volume_serial, FILE_ID_INFO.FileId)`.
     WindowsVolumeFileId {
-        /// 32-bit volume serial number.
-        volume_serial: u32,
+        /// 64-bit `FILE_ID_INFO.VolumeSerialNumber`.
+        volume_serial: u64,
         /// 128-bit file identifier, stored verbatim.
         file_id: [u8; 16],
     },
@@ -146,7 +155,7 @@ impl Locator {
                 file_id,
             } => {
                 out.write_u8(0x02);
-                out.write_u32(volume_serial);
+                out.write_u64(volume_serial);
                 out.write_bytes(&file_id);
             }
         }
@@ -162,7 +171,7 @@ impl Locator {
                 Ok(Locator::PosixDevIno { dev, ino })
             }
             0x02 => {
-                let volume_serial = input.read_u32()?;
+                let volume_serial = input.read_u64()?;
                 let mut file_id = [0u8; 16];
                 file_id.copy_from_slice(input.read_exact(16)?);
                 Ok(Locator::WindowsVolumeFileId {

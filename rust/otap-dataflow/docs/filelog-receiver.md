@@ -401,6 +401,33 @@ Discovery and admission use distinct bounded populations:
 | Tracked identities | Durable `file_id` checkpoint records | `max_tracked_files` |
 | Open descriptors | Files with an open operating-system handle | `max_open_files` |
 
+Fingerprint-only restart matching uses multiplicities from the complete bounded
+reconciliation population, not only the current open-file batch. The inventory covers
+retained pending, in-flight, and open candidates plus every live locator. A scan that
+overflows the retained population, observes unstable evidence, or otherwise cannot prove
+that this inventory is complete disables fingerprint-only inheritance for that pass;
+exact-locator matching remains available.
+
+Configuration bounds the conservative identity reconciliation working set to 1 GiB:
+
+```text
+candidate_base =
+  (max_pending_candidates + max_open_files) *
+  (fingerprint_bytes + ADVISORY_PATH_MAX_BYTES + 256)
+
+open_candidate_amplification =
+  max_open_files *
+  (4 * fingerprint_bytes + 2 * ADVISORY_PATH_MAX_BYTES + 512)
+
+checkpoint_indexes = max_tracked_files * 384
+
+candidate_base + open_candidate_amplification + checkpoint_indexes <= 1 GiB
+```
+
+The fixed terms conservatively cover hash buckets, vectors, locators, operation
+preflight, and allocation metadata. Validation uses checked arithmetic and rejects a
+configuration above the ceiling before the receiver starts.
+
 Reconciliation processes directory entries and glob matches incrementally. It retains
 scan-generation markers only for bounded tracked identities and retained pending
 candidates, not a snapshot of every untracked match. Each scan marks those locators that
@@ -569,12 +596,15 @@ Identity invariants:
   current fingerprint length, last-known platform runtime locator, and last path are
   mutable fields used for recovery matching.
 - **INV-ID3:** on restart or reopen, an exact platform runtime locator plus successful
-  fingerprint-prefix validation is the strongest match. A unique full-window
-  fingerprint match may reconnect a record only when its previous runtime locator is no
-  longer live and no other candidate or record shares that fingerprint. Otherwise the
-  match is ambiguous and the candidate receives a new `file_id`. Recovery mismatch is
-  not first discovery: it follows `identity.on_recovery_mismatch`, whose default is
-  `beginning`, so the normal bias is duplicates over skipped data.
+  fingerprint-prefix validation is the strongest active-record match. The stored
+  fingerprint must be a prefix of the current candidate evidence; evidence may grow but
+  never shrink. A unique full-window fingerprint match may reconnect a record only when
+  its previous runtime locator is no longer live and no other candidate in the complete
+  bounded reconciliation population or checkpoint record shares that fingerprint. If
+  the candidate inventory is incomplete, fingerprint-only reconnect is disabled.
+  Otherwise the match is ambiguous and the candidate receives a new `file_id`. Recovery
+  mismatch is not first discovery: it follows `identity.on_recovery_mismatch`, whose
+  default is `beginning`, so the normal bias is duplicates over skipped data.
 - **INV-ID4:** `committed_offset <= current_size` is required before resuming. A failed
   fingerprint validation, offset beyond size, or ambiguous match never inherits an old
   offset. It creates a new logical identity, increments `filelog.identity.reset`, and
@@ -591,6 +621,12 @@ Fingerprint growth updates matching evidence under the same `file_id`; it never 
 a checkpoint record. Cross-device copy/unlink is not inferred from fingerprint equality
 in Phase 1 because a copied file and an unrelated file with the same prefix are
 indistinguishable without stronger source-specific evidence.
+
+A quarantined record is the deliberate exception to active-record fingerprint
+validation: the same exact runtime locator always reconnects the existing quarantine,
+even if the current size or prefix bytes changed after quarantine. It may refresh only
+advisory path and last-seen metadata. A different locator never inherits that
+quarantine.
 
 No local-filesystem locator is a permanent identity across deletion and identifier
 reuse. A reused locator whose replacement reproduces the same fingerprint window can be
@@ -617,6 +653,14 @@ runtime locator described above. Windows uses
 correctness. Equivalent restart and rotation tests are Phase-1 acceptance criteria on
 all three platforms. Reading a Windows file whose writer denies shared-read access
 remains a separate source contract and is not implied by Windows identity support.
+
+Identity evidence is collected from the opened regular-file handle, not from a path
+metadata lookup performed before open. With `follow_symlinks: false`, Unix opens use
+`O_NOFOLLOW` and Windows opens use `FILE_FLAG_OPEN_REPARSE_POINT` followed by handle
+validation. Advisory paths remain diagnostics rather than identity and are encoded
+without lossy conversion: Unix stores the original `OsStr` bytes, while Windows stores
+native UTF-16 code units as big-endian byte pairs. Both encodings are bounded by the
+checkpoint format's `ADVISORY_PATH_MAX_BYTES`.
 
 ## Execution model
 
@@ -1875,10 +1919,12 @@ recovery closed rather than truncating durable state.
 ### Framing-profile compatibility
 
 Each checkpoint stores a framing-profile version and a collision-resistant digest that
-covers all configuration affecting record boundaries or deterministic replay. A version
-or digest mismatch with resumable state fails closed and requires an explicit migration
-or reset. The companion checkpoint-format specification defines the canonical
-serialization, digest algorithm, and compatibility vectors.
+covers the identity-evidence profile plus all configuration affecting record boundaries
+or deterministic replay. Including the identity profile makes changes to
+`fingerprint_bytes`, `ignored_header_bytes`, or its algorithm fail closed even when all
+stored fingerprints are short. Any version or digest mismatch with resumable state
+requires an explicit migration or reset. The companion checkpoint-format specification
+defines the canonical serialization, digest algorithm, and compatibility vectors.
 
 ## Appendix C: Complete Phase 1 configuration
 

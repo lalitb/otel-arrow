@@ -1,8 +1,8 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Canonical serialization and SHA-256 digest for the framing-profile
-//! compatibility contract.
+//! Canonical serialization and SHA-256 digest for the framing and identity
+//! resumption-compatibility contract.
 //!
 //! See `docs/filelog-checkpoint-format.md`,
 //! "Framing-profile canonical serialization and digest", for the exact byte
@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use super::error::EncodeError;
 use super::primitives::{ByteWriter, FRAMING_PATTERN_MAX_BYTES};
 
-const DOMAIN_PREFIX: &[u8] = b"otel-arrow-filelog-framing-profile-v1\0";
+const DOMAIN_PREFIX: &[u8] = b"otel-arrow-filelog-framing-profile-v2\0";
 
 /// Configured character encoding (decode-before-framing contract).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,11 +100,17 @@ impl MultilineMode {
     }
 }
 
-/// The subset of Appendix C configuration that affects record boundaries or
-/// deterministic replay, exactly as enumerated in
+/// The subset of Appendix C configuration that affects identity matching,
+/// record boundaries, or deterministic replay, exactly as enumerated in
 /// "Framing-profile canonical serialization and digest".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FramingProfileParams {
+    /// Versioned fingerprint algorithm/profile.
+    pub fingerprint_profile_version: u16,
+    /// Configured fingerprint evidence window.
+    pub fingerprint_bytes: u16,
+    /// Configured prefix skipped before fingerprint evidence.
+    pub ignored_header_bytes: u32,
     /// Configured character encoding.
     pub encoding: FramingEncoding,
     /// Configured multiline boundary mode.
@@ -130,6 +136,9 @@ impl FramingProfileParams {
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, EncodeError> {
         let mut out = ByteWriter::new();
         out.write_bytes(DOMAIN_PREFIX);
+        out.write_u16(self.fingerprint_profile_version);
+        out.write_u16(self.fingerprint_bytes);
+        out.write_u32(self.ignored_header_bytes);
         out.write_u8(self.encoding.to_wire());
         let (multiline_kind, regex_profile_version, pattern) = self.multiline_mode.to_wire();
         out.write_u8(multiline_kind);
@@ -163,6 +172,9 @@ mod tests {
 
     fn default_newline_profile() -> FramingProfileParams {
         FramingProfileParams {
+            fingerprint_profile_version: 1,
+            fingerprint_bytes: 1000,
+            ignored_header_bytes: 0,
             encoding: FramingEncoding::Utf8,
             multiline_mode: MultilineMode::Newline,
             max_line_bytes: 1_048_576,
@@ -183,11 +195,11 @@ mod tests {
     fn matches_published_default_profile_vector() {
         let profile = default_newline_profile();
         let bytes = profile.canonical_bytes().unwrap();
-        assert_eq!(bytes.len(), 73);
+        assert_eq!(bytes.len(), 81);
         let digest = profile.digest().unwrap();
         assert_eq!(
             hex::encode(digest),
-            "f00ca1eef473e3dc0dbd141e378270c0be2e6d698a4603d8bb63c81acbeed537"
+            "46c818a27f8cb6281a903e2a54c4fd72b38dd6e4d4ac30b1e33fb1e26ff2aaae"
         );
     }
 
@@ -204,13 +216,29 @@ mod tests {
             pattern: "^END request$".to_owned(),
         };
         let bytes = profile.canonical_bytes().unwrap();
-        assert_eq!(bytes.len(), 86);
+        assert_eq!(bytes.len(), 94);
         let digest = profile.digest().unwrap();
         assert_eq!(
             hex::encode(digest),
-            "5343f5c8ebe99bf88cb1663791aa62d10da364f6da581bbd556a5cfa11087d22"
+            "7c5c808319692ce9d0b8c7a50772f53e236d60a98e50fd30e2c5cf073e7da179"
         );
         assert_ne!(digest, default_newline_profile().digest().unwrap());
+    }
+
+    /// Scenario: only the fingerprint evidence window or ignored-header
+    /// count changes while every framing setting remains unchanged.
+    /// Guarantees: identity configuration changes produce different durable
+    /// compatibility digests and therefore cannot silently reuse checkpoints.
+    #[test]
+    fn identity_profile_changes_digest() {
+        let base = default_newline_profile();
+        let mut changed_window = base.clone();
+        changed_window.fingerprint_bytes += 1;
+        let mut changed_header = base.clone();
+        changed_header.ignored_header_bytes = 1;
+
+        assert_ne!(base.digest().unwrap(), changed_window.digest().unwrap());
+        assert_ne!(base.digest().unwrap(), changed_header.digest().unwrap());
     }
 
     /// Scenario: a configured multiline pattern longer than

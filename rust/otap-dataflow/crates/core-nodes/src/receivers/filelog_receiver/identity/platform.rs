@@ -1,0 +1,573 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+//! Handle-based file opening, locator extraction, and bounded identity
+//! evidence collection.
+
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::path::Path;
+
+use super::{CandidateEvidence, IdentityError};
+use crate::receivers::filelog_receiver::checkpoint::primitives::{
+    ADVISORY_PATH_MAX_BYTES, Locator,
+};
+
+/// An opened regular-file candidate and the evidence collected from that
+/// same handle.
+#[derive(Debug)]
+pub(crate) struct OpenedCandidate {
+    pub(crate) file: File,
+    pub(crate) evidence: CandidateEvidence,
+}
+
+/// Opens one candidate without write access and collects all identity
+/// evidence from the resulting handle.
+pub(crate) fn open_candidate(
+    path: &Path,
+    follow_symlinks: bool,
+    fingerprint_bytes: u16,
+    ignored_header_bytes: u32,
+) -> Result<OpenedCandidate, IdentityError> {
+    let file = open_read_only(path, follow_symlinks).map_err(|source| IdentityError::Io {
+        operation: "open candidate",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let metadata = file.metadata().map_err(|source| IdentityError::Io {
+        operation: "read candidate metadata",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(IdentityError::NotRegularFile {
+            path: path.to_path_buf(),
+        });
+    }
+
+    let locator = locator_from_handle(&file, path, follow_symlinks)?;
+    let (fingerprint, size) =
+        collect_consistent_fingerprint(&file, path, fingerprint_bytes, ignored_header_bytes)?;
+    let advisory_path = encode_advisory_path(path)?;
+
+    Ok(OpenedCandidate {
+        file,
+        evidence: CandidateEvidence {
+            locator,
+            size,
+            fingerprint,
+            advisory_path,
+        },
+    })
+}
+
+fn collect_consistent_fingerprint(
+    file: &File,
+    path: &Path,
+    fingerprint_bytes: u16,
+    ignored_header_bytes: u32,
+) -> Result<(Vec<u8>, u64), IdentityError> {
+    let observe = || -> Result<(Vec<u8>, u64), IdentityError> {
+        let fingerprint = read_fingerprint(
+            file,
+            u64::from(ignored_header_bytes),
+            usize::from(fingerprint_bytes),
+        )
+        .map_err(|source| IdentityError::Io {
+            operation: "read candidate fingerprint",
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let size = file
+            .metadata()
+            .map_err(|source| IdentityError::Io {
+                operation: "refresh candidate metadata",
+                path: path.to_path_buf(),
+                source,
+            })?
+            .len();
+        Ok((fingerprint, size))
+    };
+
+    let (first_fingerprint, first_size) = observe()?;
+    let (second_fingerprint, second_size) = observe()?;
+    if fingerprint_observations_are_compatible(
+        &first_fingerprint,
+        first_size,
+        &second_fingerprint,
+        second_size,
+        fingerprint_bytes,
+        ignored_header_bytes,
+    ) {
+        return Ok((second_fingerprint, second_size));
+    }
+    Err(IdentityError::CandidateChangedDuringIdentity {
+        path: path.to_path_buf(),
+    })
+}
+
+fn fingerprint_length_is_consistent(
+    actual: usize,
+    size: u64,
+    fingerprint_bytes: u16,
+    ignored_header_bytes: u32,
+) -> bool {
+    let expected =
+        u64::from(fingerprint_bytes).min(size.saturating_sub(u64::from(ignored_header_bytes)));
+    u64::try_from(actual).is_ok_and(|actual| actual == expected)
+}
+
+fn fingerprint_observations_are_compatible(
+    first: &[u8],
+    first_size: u64,
+    second: &[u8],
+    second_size: u64,
+    fingerprint_bytes: u16,
+    ignored_header_bytes: u32,
+) -> bool {
+    fingerprint_length_is_consistent(
+        first.len(),
+        first_size,
+        fingerprint_bytes,
+        ignored_header_bytes,
+    ) && fingerprint_length_is_consistent(
+        second.len(),
+        second_size,
+        fingerprint_bytes,
+        ignored_header_bytes,
+    ) && second_size >= first_size
+        && second.starts_with(first)
+}
+
+#[cfg(unix)]
+fn open_read_only(path: &Path, follow_symlinks: bool) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = OpenOptions::new();
+    let _ = options.read(true);
+    let mut flags = libc::O_CLOEXEC | libc::O_NONBLOCK;
+    if !follow_symlinks {
+        flags |= libc::O_NOFOLLOW;
+    }
+    options.custom_flags(flags).open(path)
+}
+
+#[cfg(windows)]
+fn open_read_only(path: &Path, follow_symlinks: bool) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+    if !follow_symlinks {
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_read_only(_path: &Path, _follow_symlinks: bool) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "filelog identity is supported only on Unix and Windows",
+    ))
+}
+
+#[cfg(unix)]
+fn locator_from_handle(
+    file: &File,
+    path: &Path,
+    _follow_symlinks: bool,
+) -> Result<Locator, IdentityError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata().map_err(|source| IdentityError::Io {
+        operation: "extract POSIX file identity",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(Locator::PosixDevIno {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn locator_from_handle(
+    file: &File,
+    path: &Path,
+    follow_symlinks: bool,
+) -> Result<Locator, IdentityError> {
+    use std::mem::{size_of, zeroed};
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ID_INFO, FileIdInfo,
+        GetFileInformationByHandle, GetFileInformationByHandleEx,
+    };
+
+    let handle = file.as_raw_handle();
+    let mut basic: BY_HANDLE_FILE_INFORMATION = unsafe { zeroed() };
+    if unsafe { GetFileInformationByHandle(handle, &mut basic) } == 0 {
+        return Err(IdentityError::Io {
+            operation: "validate Windows candidate handle",
+            path: path.to_path_buf(),
+            source: io::Error::last_os_error(),
+        });
+    }
+    if !follow_symlinks && basic.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(IdentityError::SymlinkOrReparsePoint {
+            path: path.to_path_buf(),
+        });
+    }
+
+    let mut identity: FILE_ID_INFO = unsafe { zeroed() };
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            (&raw mut identity).cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(IdentityError::Io {
+            operation: "extract Windows file identity",
+            path: path.to_path_buf(),
+            source: io::Error::last_os_error(),
+        });
+    }
+
+    Ok(Locator::WindowsVolumeFileId {
+        volume_serial: identity.VolumeSerialNumber,
+        file_id: identity.FileId.Identifier,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn locator_from_handle(
+    _file: &File,
+    path: &Path,
+    _follow_symlinks: bool,
+) -> Result<Locator, IdentityError> {
+    Err(IdentityError::UnsupportedPlatform {
+        path: path.to_path_buf(),
+    })
+}
+
+#[cfg(unix)]
+fn read_fingerprint(file: &File, offset: u64, maximum: usize) -> io::Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+
+    read_bounded_at(maximum, |buffer, relative| {
+        file.read_at(buffer, offset + relative)
+    })
+}
+
+#[cfg(windows)]
+fn read_fingerprint(file: &File, offset: u64, maximum: usize) -> io::Result<Vec<u8>> {
+    use std::os::windows::fs::FileExt;
+
+    read_bounded_at(maximum, |buffer, relative| {
+        file.seek_read(buffer, offset + relative)
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_fingerprint(_file: &File, _offset: u64, _maximum: usize) -> io::Result<Vec<u8>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "filelog identity is supported only on Unix and Windows",
+    ))
+}
+
+fn read_bounded_at(
+    maximum: usize,
+    mut read_at: impl FnMut(&mut [u8], u64) -> io::Result<usize>,
+) -> io::Result<Vec<u8>> {
+    let mut bytes = vec![0; maximum];
+    let mut read = 0usize;
+    while read < maximum {
+        match read_at(&mut bytes[read..], read as u64) {
+            Ok(0) => break,
+            Ok(count) => {
+                read = read.checked_add(count).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "fingerprint length overflow")
+                })?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    bytes.truncate(read);
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn encode_advisory_path(path: &Path) -> Result<Vec<u8>, IdentityError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    bounded_path_bytes(path, path.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(windows)]
+fn encode_advisory_path(path: &Path) -> Result<Vec<u8>, IdentityError> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut bytes = Vec::new();
+    for code_unit in path.as_os_str().encode_wide() {
+        bytes.extend_from_slice(&code_unit.to_be_bytes());
+    }
+    bounded_path_bytes(path, bytes)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn encode_advisory_path(path: &Path) -> Result<Vec<u8>, IdentityError> {
+    Err(IdentityError::UnsupportedPlatform {
+        path: path.to_path_buf(),
+    })
+}
+
+fn bounded_path_bytes(path: &Path, bytes: Vec<u8>) -> Result<Vec<u8>, IdentityError> {
+    if bytes.len() > ADVISORY_PATH_MAX_BYTES {
+        return Err(IdentityError::AdvisoryPathTooLong {
+            path: path.to_path_buf(),
+            bytes: bytes.len(),
+            maximum: ADVISORY_PATH_MAX_BYTES,
+        });
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    /// Scenario: a regular file has ignored prefix bytes and less content
+    /// than the configured fingerprint window.
+    /// Guarantees: evidence comes from the opened handle, skips the exact
+    /// prefix, preserves the short fingerprint, and reports the handle size.
+    #[test]
+    fn opened_candidate_collects_short_bounded_evidence() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("app.log");
+        std::fs::write(&path, b"headerpayload").unwrap();
+
+        let candidate = open_candidate(&path, false, 32, 6).unwrap();
+
+        assert_eq!(candidate.evidence.fingerprint, b"payload");
+        assert_eq!(candidate.evidence.size, 13);
+        assert_ne!(candidate.evidence.locator, Locator::Unspecified);
+        assert_eq!(
+            candidate.file.metadata().unwrap().len(),
+            candidate.evidence.size
+        );
+    }
+
+    /// Scenario: a file grows from a short fingerprint to the configured
+    /// evidence-window length.
+    /// Guarantees: reopening preserves the locator and grows matching
+    /// evidence without moving either file handle's stream position.
+    #[test]
+    fn fingerprint_grows_without_changing_locator_or_cursor() {
+        use std::io::Seek;
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("grow.log");
+        std::fs::write(&path, b"ab").unwrap();
+        let mut first = open_candidate(&path, false, 4, 0).unwrap();
+        assert_eq!(first.file.stream_position().unwrap(), 0);
+
+        let mut append = OpenOptions::new().append(true).open(&path).unwrap();
+        append.write_all(b"cdmore").unwrap();
+        let mut second = open_candidate(&path, false, 4, 0).unwrap();
+
+        assert_eq!(first.evidence.locator, second.evidence.locator);
+        assert_eq!(first.evidence.fingerprint, b"ab");
+        assert_eq!(second.evidence.fingerprint, b"abcd");
+        assert_eq!(second.file.stream_position().unwrap(), 0);
+    }
+
+    #[cfg(unix)]
+    /// Scenario: a Unix path contains bytes that are not valid UTF-8.
+    /// Guarantees: advisory metadata preserves the original `OsStr` bytes
+    /// exactly and never uses lossy replacement.
+    #[test]
+    fn unix_advisory_path_preserves_non_utf8_bytes() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let directory = tempdir().unwrap();
+        let name = OsStr::from_bytes(b"log-\xff");
+        let path = directory.path().join(name);
+        let encoded = encode_advisory_path(&path).unwrap();
+
+        assert_eq!(encoded, path.as_os_str().as_bytes());
+    }
+
+    #[cfg(unix)]
+    /// Scenario: discovery reaches a symbolic link while following links is
+    /// disabled and then enabled.
+    /// Guarantees: no-follow opening rejects the link itself, while explicit
+    /// follow mode identifies the regular target from the resulting handle.
+    #[test]
+    fn unix_symlink_policy_is_enforced_at_open() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let target = directory.path().join("target.log");
+        let link = directory.path().join("link.log");
+        std::fs::write(&target, b"target").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(open_candidate(&link, false, 16, 0).is_err());
+        let followed = open_candidate(&link, true, 16, 0).unwrap();
+        let direct = open_candidate(&target, false, 16, 0).unwrap();
+        assert_eq!(followed.evidence.locator, direct.evidence.locator);
+    }
+
+    /// Scenario: a candidate advisory path exceeds the durable format's
+    /// byte bound.
+    /// Guarantees: path encoding reports the exact bound violation instead
+    /// of truncating two distinct paths to the same diagnostic evidence.
+    #[test]
+    fn oversized_advisory_path_is_rejected() {
+        let path = PathBuf::from("x".repeat(ADVISORY_PATH_MAX_BYTES + 1));
+        assert!(matches!(
+            encode_advisory_path(&path),
+            Err(IdentityError::AdvisoryPathTooLong { .. })
+        ));
+    }
+
+    /// Scenario: a fingerprint read reaches an early EOF but the following
+    /// handle metadata says more evidence bytes were available, as can occur
+    /// during concurrent growth or truncation.
+    /// Guarantees: evidence-length validation accepts only the exact
+    /// configured-or-EOF length and marks the inconsistent observation for
+    /// bounded retry.
+    #[test]
+    fn fingerprint_length_detects_file_mutation_during_collection() {
+        assert!(fingerprint_length_is_consistent(4, 4, 16, 0));
+        assert!(fingerprint_length_is_consistent(16, 100, 16, 0));
+        assert!(fingerprint_length_is_consistent(0, 4, 16, 8));
+        assert!(!fingerprint_length_is_consistent(4, 100, 16, 0));
+        assert!(!fingerprint_length_is_consistent(16, 4, 16, 0));
+    }
+
+    /// Scenario: two evidence observations see stable bytes, append-only
+    /// growth, a same-size rewrite, and a truncation respectively.
+    /// Guarantees: collection accepts stable/prefix-growing evidence but
+    /// rejects changed bytes and non-monotonic size before recovery matching.
+    #[test]
+    fn fingerprint_observations_require_stable_prefix_bytes() {
+        assert!(fingerprint_observations_are_compatible(
+            b"same", 4, b"same", 4, 16, 0
+        ));
+        assert!(fingerprint_observations_are_compatible(
+            b"ab", 2, b"abcd", 4, 16, 0
+        ));
+        assert!(!fingerprint_observations_are_compatible(
+            b"aaaa", 4, b"bbbb", 4, 16, 0
+        ));
+        assert!(!fingerprint_observations_are_compatible(
+            b"abcd", 4, b"abc", 3, 16, 0
+        ));
+    }
+
+    #[cfg(windows)]
+    /// Scenario: a Windows advisory path contains both BMP and surrogate-pair
+    /// UTF-16 code units.
+    /// Guarantees: path evidence is the reversible big-endian byte encoding
+    /// of native UTF-16 units, not a lossy UTF-8 conversion.
+    #[test]
+    fn windows_advisory_path_uses_big_endian_utf16_units() {
+        use std::os::windows::ffi::OsStrExt;
+
+        let path = PathBuf::from("C:\\logs\\snowman-\u{2603}-rocket-\u{1f680}.log");
+        let expected: Vec<u8> = path
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_be_bytes)
+            .collect();
+
+        assert_eq!(encode_advisory_path(&path).unwrap(), expected);
+    }
+
+    #[cfg(windows)]
+    /// Scenario: a candidate remains open while its path is renamed, as a
+    /// log rotator would do under move/create rotation.
+    /// Guarantees: read/write/delete sharing permits the rename and the
+    /// handle-derived volume/file ID remains stable at the new path.
+    #[test]
+    fn windows_candidate_sharing_and_identity_survive_rename() {
+        let directory = tempdir().unwrap();
+        let original = directory.path().join("active.log");
+        let rotated = directory.path().join("active.log.1");
+        std::fs::write(&original, b"line").unwrap();
+        let candidate = open_candidate(&original, false, 16, 0).unwrap();
+
+        std::fs::rename(&original, &rotated).unwrap();
+        let reopened = open_candidate(&rotated, false, 16, 0).unwrap();
+
+        assert_eq!(candidate.evidence.locator, reopened.evidence.locator);
+        assert!(matches!(
+            candidate.evidence.locator,
+            Locator::WindowsVolumeFileId { .. }
+        ));
+        assert_eq!(candidate.file.metadata().unwrap().len(), 4);
+    }
+
+    #[cfg(windows)]
+    /// Scenario: a Windows file symlink is opened with link following
+    /// disabled and then explicitly enabled.
+    /// Guarantees: `FILE_FLAG_OPEN_REPARSE_POINT` plus handle validation
+    /// prevents a reparse point from bypassing no-follow policy, while
+    /// follow mode identifies the regular target.
+    #[test]
+    fn windows_reparse_point_policy_is_enforced_at_open() {
+        use std::os::windows::fs::symlink_file;
+
+        let directory = tempdir().unwrap();
+        let target = directory.path().join("target.log");
+        let link = directory.path().join("link.log");
+        std::fs::write(&target, b"target").unwrap();
+        symlink_file(&target, &link).unwrap();
+
+        assert!(open_candidate(&link, false, 16, 0).is_err());
+        let followed = open_candidate(&link, true, 16, 0).unwrap();
+        let direct = open_candidate(&target, false, 16, 0).unwrap();
+        assert_eq!(followed.evidence.locator, direct.evidence.locator);
+    }
+
+    #[cfg(windows)]
+    /// Scenario: another Windows handle denies every sharing mode before the
+    /// receiver attempts to open the file.
+    /// Guarantees: candidate opening surfaces the sharing violation instead
+    /// of claiming identity evidence from a different path lookup or a
+    /// success-shaped fallback.
+    #[test]
+    fn windows_incompatible_writer_sharing_is_reported() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("exclusive.log");
+        std::fs::write(&path, b"line").unwrap();
+        let exclusive = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+
+        assert!(open_candidate(&path, false, 16, 0).is_err());
+        drop(exclusive);
+        assert!(open_candidate(&path, false, 16, 0).is_ok());
+    }
+}

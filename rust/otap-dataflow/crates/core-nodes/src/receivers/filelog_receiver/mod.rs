@@ -3,7 +3,7 @@
 
 //! Filelog receiver (Phase 1, under construction).
 //!
-//! This module currently ships three Phase 1 implementation-plan
+//! This module currently ships the following Phase 1 implementation-plan
 //! deliverables:
 //!
 //! - Stage 2: the exact version-1 durable checkpoint byte format and its
@@ -24,12 +24,15 @@
 //!   gives each receiver a preallocated, bounded ownership scope and prevents
 //!   two filelog readers in one engine process from controlling the same live
 //!   file.
+//! - Secure handle-based identity evidence plus durable recovery matching
+//!   ([`identity`]), including exact-locator and guarded unique-fingerprint
+//!   reconnect, start/mismatch policy, and atomic registration.
 //!
-//! Runtime receiver wiring -- discovery, framing, identity/recovery
-//! matching, the read/checkpoint thread that drives the store, and component
-//! factory registration -- is implemented in a later stage and does not
-//! exist yet. [`FILELOG_RECEIVER_URN`] is exported so that stage can register
-//! a `ReceiverFactory` without renaming anything here, but no factory is
+//! Runtime receiver wiring -- discovery, framing, the read/checkpoint thread
+//! that drives these foundations, and component factory registration -- is
+//! implemented in a later stage and does not exist yet.
+//! [`FILELOG_RECEIVER_URN`] is exported so that stage can register a
+//! `ReceiverFactory` without renaming anything here, but no factory is
 //! registered yet: there is no `distributed_slice` entry and no receiver
 //! implementation in this module.
 #![allow(dead_code)] // Config validation and the checkpoint codec are wired up so far, but nothing constructs a receiver yet.
@@ -40,11 +43,12 @@
 /// The codec modules encode, decode, and replay checkpoint bytes in memory
 /// and perform no I/O. [`checkpoint::store`] owns the namespace on disk; it
 /// blocks, so it belongs on the receiver's dedicated read/checkpoint OS
-/// thread. Neither performs OS-specific locator lookups; those belong to a
-/// later implementation stage.
+/// thread. OS-specific locator lookup and recovery matching live in
+/// [`identity`].
 pub mod checkpoint;
 
 mod config;
+mod identity;
 mod lease;
 
 pub use config::{

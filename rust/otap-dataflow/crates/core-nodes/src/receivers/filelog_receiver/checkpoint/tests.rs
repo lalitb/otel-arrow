@@ -138,7 +138,7 @@ fn decode_snapshot_two_records_matches_expected_fields() {
     assert_eq!(
         quarantined.locator,
         Locator::WindowsVolumeFileId {
-            volume_serial: 0xDEAD_BEEF,
+            volume_serial: 0x0123_4567_DEAD_BEEF,
             file_id: [0xAA; 16],
         }
     );

@@ -284,6 +284,81 @@ fn distinct_registrations(count: usize) -> Vec<RegisterFile> {
         .collect()
 }
 
+/// Scenario: a nearly full WAL transaction is followed by a two-operation
+/// caller-defined atomic group.
+/// Guarantees: grouped packing starts a new transaction before the pair
+/// instead of splitting the pair at the format operation boundary.
+#[test]
+fn atomic_group_packing_never_splits_a_group() {
+    let operation = Operation::RegisterFile(registration(1));
+    let leading = vec![operation.clone(); usize::from(WAL_MAX_OPS_PER_TX) - 1];
+    let pair = vec![operation.clone(), operation];
+
+    let (operations, transaction_lengths) =
+        super::pack_atomic_groups(vec![leading, pair]).expect("groups pack");
+
+    assert_eq!(operations.len(), usize::from(WAL_MAX_OPS_PER_TX) + 1);
+    assert_eq!(
+        transaction_lengths,
+        vec![usize::from(WAL_MAX_OPS_PER_TX) - 1, 2]
+    );
+}
+
+/// Scenario: 4,095 valid registrations fill the first grouped WAL
+/// transaction and a `register_file + quarantine_file` pair starts the
+/// second transaction, where every WAL persistence boundary is faulted.
+/// Guarantees: actual packing, append, and recovery preserve the pair as an
+/// indivisible group at the transaction boundary; reopen sees it either
+/// absent or fully quarantined, never active.
+#[test]
+fn atomic_group_boundary_survives_every_wal_fault() {
+    for point in FaultPoint::WAL_DURABILITY {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("namespace");
+        let mut store_options = options(&path);
+        store_options.max_tracked_files = u32::from(WAL_MAX_OPS_PER_TX);
+        drop(CheckpointStore::open(store_options.clone()).expect("namespace initializes"));
+
+        let mut registrations = distinct_registrations(usize::from(WAL_MAX_OPS_PER_TX));
+        let candidate = registrations.pop().expect("candidate registration");
+        let candidate_id = candidate.file_id;
+        let candidate_locator = candidate.locator;
+        let mut groups: Vec<Vec<Operation>> = registrations
+            .into_iter()
+            .map(|registration| vec![Operation::RegisterFile(registration)])
+            .collect();
+        groups.push(vec![
+            Operation::RegisterFile(candidate),
+            Operation::QuarantineFile(QuarantineFile {
+                file_id: candidate_id,
+                expected_file_epoch: 1,
+                reason_code: 0x0003,
+                locator: candidate_locator,
+                observed_size: 8,
+                quarantine_epoch: 1,
+                quarantine_time_unix_nano: 2_000,
+            }),
+        ]);
+
+        let mut faulted = CheckpointStore::open_with_fault_after(store_options.clone(), point, 1)
+            .expect("faulted store opens");
+        assert!(
+            faulted.append_atomic_groups(groups).is_err(),
+            "{point:?} must interrupt the second transaction"
+        );
+        drop(faulted);
+
+        let recovered = CheckpointStore::open(store_options).expect("namespace recovers");
+        if let Some(record) = recovered.table().get(&candidate_id) {
+            assert_eq!(
+                record.lifecycle_state,
+                LifecycleState::Quarantined,
+                "{point:?} recovered a register-only candidate"
+            );
+        }
+    }
+}
+
 /// Scenario: one Ack delta set exceeds the format's operation maximum, and
 /// the next sequence is forced to the final `u64` value.
 /// Guarantees: progress is one WAL transaction and both bounds are
@@ -564,7 +639,7 @@ fn widest_registration(index: u64) -> RegisterFile {
         // The widest locator variant; `register_file` must still carry the
         // clean resume state and epoch 1 that replay requires.
         locator: Locator::WindowsVolumeFileId {
-            volume_serial: u32::MAX,
+            volume_serial: u64::MAX,
             file_id: [0xAB; 16],
         },
         fingerprint: vec![0x5A; 16],

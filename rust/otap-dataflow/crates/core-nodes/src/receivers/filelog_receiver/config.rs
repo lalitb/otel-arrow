@@ -22,7 +22,10 @@ use std::time::Duration;
 use regex::Regex;
 
 use super::checkpoint::framing_profile;
-use super::checkpoint::primitives::{FINGERPRINT_MAX_BYTES, NAMESPACE_ID_MAX_BYTES};
+use super::checkpoint::primitives::{
+    ADVISORY_PATH_MAX_BYTES, FINGERPRINT_MAX_BYTES, FINGERPRINT_PROFILE_VERSION,
+    NAMESPACE_ID_MAX_BYTES,
+};
 use super::checkpoint::store::limits::StoreLimits;
 
 /// URN for the filelog receiver.
@@ -64,6 +67,15 @@ const MIN_FINGERPRINT_BYTES: u64 = 16;
 /// stores `fingerprint` as a `u16`-length-prefixed byte field, so a value
 /// larger than this can never round-trip through the durable format.
 const MAX_FINGERPRINT_BYTES: u64 = FINGERPRINT_MAX_BYTES as u64;
+/// Conservative process-memory ceiling for one identity reconciliation pass.
+const IDENTITY_RECONCILIATION_BYTES_CEILING: u64 = 1024 * 1024 * 1024;
+/// Conservative map/vector/allocation overhead per pending/open candidate.
+const IDENTITY_CANDIDATE_OVERHEAD_BYTES: u64 = 256;
+/// Additional allocation overhead for an opened candidate while its durable
+/// operations are preflighted.
+const IDENTITY_OPEN_CANDIDATE_OVERHEAD_BYTES: u64 = 512;
+/// Conservative locator/fingerprint/path index overhead per checkpoint row.
+const IDENTITY_RECORD_INDEX_OVERHEAD_BYTES: u64 = 384;
 
 /// Maximum accepted `identity.ignored_header_bytes`: the checkpoint codec
 /// stores `ignored_header_bytes` as a `u32`, so a value larger than this can
@@ -1030,8 +1042,9 @@ impl RuntimeConfig {
             return Err(invalid("drain_timeout must be greater than zero"));
         }
         let limits = validate_limits(limits)?;
+        validate_identity_reconciliation_bounds(&identity, &limits)?;
         let (framing, framing_profile_digest, compiled_multiline_pattern) =
-            validate_framing(framing, encoding)?;
+            validate_framing(framing, encoding, &identity)?;
         let batch = validate_batch(batch, &framing, &metadata)?;
         let rotation = validate_rotation(rotation)?;
         let retry = validate_retry(retry)?;
@@ -1179,6 +1192,10 @@ fn validate_limits(limits: LimitsConfig) -> Result<LimitsConfig, otap_df_config:
             "limits.max_open_files must be <= limits.max_tracked_files",
         ));
     }
+    ensure_fits_usize(
+        "limits.max_pending_candidates + limits.max_open_files",
+        u64::from(limits.max_pending_candidates) + u64::from(limits.max_open_files),
+    )?;
     if limits.max_read_bytes_per_turn == 0 {
         return Err(invalid(
             "limits.max_read_bytes_per_turn must be greater than zero",
@@ -1189,6 +1206,54 @@ fn validate_limits(limits: LimitsConfig) -> Result<LimitsConfig, otap_df_config:
         limits.max_read_bytes_per_turn,
     )?;
     Ok(limits)
+}
+
+fn validate_identity_reconciliation_bounds(
+    identity: &IdentityConfig,
+    limits: &LimitsConfig,
+) -> Result<(), otap_df_config::error::Error> {
+    let candidate_population = u64::from(limits.max_pending_candidates)
+        .checked_add(u64::from(limits.max_open_files))
+        .ok_or_else(|| invalid("identity reconciliation candidate population overflows u64"))?;
+    let candidate_bytes = identity
+        .fingerprint_bytes
+        .checked_add(ADVISORY_PATH_MAX_BYTES as u64)
+        .and_then(|bytes| bytes.checked_add(IDENTITY_CANDIDATE_OVERHEAD_BYTES))
+        .and_then(|bytes| bytes.checked_mul(candidate_population))
+        .ok_or_else(|| invalid("identity reconciliation candidate memory bound overflows u64"))?;
+    // Besides the candidate/inventory copy above, durable admission can
+    // transiently hold operation, validation, and applied-record copies.
+    // Four extra fingerprints and two extra paths conservatively cover that
+    // open-candidate amplification.
+    let open_candidate_bytes = identity
+        .fingerprint_bytes
+        .checked_mul(4)
+        .and_then(|bytes| {
+            (ADVISORY_PATH_MAX_BYTES as u64)
+                .checked_mul(2)
+                .and_then(|paths| bytes.checked_add(paths))
+        })
+        .and_then(|bytes| bytes.checked_add(IDENTITY_OPEN_CANDIDATE_OVERHEAD_BYTES))
+        .and_then(|bytes| bytes.checked_mul(u64::from(limits.max_open_files)))
+        .ok_or_else(|| {
+            invalid("identity reconciliation open-candidate memory bound overflows u64")
+        })?;
+    let record_index_bytes = u64::from(limits.max_tracked_files)
+        .checked_mul(IDENTITY_RECORD_INDEX_OVERHEAD_BYTES)
+        .ok_or_else(|| invalid("identity reconciliation record-index bound overflows u64"))?;
+    let total = candidate_bytes
+        .checked_add(open_candidate_bytes)
+        .and_then(|bytes| bytes.checked_add(record_index_bytes))
+        .ok_or_else(|| invalid("identity reconciliation working-set bound overflows u64"))?;
+    if total > IDENTITY_RECONCILIATION_BYTES_CEILING {
+        return Err(invalid(&format!(
+            "identity reconciliation worst-case working set is {total} bytes, exceeding the \
+             {IDENTITY_RECONCILIATION_BYTES_CEILING}-byte ceiling; reduce \
+             limits.max_pending_candidates, limits.max_open_files, limits.max_tracked_files, \
+             or identity.fingerprint_bytes"
+        )));
+    }
+    Ok(())
 }
 
 /// Validates the RE2-compatible pattern (rejecting backreferences,
@@ -1237,6 +1302,7 @@ fn canonicalize_force_flush_period_millis(
 fn validate_framing(
     framing: FramingConfig,
     encoding: Encoding,
+    identity: &IdentityConfig,
 ) -> Result<(FramingConfig, [u8; 32], Option<Regex>), otap_df_config::error::Error> {
     if framing.max_line_bytes == 0 {
         return Err(invalid("framing.max_line_bytes must be greater than zero"));
@@ -1290,6 +1356,11 @@ fn validate_framing(
     let force_flush_period_millis =
         canonicalize_force_flush_period_millis(framing.force_flush_period)?;
     let params = framing_profile::FramingProfileParams {
+        fingerprint_profile_version: FINGERPRINT_PROFILE_VERSION,
+        fingerprint_bytes: u16::try_from(identity.fingerprint_bytes)
+            .expect("validated fingerprint_bytes fits u16"),
+        ignored_header_bytes: u32::try_from(identity.ignored_header_bytes)
+            .expect("validated ignored_header_bytes fits u32"),
         encoding: encoding_to_framing_profile(encoding),
         multiline_mode,
         max_line_bytes: framing.max_line_bytes,
@@ -2188,6 +2259,27 @@ mod tests {
         cfg.limits.max_tracked_files = 10;
         cfg.limits.max_open_files = 10;
         assert!(RuntimeConfig::from_config(cfg, "node-1").is_ok());
+    }
+
+    /// Scenario: candidate, open-file, tracked-record, and fingerprint
+    /// limits independently validate but their combined identity
+    /// reconciliation working set exceeds one GiB.
+    /// Guarantees: cross-field validation rejects the configuration before
+    /// runtime allocation and identifies the knobs that reduce the bound.
+    #[test]
+    fn identity_reconciliation_working_set_is_bounded() {
+        let mut cfg = minimal_config();
+        cfg.limits.max_pending_candidates = 1_000_000;
+        cfg.limits.max_tracked_files = 1_000_000;
+        cfg.limits.max_open_files = 1_000_000;
+
+        let error = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("identity reconciliation worst-case working set")
+        );
     }
 
     /// Scenario: `batch.max_records` is zero, at the documented maximum of

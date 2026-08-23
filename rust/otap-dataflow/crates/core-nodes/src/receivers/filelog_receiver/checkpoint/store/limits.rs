@@ -80,8 +80,8 @@ const TRANSACTION_OVERHEAD_BYTES: u64 = 4 + 8 + 2 + 4;
 /// The `u16` length prefix of one variable-length field.
 const VAR_LEN_PREFIX_BYTES: u64 = 2;
 /// Widest encoded `locator`: the Windows variant (`kind`, `volume_serial`,
-/// 16-byte file id). The POSIX variant is four bytes shorter.
-const LOCATOR_MAX_BYTES: u64 = 1 + 4 + 16;
+/// 16-byte file id). The POSIX variant is eight bytes shorter.
+const LOCATOR_MAX_BYTES: u64 = 1 + 8 + 16;
 /// Widest encoded `framing_resume`: the continuation variant (`kind`,
 /// `record_start_offset`, `next_fragment_index`).
 const FRAMING_RESUME_MAX_BYTES: u64 = 1 + 8 + 4;
@@ -496,7 +496,7 @@ mod tests {
     /// The widest locator, resume state, and evidence the codec can emit,
     /// so a fixture is a genuine worst case rather than a typical value.
     const WIDEST_LOCATOR: Locator = Locator::WindowsVolumeFileId {
-        volume_serial: u32::MAX,
+        volume_serial: u64::MAX,
         file_id: [0xAB; 16],
     };
     const WIDEST_RESUME: FramingResume = FramingResume::Continuation {
