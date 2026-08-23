@@ -25,3 +25,6 @@ pub mod host_metrics_receiver;
 
 /// Journald receiver.
 pub mod journald_receiver;
+
+/// Filelog receiver.
+pub mod filelog_receiver;
