@@ -1215,8 +1215,8 @@ fn remove_file_replay_against_absent_file_id_is_idempotent() {
 /// Scenario: a snapshot record and its equivalent standalone `SnapshotRecord`
 /// value are compared after a round trip through `CheckpointTable`.
 /// Guarantees: `CheckpointTable::snapshot_records` reproduces exactly the
-/// records a snapshot would persist, so compaction (a later stage) can
-/// encode `table.snapshot_records()` directly with `encode_snapshot`.
+/// records a snapshot would persist, so compaction can encode
+/// `table.snapshot_records()` directly with `encode_snapshot`.
 #[test]
 fn checkpoint_table_snapshot_records_round_trip_through_encode_snapshot() {
     let file_id = FileId([19; 16]);

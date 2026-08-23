@@ -94,7 +94,7 @@ contain snapshot/WAL files for more than one generation simultaneously during
 compaction (the previous generation stays present and valid until `CURRENT`
 is atomically repointed); this document only defines the byte format of each
 individual file, not the atomic-replacement procedure for `CURRENT` itself,
-which is a durable-checkpoint-store concern (a later implementation stage).
+which is a durable-checkpoint-store concern.
 
 ## The `CURRENT` marker
 

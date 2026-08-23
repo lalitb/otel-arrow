@@ -11,12 +11,17 @@
 //! `quarantine_file`, `reset_quarantined_file`, `remove_file`), and the
 //! framing-profile canonical serialization and digest.
 //!
-//! Scope note (Stage 2 of the Phase 1 filelog receiver implementation plan):
-//! this module only encodes, decodes, and replays checkpoint bytes against
-//! an in-memory table. It performs no filesystem I/O, no namespace locking,
-//! no atomic file replacement, and no OS-specific locator lookups; the
-//! durable checkpoint store (Stage 4) builds on top of this codec in a later
-//! implementation stage.
+//! Scope note: the codec modules here ([`primitives`], [`current_marker`],
+//! [`snapshot`], [`wal`], [`apply`], [`framing_profile`]) only encode,
+//! decode, and replay checkpoint bytes against an in-memory table. They
+//! perform no filesystem I/O, no namespace locking, no atomic file
+//! replacement, and no OS-specific locator lookups.
+//!
+//! [`store`] is the durable half built on top of them: it owns the
+//! namespace directory, the ownership lock, generation selection, recovery,
+//! WAL appends, sync policy, compaction, and retention. Everything in
+//! [`store`] blocks and must run on the receiver's dedicated
+//! read/checkpoint OS thread, never in async code.
 //!
 //! Locators are represented purely as normalized data ([`primitives::Locator`])
 //! with no OS FFI, so this module and its tests compile and run identically
@@ -28,6 +33,7 @@ pub mod error;
 pub mod framing_profile;
 pub mod primitives;
 pub mod snapshot;
+pub mod store;
 pub mod wal;
 
 #[cfg(test)]
@@ -39,4 +45,7 @@ pub use apply::{CheckpointTable, TableRecord};
 pub use error::{ApplyError, DecodeError, EncodeError};
 pub use primitives::{FileId, FramingResume, LifecycleState, Locator};
 pub use snapshot::{QuarantineEvidence, SnapshotContents, SnapshotRecord};
+pub use store::error::StoreError;
+pub use store::limits::StoreLimits;
+pub use store::{AppendOutcome, CheckpointStore, RecoveryReport, StoreOptions, StoreStats};
 pub use wal::WalContents;

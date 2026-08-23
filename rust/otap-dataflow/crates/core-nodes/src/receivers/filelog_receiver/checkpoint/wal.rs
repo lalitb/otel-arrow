@@ -808,7 +808,7 @@ impl Transaction {
 
 /// The result of scanning exactly one transaction attempt from the current
 /// WAL cursor position.
-enum TransactionScan {
+pub(crate) enum TransactionScan {
     /// A structurally complete, checksum-valid transaction.
     Complete(Transaction, usize),
     /// A structurally incomplete final transaction (the torn-tail case):
@@ -821,7 +821,7 @@ enum TransactionScan {
 /// structurally complete frame with an invalid checksum, or invalid
 /// contents once validated), per
 /// `docs/filelog-checkpoint-format.md#torn-tail-versus-corruption`.
-fn scan_one_transaction(bytes: &[u8]) -> Result<TransactionScan, DecodeError> {
+pub(crate) fn scan_one_transaction(bytes: &[u8]) -> Result<TransactionScan, DecodeError> {
     let remaining = bytes.len();
     if remaining < 4 {
         return Ok(TransactionScan::TornTail(remaining));
@@ -865,27 +865,12 @@ pub struct WalContents {
     pub torn_tail_bytes: usize,
 }
 
-/// Encodes a complete WAL file (header plus every transaction) for the
-/// given `generation`.
-pub fn encode_wal(generation: u64, transactions: &[Transaction]) -> Result<Vec<u8>, EncodeError> {
-    let mut out = ByteWriter::new();
-    out.write_bytes(WAL_MAGIC);
-    out.write_u16(FORMAT_VERSION);
-    out.write_u16(0); // flags, reserved
-    out.write_u64(generation);
-    let header_crc = crc32c(out.as_bytes());
-    out.write_u32(header_crc);
-    for transaction in transactions {
-        out.write_bytes(&transaction.encode()?);
-    }
-    Ok(out.into_bytes())
-}
-
-/// Decodes and validates a complete WAL file: the header (no torn-tail
-/// leniency), then every transaction in strictly increasing sequence order,
-/// applying the torn-tail-versus-corruption distinction to the final
-/// transaction only.
-pub fn decode_wal(bytes: &[u8]) -> Result<WalContents, DecodeError> {
+/// Decodes and validates the fixed-width WAL header, returning its
+/// generation.
+///
+/// The durable store calls this once, then scans and applies one transaction
+/// at a time so recovery does not retain every decoded operation in memory.
+pub(crate) fn decode_wal_header(bytes: &[u8]) -> Result<u64, DecodeError> {
     if bytes.len() < WAL_HEADER_LEN {
         return Err(DecodeError::Truncated {
             needed: WAL_HEADER_LEN,
@@ -923,6 +908,31 @@ pub fn decode_wal(bytes: &[u8]) -> Result<WalContents, DecodeError> {
             computed: computed_header_crc,
         });
     }
+    Ok(generation)
+}
+
+/// Encodes a complete WAL file (header plus every transaction) for the
+/// given `generation`.
+pub fn encode_wal(generation: u64, transactions: &[Transaction]) -> Result<Vec<u8>, EncodeError> {
+    let mut out = ByteWriter::new();
+    out.write_bytes(WAL_MAGIC);
+    out.write_u16(FORMAT_VERSION);
+    out.write_u16(0); // flags, reserved
+    out.write_u64(generation);
+    let header_crc = crc32c(out.as_bytes());
+    out.write_u32(header_crc);
+    for transaction in transactions {
+        out.write_bytes(&transaction.encode()?);
+    }
+    Ok(out.into_bytes())
+}
+
+/// Decodes and validates a complete WAL file: the header (no torn-tail
+/// leniency), then every transaction in strictly increasing sequence order,
+/// applying the torn-tail-versus-corruption distinction to the final
+/// transaction only.
+pub fn decode_wal(bytes: &[u8]) -> Result<WalContents, DecodeError> {
+    let generation = decode_wal_header(bytes)?;
 
     let mut cursor = WAL_HEADER_LEN;
     let mut transactions = Vec::new();

@@ -78,6 +78,15 @@ impl CheckpointTable {
         self.records.is_empty()
     }
 
+    /// Iterates every record and its key, in unspecified order.
+    ///
+    /// Borrowing avoids the whole-table clone
+    /// [`Self::snapshot_records`] performs, which matters for read-only
+    /// scans such as the durable store's retention pass.
+    pub fn iter(&self) -> impl Iterator<Item = (&FileId, &TableRecord)> {
+        self.records.iter()
+    }
+
     /// Returns every record, ordered by `file_id`, suitable for deterministic
     /// snapshot encoding.
     #[must_use]
@@ -85,6 +94,40 @@ impl CheckpointTable {
         let mut records: Vec<SnapshotRecord> = self.records.values().cloned().collect();
         records.sort_by_key(|record| record.file_id);
         records
+    }
+
+    /// Validates and stages `operations` in a bounded scratch map without
+    /// changing the table.
+    fn stage_operations(
+        &self,
+        operations: &[Operation],
+        namespace_id: &str,
+    ) -> Result<HashMap<FileId, Option<TableRecord>>, ApplyError> {
+        let mut touched: HashMap<FileId, Option<TableRecord>> = HashMap::new();
+        for operation in operations {
+            let file_id = operation.file_id();
+            let _ = touched
+                .entry(file_id)
+                .or_insert_with(|| self.records.get(&file_id).cloned());
+        }
+        for operation in operations {
+            Self::apply_operation(&mut touched, operation, namespace_id)?;
+        }
+        Ok(touched)
+    }
+
+    /// Validates every supplied operation without changing the table.
+    ///
+    /// The durable store uses this to preflight a caller batch that will be
+    /// split across multiple on-disk transactions. Deterministic failures
+    /// are therefore reported before the first chunk becomes durable.
+    pub(crate) fn validate_operations(
+        &self,
+        operations: &[Operation],
+        namespace_id: &str,
+    ) -> Result<(), ApplyError> {
+        let _staged = self.stage_operations(operations, namespace_id)?;
+        Ok(())
     }
 
     /// Applies every operation in `transaction` atomically: either every
@@ -110,16 +153,7 @@ impl CheckpointTable {
         transaction: &Transaction,
         namespace_id: &str,
     ) -> Result<(), ApplyError> {
-        let mut touched: HashMap<FileId, Option<TableRecord>> = HashMap::new();
-        for operation in &transaction.operations {
-            let file_id = operation.file_id();
-            let _ = touched
-                .entry(file_id)
-                .or_insert_with(|| self.records.get(&file_id).cloned());
-        }
-        for operation in &transaction.operations {
-            Self::apply_operation(&mut touched, operation, namespace_id)?;
-        }
+        let touched = self.stage_operations(&transaction.operations, namespace_id)?;
         for (file_id, record) in touched {
             match record {
                 Some(record) => {

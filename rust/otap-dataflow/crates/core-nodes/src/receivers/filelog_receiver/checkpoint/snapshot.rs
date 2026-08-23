@@ -258,9 +258,9 @@ pub fn encode_snapshot(
 }
 
 /// The fully decoded contents of one snapshot file. Mirrors
-/// [`super::wal::WalContents`] so a later stage (Stage 4) can cross-check
-/// the `CURRENT` marker's generation, this snapshot's own `generation`, and
-/// the WAL's `generation` against each other.
+/// [`super::wal::WalContents`] so [`super::store`] can cross-check the
+/// `CURRENT` marker's generation, this snapshot's own `generation`, and the
+/// WAL's `generation` against each other.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotContents {
     /// The generation number recorded in the snapshot header.
@@ -269,13 +269,21 @@ pub struct SnapshotContents {
     pub records: Vec<SnapshotRecord>,
 }
 
-/// Decodes and fully validates a complete snapshot file, returning its
-/// generation and records in on-disk order.
+/// Validated fixed-width fields from one snapshot header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SnapshotHeader {
+    /// Generation declared by the snapshot.
+    pub(crate) generation: u64,
+    /// Number of records declared by the snapshot.
+    pub(crate) record_count: u32,
+}
+
+/// Decodes and validates only the fixed-width snapshot header.
 ///
-/// Fails closed (with no torn-tail leniency) on any header, record, or
-/// footer inconsistency, including trailing bytes after a structurally
-/// complete footer.
-pub fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotContents, DecodeError> {
+/// The durable store uses the count before allocating decoded records so a
+/// namespace cannot bypass `limits.max_tracked_files` with many compact
+/// records inside an otherwise byte-bounded snapshot.
+pub(crate) fn decode_snapshot_header(bytes: &[u8]) -> Result<SnapshotHeader, DecodeError> {
     if bytes.len() < SNAPSHOT_HEADER_LEN {
         return Err(DecodeError::Truncated {
             needed: SNAPSHOT_HEADER_LEN,
@@ -314,6 +322,22 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotContents, DecodeError> {
             computed: computed_header_crc,
         });
     }
+    Ok(SnapshotHeader {
+        generation,
+        record_count,
+    })
+}
+
+/// Decodes and fully validates a complete snapshot file, returning its
+/// generation and records in on-disk order.
+///
+/// Fails closed (with no torn-tail leniency) on any header, record, or
+/// footer inconsistency, including trailing bytes after a structurally
+/// complete footer.
+pub fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotContents, DecodeError> {
+    let header = decode_snapshot_header(bytes)?;
+    let generation = header.generation;
+    let record_count = header.record_count;
 
     let mut records = Vec::with_capacity(record_count.min(1 << 16) as usize);
     let mut seen_file_ids =

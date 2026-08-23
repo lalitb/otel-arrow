@@ -1052,8 +1052,12 @@ and recovery model**. The exact byte encoding is a separate Phase 1 deliverable.
 - **Ack cost is proportional to changed files.** One Ack produces one transaction with
   updates for only the files in that batch. With `checkpoint.sync_interval: 0`, the WAL
   is synced before the batch is released and the next read begins. A nonzero interval
-  may coalesce syncs; this widens only the crash-duplicate window for already-Acked
-  data. Drain always syncs outstanding transactions.
+  may coalesce syncs; the read/checkpoint worker drives the store's next-sync deadline
+  even while sources are idle, so the configured interval remains the maximum
+  crash-duplicate window for already-Acked data. Drain always syncs outstanding
+  transactions. An Ack delta set larger than the WAL transaction operation limit is
+  rejected before any file advances; it is never split into partially successful
+  progress transactions.
 - **Fail-policy quarantine is durable.** `quarantine_file` is appended and synced before
   the file is reported as quarantined. It records a bounded reason code and the observed
   locator, size, epoch, and wall-clock time. A restart reconnecting the same runtime
@@ -1065,9 +1069,11 @@ and recovery model**. The exact byte encoding is a separate Phase 1 deliverable.
   must invoke the state-management operation with the checkpoint namespace, exact
   `file_id`, and one action: `reset_to_beginning`, `reset_to_end`, or `keep_failed`.
   The operation requires exclusive ownership of the checkpoint namespace, appends and
-  syncs `reset_quarantined_file`, increments `file_epoch`, resets framing state, and
-  emits an auditable health event and counter. A bulk configuration switch cannot
-  authorize loss for every quarantined file.
+  syncs `reset_quarantined_file`, and emits an auditable health event and counter.
+  Either reset action increments `file_epoch`, clears framing state, and activates the
+  requested offset; `keep_failed` preserves the epoch, offset, framing state, and
+  quarantine evidence. A bulk configuration switch cannot authorize loss for every
+  quarantined file.
 - **Torn tails are recoverable.** Recovery loads the selected snapshot, replays complete
   monotonically sequenced transactions, and ignores only trailing bytes that cannot
   form the transaction length declared by the final header. A complete transaction
@@ -1082,6 +1088,25 @@ and recovery model**. The exact byte encoding is a separate Phase 1 deliverable.
   first-store creation, it selects the highest complete pair; an invalid selected pair
   otherwise fails closed rather than guessing from modification time. Compaction
   duration is measured because a large tracked-file table can delay the next Phase 1 batch.
+- **Publication is platform-specific but preserves one-generation selection.** Unix
+  installs same-directory temporary files with atomic `rename` and syncs the namespace
+  directory. Windows uses `ReplaceFileW` when `CURRENT` already exists and
+  `MoveFileExW(MOVEFILE_WRITE_THROUGH)` for first publication; the store closes its
+  temporary and marker handles before replacement so incompatible self-owned sharing
+  modes cannot block publication. Direct Win32 calls receive absolute extended-length
+  paths resolved from the existing namespace parent, so publication is not limited by
+  legacy `MAX_PATH` handling and preserves drive and UNC path forms. `ReplaceFileW`
+  errors 1176 and 1177 can change one or both names despite reporting failure; either
+  error makes the live store unusable until reopen determines the authoritative
+  generation. `std::fs` cannot sync a Windows directory handle, so the directory-sync
+  step is a documented no-op there after the temporary file itself is synced. Atomic
+  replacement is preserved, while power-loss durability of the directory entry relies
+  on the local filesystem's metadata journaling and is weaker evidence than Unix
+  directory `fsync`. Windows CI must execute first creation, replacement of an existing
+  `CURRENT`, long-path publication, every compaction fault point, reopen after
+  interrupted cleanup, namespace-lock contention, and sharing-violation failure; a
+  platform power-cut test remains required before claiming equivalent crash-durability
+  evidence.
 - **Retention is applied during compaction.** A record may be removed only when it has
   been absent from discovery and all open/in-flight state longer than
   `checkpoint.retention`. Wall-clock time is required across restart, so a large forward
@@ -1089,7 +1114,9 @@ and recovery model**. The exact byte encoding is a separate Phase 1 deliverable.
   `start_at: end` skipping if the file later returns. This is an explicit retention
   tradeoff, not harmless behavior. Retention can be disabled for operators that require
   indefinite resume state. Quarantined records are exempt regardless of this setting and
-  remain until an explicit per-file reset or administrative removal.
+  remain until an explicit per-file reset or administrative removal. The runtime passes
+  the store an explicitly vetted set of records absent from discovery, readers, leases,
+  and in-flight deltas; persisted age alone never authorizes removal.
 
 The Phase 1 namespace lock prevents stale whole-store writers. Phase 3 cannot obtain fencing
 merely by storing an epoch in these files; it requires a coordinator or storage API that
@@ -1769,9 +1796,81 @@ selecting it through `CURRENT`. The previously selected generation remains recov
 until the new generation and marker are durable. Cleanup never makes an incomplete
 generation authoritative.
 
+Cleanup is resumable: the complete pending-generation list is retained until every
+unlink and the final directory sync succeed. A retry therefore repeats already completed
+unlinks idempotently, including when both files disappeared but the directory update was
+not known durable. A store with any pending retired generation refuses another
+compaction until cleanup succeeds, which bounds normal operation to the active pair plus
+one retired pair. Recovery accepts at most three recognized generations so it can also
+clean one incomplete staged generation or state left by the earlier implementation
+without admitting an unbounded directory population. It likewise refuses more than
+seven recognized temporary artifacts before deleting any of them.
+
 Every stored format carries an explicit version. An incompatible encoding or semantic
 change requires a new version, an explicit migration policy, and compatibility vectors.
 Recovery never guesses across unknown versions or silently resets durable progress.
+
+### Bounded recovery resources
+
+Recovery reads each durable artifact into memory, so snapshot, WAL, transaction, and
+combined working-set bounds are derived from configuration rather than configured
+independently. The size a store may write and the size it will read back are therefore
+the same:
+
+| Artifact | Worst case |
+| --- | --- |
+| Snapshot | Header and footer plus `limits.max_tracked_files` worst-case records, where a worst-case record carries an `identity.fingerprint_bytes` fingerprint, a maximum-length advisory path, and quarantine evidence |
+| WAL | Header plus `checkpoint.compact_after_bytes` plus one maximal transaction (the format's per-transaction operation maximum at the widest operation encoding for that fingerprint window) |
+| Transaction | Transaction framing plus 4,096 widest operations for the configured fingerprint window |
+
+Both write paths enforce those same bounds: an append that would push the live WAL past
+its bound is refused before the in-memory table advances, so compacting and retrying the
+identical transaction succeeds, and a compaction whose encoded snapshot exceeds its
+bound is refused before any byte is written, leaving the current generation
+authoritative. A multi-transaction caller batch preflights all transitions, sequences,
+tracked-file growth, encoded bytes, and counters before its first chunk is persisted.
+
+Recovery validates the snapshot header's record count before decoding records, builds
+the table, and drops the snapshot byte buffer before reading the WAL. It validates each
+declared transaction length against the configured transaction bound before decoding,
+then decodes and applies one transaction at a time instead of retaining the decoded WAL.
+The conservative logical working-set model is the larger of:
+
+```text
+snapshot phase = 4 * maximum snapshot bytes
+WAL phase      = 3 * maximum snapshot bytes
+                 + maximum WAL bytes
+                 + 4 * maximum transaction bytes
+```
+
+The multipliers cover decoded records, hash-table storage, decoded operations, and the
+touched-record scratch map in addition to the encoded buffer. Every term and sum uses
+checked arithmetic. Each artifact and the combined model must remain within a fixed
+1 GiB admission ceiling. Config validation rejects a larger result before a namespace is
+opened and names the knobs to reduce. The defaults bound the snapshot at 52,390,036
+bytes, the WAL at 88,477,738 bytes, a transaction at 21,368,850 bytes, and the combined
+model at 331,123,246 bytes.
+
+The ignored
+`checkpoint_recovery_stress_reports_latency_and_peak_memory` test makes this evidence
+reproducible in a fresh subprocess. A release-mode boundary run on 2026-08-23 on an
+arm64 Mac16,8 with macOS 26.6 used 63,087 maximum-path records and a 266,290,279-byte
+snapshot. Its modeled working set was 1,073,740,948 bytes (876 bytes below the ceiling);
+recovery took 659,968 microseconds and the 1 ms RSS sampler observed a 599,097,344-byte
+increase. These are reference measurements, not a latency or RSS guarantee; allocators,
+filesystems, hardware, and WAL shape vary. Reproduce the boundary case with:
+
+```console
+OTAP_FILELOG_CHECKPOINT_STRESS_RECORDS=63087 cargo test --release \
+  -p otap-df-core-nodes \
+  checkpoint_recovery_stress_reports_latency_and_peak_memory \
+  -- --ignored --nocapture
+```
+
+The bounds travel with the configuration, not with the files. Shrinking
+`limits.max_tracked_files`, `identity.fingerprint_bytes`, or
+`checkpoint.compact_after_bytes` below what an existing namespace already holds fails
+recovery closed rather than truncating durable state.
 
 ### Framing-profile compatibility
 

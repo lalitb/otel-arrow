@@ -23,6 +23,7 @@ use regex::Regex;
 
 use super::checkpoint::framing_profile;
 use super::checkpoint::primitives::{FINGERPRINT_MAX_BYTES, NAMESPACE_ID_MAX_BYTES};
+use super::checkpoint::store::limits::StoreLimits;
 
 /// URN for the filelog receiver.
 ///
@@ -1037,7 +1038,7 @@ impl RuntimeConfig {
 
         let checkpoint_id = resolve_checkpoint_id(checkpoint.id.as_deref(), default_checkpoint_id)?;
         let checkpoint_namespace_dir = checkpoint_namespace_dir(&checkpoint_id);
-        validate_checkpoint_bounds(&checkpoint)?;
+        validate_checkpoint_bounds(&checkpoint, &limits, &identity)?;
 
         let include = validate_include(include, &checkpoint_namespace_dir)?;
         let exclude = validate_exclude(exclude)?;
@@ -1412,6 +1413,8 @@ fn validate_retry(retry: RetryConfig) -> Result<RetryConfig, otap_df_config::err
 
 fn validate_checkpoint_bounds(
     checkpoint: &CheckpointConfig,
+    limits: &LimitsConfig,
+    identity: &IdentityConfig,
 ) -> Result<(), otap_df_config::error::Error> {
     if checkpoint.compact_after_bytes == 0 {
         return Err(invalid(
@@ -1433,6 +1436,17 @@ fn validate_checkpoint_bounds(
             "checkpoint.max_consecutive_failures must be greater than zero",
         ));
     }
+    // The durable checkpoint store derives its artifact and combined
+    // recovery-working-set caps from exactly these three knobs, and enforces
+    // the same artifact caps when it writes. Running the derivation here
+    // rejects an unrecoverable configuration at build time, with the knobs
+    // to reduce, rather than at the first compaction or reopen.
+    let _store_limits = StoreLimits::derive(
+        checkpoint.compact_after_bytes,
+        limits.max_tracked_files,
+        identity.fingerprint_bytes,
+    )
+    .map_err(|error| invalid(&error.to_string()))?;
     Ok(())
 }
 
@@ -1627,6 +1641,7 @@ fn validate_exclude(exclude: Vec<String>) -> Result<Vec<String>, otap_df_config:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::receivers::filelog_receiver::checkpoint::store::limits as store_limits;
 
     fn minimal_config() -> Config {
         Config {
@@ -1637,6 +1652,19 @@ mod tests {
 
     fn parse(value: serde_json::Value) -> Result<Config, serde_json::Error> {
         serde_json::from_value(value)
+    }
+
+    fn largest_accepted(mut low: u64, mut high: u64, mut accepts: impl FnMut(u64) -> bool) -> u64 {
+        assert!(accepts(low), "the lower boundary must be accepted");
+        while low < high {
+            let middle = low + ((high - low) / 2) + 1;
+            if accepts(middle) {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        low
     }
 
     /// Scenario: parsing a minimal config with only `include` set.
@@ -1852,19 +1880,23 @@ mod tests {
     /// Scenario: `identity.fingerprint_bytes` is set to exactly the
     /// checkpoint format's `FINGERPRINT_MAX_BYTES` (`u16::MAX`) and to one
     /// byte above it.
-    /// Guarantees: the codec's `u16`-length-prefixed `fingerprint` field
-    /// bound is enforced at config-build time: the maximum validates, and
-    /// one byte more is rejected before it could ever fail later at
-    /// checkpoint-encode time.
+    /// Guarantees: the exact format maximum reaches the stricter recovery
+    /// working-set check, while one byte more is rejected specifically as
+    /// unrepresentable by the codec's `u16` length prefix.
     #[test]
     fn fingerprint_bytes_maximum_is_enforced() {
         let mut cfg = minimal_config();
         cfg.identity.fingerprint_bytes = MAX_FINGERPRINT_BYTES;
-        assert!(RuntimeConfig::from_config(cfg.clone(), "node-1").is_ok());
+        let err = RuntimeConfig::from_config(cfg.clone(), "node-1").unwrap_err();
+        assert!(
+            err.to_string().contains("checkpoint recovery working set"),
+            "{err}"
+        );
 
         cfg.identity.fingerprint_bytes = MAX_FINGERPRINT_BYTES + 1;
         let err = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
-        assert!(err.to_string().contains("fingerprint_bytes"));
+        assert!(err.to_string().contains("fingerprint_bytes"), "{err}");
+        assert!(err.to_string().contains("65535"), "{err}");
     }
 
     /// Scenario: `identity.ignored_header_bytes` is set to exactly
@@ -2403,6 +2435,146 @@ mod tests {
         let mut cfg = minimal_config();
         cfg.checkpoint.max_consecutive_failures = 0;
         assert!(RuntimeConfig::from_config(cfg, "node-1").is_err());
+    }
+
+    /// The exact remedies the store's size formulas attach to a bound that
+    /// cannot be honored, asserted verbatim so a rejection always names the
+    /// knob an operator has to change.
+    const WAL_REMEDY: &str = "reduce checkpoint.compact_after_bytes or identity.fingerprint_bytes";
+    const RECOVERY_REMEDY: &str = "reduce limits.max_tracked_files, \
+                                   checkpoint.compact_after_bytes, or \
+                                   identity.fingerprint_bytes";
+
+    /// Scenario: the checkpoint size knobs that jointly determine artifact
+    /// sizes and recovery memory -- `compact_after_bytes`,
+    /// `limits.max_tracked_files`, and `identity.fingerprint_bytes` -- are
+    /// validated at their defaults, at the combined recovery-working-set
+    /// boundary, and one step beyond each.
+    /// Guarantees: config validation runs the durable store's own checked
+    /// formulas, so accepted boundary values fit the artifact and peak
+    /// recovery-memory ceilings without rounding, while each one-step
+    /// rejection names all knobs that can reduce the combined bound.
+    #[test]
+    fn checkpoint_size_bounds_must_stay_recoverable() {
+        let defaults = StoreLimits::derive(
+            DEFAULT_COMPACT_AFTER_BYTES,
+            DEFAULT_MAX_TRACKED_FILES,
+            DEFAULT_FINGERPRINT_BYTES,
+        )
+        .expect("the shipped defaults are recoverable");
+        assert!(defaults.max_snapshot_bytes <= store_limits::ARTIFACT_BYTES_CEILING);
+        assert!(defaults.max_wal_bytes <= store_limits::ARTIFACT_BYTES_CEILING);
+        assert!(
+            defaults.max_recovery_working_bytes <= store_limits::RECOVERY_WORKING_BYTES_CEILING
+        );
+        assert!(RuntimeConfig::from_config(minimal_config(), "node-1").is_ok());
+
+        // Largest tracked-file population whose complete recovery working
+        // set remains bounded at the other defaults.
+        let boundary_files = u32::try_from(largest_accepted(
+            u64::from(DEFAULT_MAX_TRACKED_FILES),
+            u64::from(u32::MAX),
+            |candidate| {
+                StoreLimits::derive(
+                    DEFAULT_COMPACT_AFTER_BYTES,
+                    candidate as u32,
+                    DEFAULT_FINGERPRINT_BYTES,
+                )
+                .is_ok()
+            },
+        ))
+        .expect("the tracked-file boundary fits u32");
+        let mut cfg = minimal_config();
+        cfg.limits.max_tracked_files = boundary_files;
+        assert!(
+            RuntimeConfig::from_config(cfg, "node-1").is_ok(),
+            "the largest recoverable tracked-file population must validate"
+        );
+
+        let mut cfg = minimal_config();
+        cfg.limits.max_tracked_files = boundary_files + 1;
+        let err = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
+        assert!(
+            err.to_string().contains("checkpoint recovery working set"),
+            "{err}"
+        );
+        assert!(err.to_string().contains(RECOVERY_REMEDY), "{err}");
+
+        // Largest compaction threshold whose complete recovery working set
+        // remains bounded at the other defaults.
+        let boundary_bytes = largest_accepted(
+            DEFAULT_COMPACT_AFTER_BYTES,
+            store_limits::ARTIFACT_BYTES_CEILING,
+            |candidate| {
+                StoreLimits::derive(
+                    candidate,
+                    DEFAULT_MAX_TRACKED_FILES,
+                    DEFAULT_FINGERPRINT_BYTES,
+                )
+                .is_ok()
+            },
+        );
+        let mut cfg = minimal_config();
+        cfg.checkpoint.compact_after_bytes = boundary_bytes;
+        assert!(
+            RuntimeConfig::from_config(cfg, "node-1").is_ok(),
+            "the largest recoverable compaction threshold must validate"
+        );
+
+        let mut cfg = minimal_config();
+        cfg.checkpoint.compact_after_bytes = boundary_bytes + 1;
+        let err = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
+        assert!(
+            err.to_string().contains("checkpoint recovery working set"),
+            "{err}"
+        );
+        assert!(err.to_string().contains(RECOVERY_REMEDY), "{err}");
+
+        // Nothing saturates: an unrepresentable worst case is an error, not
+        // a clamped bound that would claim it fits.
+        let mut cfg = minimal_config();
+        cfg.checkpoint.compact_after_bytes = u64::MAX;
+        let err = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
+        assert!(err.to_string().contains("overflows u64"), "{err}");
+        assert!(err.to_string().contains(WAL_REMEDY), "{err}");
+
+        // Find the widest fingerprint window whose complete recovery
+        // working set remains bounded at the other defaults.
+        let boundary_fingerprint = largest_accepted(
+            DEFAULT_FINGERPRINT_BYTES,
+            MAX_FINGERPRINT_BYTES,
+            |candidate| {
+                StoreLimits::derive(
+                    DEFAULT_COMPACT_AFTER_BYTES,
+                    DEFAULT_MAX_TRACKED_FILES,
+                    candidate,
+                )
+                .is_ok()
+            },
+        );
+        let mut cfg = minimal_config();
+        cfg.identity.fingerprint_bytes = boundary_fingerprint;
+        assert!(RuntimeConfig::from_config(cfg, "node-1").is_ok());
+
+        let mut cfg = minimal_config();
+        cfg.identity.fingerprint_bytes = boundary_fingerprint + 1;
+        let err = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
+        assert!(
+            err.to_string().contains("checkpoint recovery working set"),
+            "{err}"
+        );
+        assert!(err.to_string().contains(RECOVERY_REMEDY), "{err}");
+
+        // The format's widest representable fingerprint is consequently
+        // refused at the shipped population and WAL defaults.
+        let mut cfg = minimal_config();
+        cfg.identity.fingerprint_bytes = MAX_FINGERPRINT_BYTES;
+        let err = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
+        assert!(
+            err.to_string().contains("checkpoint recovery working set"),
+            "{err}"
+        );
+        assert!(err.to_string().contains(RECOVERY_REMEDY), "{err}");
     }
 
     /// Scenario: `checkpoint.id` is omitted, and `RuntimeConfig` is built

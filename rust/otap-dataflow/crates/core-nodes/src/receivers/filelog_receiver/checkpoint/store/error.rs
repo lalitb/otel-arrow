@@ -1,0 +1,444 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+//! Errors returned by the durable checkpoint store.
+//!
+//! Every variant names the operation that failed, the path it failed on
+//! (when a path is involved), and keeps the underlying cause as a
+//! [`std::error::Error`] source, so an operator sees which durable step
+//! failed on which file rather than a bare `io::Error`.
+//!
+//! The store never converts a durable-state failure into a success-shaped
+//! fallback: an unreadable, inconsistent, or unsupported namespace is
+//! reported here and the caller decides what to do.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use super::super::error::{ApplyError, DecodeError, EncodeError};
+use super::super::primitives::FileId;
+use super::fault::FaultPoint;
+use super::limits::LimitsError;
+
+/// A durable checkpoint store failure.
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    /// A filesystem operation failed.
+    #[error("failed to {operation} at {path}: {source}")]
+    Io {
+        /// The durable step that failed, phrased as an action.
+        operation: &'static str,
+        /// The path the step was operating on.
+        path: PathBuf,
+        /// The underlying operating-system error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A namespace or artifact path resolved to a filesystem object the
+    /// store must not follow or mutate.
+    #[error("refusing unsafe checkpoint filesystem object at {path}: {reason}")]
+    UnsafeFilesystemObject {
+        /// The rejected path.
+        path: PathBuf,
+        /// The violated filesystem invariant.
+        reason: &'static str,
+    },
+    /// The namespace ownership lock is held by another writer and was not
+    /// released within the configured bounded wait.
+    #[error(
+        "checkpoint namespace lock {path} is held by another writer; \
+         waited {waited:?} of the {timeout:?} ownership timeout"
+    )]
+    NamespaceLocked {
+        /// The lock file that could not be acquired.
+        path: PathBuf,
+        /// How long acquisition was actually attempted.
+        waited: Duration,
+        /// The configured bound on that attempt.
+        timeout: Duration,
+    },
+    /// A stored artifact failed structural decoding (bad magic, unsupported
+    /// version, checksum mismatch, invalid length, unknown discriminant).
+    #[error("failed to decode {artifact} at {path}: {source}")]
+    Decode {
+        /// Which artifact failed to decode.
+        artifact: &'static str,
+        /// The file the artifact was read from.
+        path: PathBuf,
+        /// The structural decode failure.
+        #[source]
+        source: DecodeError,
+    },
+    /// An artifact could not be encoded for writing.
+    #[error("failed to encode {artifact} for generation {generation}: {source}")]
+    Encode {
+        /// Which artifact failed to encode.
+        artifact: &'static str,
+        /// The generation the artifact belongs to.
+        generation: u64,
+        /// The structural encode failure.
+        #[source]
+        source: EncodeError,
+    },
+    /// A decoded operation failed its apply-time preconditions, either while
+    /// replaying a recovered WAL or while validating a caller-supplied
+    /// transaction before it reaches the WAL.
+    #[error("failed to {operation} for checkpoint namespace at {path}: {source}")]
+    Apply {
+        /// The store operation that was being performed.
+        operation: &'static str,
+        /// The WAL the operation belongs (or would belong) to.
+        path: PathBuf,
+        /// The apply-time failure.
+        #[source]
+        source: ApplyError,
+    },
+    /// A stored artifact's embedded generation disagreed with the generation
+    /// selected by `CURRENT` or encoded in its own file name.
+    #[error("{artifact} at {path} declares generation {found}, expected {expected}")]
+    GenerationMismatch {
+        /// Which artifact carried the disagreeing generation.
+        artifact: &'static str,
+        /// The file that was read.
+        path: PathBuf,
+        /// The generation the store selected.
+        expected: u64,
+        /// The generation the artifact declared.
+        found: u64,
+    },
+    /// The selected generation is missing one of its two required files.
+    #[error(
+        "checkpoint generation {generation} in {dir} is incomplete: \
+         {missing} is missing"
+    )]
+    IncompleteGeneration {
+        /// The namespace directory.
+        dir: PathBuf,
+        /// The generation that is incomplete.
+        generation: u64,
+        /// Which file of the pair is missing.
+        missing: &'static str,
+    },
+    /// `CURRENT` is absent from a namespace that has already advanced past
+    /// its first generation. Only an interrupted first-store creation can
+    /// legitimately leave the marker absent, so the store refuses to guess
+    /// which generation was authoritative.
+    #[error(
+        "checkpoint namespace {dir} has no {marker} marker but contains \
+         generation {highest_generation}; refusing to guess which generation \
+         was authoritative"
+    )]
+    MissingMarker {
+        /// The namespace directory.
+        dir: PathBuf,
+        /// The marker file name that was expected.
+        marker: &'static str,
+        /// The highest generation found on disk.
+        highest_generation: u64,
+    },
+    /// `CURRENT` is absent and the namespace's initial generation is
+    /// incomplete, but the half that survives carries durable state, so it
+    /// cannot be the residue of an interrupted first creation. Recreating
+    /// the generation would discard that state, so the store fails closed
+    /// instead.
+    #[error(
+        "checkpoint namespace {dir} has no {marker} marker and an incomplete \
+         initial generation that {reason}; refusing to recreate it"
+    )]
+    IncompleteInitialGeneration {
+        /// The namespace directory.
+        dir: PathBuf,
+        /// The marker file name that was expected.
+        marker: &'static str,
+        /// What the surviving half of the pair holds.
+        reason: &'static str,
+    },
+    /// A stored file was larger than the configured bound, so it was
+    /// rejected before any buffer was allocated for it.
+    #[error("{artifact} at {path} is {len} bytes, exceeding the {max}-byte maximum")]
+    FileTooLarge {
+        /// Which artifact was oversized.
+        artifact: &'static str,
+        /// The file that was rejected.
+        path: PathBuf,
+        /// The file's actual length.
+        len: u64,
+        /// The configured maximum.
+        max: u64,
+    },
+    /// A bounded checkpoint read could not reserve its validated buffer.
+    #[error("failed to reserve {requested} bytes while reading {artifact} at {path}: {source}")]
+    Allocation {
+        /// Which artifact was being read.
+        artifact: &'static str,
+        /// The artifact path.
+        path: PathBuf,
+        /// Validated allocation size requested.
+        requested: usize,
+        /// The allocator failure.
+        #[source]
+        source: std::collections::TryReserveError,
+    },
+    /// The options a store was opened with imply a worst-case artifact or
+    /// recovery working set that exceeds its bound, so no namespace was
+    /// opened.
+    #[error("refusing to open the checkpoint namespace at {namespace_dir}: {source}")]
+    ResourceBounds {
+        /// The namespace directory that was refused.
+        namespace_dir: PathBuf,
+        /// Which bound could not be honored, and the knob to reduce.
+        #[source]
+        source: LimitsError,
+    },
+    /// A compaction encoded a snapshot larger than this configuration can
+    /// read back, so it was refused before any byte was written and the
+    /// current generation stays authoritative.
+    #[error(
+        "refusing to publish generation {generation} in {dir}: its {records}-record snapshot \
+         encodes to {len} bytes, exceeding the {max}-byte maximum this configuration can \
+         recover; reduce the tracked-file population or raise limits.max_tracked_files"
+    )]
+    SnapshotTooLarge {
+        /// The namespace directory.
+        dir: PathBuf,
+        /// The generation that was being staged.
+        generation: u64,
+        /// How many records the snapshot holds.
+        records: usize,
+        /// The encoded snapshot's size.
+        len: u64,
+        /// The largest snapshot this configuration can recover.
+        max: u64,
+    },
+    /// Appending the transaction would grow the live WAL past the largest
+    /// WAL this configuration can read back, so it was refused before the
+    /// in-memory table advanced.
+    #[error(
+        "refusing to append {transaction_bytes} bytes to the checkpoint WAL at {path}: it \
+         already holds {wal_bytes} bytes and the maximum this configuration can recover is \
+         {max} bytes; compact the namespace and retry"
+    )]
+    WalWouldExceedMaximum {
+        /// The live WAL.
+        path: PathBuf,
+        /// Bytes the WAL already holds.
+        wal_bytes: u64,
+        /// Bytes the refused transaction would add.
+        transaction_bytes: u64,
+        /// The largest WAL this configuration can recover.
+        max: u64,
+    },
+    /// A caller supplied more operations than one WAL transaction may carry.
+    #[error(
+        "transaction carries {operations} operations, exceeding the \
+         {max}-operation maximum for a single transaction"
+    )]
+    TransactionTooLarge {
+        /// The number of operations supplied.
+        operations: usize,
+        /// The format's per-transaction maximum.
+        max: u16,
+    },
+    /// A caller tried to append a transaction with no operations, which the
+    /// format forbids.
+    #[error("refusing to append a checkpoint transaction with no operations")]
+    EmptyTransaction,
+    /// A transaction's registrations would push the durable record
+    /// population past the configured `limits.max_tracked_files`, whose
+    /// worth of worst-case records is exactly what the snapshot bound is
+    /// sized for.
+    #[error(
+        "refusing to register {registrations} new files in {dir}: the namespace already tracks \
+         {tracked} records and limits.max_tracked_files is {max}; remove or expire records, or \
+         raise limits.max_tracked_files"
+    )]
+    TrackedFilesExhausted {
+        /// The namespace directory.
+        dir: PathBuf,
+        /// Records the namespace already tracks.
+        tracked: usize,
+        /// New registrations the refused transaction carried.
+        registrations: usize,
+        /// The configured population maximum.
+        max: u32,
+    },
+    /// Recovered state already exceeds the configured tracked-file
+    /// population, so opening it would accept a limit reduction that the
+    /// current configuration cannot represent safely.
+    #[error(
+        "checkpoint namespace {dir} holds {tracked} records, exceeding \
+         limits.max_tracked_files ({max}); restore the previous limit or \
+         administratively reduce the namespace before reopening"
+    )]
+    RecoveredTrackedFilesExceedMaximum {
+        /// The checkpoint namespace.
+        dir: PathBuf,
+        /// Records recovered from the selected generation.
+        tracked: usize,
+        /// The configured population maximum.
+        max: u32,
+    },
+    /// More recognized generations were present than recovery is willing
+    /// to retain in memory or on disk.
+    #[error(
+        "checkpoint namespace {dir} contains more than {max} recognized generations; \
+         remove obsolete generation pairs only after identifying the authoritative \
+         generation from CURRENT"
+    )]
+    TooManyGenerations {
+        /// The checkpoint namespace.
+        dir: PathBuf,
+        /// Maximum recognized generations allowed on disk.
+        max: usize,
+    },
+    /// More abandoned temporary artifacts were present than one bounded
+    /// store lifecycle can create.
+    #[error(
+        "checkpoint namespace {dir} contains more than {max} recognized temporary artifacts; \
+         refusing unbounded recovery cleanup"
+    )]
+    TooManyTemporaryFiles {
+        /// The checkpoint namespace.
+        dir: PathBuf,
+        /// Maximum recognized temporary files cleanup will process.
+        max: usize,
+    },
+    /// Compaction was requested before the previous generation was cleaned
+    /// up, which would permit retired artifacts to grow without bound.
+    #[error(
+        "checkpoint namespace {dir} still has retired generation {generation}; \
+         clean up retired generations before compacting again"
+    )]
+    RetiredGenerationCleanupRequired {
+        /// The checkpoint namespace.
+        dir: PathBuf,
+        /// Oldest generation still awaiting cleanup.
+        generation: u64,
+    },
+    /// A fingerprint in a caller-supplied operation or recovered record is
+    /// wider than this store's configured fingerprint window.
+    #[error(
+        "{context} for file {file_id:?} is {len} bytes, exceeding the configured \
+         identity.fingerprint_bytes maximum of {max}; restore the previous limit \
+         or migrate the checkpoint namespace explicitly"
+    )]
+    FingerprintExceedsConfiguredMaximum {
+        /// Whether the value came from recovery or a caller operation.
+        context: &'static str,
+        /// The record or operation carrying the fingerprint.
+        file_id: FileId,
+        /// Actual fingerprint length.
+        len: usize,
+        /// Configured fingerprint maximum.
+        max: u64,
+    },
+    /// Durable state recovered from disk carries the reserved reason code
+    /// the format forbids an encoder from writing. Accepting it would make
+    /// the next compaction re-encode it, so recovery fails closed instead.
+    #[error(
+        "checkpoint generation {generation} in {dir} holds a record ({file_id:?}) whose {field} \
+         is the reserved value 0x0000, which no encoder may write"
+    )]
+    ReservedReasonCodeRecovered {
+        /// The namespace directory.
+        dir: PathBuf,
+        /// The generation the record was recovered from.
+        generation: u64,
+        /// The record carrying the reserved value.
+        file_id: FileId,
+        /// The durable field carrying it.
+        field: &'static str,
+    },
+    /// The configured `checkpoint.id` cannot be represented by the durable
+    /// format, so an administrative operation could never name this
+    /// namespace correctly.
+    #[error(
+        "refusing to open the checkpoint namespace at {namespace_dir}: its id is invalid, {reason}"
+    )]
+    InvalidNamespaceId {
+        /// The namespace directory that was refused.
+        namespace_dir: PathBuf,
+        /// Why the id cannot be used.
+        reason: &'static str,
+    },
+    /// A durable write failed after the in-memory table had already
+    /// advanced, or after `CURRENT` had already been repointed, so the store
+    /// instance can no longer be trusted to mirror durable state. The
+    /// namespace on disk remains recoverable; the store must be reopened.
+    #[error(
+        "checkpoint store for {dir} refused to {operation}: the store is \
+         unusable because {reason}; reopen the namespace to recover"
+    )]
+    Unusable {
+        /// The namespace directory.
+        dir: PathBuf,
+        /// The operation that was refused.
+        operation: &'static str,
+        /// Why the store became unusable.
+        reason: &'static str,
+    },
+    /// The generation counter would overflow, so no new generation can be
+    /// created.
+    #[error("checkpoint generation counter would overflow past {generation}")]
+    GenerationOverflow {
+        /// The current generation.
+        generation: u64,
+    },
+    /// The WAL transaction sequence would overflow, so no further
+    /// transaction can be appended to this generation.
+    #[error("checkpoint WAL sequence would overflow past {sequence}; compaction is required")]
+    SequenceOverflow {
+        /// The sequence that could not be advanced.
+        sequence: u64,
+    },
+    /// WAL byte accounting would overflow `u64`.
+    #[error("checkpoint WAL byte accounting would overflow past {bytes} bytes")]
+    AccountingOverflow {
+        /// The accumulated byte count that could not be advanced.
+        bytes: u64,
+    },
+    /// An in-memory durability counter would overflow.
+    #[error("checkpoint {counter} counter would overflow past {value}")]
+    CounterOverflow {
+        /// Counter that could not be advanced.
+        counter: &'static str,
+        /// Current value that could not be incremented.
+        value: u64,
+    },
+    /// An administrative operation was requested without the mandatory,
+    /// non-empty audit reason the format requires.
+    #[error("administrative {operation} requires a non-empty audit reason")]
+    AuditReasonRequired {
+        /// The administrative operation that was refused.
+        operation: &'static str,
+    },
+    /// A quarantine-only administrative operation targeted a record that is
+    /// no longer quarantined.
+    #[error(
+        "administrative {operation} requires file {file_id:?} to be quarantined, \
+         but its current state is {state:?}"
+    )]
+    NotQuarantined {
+        /// The administrative operation that was refused.
+        operation: &'static str,
+        /// The targeted checkpoint record.
+        file_id: FileId,
+        /// Its current lifecycle state.
+        state: super::super::primitives::LifecycleState,
+    },
+    /// A reason code of `0x0000` was supplied; the format reserves it and
+    /// forbids an encoder from writing it.
+    #[error("{field} must not be the reserved reason code 0x0000")]
+    ReservedReasonCode {
+        /// The durable field that was given the reserved value.
+        field: &'static str,
+    },
+    /// A test armed a fault point and execution reached it. Production code
+    /// has no way to arm a fault point (see [`super::fault::FaultPlan`]), so
+    /// this variant is unreachable outside this crate's own tests.
+    #[error("injected checkpoint fault at persistence boundary {point}")]
+    InjectedFault {
+        /// The boundary that was armed.
+        point: FaultPoint,
+    },
+}

@@ -36,6 +36,7 @@ crc.workspace = true
 hashbrown.workspace = true
 data_engine_expressions.workspace = true
 data_engine_kql_parser.workspace = true
+fs4.workspace = true
 futures.workspace = true
 futures-timer.workspace = true
 hex.workspace = true
@@ -72,9 +73,14 @@ weaver_resolved_schema = { workspace = true, optional = true }
 weaver_resolver = { workspace = true, optional = true }
 weaver_semconv = { workspace = true, optional = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
 nix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [features]
 dev-tools = [
@@ -91,6 +97,7 @@ arrow-ipc.workspace = true
 arrow-schema.workspace = true
 fluke-hpack.workspace = true
 flume.workspace = true
+memory-stats.workspace = true
 otap-df-channel = { workspace = true }
 otap-df-engine = { workspace = true, features = ["test-utils"] }
 otap-df-otap = { workspace = true, features = ["test-utils", "crypto-ring"] }
