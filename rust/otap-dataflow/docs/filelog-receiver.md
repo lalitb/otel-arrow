@@ -365,14 +365,26 @@ candidate-handoff time. Discovery scan duration and candidate-channel delay are
 measured so operators can detect when that expectation is not met. Phase 2 notifications
 may improve latency but do not change the correctness mechanism.
 
+Lifecycle shutdown sets a direct cooperative cancellation signal in addition to using
+the bounded command channel. Discovery checks it between traversal entries, path
+resolutions, and candidate observations, so cancellation does not wait for the rest of
+a large tree. Portable APIs cannot interrupt a filesystem operation already blocked in
+the kernel; the async lifecycle therefore never synchronously joins this thread and
+still applies the receiver drain deadline.
+
 #### Discovery rules and safety
 
 Phase 1 applies these discovery rules:
 
+- Include and exclude globs are compiled once during validation with path separators
+  treated literally. Configuration accepts at most 1,024 include-plus-exclude patterns,
+  4,096 UTF-8 bytes per pattern, and 1 MiB of aggregate pattern text. On Unix, backslash
+  escapes glob metacharacters and is removed when constructing a literal filesystem
+  prefix; on Windows, backslash is a path separator rather than an escape.
 - Excludes take precedence over includes.
 - `follow_symlinks` defaults to false. When enabled, directory cycles are detected by
   runtime identity; the traversal stack and ancestor-locator state remain bounded by
-  `max_recursion_depth`.
+  `max_recursion_depth`, which must be in `1..=1024`.
 - Excludes apply to both the matched path and resolved target, so a symlink cannot
   bypass a sensitive-path exclusion.
 - A newly matching exclude revokes an active file at the next record boundary.
@@ -381,6 +393,27 @@ Phase 1 applies these discovery rules:
 - `recursive` controls whether the scanner may descend below the directory named by an
   include. `**` controls matching within that permitted traversal and does not override
   `recursive: false`.
+
+Each include retains its configured lexical prefix for glob matching and canonicalizes
+that prefix before traversal. This preserves the operator-visible matched path while
+opening the resolved target. An alias in an include's fixed prefix is therefore
+followed even when `follow_symlinks` is false; final symlinks and descendant symlinks
+are not followed in that mode. Excludes are checked against the lexical match, the
+canonical target, and the target mapped back through each canonicalized exclude root.
+This mapping is required on platforms where ordinary path aliases canonicalize to a
+different prefix.
+
+Before admission, discovery opens the canonical target twice. The two observations
+must have the same runtime locator, the second size must not shrink, and the second
+fingerprint must extend the first. A detected replacement, truncation, path-resolution
+change, traversal error, cycle, or bounded-state overflow marks the reconciliation
+inventory incomplete rather than treating partial evidence as unique.
+
+Traversal or candidate-evidence errors also make absence evidence incomplete. Such a
+pass does not emit `Removed`, evict unseen pending evidence, or admit stale pending
+evidence; a later complete pass must prove disappearance. Bounded candidate overflow
+alone does not suppress removals because traversal still visits and marks every already
+retained locator.
 
 The receiver always excludes its resolved checkpoint namespace under
 `${engine.state_dir}`. Configuration is rejected when an include resolves directly to
@@ -396,14 +429,18 @@ Discovery and admission use distinct bounded populations:
 | Population | Meaning | Bound |
 | --- | --- | --- |
 | Scan working state | Traversal stack, current directory entry and match evaluation | Incremental processing plus `max_recursion_depth`; the complete match set is never materialized |
-| Candidate events | Matches waiting for worker handoff | Bounded discovery channel |
+| Candidate events | Matches waiting for worker handoff | At most `max_open_files` observed/updated transitions plus bounded tracked-file removals in one batch; one batch in the discovery channel |
 | Pending candidates | Matches retained while tracked-identity capacity is unavailable | `max_pending_candidates` |
 | Tracked identities | Durable `file_id` checkpoint records | `max_tracked_files` |
 | Open descriptors | Files with an open operating-system handle | `max_open_files` |
 
 Fingerprint-only restart matching uses multiplicities from the complete bounded
 reconciliation population, not only the current open-file batch. The inventory covers
-retained pending, in-flight, and open candidates plus every live locator. A scan that
+retained pending and in-flight candidate evidence plus every live locator. A removed
+locator remains live until its reader and runtime lease are explicitly finalized, which
+prevents a reused native locator from being admitted concurrently. Reappearance before
+finalization remains blocked and makes that pass incomplete; after finalization, a later
+pass emits a fresh `Observed` transition. A scan that
 overflows the retained population, observes unstable evidence, or otherwise cannot prove
 that this inventory is complete disables fingerprint-only inheritance for that pass;
 exact-locator matching remains available.
@@ -413,20 +450,35 @@ Configuration bounds the conservative identity reconciliation working set to 1 G
 ```text
 candidate_base =
   (max_pending_candidates + max_open_files) *
-  (fingerprint_bytes + ADVISORY_PATH_MAX_BYTES + 256)
+  (5 * fingerprint_bytes + 4 * ADVISORY_PATH_MAX_BYTES + 2048)
 
 open_candidate_amplification =
   max_open_files *
-  (4 * fingerprint_bytes + 2 * ADVISORY_PATH_MAX_BYTES + 512)
+  (10 * fingerprint_bytes + 10 * ADVISORY_PATH_MAX_BYTES + 4096)
 
-checkpoint_indexes = max_tracked_files * 384
+checkpoint_record_state =
+  max_tracked_files *
+  (fingerprint_bytes + ADVISORY_PATH_MAX_BYTES + 384)
 
-candidate_base + open_candidate_amplification + checkpoint_indexes <= 1 GiB
+discovery_tracked_state = max_tracked_files * 1024
+
+candidate_base + open_candidate_amplification + checkpoint_record_state +
+  discovery_tracked_state <= 1 GiB
 ```
 
-The fixed terms conservatively cover hash buckets, vectors, locators, operation
-preflight, and allocation metadata. Validation uses checked arithmetic and rejects a
-configuration above the ceiling before the receiver starts.
+The candidate term covers retained discovery paths, a temporary evidence vector, and
+fingerprint keys in the three inventories that can coexist at peak: one owned by the
+worker, one in the one-slot event channel, and one under construction. The
+open-candidate term additionally covers the emitted event copy and transient
+old/new fingerprint and metadata operations, the cloned preflight transaction, its
+encoded body and outer frame, validation, and a transient applied-record copy.
+Checkpoint record payloads are counted independently for every tracked record rather
+than hidden in a fixed index estimate. The fixed terms
+conservatively cover hash buckets, vectors, locators, allocation metadata, and
+over-allocation. The tracked discovery term includes the admission map, concurrent
+live-locator inventories, and a removal-heavy batch retained in the event channel.
+Validation uses checked arithmetic and rejects a configuration above the ceiling before
+the receiver starts.
 
 Reconciliation processes directory entries and glob matches incrementally. It retains
 scan-generation markers only for bounded tracked identities and retained pending
@@ -438,10 +490,17 @@ without materializing an unbounded filesystem snapshot.
 When `max_tracked_files` is reached, candidates are retained in the bounded pending
 queue. Retained candidates are admitted oldest-discovered first. When that queue is
 full, additional matches are counted and reported but are not retained in memory;
-periodic reconciliation makes them eligible again. Reconciliation rotates or otherwise
-fairly varies admission opportunity so stable traversal order cannot permanently starve
+periodic reconciliation makes them eligible again. A generation-keyed hash of the
+runtime locator selects a bounded subset of otherwise unretained candidates, varying
+admission opportunity across passes so stable traversal order cannot permanently starve
 candidates that previously overflowed. Strict oldest-first ordering applies only among
 retained candidates.
+
+Discovery always hands a bounded candidate subset to identity resolution even when the
+durable table currently has no free slot: the candidate may reconnect an existing
+checkpoint record. Only identity resolution can distinguish that case from a genuinely
+new identity. It returns the latter through explicit deferred feedback, which restores
+the evidence to the bounded pending population when space is available.
 
 Admission pressure is observable through pending depth, oldest retained wait age,
 overflow count, reconciliation passes with overflow, and time since the last successful
@@ -1413,7 +1472,7 @@ Phase 1 requires the following evidence:
 | Checkpoint format | Approved `filelog-checkpoint-format.md`; encode/decode, round-trip, corruption, torn-write, cross-version, cross-platform, migration, and compatibility-vector conformance |
 | Rotation and recovery | Move/create and detectable copy-truncate; truncation over unacknowledged bytes; same-locator and replacement-locator recovery |
 | Ownership and lifecycle | Namespace serialization; overlapping-pattern lease contention; lease survival across temporary FD rotation; cleanup and registry-integrity failure; drain during backpressure; receiver-wide head-of-line behavior |
-| Resource bounds and platforms | Worst-case line-plus-multiline memory accounting; hot-file fairness; equivalent identity, rotation, and open-file lifecycle tests on Linux, macOS, and Windows |
+| Resource bounds and platforms | Worst-case line-plus-multiline memory accounting; hot-file fairness; equivalent discovery, identity, rotation, and open-file lifecycle tests on Linux, macOS, and Windows |
 
 The checkpoint-format evidence is a release gate: the checkpoint implementation is not
 stable and Phase 1 cannot ship until the companion specification and its conformance

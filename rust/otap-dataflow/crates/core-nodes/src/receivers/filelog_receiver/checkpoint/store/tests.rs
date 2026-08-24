@@ -3369,6 +3369,10 @@ fn every_legal_configuration_creates_a_namespace_that_reopens() {
             "largest-recoverable-fingerprint",
             Box::new(move |config: &mut Config| {
                 config.identity.fingerprint_bytes = boundary_fingerprint;
+                // Isolate the durable-store boundary from the independent
+                // discovery/identity runtime-memory ceiling.
+                config.limits.max_pending_candidates = 1;
+                config.limits.max_open_files = 1;
             }),
         ),
         (

@@ -29,26 +29,44 @@ pub(crate) fn open_candidate(
     fingerprint_bytes: u16,
     ignored_header_bytes: u32,
 ) -> Result<OpenedCandidate, IdentityError> {
-    let file = open_read_only(path, follow_symlinks).map_err(|source| IdentityError::Io {
+    open_candidate_at(
+        path,
+        path,
+        follow_symlinks,
+        fingerprint_bytes,
+        ignored_header_bytes,
+    )
+}
+
+/// Opens a resolved target while retaining the matched path as advisory
+/// evidence.
+pub(crate) fn open_candidate_at(
+    open_path: &Path,
+    advisory_path: &Path,
+    follow_symlinks: bool,
+    fingerprint_bytes: u16,
+    ignored_header_bytes: u32,
+) -> Result<OpenedCandidate, IdentityError> {
+    let file = open_read_only(open_path, follow_symlinks).map_err(|source| IdentityError::Io {
         operation: "open candidate",
-        path: path.to_path_buf(),
+        path: open_path.to_path_buf(),
         source,
     })?;
     let metadata = file.metadata().map_err(|source| IdentityError::Io {
         operation: "read candidate metadata",
-        path: path.to_path_buf(),
+        path: open_path.to_path_buf(),
         source,
     })?;
     if !metadata.is_file() {
         return Err(IdentityError::NotRegularFile {
-            path: path.to_path_buf(),
+            path: open_path.to_path_buf(),
         });
     }
 
-    let locator = locator_from_handle(&file, path, follow_symlinks)?;
+    let locator = locator_from_handle(&file, open_path, follow_symlinks)?;
     let (fingerprint, size) =
-        collect_consistent_fingerprint(&file, path, fingerprint_bytes, ignored_header_bytes)?;
-    let advisory_path = encode_advisory_path(path)?;
+        collect_consistent_fingerprint(&file, open_path, fingerprint_bytes, ignored_header_bytes)?;
+    let advisory_path = encode_advisory_path(advisory_path)?;
 
     Ok(OpenedCandidate {
         file,
@@ -307,14 +325,14 @@ fn read_bounded_at(
 }
 
 #[cfg(unix)]
-fn encode_advisory_path(path: &Path) -> Result<Vec<u8>, IdentityError> {
+pub(crate) fn encode_advisory_path(path: &Path) -> Result<Vec<u8>, IdentityError> {
     use std::os::unix::ffi::OsStrExt;
 
     bounded_path_bytes(path, path.as_os_str().as_bytes().to_vec())
 }
 
 #[cfg(windows)]
-fn encode_advisory_path(path: &Path) -> Result<Vec<u8>, IdentityError> {
+pub(crate) fn encode_advisory_path(path: &Path) -> Result<Vec<u8>, IdentityError> {
     use std::os::windows::ffi::OsStrExt;
 
     let mut bytes = Vec::new();
@@ -325,7 +343,7 @@ fn encode_advisory_path(path: &Path) -> Result<Vec<u8>, IdentityError> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn encode_advisory_path(path: &Path) -> Result<Vec<u8>, IdentityError> {
+pub(crate) fn encode_advisory_path(path: &Path) -> Result<Vec<u8>, IdentityError> {
     Err(IdentityError::UnsupportedPlatform {
         path: path.to_path_buf(),
     })

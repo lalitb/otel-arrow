@@ -16,9 +16,11 @@
 //! later stage can wire a `ReceiverFactory` without renaming anything here.
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
+use globset::{GlobBuilder, GlobMatcher};
 use regex::Regex;
 
 use super::checkpoint::framing_profile;
@@ -69,13 +71,33 @@ const MIN_FINGERPRINT_BYTES: u64 = 16;
 const MAX_FINGERPRINT_BYTES: u64 = FINGERPRINT_MAX_BYTES as u64;
 /// Conservative process-memory ceiling for one identity reconciliation pass.
 const IDENTITY_RECONCILIATION_BYTES_CEILING: u64 = 1024 * 1024 * 1024;
-/// Conservative map/vector/allocation overhead per pending/open candidate.
-const IDENTITY_CANDIDATE_OVERHEAD_BYTES: u64 = 256;
-/// Additional allocation overhead for an opened candidate while its durable
-/// operations are preflighted.
-const IDENTITY_OPEN_CANDIDATE_OVERHEAD_BYTES: u64 = 512;
-/// Conservative locator/fingerprint/path index overhead per checkpoint row.
+/// One worker-owned inventory, one inventory in the bounded event channel,
+/// and one inventory under construction can coexist.
+const DISCOVERY_MAX_SIMULTANEOUS_INVENTORIES: u64 = 3;
+/// Candidate state, each simultaneous inventory key, and the temporary
+/// evidence vector each retain a fingerprint payload at peak construction.
+const DISCOVERY_CANDIDATE_FINGERPRINT_COPIES: u64 = 1 + DISCOVERY_MAX_SIMULTANEOUS_INVENTORIES + 1;
+/// Candidate matched/resolved/advisory paths plus the temporary inventory
+/// evidence path coexist at peak construction.
+const DISCOVERY_CANDIDATE_PATH_COPIES: u64 = 4;
+/// Conservative map/vector/allocation overhead per pending/in-flight candidate.
+const IDENTITY_CANDIDATE_OVERHEAD_BYTES: u64 = 2048;
+/// Additional allocation overhead for an in-flight candidate while its event
+/// and durable operations are preflighted.
+const IDENTITY_OPEN_CANDIDATE_OVERHEAD_BYTES: u64 = 4096;
+/// An emitted event, original and cloned old/new fingerprint operations,
+/// transaction body and frame, and transient applied record can coexist.
+const IDENTITY_OPEN_CANDIDATE_FINGERPRINT_COPIES: u64 = 10;
+/// The event's three paths, four metadata-operation encoding stages, and a
+/// transient applied record require eight path payloads; retain two more as
+/// allocator and operation-shape margin.
+const IDENTITY_OPEN_CANDIDATE_PATH_COPIES: u64 = 10;
+/// Conservative locator/index overhead per checkpoint row, excluding its
+/// separately counted fingerprint and advisory-path payloads.
 const IDENTITY_RECORD_INDEX_OVERHEAD_BYTES: u64 = 384;
+/// Conservative discovery-map, live-locator inventory, and removal-event
+/// storage per tracked locator while one earlier batch occupies the channel.
+const DISCOVERY_TRACKED_OVERHEAD_BYTES: u64 = 1024;
 
 /// Maximum accepted `identity.ignored_header_bytes`: the checkpoint codec
 /// stores `ignored_header_bytes` as a `u32`, so a value larger than this can
@@ -92,6 +114,14 @@ const DEFAULT_MAX_RECURSION_DEPTH: u32 = 64;
 const DEFAULT_DISCOVERY_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// Default `ignore_older_than` (0 disables the filter).
 const DEFAULT_IGNORE_OLDER_THAN: Duration = Duration::ZERO;
+/// Maximum total include-plus-exclude glob count.
+const MAX_DISCOVERY_PATTERNS: usize = 1024;
+/// Maximum UTF-8 bytes in one discovery glob.
+const MAX_DISCOVERY_PATTERN_BYTES: usize = 4096;
+/// Maximum aggregate UTF-8 bytes retained for all discovery globs.
+const MAX_DISCOVERY_PATTERN_TOTAL_BYTES: usize = 1024 * 1024;
+/// Maximum traversal depth accepted from configuration.
+const MAX_RECURSION_DEPTH: u32 = 1024;
 /// Default `framing.max_line_bytes` (1 MiB).
 const DEFAULT_MAX_LINE_BYTES: u64 = 1024 * 1024;
 /// Default `framing.max_record_bytes` (1 MiB).
@@ -938,8 +968,12 @@ pub(crate) fn logical_record_size(
 pub(crate) struct RuntimeConfig {
     /// Glob include patterns.
     pub(crate) include: Vec<String>,
+    /// Include patterns compiled once with path-separator-aware semantics.
+    pub(crate) compiled_include: Vec<GlobMatcher>,
     /// Glob exclude patterns.
     pub(crate) exclude: Vec<String>,
+    /// Exclude patterns compiled once with path-separator-aware semantics.
+    pub(crate) compiled_exclude: Vec<GlobMatcher>,
     /// Whether the scanner may descend below a directory named by an
     /// include.
     pub(crate) recursive: bool,
@@ -1034,15 +1068,16 @@ impl RuntimeConfig {
         } = config;
 
         let identity = validate_identity(identity)?;
-        if max_recursion_depth == 0 {
-            return Err(invalid("max_recursion_depth must be greater than zero"));
+        if !(1..=MAX_RECURSION_DEPTH).contains(&max_recursion_depth) {
+            return Err(invalid(&format!(
+                "max_recursion_depth must be in 1..={MAX_RECURSION_DEPTH}"
+            )));
         }
         let discovery = validate_discovery(discovery)?;
         if drain_timeout.is_zero() {
             return Err(invalid("drain_timeout must be greater than zero"));
         }
         let limits = validate_limits(limits)?;
-        validate_identity_reconciliation_bounds(&identity, &limits)?;
         let (framing, framing_profile_digest, compiled_multiline_pattern) =
             validate_framing(framing, encoding, &identity)?;
         let batch = validate_batch(batch, &framing, &metadata)?;
@@ -1052,13 +1087,17 @@ impl RuntimeConfig {
         let checkpoint_id = resolve_checkpoint_id(checkpoint.id.as_deref(), default_checkpoint_id)?;
         let checkpoint_namespace_dir = checkpoint_namespace_dir(&checkpoint_id);
         validate_checkpoint_bounds(&checkpoint, &limits, &identity)?;
+        validate_identity_reconciliation_bounds(&identity, &limits)?;
 
-        let include = validate_include(include, &checkpoint_namespace_dir)?;
-        let exclude = validate_exclude(exclude)?;
+        validate_discovery_pattern_population(&include, &exclude)?;
+        let (include, compiled_include) = validate_include(include, &checkpoint_namespace_dir)?;
+        let (exclude, compiled_exclude) = validate_exclude(exclude)?;
 
         Ok(Self {
             include,
+            compiled_include,
             exclude,
+            compiled_exclude,
             recursive,
             follow_symlinks,
             max_recursion_depth,
@@ -1196,6 +1235,12 @@ fn validate_limits(limits: LimitsConfig) -> Result<LimitsConfig, otap_df_config:
         "limits.max_pending_candidates + limits.max_open_files",
         u64::from(limits.max_pending_candidates) + u64::from(limits.max_open_files),
     )?;
+    ensure_fits_usize(
+        "limits.max_tracked_files + limits.max_pending_candidates + limits.max_open_files",
+        u64::from(limits.max_tracked_files)
+            + u64::from(limits.max_pending_candidates)
+            + u64::from(limits.max_open_files),
+    )?;
     if limits.max_read_bytes_per_turn == 0 {
         return Err(invalid(
             "limits.max_read_bytes_per_turn must be greater than zero",
@@ -1217,20 +1262,27 @@ fn validate_identity_reconciliation_bounds(
         .ok_or_else(|| invalid("identity reconciliation candidate population overflows u64"))?;
     let candidate_bytes = identity
         .fingerprint_bytes
-        .checked_add(ADVISORY_PATH_MAX_BYTES as u64)
+        .checked_mul(DISCOVERY_CANDIDATE_FINGERPRINT_COPIES)
+        .and_then(|bytes| {
+            (ADVISORY_PATH_MAX_BYTES as u64)
+                .checked_mul(DISCOVERY_CANDIDATE_PATH_COPIES)
+                .and_then(|paths| bytes.checked_add(paths))
+        })
         .and_then(|bytes| bytes.checked_add(IDENTITY_CANDIDATE_OVERHEAD_BYTES))
         .and_then(|bytes| bytes.checked_mul(candidate_population))
         .ok_or_else(|| invalid("identity reconciliation candidate memory bound overflows u64"))?;
-    // Besides the candidate/inventory copy above, durable admission can
-    // transiently hold operation, validation, and applied-record copies.
-    // Four extra fingerprints and two extra paths conservatively cover that
-    // open-candidate amplification.
+    // The common candidate term covers retained state, the temporary evidence
+    // vector, and every simultaneously retained inventory. In-flight
+    // admission also retains a full event copy, and durable update preflight
+    // can retain old/new operations, a cloned transaction, encoded body and
+    // frame, and a transient applied record. Ten extra fingerprint and path
+    // payloads conservatively cover that amplification.
     let open_candidate_bytes = identity
         .fingerprint_bytes
-        .checked_mul(4)
+        .checked_mul(IDENTITY_OPEN_CANDIDATE_FINGERPRINT_COPIES)
         .and_then(|bytes| {
             (ADVISORY_PATH_MAX_BYTES as u64)
-                .checked_mul(2)
+                .checked_mul(IDENTITY_OPEN_CANDIDATE_PATH_COPIES)
                 .and_then(|paths| bytes.checked_add(paths))
         })
         .and_then(|bytes| bytes.checked_add(IDENTITY_OPEN_CANDIDATE_OVERHEAD_BYTES))
@@ -1238,12 +1290,19 @@ fn validate_identity_reconciliation_bounds(
         .ok_or_else(|| {
             invalid("identity reconciliation open-candidate memory bound overflows u64")
         })?;
-    let record_index_bytes = u64::from(limits.max_tracked_files)
-        .checked_mul(IDENTITY_RECORD_INDEX_OVERHEAD_BYTES)
-        .ok_or_else(|| invalid("identity reconciliation record-index bound overflows u64"))?;
+    let record_state_bytes = identity
+        .fingerprint_bytes
+        .checked_add(ADVISORY_PATH_MAX_BYTES as u64)
+        .and_then(|bytes| bytes.checked_add(IDENTITY_RECORD_INDEX_OVERHEAD_BYTES))
+        .and_then(|bytes| bytes.checked_mul(u64::from(limits.max_tracked_files)))
+        .ok_or_else(|| invalid("identity reconciliation record-state bound overflows u64"))?;
+    let discovery_tracked_bytes = u64::from(limits.max_tracked_files)
+        .checked_mul(DISCOVERY_TRACKED_OVERHEAD_BYTES)
+        .ok_or_else(|| invalid("discovery tracked-state bound overflows u64"))?;
     let total = candidate_bytes
         .checked_add(open_candidate_bytes)
-        .and_then(|bytes| bytes.checked_add(record_index_bytes))
+        .and_then(|bytes| bytes.checked_add(record_state_bytes))
+        .and_then(|bytes| bytes.checked_add(discovery_tracked_bytes))
         .ok_or_else(|| invalid("identity reconciliation working-set bound overflows u64"))?;
     if total > IDENTITY_RECONCILIATION_BYTES_CEILING {
         return Err(invalid(&format!(
@@ -1652,16 +1711,42 @@ fn hex_digit(value: u8) -> u8 {
 /// (`./`) component so a pattern like `./.otap-state/filelog/<id>/*.log`
 /// compares equal to the equivalent pattern without it; see
 /// [`strip_leading_curdir`].
-fn glob_literal_prefix(pattern: &str) -> PathBuf {
+pub(super) fn glob_literal_prefix(pattern: &str) -> PathBuf {
     let mut prefix = PathBuf::new();
     for component in Path::new(pattern).components() {
-        let text = component.as_os_str().to_string_lossy();
-        if text.contains(['*', '?', '[', '{']) {
+        if component_has_glob_meta(&component.as_os_str().to_string_lossy()) {
             break;
         }
-        prefix.push(component);
+        #[cfg(not(windows))]
+        {
+            prefix.push(unescape_glob_component(
+                &component.as_os_str().to_string_lossy(),
+            ));
+        }
+        #[cfg(windows)]
+        {
+            prefix.push(component);
+        }
     }
     strip_leading_curdir(&prefix)
+}
+
+#[cfg(not(windows))]
+fn unescape_glob_component(component: &str) -> String {
+    let mut unescaped = String::with_capacity(component.len());
+    let mut characters = component.chars();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            if let Some(escaped) = characters.next() {
+                unescaped.push(escaped);
+            } else {
+                unescaped.push(character);
+            }
+        } else {
+            unescaped.push(character);
+        }
+    }
+    unescaped
 }
 
 /// Reports whether `pattern`'s literal (non-glob) directory prefix resolves
@@ -1677,13 +1762,86 @@ fn include_targets_checkpoint_namespace(pattern: &str, namespace_dir: &Path) -> 
         && (literal_prefix == namespace_dir || literal_prefix.starts_with(namespace_dir))
 }
 
+fn component_has_glob_meta(component: &str) -> bool {
+    let mut escaped = false;
+    for character in component.chars() {
+        if cfg!(not(windows)) && !escaped && character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if !escaped && matches!(character, '*' | '?' | '[' | '{') {
+            return true;
+        }
+        escaped = false;
+    }
+    false
+}
+
+fn compile_path_glob(
+    pattern: &str,
+    field: &'static str,
+) -> Result<GlobMatcher, otap_df_config::error::Error> {
+    let normalized = strip_leading_curdir(Path::new(pattern));
+    let normalized = if normalized.as_os_str().is_empty() {
+        Cow::Borrowed(pattern)
+    } else {
+        normalized.to_string_lossy()
+    };
+    let mut builder = GlobBuilder::new(&normalized);
+    let _ = builder
+        .literal_separator(true)
+        .backslash_escape(cfg!(not(windows)));
+    builder
+        .build()
+        .map(|glob| glob.compile_matcher())
+        .map_err(|source| invalid(&format!("{field} pattern '{pattern}' is invalid: {source}")))
+}
+
+fn validate_discovery_pattern_population(
+    include: &[String],
+    exclude: &[String],
+) -> Result<(), otap_df_config::error::Error> {
+    let count = include
+        .len()
+        .checked_add(exclude.len())
+        .ok_or_else(|| invalid("discovery glob count overflows usize"))?;
+    if count > MAX_DISCOVERY_PATTERNS {
+        return Err(invalid(&format!(
+            "include plus exclude supports at most {MAX_DISCOVERY_PATTERNS} patterns"
+        )));
+    }
+    let mut total_bytes = 0usize;
+    for (field, patterns) in [("include", include), ("exclude", exclude)] {
+        for pattern in patterns {
+            if pattern.len() > MAX_DISCOVERY_PATTERN_BYTES {
+                return Err(invalid(&format!(
+                    "{field} pattern is {} bytes, exceeding the \
+                     {MAX_DISCOVERY_PATTERN_BYTES}-byte maximum",
+                    pattern.len()
+                )));
+            }
+            total_bytes = total_bytes
+                .checked_add(pattern.len())
+                .ok_or_else(|| invalid("aggregate discovery glob bytes overflow usize"))?;
+        }
+    }
+    if total_bytes > MAX_DISCOVERY_PATTERN_TOTAL_BYTES {
+        return Err(invalid(&format!(
+            "include plus exclude patterns total {total_bytes} bytes, exceeding the \
+             {MAX_DISCOVERY_PATTERN_TOTAL_BYTES}-byte maximum"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_include(
     include: Vec<String>,
     checkpoint_namespace_dir: &Path,
-) -> Result<Vec<String>, otap_df_config::error::Error> {
+) -> Result<(Vec<String>, Vec<GlobMatcher>), otap_df_config::error::Error> {
     if include.is_empty() {
         return Err(invalid("include must be non-empty"));
     }
+    let mut compiled = Vec::with_capacity(include.len());
     for pattern in &include {
         if pattern.is_empty() {
             return Err(invalid("include entries must not be empty"));
@@ -1696,17 +1854,22 @@ fn validate_include(
                 checkpoint_namespace_dir.display()
             )));
         }
+        compiled.push(compile_path_glob(pattern, "include")?);
     }
-    Ok(include)
+    Ok((include, compiled))
 }
 
-fn validate_exclude(exclude: Vec<String>) -> Result<Vec<String>, otap_df_config::error::Error> {
+fn validate_exclude(
+    exclude: Vec<String>,
+) -> Result<(Vec<String>, Vec<GlobMatcher>), otap_df_config::error::Error> {
+    let mut compiled = Vec::with_capacity(exclude.len());
     for pattern in &exclude {
         if pattern.is_empty() {
             return Err(invalid("exclude entries must not be empty"));
         }
+        compiled.push(compile_path_glob(pattern, "exclude")?);
     }
-    Ok(exclude)
+    Ok((exclude, compiled))
 }
 
 #[cfg(test)]
@@ -1888,6 +2051,59 @@ mod tests {
         assert!(RuntimeConfig::from_config(cfg, "node-1").is_err());
     }
 
+    /// Scenario: include and exclude lists contain malformed character-class
+    /// globs.
+    /// Guarantees: every path glob is compiled during configuration
+    /// validation, so syntax failures cannot surface after the discovery
+    /// thread starts.
+    #[test]
+    fn discovery_glob_syntax_is_validated_eagerly() {
+        let mut include = minimal_config();
+        include.include = vec!["/var/log/[".to_owned()];
+        let error = RuntimeConfig::from_config(include, "node-1").unwrap_err();
+        assert!(error.to_string().contains("include pattern"));
+
+        let mut exclude = minimal_config();
+        exclude.exclude = vec!["/var/log/[".to_owned()];
+        let error = RuntimeConfig::from_config(exclude, "node-1").unwrap_err();
+        assert!(error.to_string().contains("exclude pattern"));
+    }
+
+    /// Scenario: discovery configuration exceeds the per-pattern, pattern
+    /// count, and aggregate pattern-byte bounds independently.
+    /// Guarantees: glob compilation and retained pattern memory are bounded
+    /// before any discovery plan or worker thread is created.
+    #[test]
+    fn discovery_pattern_population_is_bounded() {
+        let mut oversized = minimal_config();
+        oversized.include = vec!["x".repeat(MAX_DISCOVERY_PATTERN_BYTES + 1)];
+        let error = RuntimeConfig::from_config(oversized, "node-1").unwrap_err();
+        assert!(error.to_string().contains("byte maximum"));
+
+        let mut too_many = minimal_config();
+        too_many.exclude = vec!["x".to_owned(); MAX_DISCOVERY_PATTERNS];
+        let error = RuntimeConfig::from_config(too_many, "node-1").unwrap_err();
+        assert!(error.to_string().contains("at most"));
+
+        let mut aggregate = minimal_config();
+        aggregate.exclude = vec!["x".repeat(MAX_DISCOVERY_PATTERN_BYTES); 257];
+        let error = RuntimeConfig::from_config(aggregate, "node-1").unwrap_err();
+        assert!(error.to_string().contains("patterns total"));
+    }
+
+    /// Scenario: a single-star include is matched against a direct child and
+    /// a nested descendant path.
+    /// Guarantees: compiled path globs treat separators literally, leaving
+    /// recursive matching to `**` plus the independent traversal switch.
+    #[test]
+    fn compiled_discovery_globs_treat_path_separators_literally() {
+        let runtime = RuntimeConfig::from_config(minimal_config(), "node-1").unwrap();
+        let matcher = &runtime.compiled_include[0];
+
+        assert!(matcher.is_match("/var/log/app/direct.log"));
+        assert!(!matcher.is_match("/var/log/app/nested/child.log"));
+    }
+
     /// Scenario: `max_recursion_depth` is set to zero.
     /// Guarantees: a zero recursion bound is rejected; it is one of the
     /// "all nonzero bounds" the design requires.
@@ -1896,6 +2112,18 @@ mod tests {
         let mut cfg = minimal_config();
         cfg.max_recursion_depth = 0;
         assert!(RuntimeConfig::from_config(cfg, "node-1").is_err());
+    }
+
+    /// Scenario: `max_recursion_depth` exceeds the fixed traversal-stack
+    /// ceiling.
+    /// Guarantees: a user cannot configure an effectively unbounded
+    /// symlink-cycle or directory traversal stack.
+    #[test]
+    fn max_recursion_depth_has_a_fixed_ceiling() {
+        let mut cfg = minimal_config();
+        cfg.max_recursion_depth = MAX_RECURSION_DEPTH + 1;
+        let error = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
+        assert!(error.to_string().contains("1..="));
     }
 
     /// Scenario: `discovery.poll_interval` is set to zero.
@@ -2261,17 +2489,88 @@ mod tests {
         assert!(RuntimeConfig::from_config(cfg, "node-1").is_ok());
     }
 
-    /// Scenario: candidate, open-file, tracked-record, and fingerprint
-    /// limits independently validate but their combined identity
-    /// reconciliation working set exceeds one GiB.
-    /// Guarantees: cross-field validation rejects the configuration before
-    /// runtime allocation and identifies the knobs that reduce the bound.
+    /// Scenario: discovery retains candidate state while one inventory is
+    /// worker-owned, one occupies the event channel, and a third is built
+    /// from a temporary evidence vector.
+    /// Guarantees: the configured memory coefficients cover all five
+    /// fingerprint payload copies, all four path payload copies, and the
+    /// minimum inline key/value storage implied by that topology.
+    #[test]
+    fn identity_memory_formula_covers_discovery_copy_topology() {
+        use std::mem::size_of;
+
+        use crate::receivers::filelog_receiver::checkpoint::Locator;
+        use crate::receivers::filelog_receiver::discovery::DiscoveredCandidate;
+        use crate::receivers::filelog_receiver::identity::CandidateEvidence;
+
+        assert_eq!(DISCOVERY_MAX_SIMULTANEOUS_INVENTORIES, 3);
+        assert_eq!(
+            DISCOVERY_CANDIDATE_FINGERPRINT_COPIES,
+            1 + DISCOVERY_MAX_SIMULTANEOUS_INVENTORIES + 1
+        );
+        assert_eq!(DISCOVERY_CANDIDATE_PATH_COPIES, 3 + 1);
+
+        let minimum_inline_bytes = size_of::<DiscoveredCandidate>()
+            + size_of::<CandidateEvidence>()
+            + usize::try_from(DISCOVERY_MAX_SIMULTANEOUS_INVENTORIES)
+                .expect("inventory count fits usize")
+                * (size_of::<Locator>() + size_of::<Vec<u8>>() + size_of::<usize>());
+        assert!(
+            usize::try_from(IDENTITY_CANDIDATE_OVERHEAD_BYTES).expect("overhead fits usize")
+                >= minimum_inline_bytes
+        );
+    }
+
+    /// Scenario: every open candidate updates both fingerprint and metadata
+    /// while checkpoint preflight retains original and cloned operations,
+    /// encoded transaction body and frame, the existing table, and a
+    /// transient applied record.
+    /// Guarantees: the in-flight coefficients cover the complete durable
+    /// update topology, and a concrete configuration that the smaller
+    /// discovery-only formula accepted is rejected before allocation.
+    #[test]
+    fn identity_memory_formula_covers_durable_update_topology() {
+        assert_eq!(IDENTITY_OPEN_CANDIDATE_FINGERPRINT_COPIES, 1 + (4 * 2) + 1);
+        const {
+            assert!(
+                IDENTITY_OPEN_CANDIDATE_PATH_COPIES > 3 + 4,
+                "event, metadata encoding stages, and applied record must fit"
+            );
+        }
+
+        let mut cfg = minimal_config();
+        cfg.identity.fingerprint_bytes = 22_000;
+        cfg.limits.max_open_files = 2_048;
+        cfg.limits.max_tracked_files = 2_048;
+        cfg.limits.max_pending_candidates = 4_192;
+        cfg.checkpoint.compact_after_bytes = 1;
+
+        let error = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("identity reconciliation worst-case working set"),
+            "{error}"
+        );
+    }
+
+    /// Scenario: pending-candidate capacity reaches the exact largest value
+    /// whose complete discovery, identity, index, and tracked-state formula
+    /// fits one GiB at the other defaults, then increases by one.
+    /// Guarantees: checked cross-field accounting accepts the boundary,
+    /// rejects the next value before runtime allocation, and identifies the
+    /// knobs that reduce the bound.
     #[test]
     fn identity_reconciliation_working_set_is_bounded() {
+        let boundary = largest_accepted(1, u64::from(u32::MAX), |candidate| {
+            let mut cfg = minimal_config();
+            cfg.limits.max_pending_candidates =
+                u32::try_from(candidate).expect("search stays in the u32 range");
+            RuntimeConfig::from_config(cfg, "node-1").is_ok()
+        });
         let mut cfg = minimal_config();
-        cfg.limits.max_pending_candidates = 1_000_000;
-        cfg.limits.max_tracked_files = 1_000_000;
-        cfg.limits.max_open_files = 1_000_000;
+        cfg.limits.max_pending_candidates =
+            u32::try_from(boundary + 1).expect("identity boundary is below u32::MAX");
 
         let error = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
 
@@ -2631,7 +2930,9 @@ mod tests {
         assert!(err.to_string().contains(WAL_REMEDY), "{err}");
 
         // Find the widest fingerprint window whose complete recovery
-        // working set remains bounded at the other defaults.
+        // working set remains bounded at the durable-store defaults. Use
+        // minimal pending/open populations so this assertion isolates the
+        // store boundary from the separate runtime reconciliation ceiling.
         let boundary_fingerprint = largest_accepted(
             DEFAULT_FINGERPRINT_BYTES,
             MAX_FINGERPRINT_BYTES,
@@ -2646,10 +2947,14 @@ mod tests {
         );
         let mut cfg = minimal_config();
         cfg.identity.fingerprint_bytes = boundary_fingerprint;
+        cfg.limits.max_pending_candidates = 1;
+        cfg.limits.max_open_files = 1;
         assert!(RuntimeConfig::from_config(cfg, "node-1").is_ok());
 
         let mut cfg = minimal_config();
         cfg.identity.fingerprint_bytes = boundary_fingerprint + 1;
+        cfg.limits.max_pending_candidates = 1;
+        cfg.limits.max_open_files = 1;
         let err = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
         assert!(
             err.to_string().contains("checkpoint recovery working set"),
@@ -2799,6 +3104,19 @@ mod tests {
         let without_curdir = glob_literal_prefix(".otap-state/filelog/app-logs/*.log");
         assert_eq!(with_curdir, without_curdir);
         assert_eq!(with_curdir, PathBuf::from(".otap-state/filelog/app-logs"));
+    }
+
+    #[cfg(unix)]
+    /// Scenario: a Unix glob component escapes metacharacters and a literal
+    /// backslash that are part of an exact filename.
+    /// Guarantees: the derived filesystem prefix removes glob escapes while
+    /// retaining each escaped character as a literal path byte.
+    #[test]
+    fn glob_literal_prefix_unescapes_unix_literal_components() {
+        assert_eq!(
+            glob_literal_prefix(r"/var/log/app\[1\]\*\\name.log"),
+            PathBuf::from(r"/var/log/app[1]*\name.log")
+        );
     }
 
     /// Scenario: stripping a leading `CurDir` component from a handful of

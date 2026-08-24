@@ -39,6 +39,7 @@ data_engine_kql_parser.workspace = true
 fs4.workspace = true
 futures.workspace = true
 futures-timer.workspace = true
+globset.workspace = true
 hex.workspace = true
 humantime-serde.workspace = true
 linkme.workspace = true
@@ -66,6 +67,7 @@ secrecy.workspace = true
 async-stream.workspace = true
 arrow-ipc.workspace = true
 uuid.workspace = true
+walkdir.workspace = true
 xxhash-rust.workspace = true
 weaver_common = { workspace = true, optional = true }
 weaver_forge = { workspace = true, optional = true }

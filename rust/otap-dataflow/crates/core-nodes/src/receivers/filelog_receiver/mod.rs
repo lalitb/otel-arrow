@@ -27,10 +27,14 @@
 //! - Secure handle-based identity evidence plus durable recovery matching
 //!   ([`identity`]), including exact-locator and guarded unique-fingerprint
 //!   reconnect, start/mismatch policy, and atomic registration.
+//! - Bounded periodic filesystem discovery and admission ([`discovery`]),
+//!   including compiled include/exclude globs, resolved-target safety,
+//!   incomplete-inventory fail-closed behavior, overflow fairness, and a
+//!   dedicated cancellable OS thread with bounded channels.
 //!
-//! Runtime receiver wiring -- discovery, framing, the read/checkpoint thread
-//! that drives these foundations, and component factory registration -- is
-//! implemented in a later stage and does not exist yet.
+//! Runtime receiver wiring -- framing, the read/checkpoint thread that drives
+//! these foundations, and component factory registration -- is implemented
+//! in a later stage and does not exist yet.
 //! [`FILELOG_RECEIVER_URN`] is exported so that stage can register a
 //! `ReceiverFactory` without renaming anything here, but no factory is
 //! registered yet: there is no `distributed_slice` entry and no receiver
@@ -48,6 +52,7 @@
 pub mod checkpoint;
 
 mod config;
+mod discovery;
 mod identity;
 mod lease;
 

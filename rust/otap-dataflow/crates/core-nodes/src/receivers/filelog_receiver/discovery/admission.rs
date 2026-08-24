@@ -1,0 +1,696 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+//! Bounded pending admission, scan-generation tracking, and fair overflow
+//! selection.
+
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::time::{Duration, SystemTime};
+
+use super::{
+    CandidateEvent, DiscoveredCandidate, DiscoveryError, DiscoveryFeedback, DiscoveryIssue,
+    DiscoveryStats, ReconciliationBatch,
+};
+use crate::receivers::filelog_receiver::checkpoint::Locator;
+use crate::receivers::filelog_receiver::identity::CandidateEvidence;
+use crate::receivers::filelog_receiver::identity::matcher::CandidateInventory;
+
+#[derive(Debug)]
+struct PendingEntry {
+    candidate: DiscoveredCandidate,
+    first_seen_generation: u64,
+    seen_generation: u64,
+}
+
+#[derive(Debug)]
+struct TrackedEntry {
+    signature: [u8; 32],
+    seen_generation: u64,
+    present: bool,
+    inflight_candidate: Option<DiscoveredCandidate>,
+    first_seen_generation: Option<u64>,
+}
+
+#[derive(Debug)]
+struct SelectedCandidate {
+    priority: [u8; 32],
+    locator_key: [u8; 25],
+    candidate: DiscoveredCandidate,
+}
+
+impl PartialEq for SelectedCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.priority == other.priority && self.locator_key == other.locator_key
+    }
+}
+
+impl Eq for SelectedCandidate {}
+
+impl PartialOrd for SelectedCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SelectedCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.priority
+            .cmp(&other.priority)
+            .then_with(|| self.locator_key.cmp(&other.locator_key))
+    }
+}
+
+/// Bounded admission state shared across periodic reconciliation passes.
+#[derive(Debug)]
+pub(crate) struct AdmissionController {
+    max_pending_candidates: usize,
+    max_live_entries: usize,
+    max_candidate_events: usize,
+    fingerprint_bytes: u16,
+    inflight_count: usize,
+    generation: u64,
+    tracked: HashMap<Locator, TrackedEntry>,
+    pending: HashMap<Locator, PendingEntry>,
+    pending_order: VecDeque<Locator>,
+    selected: BinaryHeap<SelectedCandidate>,
+    selected_locators: HashSet<Locator>,
+    events: Vec<CandidateEvent>,
+    stats: Option<DiscoveryStats>,
+    scan_now: Option<SystemTime>,
+    removal_evidence_complete: bool,
+    deferred_overflow: u64,
+}
+
+impl AdmissionController {
+    pub(crate) fn new(
+        max_pending_candidates: usize,
+        max_tracked_files: usize,
+        max_candidate_events: usize,
+        fingerprint_bytes: u16,
+    ) -> Result<Self, DiscoveryError> {
+        let max_live_entries = max_tracked_files.checked_add(max_candidate_events).ok_or(
+            DiscoveryError::CounterOverflow {
+                counter: "tracked plus in-flight discovery entries",
+            },
+        )?;
+        Ok(Self {
+            max_pending_candidates,
+            max_live_entries,
+            max_candidate_events,
+            fingerprint_bytes,
+            inflight_count: 0,
+            generation: 0,
+            tracked: HashMap::with_capacity(max_tracked_files),
+            pending: HashMap::with_capacity(max_pending_candidates),
+            pending_order: VecDeque::with_capacity(max_pending_candidates),
+            selected: BinaryHeap::new(),
+            selected_locators: HashSet::new(),
+            events: Vec::new(),
+            stats: None,
+            scan_now: None,
+            removal_evidence_complete: false,
+            deferred_overflow: 0,
+        })
+    }
+
+    pub(crate) fn begin_scan(&mut self, now: SystemTime) -> Result<u64, DiscoveryError> {
+        if self.stats.is_some() {
+            return Err(DiscoveryError::GenerationOutOfOrder {
+                expected: self.generation,
+                found: self.generation,
+            });
+        }
+        self.generation =
+            self.generation
+                .checked_add(1)
+                .ok_or(DiscoveryError::CounterOverflow {
+                    counter: "reconciliation generation",
+                })?;
+        self.events.clear();
+        self.selected.clear();
+        self.selected_locators.clear();
+        let mut stats = DiscoveryStats::new(self.generation);
+        stats.overflowed_candidates = std::mem::take(&mut self.deferred_overflow);
+        if stats.overflowed_candidates != 0 {
+            stats.complete = false;
+        }
+        self.stats = Some(stats);
+        self.scan_now = Some(now);
+        self.removal_evidence_complete = true;
+        Ok(self.generation)
+    }
+
+    pub(crate) fn increment_matched_paths(&mut self) -> Result<(), DiscoveryError> {
+        let stats = self.current_stats_mut()?;
+        stats.matched_paths =
+            stats
+                .matched_paths
+                .checked_add(1)
+                .ok_or(DiscoveryError::CounterOverflow {
+                    counter: "matched discovery paths",
+                })?;
+        Ok(())
+    }
+
+    pub(crate) fn record_issue(&mut self, issue: DiscoveryIssue) -> Result<(), DiscoveryError> {
+        self.removal_evidence_complete = false;
+        self.current_stats_mut()?.record_issue(issue)
+    }
+
+    pub(crate) fn observe(
+        &mut self,
+        generation: u64,
+        candidate: DiscoveredCandidate,
+        ignore_older_than: Duration,
+    ) -> Result<(), DiscoveryError> {
+        if generation != self.generation || self.stats.is_none() {
+            return Err(DiscoveryError::GenerationOutOfOrder {
+                expected: self.generation,
+                found: generation,
+            });
+        }
+        let locator = candidate.evidence.locator;
+        if self.tracked.contains_key(&locator) {
+            let mut emit_update = false;
+            let mut evidence_blocked = false;
+            {
+                let entry = self
+                    .tracked
+                    .get_mut(&locator)
+                    .expect("contains_key established tracked entry");
+                if entry.seen_generation == generation {
+                    return Ok(());
+                }
+                entry.seen_generation = generation;
+                let was_present = entry.present;
+                let signature = candidate_signature(&candidate.evidence);
+                if !was_present {
+                    evidence_blocked = true;
+                } else if entry.signature != signature {
+                    if entry.inflight_candidate.is_some()
+                        || self.inflight_count >= self.max_candidate_events
+                    {
+                        evidence_blocked = true;
+                    } else {
+                        entry.signature = signature;
+                        entry.inflight_candidate = Some(candidate.clone());
+                        entry.present = true;
+                        emit_update = true;
+                    }
+                } else {
+                    entry.present = true;
+                }
+            }
+            if emit_update {
+                self.inflight_count += 1;
+                self.events.push(CandidateEvent::Updated(candidate));
+            } else if evidence_blocked {
+                self.mark_incomplete_overflow()?;
+            }
+            self.increment_eligible_candidates()?;
+            return Ok(());
+        }
+        if let Some(entry) = self.pending.get_mut(&locator) {
+            if entry.seen_generation != generation {
+                entry.candidate = candidate;
+                entry.seen_generation = generation;
+                self.increment_eligible_candidates()?;
+            }
+            return Ok(());
+        }
+        if candidate_is_too_old(
+            candidate.modified,
+            self.scan_now.expect("active scan records its start time"),
+            ignore_older_than,
+        ) {
+            return Ok(());
+        }
+        self.increment_eligible_candidates()?;
+        self.consider_new_candidate(candidate)
+    }
+
+    pub(crate) fn finish_scan(&mut self) -> Result<ReconciliationBatch, DiscoveryError> {
+        let generation = self.generation;
+        if self.stats.is_none() {
+            return Err(DiscoveryError::GenerationOutOfOrder {
+                expected: generation,
+                found: generation,
+            });
+        }
+
+        if self.removal_evidence_complete {
+            self.pending
+                .retain(|_, entry| entry.seen_generation == generation);
+            self.pending_order
+                .retain(|locator| self.pending.contains_key(locator));
+        }
+
+        self.admit_pending()?;
+        self.retain_selected()?;
+
+        if self.removal_evidence_complete {
+            for (locator, entry) in &mut self.tracked {
+                if entry.present && entry.seen_generation != generation {
+                    entry.present = false;
+                    self.events
+                        .push(CandidateEvent::Removed { locator: *locator });
+                }
+            }
+        }
+
+        let mut inventory_candidates =
+            Vec::with_capacity(self.pending.len().checked_add(self.inflight_count).ok_or(
+                DiscoveryError::CounterOverflow {
+                    counter: "candidate inventory population",
+                },
+            )?);
+        inventory_candidates.extend(
+            self.pending
+                .values()
+                .map(|entry| entry.candidate.evidence.clone()),
+        );
+        inventory_candidates.extend(self.tracked.values().filter_map(|entry| {
+            entry
+                .inflight_candidate
+                .as_ref()
+                .map(|candidate| candidate.evidence.clone())
+        }));
+        let live_locators: HashSet<Locator> = self.tracked.keys().copied().collect();
+
+        let mut stats = self
+            .stats
+            .take()
+            .expect("active scan always owns statistics");
+        stats.pending_candidates = self.pending.len();
+        stats.emitted_events = self.events.len();
+        let inventory = if stats.complete {
+            CandidateInventory::from_complete_reconciliation(
+                &inventory_candidates,
+                &live_locators,
+                self.fingerprint_bytes,
+            )
+        } else {
+            CandidateInventory::from_incomplete_reconciliation(
+                &inventory_candidates,
+                &live_locators,
+                self.fingerprint_bytes,
+            )
+        };
+        self.scan_now = None;
+        Ok(ReconciliationBatch {
+            events: std::mem::take(&mut self.events),
+            inventory,
+            stats,
+        })
+    }
+
+    pub(crate) fn apply_feedback(
+        &mut self,
+        feedback: DiscoveryFeedback,
+    ) -> Result<(), DiscoveryError> {
+        let mut named = HashSet::new();
+        for (locator, requires_inflight, requires_absence) in feedback
+            .durable
+            .iter()
+            .map(|locator| (locator, true, false))
+            .chain(
+                feedback
+                    .rejected
+                    .iter()
+                    .map(|locator| (locator, false, false)),
+            )
+            .chain(
+                feedback
+                    .deferred
+                    .iter()
+                    .map(|locator| (locator, true, false)),
+            )
+            .chain(
+                feedback
+                    .finalized
+                    .iter()
+                    .map(|locator| (locator, false, true)),
+            )
+        {
+            if !named.insert(*locator) {
+                return Err(DiscoveryError::InvalidFeedback {
+                    locator: *locator,
+                    reason: "one feedback transaction names the locator more than once",
+                });
+            }
+            let Some(entry) = self.tracked.get(locator) else {
+                return Err(DiscoveryError::InvalidFeedback {
+                    locator: *locator,
+                    reason: "locator is not tracked by discovery",
+                });
+            };
+            if requires_inflight && entry.inflight_candidate.is_none() {
+                return Err(DiscoveryError::InvalidFeedback {
+                    locator: *locator,
+                    reason: "feedback has no in-flight candidate evidence",
+                });
+            }
+            if requires_absence && entry.present {
+                return Err(DiscoveryError::InvalidFeedback {
+                    locator: *locator,
+                    reason: "locator has not emitted a removal transition",
+                });
+            }
+        }
+        let deferred_to_pending = feedback
+            .deferred
+            .iter()
+            .filter(|locator| self.tracked.get(locator).is_some_and(|entry| entry.present))
+            .count();
+        let deferred_overflow = deferred_to_pending.saturating_sub(
+            self.max_pending_candidates
+                .saturating_sub(self.pending.len()),
+        );
+        let deferred_overflow =
+            u64::try_from(deferred_overflow).map_err(|_| DiscoveryError::BoundTooLarge {
+                field: "deferred candidate overflow",
+                value: u64::MAX,
+            })?;
+        let next_deferred_overflow = self
+            .deferred_overflow
+            .checked_add(deferred_overflow)
+            .ok_or(DiscoveryError::CounterOverflow {
+                counter: "deferred candidate overflow",
+            })?;
+
+        for locator in feedback.durable {
+            let entry = self
+                .tracked
+                .get_mut(&locator)
+                .expect("feedback was preflighted");
+            entry.inflight_candidate = None;
+            entry.first_seen_generation = None;
+            self.inflight_count =
+                self.inflight_count
+                    .checked_sub(1)
+                    .ok_or(DiscoveryError::CounterOverflow {
+                        counter: "in-flight candidate evidence",
+                    })?;
+        }
+        for locator in feedback.rejected {
+            let mut entry = self
+                .tracked
+                .remove(&locator)
+                .expect("feedback was preflighted");
+            if entry.inflight_candidate.take().is_some() {
+                self.inflight_count =
+                    self.inflight_count
+                        .checked_sub(1)
+                        .ok_or(DiscoveryError::CounterOverflow {
+                            counter: "in-flight candidate evidence",
+                        })?;
+            }
+            if !entry.present {
+                entry.first_seen_generation = None;
+                let previous = self.tracked.insert(locator, entry);
+                debug_assert!(previous.is_none());
+            }
+        }
+        for locator in feedback.deferred {
+            let mut entry = self
+                .tracked
+                .remove(&locator)
+                .expect("feedback was preflighted");
+            let candidate = entry
+                .inflight_candidate
+                .take()
+                .expect("deferred feedback requires candidate evidence");
+            self.inflight_count =
+                self.inflight_count
+                    .checked_sub(1)
+                    .ok_or(DiscoveryError::CounterOverflow {
+                        counter: "in-flight candidate evidence",
+                    })?;
+            if !entry.present {
+                entry.first_seen_generation = None;
+                let previous = self.tracked.insert(locator, entry);
+                debug_assert!(previous.is_none());
+            } else if self.pending.len() < self.max_pending_candidates {
+                let first_seen_generation = entry.first_seen_generation.unwrap_or(self.generation);
+                let previous = self.pending.insert(
+                    locator,
+                    PendingEntry {
+                        candidate,
+                        first_seen_generation,
+                        seen_generation: self.generation,
+                    },
+                );
+                debug_assert!(previous.is_none());
+            }
+        }
+        for locator in feedback.finalized {
+            if self
+                .tracked
+                .remove(&locator)
+                .is_some_and(|entry| entry.inflight_candidate.is_some())
+            {
+                self.inflight_count =
+                    self.inflight_count
+                        .checked_sub(1)
+                        .ok_or(DiscoveryError::CounterOverflow {
+                            counter: "in-flight candidate evidence",
+                        })?;
+            }
+        }
+        self.rebuild_pending_order();
+        self.deferred_overflow = next_deferred_overflow;
+        Ok(())
+    }
+
+    pub(crate) fn tracked_locators(&self) -> HashSet<Locator> {
+        self.tracked.keys().copied().collect()
+    }
+
+    pub(crate) fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn consider_new_candidate(
+        &mut self,
+        candidate: DiscoveredCandidate,
+    ) -> Result<(), DiscoveryError> {
+        let remaining_events = self
+            .max_candidate_events
+            .saturating_sub(self.inflight_count);
+        let free_pending = self
+            .max_pending_candidates
+            .saturating_sub(self.pending.len());
+        let selection_capacity =
+            remaining_events
+                .checked_add(free_pending)
+                .ok_or(DiscoveryError::CounterOverflow {
+                    counter: "candidate selection capacity",
+                })?;
+        if selection_capacity == 0 {
+            return self.mark_incomplete_overflow();
+        }
+        let locator = candidate.evidence.locator;
+        if !self.selected_locators.insert(locator) {
+            return Ok(());
+        }
+        let selected = SelectedCandidate {
+            priority: candidate_priority(self.generation, locator),
+            locator_key: locator_key(locator),
+            candidate,
+        };
+        if self.selected.len() < selection_capacity {
+            self.selected.push(selected);
+            return Ok(());
+        }
+        let replace = self.selected.peek().is_some_and(|worst| selected < *worst);
+        if replace {
+            let displaced = self
+                .selected
+                .pop()
+                .expect("non-empty full selection has a worst candidate");
+            let _ = self
+                .selected_locators
+                .remove(&displaced.candidate.evidence.locator);
+            self.selected.push(selected);
+            self.mark_incomplete_overflow()
+        } else {
+            let _ = self.selected_locators.remove(&locator);
+            self.mark_incomplete_overflow()
+        }
+    }
+
+    fn admit_pending(&mut self) -> Result<(), DiscoveryError> {
+        let retained = self.pending_order.len();
+        for _ in 0..retained {
+            if self.inflight_count >= self.max_candidate_events {
+                break;
+            }
+            let Some(locator) = self.pending_order.pop_front() else {
+                break;
+            };
+            if self
+                .pending
+                .get(&locator)
+                .is_some_and(|entry| entry.seen_generation != self.generation)
+            {
+                self.pending_order.push_back(locator);
+                continue;
+            }
+            let Some(entry) = self.pending.remove(&locator) else {
+                continue;
+            };
+            self.track_observed(entry.candidate, entry.first_seen_generation)?;
+        }
+        Ok(())
+    }
+
+    fn retain_selected(&mut self) -> Result<(), DiscoveryError> {
+        let selected = std::mem::take(&mut self.selected).into_sorted_vec();
+        self.selected_locators.clear();
+        for selected in selected {
+            if self.inflight_count < self.max_candidate_events {
+                self.track_observed(selected.candidate, self.generation)?;
+            } else if self.pending.len() < self.max_pending_candidates {
+                let locator = selected.candidate.evidence.locator;
+                self.pending_order.push_back(locator);
+                let previous = self.pending.insert(
+                    locator,
+                    PendingEntry {
+                        candidate: selected.candidate,
+                        first_seen_generation: self.generation,
+                        seen_generation: self.generation,
+                    },
+                );
+                debug_assert!(previous.is_none());
+            } else {
+                self.mark_incomplete_overflow()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn track_observed(
+        &mut self,
+        candidate: DiscoveredCandidate,
+        first_seen_generation: u64,
+    ) -> Result<(), DiscoveryError> {
+        if self.tracked.len() >= self.max_live_entries {
+            return self.mark_incomplete_overflow();
+        }
+        let locator = candidate.evidence.locator;
+        let previous = self.tracked.insert(
+            locator,
+            TrackedEntry {
+                signature: candidate_signature(&candidate.evidence),
+                seen_generation: self.generation,
+                present: true,
+                inflight_candidate: Some(candidate.clone()),
+                first_seen_generation: Some(first_seen_generation),
+            },
+        );
+        debug_assert!(previous.is_none());
+        self.inflight_count =
+            self.inflight_count
+                .checked_add(1)
+                .ok_or(DiscoveryError::CounterOverflow {
+                    counter: "in-flight candidate evidence",
+                })?;
+        self.events.push(CandidateEvent::Observed(candidate));
+        Ok(())
+    }
+
+    fn increment_eligible_candidates(&mut self) -> Result<(), DiscoveryError> {
+        let stats = self.current_stats_mut()?;
+        stats.eligible_candidates =
+            stats
+                .eligible_candidates
+                .checked_add(1)
+                .ok_or(DiscoveryError::CounterOverflow {
+                    counter: "eligible discovery candidates",
+                })?;
+        Ok(())
+    }
+
+    fn mark_incomplete_overflow(&mut self) -> Result<(), DiscoveryError> {
+        let stats = self.current_stats_mut()?;
+        stats.overflowed_candidates =
+            stats
+                .overflowed_candidates
+                .checked_add(1)
+                .ok_or(DiscoveryError::CounterOverflow {
+                    counter: "overflowed discovery candidates",
+                })?;
+        stats.complete = false;
+        Ok(())
+    }
+
+    fn current_stats_mut(&mut self) -> Result<&mut DiscoveryStats, DiscoveryError> {
+        self.stats
+            .as_mut()
+            .ok_or(DiscoveryError::GenerationOutOfOrder {
+                expected: self.generation,
+                found: self.generation,
+            })
+    }
+
+    fn rebuild_pending_order(&mut self) {
+        let mut ordered: Vec<_> = self
+            .pending
+            .iter()
+            .map(|(locator, entry)| (entry.first_seen_generation, *locator))
+            .collect();
+        ordered.sort_unstable_by_key(|(generation, locator)| (*generation, locator_key(*locator)));
+        self.pending_order = ordered.into_iter().map(|(_, locator)| locator).collect();
+    }
+}
+
+fn candidate_is_too_old(
+    modified: Option<SystemTime>,
+    now: SystemTime,
+    ignore_older_than: Duration,
+) -> bool {
+    !ignore_older_than.is_zero()
+        && modified
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > ignore_older_than)
+}
+
+fn candidate_signature(evidence: &CandidateEvidence) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    let _ = hasher.update(b"otel-arrow-filelog-discovery-signature-v1\0");
+    let _ = hasher.update(&(evidence.fingerprint.len() as u64).to_be_bytes());
+    let _ = hasher.update(&evidence.fingerprint);
+    let _ = hasher.update(&(evidence.advisory_path.len() as u64).to_be_bytes());
+    let _ = hasher.update(&evidence.advisory_path);
+    *hasher.finalize().as_bytes()
+}
+
+fn candidate_priority(generation: u64, locator: Locator) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    let _ = hasher.update(b"otel-arrow-filelog-discovery-fairness-v1\0");
+    let _ = hasher.update(&generation.to_be_bytes());
+    let _ = hasher.update(&locator_key(locator));
+    *hasher.finalize().as_bytes()
+}
+
+fn locator_key(locator: Locator) -> [u8; 25] {
+    let mut key = [0u8; 25];
+    match locator {
+        Locator::Unspecified => {}
+        Locator::PosixDevIno { dev, ino } => {
+            key[0] = 1;
+            key[1..9].copy_from_slice(&dev.to_be_bytes());
+            key[9..17].copy_from_slice(&ino.to_be_bytes());
+        }
+        Locator::WindowsVolumeFileId {
+            volume_serial,
+            file_id,
+        } => {
+            key[0] = 2;
+            key[1..9].copy_from_slice(&volume_serial.to_be_bytes());
+            key[9..25].copy_from_slice(&file_id);
+        }
+    }
+    key
+}

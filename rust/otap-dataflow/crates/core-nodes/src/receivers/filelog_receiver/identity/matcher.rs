@@ -46,6 +46,12 @@ pub(crate) struct CandidateInventory {
 }
 
 impl CandidateInventory {
+    /// Reports whether fingerprint multiplicities cover the complete
+    /// reconciliation population.
+    pub(crate) fn is_complete(&self) -> bool {
+        self.fingerprint_counts_complete
+    }
+
     /// Builds an inventory only when the reconciliation owner has retained
     /// every eligible candidate and observed no scan overflow or unstable
     /// evidence.
@@ -111,7 +117,8 @@ impl IdentitySettings {
             framing_profile_digest: config.framing_profile_digest,
             max_candidates: config.limits.max_open_files as usize,
             max_inventory_candidates: usize::try_from(
-                u64::from(config.limits.max_pending_candidates)
+                u64::from(config.limits.max_tracked_files)
+                    + u64::from(config.limits.max_pending_candidates)
                     + u64::from(config.limits.max_open_files),
             )
             .expect("validated candidate inventory population fits usize"),
