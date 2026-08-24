@@ -436,6 +436,8 @@ impl FilesystemScanner {
             self.plan.fingerprint_bytes,
             self.plan.ignored_header_bytes,
         )?;
+        let first_evidence = first.evidence;
+        drop(first.file);
         let resolved_again =
             std::fs::canonicalize(matched_path).map_err(|source| DiscoveryIssue::Io {
                 operation: "revalidate resolved candidate",
@@ -464,12 +466,12 @@ impl FilesystemScanner {
             self.plan.fingerprint_bytes,
             self.plan.ignored_header_bytes,
         )?;
-        if first.evidence.locator != second.evidence.locator
-            || second.evidence.size < first.evidence.size
+        if first_evidence.locator != second.evidence.locator
+            || second.evidence.size < first_evidence.size
             || !second
                 .evidence
                 .fingerprint
-                .starts_with(&first.evidence.fingerprint)
+                .starts_with(&first_evidence.fingerprint)
         {
             return Err(DiscoveryIssue::Identity(
                 IdentityError::CandidateChangedDuringIdentity {

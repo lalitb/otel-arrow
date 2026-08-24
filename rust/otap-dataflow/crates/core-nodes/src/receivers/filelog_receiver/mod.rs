@@ -31,10 +31,14 @@
 //!   including compiled include/exclude globs, resolved-target safety,
 //!   incomplete-inventory fail-closed behavior, overflow fairness, and a
 //!   dedicated cancellable OS thread with bounded channels.
+//! - Fair, bounded logical-reader scheduling ([`reader`]), including
+//!   source-byte read turns, least-recently-served descriptor rotation,
+//!   exact identity revalidation on reopen, and runtime leases that survive
+//!   temporary descriptor closure.
 //!
-//! Runtime receiver wiring -- framing, the read/checkpoint thread that drives
-//! these foundations, and component factory registration -- is implemented
-//! in a later stage and does not exist yet.
+//! Runtime receiver wiring -- decoding/framing, the read/checkpoint thread
+//! that drives these foundations, and component factory registration -- is
+//! implemented in a later stage and does not exist yet.
 //! [`FILELOG_RECEIVER_URN`] is exported so that stage can register a
 //! `ReceiverFactory` without renaming anything here, but no factory is
 //! registered yet: there is no `distributed_slice` entry and no receiver
@@ -55,6 +59,7 @@ mod config;
 mod discovery;
 mod identity;
 mod lease;
+mod reader;
 
 pub use config::{
     BatchConfig, CheckpointConfig, Config, DiscoveryConfig, Encoding, FILELOG_RECEIVER_URN,

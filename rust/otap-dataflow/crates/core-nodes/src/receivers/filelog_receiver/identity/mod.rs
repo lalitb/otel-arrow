@@ -59,6 +59,36 @@ pub(crate) enum IdentityError {
         /// Candidate path.
         path: PathBuf,
     },
+    /// Reopening a logical reader reached a different native file identity.
+    #[error("filelog reader reopen at {path} found locator {found:?}, expected {expected:?}")]
+    ReopenLocatorMismatch {
+        /// Reader path used for the reopen.
+        path: PathBuf,
+        /// Locator owned by the logical reader and its runtime lease.
+        expected: Locator,
+        /// Locator extracted from the reopened handle.
+        found: Locator,
+    },
+    /// Reopening a logical reader found matching evidence that no longer
+    /// extends the durable prefix.
+    #[error("filelog reader reopen fingerprint no longer extends durable evidence at {path}")]
+    ReopenFingerprintMismatch {
+        /// Reader path used for the reopen.
+        path: PathBuf,
+    },
+    /// Reopening a logical reader found a source shorter than its durable
+    /// checkpoint frontier.
+    #[error(
+        "filelog reader reopen at {path} found size {size}, below committed offset {committed_offset}"
+    )]
+    ReopenOffsetBeyondSize {
+        /// Reader path used for the reopen.
+        path: PathBuf,
+        /// Durable source-byte frontier.
+        committed_offset: u64,
+        /// Size observed from the reopened handle.
+        size: u64,
+    },
     /// The current target cannot provide a supported native locator.
     #[error("filelog handle identity is unsupported on this platform: {path}")]
     UnsupportedPlatform {

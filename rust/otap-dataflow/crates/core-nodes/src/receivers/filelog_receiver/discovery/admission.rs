@@ -13,7 +13,7 @@ use super::{
     DiscoveryStats, ReconciliationBatch,
 };
 use crate::receivers::filelog_receiver::checkpoint::Locator;
-use crate::receivers::filelog_receiver::identity::CandidateEvidence;
+
 use crate::receivers::filelog_receiver::identity::matcher::CandidateInventory;
 
 #[derive(Debug)]
@@ -184,7 +184,7 @@ impl AdmissionController {
                 }
                 entry.seen_generation = generation;
                 let was_present = entry.present;
-                let signature = candidate_signature(&candidate.evidence);
+                let signature = candidate_signature(&candidate);
                 if !was_present {
                     evidence_blocked = true;
                 } else if entry.signature != signature {
@@ -582,7 +582,7 @@ impl AdmissionController {
         let previous = self.tracked.insert(
             locator,
             TrackedEntry {
-                signature: candidate_signature(&candidate.evidence),
+                signature: candidate_signature(&candidate),
                 seen_generation: self.generation,
                 present: true,
                 inflight_candidate: Some(candidate.clone()),
@@ -656,13 +656,17 @@ fn candidate_is_too_old(
             .is_some_and(|age| age > ignore_older_than)
 }
 
-fn candidate_signature(evidence: &CandidateEvidence) -> [u8; 32] {
+fn candidate_signature(candidate: &DiscoveredCandidate) -> [u8; 32] {
+    let evidence = &candidate.evidence;
+    let resolved_path = candidate.resolved_path.as_os_str().as_encoded_bytes();
     let mut hasher = blake3::Hasher::new();
-    let _ = hasher.update(b"otel-arrow-filelog-discovery-signature-v1\0");
+    let _ = hasher.update(b"otel-arrow-filelog-discovery-signature-v2\0");
     let _ = hasher.update(&(evidence.fingerprint.len() as u64).to_be_bytes());
     let _ = hasher.update(&evidence.fingerprint);
     let _ = hasher.update(&(evidence.advisory_path.len() as u64).to_be_bytes());
     let _ = hasher.update(&evidence.advisory_path);
+    let _ = hasher.update(&(resolved_path.len() as u64).to_be_bytes());
+    let _ = hasher.update(resolved_path);
     *hasher.finalize().as_bytes()
 }
 

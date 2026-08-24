@@ -450,6 +450,16 @@ impl RuntimeLeaseRegistry {
         Ok(())
     }
 
+    fn ensure_healthy_fast(&self) -> Result<(), LeaseError> {
+        if self.inner.state.is_poisoned() {
+            return Err(LeaseError::RegistryPoisoned);
+        }
+        if self.inner.inconsistent.load(Ordering::Acquire) {
+            return Err(LeaseError::RegistryInconsistent);
+        }
+        Ok(())
+    }
+
     fn locator_hash(&self, locator: Locator) -> u64 {
         self.inner.hash_builder.hash_one(locator)
     }
@@ -655,6 +665,17 @@ impl ReceiverLeaseScope {
     /// that process-local single-reader enforcement is no longer reliable.
     pub(crate) fn ensure_healthy(&self) -> Result<(), LeaseError> {
         self.token()?.registry.ensure_healthy()
+    }
+
+    /// Checks the fail-closed poison and integrity indicators without taking
+    /// the process-wide mutex.
+    ///
+    /// The read worker uses this on its scheduling path so corruption
+    /// detected by another receiver cannot leave existing readers running.
+    /// Acquire, release, and explicit lifecycle checks still take the mutex
+    /// and validate the protected indexes.
+    pub(crate) fn ensure_healthy_fast(&self) -> Result<(), LeaseError> {
+        self.token()?.registry.ensure_healthy_fast()
     }
 
     /// Explicitly unregisters the receiver and reports cleanup failure before
@@ -972,6 +993,10 @@ mod tests {
             first_scope.ensure_healthy(),
             Err(LeaseError::RegistryInconsistent)
         ));
+        assert!(matches!(
+            first_scope.ensure_healthy_fast(),
+            Err(LeaseError::RegistryInconsistent)
+        ));
     }
 
     /// Scenario: a thread panics while holding a test-local registry mutex
@@ -989,6 +1014,10 @@ mod tests {
 
         assert!(matches!(
             scope.ensure_healthy(),
+            Err(LeaseError::RegistryPoisoned)
+        ));
+        assert!(matches!(
+            scope.ensure_healthy_fast(),
             Err(LeaseError::RegistryPoisoned)
         ));
         assert!(matches!(

@@ -79,6 +79,48 @@ pub(crate) fn open_candidate_at(
     })
 }
 
+/// Reopens an existing logical reader and validates the exact locator,
+/// durable fingerprint prefix, and committed source-byte frontier before
+/// returning the handle.
+pub(crate) fn reopen_candidate_at(
+    open_path: &Path,
+    advisory_path: &Path,
+    follow_symlinks: bool,
+    fingerprint_bytes: u16,
+    ignored_header_bytes: u32,
+    expected_locator: Locator,
+    durable_fingerprint: &[u8],
+    committed_offset: u64,
+) -> Result<OpenedCandidate, IdentityError> {
+    let opened = open_candidate_at(
+        open_path,
+        advisory_path,
+        follow_symlinks,
+        fingerprint_bytes,
+        ignored_header_bytes,
+    )?;
+    if opened.evidence.locator != expected_locator {
+        return Err(IdentityError::ReopenLocatorMismatch {
+            path: open_path.to_path_buf(),
+            expected: expected_locator,
+            found: opened.evidence.locator,
+        });
+    }
+    if !opened.evidence.fingerprint.starts_with(durable_fingerprint) {
+        return Err(IdentityError::ReopenFingerprintMismatch {
+            path: open_path.to_path_buf(),
+        });
+    }
+    if opened.evidence.size < committed_offset {
+        return Err(IdentityError::ReopenOffsetBeyondSize {
+            path: open_path.to_path_buf(),
+            committed_offset,
+            size: opened.evidence.size,
+        });
+    }
+    Ok(opened)
+}
+
 fn collect_consistent_fingerprint(
     file: &File,
     path: &Path,
@@ -322,6 +364,46 @@ fn read_bounded_at(
     }
     bytes.truncate(read);
     Ok(bytes)
+}
+
+/// Performs one bounded positioned source read, retrying only interrupted
+/// system calls. A short read or zero-byte EOF returns control to the fair
+/// reader scheduler.
+#[cfg(unix)]
+pub(crate) fn read_source_at(file: &File, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+
+    loop {
+        match file.read_at(buffer, offset) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            result => return result,
+        }
+    }
+}
+
+/// Performs one bounded positioned source read, retrying only interrupted
+/// system calls. A short read or zero-byte EOF returns control to the fair
+/// reader scheduler.
+#[cfg(windows)]
+pub(crate) fn read_source_at(file: &File, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+
+    loop {
+        match file.seek_read(buffer, offset) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            result => return result,
+        }
+    }
+}
+
+/// Reports unsupported source reading on targets without a Phase 1 locator
+/// contract.
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn read_source_at(_file: &File, _offset: u64, _buffer: &mut [u8]) -> io::Result<usize> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "filelog reading is supported only on Unix and Windows",
+    ))
 }
 
 #[cfg(unix)]

@@ -705,6 +705,10 @@ jobs:
         if: runner.os == 'Windows'
         run: cargo test --locked -p otap-df-core-nodes --lib filelog_receiver::discovery
         working-directory: ./rust/${{ matrix.folder }}
+      - name: Run filelog reader tests (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test --locked -p otap-df-core-nodes --lib filelog_receiver::reader
+        working-directory: ./rust/${{ matrix.folder }}
 
   host-metrics-semconv:
     runs-on: ubuntu-latest

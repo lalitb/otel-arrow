@@ -512,7 +512,8 @@ pub struct LimitsConfig {
     /// unavailable.
     #[serde(default = "LimitsConfig::default_max_pending_candidates")]
     pub max_pending_candidates: u32,
-    /// Maximum files with an open operating-system handle.
+    /// Maximum resident tail readers with an open operating-system handle.
+    /// Discovery uses at most one additional transient probe handle.
     #[serde(default = "LimitsConfig::default_max_open_files")]
     pub max_open_files: u32,
     /// Maximum bytes read per file per worker turn.

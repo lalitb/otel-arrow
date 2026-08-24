@@ -432,7 +432,7 @@ Discovery and admission use distinct bounded populations:
 | Candidate events | Matches waiting for worker handoff | At most `max_open_files` observed/updated transitions plus bounded tracked-file removals in one batch; one batch in the discovery channel |
 | Pending candidates | Matches retained while tracked-identity capacity is unavailable | `max_pending_candidates` |
 | Tracked identities | Durable `file_id` checkpoint records | `max_tracked_files` |
-| Open descriptors | Files with an open operating-system handle | `max_open_files` |
+| Open descriptors | Resident tail readers with an open operating-system handle | `max_open_files`; discovery uses at most one additional transient probe handle |
 
 Fingerprint-only restart matching uses multiplicities from the complete bounded
 reconciliation population, not only the current open-file batch. The inventory covers
@@ -769,8 +769,15 @@ Reader scheduling within the worker:
   from one file. Intra-file ordering is guaranteed (single reader per file, offsets
   monotonic); cross-file ordering is not guaranteed, matching all prior art.
 - At most `max_open_files` FDs are held. When over the cap, the **least-recently-served**
-  reader is closed (offset retained; reopen re-validates identity per INV-ID3) so FD
-  ownership rotates and a hot subset cannot permanently starve cold files.
+  reader is closed (durable committed offset retained; uncommitted read state rewound;
+  reopen re-validates identity per INV-ID3) so FD ownership rotates and a hot subset
+  cannot permanently starve cold files.
+- `max_open_files` bounds resident tail-reader handles. Discovery closes its first
+  stability observation before opening the second and therefore adds at most one
+  transient probe handle outside that resident pool.
+- A reader that observes EOF is re-probed at `discovery.poll_interval` unless an earlier
+  framing or lifecycle deadline applies. It is not continuously requeued, so EOF files
+  cannot spin or crowd ready files out of the round-robin schedule.
 - Only readers holding one of those open-file slots retain in-memory decoding, physical
   line, or multiline buffers. Closing a reader discards any uncommitted framing buffers;
   reopening starts at the durable committed offset and reconstructs them from source
@@ -1265,6 +1272,15 @@ policy. It never advances a checkpoint for unread bytes. Platform acceptance tes
 cover rename, delete-pending or name removal, late writes through a compatible writer,
 EOF finalization, and incompatible sharing behavior.
 
+Late-write capture after removal requires the logical reader's descriptor to still be
+resident. Because `max_tracked_files` may exceed `max_open_files`, a present reader can
+have rotated its descriptor out before the path disappears. Such a reader cannot
+portably reopen an unlinked POSIX inode or a Windows delete-pending file by path. The
+receiver reports this condition and applies the explicit rotation failure policy rather
+than claiming late-write capture. Removed resident handles are pinned until finalization
+and are never selected as descriptor-rotation victims; closed readers waiting for their
+slots cannot starve those retained handles.
+
 The rotated identity is finalized after EOF plus `rotate_wait` (default 5 seconds,
 matching Fluent Bit's `Rotate_Wait` precedent). Its unterminated trailing bytes remain
 uncommitted and are counted, its durable state becomes `rotated_finalized`, and its
@@ -1321,6 +1337,22 @@ logical bound, not an exact allocator-resident-byte formula; implementation test
 measure fixed and library overhead separately.
 The async half's control-priority obligations under backpressure are part of D13 (see
 Execution model).
+
+The reader scheduler adds one shared source-turn buffer rather than one buffer per
+reader. Both retained reader paths are checked against `ADVISORY_PATH_MAX_BYTES` in
+their native reversible encoding before admission. Its conservative payload bound is:
+
+```text
+reader_table_payload =
+  max_tracked_files *
+    (fingerprint_bytes + 2 * ADVISORY_PATH_MAX_BYTES + 1024) +
+  max_read_bytes_per_turn
+```
+
+The fixed per-reader term covers the logical-reader entry, two bounded indexes, ready
+and EOF scheduling state, the runtime-lease guard, and collection allocation overhead.
+At most one `ReadTurn` owns the shared buffer; returning the turn transfers that same
+allocation back to the scheduler rather than retaining a second copy.
 
 ## Lifecycle and drain
 
@@ -2026,7 +2058,7 @@ receivers:
       limits:
         max_tracked_files: 10000
         max_pending_candidates: 10000
-        max_open_files: 512
+        max_open_files: 512                    # resident tail-reader handles
         max_read_bytes_per_turn: 128KiB
       batch:
         max_records: 1024                       # <= 65535

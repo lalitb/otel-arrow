@@ -113,6 +113,40 @@ fn fake_candidate(number: u64) -> DiscoveredCandidate {
     }
 }
 
+/// Scenario: a tracked locator, fingerprint, and advisory matched path stay
+/// unchanged while the canonical target path changes.
+/// Guarantees: discovery emits an update so an evicted logical reader can
+/// reopen through the newly resolved target instead of retaining a stale
+/// canonical path.
+#[test]
+fn resolved_path_change_emits_tracked_update() {
+    let mut admission = AdmissionController::new(1, 1, 1, 16).unwrap();
+    let original = fake_candidate(90);
+    let locator = original.evidence.locator;
+
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe(generation, original, Duration::ZERO)
+        .unwrap();
+    let first = admission.finish_scan().unwrap();
+    admission.apply_feedback(durable_feedback(&first)).unwrap();
+
+    let mut retargeted = fake_candidate(90);
+    retargeted.resolved_path = PathBuf::from("retargeted-candidate-90.log");
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe(generation, retargeted, Duration::ZERO)
+        .unwrap();
+    let updated = admission.finish_scan().unwrap();
+
+    assert!(matches!(
+        updated.events.as_slice(),
+        [CandidateEvent::Updated(candidate)]
+            if candidate.evidence.locator == locator
+                && candidate.resolved_path == Path::new("retargeted-candidate-90.log")
+    ));
+}
+
 fn durable_feedback(batch: &ReconciliationBatch) -> DiscoveryFeedback {
     DiscoveryFeedback {
         durable: event_locators(batch),
