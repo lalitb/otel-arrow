@@ -177,36 +177,48 @@ const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(5);
 const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Registered semantic-convention attribute keys always attached to an
-/// emitted record, counted by [`logical_record_size`].
-const ATTR_KEY_LOG_FILE_PATH: &str = "log.file.path";
-const ATTR_KEY_LOG_FILE_NAME: &str = "log.file.name";
+/// emitted record, counted by [`checked_logical_record_size`].
+pub(crate) const ATTR_KEY_LOG_FILE_PATH: &str = "log.file.path";
+pub(crate) const ATTR_KEY_LOG_FILE_NAME: &str = "log.file.name";
 /// Experimental metadata attribute keys, counted only when their matching
 /// `metadata.*` flag is enabled.
-const ATTR_KEY_RECORD_OFFSET: &str = "otel_arrow.filelog.record.offset";
-const ATTR_KEY_RECORD_NUMBER: &str = "otel_arrow.filelog.record.number";
+pub(crate) const ATTR_KEY_PATH_RESOLVED: &str = "otel_arrow.filelog.path_resolved";
+pub(crate) const ATTR_KEY_PATH_ENCODING: &str = "otel_arrow.filelog.path.encoding";
+pub(crate) const ATTR_KEY_RECORD_OFFSET: &str = "otel_arrow.filelog.record.offset";
+pub(crate) const ATTR_KEY_RECORD_NUMBER: &str = "otel_arrow.filelog.record.number";
 /// Experimental oversize-marker attribute keys, counted according to the
 /// configured `max_log_size_behavior`.
-const ATTR_KEY_FRAGMENT_ID: &str = "otel_arrow.filelog.fragment.id";
-const ATTR_KEY_FRAGMENT_INDEX: &str = "otel_arrow.filelog.fragment.index";
-const ATTR_KEY_FRAGMENT_LAST: &str = "otel_arrow.filelog.fragment.last";
-const ATTR_KEY_RECORD_TRUNCATED: &str = "otel_arrow.filelog.record.truncated";
+pub(crate) const ATTR_KEY_FRAGMENT_ID: &str = "otel_arrow.filelog.fragment.id";
+pub(crate) const ATTR_KEY_FRAGMENT_INDEX: &str = "otel_arrow.filelog.fragment.index";
+pub(crate) const ATTR_KEY_FRAGMENT_LAST: &str = "otel_arrow.filelog.fragment.last";
+pub(crate) const ATTR_KEY_FRAGMENT_SOURCE_START: &str = "otel_arrow.filelog.fragment.source.start";
+pub(crate) const ATTR_KEY_FRAGMENT_SOURCE_END: &str = "otel_arrow.filelog.fragment.source.end";
+pub(crate) const ATTR_KEY_RECORD_TRUNCATED: &str = "otel_arrow.filelog.record.truncated";
+pub(crate) const ATTR_KEY_FLUSH_REASON: &str = "otel_arrow.filelog.flush.reason";
+pub(crate) const ATTR_KEY_DECODE_ERROR_POLICY: &str = "otel_arrow.filelog.decode.error.policy";
+pub(crate) const ATTR_KEY_DECODE_ERROR_COUNT: &str = "otel_arrow.filelog.decode.error_count";
 
-/// Conservative reserved bytes for a path-shaped attribute value (`log.file.path`,
-/// `log.file.name`) whose exact runtime length is unknown at config-build
-/// time. Matches common `PATH_MAX` on POSIX and Windows.
-const RESERVED_PATH_ATTRIBUTE_VALUE_BYTES: u64 = 4096;
+/// Prefix distinguishing a reversible non-UTF-8 path value.
+pub(crate) const ENCODED_PATH_PREFIX: &str = "filelog-percent:";
+/// Discriminator value emitted whenever any path-shaped value is encoded.
+pub(crate) const ENCODED_PATH_DISCRIMINATOR: &str = "percent-v1";
+
+/// Worst-case percent-encoded output for one path-shaped attribute value.
+///
+/// Native path evidence is capped at `ADVISORY_PATH_MAX_BYTES`; every byte
+/// expands to `%HH`, after the fixed discriminator prefix.
+pub(crate) const MAX_ENCODED_PATH_ATTRIBUTE_VALUE_BYTES: u64 =
+    ENCODED_PATH_PREFIX.len() as u64 + 3 * ADVISORY_PATH_MAX_BYTES as u64;
 /// Conservative reserved bytes for a decimal-encoded `u64` attribute value
 /// (source byte offset / record number), sized for the longest possible
 /// `u64` (20 digits).
 const RESERVED_DECIMAL_U64_VALUE_BYTES: u64 = 20;
 /// Length in bytes of the fixed-width lowercase-hex fragment id value.
 const FRAGMENT_ID_VALUE_BYTES: u64 = 64;
-/// Conservative reserved bytes for a boolean attribute value (`"false"`).
-const BOOLEAN_VALUE_BYTES: u64 = 5;
 /// Conservative fixed per-record bookkeeping overhead not attributable to
 /// any single attribute (Arrow builder / OTAP record bookkeeping). Matches
 /// the "conservative fixed per-record overhead" language in the design.
-const FIXED_PER_RECORD_OVERHEAD_BYTES: u64 = 128;
+pub(crate) const FIXED_PER_RECORD_OVERHEAD_BYTES: u64 = 128;
 
 fn deserialize_byte_size<'de, D>(deserializer: D) -> Result<u64, D::Error>
 where
@@ -509,6 +521,9 @@ impl Default for FramingConfig {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetadataConfig {
+    /// Attach the resolved target path under the experimental filelog key.
+    #[serde(default)]
+    pub include_file_path_resolved: bool,
     /// Attach the first source byte offset represented by the record.
     #[serde(default)]
     pub include_file_record_offset: bool,
@@ -873,7 +888,7 @@ impl Default for Config {
     }
 }
 
-/// Error returned by [`logical_record_size`] when its checked-arithmetic
+/// Error returned by [`checked_logical_record_size`] when its checked-arithmetic
 /// computation would overflow `u64`. Kept distinct from
 /// `otap_df_config::error::Error` so the single shared runtime/config
 /// function stays independent of the config crate's error type; config
@@ -888,93 +903,163 @@ pub(crate) enum LogicalSizeError {
     Overflow,
 }
 
-/// The shared logical-size function used both to validate `max_line_bytes`
-/// and `max_record_bytes` against `batch.max_bytes` at config-build time and,
-/// later, by runtime batch flushing to size an actual emitted record or
-/// fragment. Deliberately a single documented function so config validation
-/// and runtime flushing can never disagree (Appendix C, "Emitted data
-/// model").
+/// Logical byte contribution of one projected attribute.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LogicalAttributeSize {
+    key_bytes: u64,
+    value_bytes: u64,
+}
+
+impl LogicalAttributeSize {
+    /// Creates one contribution from the exact key and the value's logical
+    /// length.
+    pub(crate) fn new(key: &str, value_bytes: u64) -> Result<Self, LogicalSizeError> {
+        Ok(Self {
+            key_bytes: u64::try_from(key.len()).map_err(|_| LogicalSizeError::Overflow)?,
+            value_bytes,
+        })
+    }
+}
+
+/// Returns the logical length of a String attribute value.
+pub(crate) fn logical_string_value_len(value: &str) -> Result<u64, LogicalSizeError> {
+    u64::try_from(value.len()).map_err(|_| LogicalSizeError::Overflow)
+}
+
+/// Returns the conservative decimal-text length used for an Int attribute.
 ///
-/// Computes `body_bytes` plus attribute-key bytes, attribute-value bytes for
-/// the attributes an emitted record always or conditionally carries, and a
-/// conservative fixed per-record overhead. This is a documented logical
-/// bound, not a claim about exact Arrow allocation size.
+/// OTAP stores the value as an integer; sizing charges the number of bytes
+/// needed by its base-10 spelling, including a leading minus sign.
+pub(crate) const fn logical_int_value_len(value: i64) -> u64 {
+    let mut magnitude = value.unsigned_abs();
+    let mut digits = 1u64;
+    while magnitude >= 10 {
+        magnitude /= 10;
+        digits += 1;
+    }
+    if value < 0 { digits + 1 } else { digits }
+}
+
+/// Returns the exact lowercase textual width charged for a Bool attribute.
+pub(crate) const fn logical_bool_value_len(value: bool) -> u64 {
+    if value { 4 } else { 5 }
+}
+
+/// The single low-level logical-size primitive shared by configuration and
+/// runtime projection.
 ///
-/// Uses checked arithmetic throughout and returns
-/// [`LogicalSizeError::Overflow`] rather than saturating: a saturating sum
-/// would let a `body_bytes` (or a `batch.max_bytes` bound compared against
-/// it) near `u64::MAX` validate successfully by coincidentally saturating to
-/// the same clamped value on both sides, even though the true logical size
-/// is unrepresentable and could never be allocated.
-pub(crate) fn logical_record_size(
+/// It sums body bytes, every actual (or deliberately reserved worst-case)
+/// attribute key and value contribution, and the documented 128-byte fixed
+/// record term. It never serializes Arrow or OTLP data to estimate size.
+pub(crate) fn checked_logical_record_size(
+    body_bytes: u64,
+    attributes: impl IntoIterator<Item = LogicalAttributeSize>,
+) -> Result<u64, LogicalSizeError> {
+    let mut size = body_bytes;
+    for attribute in attributes {
+        size = size
+            .checked_add(attribute.key_bytes)
+            .and_then(|size| size.checked_add(attribute.value_bytes))
+            .ok_or(LogicalSizeError::Overflow)?;
+    }
+    size.checked_add(FIXED_PER_RECORD_OVERHEAD_BYTES)
+        .ok_or(LogicalSizeError::Overflow)
+}
+
+/// Computes the conservative configuration-time bound for one record.
+///
+/// Each path reserves `filelog-percent:` plus three output bytes for every
+/// byte in the 4,096-byte reversible advisory-path cap. The path-encoding
+/// discriminator, the longest flush reason, policy-specific decode evidence,
+/// and all enabled/policy-specific metadata are included.
+pub(crate) fn configured_logical_record_size(
     body_bytes: u64,
     metadata: &MetadataConfig,
     oversize_behavior: MaxLogSizeBehavior,
+    decode_policy: OnDecodeError,
 ) -> Result<u64, LogicalSizeError> {
-    let mut size = body_bytes;
-    // Always-present registered semantic-convention attributes. Their value
-    // length is unknown at config-build time (an arbitrary source path), so
-    // reserve a conservative fixed budget per path-shaped attribute.
-    size = size
-        .checked_add(ATTR_KEY_LOG_FILE_PATH.len() as u64)
-        .ok_or(LogicalSizeError::Overflow)?;
-    size = size
-        .checked_add(RESERVED_PATH_ATTRIBUTE_VALUE_BYTES)
-        .ok_or(LogicalSizeError::Overflow)?;
-    size = size
-        .checked_add(ATTR_KEY_LOG_FILE_NAME.len() as u64)
-        .ok_or(LogicalSizeError::Overflow)?;
-    size = size
-        .checked_add(RESERVED_PATH_ATTRIBUTE_VALUE_BYTES)
-        .ok_or(LogicalSizeError::Overflow)?;
+    const MAX_ATTRIBUTES: usize = 14;
+    const EMPTY: LogicalAttributeSize = LogicalAttributeSize {
+        key_bytes: 0,
+        value_bytes: 0,
+    };
+
+    let mut attributes = [EMPTY; MAX_ATTRIBUTES];
+    let mut count = 0usize;
+    let mut push = |key: &str, value_bytes: u64| -> Result<(), LogicalSizeError> {
+        let slot = attributes
+            .get_mut(count)
+            .ok_or(LogicalSizeError::Overflow)?;
+        *slot = LogicalAttributeSize::new(key, value_bytes)?;
+        count = count.checked_add(1).ok_or(LogicalSizeError::Overflow)?;
+        Ok(())
+    };
+
+    push(
+        ATTR_KEY_LOG_FILE_PATH,
+        MAX_ENCODED_PATH_ATTRIBUTE_VALUE_BYTES,
+    )?;
+    push(
+        ATTR_KEY_LOG_FILE_NAME,
+        MAX_ENCODED_PATH_ATTRIBUTE_VALUE_BYTES,
+    )?;
+    if metadata.include_file_path_resolved {
+        push(
+            ATTR_KEY_PATH_RESOLVED,
+            MAX_ENCODED_PATH_ATTRIBUTE_VALUE_BYTES,
+        )?;
+    }
+    push(
+        ATTR_KEY_PATH_ENCODING,
+        ENCODED_PATH_DISCRIMINATOR.len() as u64,
+    )?;
     if metadata.include_file_record_offset {
-        size = size
-            .checked_add(ATTR_KEY_RECORD_OFFSET.len() as u64)
-            .ok_or(LogicalSizeError::Overflow)?;
-        size = size
-            .checked_add(RESERVED_DECIMAL_U64_VALUE_BYTES)
-            .ok_or(LogicalSizeError::Overflow)?;
+        push(ATTR_KEY_RECORD_OFFSET, RESERVED_DECIMAL_U64_VALUE_BYTES)?;
     }
     if metadata.include_file_record_number {
-        size = size
-            .checked_add(ATTR_KEY_RECORD_NUMBER.len() as u64)
-            .ok_or(LogicalSizeError::Overflow)?;
-        size = size
-            .checked_add(RESERVED_DECIMAL_U64_VALUE_BYTES)
-            .ok_or(LogicalSizeError::Overflow)?;
+        push(ATTR_KEY_RECORD_NUMBER, RESERVED_DECIMAL_U64_VALUE_BYTES)?;
     }
-    size = match oversize_behavior {
+    match oversize_behavior {
         MaxLogSizeBehavior::Split => {
-            let mut fragment_overhead = ATTR_KEY_FRAGMENT_ID.len() as u64;
-            fragment_overhead = fragment_overhead
-                .checked_add(FRAGMENT_ID_VALUE_BYTES)
-                .ok_or(LogicalSizeError::Overflow)?;
-            fragment_overhead = fragment_overhead
-                .checked_add(ATTR_KEY_FRAGMENT_INDEX.len() as u64)
-                .ok_or(LogicalSizeError::Overflow)?;
-            fragment_overhead = fragment_overhead
-                .checked_add(RESERVED_DECIMAL_U64_VALUE_BYTES)
-                .ok_or(LogicalSizeError::Overflow)?;
-            fragment_overhead = fragment_overhead
-                .checked_add(ATTR_KEY_FRAGMENT_LAST.len() as u64)
-                .ok_or(LogicalSizeError::Overflow)?;
-            fragment_overhead = fragment_overhead
-                .checked_add(BOOLEAN_VALUE_BYTES)
-                .ok_or(LogicalSizeError::Overflow)?;
-            size.checked_add(fragment_overhead)
-                .ok_or(LogicalSizeError::Overflow)?
+            push(ATTR_KEY_FRAGMENT_ID, FRAGMENT_ID_VALUE_BYTES)?;
+            push(
+                ATTR_KEY_FRAGMENT_INDEX,
+                logical_int_value_len(i64::from(u32::MAX)),
+            )?;
+            push(ATTR_KEY_FRAGMENT_LAST, logical_bool_value_len(false))?;
+            push(
+                ATTR_KEY_FRAGMENT_SOURCE_START,
+                RESERVED_DECIMAL_U64_VALUE_BYTES,
+            )?;
+            push(
+                ATTR_KEY_FRAGMENT_SOURCE_END,
+                RESERVED_DECIMAL_U64_VALUE_BYTES,
+            )?;
         }
         MaxLogSizeBehavior::Truncate => {
-            let mut truncate_overhead = ATTR_KEY_RECORD_TRUNCATED.len() as u64;
-            truncate_overhead = truncate_overhead
-                .checked_add(BOOLEAN_VALUE_BYTES)
-                .ok_or(LogicalSizeError::Overflow)?;
-            size.checked_add(truncate_overhead)
-                .ok_or(LogicalSizeError::Overflow)?
+            push(ATTR_KEY_RECORD_TRUNCATED, logical_bool_value_len(true))?;
         }
-    };
-    size.checked_add(FIXED_PER_RECORD_OVERHEAD_BYTES)
-        .ok_or(LogicalSizeError::Overflow)
+    }
+    push(ATTR_KEY_FLUSH_REASON, "oversize_line_boundary".len() as u64)?;
+    match decode_policy {
+        OnDecodeError::PreserveRaw => {
+            push(ATTR_KEY_DECODE_ERROR_POLICY, "preserve_raw".len() as u64)?;
+            push(
+                ATTR_KEY_DECODE_ERROR_COUNT,
+                RESERVED_DECIMAL_U64_VALUE_BYTES,
+            )?;
+        }
+        OnDecodeError::Replace => {
+            push(ATTR_KEY_DECODE_ERROR_POLICY, "replace".len() as u64)?;
+            push(
+                ATTR_KEY_DECODE_ERROR_COUNT,
+                RESERVED_DECIMAL_U64_VALUE_BYTES,
+            )?;
+        }
+        OnDecodeError::Fail => {}
+    }
+
+    checked_logical_record_size(body_bytes, attributes[..count].iter().copied())
 }
 
 /// Validated, runtime-ready form of the filelog receiver configuration.
@@ -1125,7 +1210,7 @@ impl RuntimeConfig {
         let limits = validate_limits(limits)?;
         let (framing, framing_profile_digest, compiled_multiline_pattern) =
             validate_framing(framing, encoding, on_decode_error, &identity)?;
-        let batch = validate_batch(batch, &framing, &metadata)?;
+        let batch = validate_batch(batch, &framing, &metadata, on_decode_error)?;
         let rotation = validate_rotation(rotation)?;
         let retry = validate_retry(retry)?;
 
@@ -1878,6 +1963,7 @@ fn validate_batch(
     batch: BatchConfig,
     framing: &FramingConfig,
     metadata: &MetadataConfig,
+    decode_policy: OnDecodeError,
 ) -> Result<BatchConfig, otap_df_config::error::Error> {
     if batch.max_records == 0 {
         return Err(invalid("batch.max_records must be greater than zero"));
@@ -1899,13 +1985,14 @@ fn validate_batch(
     // same logical-size function used by runtime flushing validates both
     // max_line_bytes and max_record_bytes with configured and fixed
     // attributes at config build time (Appendix C, "Emitted data model").
-    // `logical_record_size` uses checked arithmetic and reports overflow
+    // `configured_logical_record_size` uses checked arithmetic and reports overflow
     // rather than saturating, so a `body_bytes`/`batch.max_bytes` pair that
     // could only "validate" via saturation is rejected here instead.
-    let line_bound = logical_record_size(
+    let line_bound = configured_logical_record_size(
         framing.max_line_bytes,
         metadata,
         framing.max_log_size_behavior,
+        decode_policy,
     )
     .map_err(|_| {
         invalid(&format!(
@@ -1921,10 +2008,11 @@ fn validate_batch(
         )));
     }
     ensure_fits_usize("framing.max_line_bytes logical record size", line_bound)?;
-    let record_bound = logical_record_size(
+    let record_bound = configured_logical_record_size(
         framing.max_record_bytes,
         metadata,
         framing.max_log_size_behavior,
+        decode_policy,
     )
     .map_err(|_| {
         invalid(&format!(
@@ -2359,6 +2447,7 @@ mod tests {
         assert_eq!(cfg.framing.multiline.line_start_pattern, None);
         assert_eq!(cfg.framing.multiline.line_end_pattern, None);
         assert_eq!(cfg.framing.max_multiline_lines, 500);
+        assert!(!cfg.metadata.include_file_path_resolved);
         assert!(!cfg.metadata.include_file_record_offset);
         assert!(!cfg.metadata.include_file_record_number);
         assert_eq!(cfg.limits.max_tracked_files, 10_000);
@@ -2389,6 +2478,27 @@ mod tests {
         let runtime = RuntimeConfig::from_config(cfg, "node-1").expect("defaults must validate");
         assert_eq!(runtime.checkpoint_id, "node-1");
         assert!(runtime.compiled_multiline_pattern.is_none());
+    }
+
+    /// Scenario: resolved-path metadata is explicitly enabled in user
+    /// configuration.
+    /// Guarantees: the new flag deserializes under `metadata`, defaults
+    /// independently from offset/number flags, and survives runtime
+    /// validation.
+    #[test]
+    fn resolved_path_metadata_flag_deserializes_and_validates() {
+        let config = parse(serde_json::json!({
+            "include": ["/var/log/app/*.log"],
+            "metadata": {
+                "include_file_path_resolved": true
+            }
+        }))
+        .unwrap();
+        assert!(config.metadata.include_file_path_resolved);
+        assert!(!config.metadata.include_file_record_offset);
+        assert!(!config.metadata.include_file_record_number);
+        let runtime = RuntimeConfig::from_config(config, "node-1").unwrap();
+        assert!(runtime.metadata.include_file_path_resolved);
     }
 
     /// Scenario: an unknown field appears at the top level, inside a nested
@@ -3417,7 +3527,7 @@ mod tests {
     }
 
     /// Scenario: `framing.max_record_bytes` is configured close enough to
-    /// `batch.max_bytes` that the shared `logical_record_size` overhead
+    /// `batch.max_bytes` that the shared logical-size overhead
     /// pushes it over the batch bound.
     /// Guarantees: the same logical-size function used by runtime flushing
     /// rejects the configuration at build time instead of deferring the
@@ -3426,15 +3536,19 @@ mod tests {
     fn oversized_record_bound_relative_to_batch_bytes_is_rejected() {
         let metadata = MetadataConfig::default();
         let small_line_bytes = 10u64;
-        let batch_bytes =
-            logical_record_size(small_line_bytes, &metadata, MaxLogSizeBehavior::Split)
-                .expect("small body_bytes must not overflow");
+        let batch_bytes = configured_logical_record_size(
+            small_line_bytes,
+            &metadata,
+            MaxLogSizeBehavior::Split,
+            OnDecodeError::PreserveRaw,
+        )
+        .expect("small body_bytes must not overflow");
 
         let mut cfg = minimal_config();
         cfg.batch.max_bytes = batch_bytes;
         cfg.framing.max_line_bytes = small_line_bytes;
         // One byte more than `small_line_bytes` pushes only the record bound
-        // over `batch_bytes`, since logical_record_size is monotonic in
+        // over `batch_bytes`, since configured sizing is monotonic in
         // body_bytes and the line bound exactly fits.
         cfg.framing.max_record_bytes = small_line_bytes + 1;
         let err = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
@@ -3451,9 +3565,13 @@ mod tests {
     fn oversized_line_bound_relative_to_batch_bytes_is_rejected() {
         let metadata = MetadataConfig::default();
         let small_record_bytes = 10u64;
-        let batch_bytes =
-            logical_record_size(small_record_bytes, &metadata, MaxLogSizeBehavior::Split)
-                .expect("small body_bytes must not overflow");
+        let batch_bytes = configured_logical_record_size(
+            small_record_bytes,
+            &metadata,
+            MaxLogSizeBehavior::Split,
+            OnDecodeError::PreserveRaw,
+        )
+        .expect("small body_bytes must not overflow");
 
         let mut cfg = minimal_config();
         cfg.batch.max_bytes = batch_bytes;
@@ -3468,28 +3586,32 @@ mod tests {
 
     /// Scenario: enabling both `metadata.include_file_record_offset` and
     /// `metadata.include_file_record_number` increases the fixed attribute
-    /// overhead counted by `logical_record_size`.
+    /// overhead counted by configured logical sizing.
     /// Guarantees: a `batch.max_bytes` configuration that fits the default
     /// (disabled) metadata overhead is rejected once both metadata flags are
     /// enabled, proving the flags are actually counted.
     #[test]
     fn metadata_flags_increase_logical_record_size() {
-        let disabled = logical_record_size(
+        let disabled = configured_logical_record_size(
             10,
             &MetadataConfig {
+                include_file_path_resolved: false,
                 include_file_record_offset: false,
                 include_file_record_number: false,
             },
             MaxLogSizeBehavior::Split,
+            OnDecodeError::PreserveRaw,
         )
         .expect("small body_bytes must not overflow");
-        let enabled = logical_record_size(
+        let enabled = configured_logical_record_size(
             10,
             &MetadataConfig {
+                include_file_path_resolved: true,
                 include_file_record_offset: true,
                 include_file_record_number: true,
             },
             MaxLogSizeBehavior::Split,
+            OnDecodeError::PreserveRaw,
         )
         .expect("small body_bytes must not overflow");
         assert!(enabled > disabled);
@@ -3498,29 +3620,126 @@ mod tests {
         cfg.framing.max_record_bytes = 10;
         cfg.framing.max_line_bytes = 10;
         cfg.batch.max_bytes = enabled - 1;
+        cfg.metadata.include_file_path_resolved = true;
         cfg.metadata.include_file_record_offset = true;
         cfg.metadata.include_file_record_number = true;
         assert!(RuntimeConfig::from_config(cfg, "node-1").is_err());
     }
 
+    /// Scenario: all metadata flags, split policy, the longest flush marker,
+    /// and preserve-raw decode evidence contribute to the configuration
+    /// worst case.
+    /// Guarantees: the high-level bound is exactly the shared primitive over
+    /// every reserved key/value length, including three maximum encoded paths
+    /// and the path-encoding discriminator.
+    #[test]
+    fn configured_logical_size_uses_exact_worst_case_attribute_formula() {
+        let metadata = MetadataConfig {
+            include_file_path_resolved: true,
+            include_file_record_offset: true,
+            include_file_record_number: true,
+        };
+        let attributes = vec![
+            LogicalAttributeSize::new(
+                ATTR_KEY_LOG_FILE_PATH,
+                MAX_ENCODED_PATH_ATTRIBUTE_VALUE_BYTES,
+            )
+            .unwrap(),
+            LogicalAttributeSize::new(
+                ATTR_KEY_LOG_FILE_NAME,
+                MAX_ENCODED_PATH_ATTRIBUTE_VALUE_BYTES,
+            )
+            .unwrap(),
+            LogicalAttributeSize::new(
+                ATTR_KEY_PATH_RESOLVED,
+                MAX_ENCODED_PATH_ATTRIBUTE_VALUE_BYTES,
+            )
+            .unwrap(),
+            LogicalAttributeSize::new(
+                ATTR_KEY_PATH_ENCODING,
+                ENCODED_PATH_DISCRIMINATOR.len() as u64,
+            )
+            .unwrap(),
+            LogicalAttributeSize::new(ATTR_KEY_RECORD_OFFSET, RESERVED_DECIMAL_U64_VALUE_BYTES)
+                .unwrap(),
+            LogicalAttributeSize::new(ATTR_KEY_RECORD_NUMBER, RESERVED_DECIMAL_U64_VALUE_BYTES)
+                .unwrap(),
+            LogicalAttributeSize::new(ATTR_KEY_FRAGMENT_ID, FRAGMENT_ID_VALUE_BYTES).unwrap(),
+            LogicalAttributeSize::new(
+                ATTR_KEY_FRAGMENT_INDEX,
+                logical_int_value_len(i64::from(u32::MAX)),
+            )
+            .unwrap(),
+            LogicalAttributeSize::new(ATTR_KEY_FRAGMENT_LAST, logical_bool_value_len(false))
+                .unwrap(),
+            LogicalAttributeSize::new(
+                ATTR_KEY_FRAGMENT_SOURCE_START,
+                RESERVED_DECIMAL_U64_VALUE_BYTES,
+            )
+            .unwrap(),
+            LogicalAttributeSize::new(
+                ATTR_KEY_FRAGMENT_SOURCE_END,
+                RESERVED_DECIMAL_U64_VALUE_BYTES,
+            )
+            .unwrap(),
+            LogicalAttributeSize::new(ATTR_KEY_FLUSH_REASON, "oversize_line_boundary".len() as u64)
+                .unwrap(),
+            LogicalAttributeSize::new(ATTR_KEY_DECODE_ERROR_POLICY, "preserve_raw".len() as u64)
+                .unwrap(),
+            LogicalAttributeSize::new(
+                ATTR_KEY_DECODE_ERROR_COUNT,
+                RESERVED_DECIMAL_U64_VALUE_BYTES,
+            )
+            .unwrap(),
+        ];
+        let expected = checked_logical_record_size(123, attributes).unwrap();
+        let actual = configured_logical_record_size(
+            123,
+            &metadata,
+            MaxLogSizeBehavior::Split,
+            OnDecodeError::PreserveRaw,
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
+
+        let fail_decode = configured_logical_record_size(
+            123,
+            &metadata,
+            MaxLogSizeBehavior::Split,
+            OnDecodeError::Fail,
+        )
+        .unwrap();
+        assert!(fail_decode < actual);
+    }
+
     /// Scenario: `MaxLogSizeBehavior::Truncate` is configured instead of the
     /// default `Split`.
-    /// Guarantees: `logical_record_size` counts the truncate marker
+    /// Guarantees: configured sizing counts the truncate marker
     /// attribute's overhead rather than the (larger) fragment-id/index/last
     /// attribute set, so the two policies are not conflated.
     #[test]
     fn oversize_behavior_changes_logical_record_size_overhead() {
         let metadata = MetadataConfig::default();
-        let split = logical_record_size(10, &metadata, MaxLogSizeBehavior::Split)
-            .expect("small body_bytes must not overflow");
-        let truncate = logical_record_size(10, &metadata, MaxLogSizeBehavior::Truncate)
-            .expect("small body_bytes must not overflow");
-        assert_ne!(split, truncate);
+        let split = configured_logical_record_size(
+            10,
+            &metadata,
+            MaxLogSizeBehavior::Split,
+            OnDecodeError::PreserveRaw,
+        )
+        .expect("small body_bytes must not overflow");
+        let truncate = configured_logical_record_size(
+            10,
+            &metadata,
+            MaxLogSizeBehavior::Truncate,
+            OnDecodeError::PreserveRaw,
+        )
+        .expect("small body_bytes must not overflow");
+        assert!(split > truncate);
     }
 
     /// Scenario: `body_bytes` is `u64::MAX`, so adding any fixed attribute
     /// overhead on top of it would overflow `u64`.
-    /// Guarantees: `logical_record_size` reports
+    /// Guarantees: configured logical sizing reports
     /// `LogicalSizeError::Overflow` via checked arithmetic instead of
     /// silently saturating to `u64::MAX`, which would let a `body_bytes` /
     /// `batch.max_bytes` pair both clamped to `u64::MAX` "validate"
@@ -3528,8 +3747,13 @@ mod tests {
     #[test]
     fn logical_record_size_reports_overflow_instead_of_saturating() {
         let metadata = MetadataConfig::default();
-        let err = logical_record_size(u64::MAX, &metadata, MaxLogSizeBehavior::Split)
-            .expect_err("u64::MAX body_bytes plus any overhead must overflow");
+        let err = configured_logical_record_size(
+            u64::MAX,
+            &metadata,
+            MaxLogSizeBehavior::Split,
+            OnDecodeError::PreserveRaw,
+        )
+        .expect_err("u64::MAX body_bytes plus any overhead must overflow");
         assert_eq!(err, LogicalSizeError::Overflow);
     }
 

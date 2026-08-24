@@ -38,7 +38,7 @@ deliverables and required evidence for each phase.
 | Phase | Scope | Principal limitation or dependency |
 | --- | --- | --- |
 | Phase 1 | One receiver; periodic discovery; bounded reading and framing; one receiver-wide in-flight batch; Ack-gated checkpoints; durable identity and quarantine; move/create rotation | Receiver-wide head-of-line blocking; no distributed ownership, fencing, or lossless live-rollout readiness guarantee |
-| Phase 2 | Native discovery notifications; multiple in-flight batches or local shards; optional source metadata and background compaction | Ownership remains local and single-instance |
+| Phase 2 | Native discovery notifications; multiple in-flight batches or local shards; background compaction | Ownership remains local and single-instance |
 | Phase 3 | Shared identity resolution; virtual-partition assignment; fenced checkpoint persistence; revoke/assign protocol; readiness; migration from Phase 1 state | Requires shared coordination and an explicit checkpoint-store migration |
 
 ## Decisions requested
@@ -786,12 +786,18 @@ Reader scheduling within the worker:
   an uncommitted reader.
 - **No read-ahead past the unacked frontier (Phase 1):** while a batch is in flight, no
   reader advances its file position beyond the offsets captured in that batch's delta
-  set. The worker is idle during the in-flight window (journald's proven invariant).
-  This deliberately caps throughput at one batch per downstream round trip; lifting it
-  is the Phase-2 pipelining/multi-in-flight work, which must then design read-ahead
-  offset tracking. Independently, one read worker is the Phase-1 aggregate file-I/O and
-  checkpoint-I/O throughput ceiling even when downstream latency is negligible; Phase-1
-  performance claims and benchmarks must name both ceilings.
+  set. At seal, the worker discards the refused record and every decoder/framer state
+  derived beyond the sealed batch. It rewinds each delta file's in-memory reader
+  frontier to that delta's final offset and every other speculative reader to its
+  durable committed offset. This narrow rewind changes neither durable progress nor
+  durable framing resume and preserves an open descriptor. The worker performs no
+  reads during the in-flight window and reconstructs framers only after terminal Ack
+  processing. It never retains the refused record across that window. This deliberately
+  caps throughput at one batch per downstream round trip; lifting it is the Phase-2
+  pipelining/multi-in-flight work, which must then design read-ahead offset tracking.
+  Independently, one read worker is the Phase-1 aggregate file-I/O and checkpoint-I/O
+  throughput ceiling even when downstream latency is negligible; Phase-1 performance
+  claims and benchmarks must name both ceilings.
 
 The one-batch rule is receiver-wide, not per file. It deliberately accepts
 head-of-line blocking in Phase 1: one slow Ack pauses all file reads, a permanent batch
@@ -1093,36 +1099,108 @@ sequenceDiagram
 
 Each framed logical record, or each fragment of a split record, becomes one OTAP log
 record built with `LogsRecordBatchBuilder` +
-`StrKeysAttributesRecordBatchBuilder<u16>`:
+`StrKeysAttributesRecordBatchBuilder<u16>`.
 
-- `body`: decoded text or preserved raw bytes according to the encoding and decode-error
-  policy. Multiline text retains its specified newline separators. No timestamp parsing:
-  `time_unix_nano` is unset;
-  `observed_time_unix_nano` is captured per record when the framed record becomes
-  ready for emission. Severity is unset.
-- Registered semantic-convention attributes are `log.file.path` (as matched) and
-  `log.file.name`. Resolved symlink metadata uses the experimental project attribute
-  `otel_arrow.filelog.path_resolved` when enabled; it is off by default. Fragment
-  correlation and truncation use the experimental `otel_arrow.filelog.*` attributes defined in the
-  framing contract. Source byte offset and record number are optional metadata, off by
-  default, for investigation and replay correlation. The offset is the first source
-  byte represented by the record; fragments additionally carry their source range.
-  Opaque `file_id` remains checkpoint state and is not exposed by default.
-- The receiver does not derive or attach host identity as part of file framing. Host
-  resource attributes come from standard OpenTelemetry resource detection or pipeline
-  enrichment.
-- Batch flush when any bound is hit: `batch.max_records` (default 1,024; hard cap
-  65,535 from the `u16` id space), `batch.max_flush_period` (default
-  1 s), or `batch.max_bytes` (default 8 MiB). The byte budget uses one documented
-  logical-size function: body bytes plus attribute-key bytes, attribute-value bytes,
-  and a conservative fixed per-record overhead. It is not a claim about exact Arrow
-  allocation size; memory bounds remain separately measured and tested.
-- A single emitted record or fragment cannot exceed `batch.max_bytes`: the same
-  logical-size function used by runtime flushing validates both `max_line_bytes` and
-  `max_record_bytes` with configured and fixed attributes at config build time (reject
-  otherwise), following journald's validate-at-build convention. Reaching either input
-  bound invokes `max_log_size_behavior`; neither bound introduces a separate hidden
-  truncation policy.
+The private batching boundary takes one owned `FramedRecord`, `file_id`, an explicit
+durable `ProgressBase { file_epoch, committed_offset, framing_resume,
+last_seen_time_unix_nano }`, matched and resolved `PathBuf` values, a nonnegative `i64`
+observed Unix-nanosecond timestamp, an independent current `u64` last-seen
+Unix-nanosecond timestamp, monotonic `ready_at: Instant`, and an optional
+worker-generated record number. A record has no mandatory finalization bit; recordless
+lifecycle finalization is a separate operation with a distinct
+`ProgressFrontier { file_epoch, offset, framing_resume }` because that frontier may
+still be provisional.
+
+- Decoded text uses an OTAP String body; raw mode and preserved malformed-byte evidence
+  use an OTAP Bytes body. Multiline String bodies retain their specified LF separators.
+- `time_unix_nano` is exactly `0`. The nonnegative per-record
+  `observed_time_unix_nano` supplied when the frame becomes ready is preserved exactly.
+  Severity text/number, trace ID, span ID, flags, event name, and schema URL are unset;
+  dropped-attribute count is `0`.
+- Every record has resource ID `0`, no resource attributes or schema URL, and resource
+  dropped-attribute count `0`. Every record has scope ID `0`, scope name
+  `otap-df-core-nodes/filelog`, scope version equal to the component crate version, no
+  scope attributes or schema URL, and scope dropped-attribute count `0`.
+- The receiver never emits opaque `file_id` or derives host identity. Host resource
+  attributes come from standard resource detection or pipeline enrichment.
+
+The complete log-attribute contract is:
+
+| Key | OTLP type | Presence and exact value |
+| --- | --- | --- |
+| `log.file.path` | String | Always; discovery's matched path |
+| `log.file.name` | String | Always; final component of the matched path |
+| `otel_arrow.filelog.path_resolved` | String | When `metadata.include_file_path_resolved`; resolved target path |
+| `otel_arrow.filelog.path.encoding` | String | If any emitted path-shaped value required reversible encoding; exactly `percent-v1` |
+| `otel_arrow.filelog.record.offset` | String | When `metadata.include_file_record_offset`; decimal `body_source_range.start` |
+| `otel_arrow.filelog.record.number` | String | When enabled and supplied for an unsplit record; decimal worker-local number |
+| `otel_arrow.filelog.fragment.id` | String | Split fragment; stable 64-character ID defined above |
+| `otel_arrow.filelog.fragment.index` | Int | Split fragment; zero-based fragment index |
+| `otel_arrow.filelog.fragment.last` | Bool | Split fragment; whether this is the final fragment |
+| `otel_arrow.filelog.fragment.source.start` | String | Split fragment; decimal half-open `body_source_range.start` |
+| `otel_arrow.filelog.fragment.source.end` | String | Split fragment; decimal half-open `body_source_range.end` |
+| `otel_arrow.filelog.record.truncated` | Bool | Truncated record only; exactly `true` |
+| `otel_arrow.filelog.flush.reason` | String | When present; exactly `max_lines`, `timeout`, `oversize_line_boundary`, `rotation`, or `drain` |
+| `otel_arrow.filelog.decode.error.policy` | String | Malformed emitted record only; exactly `replace` or `preserve_raw` |
+| `otel_arrow.filelog.decode.error_count` | String | With decode policy evidence; decimal malformed-unit count |
+
+A clean decode emits neither decode attribute. Decode attributes are policy/error
+evidence; they do not claim that bytes discarded by an explicit truncation policy are
+represented in the body. The receiver does not yet emit discarded-byte count.
+
+Valid UTF-8 path values remain exact, including a literal value beginning with
+`filelog-percent:`. A path that is not valid UTF-8 reuses the identity layer's reversible
+native encoding: raw `OsStr` bytes on Unix and big-endian UTF-16 code-unit bytes on
+Windows, capped at `ADVISORY_PATH_MAX_BYTES` (4,096 bytes). Its String value is
+`filelog-percent:` followed by uppercase `%HH` for every encoded byte. The
+`otel_arrow.filelog.path.encoding = "percent-v1"` discriminator distinguishes that
+encoding from a valid literal prefix. If matched path, file name, or enabled resolved
+path is encoded, the discriminator is emitted once.
+
+Record numbers are optional and disabled by default. They are zero-based and local to
+one worker process and file epoch. A bounded table sized by `max_tracked_files` survives
+descriptor eviction. Removing or finalizing a tracked identity releases its table slot;
+process recovery or epoch change resets the number to zero.
+Unsplit records receive and advance a number. Every split fragment omits the number:
+fragment index zero advances the logical-record counter once and later fragments do not.
+The stable fragment ID, not record number, is the cross-restart correlation key.
+Numbering uses a prepare/commit decision so a record refused at a batch boundary does
+not consume a number.
+
+Logs receive zero-based `u16` IDs from `0` through `record_count - 1`; the count itself
+is tracked as `u32`. The hard maximum of 65,535 records therefore ends at ID 65,534.
+An open batch seals after an append that exactly reaches `batch.max_records`,
+`batch.max_bytes`, or 4,096 distinct progress deltas. It seals before a record that
+would exceed one of those bounds. A single record larger than `batch.max_bytes` is a
+terminal error; a record exactly equal to the byte bound is accepted and sealed. A
+lifecycle-only change never emits an empty batch.
+
+The flush deadline is `ready_at` of the first accepted record plus
+`batch.max_flush_period`; checked `Instant` arithmetic rejects overflow. It never rearms.
+Later `ready_at` values must be monotonic, and a later record ready at or after the
+deadline is refused so the existing batch seals first. The worker also polls
+`deadline()`/`is_flush_due(now)` so a sparse batch flushes without another input record.
+
+One checked logical-size primitive is used at configuration and runtime:
+
+```text
+body bytes
++ every actual attribute key's UTF-8 bytes
++ every actual attribute value's logical bytes
++ 128 fixed bytes per record
+```
+
+String value length is its UTF-8 byte length. Int value length is the conservative
+decimal-text width including a minus sign; Bool length is the actual lowercase textual
+width (`true` or `false`). The 128-byte term is conservative OTAP/Arrow record
+bookkeeping, not measured Arrow allocation. Runtime enumerates the exact attributes it
+appends and never serializes a record to estimate size. Configuration uses the same
+primitive with checked arithmetic and reserves, for each possible path, the
+`filelog-percent:` prefix plus three bytes for each of the 4,096 native bytes. It also
+reserves the path discriminator, enabled resolved/offset/number metadata,
+policy-dependent fragment or truncate fields, and worst-case flush/decode markers.
+Both `max_line_bytes` and `max_record_bytes` plus this worst case must fit
+`batch.max_bytes`.
 
 ## Ack and checkpoint model
 
@@ -1152,19 +1230,52 @@ source bytes disappear before capture/recovery.
 
 ### In-flight tracking and Nack recovery
 
-Each emitted batch carries a delta set `{ (file_id, file_epoch, prev_offset,
-new_offset, framing_resume) }` plus rotation-finalization markers. The async half
-subscribes the batch to `ACKS | NACKS` with `(batch_id, attempt)` in `CallData`.
-Phase 1 enforces `max_in_flight_batches = 1`, the proven Ack-gating pattern.
+Each emitted batch carries at most 4,096 `ProgressDelta` values, so one Ack maps to one
+WAL transaction and is never split. A delta contains `file_id`, expected file epoch,
+expected durable offset and base framing resume, final offset and framing resume,
+monotonic maximum last-seen time, and a finalization flag. The first record for a file
+must begin at its explicit durable base. Later same-file frames may interleave with
+other files but must keep the same epoch/base and begin exactly at the prior final
+offset. Every frame requires `checkpoint_end == frame_source_range.end`. The first
+expected offset/resume remain immutable; merging updates only final offset/resume and
+the last-seen maximum. Before producing the checkpoint operation, the worker revalidates
+the current durable epoch, offset, and framing resume against that immutable base and
+takes the maximum of the batch and current durable last-seen values. A newer discovery
+metadata write therefore cannot be regressed by a later Ack. Final offset never
+regresses, and no record can follow merged finalization.
+
+Split progress is validated as a state transition, not merely as well-formed metadata.
+A clean base can produce only fragment index zero. A continuation must produce its
+stored next index and retain the original record start. The stable fragment ID must
+match `file_id`, epoch, and that start; a nonfinal fragment must advance the index by
+one and produce the corresponding continuation, while a final fragment must produce
+`clean`. An unsplit record can neither consume nor produce continuation state.
+
+Recordless finalization merges into an existing delta only when its supplied
+offset/resume frontier matches exactly. If the file has no record in the open batch,
+the worker returns a direct same-frontier finalizing delta for Stage 11 to persist
+without synthesizing an empty OTAP batch.
+
+The async half subscribes the batch to `ACKS | NACKS` with `(batch_id, attempt)` in
+`CallData`. Phase 1 enforces `max_in_flight_batches = 1`, the proven Ack-gating pattern.
 
 - **Retention:** the worker retains a shallow clone of the in-flight batch. This is
   bounded by the declared in-flight memory budget; cloning does not duplicate Arrow
-  buffers because the columns are `Arc`-shared.
+  buffers because the columns are `Arc`-shared. Delta storage is also one
+  `Arc<[ProgressDelta]>`, shared by retained and completion views.
+- **Seal and speculative rewind:** if a nonempty batch must seal before a framed record,
+  the builder returns that owned record unchanged. The worker does not hold it. It
+  discards that record and all speculative decoder/framer state, rewinds delta readers
+  to batch final offsets and all other speculative readers to durable offsets, then
+  performs no source reads while the batch is in flight. Reader rewind preserves
+  descriptors and changes neither durable offset nor durable framing resume. Framers
+  are reconstructed after Ack handling.
 - **Ack:** only an Ack matching the current `(batch_id, attempt)` is terminal. The
   worker applies each delta only when its `file_epoch` still matches (a truncate reset
-  invalidates old deltas), appends the corresponding progress transaction, then drops
-  the retained clone. Late or duplicate completions for earlier attempts are ignored
-  and counted.
+  invalidates old deltas) and its expected durable offset/resume still matches. It
+  appends the one atomic progress transaction, updates live readers from the committed
+  final frontiers, then drops the retained clone. Late or duplicate completions for
+  earlier attempts are ignored and counted.
 - **Retryable Nack:** `RouteFull` and `Unspecified` non-permanent Nacks schedule
   exponential backoff (`initial_backoff`, doubling to `max_backoff`). After the delay,
   the async half sends `Resend` to the worker; the worker returns its retained clone,
@@ -1585,7 +1696,6 @@ Phase 2 adds:
   semantics, lifting the one-batch-per-round-trip Phase 1 limit.
 - Filesystem notifications as discovery hints, with reconciliation retained as the
   correctness mechanism.
-- Optional source-offset metadata.
 - Optional background checkpoint compaction when measurements justify it.
 - Full-path benchmarks covering allocation, checkpoint I/O, throughput, and latency.
 
@@ -2112,6 +2222,7 @@ receivers:
           line_end_pattern: null
         max_multiline_lines: 500
       metadata:
+        include_file_path_resolved: false
         include_file_record_offset: false
         include_file_record_number: false
       limits:

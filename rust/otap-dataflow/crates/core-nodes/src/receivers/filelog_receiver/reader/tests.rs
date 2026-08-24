@@ -1267,3 +1267,134 @@ fn invalid_turn_consumption_restores_buffer_and_frontier() {
         .unwrap();
     table.shutdown().unwrap();
 }
+
+/// Scenario: a reader consumed six bytes, while a sealed provisional batch
+/// owns only the first three.
+/// Guarantees: rewind pauses at the supplied frontier, counts exactly three
+/// replay bytes, preserves the resident descriptor, and permits a later Ack
+/// observation followed by reading from that committed offset.
+#[test]
+fn provisional_frontier_rewind_preserves_descriptor_and_accepts_later_ack() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("provisional.log");
+    std::fs::write(&path, b"abcdef").unwrap();
+    let mut table = ReaderTable::new(settings(1, 1, 6)).unwrap();
+    table.insert(candidate(&path), resolved(45, 0)).unwrap();
+    let now = Instant::now();
+
+    let turn = data(table.poll(now).unwrap());
+    table
+        .complete_turn(turn, 6, TurnDisposition::Paused)
+        .unwrap();
+    let before = table.stats();
+    assert_eq!(before.open_files, 1);
+    table
+        .rewind_provisional_frontier(file_id(45), 0, 3)
+        .unwrap();
+    let after = table.stats();
+    assert_eq!(after.open_files, 1);
+    assert_eq!(after.opens, before.opens);
+    assert_eq!(after.reopens, before.reopens);
+    assert_eq!(after.source_bytes_rewound, 3);
+
+    let resume = FramingResume::Continuation {
+        record_start_offset: 1,
+        next_fragment_index: 2,
+    };
+    table
+        .observe_committed_progress(file_id(45), 0, 3, resume)
+        .unwrap();
+    table.make_ready(file_id(45)).unwrap();
+    let replay = data(table.poll(now).unwrap());
+    assert_eq!(replay.committed_offset(), 3);
+    assert_eq!(replay.framing_resume(), resume);
+    assert_eq!(replay.source_offset(), 3);
+    assert_eq!(replay.bytes(), b"def");
+    table
+        .complete_turn(replay, 3, TurnDisposition::Paused)
+        .unwrap();
+    table.shutdown().unwrap();
+}
+
+/// Scenario: provisional rewind supplies a stale epoch, an offset below the
+/// durable frontier, and an offset beyond bytes consumed in memory.
+/// Guarantees: every bounds/epoch failure leaves the reader frontier and
+/// exact rewind counter unchanged.
+#[test]
+fn provisional_frontier_rewind_rejects_epoch_and_offset_bounds() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("bounds.log");
+    std::fs::write(&path, b"abcdef").unwrap();
+    let mut table = ReaderTable::new(settings(1, 1, 4)).unwrap();
+    table.insert(candidate(&path), resolved(46, 1)).unwrap();
+    let now = Instant::now();
+
+    let turn = data(table.poll(now).unwrap());
+    assert_eq!(turn.source_offset(), 1);
+    table
+        .complete_turn(turn, 3, TurnDisposition::Paused)
+        .unwrap();
+    assert!(matches!(
+        table.rewind_provisional_frontier(file_id(46), 1, 2),
+        Err(ReaderError::InvalidProgress { .. })
+    ));
+    assert!(matches!(
+        table.rewind_provisional_frontier(file_id(46), 0, 0),
+        Err(ReaderError::InvalidProgress { .. })
+    ));
+    assert!(matches!(
+        table.rewind_provisional_frontier(file_id(46), 0, 5),
+        Err(ReaderError::InvalidProgress { .. })
+    ));
+    assert_eq!(table.stats().source_bytes_rewound, 0);
+
+    table.make_ready(file_id(46)).unwrap();
+    let next = data(table.poll(now).unwrap());
+    assert_eq!(next.source_offset(), 4);
+    table
+        .complete_turn(next, 0, TurnDisposition::Paused)
+        .unwrap();
+    table.shutdown().unwrap();
+}
+
+/// Scenario: provisional rewind is requested while a source turn is
+/// outstanding and while a descriptor eviction involving that file awaits a
+/// caller decision.
+/// Guarantees: both conflicting scheduler states fail without changing
+/// frontiers, descriptors, or the pending eviction contract.
+#[test]
+fn provisional_frontier_rewind_rejects_outstanding_turn_and_eviction() {
+    let directory = tempdir().unwrap();
+    let first_path = directory.path().join("first.log");
+    let second_path = directory.path().join("second.log");
+    std::fs::write(&first_path, b"a").unwrap();
+    std::fs::write(&second_path, b"b").unwrap();
+    let mut table = ReaderTable::new(settings(2, 1, 1)).unwrap();
+    table
+        .insert(candidate(&first_path), resolved(47, 0))
+        .unwrap();
+    table
+        .insert(candidate(&second_path), resolved(48, 0))
+        .unwrap();
+    let now = Instant::now();
+
+    let first = data(table.poll(now).unwrap());
+    assert!(matches!(
+        table.rewind_provisional_frontier(file_id(47), 0, 0),
+        Err(ReaderError::InvalidState { .. })
+    ));
+    table
+        .complete_turn(first, 1, TurnDisposition::Ready)
+        .unwrap();
+    let request = eviction(table.poll(now).unwrap());
+    assert!(matches!(
+        table.rewind_provisional_frontier(request.victim_file_id, 0, 1),
+        Err(ReaderError::InvalidState { .. })
+    ));
+    assert!(matches!(
+        table.rewind_provisional_frontier(request.target_file_id, 0, 0),
+        Err(ReaderError::InvalidState { .. })
+    ));
+    table.defer_eviction(request).unwrap();
+    table.shutdown().unwrap();
+}

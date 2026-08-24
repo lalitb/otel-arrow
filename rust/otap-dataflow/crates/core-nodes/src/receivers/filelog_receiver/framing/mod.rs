@@ -11,5 +11,5 @@ pub(crate) use decoder::{DecodeError, SourceRange};
 #[allow(unused_imports)]
 pub(crate) use framer::{
     DecodeOutcome, FlushReason, FlushStep, FragmentMetadata, FramedBody, FramedRecord, Framer,
-    FramerError, FramerStep,
+    FramerError, FramerStep, fragment_id,
 };

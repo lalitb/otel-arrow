@@ -1127,6 +1127,133 @@ impl ReaderTable {
         Ok(())
     }
 
+    /// Pauses one reader and rewinds only its in-memory source frontier to a
+    /// provisional batch boundary.
+    ///
+    /// Stage 11 uses this after discarding every speculative decoder/framer
+    /// object at batch seal. The durable committed offset and framing resume
+    /// remain unchanged until the matching Ack is persisted. The resident
+    /// descriptor and runtime lease are preserved.
+    pub(crate) fn rewind_provisional_frontier(
+        &mut self,
+        file_id: FileId,
+        file_epoch: u32,
+        target_offset: u64,
+    ) -> Result<(), ReaderError> {
+        if self.read_buffer.is_none() {
+            return Err(ReaderError::InvalidState {
+                file_id,
+                operation: "rewind provisional frontier",
+                state: "a source turn is outstanding",
+            });
+        }
+        if self.pending_eviction.is_some_and(|request| {
+            request.target_file_id == file_id || request.victim_file_id == file_id
+        }) {
+            return Err(ReaderError::InvalidState {
+                file_id,
+                operation: "rewind provisional frontier",
+                state: "an eviction decision is pending",
+            });
+        }
+
+        let (committed_offset, read_offset, schedule_name) = {
+            let reader = self
+                .readers
+                .get(&file_id)
+                .ok_or(ReaderError::UnknownFile { file_id })?;
+            if reader.file_epoch != file_epoch {
+                return Err(ReaderError::InvalidProgress {
+                    file_id,
+                    reason: "file epoch does not match the live reader",
+                });
+            }
+            if target_offset < reader.committed_offset {
+                return Err(ReaderError::InvalidProgress {
+                    file_id,
+                    reason: "provisional rewind target precedes durable progress",
+                });
+            }
+            if target_offset > reader.read_offset {
+                return Err(ReaderError::InvalidProgress {
+                    file_id,
+                    reason: "provisional rewind target exceeds bytes consumed in memory",
+                });
+            }
+            if matches!(reader.schedule, ScheduleState::InFlight { .. }) {
+                return Err(ReaderError::InvalidState {
+                    file_id,
+                    operation: "rewind provisional frontier",
+                    state: reader.schedule.name(),
+                });
+            }
+            (
+                reader.committed_offset,
+                reader.read_offset,
+                reader.schedule.name(),
+            )
+        };
+
+        // Validate the scheduling indexes before changing either one, so an
+        // integrity failure leaves the reader frontier untouched.
+        match &self
+            .readers
+            .get(&file_id)
+            .ok_or(ReaderError::UnknownFile { file_id })?
+            .schedule
+        {
+            ScheduleState::Ready => {
+                if self
+                    .ready
+                    .iter()
+                    .filter(|queued| **queued == file_id)
+                    .count()
+                    != 1
+                {
+                    return Err(ReaderError::Inconsistent {
+                        reason: "ready reader does not have exactly one queue entry",
+                    });
+                }
+            }
+            ScheduleState::Eof { next_probe } => {
+                if !self.eof_deadlines.contains(&(*next_probe, file_id)) {
+                    return Err(ReaderError::Inconsistent {
+                        reason: "EOF reader has no deadline entry",
+                    });
+                }
+            }
+            ScheduleState::DescriptorBlocked | ScheduleState::Paused => {}
+            ScheduleState::InFlight { .. } => {
+                return Err(ReaderError::InvalidState {
+                    file_id,
+                    operation: "rewind provisional frontier",
+                    state: schedule_name,
+                });
+            }
+        }
+        let rewound = read_offset - target_offset;
+        let updated_rewound = self
+            .counters
+            .source_bytes_rewound
+            .checked_add(rewound)
+            .ok_or(ReaderError::CounterOverflow {
+                counter: "source bytes rewound",
+            })?;
+
+        self.remove_scheduling_state(file_id)?;
+        let reader = self
+            .readers
+            .get_mut(&file_id)
+            .ok_or(ReaderError::Inconsistent {
+                reason: "rewound reader disappeared",
+            })?;
+        debug_assert_eq!(reader.committed_offset, committed_offset);
+        reader.read_offset = target_offset;
+        reader.schedule = ScheduleState::Paused;
+        self.counters.source_bytes_rewound = updated_rewound;
+        Ok(())
+    }
+
     /// Records an Ack-gated durable frontier after the checkpoint store has
     /// accepted the matching progress operation.
     pub(crate) fn observe_committed_progress(

@@ -38,13 +38,16 @@
 //! - Constant-state source decoding and bounded newline/multiline framing
 //!   ([`framing`]), including exact source-byte evidence, EOF-gated partial
 //!   flushes, split/truncate policies, and durable fragment continuation.
+//! - Exact OTAP projection and bounded open-batch construction
+//!   ([`batching`]), including shared logical sizing, contiguous Ack deltas,
+//!   recordless finalization, and transactional worker-local record numbers.
 //!
-//! Runtime delivery wiring -- OTAP batch construction, the read/checkpoint
-//! driver, Ack/Nack handling, and component factory registration -- is
-//! implemented in later stages. [`FILELOG_RECEIVER_URN`] is exported so that
-//! stage can register a `ReceiverFactory` without renaming anything here, but
-//! no factory is registered yet: there is no `distributed_slice` entry and no
-//! receiver implementation in this module.
+//! Runtime delivery wiring -- the read/checkpoint driver, Ack/Nack handling,
+//! and component factory registration -- is implemented in later stages.
+//! [`FILELOG_RECEIVER_URN`] is exported so that stage can register a
+//! `ReceiverFactory` without renaming anything here, but no factory is
+//! registered yet: there is no `distributed_slice` entry and no receiver
+//! implementation in this module.
 #![allow(dead_code)] // Phase 1 internals intentionally land before the receiver factory.
 
 /// Durable checkpoint state: the version-1 snapshot/WAL byte format and the
@@ -57,6 +60,7 @@
 /// [`identity`].
 pub mod checkpoint;
 
+mod batching;
 mod config;
 mod discovery;
 mod framing;
