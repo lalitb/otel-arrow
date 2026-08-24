@@ -35,15 +35,17 @@
 //!   source-byte read turns, least-recently-served descriptor rotation,
 //!   exact identity revalidation on reopen, and runtime leases that survive
 //!   temporary descriptor closure.
+//! - Constant-state source decoding and bounded newline/multiline framing
+//!   ([`framing`]), including exact source-byte evidence, EOF-gated partial
+//!   flushes, split/truncate policies, and durable fragment continuation.
 //!
-//! Runtime receiver wiring -- decoding/framing, the read/checkpoint thread
-//! that drives these foundations, and component factory registration -- is
-//! implemented in a later stage and does not exist yet.
-//! [`FILELOG_RECEIVER_URN`] is exported so that stage can register a
-//! `ReceiverFactory` without renaming anything here, but no factory is
-//! registered yet: there is no `distributed_slice` entry and no receiver
-//! implementation in this module.
-#![allow(dead_code)] // Config validation and the checkpoint codec are wired up so far, but nothing constructs a receiver yet.
+//! Runtime delivery wiring -- OTAP batch construction, the read/checkpoint
+//! driver, Ack/Nack handling, and component factory registration -- is
+//! implemented in later stages. [`FILELOG_RECEIVER_URN`] is exported so that
+//! stage can register a `ReceiverFactory` without renaming anything here, but
+//! no factory is registered yet: there is no `distributed_slice` entry and no
+//! receiver implementation in this module.
+#![allow(dead_code)] // Phase 1 internals intentionally land before the receiver factory.
 
 /// Durable checkpoint state: the version-1 snapshot/WAL byte format and the
 /// file-backed store that persists it.
@@ -57,6 +59,7 @@ pub mod checkpoint;
 
 mod config;
 mod discovery;
+mod framing;
 mod identity;
 mod lease;
 mod reader;

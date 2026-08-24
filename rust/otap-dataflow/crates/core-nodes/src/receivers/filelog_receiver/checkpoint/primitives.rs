@@ -24,10 +24,10 @@ pub const FORMAT_VERSION: u16 = 1;
 
 /// Canonical-serialization/digest recipe version for the framing profile.
 ///
-/// Version 2 also binds the identity-evidence profile so a receiver cannot
-/// resume durable state after an unacknowledged fingerprint-window or
-/// ignored-header change.
-pub const FRAMING_PROFILE_VERSION: u16 = 2;
+/// Version 3 binds the decode-error policy in addition to the identity and
+/// framing inputs, so a receiver cannot resume durable state under different
+/// emitted-body or decoding-failure semantics.
+pub const FRAMING_PROFILE_VERSION: u16 = 3;
 /// Current raw-prefix fingerprint algorithm/profile.
 pub const FINGERPRINT_PROFILE_VERSION: u16 = 1;
 

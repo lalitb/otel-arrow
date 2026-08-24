@@ -41,7 +41,7 @@ pub(super) const SNAPSHOT_VECTOR_QUARANTINED_FILE_ID: [u8; 16] = [
 /// `Continuation` framing resume. Both use the default newline-framing
 /// legacy profile-v1 digest. The byte codec treats the version and digest as
 /// opaque fields; runtime recovery separately rejects this legacy profile
-/// against the current profile-v2 configuration.
+/// against the current profile-v3 configuration.
 /// Demonstrates round-trip decoding, and that decoding a POSIX-locator and a
 /// Windows-locator record never depends on the host's own native locator
 /// type (the cross-platform-locator conformance vector).

@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use super::error::EncodeError;
 use super::primitives::{ByteWriter, FRAMING_PATTERN_MAX_BYTES};
 
-const DOMAIN_PREFIX: &[u8] = b"otel-arrow-filelog-framing-profile-v2\0";
+const DOMAIN_PREFIX: &[u8] = b"otel-arrow-filelog-framing-profile-v3\0";
 
 /// Configured character encoding (decode-before-framing contract).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +39,27 @@ impl FramingEncoding {
             FramingEncoding::Utf16Le => 0x03,
             FramingEncoding::Utf16Be => 0x04,
             FramingEncoding::Raw => 0x05,
+        }
+    }
+}
+
+/// Configured behavior when decoding source bytes fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FramingOnDecodeError {
+    /// Emit the complete framed source slice as a bytes body.
+    PreserveRaw,
+    /// Emit decoded text with malformed input replaced.
+    Replace,
+    /// Fail and quarantine the file.
+    Fail,
+}
+
+impl FramingOnDecodeError {
+    fn to_wire(self) -> u8 {
+        match self {
+            FramingOnDecodeError::PreserveRaw => 0x01,
+            FramingOnDecodeError::Replace => 0x02,
+            FramingOnDecodeError::Fail => 0x03,
         }
     }
 }
@@ -113,6 +134,8 @@ pub struct FramingProfileParams {
     pub ignored_header_bytes: u32,
     /// Configured character encoding.
     pub encoding: FramingEncoding,
+    /// Configured behavior when decoding source bytes fails.
+    pub on_decode_error: FramingOnDecodeError,
     /// Configured multiline boundary mode.
     pub multiline_mode: MultilineMode,
     /// Physical-line buffer bound, in bytes.
@@ -140,6 +163,7 @@ impl FramingProfileParams {
         out.write_u16(self.fingerprint_bytes);
         out.write_u32(self.ignored_header_bytes);
         out.write_u8(self.encoding.to_wire());
+        out.write_u8(self.on_decode_error.to_wire());
         let (multiline_kind, regex_profile_version, pattern) = self.multiline_mode.to_wire();
         out.write_u8(multiline_kind);
         out.write_u16(regex_profile_version);
@@ -176,6 +200,7 @@ mod tests {
             fingerprint_bytes: 1000,
             ignored_header_bytes: 0,
             encoding: FramingEncoding::Utf8,
+            on_decode_error: FramingOnDecodeError::PreserveRaw,
             multiline_mode: MultilineMode::Newline,
             max_line_bytes: 1_048_576,
             max_record_bytes: 1_048_576,
@@ -195,11 +220,15 @@ mod tests {
     fn matches_published_default_profile_vector() {
         let profile = default_newline_profile();
         let bytes = profile.canonical_bytes().unwrap();
-        assert_eq!(bytes.len(), 81);
+        assert_eq!(bytes.len(), 82);
+        assert_eq!(
+            hex::encode(&bytes),
+            "6f74656c2d6172726f772d66696c656c6f672d6672616d696e672d70726f66696c652d763300000103e800000000010100000000000000000000100000000000000010000001000001f400000000000001f4"
+        );
         let digest = profile.digest().unwrap();
         assert_eq!(
             hex::encode(digest),
-            "46c818a27f8cb6281a903e2a54c4fd72b38dd6e4d4ac30b1e33fb1e26ff2aaae"
+            "84cd122c62b3a4aea428db9f2c41166ed9af1f8087ab3e562f8033a9eedcf513"
         );
     }
 
@@ -216,13 +245,35 @@ mod tests {
             pattern: "^END request$".to_owned(),
         };
         let bytes = profile.canonical_bytes().unwrap();
-        assert_eq!(bytes.len(), 94);
+        assert_eq!(bytes.len(), 95);
+        assert_eq!(
+            hex::encode(&bytes),
+            "6f74656c2d6172726f772d66696c656c6f672d6672616d696e672d70726f66696c652d763300000103e8000000000101020001000d5e454e442072657175657374240000000000100000000000000010000001000001f400000000000001f4"
+        );
         let digest = profile.digest().unwrap();
         assert_eq!(
             hex::encode(digest),
-            "7c5c808319692ce9d0b8c7a50772f53e236d60a98e50fd30e2c5cf073e7da179"
+            "49834e9d951d6c68f351d1a51f70cca9ed4da0b8eef18670607b71aa15c03637"
         );
         assert_ne!(digest, default_newline_profile().digest().unwrap());
+    }
+
+    /// Scenario: only the decode-error policy changes among preserve-raw,
+    /// replace, and fail while every other profile input remains unchanged.
+    /// Guarantees: each policy produces a distinct durable digest, so
+    /// recovery cannot reuse replay state created under different body or
+    /// failure semantics.
+    #[test]
+    fn decode_error_policy_changes_digest() {
+        let preserve_raw = default_newline_profile();
+        let mut replace = preserve_raw.clone();
+        replace.on_decode_error = FramingOnDecodeError::Replace;
+        let mut fail = preserve_raw.clone();
+        fail.on_decode_error = FramingOnDecodeError::Fail;
+
+        assert_ne!(preserve_raw.digest().unwrap(), replace.digest().unwrap());
+        assert_ne!(preserve_raw.digest().unwrap(), fail.digest().unwrap());
+        assert_ne!(replace.digest().unwrap(), fail.digest().unwrap());
     }
 
     /// Scenario: only the fingerprint evidence window or ignored-header

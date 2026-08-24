@@ -848,7 +848,10 @@ Invariants and constraints:
   Split records that continue across batches commit `continuation { record_start_offset,
   next_fragment_index }`. Incomplete encoded characters are never committed. A reader
   must be able to resume from `(committed_offset, framing_resume)` and deterministically
-  reproduce the same subsequent records.
+  reproduce the same subsequent records. A continuation always belongs to the
+  bound-terminated physical line described below and ends at that line's `LF`; it never
+  carries hidden multiline line counts or pattern state that the durable format cannot
+  represent.
 - `max_line_bytes` (default 1 MiB) bounds the decoded physical-line buffer and is not an
   independent loss policy. When a physical line exceeds it, the receiver applies
   `max_log_size_behavior` exactly as it does for an oversized logical record. Under
@@ -865,19 +868,24 @@ Invariants and constraints:
   buffering is not permitted.
 - A trailing partial line (no `\n` yet) is held in the reader's buffer until
   `max_line_bytes`; crossing that bound invokes the configured oversize policy. The
-  configured `force_flush_period` may emit it after idle time,
-  with a reason marker and a committed partial boundary as defined by INV-FR1. Without
-  partial flush, EOF plus `rotate_wait` remains only an inactivity heuristic: a process
-  may retain the renamed FD and write again later, so the receiver cannot prove the
-  line is terminal. On rotation finalization any unflushed partial bytes are counted as
+  configured `force_flush_period` may emit it after an observed EOF remains idle, with a
+  reason marker and a committed partial boundary as defined by INV-FR1. The deadline is
+  armed only after a source read reports EOF; any newly available source byte cancels
+  it before framing continues. A resumed continuation with no newly observed source
+  bytes remains pending and cannot fabricate an empty final fragment. Without partial
+  flush, EOF plus `rotate_wait` remains only an inactivity heuristic: a process may
+  retain the renamed FD and write again later, so the receiver cannot prove the line is
+  terminal. On rotation finalization any unflushed partial bytes are counted as
   `filelog.partial_bytes_dropped`; the checkpoint remains at the previous complete
   boundary. At drain, recoverable buffered bytes are reported as pending, not dropped,
   so restart can resume if the source still exists.
-- Idle flush is the only sanctioned way to commit a mid-line offset on a non-terminal
-  file. It trades latency for a documented slow-writer split risk and is included in
-  Phase 1 so a final record can be released without waiting indefinitely. The flush
-  terminates that logical record and commits a `clean` resume state; it does not require
-  the next append to be merged with the timeout-flushed record.
+- Idle flush is the only sanctioned way to commit a mid-line offset with `clean` resume
+  on a non-terminal file; bounded split fragments may commit a mid-line
+  `continuation`. Idle flush trades latency for a documented slow-writer split risk and
+  is included in Phase 1 so a final record can be released without waiting
+  indefinitely. The flush terminates that logical record and commits a `clean` resume
+  state; it does not require the next append to be merged with the timeout-flushed
+  record.
 - Phase 1 encoding supports UTF-8, ASCII, UTF-16LE, UTF-16BE, and raw mode using the
   decode-before-framing contract below. Raw byte preservation is not a substitute for
   selecting UTF-16.
@@ -904,6 +912,14 @@ operator-chain compatibility.
   on the selected encoding. Checkpoint offsets always remain offsets in source bytes.
   After detectable truncation, decoding restarts at source offset zero so a new
   byte-order mark is handled as a new stream.
+- **LF and source ranges are explicit.** Decoded U+000A (or byte `0x0a` in
+  `raw`) is the only physical-line delimiter. The final LF is excluded from the body
+  but included in checkpoint progress; a preceding carriage return is ordinary data,
+  so `a\r\n` emits `a\r`. Internal multiline LFs remain in the body. The body source
+  range covers only bytes transformed into the body, while the frame source range also
+  owns a stripped initial BOM, the final LF, and any explicitly truncated tail. Empty
+  lines have an empty body range and still advance through their LF. Splits never end
+  inside one decoded scalar.
 - **NUL is data, not termination.** In UTF-8 and ASCII modes, byte `0x00` decodes as
   U+0000. In UTF-16 modes, code unit `0x0000` decodes as U+0000. In raw mode, byte
   `0x00` is preserved unchanged. NUL never means EOF or a record boundary; only the
@@ -911,38 +927,65 @@ operator-chain compatibility.
 - **Decode errors preserve evidence.** Invalid source bytes never terminate a record
   silently. `on_decode_error: preserve_raw | replace | fail` is explicit; the generic
   default is `preserve_raw`, which emits the complete framed source slice as a bytes
-  body and marks the record. `replace` is lossy and counted; `fail` quarantines the
-  file. The receiver contract ends at an OTAP bytes body. JSON escaping, base64, column
-  mapping, and destination searchability are exporter/product contracts and must be
-  validated end to end before claiming byte-for-byte recovery from a text destination.
+  body and marks an ordinary malformed record. `replace` is lossy and counted; `fail`
+  quarantines the file. Because an open-ended split may emit before a later malformed
+  unit is observed, every fragment in a `preserve_raw` split sequence uses exact source
+  bytes prospectively, including clean fragments; concatenating fragment bodies
+  preserves the bound-terminated body. An unsplit clean record and a clean truncated
+  prefix remain decoded text. Truncation is an explicit loss policy: malformed units in
+  its discarded tail are still checked and counted, but discarded evidence is not
+  emitted. The receiver contract ends at an OTAP bytes body. JSON escaping, base64,
+  column mapping, and destination searchability are exporter/product contracts and
+  must be validated end to end before claiming byte-for-byte recovery from a text
+  destination.
 - **Multiline boundaries.** Configuration may set zero or one of
   `line_start_pattern` or `line_end_pattern`. Setting neither selects the default
   newline-framing mode; setting both is rejected at build time.
-  The regex contract is a versioned, RE2-compatible syntax profile shared by control
-  plane validation and the agent. Unsupported constructs are rejected before rollout;
-  the agent also compiles defensively and fails the affected data source rather than
-  silently falling back. Joined physical lines retain their newline separators. The
-  emitted record's checkpoint delta ends after the last source byte included in that
-  record.
+  The regex contract is the versioned `re2-v1` executable subset shared by control
+  plane validation and the agent. It accepts RE2 inline flags `i`, `m`, `s`, and `U`;
+  Perl classes (`\d`, `\s`, and `\w` and their negations) and word boundaries are
+  ASCII-only as in RE2. Rust-only `u`, `R`, and `x` flags, Unicode property escapes,
+  nested or set-operation character classes, and constructs unsupported by the
+  linear-time engine are rejected before rollout. Counted repetition bounds cannot
+  exceed RE2's limit of 1000. Each compiled matcher has a 10 MiB program-size limit and
+  a 2 MiB lazy-DFA cache limit rather than library-version-dependent defaults. The agent
+  fails the affected data source rather than silently falling back. Text patterns match
+  validated decoded UTF-8. Raw patterns use non-Unicode byte-regex semantics, so byte
+  escapes such as `\xFF` match the original byte without lossy conversion. Joined
+  physical lines retain their newline separators. The emitted record's checkpoint delta
+  ends after the last source byte included in that record.
 - **Bounded multiline state.** A multiline record is bounded by decoded output bytes,
   physical line count, and, when nonzero, `force_flush_period`, measured as idle time
   since the most recent physical line. `force_flush_period: 0s` disables idle partial
   flushing. The first enabled bound reached determines the result. A line-count or
   timeout flush emits the complete buffer, marks the reason, and begins a new candidate
   record at the next physical line; no source bytes are discarded. A timeout is an
-  explicit heuristic and can split a record written slowly. Byte overflow follows the
-  oversize policy below. Rotation and drain use the same reason-marked flush contract
-  when idle partial flushing is enabled; otherwise they retain the documented Phase 1
-  behavior.
+  explicit heuristic and can split a record written slowly. The idle deadline is
+  EOF-gated as described above. Byte overflow follows the oversize policy below.
+  Rotation and drain use the same reason-marked flush contract when idle partial
+  flushing is enabled; otherwise they retain the documented Phase 1 behavior.
 - **Oversize policy.** `split` preserves all input by emitting bounded fragments;
-  `truncate` emits the bounded prefix and discards through the logical record boundary.
-  Both policies emit telemetry, and emitted records identify truncation or
-  fragmentation. Until equivalent OpenTelemetry semantic conventions are accepted,
-  split fragments use experimental project attributes: `otel_arrow.filelog.fragment.id`
-  (string), `otel_arrow.filelog.fragment.index` (zero-based integer), and
-  `otel_arrow.filelog.fragment.last` (boolean). They are not registered semantic conventions.
-  A future convention must include an explicit migration rather than silently reusing a
-  `log.*` name.
+  `truncate` emits the bounded prefix and discards through the bound-terminated logical
+  record boundary. For multiline input, `max_record_bytes` creates that forced boundary
+  at the LF of the first complete physical line whose inclusion would exceed the body
+  bound. Split fragments reconstruct this bound-terminated record, not the
+  counterfactual pattern-only record that would exist with the byte bound disabled;
+  truncate discards only through the same trigger line. Regex and line-count decisions
+  are suppressed while finishing that line, then multiline state resets. This rule is
+  what makes restart deterministic from the exact durable continuation fields without
+  retaining hidden state. A body exactly equal to the bound fits. In start-pattern mode
+  its trailing LF is necessarily terminal because retaining it as an internal separator
+  would exceed the bound; the framer therefore emits that clean forced boundary before
+  decoding any later source unit and restarts seeking on the next line. End-pattern mode
+  makes the same clean boundary when retaining a nonmatching line's LF as an internal
+  separator would exceed the bound. Both policies emit telemetry, and emitted records
+  identify truncation or fragmentation. Until equivalent OpenTelemetry semantic
+  conventions are accepted, split fragments use experimental project attributes:
+  `otel_arrow.filelog.fragment.id` (string),
+  `otel_arrow.filelog.fragment.index` (zero-based integer), and
+  `otel_arrow.filelog.fragment.last` (boolean). They are not registered semantic
+  conventions. A future convention must include an explicit migration rather than
+  silently reusing a `log.*` name.
 
   `otel_arrow.filelog.fragment.id` is the lowercase 64-character hexadecimal encoding of the
   full SHA-256 digest over the following byte sequence:
@@ -958,10 +1001,12 @@ operator-chain compatibility.
   restart, has SHA-256 collision expectations, and does not expose the raw `file_id`.
   It is an opaque correlation value, not authentication, authorization, or a secret.
   Together with index and finality, it lets processors or destinations reconstruct the
-  original record. When a split logical record crosses an Ack boundary, its next
-  fragment index and original record start are durable framing-resume state.
-  For decoded text, the byte limit is measured on the UTF-8 body emitted into OTAP; for
-  `raw`, it is measured on source bytes.
+  bound-terminated record. When a split logical record crosses an Ack boundary, its
+  next fragment index and original record start are durable framing-resume state. For
+  decoded text, the byte limit is measured on the UTF-8 body emitted into OTAP; for
+  `raw`, it is measured on source bytes. Under `preserve_raw`, prospective split sizing
+  uses the larger of decoded UTF-8 and exact source bytes so either eventual body
+  representation remains bounded.
 
 Boundary completion is deterministic:
 
@@ -970,8 +1015,8 @@ Boundary completion is deterministic:
 | Next start-pattern match | Emit the previous record; matching line begins the next |
 | End-pattern match | Include the matching line and emit the record |
 | `max_multiline_lines` | Emit buffered lines, mark `max_lines`, continue with next line |
-| `max_record_bytes` | Apply `split` or `truncate`, mark the record, advance deterministically |
-| Idle `force_flush_period` | Emit buffered content, mark `timeout`, continue with next line |
+| `max_record_bytes` | End at the overflow-triggering line, apply `split` or `truncate`, then reset multiline state |
+| Idle `force_flush_period` after observed EOF | Emit buffered content, mark `timeout`, continue with next line |
 
 The phrase "pattern matched nothing" has no unambiguous meaning for a growing stream.
 The receiver therefore does not permanently disable a valid configured pattern based
@@ -1327,14 +1372,28 @@ Every buffer is bounded: candidate channel, pending-candidate queue
 (`max_pending_candidates`), worker->async handoff (capacity 1), command channel,
 per-open-reader line buffer (`max_line_bytes`) and multiline record buffer
 (`max_record_bytes`), open batch (`batch.max_*`), and retained batch (shallow clone of
-the open-batch bound). When
+the open-batch bound). The framer validates this conservative peak payload-allocation
+formula with checked arithmetic:
+
+```text
+framer_peak_payload =
+  4 * copies * (min(max_line_bytes, max_record_bytes) + max_record_bytes) +
+  16 * copies +
+  16
+
+copies = 2 for non-raw preserve_raw; otherwise 1
+```
+
+The factor four covers old and new vector allocations that can coexist during growth;
+the fixed terms cover terminal-delimiter lookahead and one pending decoded/source unit.
+Regex and decoder state add bounded fixed/library overhead measured separately. When
 downstream is slow the handoff fills and the worker stops calling `read(2)` -- unread
 bytes stay in the files; the filesystem is the buffer. Memory ceiling per instance is
-approximately `batch.max_bytes + max_open_files x (max_line_bytes + max_record_bytes) +
-bounded candidate state + offset/checkpoint tables + decoder and Arrow overhead`;
-retained and outgoing batches share the same Arrow buffers. This is a conservative
-logical bound, not an exact allocator-resident-byte formula; implementation tests must
-measure fixed and library overhead separately.
+approximately `batch.max_bytes + max_open_files * framer_peak_payload + bounded
+candidate state + offset/checkpoint tables + decoder and Arrow overhead`; retained and
+outgoing batches share the same Arrow buffers. This is a conservative logical bound,
+not an exact allocator-resident-byte formula; implementation tests must measure fixed
+and library overhead separately.
 The async half's control-priority obligations under backpressure are part of D13 (see
 Execution model).
 

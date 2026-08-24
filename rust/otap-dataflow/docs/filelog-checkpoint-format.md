@@ -851,7 +851,7 @@ independent implementations produce byte-identical digests for the same
 configuration.
 
 `framing_profile_version` (the profile/digest recipe version, stored
-alongside the digest in the snapshot and in `register_file`) is `2` in this
+alongside the digest in the snapshot and in `register_file`) is `3` in this
 version of this document. It is independent of the snapshot/WAL/`CURRENT`
 `format_version` field: this version tracks only the digest recipe below and
 can advance when the identity or framing compatibility inputs change without
@@ -860,20 +860,21 @@ requiring a change to the snapshot/WAL byte layout.
 ### Canonical serialization input
 
 ```text
-UTF-8("otel-arrow-filelog-framing-profile-v2\0") ||
+UTF-8("otel-arrow-filelog-framing-profile-v3\0") ||
 fingerprint_profile_version : u16 BE ||
 fingerprint_bytes            : u16 BE ||
 ignored_header_bytes         : u32 BE ||
-encoding                    : u8  ||
-multiline_mode              : u8  ||
-regex_profile_version       : u16 BE  ||
-pattern_len                 : u16 BE  ||
+encoding                     : u8  ||
+on_decode_error              : u8  ||
+multiline_mode               : u8  ||
+regex_profile_version        : u16 BE  ||
+pattern_len                  : u16 BE  ||
 pattern_bytes                : pattern_len bytes (UTF-8 regex source) ||
 max_line_bytes               : u64 BE  ||
 max_record_bytes             : u64 BE  ||
-max_log_size_behavior         : u8  ||
-max_multiline_lines           : u32 BE  ||
-force_flush_period_millis      : u64 BE
+max_log_size_behavior        : u8  ||
+max_multiline_lines          : u32 BE  ||
+force_flush_period_millis    : u64 BE
 ```
 
 Field values:
@@ -884,8 +885,9 @@ Field values:
 | `fingerprint_bytes` | configured matching-evidence window, `16..=65535` |
 | `ignored_header_bytes` | configured byte count skipped before fingerprint evidence |
 | `encoding` | `0x01` utf-8, `0x02` ascii, `0x03` utf-16le, `0x04` utf-16be, `0x05` raw |
+| `on_decode_error` | `0x01` preserve_raw, `0x02` replace, `0x03` fail |
 | `multiline_mode` | `0x00` newline (default framing), `0x01` start-pattern, `0x02` end-pattern |
-| `regex_profile_version` | `0` when `multiline_mode == 0x00`; otherwise the versioned RE2-compatible profile number (`1` for `re2-v1`) |
+| `regex_profile_version` | `0` when `multiline_mode == 0x00`; otherwise the versioned RE2-compatible executable-subset number (`1` for `re2-v1`, whose exact syntax and ASCII Perl-class semantics are defined by the architecture contract) |
 | `pattern_len` / `pattern_bytes` | `0` / empty when `multiline_mode == 0x00`; otherwise the configured pattern source, at most `4096` bytes |
 | `max_log_size_behavior` | `0x01` split, `0x02` truncate |
 | `force_flush_period_millis` | configured idle-flush period in milliseconds; `0` means disabled |
@@ -893,11 +895,12 @@ Field values:
 This list includes the complete Phase 1 identity profile
 (`fingerprint_profile_version`, `fingerprint_bytes`,
 `ignored_header_bytes`) and exactly the Appendix C framing knobs that change
-record boundaries or replay determinism (`encoding`, the multiline mode and
-pattern, `max_line_bytes`, `max_record_bytes`, `max_log_size_behavior`,
-`max_multiline_lines`, `force_flush_period`). It deliberately excludes
-knobs that affect neither identity nor framing, such as `checkpoint.id`,
-`limits.*`, `batch.*`, and `retry.*`.
+record boundaries, emitted bodies, failure behavior, or replay determinism
+(`encoding`, `on_decode_error`, the multiline mode and pattern,
+`max_line_bytes`, `max_record_bytes`, `max_log_size_behavior`,
+`max_multiline_lines`, `force_flush_period`). It deliberately excludes knobs
+that affect neither identity nor framing, such as `checkpoint.id`, `limits.*`,
+`batch.*`, and `retry.*`.
 
 The digest is:
 
@@ -916,28 +919,31 @@ ever to coincide.
 Given the default identity profile (`fingerprint_profile_version = 1`,
 `fingerprint_bytes = 1000`, `ignored_header_bytes = 0`) and the
 newline-framing default profile (`encoding = utf-8 (0x01)`,
+`on_decode_error = preserve_raw (0x01)`,
 `multiline_mode = newline (0x00)`, `regex_profile_version = 0`,
 `pattern_len = 0`, `max_line_bytes = 1048576`, `max_record_bytes = 1048576`,
 `max_log_size_behavior = split (0x01)`, `max_multiline_lines = 500`,
-`force_flush_period_millis = 500`), the canonical serialization is 81 bytes
-(38-byte domain-separated prefix + 2 + 2 + 4 + 1 + 1 + 2 + 2 + 0 + 8 + 8 +
-1 + 4 + 8) and:
+`force_flush_period_millis = 500`), the canonical serialization is 82 bytes
+(38-byte domain-separated prefix + 2 + 2 + 4 + 1 + 1 + 1 + 2 + 2 + 0 + 8 +
+8 + 1 + 4 + 8):
 
 ```text
-framing_profile_digest = 46c818a27f8cb6281a903e2a54c4fd72b38dd6e4d4ac30b1e33fb1e26ff2aaae
+canonical_bytes = 6f74656c2d6172726f772d66696c656c6f672d6672616d696e672d70726f66696c652d763300000103e800000000010100000000000000000000100000000000000010000001000001f400000000000001f4
+framing_profile_digest = 84cd122c62b3a4aea428db9f2c41166ed9af1f8087ab3e562f8033a9eedcf513
 ```
 
 A second vector, changing only `multiline_mode` to end-pattern
 (`multiline_mode = 0x02`, `regex_profile_version = 1`, pattern
 `"^END request$"`, all other fields unchanged), MUST produce a different
-94-byte canonical input and digest:
+95-byte canonical input and digest:
 
 ```text
-framing_profile_digest = 7c5c808319692ce9d0b8c7a50772f53e236d60a98e50fd30e2c5cf073e7da179
+canonical_bytes = 6f74656c2d6172726f772d66696c656c6f672d6672616d696e672d70726f66696c652d763300000103e8000000000101020001000d5e454e442072657175657374240000000000100000000000000010000001000001f400000000000001f4
+framing_profile_digest = 49834e9d951d6c68f351d1a51f70cca9ed4da0b8eef18670607b71aa15c03637
 ```
 
 Both vectors are executable conformance tests in
-`crates/core-nodes/src/receivers/filelog_receiver/checkpoint/test_vectors.rs`
+`crates/core-nodes/src/receivers/filelog_receiver/checkpoint/framing_profile.rs`
 and MUST continue to match exactly; a change to either value without a
 `framing_profile_version` bump is a specification regression.
 
@@ -1020,7 +1026,7 @@ action without ambiguity:
 
 Executable checkpoint-byte vectors live in
 `crates/core-nodes/src/receivers/filelog_receiver/checkpoint/test_vectors.rs`
-and are consumed by `checkpoint/tests.rs`. The two current profile-v2
+and are consumed by `checkpoint/tests.rs`. The two current profile-v3
 canonical-byte and SHA-256 vectors live in `checkpoint/framing_profile.rs`.
 All expected bytes and digests are independently computed (using a
 separately verified CRC-32C implementation and standard SHA-256, not by
@@ -1048,7 +1054,7 @@ round-tripping through this crate's own encoder). They cover:
 The snapshot/WAL byte fixtures intentionally retain opaque legacy
 `framing_profile_version = 1` fields so codec conformance is independent of
 the current recipe. Runtime identity tests separately prove that a
-non-finalized profile-v1 record fails closed against profile v2 even when no
+non-finalized profile-v1 record fails closed against profile v3 even when no
 candidate is present.
 
 Phase 1 cannot ship the durable checkpoint store until these tests, plus the

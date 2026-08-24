@@ -10,10 +10,10 @@
 //! Scope note: this module ships only the user-facing config types, their
 //! defaults, semantic validation into a [`RuntimeConfig`], the shared
 //! logical-record-size function, and the framing-profile canonical digest
-//! integration (built on [`checkpoint::framing_profile`]). It performs no
-//! filesystem I/O, discovery, framing, or checkpoint durability, and it
-//! registers no component factory: [`FILELOG_RECEIVER_URN`] is exported so a
-//! later stage can wire a `ReceiverFactory` without renaming anything here.
+//! integration (built on [`checkpoint::framing_profile`]). Runtime discovery,
+//! framing, identity, reader, and checkpoint behavior lives in sibling
+//! modules; this configuration module performs no filesystem I/O and
+//! registers no component factory.
 
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -26,15 +26,15 @@ use regex::Regex;
 use super::checkpoint::framing_profile;
 use super::checkpoint::primitives::{
     ADVISORY_PATH_MAX_BYTES, FINGERPRINT_MAX_BYTES, FINGERPRINT_PROFILE_VERSION,
-    NAMESPACE_ID_MAX_BYTES,
+    FRAMING_PATTERN_MAX_BYTES, NAMESPACE_ID_MAX_BYTES,
 };
 use super::checkpoint::store::limits::StoreLimits;
 
 /// URN for the filelog receiver.
 ///
-/// Not yet registered with a `ReceiverFactory` / `distributed_slice`; the
-/// runtime (discovery, framing, checkpoint store) does not exist yet. See the
-/// module-level scope note.
+/// Not yet registered with a `ReceiverFactory` / `distributed_slice`;
+/// [`FILELOG_RECEIVER_URN`] is exported so the delivery-wiring stage can
+/// register the factory without renaming the component.
 pub const FILELOG_RECEIVER_URN: &str = "urn:otel:receiver:filelog";
 
 /// Namespace root matching Appendix B's layout:
@@ -69,6 +69,12 @@ const MIN_FINGERPRINT_BYTES: u64 = 16;
 /// stores `fingerprint` as a `u16`-length-prefixed byte field, so a value
 /// larger than this can never round-trip through the durable format.
 const MAX_FINGERPRINT_BYTES: u64 = FINGERPRINT_MAX_BYTES as u64;
+/// RE2 rejects counted repetition bounds above 1000.
+const RE2_MAX_COUNTED_REPETITION: u16 = 1000;
+/// Maximum compiled regex program size for one multiline matcher.
+const MULTILINE_REGEX_SIZE_LIMIT_BYTES: usize = 10 * 1024 * 1024;
+/// Maximum lazy-DFA cache retained by one multiline matcher.
+const MULTILINE_REGEX_DFA_SIZE_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 /// Conservative process-memory ceiling for one identity reconciliation pass.
 const IDENTITY_RECONCILIATION_BYTES_CEILING: u64 = 1024 * 1024 * 1024;
 /// One worker-owned inventory, one inventory in the bounded event channel,
@@ -274,6 +280,16 @@ pub enum OnDecodeError {
     Replace,
     /// Quarantine the file.
     Fail,
+}
+
+impl OnDecodeError {
+    fn to_framing_profile(self) -> framing_profile::FramingOnDecodeError {
+        match self {
+            OnDecodeError::PreserveRaw => framing_profile::FramingOnDecodeError::PreserveRaw,
+            OnDecodeError::Replace => framing_profile::FramingOnDecodeError::Replace,
+            OnDecodeError::Fail => framing_profile::FramingOnDecodeError::Fail,
+        }
+    }
 }
 
 /// Versioned, RE2-compatible regex syntax profile shared by control-plane
@@ -1020,16 +1036,44 @@ pub(crate) struct RuntimeConfig {
     pub(crate) on_nack: OnNack,
     /// Drain deadline budget.
     pub(crate) drain_timeout: Duration,
-    /// SHA-256 framing-profile digest for the configured framing contract
-    /// (encoding, multiline mode, size bounds, oversize policy, multiline
-    /// line cap, idle flush period). Persisted checkpoint records compare
-    /// this to detect an incompatible framing-profile change across
-    /// restart.
+    /// SHA-256 framing-profile digest for the configured identity and framing
+    /// contract (identity evidence, encoding, decode-error policy, multiline
+    /// mode, size bounds, oversize policy, multiline line cap, and idle flush
+    /// period). Persisted checkpoint records compare this to detect an
+    /// incompatible framing-profile change across restart.
     pub(crate) framing_profile_digest: [u8; 32],
     /// The compiled multiline boundary pattern, when one is configured.
     /// Compiled once here so the runtime never recompiles or re-validates
     /// it.
-    pub(crate) compiled_multiline_pattern: Option<Regex>,
+    pub(crate) compiled_multiline_pattern: Option<CompiledMultilinePattern>,
+}
+
+/// A multiline boundary pattern compiled for the configured framing
+/// semantics.
+#[derive(Clone, Debug)]
+pub(crate) enum CompiledMultilinePattern {
+    /// A pattern matching decoded UTF-8 text.
+    Text(Regex),
+    /// A pattern matching raw source bytes.
+    Raw(regex::bytes::Regex),
+}
+
+impl CompiledMultilinePattern {
+    /// Matches a decoded physical line without performing a lossy
+    /// conversion.
+    ///
+    /// Raw patterns accept every byte sequence. Text patterns return the
+    /// original UTF-8 validation error if a caller violates the decoded-text
+    /// invariant.
+    pub(crate) fn is_match(&self, line: &[u8]) -> Result<bool, std::str::Utf8Error> {
+        match self {
+            Self::Text(pattern) => {
+                let text = std::str::from_utf8(line)?;
+                Ok(pattern.is_match(text))
+            }
+            Self::Raw(pattern) => Ok(pattern.is_match(line)),
+        }
+    }
 }
 
 impl RuntimeConfig {
@@ -1080,7 +1124,7 @@ impl RuntimeConfig {
         }
         let limits = validate_limits(limits)?;
         let (framing, framing_profile_digest, compiled_multiline_pattern) =
-            validate_framing(framing, encoding, &identity)?;
+            validate_framing(framing, encoding, on_decode_error, &identity)?;
         let batch = validate_batch(batch, &framing, &metadata)?;
         let rotation = validate_rotation(rotation)?;
         let retry = validate_retry(retry)?;
@@ -1316,15 +1360,319 @@ fn validate_identity_reconciliation_bounds(
     Ok(())
 }
 
-/// Validates the RE2-compatible pattern (rejecting backreferences,
-/// lookaround, and any other construct the `regex` crate itself does not
-/// accept -- the same restricted feature set RE2 supports) and returns the
-/// compiled [`Regex`].
-fn compile_re2_pattern(field: &str, pattern: &str) -> Result<Regex, otap_df_config::error::Error> {
+fn invalid_re2(field: &str, detail: &str) -> otap_df_config::error::Error {
+    invalid(&format!(
+        "{field} is not a valid re2-v1 regular expression: {detail}"
+    ))
+}
+
+fn append_re2_escape(
+    output: &mut Vec<u8>,
+    field: &str,
+    escaped: u8,
+    in_character_class: bool,
+) -> Result<(), otap_df_config::error::Error> {
+    let replacement: &[u8] = match (escaped, in_character_class) {
+        (b'd', false) => br"[0-9]",
+        (b'D', false) => br"[^0-9]",
+        (b's', false) => br"[\t\n\f\r ]",
+        (b'S', false) => br"[^\t\n\f\r ]",
+        (b'w', false) => br"[0-9A-Za-z_]",
+        (b'W', false) => br"[^0-9A-Za-z_]",
+        (b'b', false) => br"(?-u:\b)",
+        (b'B', false) => br"(?-u:\B)",
+        (b'd', true) => br"0-9",
+        (b'D', true) => br"[^0-9]",
+        (b's', true) => br"\t\n\f\r ",
+        (b'S', true) => br"[^\t\n\f\r ]",
+        (b'w', true) => br"0-9A-Za-z_",
+        (b'W', true) => br"[^0-9A-Za-z_]",
+        (b'b' | b'B', true) => {
+            return Err(invalid_re2(
+                field,
+                "word-boundary escapes are not supported inside character classes",
+            ));
+        }
+        (b'p' | b'P', _) => {
+            return Err(invalid_re2(
+                field,
+                "Unicode property escapes are not supported by the re2-v1 subset",
+            ));
+        }
+        (b'u' | b'U', _) => {
+            return Err(invalid_re2(
+                field,
+                "Rust Unicode escapes are not supported; use an RE2 hex escape or a literal",
+            ));
+        }
+        (punctuation, _) if punctuation.is_ascii_punctuation() => {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            output.extend_from_slice(br"\x");
+            output.push(HEX[usize::from(punctuation >> 4)]);
+            output.push(HEX[usize::from(punctuation & 0x0f)]);
+            return Ok(());
+        }
+        (letter, in_class) if letter.is_ascii_alphabetic() => {
+            let supported = matches!(letter, b'a' | b'f' | b'n' | b'r' | b't' | b'v' | b'x')
+                || (!in_class && matches!(letter, b'A' | b'z'));
+            if !supported {
+                return Err(invalid_re2(
+                    field,
+                    "escape is not supported by the re2-v1 executable subset",
+                ));
+            }
+            output.push(b'\\');
+            output.push(letter);
+            return Ok(());
+        }
+        (digit, _) if digit.is_ascii_digit() => {
+            output.push(b'\\');
+            output.push(digit);
+            return Ok(());
+        }
+        _ => {
+            return Err(invalid_re2(
+                field,
+                "escape is not supported by the re2-v1 executable subset",
+            ));
+        }
+    };
+    output.extend_from_slice(replacement);
+    Ok(())
+}
+
+fn validate_re2_inline_flags(
+    field: &str,
+    bytes: &[u8],
+    group_start: usize,
+) -> Result<(), otap_df_config::error::Error> {
+    let mut index = group_start + 2;
+    while let Some(flag) = bytes.get(index) {
+        match flag {
+            b'i' | b'm' | b's' | b'U' | b'-' => index += 1,
+            b'u' | b'R' | b'x' => {
+                return Err(invalid_re2(
+                    field,
+                    "only RE2 inline flags i, m, s, and U are supported",
+                ));
+            }
+            _ => break,
+        }
+    }
+    Ok(())
+}
+
+fn parse_repetition_bound(bytes: &[u8], index: &mut usize) -> (bool, bool) {
+    let start = *index;
+    let mut value = 0u16;
+    let mut exceeds_limit = false;
+    while let Some(digit) = bytes.get(*index).and_then(|byte| byte.checked_sub(b'0')) {
+        if digit > 9 {
+            break;
+        }
+        if !exceeds_limit {
+            value = value.saturating_mul(10).saturating_add(u16::from(digit));
+            exceeds_limit = value > RE2_MAX_COUNTED_REPETITION;
+        }
+        *index += 1;
+    }
+    (*index != start, exceeds_limit)
+}
+
+fn validate_re2_counted_repetition(
+    field: &str,
+    bytes: &[u8],
+    opening_brace: usize,
+) -> Result<(), otap_df_config::error::Error> {
+    let mut index = opening_brace + 1;
+    let (has_minimum, minimum_exceeds) = parse_repetition_bound(bytes, &mut index);
+    if !has_minimum {
+        if bytes.get(index) == Some(&b',') {
+            index += 1;
+            let (has_maximum, _) = parse_repetition_bound(bytes, &mut index);
+            if has_maximum && bytes.get(index) == Some(&b'}') {
+                return Err(invalid_re2(
+                    field,
+                    "counted repetitions require a minimum bound",
+                ));
+            }
+        }
+        return Ok(());
+    }
+
+    let mut maximum_exceeds = false;
+    let valid = match bytes.get(index) {
+        Some(b'}') => true,
+        Some(b',') => {
+            index += 1;
+            let (_, exceeds) = parse_repetition_bound(bytes, &mut index);
+            maximum_exceeds = exceeds;
+            bytes.get(index) == Some(&b'}')
+        }
+        _ => false,
+    };
+    if valid && (minimum_exceeds || maximum_exceeds) {
+        return Err(invalid_re2(
+            field,
+            "counted repetition bounds must not exceed 1000",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates the lexical differences between RE2 and Rust `regex`, and
+/// rewrites RE2's ASCII-only Perl classes and word boundaries into equivalent
+/// Rust syntax. The regex compiler remains authoritative for the shared
+/// grammar and rejects unsupported RE2 constructs that Rust cannot execute.
+fn normalize_re2_pattern(
+    field: &str,
+    pattern: &str,
+) -> Result<String, otap_df_config::error::Error> {
     if pattern.is_empty() {
         return Err(invalid(&format!("{field} must not be empty when set")));
     }
-    Regex::new(pattern).map_err(|source| {
+    if pattern.len() > FRAMING_PATTERN_MAX_BYTES {
+        return Err(invalid(&format!(
+            "{field} is {} bytes, exceeding the {FRAMING_PATTERN_MAX_BYTES}-byte maximum",
+            pattern.len()
+        )));
+    }
+
+    let bytes = pattern.as_bytes();
+    let mut output = Vec::with_capacity(pattern.len());
+    let mut index = 0;
+    let mut character_class_phase = None::<u8>;
+
+    while index < bytes.len() {
+        if let Some(phase) = character_class_phase {
+            match bytes[index] {
+                b'\\' => {
+                    let Some(escaped) = bytes.get(index + 1).copied() else {
+                        output.push(b'\\');
+                        index += 1;
+                        continue;
+                    };
+                    append_re2_escape(&mut output, field, escaped, true)?;
+                    character_class_phase = Some(2);
+                    index += 2;
+                    continue;
+                }
+                b'[' if bytes.get(index + 1).is_some_and(|byte| *byte == b':') => {
+                    let mut end = index + 2;
+                    while end + 1 < bytes.len() && !(bytes[end] == b':' && bytes[end + 1] == b']') {
+                        end += 1;
+                    }
+                    if end + 1 >= bytes.len() {
+                        return Err(invalid_re2(field, "unterminated POSIX character class"));
+                    }
+                    output.extend_from_slice(&bytes[index..end + 2]);
+                    character_class_phase = Some(2);
+                    index = end + 2;
+                    continue;
+                }
+                b'[' => {
+                    return Err(invalid_re2(
+                        field,
+                        "nested character classes are not supported by the re2-v1 subset",
+                    ));
+                }
+                b'^' if phase == 0 => {
+                    output.push(b'^');
+                    character_class_phase = Some(1);
+                    index += 1;
+                    continue;
+                }
+                b']' if phase < 2 => {
+                    output.push(b']');
+                    character_class_phase = Some(2);
+                    index += 1;
+                    continue;
+                }
+                b']' => {
+                    output.push(b']');
+                    character_class_phase = None;
+                    index += 1;
+                    continue;
+                }
+                b'&' | b'-' | b'~'
+                    if bytes
+                        .get(index + 1)
+                        .is_some_and(|next| *next == bytes[index]) =>
+                {
+                    return Err(invalid_re2(
+                        field,
+                        "Rust character-class set operators are not supported",
+                    ));
+                }
+                _ => {
+                    output.push(bytes[index]);
+                    character_class_phase = Some(2);
+                    index += 1;
+                    continue;
+                }
+            }
+        }
+
+        match bytes[index] {
+            b'\\' => {
+                let Some(escaped) = bytes.get(index + 1).copied() else {
+                    output.push(b'\\');
+                    index += 1;
+                    continue;
+                };
+                append_re2_escape(&mut output, field, escaped, false)?;
+                index += 2;
+                continue;
+            }
+            b'[' => {
+                output.push(b'[');
+                character_class_phase = Some(0);
+            }
+            b'(' if bytes.get(index + 1).is_some_and(|byte| *byte == b'?') => {
+                validate_re2_inline_flags(field, bytes, index)?;
+                output.push(b'(');
+            }
+            b'{' => {
+                validate_re2_counted_repetition(field, bytes, index)?;
+                output.push(b'{');
+            }
+            _ => output.push(bytes[index]),
+        }
+        index += 1;
+    }
+
+    String::from_utf8(output).map_err(|_| {
+        invalid_re2(
+            field,
+            "internal normalization did not preserve UTF-8 pattern source",
+        )
+    })
+}
+
+/// Validates and normalizes the `re2-v1` subset, then returns the matcher
+/// compiled for the configured encoding.
+fn compile_re2_pattern(
+    field: &str,
+    pattern: &str,
+    encoding: Encoding,
+) -> Result<CompiledMultilinePattern, otap_df_config::error::Error> {
+    let normalized = normalize_re2_pattern(field, pattern)?;
+    let compiled = match encoding {
+        Encoding::Raw => regex::bytes::RegexBuilder::new(&normalized)
+            .unicode(false)
+            .size_limit(MULTILINE_REGEX_SIZE_LIMIT_BYTES)
+            .dfa_size_limit(MULTILINE_REGEX_DFA_SIZE_LIMIT_BYTES)
+            .build()
+            .map(CompiledMultilinePattern::Raw),
+        Encoding::Utf8 | Encoding::Ascii | Encoding::Utf16Le | Encoding::Utf16Be => {
+            regex::RegexBuilder::new(&normalized)
+                .size_limit(MULTILINE_REGEX_SIZE_LIMIT_BYTES)
+                .dfa_size_limit(MULTILINE_REGEX_DFA_SIZE_LIMIT_BYTES)
+                .build()
+                .map(CompiledMultilinePattern::Text)
+        }
+    };
+    compiled.map_err(|source| {
         invalid(&format!(
             "{field} is not a valid RE2-compatible regular expression: {source}"
         ))
@@ -1359,11 +1707,74 @@ fn canonicalize_force_flush_period_millis(
         .map_err(|_| invalid("framing.force_flush_period exceeds u64::MAX milliseconds"))
 }
 
+const fn minimum_framing_bound(encoding: Encoding, on_decode_error: OnDecodeError) -> u64 {
+    match (encoding, on_decode_error) {
+        (Encoding::Raw, _) | (Encoding::Ascii, OnDecodeError::Fail) => 1,
+        (Encoding::Ascii, OnDecodeError::PreserveRaw | OnDecodeError::Replace) => 3,
+        (
+            Encoding::Utf8 | Encoding::Utf16Le | Encoding::Utf16Be,
+            OnDecodeError::PreserveRaw | OnDecodeError::Replace | OnDecodeError::Fail,
+        ) => 4,
+    }
+}
+
+const fn framer_payload_copy_count(encoding: Encoding, on_decode_error: OnDecodeError) -> usize {
+    if !matches!(encoding, Encoding::Raw) && matches!(on_decode_error, OnDecodeError::PreserveRaw) {
+        2
+    } else {
+        1
+    }
+}
+
+/// Computes the conservative peak retained framer payload:
+///
+/// `4 * copies * (min(max_line_bytes, max_record_bytes) + max_record_bytes)
+///  + 16 * copies + 16`.
+///
+/// Returns `None` if any operation is not representable as `usize`.
+pub(crate) fn peak_framer_payload_bytes(
+    max_line_bytes: usize,
+    max_record_bytes: usize,
+    copies: usize,
+) -> Option<usize> {
+    let retained = max_line_bytes
+        .min(max_record_bytes)
+        .checked_add(max_record_bytes)?;
+    4usize
+        .checked_mul(copies)?
+        .checked_mul(retained)?
+        .checked_add(16usize.checked_mul(copies)?)?
+        .checked_add(16)
+}
+
+fn validate_peak_framer_payload_bytes(
+    framing: &FramingConfig,
+    encoding: Encoding,
+    on_decode_error: OnDecodeError,
+) -> Result<(), otap_df_config::error::Error> {
+    let overflow = || {
+        invalid(&format!(
+            "framing bounds max_line_bytes={} and max_record_bytes={} overflow usize in the \
+             conservative peak framer payload formula; reduce framing.max_line_bytes or \
+             framing.max_record_bytes",
+            framing.max_line_bytes, framing.max_record_bytes
+        ))
+    };
+    let max_line_bytes = usize::try_from(framing.max_line_bytes).map_err(|_| overflow())?;
+    let max_record_bytes = usize::try_from(framing.max_record_bytes).map_err(|_| overflow())?;
+    let copies = framer_payload_copy_count(encoding, on_decode_error);
+    peak_framer_payload_bytes(max_line_bytes, max_record_bytes, copies)
+        .ok_or_else(overflow)
+        .map(|_| ())
+}
+
 fn validate_framing(
     framing: FramingConfig,
     encoding: Encoding,
+    on_decode_error: OnDecodeError,
     identity: &IdentityConfig,
-) -> Result<(FramingConfig, [u8; 32], Option<Regex>), otap_df_config::error::Error> {
+) -> Result<(FramingConfig, [u8; 32], Option<CompiledMultilinePattern>), otap_df_config::error::Error>
+{
     if framing.max_line_bytes == 0 {
         return Err(invalid("framing.max_line_bytes must be greater than zero"));
     }
@@ -1372,13 +1783,25 @@ fn validate_framing(
             "framing.max_record_bytes must be greater than zero",
         ));
     }
+    let minimum_bound = minimum_framing_bound(encoding, on_decode_error);
+    if framing.max_line_bytes < minimum_bound {
+        return Err(invalid(&format!(
+            "framing.max_line_bytes must be at least {minimum_bound} for encoding {encoding:?} \
+             with on_decode_error {on_decode_error:?}"
+        )));
+    }
+    if framing.max_record_bytes < minimum_bound {
+        return Err(invalid(&format!(
+            "framing.max_record_bytes must be at least {minimum_bound} for encoding {encoding:?} \
+             with on_decode_error {on_decode_error:?}"
+        )));
+    }
     if framing.max_multiline_lines == 0 {
         return Err(invalid(
             "framing.max_multiline_lines must be greater than zero",
         ));
     }
-    ensure_fits_usize("framing.max_line_bytes", framing.max_line_bytes)?;
-    ensure_fits_usize("framing.max_record_bytes", framing.max_record_bytes)?;
+    validate_peak_framer_payload_bytes(&framing, encoding, on_decode_error)?;
 
     let (multiline_mode, compiled_pattern) = match (
         &framing.multiline.line_start_pattern,
@@ -1392,7 +1815,8 @@ fn validate_framing(
             ));
         }
         (Some(pattern), None) => {
-            let compiled = compile_re2_pattern("framing.multiline.line_start_pattern", pattern)?;
+            let compiled =
+                compile_re2_pattern("framing.multiline.line_start_pattern", pattern, encoding)?;
             (
                 framing_profile::MultilineMode::StartPattern {
                     regex_profile_version: framing.multiline.regex_profile.version(),
@@ -1402,7 +1826,8 @@ fn validate_framing(
             )
         }
         (None, Some(pattern)) => {
-            let compiled = compile_re2_pattern("framing.multiline.line_end_pattern", pattern)?;
+            let compiled =
+                compile_re2_pattern("framing.multiline.line_end_pattern", pattern, encoding)?;
             (
                 framing_profile::MultilineMode::EndPattern {
                     regex_profile_version: framing.multiline.regex_profile.version(),
@@ -1422,6 +1847,7 @@ fn validate_framing(
         ignored_header_bytes: u32::try_from(identity.ignored_header_bytes)
             .expect("validated ignored_header_bytes fits u32"),
         encoding: encoding_to_framing_profile(encoding),
+        on_decode_error: on_decode_error.to_framing_profile(),
         multiline_mode,
         max_line_bytes: framing.max_line_bytes,
         max_record_bytes: framing.max_record_bytes,
@@ -2265,6 +2691,29 @@ mod tests {
         }
     }
 
+    /// Scenario: each decode-error policy is validated with otherwise
+    /// identical default framing and identity configuration.
+    /// Guarantees: preserve-raw, replace, and fail map into three distinct
+    /// runtime framing-profile digests.
+    #[test]
+    fn on_decode_error_changes_runtime_profile_digest() {
+        let digest_for = |on_decode_error| {
+            let mut cfg = minimal_config();
+            cfg.on_decode_error = on_decode_error;
+            RuntimeConfig::from_config(cfg, "node-1")
+                .expect("decode-error policy must validate")
+                .framing_profile_digest
+        };
+
+        let preserve_raw = digest_for(OnDecodeError::PreserveRaw);
+        let replace = digest_for(OnDecodeError::Replace);
+        let fail = digest_for(OnDecodeError::Fail);
+
+        assert_ne!(preserve_raw, replace);
+        assert_ne!(preserve_raw, fail);
+        assert_ne!(replace, fail);
+    }
+
     /// Scenario: `framing.max_line_bytes`, `framing.max_record_bytes`, and
     /// `framing.max_multiline_lines` are each set to zero in turn.
     /// Guarantees: every framing bound is a "nonzero bound"; zero is
@@ -2282,6 +2731,101 @@ mod tests {
         let mut cfg = minimal_config();
         cfg.framing.max_multiline_lines = 0;
         assert!(RuntimeConfig::from_config(cfg, "node-1").is_err());
+    }
+
+    /// Scenario: every encoding and decode-error policy is configured at the
+    /// maximum atomic emitted-unit width, then each bound is reduced by one
+    /// where that is possible.
+    /// Guarantees: raw and ASCII/fail accept one byte, ASCII replacement and
+    /// preserve-raw require three bytes, and UTF-8/UTF-16 require four bytes
+    /// without imposing an unnecessary four-byte ASCII/fail minimum.
+    #[test]
+    fn framing_bounds_follow_maximum_atomic_emitted_unit() {
+        for (encoding, on_decode_error, minimum) in [
+            (Encoding::Raw, OnDecodeError::PreserveRaw, 1),
+            (Encoding::Raw, OnDecodeError::Replace, 1),
+            (Encoding::Raw, OnDecodeError::Fail, 1),
+            (Encoding::Ascii, OnDecodeError::PreserveRaw, 3),
+            (Encoding::Ascii, OnDecodeError::Replace, 3),
+            (Encoding::Ascii, OnDecodeError::Fail, 1),
+            (Encoding::Utf8, OnDecodeError::PreserveRaw, 4),
+            (Encoding::Utf8, OnDecodeError::Replace, 4),
+            (Encoding::Utf8, OnDecodeError::Fail, 4),
+            (Encoding::Utf16Le, OnDecodeError::PreserveRaw, 4),
+            (Encoding::Utf16Le, OnDecodeError::Replace, 4),
+            (Encoding::Utf16Le, OnDecodeError::Fail, 4),
+            (Encoding::Utf16Be, OnDecodeError::PreserveRaw, 4),
+            (Encoding::Utf16Be, OnDecodeError::Replace, 4),
+            (Encoding::Utf16Be, OnDecodeError::Fail, 4),
+        ] {
+            let mut cfg = minimal_config();
+            cfg.encoding = encoding;
+            cfg.on_decode_error = on_decode_error;
+            cfg.framing.max_line_bytes = minimum;
+            cfg.framing.max_record_bytes = minimum;
+            let _runtime = RuntimeConfig::from_config(cfg.clone(), "node-1")
+                .expect("the exact atomic-unit framing bounds must validate");
+
+            if minimum > 1 {
+                cfg.framing.max_line_bytes = minimum - 1;
+                let err = RuntimeConfig::from_config(cfg.clone(), "node-1").unwrap_err();
+                assert!(err.to_string().contains("max_line_bytes"), "{err}");
+                assert!(
+                    err.to_string().contains(&format!("at least {minimum}")),
+                    "{err}"
+                );
+
+                cfg.framing.max_line_bytes = minimum;
+                cfg.framing.max_record_bytes = minimum - 1;
+                let err = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
+                assert!(err.to_string().contains("max_record_bytes"), "{err}");
+                assert!(
+                    err.to_string().contains(&format!("at least {minimum}")),
+                    "{err}"
+                );
+            }
+        }
+    }
+
+    /// Scenario: the peak framer payload helper is evaluated for one and two
+    /// retained payload copies with different line and record bounds.
+    /// Guarantees: it implements the complete conservative formula, including
+    /// the minimum bound, fourfold growth factor, copy count, and fixed terms.
+    #[test]
+    fn peak_framer_payload_formula_is_complete() {
+        assert_eq!(peak_framer_payload_bytes(8, 12, 1), Some(112));
+        assert_eq!(peak_framer_payload_bytes(8, 12, 2), Some(208));
+        assert_eq!(
+            framer_payload_copy_count(Encoding::Raw, OnDecodeError::PreserveRaw),
+            1
+        );
+        assert_eq!(
+            framer_payload_copy_count(Encoding::Utf8, OnDecodeError::PreserveRaw),
+            2
+        );
+        assert_eq!(
+            framer_payload_copy_count(Encoding::Utf8, OnDecodeError::Replace),
+            1
+        );
+    }
+
+    /// Scenario: both framing byte bounds are the largest value representable
+    /// by `usize`, so the complete conservative peak formula cannot be
+    /// represented even though each individual bound can.
+    /// Guarantees: RuntimeConfig construction rejects arithmetic overflow
+    /// with a framing-bounds error before runtime allocation is possible.
+    #[test]
+    fn peak_framer_payload_overflow_is_rejected_during_config_build() {
+        let mut cfg = minimal_config();
+        cfg.encoding = Encoding::Raw;
+        cfg.framing.max_line_bytes = usize::MAX as u64;
+        cfg.framing.max_record_bytes = usize::MAX as u64;
+        cfg.batch.max_bytes = u64::MAX;
+
+        let err = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
+        assert!(err.to_string().contains("framing bounds"), "{err}");
+        assert!(err.to_string().contains("peak framer payload"), "{err}");
+        assert!(err.to_string().contains("overflow usize"), "{err}");
     }
 
     /// Scenario: `framing.force_flush_period` is zero, exactly one
@@ -2411,19 +2955,216 @@ mod tests {
         assert!(ok.is_ok(), "re2-v1 must be accepted");
     }
 
-    /// Scenario: a multiline end pattern using a backreference (`\1`), a
-    /// lookahead (`(?=`), and a lookbehind (`(?<=`) construct.
-    /// Guarantees: every RE2-incompatible construct the `regex` crate
-    /// itself refuses is surfaced as a structured `InvalidUserConfig`
-    /// instead of panicking or silently accepting it.
+    /// Scenario: text and raw multiline end patterns use a backreference
+    /// (`\1`), lookahead (`(?=`), or lookbehind (`(?<=`) construct.
+    /// Guarantees: both compiled matcher variants surface every
+    /// RE2-incompatible construct as structured `InvalidUserConfig` instead
+    /// of panicking or silently accepting it.
     #[test]
     fn re2_incompatible_constructs_are_rejected() {
-        for pattern in [r"(foo)\1", r"(?=foo)", r"(?!foo)", r"(?<=foo)", r"(?<!foo)"] {
+        for encoding in [Encoding::Utf8, Encoding::Raw] {
+            for pattern in [r"(foo)\1", r"(?=foo)", r"(?!foo)", r"(?<=foo)", r"(?<!foo)"] {
+                let mut cfg = minimal_config();
+                cfg.encoding = encoding;
+                cfg.framing.multiline.line_end_pattern = Some(pattern.to_owned());
+                let err = RuntimeConfig::from_config(cfg, "node-1")
+                    .expect_err(&format!("pattern '{pattern}' must be rejected"));
+                assert!(err.to_string().contains("RE2-compatible"));
+            }
+        }
+    }
+
+    /// Scenario: Text and raw re2-v1 patterns use Rust-only `u`, `R`, or `x`
+    /// inline flags in global, disabled, scoped, and mixed flag groups.
+    /// Guarantees: only RE2's `i`, `m`, `s`, and `U` flags are accepted,
+    /// while escaped text, POSIX classes, and character-class literals are
+    /// not mistaken for inline flag syntax.
+    #[test]
+    fn rust_only_inline_flags_are_rejected_for_re2_v1() {
+        for encoding in [Encoding::Utf8, Encoding::Raw] {
+            for pattern in [
+                r"(?u)^x$",
+                r"(?-u:^x$)",
+                r"(?R:^x$)",
+                r"(?-R)^x$",
+                r"(?x)^x$",
+                r"(?im-x:^x$)",
+            ] {
+                let mut cfg = minimal_config();
+                cfg.encoding = encoding;
+                cfg.framing.multiline.line_end_pattern = Some(pattern.to_owned());
+                let err = RuntimeConfig::from_config(cfg, "node-1")
+                    .expect_err(&format!("pattern '{pattern}' must be rejected"));
+                assert!(err.to_string().contains("re2-v1"), "{err}");
+                assert!(
+                    err.to_string()
+                        .contains("only RE2 inline flags i, m, s, and U"),
+                    "{err}"
+                );
+            }
+
+            for pattern in [r"^\(\?u\)$", r"^[?u]+$", r"[[:alpha:](?u)]"] {
+                let mut cfg = minimal_config();
+                cfg.encoding = encoding;
+                cfg.framing.multiline.line_end_pattern = Some(pattern.to_owned());
+                let _runtime = RuntimeConfig::from_config(cfg, "node-1").unwrap_or_else(|err| {
+                    panic!("literal pattern '{pattern}' must validate: {err}")
+                });
+            }
+
             let mut cfg = minimal_config();
-            cfg.framing.multiline.line_end_pattern = Some(pattern.to_owned());
-            let err = RuntimeConfig::from_config(cfg, "node-1")
-                .expect_err(&format!("pattern '{pattern}' must be rejected"));
-            assert!(err.to_string().contains("RE2-compatible"));
+            cfg.encoding = encoding;
+            cfg.framing.multiline.line_end_pattern = Some(r"(?ims-U:^x$)".to_owned());
+            let _runtime = RuntimeConfig::from_config(cfg, "node-1")
+                .expect("all and only RE2 inline flags must validate");
+        }
+    }
+
+    /// Scenario: Text and raw re2-v1 patterns use Perl digit, whitespace,
+    /// word, negated-class, and word-boundary escapes on non-ASCII input.
+    /// Guarantees: The compiled matcher uses RE2's ASCII-only semantics
+    /// instead of Rust regex's default Unicode Perl-class semantics.
+    #[test]
+    fn re2_perl_classes_and_boundaries_are_ascii_only() {
+        for encoding in [Encoding::Utf8, Encoding::Raw] {
+            let matcher_for = |pattern: &str| {
+                let mut cfg = minimal_config();
+                cfg.encoding = encoding;
+                cfg.framing.multiline.line_end_pattern = Some(pattern.to_owned());
+                RuntimeConfig::from_config(cfg, "node-1")
+                    .expect("RE2 Perl-class pattern must validate")
+                    .compiled_multiline_pattern
+                    .expect("configured pattern must compile")
+            };
+
+            let digits = matcher_for(r"^\d+$");
+            assert!(digits.is_match(b"123").unwrap());
+            assert!(!digits.is_match("\u{0661}".as_bytes()).unwrap());
+
+            let not_ascii_digits = matcher_for(r"^[\D]+$");
+            assert!(not_ascii_digits.is_match(b"abc").unwrap());
+            assert!(not_ascii_digits.is_match("\u{0661}".as_bytes()).unwrap());
+
+            let whitespace = matcher_for(r"^\s+$");
+            assert!(whitespace.is_match(b"\t \r").unwrap());
+            assert!(!whitespace.is_match("\u{00a0}".as_bytes()).unwrap());
+
+            let words = matcher_for(r"^\w+$");
+            assert!(words.is_match(b"Az_09").unwrap());
+            assert!(!words.is_match("\u{00e9}".as_bytes()).unwrap());
+
+            let boundary = matcher_for(r"^A\b");
+            assert!(boundary.is_match(b"A").unwrap());
+            assert!(boundary.is_match("A\u{00e9}".as_bytes()).unwrap());
+
+            let not_boundary = matcher_for(r"^A\B");
+            assert!(!not_boundary.is_match("A\u{00e9}".as_bytes()).unwrap());
+        }
+    }
+
+    /// Scenario: Text and raw patterns escape angle brackets outside and
+    /// inside character classes using RE2's escaped-punctuation syntax.
+    /// Guarantees: Escaped punctuation remains literal and cannot inherit
+    /// Rust regex's `\<` and `\>` word-boundary assertion semantics.
+    #[test]
+    fn re2_escaped_punctuation_is_always_literal() {
+        for encoding in [Encoding::Utf8, Encoding::Raw] {
+            let matcher_for = |pattern: &str| {
+                let mut cfg = minimal_config();
+                cfg.encoding = encoding;
+                cfg.framing.multiline.line_end_pattern = Some(pattern.to_owned());
+                RuntimeConfig::from_config(cfg, "node-1")
+                    .expect("escaped RE2 punctuation must validate")
+                    .compiled_multiline_pattern
+                    .expect("configured pattern must compile")
+            };
+
+            let angles = matcher_for(r"^\<START\>$");
+            assert!(angles.is_match(b"<START>").unwrap());
+            assert!(!angles.is_match(b"START").unwrap());
+
+            let angle_class = matcher_for(r"^[\<\>]+$");
+            assert!(angle_class.is_match(b"><>").unwrap());
+            assert!(!angle_class.is_match(b"START").unwrap());
+        }
+    }
+
+    /// Scenario: Text and raw patterns use Unicode property escapes, class
+    /// set operations, or letter escapes that re2-v1 does not execute.
+    /// Guarantees: Constructs whose accepted grammar or semantics would
+    /// differ from the executable RE2 subset fail config validation.
+    #[test]
+    fn re2_v1_rejects_unsupported_properties_class_sets_and_escapes() {
+        for encoding in [Encoding::Utf8, Encoding::Raw] {
+            for pattern in [
+                r"^\p{Greek}+$",
+                r"[a&&b]",
+                r"[a--b]",
+                r"[a~~b]",
+                r"\C",
+                r"\Qliteral\E",
+                r"\e",
+                r"\m",
+                r"[\A]",
+            ] {
+                let mut cfg = minimal_config();
+                cfg.encoding = encoding;
+                cfg.framing.multiline.line_end_pattern = Some(pattern.to_owned());
+                let err = RuntimeConfig::from_config(cfg, "node-1")
+                    .expect_err(&format!("pattern '{pattern}' must be rejected"));
+                assert!(err.to_string().contains("re2-v1"), "{err}");
+            }
+        }
+    }
+
+    /// Scenario: Text and raw patterns use counted repetitions at RE2's
+    /// 1000-count ceiling, above it, without a minimum, and as escaped text.
+    /// Guarantees: Valid bounds through 1000 compile, larger or missing
+    /// minimum bounds are rejected, and escaped braces are not misclassified.
+    #[test]
+    fn re2_counted_repetition_bounds_are_enforced() {
+        for encoding in [Encoding::Utf8, Encoding::Raw] {
+            for pattern in [r"^a{1000}$", r"^a{0,1000}$", r"^\{1001\}$"] {
+                let mut cfg = minimal_config();
+                cfg.encoding = encoding;
+                cfg.framing.multiline.line_end_pattern = Some(pattern.to_owned());
+                let _runtime = RuntimeConfig::from_config(cfg, "node-1")
+                    .unwrap_or_else(|err| panic!("pattern '{pattern}' must validate: {err}"));
+            }
+
+            for pattern in [r"a{1001}", r"a{1,1001}", r"a{1001,}", r"a{,10}"] {
+                let mut cfg = minimal_config();
+                cfg.encoding = encoding;
+                cfg.framing.multiline.line_end_pattern = Some(pattern.to_owned());
+                let err = RuntimeConfig::from_config(cfg, "node-1")
+                    .expect_err(&format!("pattern '{pattern}' must be rejected"));
+                assert!(err.to_string().contains("re2-v1"), "{err}");
+            }
+        }
+    }
+
+    /// Scenario: Text and raw multiline patterns are configured at exactly the durable 4096-byte limit and one byte beyond it, with the oversized input also syntactically invalid.
+    /// Guarantees: The exact limit compiles and profiles successfully, while the oversized pattern is rejected by the byte bound before regex scanning or compilation.
+    #[test]
+    fn multiline_pattern_length_is_bounded_before_compilation() {
+        for encoding in [Encoding::Utf8, Encoding::Raw] {
+            let mut exact = minimal_config();
+            exact.encoding = encoding;
+            exact.framing.multiline.line_end_pattern = Some("a".repeat(FRAMING_PATTERN_MAX_BYTES));
+            let _runtime = RuntimeConfig::from_config(exact, "node-1")
+                .expect("an exact-bound literal pattern must validate");
+
+            let mut oversized = minimal_config();
+            oversized.encoding = encoding;
+            oversized.framing.multiline.line_end_pattern =
+                Some("(".repeat(FRAMING_PATTERN_MAX_BYTES + 1));
+            let err = RuntimeConfig::from_config(oversized, "node-1")
+                .expect_err("an oversized pattern must fail before compilation");
+            assert!(
+                err.to_string()
+                    .contains(&format!("{FRAMING_PATTERN_MAX_BYTES}-byte maximum")),
+                "{err}"
+            );
         }
     }
 
@@ -2437,6 +3178,14 @@ mod tests {
         cfg.framing.multiline.line_end_pattern = Some("^END request$".to_owned());
         let runtime = RuntimeConfig::from_config(cfg, "node-1").expect("must validate");
         assert!(runtime.compiled_multiline_pattern.is_some());
+        assert!(
+            runtime
+                .compiled_multiline_pattern
+                .as_ref()
+                .expect("pattern must be compiled")
+                .is_match(b"END request")
+                .expect("decoded text is valid UTF-8")
+        );
 
         let default_runtime =
             RuntimeConfig::from_config(minimal_config(), "node-1").expect("must validate");
@@ -2444,6 +3193,57 @@ mod tests {
             runtime.framing_profile_digest,
             default_runtime.framing_profile_digest
         );
+    }
+
+    /// Scenario: raw multiline uses plain RE2-compatible `\xFF` to match an
+    /// invalid UTF-8 byte, without a Rust-only inline Unicode flag change.
+    /// Guarantees: the globally non-Unicode byte regex sees the original byte
+    /// and returns `Ok`, rather than requiring `(?-u:...)` or lossy conversion.
+    #[test]
+    fn raw_multiline_matches_invalid_utf8_bytes() {
+        let mut cfg = minimal_config();
+        cfg.encoding = Encoding::Raw;
+        cfg.framing.multiline.line_start_pattern = Some(r"^\xFF$".to_owned());
+        let runtime = RuntimeConfig::from_config(cfg, "node-1").expect("must validate");
+        let pattern = runtime
+            .compiled_multiline_pattern
+            .as_ref()
+            .expect("raw pattern must be compiled");
+
+        assert_eq!(pattern.is_match(&[0xff]), Ok(true));
+        assert_eq!(pattern.is_match("\u{fffd}".as_bytes()), Ok(false));
+    }
+
+    /// Scenario: a compiled text multiline matcher receives invalid UTF-8,
+    /// while an equivalent raw matcher receives the same bytes.
+    /// Guarantees: text matching returns the explicit UTF-8 error in every
+    /// build mode, and raw matching remains byte-oriented and returns `Ok`.
+    #[test]
+    fn multiline_match_reports_invalid_text_utf8_but_raw_accepts_bytes() {
+        let mut text_cfg = minimal_config();
+        text_cfg.framing.multiline.line_start_pattern = Some("^.$".to_owned());
+        let text_runtime =
+            RuntimeConfig::from_config(text_cfg, "node-1").expect("text config must validate");
+        let text_pattern = text_runtime
+            .compiled_multiline_pattern
+            .as_ref()
+            .expect("text pattern must be compiled");
+        let error = text_pattern
+            .is_match(&[0xff])
+            .expect_err("invalid text input must return its UTF-8 error");
+        assert_eq!(error.valid_up_to(), 0);
+        assert_eq!(error.error_len(), Some(1));
+
+        let mut raw_cfg = minimal_config();
+        raw_cfg.encoding = Encoding::Raw;
+        raw_cfg.framing.multiline.line_start_pattern = Some("^.$".to_owned());
+        let raw_runtime =
+            RuntimeConfig::from_config(raw_cfg, "node-1").expect("raw config must validate");
+        let raw_pattern = raw_runtime
+            .compiled_multiline_pattern
+            .as_ref()
+            .expect("raw pattern must be compiled");
+        assert_eq!(raw_pattern.is_match(&[0xff]), Ok(true));
     }
 
     /// Scenario: an empty multiline pattern string is configured.
@@ -2735,10 +3535,10 @@ mod tests {
 
     /// Scenario: `framing.max_record_bytes` is `u64::MAX` and
     /// `batch.max_bytes` is also `u64::MAX`.
-    /// Guarantees: config validation rejects this configuration with an
-    /// `InvalidUserConfig` error (an overflowing logical size) rather than
-    /// accepting it because a saturating comparison would coincidentally
-    /// clamp both sides to the same value.
+    /// Guarantees: config validation rejects this configuration through
+    /// checked framing arithmetic rather than accepting it because a
+    /// saturating comparison would coincidentally clamp both sides to the
+    /// same value.
     #[test]
     fn max_u64_record_bytes_and_batch_bytes_is_rejected() {
         let mut cfg = minimal_config();
@@ -2746,7 +3546,8 @@ mod tests {
         cfg.framing.max_line_bytes = 10;
         cfg.batch.max_bytes = u64::MAX;
         let err = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
-        assert!(err.to_string().contains("overflows u64"));
+        assert!(err.to_string().contains("max_record_bytes"), "{err}");
+        assert!(err.to_string().contains("overflow"), "{err}");
     }
 
     /// Scenario: `ensure_fits_usize` is called with an ordinary in-range
