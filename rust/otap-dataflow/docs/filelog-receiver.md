@@ -1628,28 +1628,92 @@ concurrency does not provide failure isolation.
 
 ## Self-telemetry
 
-Metric set `receiver.filelog` (URN convention): records/bytes emitted,
-batches emitted/acked/nacked/resent, checkpoint persists/failures/duration, files
-discovered/open/quarantined, identity resets, rotations by type, copytruncate
-detections, truncated lines, partial bytes dropped, records dropped on permanent Nack,
-retry attempts/exhaustion, stale completions, WAL bytes/transactions, compaction duration,
-read-paused time (backpressure), discovery scan duration, namespace-lock wait, and
-runtime-file-lease wait. The inventory also includes named counters for
-`pattern_not_matched`, decode failures by policy/result, pending partial bytes at drain,
-pending-candidate queue depth and oldest-retained age, candidate overflow and
-overflowing reconciliation passes, time since successful admission while overflow
-persists, files quarantined by reason, and explicit quarantine resets by action.
+The implementation registers one typed metric set named `receiver.filelog`. It is a
+plain set with no registration-time or measurement attributes. In particular, paths,
+resolved paths, locators, `file_id`, checkpoint IDs, namespaces, patterns, and error
+strings never become metric dimensions. Instrument suffixes and semantics are:
 
-The receiver emits bounded self-telemetry and health events. A distribution or product
-integration is responsible for exposing those signals through an operator-visible
-surface. That integration defines stable names, retention, and bounded dimensions at
-least by machine and data source. Per-file paths must not become unbounded metric
-dimensions; detailed file identity belongs in sampled/rate-limited health events.
-Required operator-visible conditions include pattern fallback, timeout/line/byte
-flushes, decode replacement, truncation, quarantine/unreadable files, identity resets,
-copytruncate detection, checkpoint failures, and tracked-file-limit saturation.
-Pending-candidate overflow is also a required health condition because it indicates
-delayed admission even though reconciliation continues retrying eligibility.
+| Area | Counter or distribution instruments | Current gauges |
+| --- | --- | --- |
+| Lifecycle and health | `lifecycle.starts`, `lifecycle.drains`, `lifecycle.shutdowns`, `lifecycle.failures`, `health_events.suppressed` | -- |
+| Delivery | `records.emitted`, `bytes.source.emitted`, `bytes.logical.emitted`, `batches.emitted`, `batches.acked`, `batches.nacked`, `batches.resent`, `batches.explicit_loss`, `retries.attempted`, `retries.exhausted`, `retry.backoff.duration`, `completions.malformed`, `completions.stale`, `completions.duplicate`, `backpressure.pause.duration` | -- |
+| Checkpoint | `checkpoint.wal.bytes`, `checkpoint.transactions`, `checkpoint.syncs`, `checkpoint.failures`, `checkpoint.persist.duration.total`, `checkpoint.persist.operations`, `checkpoint.sync.duration.total`, `checkpoint.sync.operations`, `checkpoint.compaction.duration.total`, `checkpoint.compactions`, `checkpoint.cleanup.generations`, `checkpoint.cleanup.failures` | `checkpoint.wal.size` |
+| Discovery and admission | `files.discovered`, `files.eligible`, `discovery.observed`, `discovery.updated`, `discovery.removed`, `discovery.scans`, `discovery.scan.errors`, `discovery.scan.duration.total`, `candidates.overflowed`, `candidates.overflow.scans`, `candidates.admission.delay.total`, `candidates.admissions`, `files.tracked.saturation`, `files.descriptor.saturation` | `files.tracked`, `files.pending`, `files.open`, `files.descriptor_blocked`, `files.removed_waiting`, `files.quarantined`, `candidates.oldest.age`, `candidates.overflow.persistence`, `files.tracked.saturated`, `files.descriptor.saturated` |
+| Identity and ownership | `identity.registrations`, `identity.resets`, `identity.recovery_mismatches`, `identity.matches.exact_locator`, `identity.matches.unique_fingerprint`, `ownership.namespace_lock.wait.duration.total`, `ownership.namespace_lock.waits`, `ownership.namespace_lock.contentions`, `ownership.namespace_lock.failures`, `ownership.runtime_lease.wait.duration.total`, `ownership.runtime_lease.waits`, `ownership.runtime_lease.contentions`, `ownership.runtime_lease.failures` | -- |
+| Rotation and truncation | `rotation.move_create`, `rotation.finalizations`, `rotation.late_writes`, `rotation.descriptor_unavailable`, `rotation.copytruncate.detected`, `rotation.copytruncate.fail`, `rotation.copytruncate.read_new` | -- |
+| Framing and loss | `decode.replace.records`, `decode.replace.units`, `decode.preserve_raw.records`, `decode.preserve_raw.units`, `decode.failures`, `records.truncated`, `records.split_fragments`, `bytes.discarded`, `partial.bytes.pending_drain`, `partial.bytes.dropped`, `multiline.pattern_fallback`, `flush.max_lines`, `flush.timeout`, `flush.oversize_line_boundary`, `flush.rotation`, `flush.drain`, `source.bytes.read` | `partial.bytes.pending` |
+| Quarantine | `quarantine.decode`, `quarantine.truncate`, `quarantine.recovery_mismatch`, `quarantine.descriptor_unavailable`, `quarantine.other`, `quarantine.recovery.reset_to_beginning`, `quarantine.recovery.reset_to_end`, `quarantine.recovery.keep_failed`, `quarantine.recovery.remove` | -- |
+
+`records.emitted` and both emitted-byte counters count every successful downstream
+handoff, including resends; `batches.resent` identifies the duplicate attempts.
+`bytes.source.emitted` is the source-progress range represented by the batch, while
+`bytes.logical.emitted` uses the receiver's checked logical-size model.
+
+The worker-to-async telemetry bridge is a fixed-size array of atomic counter slots and
+current-gauge slots. It adds no queue, task, path clone, or Arrow clone. Counter slots
+use saturating addition and transfer with atomic `swap(0)`; a full telemetry reporter
+leaves the hot metric set uncleared, so a later report cannot lose or double count the
+worker delta. Current gauges are loaded again for every collection and terminal
+snapshot. Source progress, Ack handling, and worker commands never wait for a telemetry
+consumer.
+
+Current reader populations and the durable quarantined population are maintained at
+their authoritative state transitions. Self-telemetry work during reading, EOF
+handling, batch sealing, ordinary Ack commit, and collection therefore inspects only
+fixed counters and index lengths; it never scans the reader or checkpoint table.
+`files.open`,
+`files.descriptor_blocked`, and `files.removed_waiting` are refreshed after every
+descriptor or scheduling transition. Discovery clears its pending and age gauges, and
+reader shutdown clears its population gauges, before the terminal bridge drain.
+Before returning a terminal receiver error, the async owner imports final worker
+deltas, increments `lifecycle.failures` once, and makes one bounded reliable submission
+through the receiver's production reporter. A telemetry submission failure never
+replaces the primary receiver error. A fixed terminal warning distinguishes a deferred
+standalone-reporter submission from a disconnected or timed-out submission.
+
+`rotation.copytruncate.detected` and `decode.failures` count accepted evidence or
+detection. They do not claim persistence succeeded. `rotation.copytruncate.fail`,
+`rotation.copytruncate.read_new`, `quarantine.truncate`, and `quarantine.decode`
+increment only after the applicable WAL operation and required sync complete. Likewise,
+`checkpoint.cleanup.generations` counts each retired generation whose full resumable
+cleanup becomes durably complete, including a retry whose files were already unlinked
+before an earlier directory-sync failure. `checkpoint.failures` counts every failed
+checkpoint-store attempt once, whether it occurs during identity admission, a direct
+file transition, Ack commit, periodic maintenance, drain, or shutdown.
+
+The internal telemetry API can merge distributions only on their owning thread.
+Consequently, retry and downstream-backpressure durations use its `Mmsc` distribution,
+while blocking-worker checkpoint persist, sync, compaction, discovery, admission, and
+ownership durations are exported as saturating total-nanosecond counters plus operation
+counts where applicable. Their mean is `duration.total / operations`; no percentile or
+bucket claim is made. Checkpoint persist duration includes any immediate sync performed
+by that append, while the sync total measures that sync separately. Compaction duration
+includes the maintenance call that selected and published the new generation.
+Runtime-lease acquisition has no internal wait queue or locator-availability backoff.
+Its wait duration measures only the single short process-local mutex acquisition
+attempt; a contended locator records one wait, contention, and failure.
+
+Detailed health events use a per-receiver fixed array indexed only by built-in event
+category. The first event in a category is emitted immediately; repeats are suppressed
+for 30 seconds. When the interval refills, the next event carries
+`suppressed_events`, and `filelog_receiver.health_events_suppressed` reports the same
+bounded category and count without entering the limiter recursively. Suppression also
+increments `health_events.suppressed`.
+
+Rate-limited conditions cover downstream backpressure, retries and exhaustion,
+ignored completions, explicit loss, checkpoint commit and maintenance failures,
+discovery errors, candidate overflow, tracked-table and descriptor saturation,
+runtime-lease failure, multiline fallback, decode failure, copy-truncate actions,
+quarantine, late writes, partial-byte drops, drain timeout, cleanup failure, and
+terminal failure. Event fields contain fixed categories and numeric counts or durations,
+not raw source identity, paths, checkpoint namespaces, patterns, or arbitrary error
+strings. Startup and normal drain transitions remain single lifecycle events and do not
+use the repeated-failure limiter.
+
+A distribution or product integration remains responsible for exporting and retaining
+the metric set and events. Administrative quarantine-action counters are updated by
+successful version-1 store operations; this receiver stage does not add a new operator
+state-management API.
 
 ## Phase delivery and validation
 

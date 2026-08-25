@@ -59,6 +59,9 @@ pub const TRUNCATE_RESET_REASON_READ_NEW: u16 = 0x0001;
 
 /// Reserved reason-code value that an encoder MUST NOT produce.
 pub const REASON_CODE_RESERVED: u16 = 0x0000;
+/// Quarantine reason: malformed input was rejected by the decode `fail`
+/// policy.
+pub const QUARANTINE_REASON_DECODE: u16 = 0x0001;
 /// Quarantine reason: recovery evidence existed but could not be inherited
 /// unambiguously and the configured policy was `fail`.
 pub const QUARANTINE_REASON_RECOVERY_MISMATCH: u16 = 0x0003;

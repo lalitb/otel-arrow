@@ -831,6 +831,11 @@ impl Framer {
         self.pattern_not_matched
     }
 
+    /// Transfers the bounded fallback count to the worker telemetry owner.
+    pub(crate) fn take_pattern_not_matched_count(&mut self) -> u64 {
+        std::mem::take(&mut self.pattern_not_matched)
+    }
+
     /// Returns the conservative peak payload-allocation formula.
     pub(crate) fn peak_payload_capacity_bound(&self) -> Result<usize, FramerError> {
         let copies = if self.payload_kind.keeps_source_shadow() {

@@ -50,11 +50,11 @@
 //!
 //! A caller-supplied transaction is validated against the in-memory table
 //! *before* any byte reaches the WAL, so an operation that could not be
-//! replayed can never be persisted. If a durable write fails after the
-//! in-memory table has already advanced, the store marks itself unusable
-//! (see [`StoreError::Unusable`]) instead of continuing with an in-memory
-//! view that no longer matches disk; the durable namespace stays valid and
-//! reopening it recovers the last durable state.
+//! replayed can never be persisted. The staged table transition is committed
+//! only after the append and any required sync succeed. A write error marks
+//! the handle unusable because disk may contain a partial or complete frame;
+//! a failed required sync attempts to restore and sync the prior WAL length.
+//! Reopening always recovers the authoritative WAL state.
 //!
 //! # Resource bounds
 //!
@@ -111,9 +111,9 @@ use super::primitives::{
 };
 use super::snapshot::{SnapshotRecord, decode_snapshot, decode_snapshot_header, encode_snapshot};
 use super::wal::{
-    Operation, QuarantineFile, RegisterFile, RemoveFile, ResetAfterTruncate, ResetQuarantinedFile,
-    Transaction, TransactionScan, UpdateFingerprint, UpdateMetadata, UpdateProgress,
-    WAL_HEADER_LEN, decode_wal_header, encode_wal, scan_one_transaction,
+    Operation, QuarantineFile, RegisterFile, RemoveFile, ResetAfterTruncate, ResetQuarantineAction,
+    ResetQuarantinedFile, Transaction, TransactionScan, UpdateFingerprint, UpdateMetadata,
+    UpdateProgress, WAL_HEADER_LEN, decode_wal_header, encode_wal, scan_one_transaction,
 };
 use crate::receivers::filelog_receiver::config::{
     CheckpointConfig, IdentityConfig, LimitsConfig, RuntimeConfig,
@@ -296,6 +296,32 @@ pub struct StoreStats {
     pub next_sequence: u64,
     /// Number of WAL syncs performed by this store instance.
     pub syncs: u64,
+    /// Current quarantined-record population.
+    pub quarantined_records: usize,
+    /// WAL bytes appended by this store instance, excluding generation headers.
+    pub wal_bytes_appended: u64,
+    /// WAL transactions appended by this store instance across compactions.
+    pub transactions_appended: u64,
+    /// Total measured WAL append latency in nanoseconds.
+    pub persist_duration_ns: u64,
+    /// Number of measured WAL append operations.
+    pub persist_operations: u64,
+    /// Total measured WAL sync latency in nanoseconds.
+    pub sync_duration_ns: u64,
+    /// Number of measured WAL sync operations.
+    pub sync_operations: u64,
+    /// Time spent acquiring the checkpoint namespace lock.
+    pub namespace_lock_wait_ns: u64,
+    /// Failed immediate namespace-lock attempts before acquisition.
+    pub namespace_lock_contentions: u64,
+    /// Durable reset-to-beginning quarantine actions.
+    pub quarantine_reset_beginning: u64,
+    /// Durable reset-to-end quarantine actions.
+    pub quarantine_reset_end: u64,
+    /// Durable keep-failed quarantine actions.
+    pub quarantine_keep_failed: u64,
+    /// Durable administrative removals targeting quarantined state.
+    pub quarantine_removals: u64,
 }
 
 /// Whether a transaction must be synced before the call returns.
@@ -443,6 +469,16 @@ pub struct CheckpointStore {
     unsynced_transactions: u64,
     last_sync: Instant,
     syncs: u64,
+    wal_bytes_appended: u64,
+    transactions_appended: u64,
+    persist_duration_ns: u64,
+    persist_operations: u64,
+    sync_duration_ns: u64,
+    sync_operations: u64,
+    quarantine_reset_beginning: u64,
+    quarantine_reset_end: u64,
+    quarantine_keep_failed: u64,
+    quarantine_removals: u64,
     faults: FaultPlan,
     unusable: Option<&'static str>,
     recovery: RecoveryReport,
@@ -611,6 +647,16 @@ impl CheckpointStore {
             unsynced_transactions: 0,
             last_sync: Instant::now(),
             syncs: 0,
+            wal_bytes_appended: 0,
+            transactions_appended: 0,
+            persist_duration_ns: 0,
+            persist_operations: 0,
+            sync_duration_ns: 0,
+            sync_operations: 0,
+            quarantine_reset_beginning: 0,
+            quarantine_reset_end: 0,
+            quarantine_keep_failed: 0,
+            quarantine_removals: 0,
             faults,
             unusable: None,
             recovery,
@@ -1237,6 +1283,19 @@ impl CheckpointStore {
             unsynced_transactions: self.unsynced_transactions,
             next_sequence: self.next_sequence,
             syncs: self.syncs,
+            quarantined_records: self.table.quarantined_len(),
+            wal_bytes_appended: self.wal_bytes_appended,
+            transactions_appended: self.transactions_appended,
+            persist_duration_ns: self.persist_duration_ns,
+            persist_operations: self.persist_operations,
+            sync_duration_ns: self.sync_duration_ns,
+            sync_operations: self.sync_operations,
+            namespace_lock_wait_ns: duration_nanos(self._lock.waited()),
+            namespace_lock_contentions: self._lock.contentions(),
+            quarantine_reset_beginning: self.quarantine_reset_beginning,
+            quarantine_reset_end: self.quarantine_reset_end,
+            quarantine_keep_failed: self.quarantine_keep_failed,
+            quarantine_removals: self.quarantine_removals,
         }
     }
 
@@ -1275,6 +1334,32 @@ impl CheckpointStore {
             });
         }
         reject_reserved_reason_codes(&operations)?;
+        let mut reset_beginning = 0u64;
+        let mut reset_end = 0u64;
+        let mut keep_failed = 0u64;
+        let mut quarantine_removals = 0u64;
+        for operation in &operations {
+            match operation {
+                Operation::ResetQuarantinedFile(reset) => match reset.action {
+                    ResetQuarantineAction::ResetToBeginning => {
+                        reset_beginning = reset_beginning.saturating_add(1);
+                    }
+                    ResetQuarantineAction::ResetToEnd => {
+                        reset_end = reset_end.saturating_add(1);
+                    }
+                    ResetQuarantineAction::KeepFailed => {
+                        keep_failed = keep_failed.saturating_add(1);
+                    }
+                },
+                Operation::RemoveFile(removal)
+                    if removal.administrative
+                        && removal.expected_prior_state == LifecycleState::Quarantined =>
+                {
+                    quarantine_removals = quarantine_removals.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
         self.ensure_fingerprint_capacity(&operations)?;
         self.ensure_tracked_capacity(&operations)?;
         let policy = sync_policy_for(&operations);
@@ -1300,14 +1385,32 @@ impl CheckpointStore {
         // WAL has no room for must leave the store exactly as it was, so
         // the caller can compact and retry it unchanged.
         self.ensure_wal_capacity(bytes.len() as u64)?;
-        self.table
-            .apply_transaction(&transaction, &self.namespace_id)
+        let staged = self
+            .table
+            .stage_operations(&transaction.operations, &self.namespace_id)
             .map_err(|source| StoreError::Apply {
-                operation: "apply a checkpoint transaction before persisting it",
+                operation: "validate a checkpoint transaction before persisting it",
                 path: self.wal_path.clone(),
                 source,
             })?;
-        self.write_transaction(&bytes, policy, transaction.sequence, operation_count)
+        let started = Instant::now();
+        let result = self.write_transaction(&bytes, policy, transaction.sequence, operation_count);
+        self.persist_duration_ns = self
+            .persist_duration_ns
+            .saturating_add(duration_nanos(started.elapsed()));
+        self.persist_operations = self.persist_operations.saturating_add(1);
+        if let Ok(outcome) = &result {
+            self.table.commit_staged(staged);
+            self.wal_bytes_appended = self.wal_bytes_appended.saturating_add(outcome.bytes);
+            self.transactions_appended = self.transactions_appended.saturating_add(1);
+            self.quarantine_reset_beginning = self
+                .quarantine_reset_beginning
+                .saturating_add(reset_beginning);
+            self.quarantine_reset_end = self.quarantine_reset_end.saturating_add(reset_end);
+            self.quarantine_keep_failed = self.quarantine_keep_failed.saturating_add(keep_failed);
+            self.quarantine_removals = self.quarantine_removals.saturating_add(quarantine_removals);
+        }
+        result
     }
 
     /// Appends `operations` as a series of atomic transactions, each bounded
@@ -1645,6 +1748,13 @@ impl CheckpointStore {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn force_sync_due_for_test(&mut self) {
+        self.last_sync = Instant::now()
+            .checked_sub(self.sync_interval)
+            .unwrap_or(self.last_sync);
+    }
+
     /// Makes every outstanding change durable as part of pipeline drain.
     ///
     /// The sync interval may defer an Ack-driven transaction's sync, so
@@ -1757,7 +1867,7 @@ impl CheckpointStore {
         if self.retired_generations.is_empty() {
             return Ok(0);
         }
-        let mut removed = 0usize;
+        let completed = self.retired_generations.len();
         for generation in self.retired_generations.iter().copied() {
             if generation == self.generation {
                 return Err(StoreError::Unusable {
@@ -1766,9 +1876,8 @@ impl CheckpointStore {
                     reason: "the authoritative generation appeared in the retired list",
                 });
             }
-            if Self::remove_generation_files(&self.namespace_dir, generation, &mut self.faults)? {
-                removed += 1;
-            }
+            let _removed =
+                Self::remove_generation_files(&self.namespace_dir, generation, &mut self.faults)?;
         }
         // Keep the complete pending list until the directory sync succeeds.
         // A retry after either an unlink or sync failure can therefore
@@ -1776,7 +1885,7 @@ impl CheckpointStore {
         self.faults.check(FaultPoint::BeforeRetiredDirectorySync)?;
         fsio::sync_directory(&self.namespace_dir)?;
         self.retired_generations.clear();
-        Ok(removed)
+        Ok(completed)
     }
 
     /// Removes one retired generation's snapshot/WAL pair, reporting
@@ -2080,27 +2189,24 @@ impl CheckpointStore {
     ) -> Result<AppendOutcome, StoreError> {
         if let Err(error) = self.faults.check(FaultPoint::BeforeWalTransactionWrite) {
             self.unusable =
-                Some("a fault was injected before writing an already-applied WAL transaction");
+                Some("a fault was injected before writing a prevalidated WAL transaction");
             return Err(error);
         }
         if let Err(error) = self.faults.check(FaultPoint::DuringWalTransactionWrite) {
             let prefix_len = (bytes.len() / 2).max(1);
             if let Err(source) = self.wal.write_all(&bytes[..prefix_len]) {
-                self.unusable =
-                    Some("a partial WAL transaction write failed after the table had advanced");
+                self.unusable = Some("a partial WAL transaction write failed");
                 return Err(StoreError::Io {
                     operation: "write a partial checkpoint WAL transaction",
                     path: self.wal_path.clone(),
                     source,
                 });
             }
-            self.unusable =
-                Some("a fault left a partial WAL transaction after the table had advanced");
+            self.unusable = Some("a fault left a partial WAL transaction");
             return Err(error);
         }
         if let Err(source) = self.wal.write_all(bytes) {
-            self.unusable =
-                Some("a WAL transaction write failed after the in-memory table had advanced");
+            self.unusable = Some("a WAL transaction write failed with uncertain partial output");
             return Err(StoreError::Io {
                 operation: "append a transaction to the checkpoint WAL",
                 path: self.wal_path.clone(),
@@ -2137,13 +2243,30 @@ impl CheckpointStore {
                 value: self.unsynced_transactions,
             });
         };
+        let wal_bytes_before = self.wal_bytes;
+        let wal_transactions_before = self.wal_transactions;
+        let unsynced_transactions_before = self.unsynced_transactions;
+        let next_sequence_before = self.next_sequence;
         self.wal_bytes = wal_bytes;
         self.next_sequence = next_sequence;
         self.wal_transactions = wal_transactions;
         self.unsynced_transactions = unsynced_transactions;
 
         let synced = if self.should_sync(policy) {
-            self.sync_wal()?;
+            if let Err(error) = self.sync_wal() {
+                if self.wal.set_len(wal_bytes_before).is_ok() && self.wal.sync_data().is_ok() {
+                    self.wal_bytes = wal_bytes_before;
+                    self.wal_transactions = wal_transactions_before;
+                    self.unsynced_transactions = unsynced_transactions_before;
+                    self.next_sequence = next_sequence_before;
+                    self.unusable =
+                        Some("a failed WAL sync was rolled back to the prior durable boundary");
+                } else {
+                    self.unusable =
+                        Some("a failed WAL sync could not be rolled back to a durable boundary");
+                }
+                return Err(error);
+            }
             true
         } else {
             false
@@ -2158,6 +2281,16 @@ impl CheckpointStore {
     }
 
     fn sync_wal(&mut self) -> Result<(), StoreError> {
+        let started = Instant::now();
+        let result = self.sync_wal_inner();
+        self.sync_duration_ns = self
+            .sync_duration_ns
+            .saturating_add(duration_nanos(started.elapsed()));
+        self.sync_operations = self.sync_operations.saturating_add(1);
+        result
+    }
+
+    fn sync_wal_inner(&mut self) -> Result<(), StoreError> {
         let Some(syncs) = self.syncs.checked_add(1) else {
             return Err(StoreError::CounterOverflow {
                 counter: "WAL syncs",
@@ -2189,6 +2322,10 @@ impl CheckpointStore {
         self.syncs = syncs;
         Ok(())
     }
+}
+
+fn duration_nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// The generation `open` selected, and how it was selected.

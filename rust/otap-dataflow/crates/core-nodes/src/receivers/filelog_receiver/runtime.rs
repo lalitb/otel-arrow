@@ -4,6 +4,7 @@
 //! Local async delivery runtime for the blocking filelog worker.
 
 use std::future::pending;
+use std::sync::Arc;
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::time::{Duration, Instant as StdInstant};
 
@@ -18,12 +19,17 @@ use otap_df_engine::{
 };
 use otap_df_otap::pdata::{Context, OtapPdata};
 use otap_df_pdata::OtapPayload;
-use otap_df_telemetry::metrics::MetricSetSnapshot;
+use otap_df_telemetry::metrics::{MetricSet, MetricSetSnapshot};
+use otap_df_telemetry::reporter::ReportOutcome;
 use otap_df_telemetry::{otel_debug, otel_info, otel_warn};
 
 use super::config::RuntimeConfig;
 use super::delivery::{
     BatchKey, CompletionIgnore, DeliveryDecision, PendingBatch, call_data, key_from_call_data,
+};
+use super::telemetry::{
+    FilelogReceiverMetrics, HealthEventCategory, HealthEventLimiter, WorkerTelemetryBridge,
+    add_counter_saturating, duration_ns, terminal_snapshots,
 };
 use super::worker::{
     WORKER_EVENT_CONTROL_SLOTS, WorkerBatch, WorkerCommand, WorkerEvent, WorkerHandle, spawn_worker,
@@ -35,11 +41,15 @@ const WORKER_COMMAND_RETRY_DELAY: Duration = Duration::from_millis(10);
 /// Runtime receiver constructed only after factory validation.
 pub(super) struct FilelogReceiver {
     config: RuntimeConfig,
+    pub(super) metrics: Option<MetricSet<FilelogReceiverMetrics>>,
 }
 
 impl FilelogReceiver {
     pub(super) const fn new(config: RuntimeConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            metrics: None,
+        }
     }
 }
 
@@ -129,23 +139,39 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
         mut control_rx: local::ControlChannel<OtapPdata>,
         effect_handler: local::EffectHandler<OtapPdata>,
     ) -> Result<TerminalState, Error> {
-        let FilelogReceiver { config } = *self;
-        otel_info!(
-            "filelog_receiver.start",
-            checkpoint_id = config.checkpoint_id.as_str()
-        );
+        let FilelogReceiver {
+            config,
+            mut metrics,
+        } = *self;
+        if let Some(metrics) = metrics.as_mut() {
+            add_counter_saturating(&mut metrics.starts, 1);
+        }
+        otel_info!("filelog_receiver.start");
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
-        let mut worker = Some(
-            spawn_worker(config.clone(), event_tx)
-                .map_err(|error| terminal_error(&effect_handler, error.to_string()))?,
-        );
+        let mut health_events = HealthEventLimiter::default();
+        let startup_telemetry = WorkerTelemetryBridge::default();
+        let worker_handle = match spawn_worker(config.clone(), event_tx) {
+            Ok(worker) => worker,
+            Err(error) => {
+                let primary = terminal_error(&effect_handler, error.to_string());
+                return Err(finish_terminal_error(
+                    primary,
+                    &mut metrics,
+                    &startup_telemetry,
+                    &mut health_events,
+                    &effect_handler,
+                )
+                .await);
+            }
+        };
+        let worker_telemetry = Arc::clone(&worker_handle.telemetry);
+        let mut worker = Some(worker_handle);
         let mut pending_batch = None;
         let mut retry_deadline = None;
         let mut drain_deadline = None;
         let mut consecutive_checkpoint_failures = 0u32;
         let mut counters = DeliveryCounters::default();
-
         let result = async {
             loop {
             tokio::select! {
@@ -165,16 +191,25 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                         )
                     })?;
                     if pending_batch.is_some() {
-                        otel_warn!(
-                            "filelog_receiver.drain_timeout",
-                            checkpoint_id = config.checkpoint_id.as_str(),
-                            message = "Drain deadline reached with an unacknowledged retained batch; checkpoint progress remains unchanged"
-                        );
+                        if let Some(suppressed) = admit_health_event(
+                            &mut health_events,
+                            &mut metrics,
+                            HealthEventCategory::DrainTimeout,
+                        ) {
+                            otel_warn!(
+                                "filelog_receiver.drain_timeout",
+                                message = "Drain deadline reached with an unacknowledged retained batch; checkpoint progress remains unchanged",
+                                suppressed_events = suppressed
+                            );
+                        }
                     }
                     shutdown_worker(&mut worker, &mut event_rx, &effect_handler).await?;
                     effect_handler.notify_receiver_drained().await?;
+                    if let Some(metrics) = metrics.as_mut() {
+                        add_counter_saturating(&mut metrics.drains, 1);
+                    }
                     log_delivery_counters(&config, &counters);
-                    return Ok(terminal_state(deadline));
+                    return Ok(terminal_state(deadline, &mut metrics, &worker_telemetry));
                 }
 
                 message = control_rx.recv() => {
@@ -182,6 +217,12 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                         Ok(NodeControlMsg::Ack(ack)) => {
                             counters.record_ack().map_err(|error| terminal_error(&effect_handler, error))?;
                             let decision = completion_ack(&mut pending_batch, &ack.unwind.route.calldata);
+                            record_completion_metrics(
+                                decision,
+                                true,
+                                &mut metrics,
+                                &mut health_events,
+                            );
                             match apply_decision(
                                 decision,
                                 &config,
@@ -190,6 +231,8 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                                 worker_sender(&worker)?,
                                 &effect_handler,
                                 &mut counters,
+                                &mut metrics,
+                                &mut health_events,
                             ).await? {
                                 DecisionOutcome::Continue => {}
                                 DecisionOutcome::Fail(key) => {
@@ -213,6 +256,12 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                                 nack.cause,
                                 &config,
                             );
+                            record_completion_metrics(
+                                decision,
+                                false,
+                                &mut metrics,
+                                &mut health_events,
+                            );
                             match apply_decision(
                                 decision,
                                 &config,
@@ -221,6 +270,8 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                                 worker_sender(&worker)?,
                                 &effect_handler,
                                 &mut counters,
+                                &mut metrics,
+                                &mut health_events,
                             ).await? {
                                 DecisionOutcome::Continue => {}
                                 DecisionOutcome::Fail(key) => {
@@ -245,17 +296,21 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                                 &effect_handler,
                             ).await?;
                             otel_info!(
-                                "filelog_receiver.drain_ingress",
-                                checkpoint_id = config.checkpoint_id.as_str()
+                                "filelog_receiver.drain_ingress"
                             );
                         }
                         Ok(NodeControlMsg::Shutdown { deadline, .. }) => {
                             shutdown_worker(&mut worker, &mut event_rx, &effect_handler).await?;
+                            if let Some(metrics) = metrics.as_mut() {
+                                add_counter_saturating(&mut metrics.shutdowns, 1);
+                            }
                             log_delivery_counters(&config, &counters);
-                            return Ok(terminal_state(deadline));
+                            return Ok(terminal_state(deadline, &mut metrics, &worker_telemetry));
                         }
-                        Ok(NodeControlMsg::CollectTelemetry { .. }
-                            | NodeControlMsg::Config { .. }
+                        Ok(NodeControlMsg::CollectTelemetry { mut metrics_reporter }) => {
+                            report_metrics(&mut metrics, &worker_telemetry, &mut metrics_reporter);
+                        }
+                        Ok(NodeControlMsg::Config { .. }
                             | NodeControlMsg::TimerTick { .. }
                             | NodeControlMsg::Wakeup { .. }
                             | NodeControlMsg::DelayedData { .. }
@@ -331,6 +386,9 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                                 &mut drain_deadline,
                                 &mut pending_batch,
                                 &mut counters,
+                                &mut metrics,
+                                &worker_telemetry,
+                                &mut health_events,
                             ).await? {
                                 SendOutcome::Sent => {
                                     if resend {
@@ -351,13 +409,19 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                                 SendOutcome::DrainDeadline(deadline) => {
                                     shutdown_worker(&mut worker, &mut event_rx, &effect_handler).await?;
                                     effect_handler.notify_receiver_drained().await?;
+                                    if let Some(metrics) = metrics.as_mut() {
+                                        add_counter_saturating(&mut metrics.drains, 1);
+                                    }
                                     log_delivery_counters(&config, &counters);
-                                    return Ok(terminal_state(deadline));
+                                    return Ok(terminal_state(deadline, &mut metrics, &worker_telemetry));
                                 }
                                 SendOutcome::Shutdown(deadline) => {
                                     shutdown_worker(&mut worker, &mut event_rx, &effect_handler).await?;
+                                    if let Some(metrics) = metrics.as_mut() {
+                                        add_counter_saturating(&mut metrics.shutdowns, 1);
+                                    }
                                     log_delivery_counters(&config, &counters);
-                                    return Ok(terminal_state(deadline));
+                                    return Ok(terminal_state(deadline, &mut metrics, &worker_telemetry));
                                 }
                             }
                         }
@@ -385,12 +449,30 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                             }
                             match result {
                                 Ok(()) => {
+                                    record_commit_success(&mut metrics, explicit_loss);
                                     pending_batch = None;
                                     retry_deadline = None;
                                     consecutive_checkpoint_failures = 0;
                                 }
                                 Err(error) => {
                                     counters.record_checkpoint_failure().map_err(|message| terminal_error(&effect_handler, message))?;
+                                    if let Some(metrics) = metrics.as_mut() {
+                                        add_counter_saturating(
+                                            &mut metrics.checkpoint_failures,
+                                            1,
+                                        );
+                                    }
+                                    if let Some(suppressed) = admit_health_event(
+                                        &mut health_events,
+                                        &mut metrics,
+                                        HealthEventCategory::CheckpointCommit,
+                                    ) {
+                                        otel_warn!(
+                                            "filelog_receiver.checkpoint_operation_failed",
+                                            operation = "commit_progress",
+                                            suppressed_events = suppressed
+                                        );
+                                    }
                                     consecutive_checkpoint_failures = consecutive_checkpoint_failures
                                         .checked_add(1)
                                         .ok_or_else(|| terminal_error(
@@ -427,8 +509,11 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                             let deadline = drain_deadline.unwrap_or_else(StdInstant::now);
                             shutdown_worker(&mut worker, &mut event_rx, &effect_handler).await?;
                             effect_handler.notify_receiver_drained().await?;
+                            if let Some(metrics) = metrics.as_mut() {
+                                add_counter_saturating(&mut metrics.drains, 1);
+                            }
                             log_delivery_counters(&config, &counters);
-                            return Ok(terminal_state(deadline));
+                            return Ok(terminal_state(deadline, &mut metrics, &worker_telemetry));
                         }
                         Some(WorkerEvent::Failed(message)) => {
                             close_and_join_worker(&mut worker, &mut event_rx, &effect_handler).await?;
@@ -448,23 +533,41 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
         }
         .await;
 
-        if worker.is_some() {
+        let result = if worker.is_some() {
             let cleanup = shutdown_worker(&mut worker, &mut event_rx, &effect_handler).await;
             match (result, cleanup) {
                 (Ok(terminal), Ok(())) => Ok(terminal),
                 (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
                 (Err(primary), Ok(())) => Err(primary),
                 (Err(primary), Err(cleanup_error)) => {
-                    otel_warn!(
-                        "filelog_receiver.cleanup_failed",
-                        checkpoint_id = config.checkpoint_id.as_str(),
-                        error = cleanup_error.to_string()
-                    );
+                    if let Some(suppressed) = admit_health_event(
+                        &mut health_events,
+                        &mut metrics,
+                        HealthEventCategory::Cleanup,
+                    ) {
+                        otel_warn!(
+                            "filelog_receiver.cleanup_failed",
+                            error_type = "worker_cleanup",
+                            suppressed_events = suppressed
+                        );
+                    }
+                    let _ = cleanup_error;
                     Err(primary)
                 }
             }
         } else {
             result
+        };
+        match result {
+            Ok(terminal) => Ok(terminal),
+            Err(primary) => Err(finish_terminal_error(
+                primary,
+                &mut metrics,
+                &worker_telemetry,
+                &mut health_events,
+                &effect_handler,
+            )
+            .await),
         }
     }
 }
@@ -503,6 +606,8 @@ async fn apply_decision(
     worker_tx: &SyncSender<WorkerCommand>,
     effect_handler: &local::EffectHandler<OtapPdata>,
     counters: &mut DeliveryCounters,
+    metrics: &mut Option<MetricSet<FilelogReceiverMetrics>>,
+    health_events: &mut HealthEventLimiter,
 ) -> Result<DecisionOutcome, Error> {
     match decision {
         DeliveryDecision::Ignored(ignored) => {
@@ -511,11 +616,24 @@ async fn apply_decision(
                 .map_err(|error| terminal_error(effect_handler, error))?;
             Ok(DecisionOutcome::Continue)
         }
-        DeliveryDecision::Commit { key, explicit_loss } => {
+        DeliveryDecision::Commit {
+            key,
+            explicit_loss,
+            exhausted: _,
+        } => {
             if explicit_loss {
                 counters
                     .record_explicit_loss()
                     .map_err(|error| terminal_error(effect_handler, error))?;
+                if let Some(suppressed) =
+                    admit_health_event(health_events, metrics, HealthEventCategory::ExplicitLoss)
+                {
+                    otel_warn!(
+                        "filelog_receiver.batch_explicit_loss",
+                        reason = "drop_and_continue",
+                        suppressed_events = suppressed
+                    );
+                }
             }
             send_worker_command(
                 worker_tx,
@@ -541,13 +659,23 @@ async fn apply_decision(
             counters
                 .record_retry()
                 .map_err(|error| terminal_error(effect_handler, error))?;
+            record_retry_metrics(metrics, backoff);
+            if let Some(suppressed) =
+                admit_health_event(health_events, metrics, HealthEventCategory::Retry)
+            {
+                otel_info!(
+                    "filelog_receiver.batch_retry",
+                    backoff_ns = duration_ns(backoff),
+                    suppressed_events = suppressed
+                );
+            }
             let deadline = StdInstant::now().checked_add(backoff).ok_or_else(|| {
                 terminal_error(effect_handler, "filelog retry deadline overflowed")
             })?;
             *retry_deadline = Some(tokio::time::Instant::from_std(deadline));
             Ok(DecisionOutcome::Continue)
         }
-        DeliveryDecision::Fail { key } => Ok(DecisionOutcome::Fail(key)),
+        DeliveryDecision::Fail { key, exhausted: _ } => Ok(DecisionOutcome::Fail(key)),
     }
 }
 
@@ -562,6 +690,9 @@ async fn send_batch(
     drain_deadline: &mut Option<StdInstant>,
     pending_batch: &mut Option<PendingBatch>,
     counters: &mut DeliveryCounters,
+    metrics: &mut Option<MetricSet<FilelogReceiverMetrics>>,
+    worker_telemetry: &WorkerTelemetryBridge,
+    health_events: &mut HealthEventLimiter,
 ) -> Result<SendOutcome, Error> {
     let WorkerBatch {
         batch_id: _,
@@ -569,6 +700,7 @@ async fn send_batch(
         records,
         record_count,
         logical_bytes,
+        source_bytes,
     } = batch;
     if let Some(deadline) = *drain_deadline
         && StdInstant::now() >= deadline
@@ -584,9 +716,9 @@ async fn send_batch(
     );
     match effect_handler.try_send_message_with_source_node(pdata) {
         Ok(()) => {
+            record_emitted_batch(metrics, key, record_count, source_bytes, logical_bytes);
             otel_debug!(
                 "filelog_receiver.batch_sent",
-                checkpoint_id = config.checkpoint_id.as_str(),
                 batch_id = key.batch_id,
                 attempt = u64::from(key.attempt),
                 record_count = u64::from(record_count),
@@ -595,6 +727,15 @@ async fn send_batch(
             Ok(SendOutcome::Sent)
         }
         Err(TypedError::ChannelSendError(SendError::Full(pdata))) => {
+            let backpressure_started = StdInstant::now();
+            if let Some(suppressed) =
+                admit_health_event(health_events, metrics, HealthEventCategory::Backpressure)
+            {
+                otel_warn!(
+                    "filelog_receiver.downstream_backpressure",
+                    suppressed_events = suppressed
+                );
+            }
             let mut send = Box::pin(effect_handler.send_message_with_source_node(pdata));
             loop {
                 let outcome = tokio::select! {
@@ -640,6 +781,12 @@ async fn send_batch(
                                     pending_batch,
                                     &ack.unwind.route.calldata,
                                 );
+                                record_completion_metrics(
+                                    decision,
+                                    true,
+                                    metrics,
+                                    health_events,
+                                );
                                 record_blocked_completion(decision, counters, effect_handler)?;
                                 continue;
                             }
@@ -654,11 +801,20 @@ async fn send_batch(
                                     nack.cause,
                                     config,
                                 );
+                                record_completion_metrics(
+                                    decision,
+                                    false,
+                                    metrics,
+                                    health_events,
+                                );
                                 record_blocked_completion(decision, counters, effect_handler)?;
                                 continue;
                             }
-                            Ok(NodeControlMsg::CollectTelemetry { .. }
-                                | NodeControlMsg::Config { .. }
+                            Ok(NodeControlMsg::CollectTelemetry { mut metrics_reporter }) => {
+                                report_metrics(metrics, worker_telemetry, &mut metrics_reporter);
+                                continue;
+                            }
+                            Ok(NodeControlMsg::Config { .. }
                                 | NodeControlMsg::TimerTick { .. }
                                 | NodeControlMsg::Wakeup { .. }
                                 | NodeControlMsg::DelayedData { .. }
@@ -676,9 +832,21 @@ async fn send_batch(
                                 format!("failed to send filelog batch downstream: {error}"),
                             )
                         })?;
+                        record_emitted_batch(
+                            metrics,
+                            key,
+                            record_count,
+                            source_bytes,
+                            logical_bytes,
+                        );
                         SendOutcome::Sent
                     }
                 };
+                if let Some(metrics) = metrics.as_mut() {
+                    metrics
+                        .backpressure_pause_duration_ns
+                        .record(duration_ns(backpressure_started.elapsed()) as f64);
+                }
                 return Ok(outcome);
             }
         }
@@ -790,8 +958,203 @@ async fn close_and_join_worker(
     worker_result.map_err(|error| receiver_error(receiver_id, error.to_string()))
 }
 
-fn terminal_state(deadline: StdInstant) -> TerminalState {
-    TerminalState::new::<[MetricSetSnapshot; 0]>(deadline, [])
+fn report_metrics(
+    metrics: &mut Option<MetricSet<FilelogReceiverMetrics>>,
+    bridge: &WorkerTelemetryBridge,
+    reporter: &mut otap_df_telemetry::reporter::MetricsReporter,
+) {
+    if let Some(metrics) = metrics.as_mut() {
+        bridge.drain_into(metrics);
+        let _ = reporter.report(metrics);
+    }
+}
+
+fn record_emitted_batch(
+    metrics: &mut Option<MetricSet<FilelogReceiverMetrics>>,
+    key: BatchKey,
+    record_count: u32,
+    source_bytes: u64,
+    logical_bytes: u64,
+) {
+    let Some(metrics) = metrics.as_mut() else {
+        return;
+    };
+    add_counter_saturating(&mut metrics.batches_emitted, 1);
+    add_counter_saturating(&mut metrics.records_emitted, u64::from(record_count));
+    add_counter_saturating(&mut metrics.source_bytes_emitted, source_bytes);
+    add_counter_saturating(&mut metrics.logical_bytes_emitted, logical_bytes);
+    if key.attempt > 1 {
+        add_counter_saturating(&mut metrics.batches_resent, 1);
+    }
+}
+
+fn record_retry_metrics(
+    metrics: &mut Option<MetricSet<FilelogReceiverMetrics>>,
+    backoff: Duration,
+) {
+    if let Some(metrics) = metrics.as_mut() {
+        add_counter_saturating(&mut metrics.retry_attempts, 1);
+        metrics
+            .retry_backoff_duration_ns
+            .record(duration_ns(backoff) as f64);
+    }
+}
+
+fn record_commit_success(
+    metrics: &mut Option<MetricSet<FilelogReceiverMetrics>>,
+    explicit_loss: bool,
+) {
+    if explicit_loss && let Some(metrics) = metrics.as_mut() {
+        add_counter_saturating(&mut metrics.batches_explicit_loss, 1);
+    }
+}
+
+fn record_completion_metrics(
+    decision: DeliveryDecision,
+    ack: bool,
+    metrics: &mut Option<MetricSet<FilelogReceiverMetrics>>,
+    health_events: &mut HealthEventLimiter,
+) {
+    match decision {
+        DeliveryDecision::Ignored(ignored) => {
+            if let Some(metrics) = metrics.as_mut() {
+                let counter = match ignored {
+                    CompletionIgnore::Malformed => &mut metrics.malformed_completions,
+                    CompletionIgnore::Stale => &mut metrics.stale_completions,
+                    CompletionIgnore::Duplicate => &mut metrics.duplicate_completions,
+                };
+                add_counter_saturating(counter, 1);
+            }
+            if let Some(suppressed) =
+                admit_health_event(health_events, metrics, HealthEventCategory::Completion)
+            {
+                let completion_type = match ignored {
+                    CompletionIgnore::Malformed => "malformed",
+                    CompletionIgnore::Stale => "stale",
+                    CompletionIgnore::Duplicate => "duplicate",
+                };
+                otel_warn!(
+                    "filelog_receiver.completion_ignored",
+                    completion_type = completion_type,
+                    suppressed_events = suppressed
+                );
+            }
+        }
+        DeliveryDecision::Commit { exhausted, .. } | DeliveryDecision::Fail { exhausted, .. } => {
+            if let Some(metrics) = metrics.as_mut() {
+                if ack {
+                    add_counter_saturating(&mut metrics.batches_acked, 1);
+                } else {
+                    add_counter_saturating(&mut metrics.batches_nacked, 1);
+                }
+                if exhausted {
+                    add_counter_saturating(&mut metrics.retry_exhausted, 1);
+                }
+            }
+            if !ack
+                && let Some(suppressed) =
+                    admit_health_event(health_events, metrics, HealthEventCategory::Retry)
+            {
+                otel_warn!(
+                    "filelog_receiver.batch_retry_terminal",
+                    exhausted = exhausted,
+                    suppressed_events = suppressed
+                );
+            }
+        }
+        DeliveryDecision::Retry { .. } => {
+            if let Some(metrics) = metrics.as_mut() {
+                add_counter_saturating(&mut metrics.batches_nacked, 1);
+            }
+        }
+    }
+}
+
+fn admit_health_event(
+    limiter: &mut HealthEventLimiter,
+    metrics: &mut Option<MetricSet<FilelogReceiverMetrics>>,
+    category: HealthEventCategory,
+) -> Option<u64> {
+    match limiter.admit(category, StdInstant::now()) {
+        Some(suppressed) => {
+            if suppressed != 0 {
+                otel_info!(
+                    "filelog_receiver.health_events_suppressed",
+                    category = category.as_str(),
+                    suppressed_events = suppressed
+                );
+            }
+            Some(suppressed)
+        }
+        None => {
+            if let Some(metrics) = metrics.as_mut() {
+                add_counter_saturating(&mut metrics.health_events_suppressed, 1);
+            }
+            None
+        }
+    }
+}
+
+fn record_terminal_failure(
+    metrics: &mut Option<MetricSet<FilelogReceiverMetrics>>,
+    health_events: &mut HealthEventLimiter,
+) {
+    if let Some(metrics) = metrics.as_mut() {
+        add_counter_saturating(&mut metrics.terminal_failures, 1);
+    }
+    if let Some(suppressed) =
+        admit_health_event(health_events, metrics, HealthEventCategory::Terminal)
+    {
+        otel_warn!(
+            "filelog_receiver.terminal_failure",
+            error_type = "receiver",
+            suppressed_events = suppressed
+        );
+    }
+}
+
+async fn finish_terminal_error(
+    primary: Error,
+    metrics: &mut Option<MetricSet<FilelogReceiverMetrics>>,
+    bridge: &WorkerTelemetryBridge,
+    health_events: &mut HealthEventLimiter,
+    effect_handler: &local::EffectHandler<OtapPdata>,
+) -> Error {
+    if let Some(metrics) = metrics.as_mut() {
+        bridge.drain_into(metrics);
+    }
+    record_terminal_failure(metrics, health_events);
+    if let Some(metrics) = metrics.as_mut() {
+        match effect_handler.report_metrics_reliably(metrics).await {
+            Ok(ReportOutcome::Sent) => {}
+            Ok(ReportOutcome::Deferred) => {
+                otel_warn!(
+                    "filelog_receiver.terminal_metrics_deferred",
+                    report_outcome = "deferred"
+                );
+            }
+            Err(_) => {
+                otel_warn!(
+                    "filelog_receiver.terminal_metrics_failed",
+                    error_type = "telemetry"
+                );
+            }
+        }
+    }
+    primary
+}
+
+fn terminal_state(
+    deadline: StdInstant,
+    metrics: &mut Option<MetricSet<FilelogReceiverMetrics>>,
+    bridge: &WorkerTelemetryBridge,
+) -> TerminalState {
+    let snapshots = terminal_snapshots(metrics, bridge);
+    if snapshots.is_empty() {
+        TerminalState::new::<[MetricSetSnapshot; 0]>(deadline, [])
+    } else {
+        TerminalState::new(deadline, snapshots)
+    }
 }
 
 fn receiver_error(receiver: otap_df_engine::node::NodeId, error: impl Into<String>) -> Error {
@@ -811,9 +1174,9 @@ fn terminal_error(
 }
 
 fn log_delivery_counters(config: &RuntimeConfig, counters: &DeliveryCounters) {
+    let _ = config;
     otel_debug!(
         "filelog_receiver.delivery_summary",
-        checkpoint_id = config.checkpoint_id.as_str(),
         acks = counters.acks,
         nacks = counters.nacks,
         retries = counters.retries,
@@ -831,6 +1194,7 @@ mod tests {
     use std::collections::HashMap;
 
     use otap_df_channel::mpsc;
+    use otap_df_engine::context::ControllerContext;
     use otap_df_engine::control::{
         AckMsg, NackCause, NackMsg, RuntimeControlMsg, runtime_ctrl_msg_channel,
     };
@@ -840,6 +1204,7 @@ mod tests {
     use otap_df_engine::testing::{setup_test_runtime, test_node};
     use otap_df_otap::testing::{next_ack, next_nack};
     use otap_df_pdata::otap::{Logs, OtapArrowRecords};
+    use otap_df_telemetry::registry::TelemetryRegistryHandle;
     use otap_df_telemetry::reporter::MetricsReporter;
     use serde_json::json;
     use tempfile::tempdir;
@@ -848,6 +1213,7 @@ mod tests {
     use crate::receivers::filelog_receiver::StartAt;
     use crate::receivers::filelog_receiver::checkpoint::store::{CheckpointStore, StoreOptions};
     use crate::receivers::filelog_receiver::config::Config;
+    use crate::receivers::filelog_receiver::telemetry::WorkerCounter;
 
     fn runtime_config() -> RuntimeConfig {
         let config: Config = serde_json::from_value(json!({
@@ -873,7 +1239,275 @@ mod tests {
             records: OtapArrowRecords::Logs(Logs::default()),
             record_count: 1,
             logical_bytes: 128,
+            source_bytes: 5,
         }
+    }
+
+    fn registered_metrics() -> Option<MetricSet<FilelogReceiverMetrics>> {
+        let controller = ControllerContext::new(TelemetryRegistryHandle::new());
+        let pipeline = controller.pipeline_context_with("group".into(), "pipeline".into(), 0, 1, 0);
+        Some(FilelogReceiverMetrics::register(&pipeline))
+    }
+
+    fn terminal_metric_value(
+        snapshot: &MetricSetSnapshot,
+        name: &str,
+    ) -> otap_df_telemetry::metrics::MetricValue {
+        let index = snapshot
+            .descriptor()
+            .metrics
+            .iter()
+            .position(|field| field.name == name)
+            .expect("terminal metric exists");
+        snapshot.get_metrics()[index].clone()
+    }
+
+    /// Scenario: initial send, resend, Ack, retryable Nack, exhausted Nack,
+    /// explicit loss, and every ignored completion category are observed.
+    /// Guarantees: delivery telemetry increments each authoritative outcome
+    /// exactly once and keeps resend, retry, exhaustion, and completion
+    /// classifications distinct.
+    #[test]
+    fn delivery_metrics_classify_every_completion_and_send_exactly() {
+        let mut metrics = registered_metrics();
+        let mut health_events = HealthEventLimiter::default();
+        record_emitted_batch(&mut metrics, BatchKey::new(1, 1).unwrap(), 2, 10, 100);
+        record_emitted_batch(&mut metrics, BatchKey::new(1, 2).unwrap(), 2, 10, 100);
+        record_completion_metrics(
+            DeliveryDecision::Commit {
+                key: BatchKey::new(1, 2).unwrap(),
+                explicit_loss: false,
+                exhausted: false,
+            },
+            true,
+            &mut metrics,
+            &mut health_events,
+        );
+        record_completion_metrics(
+            DeliveryDecision::Retry {
+                current: BatchKey::new(2, 1).unwrap(),
+                next_attempt: 2,
+                backoff: Duration::from_millis(25),
+            },
+            false,
+            &mut metrics,
+            &mut health_events,
+        );
+        record_completion_metrics(
+            DeliveryDecision::Fail {
+                key: BatchKey::new(2, 2).unwrap(),
+                exhausted: true,
+            },
+            false,
+            &mut metrics,
+            &mut health_events,
+        );
+        for ignored in [
+            CompletionIgnore::Malformed,
+            CompletionIgnore::Stale,
+            CompletionIgnore::Duplicate,
+        ] {
+            record_completion_metrics(
+                DeliveryDecision::Ignored(ignored),
+                true,
+                &mut metrics,
+                &mut health_events,
+            );
+        }
+        record_retry_metrics(&mut metrics, Duration::from_millis(25));
+        record_commit_success(&mut metrics, true);
+
+        let metrics = metrics.unwrap();
+        assert_eq!(metrics.batches_emitted.get(), 2);
+        assert_eq!(metrics.batches_resent.get(), 1);
+        assert_eq!(metrics.records_emitted.get(), 4);
+        assert_eq!(metrics.source_bytes_emitted.get(), 20);
+        assert_eq!(metrics.logical_bytes_emitted.get(), 200);
+        assert_eq!(metrics.batches_acked.get(), 1);
+        assert_eq!(metrics.batches_nacked.get(), 2);
+        assert_eq!(metrics.retry_attempts.get(), 1);
+        assert_eq!(metrics.retry_exhausted.get(), 1);
+        assert_eq!(metrics.batches_explicit_loss.get(), 1);
+        assert_eq!(metrics.malformed_completions.get(), 1);
+        assert_eq!(metrics.stale_completions.get(), 1);
+        assert_eq!(metrics.duplicate_completions.get(), 1);
+        assert_eq!(metrics.retry_backoff_duration_ns.get().count, 1);
+        assert_eq!(
+            metrics.retry_backoff_duration_ns.get().sum,
+            duration_ns(Duration::from_millis(25)) as f64
+        );
+    }
+
+    /// Scenario: a terminal receiver error follows an uncollected worker
+    /// counter while the production reporter has capacity.
+    /// Guarantees: the final worker delta and exactly one lifecycle failure
+    /// are submitted reliably before the unchanged primary error is returned.
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_error_reliably_reports_final_worker_metrics_once() {
+        let (metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(2);
+        let (runtime_tx, _runtime_rx) = runtime_ctrl_msg_channel(1);
+        let effect_handler = local::EffectHandler::new(
+            test_node("filelog"),
+            HashMap::new(),
+            None,
+            runtime_tx,
+            metrics_reporter,
+        );
+        let mut metrics = registered_metrics();
+        let bridge = WorkerTelemetryBridge::default();
+        bridge.add(WorkerCounter::SourceBytesRead, 9);
+        let mut health_events = HealthEventLimiter::default();
+        let primary = terminal_error(&effect_handler, "primary receiver failure");
+
+        let returned = finish_terminal_error(
+            primary,
+            &mut metrics,
+            &bridge,
+            &mut health_events,
+            &effect_handler,
+        )
+        .await;
+        assert!(returned.to_string().contains("primary receiver failure"));
+        let snapshot = metrics_rx.recv().unwrap();
+        assert_eq!(
+            terminal_metric_value(&snapshot, "lifecycle.failures"),
+            otap_df_telemetry::metrics::MetricValue::U64(1)
+        );
+        assert_eq!(
+            terminal_metric_value(&snapshot, "source.bytes.read"),
+            otap_df_telemetry::metrics::MetricValue::U64(9)
+        );
+        assert!(metrics_rx.try_recv().is_err());
+    }
+
+    /// Scenario: terminal telemetry reporting fails after cleanup has already
+    /// produced the primary receiver error.
+    /// Guarantees: reporting neither replaces the primary error nor repeats
+    /// lifecycle accounting, and the unsent hot set remains available.
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_reporter_failure_does_not_mask_primary_error() {
+        let (metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
+        drop(metrics_rx);
+        let (runtime_tx, _runtime_rx) = runtime_ctrl_msg_channel(1);
+        let effect_handler = local::EffectHandler::new(
+            test_node("filelog"),
+            HashMap::new(),
+            None,
+            runtime_tx,
+            metrics_reporter,
+        );
+        let mut metrics = registered_metrics();
+        let bridge = WorkerTelemetryBridge::default();
+        bridge.add(WorkerCounter::SourceBytesRead, 4);
+        let mut health_events = HealthEventLimiter::default();
+        let primary = terminal_error(&effect_handler, "primary receiver failure");
+
+        let returned = finish_terminal_error(
+            primary,
+            &mut metrics,
+            &bridge,
+            &mut health_events,
+            &effect_handler,
+        )
+        .await;
+        assert!(returned.to_string().contains("primary receiver failure"));
+        let metrics = metrics.expect("failed report retains the hot metric set");
+        assert_eq!(metrics.terminal_failures.get(), 1);
+        assert_eq!(metrics.source_bytes_read.get(), 4);
+    }
+
+    /// Scenario: terminal telemetry uses a standalone reporter whose bounded
+    /// channel already contains an earlier snapshot.
+    /// Guarantees: a deferred terminal snapshot emits a fixed failure signal,
+    /// preserves the primary error, and retains every hot metric for diagnosis.
+    #[tokio::test(flavor = "current_thread")]
+    async fn full_terminal_reporter_retains_unsent_metrics() {
+        let (metrics_rx, mut metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
+        let mut occupying_metrics = registered_metrics().unwrap();
+        add_counter_saturating(&mut occupying_metrics.starts, 1);
+        assert_eq!(
+            metrics_reporter
+                .report_with_outcome(&mut occupying_metrics)
+                .unwrap(),
+            ReportOutcome::Sent
+        );
+        let (runtime_tx, _runtime_rx) = runtime_ctrl_msg_channel(1);
+        let effect_handler = local::EffectHandler::new(
+            test_node("filelog"),
+            HashMap::new(),
+            None,
+            runtime_tx,
+            metrics_reporter,
+        );
+        let mut metrics = registered_metrics();
+        let bridge = WorkerTelemetryBridge::default();
+        bridge.add(WorkerCounter::SourceBytesRead, 6);
+        let mut health_events = HealthEventLimiter::default();
+        let primary = terminal_error(&effect_handler, "primary receiver failure");
+
+        let returned = finish_terminal_error(
+            primary,
+            &mut metrics,
+            &bridge,
+            &mut health_events,
+            &effect_handler,
+        )
+        .await;
+
+        assert!(returned.to_string().contains("primary receiver failure"));
+        let metrics = metrics.expect("deferred report retains the hot metric set");
+        assert_eq!(metrics.terminal_failures.get(), 1);
+        assert_eq!(metrics.source_bytes_read.get(), 6);
+        let _occupying_snapshot = metrics_rx.recv().unwrap();
+        assert!(metrics_rx.try_recv().is_err());
+    }
+
+    /// Scenario: worker setup cannot acquire the checkpoint namespace and
+    /// therefore never produces a usable runtime handle.
+    /// Guarantees: start and one terminal failure plus the last setup counter
+    /// reach the owned reporter before the receiver returns its setup error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_worker_setup_reports_start_failure_and_worker_delta() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("unused.log");
+        let mut runtime = source_runtime(&source, &directory.path().join("checkpoint"));
+        runtime.checkpoint.ownership_timeout = Duration::from_millis(20);
+        let _namespace_owner =
+            CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
+        let (control_tx, control_rx) = mpsc::Channel::new(1);
+        let control_rx =
+            local::ControlChannel::new(EngineReceiver::Local(LocalReceiver::mpsc(control_rx)));
+        let (metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(2);
+        let (runtime_tx, _runtime_rx) = runtime_ctrl_msg_channel(1);
+        let effect_handler = local::EffectHandler::new(
+            test_node("filelog"),
+            HashMap::new(),
+            None,
+            runtime_tx,
+            metrics_reporter,
+        );
+        let mut receiver = FilelogReceiver::new(runtime);
+        receiver.metrics = registered_metrics();
+
+        let error = match Box::new(receiver).start(control_rx, effect_handler).await {
+            Ok(_) => panic!("namespace contention unexpectedly started the receiver"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("namespace"));
+        let snapshot = metrics_rx.recv().unwrap();
+        assert_eq!(
+            terminal_metric_value(&snapshot, "lifecycle.starts"),
+            otap_df_telemetry::metrics::MetricValue::U64(1)
+        );
+        assert_eq!(
+            terminal_metric_value(&snapshot, "lifecycle.failures"),
+            otap_df_telemetry::metrics::MetricValue::U64(1)
+        );
+        assert_eq!(
+            terminal_metric_value(&snapshot, "ownership.namespace_lock.failures"),
+            otap_df_telemetry::metrics::MetricValue::U64(1)
+        );
+        drop(control_tx);
     }
 
     fn source_runtime(source: &std::path::Path, namespace_dir: &std::path::Path) -> RuntimeConfig {
@@ -931,6 +1565,9 @@ mod tests {
         let mut drain_deadline = None;
         let mut pending_batch = None;
         let mut counters = DeliveryCounters::default();
+        let mut metrics = None;
+        let worker_telemetry = WorkerTelemetryBridge::default();
+        let mut health_events = HealthEventLimiter::default();
 
         let outcome = send_batch(
             worker_batch(),
@@ -942,6 +1579,9 @@ mod tests {
             &mut drain_deadline,
             &mut pending_batch,
             &mut counters,
+            &mut metrics,
+            &worker_telemetry,
+            &mut health_events,
         )
         .await
         .unwrap();
@@ -992,6 +1632,9 @@ mod tests {
         let mut drain_deadline = None;
         let mut pending_batch = None;
         let mut counters = DeliveryCounters::default();
+        let mut metrics = None;
+        let worker_telemetry = WorkerTelemetryBridge::default();
+        let mut health_events = HealthEventLimiter::default();
 
         let outcome = send_batch(
             worker_batch(),
@@ -1003,6 +1646,9 @@ mod tests {
             &mut drain_deadline,
             &mut pending_batch,
             &mut counters,
+            &mut metrics,
+            &worker_telemetry,
+            &mut health_events,
         )
         .await
         .unwrap();
@@ -1048,9 +1694,9 @@ mod tests {
                 metrics_reporter,
             );
             let receiver = tokio::task::spawn_local(async move {
-                Box::new(FilelogReceiver::new(runtime))
-                    .start(control_rx, effect_handler)
-                    .await
+                let mut filelog = FilelogReceiver::new(runtime);
+                filelog.metrics = registered_metrics();
+                Box::new(filelog).start(control_rx, effect_handler).await
             });
 
             let forwarded = tokio::time::timeout(Duration::from_secs(5), output_rx.recv())
@@ -1077,6 +1723,19 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(terminal.deadline(), deadline);
+            assert_eq!(terminal.metrics().len(), 1);
+            assert_eq!(
+                terminal_metric_value(&terminal.metrics()[0], "lifecycle.starts"),
+                otap_df_telemetry::metrics::MetricValue::U64(1)
+            );
+            assert_eq!(
+                terminal_metric_value(&terminal.metrics()[0], "lifecycle.drains"),
+                otap_df_telemetry::metrics::MetricValue::U64(1)
+            );
+            assert_eq!(
+                terminal_metric_value(&terminal.metrics()[0], "batches.acked"),
+                otap_df_telemetry::metrics::MetricValue::U64(1)
+            );
             assert!(matches!(
                 runtime_rx.recv().await.unwrap(),
                 RuntimeControlMsg::ReceiverDrained { .. }

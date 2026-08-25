@@ -232,6 +232,7 @@ fn quarantine_removal_rejects_a_record_that_is_now_active() {
     let _quarantined = store
         .quarantine_files(vec![quarantine(1)])
         .expect("quarantines");
+    assert_eq!(store.stats().quarantined_records, 1);
     let _reset = store
         .reset_quarantined_file(ResetQuarantinedFile {
             file_id: file_id(1),
@@ -244,6 +245,7 @@ fn quarantine_removal_rejects_a_record_that_is_now_active() {
             audit_reason: "release".to_owned(),
         })
         .expect("resets");
+    assert_eq!(store.stats().quarantined_records, 0);
     assert!(matches!(
         store
             .remove_quarantined_file(file_id(1), 1, 2, "stale purge".to_owned())
@@ -577,6 +579,29 @@ fn progress(seed: u8, from: u64, to: u64) -> UpdateProgress {
         new_last_seen_time_unix_nano: 2_000,
         finalize: false,
     }
+}
+
+/// Scenario: one immediate-durability registration is appended to a newly
+/// opened checkpoint store.
+/// Guarantees: byte, transaction, persist-operation, sync-operation, and
+/// namespace-lock telemetry sources advance once without changing durable
+/// transition behavior.
+#[test]
+fn store_stats_expose_authoritative_persistence_telemetry() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = CheckpointStore::open(options(directory.path())).unwrap();
+    let before = store.stats();
+    let outcome = store
+        .append(vec![Operation::RegisterFile(registration(1))])
+        .unwrap();
+    let after = store.stats();
+
+    assert_eq!(after.wal_bytes_appended, outcome.bytes);
+    assert_eq!(after.transactions_appended, 1);
+    assert_eq!(after.persist_operations, 1);
+    assert_eq!(after.syncs, before.syncs + 1);
+    assert_eq!(after.sync_operations, 1);
+    assert!(after.namespace_lock_wait_ns >= before.namespace_lock_wait_ns);
 }
 
 fn quarantine(seed: u8) -> QuarantineFile {
@@ -1150,6 +1175,7 @@ fn required_operations_sync_immediately_despite_the_interval() {
         .quarantine_files(vec![quarantine(2)])
         .expect("quarantine succeeds");
     assert!(outcomes[0].synced);
+    assert_eq!(store.stats().quarantined_records, 1);
 
     let outcome = store
         .reset_quarantined_file(ResetQuarantinedFile {
@@ -1165,9 +1191,12 @@ fn required_operations_sync_immediately_despite_the_interval() {
         .expect("quarantine reset succeeds");
     assert!(outcome.synced);
     assert_eq!(store.stats().unsynced_transactions, 0);
+    assert_eq!(store.stats().quarantined_records, 0);
+    assert_eq!(store.stats().quarantine_reset_beginning, 1);
     drop(store);
 
     let reopened = open(&path);
+    assert_eq!(reopened.stats().quarantined_records, 0);
     let reset = reopened
         .table()
         .get(&file_id(1))
@@ -1377,7 +1406,10 @@ fn wal_append_faults_recover_only_complete_transactions() {
         let reopened = open(&path);
         let transaction_was_complete = !matches!(
             point,
-            FaultPoint::BeforeWalTransactionWrite | FaultPoint::DuringWalTransactionWrite
+            FaultPoint::BeforeWalTransactionWrite
+                | FaultPoint::DuringWalTransactionWrite
+                | FaultPoint::BeforeWalSync
+                | FaultPoint::AfterWalSync
         );
         assert_eq!(
             reopened.table().get(&file_id(1)).is_some(),
@@ -2833,8 +2865,8 @@ fn windows_marker_sharing_violation_preserves_the_old_generation() {
 /// between its two unlinks, or before the final directory sync.
 /// Guarantees: the complete pending list remains recorded through every
 /// failure, including when both entries are gone but their unlinks are not
-/// yet durable, so a retry repeats the idempotent removals and durability
-/// boundary before clearing the list.
+/// yet durable, so a retry counts the generation when its complete cleanup
+/// becomes durable rather than undercounting already-unlinked files.
 #[test]
 fn cleanup_preserves_the_remainder_and_retries_after_a_partial_failure() {
     for point in FaultPoint::CLEANUP {
@@ -2885,9 +2917,8 @@ fn cleanup_preserves_the_remainder_and_retries_after_a_partial_failure() {
         let removed = store
             .cleanup_retired_generations()
             .expect("the retry completes the remaining work");
-        let expected_removed = usize::from(point != FaultPoint::BeforeRetiredDirectorySync);
         assert_eq!(
-            removed, expected_removed,
+            removed, 1,
             "the retry after a fault at {point} reported the wrong removals"
         );
         assert!(store.retired_generations().is_empty());

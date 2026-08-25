@@ -80,6 +80,7 @@ mod identity;
 mod lease;
 mod reader;
 mod runtime;
+mod telemetry;
 mod worker;
 
 use config::RuntimeConfig;
@@ -91,6 +92,7 @@ pub use config::{
     MultilineConfig, OnDecodeError, OnNack, OnRecoveryMismatch, OnTruncate, RegexProfile,
     RetryConfig, RotationConfig, StartAt,
 };
+pub use telemetry::FilelogReceiverMetrics;
 
 #[allow(unsafe_code)]
 #[otap_df_engine::component_inventory(category = Receiver)]
@@ -130,8 +132,10 @@ fn create_filelog_receiver(
         }
     })?;
     let runtime = RuntimeConfig::from_config(parsed, &default_checkpoint_id)?;
+    let mut receiver = FilelogReceiver::new(runtime);
+    receiver.metrics = Some(FilelogReceiverMetrics::register(&pipeline));
     Ok(ReceiverWrapper::local(
-        FilelogReceiver::new(runtime),
+        receiver,
         node,
         node_config,
         receiver_config,

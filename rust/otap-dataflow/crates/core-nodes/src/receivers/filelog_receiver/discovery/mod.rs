@@ -13,7 +13,7 @@ pub(crate) mod scanner;
 pub(crate) mod source;
 
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use thiserror::Error;
 
@@ -78,6 +78,16 @@ pub(crate) struct DiscoveryStats {
     pub(crate) pending_candidates: usize,
     /// Candidate transitions in the emitted batch.
     pub(crate) emitted_events: usize,
+    /// Wall-clock duration of the filesystem reconciliation pass.
+    pub(crate) scan_duration: Duration,
+    /// Age of the oldest retained pending candidate.
+    pub(crate) oldest_pending_age: Duration,
+    /// Sum of admission delays for candidates emitted by this pass.
+    pub(crate) admission_delay: Duration,
+    /// Candidates contributing to `admission_delay`.
+    pub(crate) admissions: u64,
+    /// Age of a continuously observed overflow condition.
+    pub(crate) overflow_persistence: Duration,
     /// Whether the pass observed the complete eligible bounded population.
     pub(crate) complete: bool,
     /// First actionable scan issue; later issues are counted but not retained.
@@ -94,6 +104,11 @@ impl DiscoveryStats {
             scan_errors: 0,
             pending_candidates: 0,
             emitted_events: 0,
+            scan_duration: Duration::ZERO,
+            oldest_pending_age: Duration::ZERO,
+            admission_delay: Duration::ZERO,
+            admissions: 0,
+            overflow_persistence: Duration::ZERO,
             complete: true,
             first_issue: None,
         }

@@ -134,6 +134,7 @@ impl PendingBatch {
         DeliveryDecision::Commit {
             key,
             explicit_loss: false,
+            exhausted: false,
         }
     }
 
@@ -160,7 +161,7 @@ impl PendingBatch {
             !permanent && matches!(cause, NackCause::RouteFull | NackCause::Unspecified);
         if retryable && key.attempt < retry.max_attempts {
             let Some(next_attempt) = key.attempt.checked_add(1) else {
-                return self.apply_policy(key, on_nack);
+                return self.apply_policy(key, on_nack, true);
             };
             let backoff = retry_backoff(retry, key.attempt);
             self.next_attempt = Some(next_attempt);
@@ -172,14 +173,19 @@ impl PendingBatch {
             };
         }
 
-        self.apply_policy(key, on_nack)
+        self.apply_policy(key, on_nack, retryable && key.attempt >= retry.max_attempts)
     }
 
-    fn apply_policy(&mut self, key: BatchKey, on_nack: OnNack) -> DeliveryDecision {
+    fn apply_policy(
+        &mut self,
+        key: BatchKey,
+        on_nack: OnNack,
+        exhausted: bool,
+    ) -> DeliveryDecision {
         match on_nack {
             OnNack::Fail => {
                 self.state = PendingState::Terminal;
-                DeliveryDecision::Fail { key }
+                DeliveryDecision::Fail { key, exhausted }
             }
             OnNack::DropAndContinue => {
                 self.explicit_loss = true;
@@ -187,6 +193,7 @@ impl PendingBatch {
                 DeliveryDecision::Commit {
                     key,
                     explicit_loss: true,
+                    exhausted,
                 }
             }
         }
@@ -208,6 +215,7 @@ pub(crate) enum DeliveryDecision {
     Commit {
         key: BatchKey,
         explicit_loss: bool,
+        exhausted: bool,
     },
     Retry {
         current: BatchKey,
@@ -216,6 +224,7 @@ pub(crate) enum DeliveryDecision {
     },
     Fail {
         key: BatchKey,
+        exhausted: bool,
     },
 }
 
@@ -303,6 +312,7 @@ mod tests {
             DeliveryDecision::Commit {
                 key: expected,
                 explicit_loss: false,
+                exhausted: false,
             }
         );
         assert_eq!(pending.awaiting_commit(), Some(false));
@@ -385,7 +395,10 @@ mod tests {
                 &config,
                 OnNack::Fail,
             ),
-            DeliveryDecision::Fail { key: key(12, 3) }
+            DeliveryDecision::Fail {
+                key: key(12, 3),
+                exhausted: true,
+            }
         );
     }
 
@@ -411,7 +424,10 @@ mod tests {
                     &config,
                     OnNack::Fail,
                 ),
-                DeliveryDecision::Fail { key: expected }
+                DeliveryDecision::Fail {
+                    key: expected,
+                    exhausted: false,
+                }
             );
 
             let mut drop = PendingBatch::after_send(expected);
@@ -426,6 +442,7 @@ mod tests {
                 DeliveryDecision::Commit {
                     key: expected,
                     explicit_loss: true,
+                    exhausted: false,
                 }
             );
             assert_eq!(drop.awaiting_commit(), Some(true));
@@ -467,6 +484,7 @@ mod tests {
             DeliveryDecision::Commit {
                 key: key(30, 2),
                 explicit_loss: false,
+                exhausted: false,
             }
         );
     }

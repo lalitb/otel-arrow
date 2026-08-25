@@ -328,6 +328,23 @@ impl<PData> EffectHandler<PData> {
         self.core.report_metrics(metrics)
     }
 
+    /// Reports receiver metrics through the owned production reporter with
+    /// its bounded reliable-send policy.
+    ///
+    /// Returns whether the snapshot was accepted. Standalone reporters can
+    /// return `Deferred` when their bounded channel is full.
+    ///
+    /// # Errors
+    ///
+    /// Returns a telemetry error when the reporter is disconnected or the
+    /// bounded reliable-send deadline expires.
+    pub async fn report_metrics_reliably<M: MetricSetHandler>(
+        &self,
+        metrics: &mut MetricSet<M>,
+    ) -> Result<otap_df_telemetry::reporter::ReportOutcome, TelemetryError> {
+        self.core.metrics_reporter.report_reliably(metrics).await
+    }
+
     // More methods will be added in the future as needed.
 }
 

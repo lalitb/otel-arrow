@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use tempfile::TempDir;
 
@@ -473,6 +473,163 @@ fn deferred_candidate_overflow_is_reported_on_the_next_scan() {
     assert_eq!(next.stats.overflowed_candidates, 1);
     assert!(!next.stats.complete);
     assert!(!next.inventory.is_complete());
+}
+
+/// Scenario: one retained candidate waits across a ten-second synthetic scan
+/// interval before the event slot becomes available.
+/// Guarantees: admission delay and pending age use explicit scan clocks and
+/// require no sleeping or per-file telemetry state.
+#[test]
+fn retained_candidate_age_is_measured_deterministically() {
+    let mut admission = AdmissionController::new(1, 2, 1, 16).unwrap();
+    let start = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    let monotonic_start = Instant::now();
+    let generation = admission.begin_scan_at(start, monotonic_start).unwrap();
+    admission
+        .observe(generation, fake_candidate(1), Duration::ZERO)
+        .unwrap();
+    admission
+        .observe(generation, fake_candidate(2), Duration::ZERO)
+        .unwrap();
+    let first = admission.finish_scan_at(monotonic_start).unwrap();
+    assert_eq!(first.stats.pending_candidates, 1);
+    assert_eq!(first.stats.oldest_pending_age, Duration::ZERO);
+    admission
+        .apply_feedback(DiscoveryFeedback {
+            durable: vec![event_locators(&first)[0]],
+            ..DiscoveryFeedback::default()
+        })
+        .unwrap();
+
+    let later = start + Duration::from_secs(10);
+    let generation = admission
+        .begin_scan_at(later, monotonic_start + Duration::from_secs(10))
+        .unwrap();
+    let emitted_locator = event_locators(&first)[0];
+    admission
+        .observe(
+            generation,
+            if emitted_locator == fake_candidate(1).evidence.locator {
+                fake_candidate(2)
+            } else {
+                fake_candidate(1)
+            },
+            Duration::ZERO,
+        )
+        .unwrap();
+    let admitted = admission
+        .finish_scan_at(monotonic_start + Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(admitted.stats.admissions, 1);
+    assert_eq!(admitted.stats.admission_delay, Duration::from_secs(10));
+    assert_eq!(admitted.stats.pending_candidates, 0);
+}
+
+/// Scenario: reconciliation work completes five synthetic seconds after the
+/// production finish path chooses its admission-decision timestamp.
+/// Guarantees: scan duration, pending age, and overflow persistence use the
+/// post-reconciliation completion clock rather than the earlier decision time.
+#[test]
+fn production_finish_clock_includes_reconciliation_work() {
+    let mut admission = AdmissionController::new(1, 1, 1, 16).unwrap();
+    let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    let start = Instant::now();
+    let generation = admission.begin_scan_at(wall, start).unwrap();
+    for id in 1..=3 {
+        admission
+            .observe(generation, fake_candidate(id), Duration::ZERO)
+            .unwrap();
+    }
+    let mut times = [
+        start + Duration::from_secs(2),
+        start + Duration::from_secs(7),
+    ]
+    .into_iter();
+
+    let finished = admission
+        .finish_scan_with_clock(&mut || times.next().expect("two finish clocks"))
+        .unwrap();
+
+    assert_eq!(finished.stats.scan_duration, Duration::from_secs(7));
+    assert_eq!(finished.stats.oldest_pending_age, Duration::from_secs(7));
+    assert_eq!(finished.stats.overflow_persistence, Duration::from_secs(7));
+    assert!(times.next().is_none());
+}
+
+/// Scenario: a slow first overflowing scan is followed by continuous
+/// overflow, one non-overflowing scan, and a later new overflow episode.
+/// Guarantees: scan duration is included from the first scan start, overflow
+/// persistence is continuous across scans, and a clear scan resets its age.
+#[test]
+fn overflow_persistence_includes_scan_time_and_resets() {
+    let mut admission = AdmissionController::new(0, 8, 1, 16).unwrap();
+    let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    let start = Instant::now();
+
+    let generation = admission.begin_scan_at(wall, start).unwrap();
+    admission
+        .observe(generation, fake_candidate(1), Duration::ZERO)
+        .unwrap();
+    admission
+        .observe(generation, fake_candidate(2), Duration::ZERO)
+        .unwrap();
+    let first = admission
+        .finish_scan_at(start + Duration::from_secs(7))
+        .unwrap();
+    assert_eq!(first.stats.scan_duration, Duration::from_secs(7));
+    assert_eq!(first.stats.overflow_persistence, Duration::from_secs(7));
+    admission
+        .apply_feedback(DiscoveryFeedback {
+            durable: event_locators(&first),
+            ..DiscoveryFeedback::default()
+        })
+        .unwrap();
+
+    let generation = admission
+        .begin_scan_at(wall, start + Duration::from_secs(10))
+        .unwrap();
+    admission
+        .observe(generation, fake_candidate(3), Duration::ZERO)
+        .unwrap();
+    admission
+        .observe(generation, fake_candidate(4), Duration::ZERO)
+        .unwrap();
+    let continuous = admission
+        .finish_scan_at(start + Duration::from_secs(15))
+        .unwrap();
+    assert_eq!(
+        continuous.stats.overflow_persistence,
+        Duration::from_secs(15)
+    );
+    admission
+        .apply_feedback(DiscoveryFeedback {
+            durable: event_locators(&continuous),
+            ..DiscoveryFeedback::default()
+        })
+        .unwrap();
+
+    let _generation = admission
+        .begin_scan_at(wall, start + Duration::from_secs(16))
+        .unwrap();
+    let clear = admission
+        .finish_scan_at(start + Duration::from_secs(17))
+        .unwrap();
+    assert_eq!(clear.stats.overflowed_candidates, 0);
+    assert_eq!(clear.stats.overflow_persistence, Duration::ZERO);
+
+    let generation = admission
+        .begin_scan_at(wall, start + Duration::from_secs(20))
+        .unwrap();
+    admission
+        .observe(generation, fake_candidate(5), Duration::ZERO)
+        .unwrap();
+    admission
+        .observe(generation, fake_candidate(6), Duration::ZERO)
+        .unwrap();
+    let restarted = admission
+        .finish_scan_at(start + Duration::from_secs(23))
+        .unwrap();
+    assert_eq!(restarted.stats.overflow_persistence, Duration::from_secs(3));
 }
 
 /// Scenario: four stable candidates repeatedly compete for one event slot

@@ -195,6 +195,29 @@ fn temporary_eof_reactivates_on_deadline_after_append() {
     table.shutdown().unwrap();
 }
 
+/// Scenario: an empty start-at-end reader opens and immediately reaches EOF.
+/// Guarantees: the current population reports one resident descriptor and
+/// one EOF reader without requiring another successful data turn.
+#[test]
+fn empty_eof_open_updates_current_populations_immediately() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("empty.log");
+    std::fs::write(&path, b"").unwrap();
+    let mut table = ReaderTable::new(settings(1, 1, 4)).unwrap();
+    table.insert(candidate(&path), resolved(54, 0)).unwrap();
+
+    assert!(matches!(
+        table.poll(Instant::now()).unwrap(),
+        ReaderPoll::EndOfFile { .. }
+    ));
+    let stats = table.stats();
+    assert_eq!(stats.open_files, 1);
+    assert_eq!(stats.eof_readers, 1);
+    assert_eq!(stats.descriptor_blocked_readers, 0);
+    assert_eq!(stats.removed_readers, 0);
+    table.shutdown().unwrap();
+}
+
 /// Scenario: three ready readers compete for two descriptor slots after the
 /// first two have each been served.
 /// Guarantees: opening the third selects the least-recently-served descriptor
@@ -1346,11 +1369,13 @@ fn multiple_descriptor_waiters_eventually_rotate_through_one_slot() {
         ReaderPoll::DescriptorCapacityBlocked { file_id: blocked }
             if blocked == file_id(40)
     ));
+    assert_eq!(table.stats().descriptor_blocked_readers, 1);
     assert!(matches!(
         table.poll(now).unwrap(),
         ReaderPoll::DescriptorCapacityBlocked { file_id: blocked }
             if blocked == file_id(41)
     ));
+    assert_eq!(table.stats().descriptor_blocked_readers, 2);
     assert!(matches!(
         table.poll(now).unwrap(),
         ReaderPoll::EndOfFile {
@@ -1359,12 +1384,16 @@ fn multiple_descriptor_waiters_eventually_rotate_through_one_slot() {
         } if eof_file == file_id(39)
     ));
     let _released = table.release_finalized(file_id(39)).unwrap();
+    assert_eq!(table.stats().descriptor_blocked_readers, 1);
+    assert_eq!(table.stats().removed_readers, 0);
+    assert_eq!(table.stats().open_files, 0);
 
     let second = data(table.poll(now).unwrap());
     assert_eq!(second.file_id(), file_id(40));
     table
         .complete_turn(second, 1, TurnDisposition::Paused)
         .unwrap();
+    assert_eq!(table.stats().descriptor_blocked_readers, 0);
     let request = eviction(table.poll(now).unwrap());
     assert_eq!(request.target_file_id, file_id(41));
     assert_eq!(request.victim_file_id, file_id(40));

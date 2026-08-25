@@ -9,12 +9,13 @@
 //! downstream sends.
 
 use std::collections::{HashMap, TryReserveError};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, sync_channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, SystemTimeError, UNIX_EPOCH};
 
 use otap_df_pdata::otap::OtapArrowRecords;
-use otap_df_telemetry::otel_warn;
+use otap_df_telemetry::{otel_info, otel_warn};
 use thiserror::Error;
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -23,12 +24,12 @@ use super::batching::{
     ProgressFrontier, RecordInput, RecordNumberTable,
 };
 use super::checkpoint::primitives::{
-    FileId, FramingResume, LifecycleState, Locator,
+    FileId, FramingResume, LifecycleState, Locator, QUARANTINE_REASON_DECODE,
     QUARANTINE_REASON_ROTATION_DESCRIPTOR_UNAVAILABLE, QUARANTINE_REASON_TRUNCATE,
     TRUNCATE_RESET_REASON_READ_NEW, WAL_MAX_OPS_PER_TX,
 };
 use super::checkpoint::store::error::StoreError;
-use super::checkpoint::store::{CheckpointStore, StoreOptions};
+use super::checkpoint::store::{CheckpointStore, StoreOptions, StoreStats};
 use super::checkpoint::wal::{Operation, QuarantineFile, ResetAfterTruncate, UpdateFingerprint};
 use super::config::{OnTruncate, RuntimeConfig};
 use super::discovery::scanner::DiscoveryPlan;
@@ -36,15 +37,20 @@ use super::discovery::source::{DiscoveryHandle, FeedbackSendError, spawn_discove
 use super::discovery::{
     CandidateEvent, DiscoveryError, DiscoveryFeedback, DiscoveryMessage, ReconciliationBatch,
 };
-use super::framing::{FramedRecord, Framer, FramerError};
+use super::framing::{DecodeError, DecodeOutcome, FlushReason, FramedRecord, Framer, FramerError};
 use super::identity::CandidateEvidence;
 use super::identity::IdentityError;
 use super::identity::matcher::{
-    IdentityResolution, IdentitySettings, resolve_and_persist_with_admission,
+    IdentityMatch, IdentityResolution, IdentitySettings, resolve_and_persist_with_admission,
 };
+use super::lease::LeaseError;
 use super::reader::{
     CandidateEvidenceRefresh, ReaderError, ReaderFrontier, ReaderPoll, ReaderSettings, ReaderTable,
     RemovalDisposition, TurnDisposition,
+};
+use super::telemetry::{
+    HealthEventCategory, HealthEventLimiter, WorkerCounter, WorkerGauge, WorkerTelemetryBridge,
+    duration_ns,
 };
 
 const WORKER_COMMAND_CHANNEL_CAPACITY: usize = 8;
@@ -80,6 +86,7 @@ pub(super) struct WorkerBatch {
     pub(super) records: OtapArrowRecords,
     pub(super) record_count: u32,
     pub(super) logical_bytes: u64,
+    pub(super) source_bytes: u64,
 }
 
 /// Bounded worker-to-async protocol.
@@ -101,6 +108,7 @@ pub(super) enum WorkerEvent {
 pub(super) struct WorkerHandle {
     pub(super) command_tx: SyncSender<WorkerCommand>,
     pub(super) join: JoinHandle<Result<(), WorkerError>>,
+    pub(super) telemetry: Arc<WorkerTelemetryBridge>,
 }
 
 /// Fail-closed worker setup, source, durability, and protocol errors.
@@ -268,6 +276,7 @@ struct FramerBase {
 struct ActiveFramer {
     framer: Framer,
     base: FramerBase,
+    pending_bytes: u64,
 }
 
 struct RetainedBatch {
@@ -298,6 +307,15 @@ struct RotationWait {
     deadline: Instant,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct FramedTelemetry {
+    decode_outcome: DecodeOutcome,
+    flush_reason: Option<FlushReason>,
+    truncated: bool,
+    discarded_source_bytes: u64,
+    split: bool,
+}
+
 /// Starts the sole read/checkpoint OS thread.
 pub(super) fn spawn_worker(
     config: RuntimeConfig,
@@ -306,12 +324,18 @@ pub(super) fn spawn_worker(
     // Blocking file reads, identity probes, framing, WAL writes, fsync, and
     // compaction are intentionally isolated on this one fixed OS thread.
     let (command_tx, command_rx) = sync_channel(WORKER_COMMAND_CHANNEL_CAPACITY);
-    let thread_name = format!("otap-filelog-{}", config.checkpoint_id);
+    let telemetry = Arc::new(WorkerTelemetryBridge::default());
+    let worker_telemetry = Arc::clone(&telemetry);
+    let thread_name = "otap-filelog-worker".to_owned();
     let join = std::thread::Builder::new()
         .name(thread_name)
-        .spawn(move || worker_thread(config, event_tx, command_rx))
+        .spawn(move || worker_thread(config, event_tx, command_rx, worker_telemetry))
         .map_err(|source| WorkerError::ThreadSpawn { source })?;
-    Ok(WorkerHandle { command_tx, join })
+    Ok(WorkerHandle {
+        command_tx,
+        join,
+        telemetry,
+    })
 }
 
 #[cfg(test)]
@@ -322,23 +346,47 @@ fn spawn_worker_with_store_fault(
     matching_occurrences_to_skip: usize,
 ) -> Result<WorkerHandle, WorkerError> {
     let (command_tx, command_rx) = sync_channel(WORKER_COMMAND_CHANNEL_CAPACITY);
+    let telemetry = Arc::new(WorkerTelemetryBridge::default());
+    let worker_telemetry = Arc::clone(&telemetry);
     let join = std::thread::Builder::new()
         .name("otap-filelog-fault-test".to_owned())
         .spawn(move || {
-            let worker =
-                WorkerRuntime::new_with_store_fault(config, point, matching_occurrences_to_skip);
+            let worker = WorkerRuntime::new_with_store_fault_and_telemetry(
+                config,
+                point,
+                matching_occurrences_to_skip,
+                worker_telemetry,
+            );
             run_worker_thread(worker, event_tx, command_rx)
         })
         .map_err(|source| WorkerError::ThreadSpawn { source })?;
-    Ok(WorkerHandle { command_tx, join })
+    Ok(WorkerHandle {
+        command_tx,
+        join,
+        telemetry,
+    })
 }
 
 fn worker_thread(
     config: RuntimeConfig,
     event_tx: tokio_mpsc::Sender<WorkerEvent>,
     command_rx: Receiver<WorkerCommand>,
+    telemetry: Arc<WorkerTelemetryBridge>,
 ) -> Result<(), WorkerError> {
-    run_worker_thread(WorkerRuntime::new(config), event_tx, command_rx)
+    let worker = WorkerRuntime::new_with_telemetry(config, Arc::clone(&telemetry));
+    match &worker {
+        Err(WorkerError::Store(StoreError::NamespaceLocked { waited, .. })) => {
+            telemetry.add(WorkerCounter::NamespaceLockFailures, 1);
+            telemetry.add(WorkerCounter::NamespaceLockWaits, 1);
+            telemetry.add(WorkerCounter::NamespaceLockContentions, 1);
+            telemetry.add(WorkerCounter::NamespaceLockWaitNs, duration_ns(*waited));
+        }
+        Err(WorkerError::Store(_)) => {
+            telemetry.add(WorkerCounter::CheckpointFailures, 1);
+        }
+        _ => {}
+    }
+    run_worker_thread(worker, event_tx, command_rx)
 }
 
 fn run_worker_thread(
@@ -351,6 +399,7 @@ fn run_worker_thread(
             let run_result = worker.run(&event_tx, &command_rx);
             let drained = worker.drain_complete;
             let shutdown_result = worker.shutdown_resources();
+            worker.publish_observations();
             let result = run_result.and(shutdown_result);
             drop(worker);
             (result, drained)
@@ -383,6 +432,7 @@ struct WorkerRuntime {
     open_batch: Option<OpenBatch>,
     record_numbers: RecordNumberTable,
     retained: Option<RetainedBatch>,
+    pending_decode_quarantine: Option<PendingDecodeQuarantine>,
     checkpoint_commit_failed: bool,
     checkpoint_maintenance_failures: u32,
     maintenance_retry_pending: bool,
@@ -396,29 +446,69 @@ struct WorkerRuntime {
     drain_order: Vec<FileId>,
     drain_initialized: bool,
     max_progress_updates: usize,
+    telemetry: Arc<WorkerTelemetryBridge>,
+    health_events: HealthEventLimiter,
+    observed_store: ObservedStoreStats,
+    partial_bytes_pending: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ObservedStoreStats {
+    wal_bytes_appended: u64,
+    transactions_appended: u64,
+    syncs: u64,
+    persist_duration_ns: u64,
+    persist_operations: u64,
+    sync_duration_ns: u64,
+    sync_operations: u64,
+    namespace_lock_wait_ns: u64,
+    namespace_lock_contentions: u64,
+    namespace_lock_observed: bool,
+    quarantine_reset_beginning: u64,
+    quarantine_reset_end: u64,
+    quarantine_keep_failed: u64,
+    quarantine_removals: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingDecodeQuarantine {
+    file_id: FileId,
+    observed_size: u64,
 }
 
 impl WorkerRuntime {
     fn new(config: RuntimeConfig) -> Result<Self, WorkerError> {
+        Self::new_with_telemetry(config, Arc::new(WorkerTelemetryBridge::default()))
+    }
+
+    fn new_with_telemetry(
+        config: RuntimeConfig,
+        telemetry: Arc<WorkerTelemetryBridge>,
+    ) -> Result<Self, WorkerError> {
         let store = CheckpointStore::open(StoreOptions::from_runtime_config(&config))?;
-        Self::with_store(config, store)
+        Self::with_store(config, store, telemetry)
     }
 
     #[cfg(test)]
-    fn new_with_store_fault(
+    fn new_with_store_fault_and_telemetry(
         config: RuntimeConfig,
         point: super::checkpoint::store::fault::FaultPoint,
         matching_occurrences_to_skip: usize,
+        telemetry: Arc<WorkerTelemetryBridge>,
     ) -> Result<Self, WorkerError> {
         let store = CheckpointStore::open_with_fault_after(
             StoreOptions::from_runtime_config(&config),
             point,
             matching_occurrences_to_skip,
         )?;
-        Self::with_store(config, store)
+        Self::with_store(config, store, telemetry)
     }
 
-    fn with_store(config: RuntimeConfig, store: CheckpointStore) -> Result<Self, WorkerError> {
+    fn with_store(
+        config: RuntimeConfig,
+        store: CheckpointStore,
+        telemetry: Arc<WorkerTelemetryBridge>,
+    ) -> Result<Self, WorkerError> {
         let max_readers = usize::try_from(config.limits.max_tracked_files).map_err(|_| {
             WorkerError::Inconsistent {
                 reason: "validated max_tracked_files does not fit usize",
@@ -484,7 +574,7 @@ impl WorkerRuntime {
         let record_numbers = RecordNumberTable::new(max_readers)?;
         let discovery = spawn_discovery(discovery_plan)?;
 
-        Ok(Self {
+        let mut worker = Self {
             config,
             identity_settings,
             discovery: Some(discovery),
@@ -500,6 +590,7 @@ impl WorkerRuntime {
             open_batch: Some(open_batch),
             record_numbers,
             retained: None,
+            pending_decode_quarantine: None,
             checkpoint_commit_failed: false,
             checkpoint_maintenance_failures: 0,
             maintenance_retry_pending: false,
@@ -513,7 +604,13 @@ impl WorkerRuntime {
             drain_order,
             drain_initialized: false,
             max_progress_updates,
-        })
+            telemetry,
+            health_events: HealthEventLimiter::default(),
+            observed_store: ObservedStoreStats::default(),
+            partial_bytes_pending: 0,
+        };
+        worker.publish_observations();
+        Ok(worker)
     }
 
     fn run(
@@ -629,9 +726,15 @@ impl WorkerRuntime {
                 continue;
             }
 
-            let poll = self.readers_mut()?.poll(now)?;
+            let poll = self.readers_mut()?.poll(now);
+            self.publish_reader_gauges();
+            let poll = poll?;
             let next_reader_probe = match poll {
                 ReaderPoll::Data(turn) => {
+                    self.telemetry.add(
+                        WorkerCounter::SourceBytesRead,
+                        u64::try_from(turn.bytes().len()).unwrap_or(u64::MAX),
+                    );
                     if self.process_turn(turn, now, event_tx, command_rx)? == LoopControl::Shutdown
                     {
                         return Ok(());
@@ -687,12 +790,22 @@ impl WorkerRuntime {
                             return Ok(());
                         }
                     } else {
-                        let _ = self.framers.remove(&request.victim_file_id);
+                        self.discard_framer(request.victim_file_id);
                         self.readers_mut()?.confirm_eviction(request)?;
+                        self.publish_reader_gauges();
                     }
                     continue;
                 }
-                ReaderPoll::DescriptorCapacityBlocked { .. } => None,
+                ReaderPoll::DescriptorCapacityBlocked { .. } => {
+                    self.telemetry.add(WorkerCounter::DescriptorSaturation, 1);
+                    if let Some(suppressed) = self.health_event(HealthEventCategory::Saturation) {
+                        otel_warn!(
+                            "filelog_receiver.descriptor_capacity_saturated",
+                            suppressed_events = suppressed
+                        );
+                    }
+                    None
+                }
                 ReaderPoll::RemovedWithoutDescriptor { file_id } => {
                     let locator = self.contain_removed_without_descriptor(file_id)?;
                     self.remember_inactive_locator(locator, file_id)?;
@@ -733,18 +846,27 @@ impl WorkerRuntime {
                 explicit_loss,
             } => {
                 let result = self.commit_retained(batch_id, attempt);
+                let committed = result.is_ok();
                 self.checkpoint_commit_failed = result.is_err();
                 if result.is_ok() {
                     self.checkpoint_maintenance_failures = 0;
                     self.maintenance_retry_pending = false;
                 }
+                self.publish_observations();
                 let event = WorkerEvent::CommitResult {
                     batch_id,
                     attempt,
                     explicit_loss,
                     result,
                 };
-                let control = send_event_interruptibly(event_tx, command_rx, event)?;
+                let handoff = send_event_interruptibly(event_tx, command_rx, event);
+                let quarantine = if committed {
+                    self.finish_pending_decode_quarantine()
+                } else {
+                    Ok(())
+                };
+                let control = handoff?;
+                quarantine?;
                 if control == HandoffControl::Shutdown {
                     return Ok(LoopControl::Shutdown);
                 }
@@ -838,10 +960,96 @@ impl WorkerRuntime {
         };
         match message {
             DiscoveryMessage::Batch(batch) => {
+                self.observe_reconciliation(&batch);
                 self.process_reconciliation(*batch, event_tx, command_rx)
             }
             DiscoveryMessage::Failed(error) => Err(WorkerError::Discovery(error)),
             DiscoveryMessage::Stopped => Err(WorkerError::DiscoveryStopped),
+        }
+    }
+
+    fn observe_reconciliation(&mut self, batch: &ReconciliationBatch) {
+        let stats = &batch.stats;
+        self.telemetry
+            .add(WorkerCounter::FilesDiscovered, stats.matched_paths);
+        self.telemetry
+            .add(WorkerCounter::FilesEligible, stats.eligible_candidates);
+        self.telemetry.add(WorkerCounter::DiscoveryScans, 1);
+        self.telemetry
+            .add(WorkerCounter::DiscoveryScanErrors, stats.scan_errors);
+        self.telemetry.add(
+            WorkerCounter::DiscoveryScanDurationNs,
+            duration_ns(stats.scan_duration),
+        );
+        self.telemetry.add(
+            WorkerCounter::CandidateOverflow,
+            stats.overflowed_candidates,
+        );
+        self.telemetry.add(
+            WorkerCounter::CandidateOverflowScans,
+            u64::from(stats.overflowed_candidates != 0),
+        );
+        self.telemetry.add(
+            WorkerCounter::CandidateAdmissionDelayNs,
+            duration_ns(stats.admission_delay),
+        );
+        self.telemetry
+            .add(WorkerCounter::CandidateAdmissions, stats.admissions);
+        self.telemetry.set(
+            WorkerGauge::FilesPending,
+            u64::try_from(stats.pending_candidates).unwrap_or(u64::MAX),
+        );
+        self.telemetry.set(
+            WorkerGauge::CandidateOldestAgeNs,
+            duration_ns(stats.oldest_pending_age),
+        );
+        self.telemetry.set(
+            WorkerGauge::CandidateOverflowPersistenceNs,
+            duration_ns(stats.overflow_persistence),
+        );
+
+        let mut observed = 0u64;
+        let mut updated = 0u64;
+        let mut removed = 0u64;
+        for event in &batch.events {
+            match event {
+                CandidateEvent::Observed(_) => observed = observed.saturating_add(1),
+                CandidateEvent::Updated(_) => updated = updated.saturating_add(1),
+                CandidateEvent::Removed { .. } => removed = removed.saturating_add(1),
+            }
+        }
+        self.telemetry
+            .add(WorkerCounter::DiscoveryObserved, observed);
+        self.telemetry.add(WorkerCounter::DiscoveryUpdated, updated);
+        self.telemetry.add(WorkerCounter::DiscoveryRemoved, removed);
+
+        if stats.scan_errors != 0
+            && let Some(suppressed) = self.health_event(HealthEventCategory::Scan)
+        {
+            let issue = stats
+                .first_issue
+                .as_ref()
+                .map_or("unknown", |issue| match issue {
+                    super::discovery::DiscoveryIssue::Io { .. } => "io",
+                    super::discovery::DiscoveryIssue::Walk { .. } => "walk",
+                    super::discovery::DiscoveryIssue::Identity(_) => "identity",
+                });
+            otel_warn!(
+                "filelog_receiver.discovery_scan_failed",
+                error_type = issue,
+                error_count = stats.scan_errors,
+                suppressed_events = suppressed
+            );
+        }
+        if stats.overflowed_candidates != 0
+            && let Some(suppressed) = self.health_event(HealthEventCategory::CandidateOverflow)
+        {
+            otel_warn!(
+                "filelog_receiver.candidate_overflow",
+                overflowed_candidates = stats.overflowed_candidates,
+                pending_candidates = u64::try_from(stats.pending_candidates).unwrap_or(u64::MAX),
+                suppressed_events = suppressed
+            );
         }
     }
 
@@ -906,11 +1114,49 @@ impl WorkerRuntime {
             &batch.inventory,
             &self.identity_settings,
             now_unix_nano,
-        )?;
+        )
+        .map_err(WorkerError::Identity);
+        let resolved = self.observe_direct_checkpoint_result(resolved)?;
         if resolved.len() != self.candidate_evidence.len() {
             return Err(WorkerError::Inconsistent {
                 reason: "identity resolution count differs from candidate event count",
             });
+        }
+        for resolution in &resolved {
+            match resolution {
+                IdentityResolution::Deferred => {
+                    self.telemetry.add(WorkerCounter::TrackedSaturation, 1);
+                    self.telemetry.set(WorkerGauge::TrackedSaturated, 1);
+                    if let Some(suppressed) = self.health_event(HealthEventCategory::Saturation) {
+                        otel_warn!(
+                            "filelog_receiver.tracked_table_saturated",
+                            suppressed_events = suppressed
+                        );
+                    }
+                }
+                IdentityResolution::Resolved(identity) => match identity.matched_by {
+                    IdentityMatch::ExactLocator => {
+                        self.telemetry.add(WorkerCounter::IdentityExactMatches, 1);
+                    }
+                    IdentityMatch::UniqueFingerprint => {
+                        self.telemetry
+                            .add(WorkerCounter::IdentityFingerprintMatches, 1);
+                    }
+                    IdentityMatch::NewDiscovery => {
+                        self.telemetry.add(WorkerCounter::IdentityRegistrations, 1);
+                    }
+                    IdentityMatch::RecoveryMismatch => {
+                        self.telemetry.add(WorkerCounter::IdentityRegistrations, 1);
+                        self.telemetry.add(WorkerCounter::IdentityResets, 1);
+                        self.telemetry
+                            .add(WorkerCounter::IdentityRecoveryMismatches, 1);
+                        if identity.lifecycle_state == LifecycleState::Quarantined {
+                            self.telemetry
+                                .add(WorkerCounter::QuarantineRecoveryMismatch, 1);
+                        }
+                    }
+                },
+            }
         }
 
         let feedback_capacity = batch
@@ -944,12 +1190,25 @@ impl WorkerRuntime {
                         feedback.durable.push(locator);
                         continue;
                     }
-                    match self.readers_mut()?.insert(candidate, identity) {
+                    let insert_result = self.readers_mut()?.insert(candidate, identity);
+                    let lease = self.readers_mut()?.take_lease_observations();
+                    self.telemetry
+                        .add(WorkerCounter::RuntimeLeaseWaits, lease.attempts);
+                    self.telemetry
+                        .add(WorkerCounter::RuntimeLeaseWaitNs, lease.wait_ns);
+                    self.telemetry
+                        .add(WorkerCounter::RuntimeLeaseFailures, lease.failures);
+                    self.telemetry
+                        .add(WorkerCounter::RuntimeLeaseContentions, lease.contentions);
+                    match insert_result {
                         Ok(()) => feedback.durable.push(locator),
                         Err(ReaderError::ReaderCapacityExhausted { .. }) => {
                             feedback.deferred.push(locator);
                         }
-                        Err(error) => return Err(WorkerError::Reader(error)),
+                        Err(error) => {
+                            self.observe_reader_error(&error);
+                            return Err(WorkerError::Reader(error));
+                        }
                     }
                 }
                 CandidateEvent::Updated(candidate) => {
@@ -963,7 +1222,15 @@ impl WorkerRuntime {
                     };
                     let locator = candidate.evidence.locator;
                     if identity.lifecycle_state == LifecycleState::Active {
+                        let path_changed = self
+                            .readers_ref()?
+                            .record_context(identity.file_id)?
+                            .matched_path
+                            != candidate.matched_path;
                         self.readers_mut()?.update(candidate, &identity)?;
+                        if path_changed {
+                            self.telemetry.add(WorkerCounter::RotationMoveCreate, 1);
+                        }
                     } else if let Some(existing) =
                         self.inactive_locators.insert(locator, identity.file_id)
                         && existing != identity.file_id
@@ -1006,7 +1273,33 @@ impl WorkerRuntime {
                 reason: "identity resolution returned unused candidates",
             });
         }
+        self.publish_observations();
         self.send_feedback_interruptibly(feedback, command_rx)
+    }
+
+    fn observe_reader_error(&mut self, error: &ReaderError) {
+        let ReaderError::Lease(lease_error) = error else {
+            return;
+        };
+        if let Some(suppressed) = self.health_event(HealthEventCategory::Lease) {
+            let error_type = match lease_error {
+                LeaseError::Contended { .. } => "contended",
+                LeaseError::UnspecifiedLocator => "unspecified_locator",
+                LeaseError::ScopeCapacityExhausted { .. }
+                | LeaseError::ScopeCapacityTooLarge { .. }
+                | LeaseError::ReceiverScopeCapacityExhausted { .. }
+                | LeaseError::LocatorBucketCapacityExhausted { .. }
+                | LeaseError::AggregateCapacityOverflow => "capacity",
+                LeaseError::AllocationFailed { .. } => "allocation",
+                LeaseError::RegistryPoisoned | LeaseError::RegistryInconsistent => "integrity",
+                LeaseError::OutstandingLeases { .. } | LeaseError::ScopeClosed => "lifecycle",
+            };
+            otel_warn!(
+                "filelog_receiver.runtime_lease_failed",
+                error_type = error_type,
+                suppressed_events = suppressed
+            );
+        }
     }
 
     fn refresh_updated_candidates(
@@ -1229,6 +1522,7 @@ impl WorkerRuntime {
     }
 
     fn apply_truncation(&mut self, truncation: DetectedTruncation) -> Result<(), WorkerError> {
+        record_truncation_detection(&self.telemetry);
         let reset_time_unix_nano = unix_nanos()?.1;
         match self.config.rotation.on_truncate {
             OnTruncate::Fail => {
@@ -1242,8 +1536,23 @@ impl WorkerRuntime {
                     quarantine_epoch: truncation.expected_file_epoch,
                     quarantine_time_unix_nano: reset_time_unix_nano,
                 });
-                let _outcomes = self.store.quarantine_files(quarantines)?;
-                self.store.sync()?;
+                let result = self
+                    .store
+                    .quarantine_files(quarantines)
+                    .map_err(WorkerError::Store);
+                let _outcomes = self.observe_direct_checkpoint_result(result)?;
+                let result = self.store.sync().map_err(WorkerError::Store);
+                self.observe_direct_checkpoint_result(result)?;
+                record_truncation_outcome(&self.telemetry, OnTruncate::Fail);
+                if let Some(suppressed) = self.health_event(HealthEventCategory::Truncation) {
+                    otel_warn!(
+                        "filelog_receiver.copytruncate_quarantined",
+                        policy = "fail",
+                        observed_size = truncation.observed_size,
+                        suppressed_events = suppressed
+                    );
+                }
+                self.publish_observations();
 
                 let released = self.readers_mut()?.release_revoked(truncation.file_id)?;
                 if released != truncation.locator {
@@ -1251,7 +1560,7 @@ impl WorkerRuntime {
                         reason: "quarantined reader released a different locator",
                     });
                 }
-                let _ = self.framers.remove(&truncation.file_id);
+                self.discard_framer(truncation.file_id);
                 let _ = self.rotation_waits.remove(&truncation.file_id);
                 let _ = self.record_numbers.remove(truncation.file_id);
                 self.remove_drain_file(truncation.file_id);
@@ -1260,12 +1569,6 @@ impl WorkerRuntime {
                 } else {
                     self.queue_finalization_feedback(truncation.locator)?;
                 }
-                otel_warn!(
-                    "filelog_receiver.copytruncate_quarantined",
-                    checkpoint_id = self.config.checkpoint_id.as_str(),
-                    observed_size = truncation.observed_size,
-                    file_epoch = u64::from(truncation.expected_file_epoch)
-                );
             }
             OnTruncate::ReadNew => {
                 let resulting_epoch = truncation.expected_file_epoch.checked_add(1).ok_or(
@@ -1299,8 +1602,20 @@ impl WorkerRuntime {
                     expected_fingerprint,
                     new_fingerprint: truncation.observed_fingerprint.clone(),
                 }));
-                let _outcome = self.store.append(operations)?;
-                self.store.sync()?;
+                let result = self.store.append(operations).map_err(WorkerError::Store);
+                let _outcome = self.observe_direct_checkpoint_result(result)?;
+                let result = self.store.sync().map_err(WorkerError::Store);
+                self.observe_direct_checkpoint_result(result)?;
+                record_truncation_outcome(&self.telemetry, OnTruncate::ReadNew);
+                if let Some(suppressed) = self.health_event(HealthEventCategory::Truncation) {
+                    otel_warn!(
+                        "filelog_receiver.copytruncate_reset",
+                        policy = "read_new",
+                        observed_size = truncation.observed_size,
+                        suppressed_events = suppressed
+                    );
+                }
+                self.publish_observations();
 
                 let resume = !self.drain_requested;
                 self.readers_mut()?.apply_preflighted_truncate_reset(
@@ -1311,19 +1626,13 @@ impl WorkerRuntime {
                     truncation.observed_fingerprint,
                     resume,
                 )?;
-                let _ = self.framers.remove(&truncation.file_id);
+                self.discard_framer(truncation.file_id);
                 let _ = self.rotation_waits.remove(&truncation.file_id);
                 let _ = self.record_numbers.remove(truncation.file_id);
                 self.remove_drain_file(truncation.file_id);
-                otel_warn!(
-                    "filelog_receiver.copytruncate_reset",
-                    checkpoint_id = self.config.checkpoint_id.as_str(),
-                    observed_size = truncation.observed_size,
-                    previous_file_epoch = u64::from(truncation.expected_file_epoch),
-                    resulting_file_epoch = u64::from(resulting_epoch)
-                );
             }
         }
+        self.publish_observations();
         Ok(())
     }
 
@@ -1376,8 +1685,22 @@ impl WorkerRuntime {
             quarantine_epoch: expected_file_epoch,
             quarantine_time_unix_nano: unix_nanos()?.1,
         });
-        let _outcomes = self.store.quarantine_files(quarantines)?;
-        self.store.sync()?;
+        let result = self
+            .store
+            .quarantine_files(quarantines)
+            .map_err(WorkerError::Store);
+        let _outcomes = self.observe_direct_checkpoint_result(result)?;
+        let result = self.store.sync().map_err(WorkerError::Store);
+        self.observe_direct_checkpoint_result(result)?;
+        record_descriptor_quarantine_telemetry(&self.telemetry);
+        if let Some(suppressed) = self.health_event(HealthEventCategory::Quarantine) {
+            otel_warn!(
+                "filelog_receiver.rotation_descriptor_unavailable",
+                committed_offset,
+                suppressed_events = suppressed
+            );
+        }
+        self.publish_observations();
 
         let released = self.readers_mut()?.release_revoked(file_id)?;
         if released != locator {
@@ -1385,16 +1708,10 @@ impl WorkerRuntime {
                 reason: "descriptor-free rotation released a different locator",
             });
         }
-        let _ = self.framers.remove(&file_id);
+        self.discard_framer(file_id);
         let _ = self.rotation_waits.remove(&file_id);
         let _ = self.record_numbers.remove(file_id);
         self.remove_drain_file(file_id);
-        otel_warn!(
-            "filelog_receiver.rotation_descriptor_unavailable",
-            checkpoint_id = self.config.checkpoint_id.as_str(),
-            committed_offset,
-            file_epoch = u64::from(expected_file_epoch)
-        );
         Ok(locator)
     }
 
@@ -1547,13 +1864,21 @@ impl WorkerRuntime {
         ready_clock: &mut impl FnMut() -> Instant,
     ) -> Result<LoopControl, WorkerError> {
         let file_id = turn.file_id();
-        let _ = self.rotation_waits.remove(&file_id);
+        if self.rotation_waits.remove(&file_id).is_some() {
+            self.telemetry.add(WorkerCounter::RotationLateWrites, 1);
+            if let Some(suppressed) = self.health_event(HealthEventCategory::Rotation) {
+                otel_info!(
+                    "filelog_receiver.rotation_late_write",
+                    suppressed_events = suppressed
+                );
+            }
+        }
         let base = FramerBase {
             file_epoch: turn.file_epoch(),
             committed_offset: turn.committed_offset(),
             framing_resume: turn.framing_resume(),
         };
-        let mut active = match self.framers.remove(&file_id) {
+        let mut active = match self.take_framer(file_id) {
             Some(active) => {
                 if active.base != base {
                     let error = WorkerError::Inconsistent {
@@ -1582,7 +1907,11 @@ impl WorkerRuntime {
                         return Err(WorkerError::Framer(error));
                     }
                 };
-                ActiveFramer { framer, base }
+                ActiveFramer {
+                    framer,
+                    base,
+                    pending_bytes: 0,
+                }
             }
         };
         let expected = active.framer.next_expected_input_offset();
@@ -1602,11 +1931,7 @@ impl WorkerRuntime {
             Ok((consumed, AppendControl::Continue)) => {
                 self.readers_mut()?
                     .complete_turn(turn, consumed, TurnDisposition::Ready)?;
-                if self.framers.insert(file_id, active).is_some() {
-                    return Err(WorkerError::Inconsistent {
-                        reason: "framer reappeared while one turn owned it",
-                    });
-                }
+                self.put_framer(file_id, active)?;
                 Ok(LoopControl::Continue)
             }
             Ok((consumed, control @ (AppendControl::SealBefore | AppendControl::SealAfter))) => {
@@ -1616,14 +1941,124 @@ impl WorkerRuntime {
                 self.seal_open_batch(event_tx, command_rx)
             }
             Err(failure) => {
+                let fatal_decode_size = match failure.error.as_ref() {
+                    WorkerError::Framer(error) => {
+                        self.observe_framer_error(error);
+                        match error {
+                            FramerError::Decode(DecodeError::FatalMalformed { range, .. }) => {
+                                Some(range.end)
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
                 self.readers_mut()?.complete_turn(
                     turn,
                     failure.consumed,
                     TurnDisposition::Paused,
                 )?;
+                if let Some(observed_size) = fatal_decode_size {
+                    self.discard_framer(file_id);
+                    if self.open_batch_record_count()? != 0 {
+                        if self
+                            .pending_decode_quarantine
+                            .replace(PendingDecodeQuarantine {
+                                file_id,
+                                observed_size,
+                            })
+                            .is_some()
+                        {
+                            return Err(WorkerError::Inconsistent {
+                                reason: "multiple decode quarantines overlap one retained batch",
+                            });
+                        }
+                        return self.seal_open_batch(event_tx, command_rx);
+                    }
+                    self.quarantine_decode_failure(file_id, observed_size)?;
+                    return Ok(LoopControl::Continue);
+                }
                 Err(*failure.error)
             }
         }
+    }
+
+    fn quarantine_decode_failure(
+        &mut self,
+        file_id: FileId,
+        observed_size: u64,
+    ) -> Result<(), WorkerError> {
+        if self.retained.is_some() || self.open_batch_record_count()? != 0 {
+            return Err(WorkerError::Inconsistent {
+                reason: "decode quarantine overlaps provisional batch progress",
+            });
+        }
+        self.readers_ref()?.preflight_release_revoked(file_id)?;
+        let frontier = self.readers_ref()?.frontier(file_id)?;
+        let (file_epoch, locator) = {
+            let record = self
+                .store
+                .table()
+                .get(&file_id)
+                .ok_or(WorkerError::MissingCheckpointRecord { file_id })?;
+            if record.lifecycle_state != LifecycleState::Active {
+                return Err(WorkerError::InactiveCheckpointRecord {
+                    file_id,
+                    state: record.lifecycle_state,
+                });
+            }
+            (record.file_epoch, record.locator)
+        };
+        let mut quarantines = reserved_vec(1, "decode quarantine operation")?;
+        quarantines.push(QuarantineFile {
+            file_id,
+            expected_file_epoch: file_epoch,
+            reason_code: QUARANTINE_REASON_DECODE,
+            locator,
+            observed_size,
+            quarantine_epoch: file_epoch,
+            quarantine_time_unix_nano: unix_nanos()?.1,
+        });
+        let result = self
+            .store
+            .quarantine_files(quarantines)
+            .map_err(WorkerError::Store);
+        let _outcomes = self.observe_direct_checkpoint_result(result)?;
+        let result = self.store.sync().map_err(WorkerError::Store);
+        self.observe_direct_checkpoint_result(result)?;
+        self.telemetry.add(WorkerCounter::QuarantineDecode, 1);
+        if let Some(suppressed) = self.health_event(HealthEventCategory::Quarantine) {
+            otel_warn!(
+                "filelog_receiver.decode_quarantined",
+                policy = "fail",
+                suppressed_events = suppressed
+            );
+        }
+        self.publish_observations();
+
+        let released = self.readers_mut()?.release_revoked(file_id)?;
+        if released != locator {
+            return Err(WorkerError::Inconsistent {
+                reason: "decode quarantine released a different locator",
+            });
+        }
+        self.discard_framer(file_id);
+        let _ = self.rotation_waits.remove(&file_id);
+        let _ = self.record_numbers.remove(file_id);
+        self.remove_drain_file(file_id);
+        if frontier.present {
+            self.remember_inactive_locator(locator, file_id)?;
+        } else {
+            self.queue_finalization_feedback(locator)?;
+        }
+        Ok(())
+    }
+
+    fn finish_pending_decode_quarantine(&mut self) -> Result<(), WorkerError> {
+        let Some(pending) = self.pending_decode_quarantine.take() else {
+            return Ok(());
+        };
+        self.quarantine_decode_failure(pending.file_id, pending.observed_size)
     }
 
     fn drive_turn(
@@ -1637,13 +2072,16 @@ impl WorkerRuntime {
         loop {
             let input = &turn.bytes()[consumed..];
             let ready_at = ready_clock();
-            let step = active
-                .framer
-                .step(input, ready_at)
-                .map_err(|error| TurnFailure {
-                    consumed,
-                    error: Box::new(WorkerError::Framer(error)),
-                })?;
+            let step = match active.framer.step(input, ready_at) {
+                Ok(step) => step,
+                Err(error) => {
+                    return Err(TurnFailure {
+                        consumed,
+                        error: Box::new(WorkerError::Framer(error)),
+                    });
+                }
+            };
+            self.observe_framer_counters(&mut active.framer);
             if step.consumed > input.len() {
                 return Err(TurnFailure {
                     consumed,
@@ -1695,7 +2133,7 @@ impl WorkerRuntime {
         event_tx: &tokio_mpsc::Sender<WorkerEvent>,
         command_rx: &Receiver<WorkerCommand>,
     ) -> Result<LoopControl, WorkerError> {
-        let mut active = self.framers.remove(&file_id);
+        let mut active = self.take_framer(file_id);
         if let Some(active) = active.as_mut() {
             if active.base.file_epoch != file_epoch
                 || active.framer.next_expected_input_offset() != source_offset
@@ -1708,6 +2146,7 @@ impl WorkerRuntime {
             loop {
                 let ready_at = Instant::now();
                 let step = active.framer.poll_timeout(ready_at)?;
+                self.observe_framer_counters(&mut active.framer);
                 let produced = step.output.is_some();
                 if let Some(record) = step.output {
                     let control = self.append_record(file_id, active.base, record, ready_at)?;
@@ -1722,12 +2161,8 @@ impl WorkerRuntime {
         }
 
         if !self.rotation_finalization_due(file_id, now)? {
-            if let Some(active) = active
-                && self.framers.insert(file_id, active).is_some()
-            {
-                return Err(WorkerError::Inconsistent {
-                    reason: "EOF framer reappeared while being polled",
-                });
+            if let Some(active) = active {
+                self.put_framer(file_id, active)?;
             }
             return Ok(LoopControl::Continue);
         }
@@ -1736,6 +2171,7 @@ impl WorkerRuntime {
             loop {
                 let ready_at = Instant::now();
                 let step = active.framer.flush_rotation(ready_at)?;
+                self.observe_framer_counters(&mut active.framer);
                 let produced = step.output.is_some();
                 if let Some(record) = step.output {
                     match self.append_record(file_id, active.base, record, ready_at)? {
@@ -1772,11 +2208,15 @@ impl WorkerRuntime {
                             .ok_or(WorkerError::Inconsistent {
                                 reason: "rotation pending range regressed",
                             })?;
-                        otel_warn!(
-                            "filelog_receiver.rotation_partial_bytes_dropped",
-                            checkpoint_id = self.config.checkpoint_id.as_str(),
-                            dropped_bytes = dropped
-                        );
+                        self.telemetry
+                            .add(WorkerCounter::PartialBytesDropped, dropped);
+                        if let Some(suppressed) = self.health_event(HealthEventCategory::Partial) {
+                            otel_warn!(
+                                "filelog_receiver.rotation_partial_bytes_dropped",
+                                dropped_bytes = dropped,
+                                suppressed_events = suppressed
+                            );
+                        }
                     }
                     break;
                 }
@@ -1884,15 +2324,13 @@ impl WorkerRuntime {
         let Some((_, file_id)) = due else {
             return Ok(None);
         };
-        let mut active = self
-            .framers
-            .remove(&file_id)
-            .ok_or(WorkerError::Inconsistent {
-                reason: "due framer disappeared",
-            })?;
+        let mut active = self.take_framer(file_id).ok_or(WorkerError::Inconsistent {
+            reason: "due framer disappeared",
+        })?;
         loop {
             let ready_at = Instant::now();
             let step = active.framer.poll_timeout(ready_at)?;
+            self.observe_framer_counters(&mut active.framer);
             let produced = step.output.is_some();
             if let Some(record) = step.output {
                 let control = self.append_record(file_id, active.base, record, ready_at)?;
@@ -1904,11 +2342,7 @@ impl WorkerRuntime {
                 break;
             }
         }
-        if self.framers.insert(file_id, active).is_some() {
-            return Err(WorkerError::Inconsistent {
-                reason: "due framer reappeared while being polled",
-            });
-        }
+        self.put_framer(file_id, active)?;
         Ok(Some(LoopControl::Continue))
     }
 
@@ -1937,6 +2371,13 @@ impl WorkerRuntime {
             )
         };
         let fragment_index = framed.fragment.as_ref().map(|fragment| fragment.index);
+        let framed_telemetry = FramedTelemetry {
+            decode_outcome: framed.decode_outcome,
+            flush_reason: framed.flush_reason,
+            truncated: framed.truncated,
+            discarded_source_bytes: framed.discarded_source_bytes,
+            split: framed.fragment.is_some(),
+        };
         let reservation = if self.config.metadata.include_file_record_number {
             Some(
                 self.record_numbers
@@ -1968,6 +2409,7 @@ impl WorkerRuntime {
             .try_append(input)?;
         match outcome {
             BatchAppendOutcome::Appended { seal } => {
+                self.observe_framed_record(framed_telemetry);
                 if let Some(reservation) = reservation {
                     let committed = self.record_numbers.commit(reservation)?;
                     if committed != record_number {
@@ -1976,6 +2418,7 @@ impl WorkerRuntime {
                         });
                     }
                 }
+
                 Ok(if seal.is_some() {
                     AppendControl::SealAfter
                 } else {
@@ -1994,6 +2437,132 @@ impl WorkerRuntime {
         }
     }
 
+    fn observe_framer_error(&mut self, error: &FramerError) {
+        if matches!(
+            error,
+            FramerError::Decode(DecodeError::FatalMalformed { .. })
+        ) {
+            self.telemetry.add(WorkerCounter::DecodeFailures, 1);
+            if let Some(suppressed) = self.health_event(HealthEventCategory::Decode) {
+                otel_warn!(
+                    "filelog_receiver.decode_failed",
+                    policy = "fail",
+                    suppressed_events = suppressed
+                );
+            }
+        }
+    }
+
+    fn observe_framer_counters(&mut self, framer: &mut Framer) {
+        let fallback = framer.take_pattern_not_matched_count();
+        self.telemetry.add(WorkerCounter::PatternFallback, fallback);
+        if fallback != 0
+            && let Some(suppressed) = self.health_event(HealthEventCategory::PatternFallback)
+        {
+            otel_info!(
+                "filelog_receiver.multiline_pattern_fallback",
+                fallback_lines = fallback,
+                suppressed_events = suppressed
+            );
+        }
+    }
+
+    fn observe_framed_record(&mut self, framed: FramedTelemetry) {
+        record_framed_telemetry(&self.telemetry, framed);
+    }
+}
+
+fn record_framed_telemetry(telemetry: &WorkerTelemetryBridge, framed: FramedTelemetry) {
+    match framed.decode_outcome {
+        DecodeOutcome::Clean => {}
+        DecodeOutcome::Replacements { count } => {
+            telemetry.add(WorkerCounter::DecodeReplaceRecords, 1);
+            telemetry.add(WorkerCounter::DecodeReplaceUnits, count);
+        }
+        DecodeOutcome::PreserveRaw { count } => {
+            telemetry.add(WorkerCounter::DecodePreserveRawRecords, 1);
+            telemetry.add(WorkerCounter::DecodePreserveRawUnits, count);
+        }
+    }
+    if framed.truncated {
+        telemetry.add(WorkerCounter::RecordsTruncated, 1);
+    }
+    telemetry.add(
+        WorkerCounter::SourceBytesDiscarded,
+        framed.discarded_source_bytes,
+    );
+    telemetry.add(WorkerCounter::SplitFragments, u64::from(framed.split));
+    match framed.flush_reason {
+        None => {}
+        Some(FlushReason::MaxLines) => {
+            telemetry.add(WorkerCounter::FlushMaxLines, 1);
+        }
+        Some(FlushReason::Timeout) => {
+            telemetry.add(WorkerCounter::FlushTimeout, 1);
+        }
+        Some(FlushReason::OversizeLineBoundary) => {
+            telemetry.add(WorkerCounter::FlushOversizeLineBoundary, 1);
+        }
+        Some(FlushReason::Rotation) => {
+            telemetry.add(WorkerCounter::FlushRotation, 1);
+        }
+        Some(FlushReason::Drain) => {
+            telemetry.add(WorkerCounter::FlushDrain, 1);
+        }
+    }
+}
+
+fn record_truncation_detection(telemetry: &WorkerTelemetryBridge) {
+    telemetry.add(WorkerCounter::CopytruncateDetected, 1);
+}
+
+fn record_truncation_outcome(telemetry: &WorkerTelemetryBridge, policy: OnTruncate) {
+    match policy {
+        OnTruncate::Fail => {
+            telemetry.add(WorkerCounter::CopytruncateFail, 1);
+            telemetry.add(WorkerCounter::QuarantineTruncate, 1);
+        }
+        OnTruncate::ReadNew => {
+            telemetry.add(WorkerCounter::CopytruncateReadNew, 1);
+        }
+    }
+}
+
+fn record_descriptor_quarantine_telemetry(telemetry: &WorkerTelemetryBridge) {
+    telemetry.add(WorkerCounter::RotationDescriptorUnavailable, 1);
+    telemetry.add(WorkerCounter::QuarantineDescriptorUnavailable, 1);
+}
+
+fn record_rotation_finalization_telemetry(telemetry: &WorkerTelemetryBridge) {
+    telemetry.add(WorkerCounter::RotationFinalizations, 1);
+}
+
+fn record_checkpoint_maintenance_telemetry(
+    telemetry: &WorkerTelemetryBridge,
+    generation_before: u64,
+    generation_after: u64,
+    duration: Duration,
+    cleaned_generations: usize,
+    cleanup_failed: bool,
+) {
+    if generation_after != generation_before {
+        telemetry.add(WorkerCounter::CheckpointCompactions, 1);
+        telemetry.add(
+            WorkerCounter::CheckpointCompactionDurationNs,
+            duration_ns(duration),
+        );
+    }
+    telemetry.add(
+        WorkerCounter::CheckpointCleanupGenerations,
+        u64::try_from(cleaned_generations).unwrap_or(u64::MAX),
+    );
+    telemetry.add(
+        WorkerCounter::CheckpointCleanupFailures,
+        u64::from(cleanup_failed),
+    );
+}
+
+impl WorkerRuntime {
     fn seal_open_batch(
         &mut self,
         event_tx: &tokio_mpsc::Sender<WorkerEvent>,
@@ -2015,7 +2584,7 @@ impl WorkerRuntime {
 
         // Every framer may contain speculative decoder lookahead, including
         // files that contributed no record to this batch.
-        self.framers.clear();
+        self.clear_framers();
         self.rewind_targets.clear();
         for delta in logical.deltas() {
             if self
@@ -2069,6 +2638,7 @@ impl WorkerRuntime {
         };
         let event = WorkerEvent::Batch(worker_batch(&retained));
         self.retained = Some(retained);
+        self.publish_observations();
         match send_event_interruptibly(event_tx, command_rx, event)? {
             HandoffControl::Sent => Ok(LoopControl::Continue),
             HandoffControl::Drain => {
@@ -2144,6 +2714,7 @@ impl WorkerRuntime {
                 let _ = self.rotation_waits.remove(&delta.file_id());
                 let _ = self.record_numbers.remove(delta.file_id());
                 self.remove_drain_file(delta.file_id());
+                record_rotation_finalization_telemetry(&self.telemetry);
             }
         }
         Ok(())
@@ -2172,9 +2743,15 @@ impl WorkerRuntime {
             if frontier.read_offset < end_offset {
                 let poll = self
                     .readers_mut()?
-                    .poll_until(Instant::now(), file_id, end_offset)?;
+                    .poll_until(Instant::now(), file_id, end_offset);
+                self.publish_reader_gauges();
+                let poll = poll?;
                 match poll {
                     ReaderPoll::Data(turn) => {
+                        self.telemetry.add(
+                            WorkerCounter::SourceBytesRead,
+                            u64::try_from(turn.bytes().len()).unwrap_or(u64::MAX),
+                        );
                         let control =
                             self.process_turn(turn, Instant::now(), event_tx, command_rx)?;
                         if control == LoopControl::Shutdown || self.retained.is_some() {
@@ -2213,7 +2790,7 @@ impl WorkerRuntime {
                         });
                     }
                     ReaderPoll::EvictionRequired(request) => {
-                        let _ = self.framers.remove(&request.victim_file_id);
+                        self.discard_framer(request.victim_file_id);
                         self.readers_mut()?.confirm_eviction(request)?;
                         continue;
                     }
@@ -2247,7 +2824,7 @@ impl WorkerRuntime {
             }
 
             self.readers_mut()?.pause(file_id)?;
-            let Some(mut active) = self.framers.remove(&file_id) else {
+            let Some(mut active) = self.take_framer(file_id) else {
                 let _ = self.drain_order.pop();
                 let _ = self.drain_limits.remove(&file_id);
                 continue;
@@ -2255,6 +2832,7 @@ impl WorkerRuntime {
             loop {
                 let ready_at = Instant::now();
                 let step = active.framer.flush_drain(ready_at)?;
+                self.observe_framer_counters(&mut active.framer);
                 let produced = step.output.is_some();
                 if let Some(record) = step.output {
                     let control = self.append_record(file_id, active.base, record, ready_at)?;
@@ -2269,6 +2847,8 @@ impl WorkerRuntime {
                     break;
                 }
             }
+            self.telemetry
+                .set(WorkerGauge::PartialBytesPending, self.partial_bytes_pending);
             let _ = self.drain_order.pop();
             let _ = self.drain_limits.remove(&file_id);
         }
@@ -2286,6 +2866,12 @@ impl WorkerRuntime {
     }
 
     fn initialize_drain_replay(&mut self) -> Result<(), WorkerError> {
+        self.telemetry.add(
+            WorkerCounter::PartialBytesPendingDrain,
+            self.partial_bytes_pending,
+        );
+        self.telemetry
+            .set(WorkerGauge::PartialBytesPending, self.partial_bytes_pending);
         self.frontier_snapshot.clear();
         {
             let readers = self.readers.as_ref().ok_or(WorkerError::Inconsistent {
@@ -2337,18 +2923,31 @@ impl WorkerRuntime {
     }
 
     fn maintain_store(&mut self) -> Result<(), WorkerError> {
-        let result = if self.store.retired_generations().is_empty() {
-            self.store
-                .sync_if_due()
-                .and_then(|_| self.store.compact_if_due())
-                .map(|_| ())
-        } else {
-            self.store
-                .sync_if_due()
-                .and_then(|_| self.store.cleanup_retired_generations())
-                .map(|_| ())
+        let generation_before = self.store.generation();
+        let cleanup_pending = !self.store.retired_generations().is_empty();
+        let started = Instant::now();
+        let mut cleaned_generations = 0usize;
+        let mut cleanup_attempted = false;
+        let result = match self.store.sync_if_due() {
+            Err(error) => Err(error),
+            Ok(_) if cleanup_pending => {
+                cleanup_attempted = true;
+                self.store.cleanup_retired_generations().map(|cleaned| {
+                    cleaned_generations = cleaned;
+                })
+            }
+            Ok(_) => self.store.compact_if_due().map(|_| ()),
         };
+        record_checkpoint_maintenance_telemetry(
+            &self.telemetry,
+            generation_before,
+            self.store.generation(),
+            started.elapsed(),
+            cleaned_generations,
+            result.is_err() && cleanup_attempted,
+        );
         let _completed = self.observe_checkpoint_operation(result, "maintain checkpoint state")?;
+        self.publish_store_observations();
         Ok(())
     }
 
@@ -2364,19 +2963,23 @@ impl WorkerRuntime {
                 Ok(true)
             }
             Err(error) => {
+                self.telemetry.add(WorkerCounter::CheckpointFailures, 1);
                 self.checkpoint_maintenance_failures = self
                     .checkpoint_maintenance_failures
                     .checked_add(1)
                     .ok_or(WorkerError::Inconsistent {
                         reason: "checkpoint maintenance failure counter overflowed",
                     })?;
-                otel_warn!(
-                    "filelog_receiver.checkpoint_operation_failed",
-                    checkpoint_id = self.config.checkpoint_id.as_str(),
-                    operation = operation,
-                    consecutive_failures = u64::from(self.checkpoint_maintenance_failures),
-                    error = error.to_string()
-                );
+                if let Some(suppressed) =
+                    self.health_event(HealthEventCategory::CheckpointMaintenance)
+                {
+                    otel_warn!(
+                        "filelog_receiver.checkpoint_operation_failed",
+                        operation = operation,
+                        consecutive_failures = u64::from(self.checkpoint_maintenance_failures),
+                        suppressed_events = suppressed
+                    );
+                }
                 if self.checkpoint_maintenance_failures
                     >= self.config.checkpoint.max_consecutive_failures
                 {
@@ -2384,6 +2987,133 @@ impl WorkerRuntime {
                 }
                 self.maintenance_retry_pending = true;
                 Ok(false)
+            }
+        }
+    }
+
+    fn observe_direct_checkpoint_result<T>(
+        &mut self,
+        result: Result<T, WorkerError>,
+    ) -> Result<T, WorkerError> {
+        if result.as_ref().is_err_and(|error| {
+            matches!(
+                error,
+                WorkerError::Store(_) | WorkerError::Identity(IdentityError::Store(_))
+            )
+        }) {
+            self.telemetry.add(WorkerCounter::CheckpointFailures, 1);
+        }
+        result
+    }
+
+    fn publish_observations(&mut self) {
+        let stats = self.store.stats();
+        self.publish_store_deltas(&stats);
+        self.telemetry
+            .set(WorkerGauge::CheckpointWalSize, stats.wal_bytes);
+        self.telemetry.set(
+            WorkerGauge::FilesTracked,
+            u64::try_from(stats.records).unwrap_or(u64::MAX),
+        );
+        self.telemetry.set(
+            WorkerGauge::FilesQuarantined,
+            u64::try_from(stats.quarantined_records).unwrap_or(u64::MAX),
+        );
+        self.telemetry.set(
+            WorkerGauge::TrackedSaturated,
+            u64::from(stats.records >= self.config.limits.max_tracked_files as usize),
+        );
+
+        self.publish_reader_gauges();
+
+        self.telemetry
+            .set(WorkerGauge::PartialBytesPending, self.partial_bytes_pending);
+    }
+
+    /// Refreshes reader populations from constant-state counters and bounded
+    /// scheduling-index lengths; it never scans the reader table.
+    fn publish_reader_gauges(&self) {
+        if let Some(readers) = self.readers.as_ref() {
+            let reader_stats = readers.stats();
+            self.telemetry.set(
+                WorkerGauge::FilesOpen,
+                u64::try_from(reader_stats.open_files).unwrap_or(u64::MAX),
+            );
+            self.telemetry.set(
+                WorkerGauge::FilesDescriptorBlocked,
+                u64::try_from(reader_stats.descriptor_blocked_readers).unwrap_or(u64::MAX),
+            );
+            self.telemetry.set(
+                WorkerGauge::FilesRemovedWaiting,
+                u64::try_from(reader_stats.removed_readers).unwrap_or(u64::MAX),
+            );
+            self.telemetry.set(
+                WorkerGauge::DescriptorSaturated,
+                u64::from(reader_stats.descriptor_blocked_readers != 0),
+            );
+        } else {
+            self.telemetry.set(WorkerGauge::FilesOpen, 0);
+            self.telemetry.set(WorkerGauge::FilesDescriptorBlocked, 0);
+            self.telemetry.set(WorkerGauge::FilesRemovedWaiting, 0);
+            self.telemetry.set(WorkerGauge::DescriptorSaturated, 0);
+        }
+    }
+
+    fn publish_store_observations(&mut self) {
+        let stats = self.store.stats();
+        self.publish_store_deltas(&stats);
+        self.telemetry
+            .set(WorkerGauge::CheckpointWalSize, stats.wal_bytes);
+    }
+
+    fn publish_store_deltas(&mut self, stats: &StoreStats) {
+        macro_rules! delta {
+            ($field:ident, $counter:ident) => {
+                self.telemetry.add(
+                    WorkerCounter::$counter,
+                    stats.$field.saturating_sub(self.observed_store.$field),
+                );
+                self.observed_store.$field = stats.$field;
+            };
+        }
+        delta!(wal_bytes_appended, CheckpointWalBytes);
+        delta!(transactions_appended, CheckpointTransactions);
+        delta!(syncs, CheckpointSyncs);
+        delta!(persist_duration_ns, CheckpointPersistDurationNs);
+        delta!(persist_operations, CheckpointPersistOperations);
+        delta!(sync_duration_ns, CheckpointSyncDurationNs);
+        delta!(sync_operations, CheckpointSyncOperations);
+        delta!(quarantine_reset_beginning, QuarantineResetBeginning);
+        delta!(quarantine_reset_end, QuarantineResetEnd);
+        delta!(quarantine_keep_failed, QuarantineKeepFailed);
+        delta!(quarantine_removals, QuarantineRemove);
+        if !self.observed_store.namespace_lock_observed {
+            self.telemetry.add(
+                WorkerCounter::NamespaceLockWaitNs,
+                stats.namespace_lock_wait_ns,
+            );
+            self.telemetry.add(WorkerCounter::NamespaceLockWaits, 1);
+            self.telemetry.add(
+                WorkerCounter::NamespaceLockContentions,
+                stats.namespace_lock_contentions,
+            );
+            self.observed_store.namespace_lock_wait_ns = stats.namespace_lock_wait_ns;
+            self.observed_store.namespace_lock_contentions = stats.namespace_lock_contentions;
+            self.observed_store.namespace_lock_observed = true;
+        }
+    }
+
+    fn health_event(&mut self, category: HealthEventCategory) -> Option<u64> {
+        match self.health_events.admit(category, Instant::now()) {
+            Some(suppressed) => {
+                if suppressed != 0 {
+                    emit_suppression_summary(category, suppressed);
+                }
+                Some(suppressed)
+            }
+            None => {
+                self.telemetry.add(WorkerCounter::HealthSuppressed, 1);
+                None
             }
         }
     }
@@ -2440,6 +3170,48 @@ impl WorkerRuntime {
         })
     }
 
+    fn take_framer(&mut self, file_id: FileId) -> Option<ActiveFramer> {
+        let active = self.framers.remove(&file_id)?;
+        self.partial_bytes_pending = self
+            .partial_bytes_pending
+            .saturating_sub(active.pending_bytes);
+        Some(active)
+    }
+
+    fn put_framer(&mut self, file_id: FileId, mut active: ActiveFramer) -> Result<(), WorkerError> {
+        if self.framers.contains_key(&file_id) {
+            return Err(WorkerError::Inconsistent {
+                reason: "framer reappeared while caller owned it",
+            });
+        }
+        active.pending_bytes = active.framer.pending_source_start().map_or(0, |start| {
+            active
+                .framer
+                .next_expected_input_offset()
+                .saturating_sub(start)
+        });
+        self.partial_bytes_pending = self
+            .partial_bytes_pending
+            .saturating_add(active.pending_bytes);
+        self.telemetry
+            .set(WorkerGauge::PartialBytesPending, self.partial_bytes_pending);
+        let previous = self.framers.insert(file_id, active);
+        debug_assert!(previous.is_none());
+        Ok(())
+    }
+
+    fn discard_framer(&mut self, file_id: FileId) {
+        let _ = self.take_framer(file_id);
+        self.telemetry
+            .set(WorkerGauge::PartialBytesPending, self.partial_bytes_pending);
+    }
+
+    fn clear_framers(&mut self) {
+        self.framers.clear();
+        self.partial_bytes_pending = 0;
+        self.telemetry.set(WorkerGauge::PartialBytesPending, 0);
+    }
+
     fn shutdown_resources(&mut self) -> Result<(), WorkerError> {
         let mut first_error = None;
         if let Some(discovery) = self.discovery.take() {
@@ -2448,6 +3220,10 @@ impl WorkerRuntime {
                 first_error = Some(WorkerError::DiscoveryThreadPanicked);
             }
         }
+        self.telemetry.set(WorkerGauge::FilesPending, 0);
+        self.telemetry.set(WorkerGauge::CandidateOldestAgeNs, 0);
+        self.telemetry
+            .set(WorkerGauge::CandidateOverflowPersistenceNs, 0);
         loop {
             let result = self.store.drain();
             match self.observe_checkpoint_operation(result, "shut down checkpoint state") {
@@ -2485,7 +3261,8 @@ impl WorkerRuntime {
             self.readers_ref()?
                 .preflight_release_finalized(delta.file_id())?;
         }
-        persist_direct_progress(&mut self.store, delta)?;
+        let result = persist_direct_progress(&mut self.store, delta);
+        self.observe_direct_checkpoint_result(result)?;
         self.readers_mut()?.observe_committed_progress(
             delta.file_id(),
             delta.expected_file_epoch(),
@@ -2498,7 +3275,9 @@ impl WorkerRuntime {
             let _ = self.rotation_waits.remove(&delta.file_id());
             let _ = self.record_numbers.remove(delta.file_id());
             self.remove_drain_file(delta.file_id());
+            record_rotation_finalization_telemetry(&self.telemetry);
         }
+        self.publish_observations();
         Ok(())
     }
 }
@@ -2510,7 +3289,16 @@ fn worker_batch(retained: &RetainedBatch) -> WorkerBatch {
         records: retained.logical.outbound_records(),
         record_count: retained.logical.record_count(),
         logical_bytes: retained.logical.logical_bytes(),
+        source_bytes: retained.logical.source_bytes(),
     }
+}
+
+fn emit_suppression_summary(category: HealthEventCategory, suppressed: u64) {
+    otel_info!(
+        "filelog_receiver.health_events_suppressed",
+        category = category.as_str(),
+        suppressed_events = suppressed
+    );
 }
 
 fn send_event_interruptibly(

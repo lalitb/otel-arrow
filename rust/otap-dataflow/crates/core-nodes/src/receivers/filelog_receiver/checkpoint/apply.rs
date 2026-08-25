@@ -29,6 +29,12 @@ pub type TableRecord = SnapshotRecord;
 #[derive(Debug, Clone, Default)]
 pub struct CheckpointTable {
     records: HashMap<FileId, TableRecord>,
+    quarantined_records: usize,
+}
+
+/// Bounded transaction scratch state validated against an unchanged table.
+pub(crate) struct StagedOperations {
+    touched: HashMap<FileId, Option<TableRecord>>,
 }
 
 impl CheckpointTable {
@@ -57,6 +63,11 @@ impl CheckpointTable {
                 });
             }
         }
+        table.quarantined_records = table
+            .records
+            .values()
+            .filter(|record| record.lifecycle_state == LifecycleState::Quarantined)
+            .count();
         Ok(table)
     }
 
@@ -70,6 +81,12 @@ impl CheckpointTable {
     #[must_use]
     pub fn len(&self) -> usize {
         self.records.len()
+    }
+
+    /// Number of durable quarantined records.
+    #[must_use]
+    pub const fn quarantined_len(&self) -> usize {
+        self.quarantined_records
     }
 
     /// Whether the table is empty.
@@ -98,11 +115,11 @@ impl CheckpointTable {
 
     /// Validates and stages `operations` in a bounded scratch map without
     /// changing the table.
-    fn stage_operations(
+    pub(crate) fn stage_operations(
         &self,
         operations: &[Operation],
         namespace_id: &str,
-    ) -> Result<HashMap<FileId, Option<TableRecord>>, ApplyError> {
+    ) -> Result<StagedOperations, ApplyError> {
         let mut touched: HashMap<FileId, Option<TableRecord>> = HashMap::new();
         for operation in operations {
             let file_id = operation.file_id();
@@ -113,7 +130,43 @@ impl CheckpointTable {
         for operation in operations {
             Self::apply_operation(&mut touched, operation, namespace_id)?;
         }
-        Ok(touched)
+        Ok(StagedOperations { touched })
+    }
+
+    /// Commits scratch state already validated against this unchanged table.
+    pub(crate) fn commit_staged(&mut self, staged: StagedOperations) {
+        for (file_id, record) in staged.touched {
+            let old_quarantined = self
+                .records
+                .get(&file_id)
+                .is_some_and(|record| record.lifecycle_state == LifecycleState::Quarantined);
+            let new_quarantined = record
+                .as_ref()
+                .is_some_and(|record| record.lifecycle_state == LifecycleState::Quarantined);
+            match (old_quarantined, new_quarantined) {
+                (false, true) => {
+                    self.quarantined_records = self
+                        .quarantined_records
+                        .checked_add(1)
+                        .expect("staged quarantine count cannot exceed the table");
+                }
+                (true, false) => {
+                    self.quarantined_records = self
+                        .quarantined_records
+                        .checked_sub(1)
+                        .expect("staged quarantine count matches the table");
+                }
+                (false, false) | (true, true) => {}
+            }
+            match record {
+                Some(record) => {
+                    let _ = self.records.insert(file_id, record);
+                }
+                None => {
+                    let _ = self.records.remove(&file_id);
+                }
+            }
+        }
     }
 
     /// Validates every supplied operation without changing the table.
@@ -153,17 +206,8 @@ impl CheckpointTable {
         transaction: &Transaction,
         namespace_id: &str,
     ) -> Result<(), ApplyError> {
-        let touched = self.stage_operations(&transaction.operations, namespace_id)?;
-        for (file_id, record) in touched {
-            match record {
-                Some(record) => {
-                    let _previous = self.records.insert(file_id, record);
-                }
-                None => {
-                    let _removed = self.records.remove(&file_id);
-                }
-            }
-        }
+        let staged = self.stage_operations(&transaction.operations, namespace_id)?;
+        self.commit_staged(staged);
         Ok(())
     }
 

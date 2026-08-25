@@ -6,7 +6,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use super::{
     CandidateEvent, DiscoveredCandidate, DiscoveryError, DiscoveryFeedback, DiscoveryIssue,
@@ -20,6 +20,7 @@ use crate::receivers::filelog_receiver::identity::matcher::CandidateInventory;
 struct PendingEntry {
     candidate: DiscoveredCandidate,
     first_seen_generation: u64,
+    first_seen_at: Instant,
     seen_generation: u64,
 }
 
@@ -30,6 +31,7 @@ struct TrackedEntry {
     present: bool,
     inflight_candidate: Option<DiscoveredCandidate>,
     first_seen_generation: Option<u64>,
+    first_seen_at: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -78,8 +80,10 @@ pub(crate) struct AdmissionController {
     events: Vec<CandidateEvent>,
     stats: Option<DiscoveryStats>,
     scan_now: Option<SystemTime>,
+    scan_started: Option<Instant>,
     removal_evidence_complete: bool,
     deferred_overflow: u64,
+    overflow_since: Option<Instant>,
 }
 
 impl AdmissionController {
@@ -109,12 +113,22 @@ impl AdmissionController {
             events: Vec::new(),
             stats: None,
             scan_now: None,
+            scan_started: None,
             removal_evidence_complete: false,
             deferred_overflow: 0,
+            overflow_since: None,
         })
     }
 
     pub(crate) fn begin_scan(&mut self, now: SystemTime) -> Result<u64, DiscoveryError> {
+        self.begin_scan_at(now, Instant::now())
+    }
+
+    pub(crate) fn begin_scan_at(
+        &mut self,
+        now: SystemTime,
+        started: Instant,
+    ) -> Result<u64, DiscoveryError> {
         if self.stats.is_some() {
             return Err(DiscoveryError::GenerationOutOfOrder {
                 expected: self.generation,
@@ -137,6 +151,7 @@ impl AdmissionController {
         }
         self.stats = Some(stats);
         self.scan_now = Some(now);
+        self.scan_started = Some(started);
         self.removal_evidence_complete = true;
         Ok(self.generation)
     }
@@ -231,6 +246,42 @@ impl AdmissionController {
     }
 
     pub(crate) fn finish_scan(&mut self) -> Result<ReconciliationBatch, DiscoveryError> {
+        self.finish_scan_with_clock(&mut Instant::now)
+    }
+
+    /// Finishes reconciliation using separate decision and completion clocks.
+    pub(super) fn finish_scan_with_clock(
+        &mut self,
+        clock: &mut impl FnMut() -> Instant,
+    ) -> Result<ReconciliationBatch, DiscoveryError> {
+        let started_at = self
+            .scan_started
+            .ok_or(DiscoveryError::GenerationOutOfOrder {
+                expected: self.generation,
+                found: self.generation,
+            })?;
+        let mut batch = self.finish_scan_at(clock())?;
+        let completed_at = clock();
+        batch.stats.scan_duration = completed_at.saturating_duration_since(started_at);
+        batch.stats.oldest_pending_age = self
+            .pending
+            .values()
+            .map(|entry| completed_at.saturating_duration_since(entry.first_seen_at))
+            .max()
+            .unwrap_or(Duration::ZERO);
+        if batch.stats.overflowed_candidates != 0 {
+            let since = self
+                .overflow_since
+                .expect("an overflowing scan records its persistence epoch");
+            batch.stats.overflow_persistence = completed_at.saturating_duration_since(since);
+        }
+        Ok(batch)
+    }
+
+    pub(crate) fn finish_scan_at(
+        &mut self,
+        finished_at: Instant,
+    ) -> Result<ReconciliationBatch, DiscoveryError> {
         let generation = self.generation;
         if self.stats.is_none() {
             return Err(DiscoveryError::GenerationOutOfOrder {
@@ -246,8 +297,8 @@ impl AdmissionController {
                 .retain(|locator| self.pending.contains_key(locator));
         }
 
-        self.admit_pending()?;
-        self.retain_selected()?;
+        self.admit_pending(finished_at)?;
+        self.retain_selected(finished_at)?;
 
         if self.removal_evidence_complete {
             for (locator, entry) in &mut self.tracked {
@@ -284,6 +335,22 @@ impl AdmissionController {
             .expect("active scan always owns statistics");
         stats.pending_candidates = self.pending.len();
         stats.emitted_events = self.events.len();
+        let started_at = self
+            .scan_started
+            .expect("active scan always has a monotonic clock");
+        stats.scan_duration = finished_at.saturating_duration_since(started_at);
+        stats.oldest_pending_age = self
+            .pending
+            .values()
+            .map(|entry| finished_at.saturating_duration_since(entry.first_seen_at))
+            .max()
+            .unwrap_or(Duration::ZERO);
+        if stats.overflowed_candidates != 0 {
+            let since = *self.overflow_since.get_or_insert(started_at);
+            stats.overflow_persistence = finished_at.saturating_duration_since(since);
+        } else {
+            self.overflow_since = None;
+        }
         let inventory = if stats.complete {
             CandidateInventory::from_complete_reconciliation(
                 &inventory_candidates,
@@ -298,6 +365,7 @@ impl AdmissionController {
             )
         };
         self.scan_now = None;
+        self.scan_started = None;
         Ok(ReconciliationBatch {
             events: std::mem::take(&mut self.events),
             inventory,
@@ -386,6 +454,7 @@ impl AdmissionController {
                 .expect("feedback was preflighted");
             entry.inflight_candidate = None;
             entry.first_seen_generation = None;
+            entry.first_seen_at = None;
             self.inflight_count =
                 self.inflight_count
                     .checked_sub(1)
@@ -408,6 +477,7 @@ impl AdmissionController {
             }
             if !entry.present {
                 entry.first_seen_generation = None;
+                entry.first_seen_at = None;
                 let previous = self.tracked.insert(locator, entry);
                 debug_assert!(previous.is_none());
             }
@@ -429,15 +499,18 @@ impl AdmissionController {
                     })?;
             if !entry.present {
                 entry.first_seen_generation = None;
+                entry.first_seen_at = None;
                 let previous = self.tracked.insert(locator, entry);
                 debug_assert!(previous.is_none());
             } else if self.pending.len() < self.max_pending_candidates {
                 let first_seen_generation = entry.first_seen_generation.unwrap_or(self.generation);
+                let first_seen_at = entry.first_seen_at.unwrap_or_else(Instant::now);
                 let previous = self.pending.insert(
                     locator,
                     PendingEntry {
                         candidate,
                         first_seen_generation,
+                        first_seen_at,
                         seen_generation: self.generation,
                     },
                 );
@@ -520,7 +593,7 @@ impl AdmissionController {
         }
     }
 
-    fn admit_pending(&mut self) -> Result<(), DiscoveryError> {
+    fn admit_pending(&mut self, finished_at: Instant) -> Result<(), DiscoveryError> {
         let retained = self.pending_order.len();
         for _ in 0..retained {
             if self.inflight_count >= self.max_candidate_events {
@@ -540,17 +613,30 @@ impl AdmissionController {
             let Some(entry) = self.pending.remove(&locator) else {
                 continue;
             };
-            self.track_observed(entry.candidate, entry.first_seen_generation)?;
+            self.track_observed(
+                entry.candidate,
+                entry.first_seen_generation,
+                entry.first_seen_at,
+                finished_at,
+            )?;
         }
         Ok(())
     }
 
-    fn retain_selected(&mut self) -> Result<(), DiscoveryError> {
+    fn retain_selected(&mut self, finished_at: Instant) -> Result<(), DiscoveryError> {
         let selected = std::mem::take(&mut self.selected).into_sorted_vec();
         self.selected_locators.clear();
         for selected in selected {
             if self.inflight_count < self.max_candidate_events {
-                self.track_observed(selected.candidate, self.generation)?;
+                let first_seen_at = self
+                    .scan_started
+                    .expect("active scan always has a monotonic clock");
+                self.track_observed(
+                    selected.candidate,
+                    self.generation,
+                    first_seen_at,
+                    finished_at,
+                )?;
             } else if self.pending.len() < self.max_pending_candidates {
                 let locator = selected.candidate.evidence.locator;
                 self.pending_order.push_back(locator);
@@ -559,6 +645,9 @@ impl AdmissionController {
                     PendingEntry {
                         candidate: selected.candidate,
                         first_seen_generation: self.generation,
+                        first_seen_at: self
+                            .scan_started
+                            .expect("active scan always has a monotonic clock"),
                         seen_generation: self.generation,
                     },
                 );
@@ -574,11 +663,25 @@ impl AdmissionController {
         &mut self,
         candidate: DiscoveredCandidate,
         first_seen_generation: u64,
+        first_seen_at: Instant,
+        admitted_at: Instant,
     ) -> Result<(), DiscoveryError> {
         if self.tracked.len() >= self.max_live_entries {
             return self.mark_incomplete_overflow();
         }
         let locator = candidate.evidence.locator;
+        let admission_delay = admitted_at.saturating_duration_since(first_seen_at);
+        {
+            let stats = self.current_stats_mut()?;
+            stats.admission_delay = stats.admission_delay.saturating_add(admission_delay);
+            stats.admissions =
+                stats
+                    .admissions
+                    .checked_add(1)
+                    .ok_or(DiscoveryError::CounterOverflow {
+                        counter: "candidate admissions",
+                    })?;
+        }
         let previous = self.tracked.insert(
             locator,
             TrackedEntry {
@@ -587,6 +690,7 @@ impl AdmissionController {
                 present: true,
                 inflight_candidate: Some(candidate.clone()),
                 first_seen_generation: Some(first_seen_generation),
+                first_seen_at: Some(first_seen_at),
             },
         );
         debug_assert!(previous.is_none());

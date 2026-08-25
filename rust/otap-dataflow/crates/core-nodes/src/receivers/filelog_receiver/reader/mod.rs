@@ -410,6 +410,8 @@ pub(crate) struct ReaderStats {
     pub(crate) eof_readers: usize,
     /// Readers removed from discovery but not finalized.
     pub(crate) removed_readers: usize,
+    /// Readers waiting for a resident descriptor slot.
+    pub(crate) descriptor_blocked_readers: usize,
     /// Bounded positioned-read attempts.
     pub(crate) read_turns: u64,
     /// Source bytes returned by operating-system reads, including replay.
@@ -424,6 +426,15 @@ pub(crate) struct ReaderStats {
     pub(crate) source_bytes_rewound: u64,
     /// Temporary EOF observations.
     pub(crate) eof_observations: u64,
+}
+
+/// Fixed-size runtime-lease observations transferred after admission.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct LeaseObservations {
+    pub(crate) wait_ns: u64,
+    pub(crate) attempts: u64,
+    pub(crate) failures: u64,
+    pub(crate) contentions: u64,
 }
 
 /// Allocation-free snapshot of one logical reader's source frontiers.
@@ -559,13 +570,18 @@ pub(crate) struct ReaderTable {
     by_locator: HashMap<Locator, FileId>,
     ready: VecDeque<FileId>,
     eof_deadlines: BTreeSet<(Instant, FileId)>,
+    descriptor_blocked: BTreeSet<FileId>,
     open_count: usize,
+    removed_count: usize,
     service_sequence: u64,
     turn_sequence: u64,
     eviction_sequence: u64,
     pending_eviction: Option<EvictionRequest>,
     read_buffer: Option<Vec<u8>>,
     counters: ActivityCounters,
+    lease_observations: LeaseObservations,
+    #[cfg(test)]
+    fail_next_revoked_release: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -667,13 +683,18 @@ impl ReaderTable {
             by_locator,
             ready,
             eof_deadlines: BTreeSet::new(),
+            descriptor_blocked: BTreeSet::new(),
             open_count: 0,
+            removed_count: 0,
             service_sequence: 0,
             turn_sequence: 0,
             eviction_sequence: 0,
             pending_eviction: None,
             read_buffer: Some(read_buffer),
             counters: ActivityCounters::new(),
+            lease_observations: LeaseObservations::default(),
+            #[cfg(test)]
+            fail_next_revoked_release: false,
         })
     }
 
@@ -714,7 +735,25 @@ impl ReaderTable {
             });
         }
         let _bounded_resolved_path = encode_advisory_path(&candidate.resolved_path)?;
-        let lease = self.lease_scope.try_acquire(candidate.evidence.locator)?;
+        let lease_started = Instant::now();
+        let lease_result = self.lease_scope.try_acquire(candidate.evidence.locator);
+        self.lease_observations.attempts = self.lease_observations.attempts.saturating_add(1);
+        self.lease_observations.wait_ns = self
+            .lease_observations
+            .wait_ns
+            .saturating_add(u64::try_from(lease_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        let lease = match lease_result {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.lease_observations.failures =
+                    self.lease_observations.failures.saturating_add(1);
+                if matches!(error, LeaseError::Contended { .. }) {
+                    self.lease_observations.contentions =
+                        self.lease_observations.contentions.saturating_add(1);
+                }
+                return Err(ReaderError::Lease(error));
+            }
+        };
         let file_id = resolved.file_id;
         let locator = candidate.evidence.locator;
         let reader = LogicalReader {
@@ -837,9 +876,22 @@ impl ReaderTable {
                 .ok_or(ReaderError::Inconsistent {
                     reason: "locator index points to a missing reader",
                 })?;
+            if !reader.present {
+                return Err(ReaderError::InvalidState {
+                    file_id,
+                    operation: "mark removed",
+                    state: "already removed",
+                });
+            }
             reader.present = false;
             reader.resident.is_some()
         };
+        self.removed_count =
+            self.removed_count
+                .checked_add(1)
+                .ok_or(ReaderError::CounterOverflow {
+                    counter: "removed readers",
+                })?;
         if has_descriptor {
             Ok(RemovalDisposition::HandleRetained)
         } else {
@@ -890,8 +942,6 @@ impl ReaderTable {
         if limit.is_none() {
             self.activate_due(now)?;
         }
-        self.promote_descriptor_waiter()?;
-
         let Some(file_id) = self.ready.pop_front() else {
             return Ok(ReaderPoll::Idle {
                 next_probe: self.eof_deadlines.first().map(|(deadline, _)| *deadline),
@@ -944,6 +994,11 @@ impl ReaderTable {
                         reason: "descriptor-blocked target disappeared",
                     })?
                     .schedule = ScheduleState::DescriptorBlocked;
+                if !self.descriptor_blocked.insert(file_id) {
+                    return Err(ReaderError::Inconsistent {
+                        reason: "descriptor-blocked reader was already indexed",
+                    });
+                }
                 return Ok(ReaderPoll::DescriptorCapacityBlocked { file_id });
             }
             match self.open_reader(file_id) {
@@ -984,8 +1039,19 @@ impl ReaderTable {
                             .ok_or(ReaderError::Inconsistent {
                                 reason: "unavailable reopen target disappeared",
                             })?;
+                    if !reader.present {
+                        return Err(ReaderError::Inconsistent {
+                            reason: "unavailable reopen target was already removed",
+                        });
+                    }
                     reader.present = false;
                     reader.schedule = ScheduleState::Paused;
+                    self.removed_count =
+                        self.removed_count
+                            .checked_add(1)
+                            .ok_or(ReaderError::CounterOverflow {
+                                counter: "removed readers",
+                            })?;
                     return Ok(ReaderPoll::RemovedWithoutDescriptor { file_id });
                 }
                 Err(error) => {
@@ -1234,6 +1300,7 @@ impl ReaderTable {
         if disposition == TurnDisposition::Ready {
             self.ready.push_back(turn.file_id);
         }
+        self.promote_descriptor_waiter()?;
         Ok(())
     }
 
@@ -1265,6 +1332,11 @@ impl ReaderTable {
                     Some(next_probe)
                 }
                 ScheduleState::DescriptorBlocked => {
+                    if !self.descriptor_blocked.remove(&file_id) {
+                        return Err(ReaderError::Inconsistent {
+                            reason: "descriptor-blocked reader has no index entry",
+                        });
+                    }
                     reader.schedule = ScheduleState::Ready;
                     None
                 }
@@ -1374,7 +1446,13 @@ impl ReaderTable {
                     });
                 }
             }
-            ScheduleState::DescriptorBlocked => {}
+            ScheduleState::DescriptorBlocked => {
+                if !self.descriptor_blocked.remove(&file_id) {
+                    return Err(ReaderError::Inconsistent {
+                        reason: "paused descriptor-blocked reader has no index entry",
+                    });
+                }
+            }
             ScheduleState::Paused => {}
             ScheduleState::InFlight { .. } => unreachable!("checked before replacement"),
         }
@@ -1731,6 +1809,12 @@ impl ReaderTable {
     /// Releases a present or absent logical reader after later policy has
     /// durably quarantined or revoked it.
     pub(crate) fn release_revoked(&mut self, file_id: FileId) -> Result<Locator, ReaderError> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_revoked_release) {
+            return Err(ReaderError::Inconsistent {
+                reason: "injected revoked-reader release failure",
+            });
+        }
         self.cancel_eviction_involving(file_id)?;
         let reader = self
             .readers
@@ -1744,6 +1828,12 @@ impl ReaderTable {
             });
         }
         self.release_reader(file_id)
+    }
+
+    #[cfg(test)]
+    /// Injects one revoked-reader release failure without mutating the table.
+    pub(crate) fn fail_next_revoked_release_for_test(&mut self) {
+        self.fail_next_revoked_release = true;
     }
 
     /// Validates a durable truncate reset against unchanged live state.
@@ -1852,11 +1942,8 @@ impl ReaderTable {
             open_files: self.open_count,
             ready_readers: self.ready.len(),
             eof_readers: self.eof_deadlines.len(),
-            removed_readers: self
-                .readers
-                .values()
-                .filter(|reader| !reader.present)
-                .count(),
+            removed_readers: self.removed_count,
+            descriptor_blocked_readers: self.descriptor_blocked.len(),
             read_turns: self.counters.read_turns,
             source_bytes_read: self.counters.source_bytes_read,
             opens: self.counters.opens,
@@ -1865,6 +1952,17 @@ impl ReaderTable {
             source_bytes_rewound: self.counters.source_bytes_rewound,
             eof_observations: self.counters.eof_observations,
         }
+    }
+
+    /// Current resident descriptor count without scanning reader entries.
+    #[must_use]
+    pub(crate) const fn open_file_count(&self) -> usize {
+        self.open_count
+    }
+
+    /// Transfers runtime-lease observations without retaining per-file state.
+    pub(crate) fn take_lease_observations(&mut self) -> LeaseObservations {
+        std::mem::take(&mut self.lease_observations)
     }
 
     /// Iterates every logical reader without allocating or cloning path
@@ -2006,7 +2104,9 @@ impl ReaderTable {
         self.by_locator.clear();
         self.ready.clear();
         self.eof_deadlines.clear();
+        self.descriptor_blocked.clear();
         self.open_count = 0;
+        self.removed_count = 0;
         if let Err(error) = self.lease_scope.close()
             && first_error.is_none()
         {
@@ -2187,7 +2287,15 @@ impl ReaderTable {
                     })
                 }
             }
-            ScheduleState::DescriptorBlocked => Ok(()),
+            ScheduleState::DescriptorBlocked => {
+                if self.descriptor_blocked.remove(&file_id) {
+                    Ok(())
+                } else {
+                    Err(ReaderError::Inconsistent {
+                        reason: "descriptor-blocked reader has no index entry",
+                    })
+                }
+            }
             ScheduleState::Paused => Ok(()),
             ScheduleState::InFlight { .. } => Err(ReaderError::InvalidState {
                 file_id,
@@ -2296,23 +2404,24 @@ impl ReaderTable {
     }
 
     fn promote_descriptor_waiter(&mut self) -> Result<(), ReaderError> {
-        let next = self
-            .readers
-            .values()
-            .filter(|reader| {
-                matches!(reader.schedule, ScheduleState::DescriptorBlocked)
-                    && (self.open_count < self.settings.max_open_files
-                        || self.select_lrs_victim(reader.file_id).is_some())
-            })
-            .map(|reader| reader.file_id)
-            .min();
-        if let Some(file_id) = next {
+        let next = self.descriptor_blocked.first().copied();
+        if let Some(file_id) = next
+            && (self.open_count < self.settings.max_open_files
+                || self.select_lrs_victim(file_id).is_some())
+        {
             let reader = self
                 .readers
                 .get_mut(&file_id)
                 .ok_or(ReaderError::Inconsistent {
                     reason: "descriptor waiter disappeared",
                 })?;
+            if !matches!(reader.schedule, ScheduleState::DescriptorBlocked)
+                || !self.descriptor_blocked.remove(&file_id)
+            {
+                return Err(ReaderError::Inconsistent {
+                    reason: "descriptor waiter index and schedule disagree",
+                });
+            }
             reader.schedule = ScheduleState::Ready;
             self.ready.push_back(file_id);
         }
@@ -2334,6 +2443,14 @@ impl ReaderTable {
                 .ok_or(ReaderError::Inconsistent {
                     reason: "open descriptor count underflowed during release",
                 })?;
+        }
+        if !reader.present {
+            self.removed_count =
+                self.removed_count
+                    .checked_sub(1)
+                    .ok_or(ReaderError::Inconsistent {
+                        reason: "removed reader count underflowed during release",
+                    })?;
         }
         if self.by_locator.remove(&reader.locator) != Some(file_id) {
             return Err(ReaderError::Inconsistent {

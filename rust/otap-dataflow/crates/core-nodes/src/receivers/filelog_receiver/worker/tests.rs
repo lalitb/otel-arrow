@@ -13,11 +13,12 @@ use tempfile::tempdir;
 use super::*;
 use crate::receivers::filelog_receiver::batching::{FinalizationOutcome, ProgressFrontier};
 use crate::receivers::filelog_receiver::checkpoint::primitives::{
-    FRAMING_PROFILE_VERSION, FramingResume, Locator,
+    FRAMING_PROFILE_VERSION, FramingResume, Locator, QUARANTINE_REASON_DECODE,
+    QUARANTINE_REASON_TRUNCATE,
 };
 use crate::receivers::filelog_receiver::checkpoint::store::fault::FaultPoint;
 use crate::receivers::filelog_receiver::checkpoint::wal::{RegisterFile, UpdateProgress};
-use crate::receivers::filelog_receiver::config::Config;
+use crate::receivers::filelog_receiver::config::{Config, OnDecodeError};
 use crate::receivers::filelog_receiver::discovery::DiscoveredCandidate;
 use crate::receivers::filelog_receiver::discovery::scanner::DiscoveryPlan;
 use crate::receivers::filelog_receiver::discovery::source::spawn_discovery;
@@ -45,6 +46,124 @@ fn runtime_config(
     let mut runtime = RuntimeConfig::from_config(config, "").unwrap();
     runtime.checkpoint_namespace_dir = namespace_dir.to_path_buf();
     runtime
+}
+
+/// Scenario: framed outputs and lifecycle transitions cover decode policies,
+/// record truncation, splitting, bounded flushes, copy-truncate policies,
+/// descriptor quarantine, rotation finalization, and checkpoint maintenance.
+/// Guarantees: worker-owned authoritative frame observations increment only
+/// their fixed telemetry counters with exact malformed and discarded counts.
+#[test]
+fn framed_record_telemetry_uses_exact_bounded_categories() {
+    let telemetry = WorkerTelemetryBridge::default();
+    record_framed_telemetry(
+        &telemetry,
+        FramedTelemetry {
+            decode_outcome: DecodeOutcome::Replacements { count: 2 },
+            flush_reason: Some(FlushReason::MaxLines),
+            truncated: true,
+            discarded_source_bytes: 7,
+            split: false,
+        },
+    );
+    record_truncation_detection(&telemetry);
+    record_truncation_outcome(&telemetry, OnTruncate::Fail);
+    record_truncation_detection(&telemetry);
+    record_truncation_outcome(&telemetry, OnTruncate::ReadNew);
+    record_descriptor_quarantine_telemetry(&telemetry);
+    record_rotation_finalization_telemetry(&telemetry);
+    record_checkpoint_maintenance_telemetry(&telemetry, 1, 2, Duration::from_nanos(11), 2, true);
+    record_framed_telemetry(
+        &telemetry,
+        FramedTelemetry {
+            decode_outcome: DecodeOutcome::PreserveRaw { count: 3 },
+            flush_reason: Some(FlushReason::Timeout),
+            truncated: false,
+            discarded_source_bytes: 0,
+            split: true,
+        },
+    );
+
+    assert_eq!(
+        telemetry.take_counter_for_test(WorkerCounter::DecodeReplaceRecords),
+        1
+    );
+    assert_eq!(
+        telemetry.take_counter_for_test(WorkerCounter::DecodeReplaceUnits),
+        2
+    );
+    assert_eq!(
+        telemetry.take_counter_for_test(WorkerCounter::DecodePreserveRawRecords),
+        1
+    );
+    assert_eq!(
+        telemetry.take_counter_for_test(WorkerCounter::DecodePreserveRawUnits),
+        3
+    );
+    assert_eq!(
+        telemetry.take_counter_for_test(WorkerCounter::RecordsTruncated),
+        1
+    );
+    assert_eq!(
+        telemetry.take_counter_for_test(WorkerCounter::SourceBytesDiscarded),
+        7
+    );
+    assert_eq!(
+        telemetry.take_counter_for_test(WorkerCounter::SplitFragments),
+        1
+    );
+    assert_eq!(
+        telemetry.take_counter_for_test(WorkerCounter::FlushMaxLines),
+        1
+    );
+    assert_eq!(
+        telemetry.take_counter_for_test(WorkerCounter::FlushTimeout),
+        1
+    );
+    assert_eq!(
+        telemetry.take_counter_for_test(WorkerCounter::CopytruncateDetected),
+        2
+    );
+    assert_eq!(
+        telemetry.take_counter_for_test(WorkerCounter::CopytruncateFail),
+        1
+    );
+    assert_eq!(
+        telemetry.take_counter_for_test(WorkerCounter::CopytruncateReadNew),
+        1
+    );
+    assert_eq!(
+        telemetry.take_counter_for_test(WorkerCounter::QuarantineTruncate),
+        1
+    );
+    assert_eq!(
+        telemetry.take_counter_for_test(WorkerCounter::RotationDescriptorUnavailable),
+        1
+    );
+    assert_eq!(
+        telemetry.take_counter_for_test(WorkerCounter::QuarantineDescriptorUnavailable),
+        1
+    );
+    assert_eq!(
+        telemetry.take_counter_for_test(WorkerCounter::RotationFinalizations),
+        1
+    );
+    assert_eq!(
+        telemetry.take_counter_for_test(WorkerCounter::CheckpointCompactions),
+        1
+    );
+    assert_eq!(
+        telemetry.take_counter_for_test(WorkerCounter::CheckpointCompactionDurationNs),
+        11
+    );
+    assert_eq!(
+        telemetry.take_counter_for_test(WorkerCounter::CheckpointCleanupGenerations),
+        2
+    );
+    assert_eq!(
+        telemetry.take_counter_for_test(WorkerCounter::CheckpointCleanupFailures),
+        1
+    );
 }
 
 async fn receive_batch(events: &mut tokio::sync::mpsc::Receiver<WorkerEvent>) -> WorkerBatch {
@@ -97,6 +216,40 @@ async fn stop_worker(
         .unwrap()
 }
 
+async fn wait_for_worker_counter(
+    telemetry: &WorkerTelemetryBridge,
+    counter: WorkerCounter,
+    expected: u64,
+) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if telemetry.counter_for_test(counter) == expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("worker telemetry counter timeout");
+}
+
+async fn wait_for_worker_gauge(
+    telemetry: &WorkerTelemetryBridge,
+    gauge: WorkerGauge,
+    expected: u64,
+) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if telemetry.gauge_for_test(gauge) == expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("worker telemetry gauge timeout");
+}
+
 /// Scenario: the exact RuntimeConfig used by worker integration tests starts
 /// the dedicated discovery source against a temporary file.
 /// Guarantees: startup emits one observed candidate immediately, ruling out
@@ -120,6 +273,43 @@ fn worker_runtime_discovery_plan_emits_initial_candidate() {
     assert!(matches!(batch.events[0], CandidateEvent::Observed(_)));
     discovery.request_shutdown();
     discovery.into_join_handle().join().unwrap();
+}
+
+/// Scenario: a worker opens a source descriptor and then receives forced
+/// shutdown while discovery still has current observations.
+/// Guarantees: terminal bridge state zeros reader and discovery gauges before
+/// the worker exits, without scanning retained reader or checkpoint tables.
+#[tokio::test]
+async fn worker_shutdown_zeros_all_terminal_population_gauges() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("shutdown-gauges.log");
+    std::fs::write(&source, b"partial").unwrap();
+    let namespace = directory.path().join("checkpoint");
+    let runtime = runtime_config(source.to_str().unwrap(), &namespace, 10);
+    let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+    let worker = spawn_worker(runtime, event_tx).unwrap();
+    let telemetry = Arc::clone(&worker.telemetry);
+
+    wait_for_worker_gauge(&telemetry, WorkerGauge::FilesOpen, 1).await;
+    stop_worker(worker, &mut events).await.unwrap();
+    assert_eq!(telemetry.gauge_for_test(WorkerGauge::FilesOpen), 0);
+    assert_eq!(
+        telemetry.gauge_for_test(WorkerGauge::FilesDescriptorBlocked),
+        0
+    );
+    assert_eq!(
+        telemetry.gauge_for_test(WorkerGauge::FilesRemovedWaiting),
+        0
+    );
+    assert_eq!(telemetry.gauge_for_test(WorkerGauge::FilesPending), 0);
+    assert_eq!(
+        telemetry.gauge_for_test(WorkerGauge::CandidateOldestAgeNs),
+        0
+    );
+    assert_eq!(
+        telemetry.gauge_for_test(WorkerGauge::CandidateOverflowPersistenceNs),
+        0
+    );
 }
 
 /// Scenario: one temporary file is discovered, assigned a durable identity,
@@ -230,6 +420,338 @@ async fn retained_batch_blocks_all_files_until_completion() {
     );
 }
 
+/// Scenario: one malformed file and one valid file are discovered together
+/// under the decode `fail` policy, then the worker is restarted.
+/// Guarantees: only the malformed identity is durably quarantined with reason
+/// `0x0001`, unrelated records continue, and restart never rereads quarantine.
+#[tokio::test]
+async fn decode_failure_is_durably_contained_to_one_file_across_restart() {
+    let directory = tempdir().unwrap();
+    let bad = directory.path().join("bad.log");
+    let good = directory.path().join("good.log");
+    std::fs::write(&bad, [0xff, b'\n']).unwrap();
+    std::fs::write(&good, b"good\n").unwrap();
+    let namespace = directory.path().join("checkpoint");
+    let include = directory.path().join("*.log");
+    let mut runtime = runtime_config(include.to_str().unwrap(), &namespace, 1);
+    runtime.on_decode_error = OnDecodeError::Fail;
+    let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+    let worker = spawn_worker(runtime.clone(), event_tx).unwrap();
+
+    let batch = receive_batch(&mut events).await;
+    worker
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: batch.batch_id,
+            attempt: batch.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    receive_commit(&mut events).await.3.unwrap();
+    wait_for_worker_counter(&worker.telemetry, WorkerCounter::QuarantineDecode, 1).await;
+    stop_worker(worker, &mut events).await.unwrap();
+
+    let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
+    let quarantined = store
+        .table()
+        .iter()
+        .find(|(_, record)| record.lifecycle_state == LifecycleState::Quarantined)
+        .map(|(_, record)| record)
+        .expect("malformed identity is quarantined");
+    assert_eq!(
+        quarantined
+            .quarantine_evidence
+            .as_ref()
+            .expect("quarantine evidence")
+            .reason_code,
+        QUARANTINE_REASON_DECODE
+    );
+    assert!(store.table().iter().any(|(_, record)| {
+        record.lifecycle_state == LifecycleState::Active && record.committed_offset == 5
+    }));
+    drop(store);
+
+    OpenOptions::new()
+        .append(true)
+        .open(&good)
+        .unwrap()
+        .write_all(b"again\n")
+        .unwrap();
+    let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+    let reopened = spawn_worker(runtime.clone(), event_tx).unwrap();
+    let continued = receive_batch(&mut events).await;
+    reopened
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: continued.batch_id,
+            attempt: continued.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    receive_commit(&mut events).await.3.unwrap();
+    assert_eq!(
+        reopened
+            .telemetry
+            .counter_for_test(WorkerCounter::QuarantineDecode),
+        0
+    );
+    stop_worker(reopened, &mut events).await.unwrap();
+}
+
+/// Scenario: a file emits one valid record and then reaches malformed input
+/// while that record remains in the open logical batch.
+/// Guarantees: the batch seals before quarantine, durable state remains
+/// active until its matching Ack, and deferred containment does not reread or
+/// count the malformed unit twice.
+#[tokio::test]
+async fn decode_quarantine_waits_for_preexisting_batch_ack() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("mixed.log");
+    std::fs::write(&source, [b'g', b'o', b'o', b'd', b'\n', 0xff, b'\n']).unwrap();
+    let namespace = directory.path().join("checkpoint");
+    let mut runtime = runtime_config(source.to_str().unwrap(), &namespace, 10);
+    runtime.on_decode_error = OnDecodeError::Fail;
+    let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+    let worker = spawn_worker(runtime.clone(), event_tx).unwrap();
+
+    let batch = receive_batch(&mut events).await;
+    assert_eq!(batch.record_count, 1);
+    assert_eq!(
+        worker
+            .telemetry
+            .counter_for_test(WorkerCounter::QuarantineDecode),
+        0
+    );
+    assert_eq!(
+        worker
+            .telemetry
+            .gauge_for_test(WorkerGauge::FilesQuarantined),
+        0
+    );
+    assert_eq!(
+        worker
+            .telemetry
+            .counter_for_test(WorkerCounter::DecodeFailures),
+        1
+    );
+
+    worker
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: batch.batch_id,
+            attempt: batch.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    receive_commit(&mut events).await.3.unwrap();
+    wait_for_worker_counter(&worker.telemetry, WorkerCounter::QuarantineDecode, 1).await;
+    assert_eq!(
+        worker
+            .telemetry
+            .counter_for_test(WorkerCounter::DecodeFailures),
+        1
+    );
+    assert_eq!(
+        worker
+            .telemetry
+            .counter_for_test(WorkerCounter::SourceBytesRead),
+        7
+    );
+    stop_worker(worker, &mut events).await.unwrap();
+
+    let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
+    let record = store.table().iter().next().unwrap().1;
+    assert_eq!(record.committed_offset, 5);
+    assert_eq!(record.lifecycle_state, LifecycleState::Quarantined);
+    assert_eq!(
+        record
+            .quarantine_evidence
+            .as_ref()
+            .expect("quarantine evidence")
+            .reason_code,
+        QUARANTINE_REASON_DECODE
+    );
+}
+
+/// Scenario: async closes the worker-event receiver after accepting the batch
+/// whose valid prefix precedes a malformed source unit, then sends its Ack.
+/// Guarantees: event-handoff cancellation cannot skip the post-commit decode
+/// quarantine or cause the malformed unit to be detected twice after restart.
+#[tokio::test]
+async fn closed_commit_handoff_still_persists_pending_decode_quarantine() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("closed-handoff.log");
+    std::fs::write(&source, [b'g', b'o', b'o', b'd', b'\n', 0xff, b'\n']).unwrap();
+    let namespace = directory.path().join("checkpoint");
+    let mut runtime = runtime_config(source.to_str().unwrap(), &namespace, 10);
+    runtime.on_decode_error = OnDecodeError::Fail;
+    let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+    let worker = spawn_worker(runtime.clone(), event_tx).unwrap();
+    let telemetry = Arc::clone(&worker.telemetry);
+
+    let batch = receive_batch(&mut events).await;
+    events.close();
+    worker
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: batch.batch_id,
+            attempt: batch.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    drop(events);
+    let joined = tokio::task::spawn_blocking(move || worker.join.join())
+        .await
+        .unwrap()
+        .unwrap();
+    joined.unwrap();
+
+    assert_eq!(telemetry.counter_for_test(WorkerCounter::DecodeFailures), 1);
+    assert_eq!(
+        telemetry.counter_for_test(WorkerCounter::QuarantineDecode),
+        1
+    );
+    let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
+    let record = store.table().iter().next().unwrap().1;
+    assert_eq!(record.committed_offset, 5);
+    assert_eq!(record.lifecycle_state, LifecycleState::Quarantined);
+}
+
+/// Scenario: decode quarantine is durably synced, then injected reader cleanup
+/// fails before the quarantined reader can be released.
+/// Guarantees: successful quarantine telemetry and the durable population are
+/// visible exactly once even though the worker subsequently fails closed.
+#[test]
+fn durable_decode_quarantine_is_reported_before_reader_cleanup() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("cleanup-fault.log");
+    std::fs::write(&source, [0xff, b'\n']).unwrap();
+    let mut runtime_config = runtime_config(
+        source.to_str().unwrap(),
+        &directory.path().join("checkpoint"),
+        1,
+    );
+    runtime_config.on_decode_error = OnDecodeError::Fail;
+    let mut runtime = WorkerRuntime::new(runtime_config).unwrap();
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+    let (_command_tx, command_rx) = sync_channel(4);
+    let deadline = Instant::now() + Duration::from_secs(5);
+
+    while runtime.readers_ref().unwrap().stats().tracked_readers == 0 {
+        assert!(Instant::now() < deadline, "discovery did not admit source");
+        assert_eq!(
+            runtime
+                .process_discovery_message(&event_tx, &command_rx)
+                .unwrap(),
+            LoopControl::Continue
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    runtime
+        .readers_mut()
+        .unwrap()
+        .fail_next_revoked_release_for_test();
+    let now = Instant::now();
+    let turn = match runtime.readers_mut().unwrap().poll(now).unwrap() {
+        ReaderPoll::Data(turn) => turn,
+        other => panic!("expected malformed source data, got {other:?}"),
+    };
+    let error = runtime
+        .process_turn(turn, now, &event_tx, &command_rx)
+        .expect_err("injected reader cleanup must fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("injected revoked-reader release")
+    );
+    assert_eq!(
+        runtime
+            .telemetry
+            .counter_for_test(WorkerCounter::DecodeFailures),
+        1
+    );
+    assert_eq!(
+        runtime
+            .telemetry
+            .counter_for_test(WorkerCounter::QuarantineDecode),
+        1
+    );
+    assert_eq!(
+        runtime
+            .telemetry
+            .gauge_for_test(WorkerGauge::FilesQuarantined),
+        1
+    );
+    let record = runtime.store.table().iter().next().unwrap().1;
+    assert_eq!(record.lifecycle_state, LifecycleState::Quarantined);
+    assert_eq!(
+        record.quarantine_evidence.as_ref().unwrap().reason_code,
+        QUARANTINE_REASON_DECODE
+    );
+    runtime.shutdown_resources().unwrap();
+}
+
+/// Scenario: decode quarantine persistence faults before its WAL append or
+/// at its required WAL sync after registration already succeeded.
+/// Guarantees: detection remains visible, successful-quarantine telemetry is
+/// zero, rollback preserves the old active state, and the worker fails closed.
+#[tokio::test]
+async fn decode_quarantine_faults_never_report_success() {
+    for point in [
+        FaultPoint::BeforeWalTransactionWrite,
+        FaultPoint::BeforeWalSync,
+    ] {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("malformed.log");
+        std::fs::write(&source, [0xff, b'\n']).unwrap();
+        let namespace = directory.path().join("checkpoint");
+        let mut runtime = runtime_config(source.to_str().unwrap(), &namespace, 1);
+        runtime.on_decode_error = OnDecodeError::Fail;
+        let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+        let worker = spawn_worker_with_store_fault(runtime.clone(), event_tx, point, 1).unwrap();
+        let telemetry = Arc::clone(&worker.telemetry);
+
+        let failure = loop {
+            match tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("worker failure timeout")
+                .expect("worker event channel closed")
+            {
+                WorkerEvent::Failed(message) => break message,
+                WorkerEvent::Stopped => panic!("worker stopped without failure evidence"),
+                WorkerEvent::Batch(_) | WorkerEvent::CommitResult { .. } | WorkerEvent::Drained => {
+                }
+            }
+        };
+        assert!(failure.contains("checkpoint"), "{failure}");
+        assert_eq!(telemetry.counter_for_test(WorkerCounter::DecodeFailures), 1);
+        assert_eq!(
+            telemetry.counter_for_test(WorkerCounter::QuarantineDecode),
+            0
+        );
+        assert_eq!(
+            telemetry.counter_for_test(WorkerCounter::CheckpointFailures),
+            u64::from(runtime.checkpoint.max_consecutive_failures) + 1
+        );
+        assert_eq!(telemetry.gauge_for_test(WorkerGauge::FilesQuarantined), 0);
+        events.close();
+        drop(worker.command_tx);
+        assert!(
+            tokio::task::spawn_blocking(move || worker.join.join())
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+
+        let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
+        let record = store.table().iter().next().unwrap().1;
+        assert_eq!(record.lifecycle_state, LifecycleState::Active);
+        assert_eq!(record.committed_offset, 0);
+    }
+}
+
 /// Scenario: the progress WAL fails before writing the Ack transaction, then
 /// async retries the same commit while the store is fail-closed.
 /// Guarantees: every failure returns a CommitResult, the logical batch stays
@@ -317,6 +839,81 @@ async fn checkpoint_maintenance_failure_retries_before_source_progress() {
     let batch = receive_batch(&mut events).await;
     assert_eq!(batch.record_count, 1);
     stop_worker(worker, &mut events).await.unwrap();
+}
+
+/// Scenario: a due interval sync fails while one retired generation is
+/// pending cleanup.
+/// Guarantees: checkpoint failure is counted, cleanup is not attempted or
+/// classified as failed, and the retired generation remains pending.
+#[test]
+fn due_sync_failure_does_not_count_unattempted_cleanup() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("unused.log");
+    let mut runtime = runtime_config(
+        source.to_str().unwrap(),
+        &directory.path().join("checkpoint"),
+        1,
+    );
+    runtime.checkpoint.sync_interval = Duration::from_millis(100);
+    runtime.checkpoint.max_consecutive_failures = 2;
+    let telemetry = Arc::new(WorkerTelemetryBridge::default());
+    let mut worker = WorkerRuntime::new_with_store_fault_and_telemetry(
+        runtime.clone(),
+        FaultPoint::BeforeWalSync,
+        1,
+        Arc::clone(&telemetry),
+    )
+    .unwrap();
+    let file_id = FileId::from_bytes([88; 16]);
+    let _registered = worker
+        .store
+        .register_files(vec![RegisterFile {
+            file_id,
+            file_epoch: 1,
+            committed_offset: 0,
+            fingerprint: b"0123456789abcdef".to_vec(),
+            ignored_header_bytes: 0,
+            locator: Locator::Unspecified,
+            framing_profile_version: FRAMING_PROFILE_VERSION,
+            framing_profile_digest: runtime.framing_profile_digest,
+            framing_resume: FramingResume::Clean,
+            last_seen_time_unix_nano: 1,
+            advisory_path: b"unused.log".to_vec(),
+        }])
+        .unwrap();
+    worker.store.compact().unwrap();
+    let _progress = worker
+        .store
+        .commit_progress(vec![UpdateProgress {
+            file_id,
+            expected_committed_offset: 0,
+            expected_file_epoch: 1,
+            new_committed_offset: 0,
+            new_framing_resume: FramingResume::Clean,
+            new_last_seen_time_unix_nano: 2,
+            finalize: false,
+        }])
+        .unwrap();
+    worker.store.force_sync_due_for_test();
+
+    worker.maintain_store().unwrap();
+    assert_eq!(
+        telemetry.counter_for_test(WorkerCounter::CheckpointFailures),
+        1
+    );
+    assert_eq!(
+        telemetry.counter_for_test(WorkerCounter::CheckpointCleanupFailures),
+        0
+    );
+    assert_eq!(worker.store.retired_generations(), [0]);
+
+    if let Some(discovery) = worker.discovery.take() {
+        discovery.request_shutdown();
+        discovery.into_join_handle().join().unwrap();
+    }
+    if let Some(readers) = worker.readers.take() {
+        readers.shutdown().unwrap();
+    }
 }
 
 /// Scenario: Drain arrives while one real batch is retained, and its matching
@@ -434,7 +1031,10 @@ async fn retained_batch_defers_truncation_transition_until_ack() {
     let worker = spawn_worker(runtime.clone(), event_tx).unwrap();
 
     let batch = receive_batch(&mut events).await;
-    std::fs::write(&source, b"new\n").unwrap();
+    let mut replacement = OpenOptions::new().write(true).open(&source).unwrap();
+    replacement.write_all(b"new\n").unwrap();
+    replacement.sync_all().unwrap();
+    drop(replacement);
     assert!(
         tokio::time::timeout(Duration::from_millis(150), events.recv())
             .await
@@ -489,7 +1089,10 @@ async fn read_new_resets_epoch_before_reading_replacement_stream() {
         .unwrap();
     receive_commit(&mut events).await.3.unwrap();
 
-    std::fs::write(&source, b"new\n").unwrap();
+    let mut replacement = OpenOptions::new().write(true).open(&source).unwrap();
+    replacement.write_all(b"new\n").unwrap();
+    replacement.sync_all().unwrap();
+    drop(replacement);
     let new = receive_batch(&mut events).await;
     assert_eq!(new.record_count, 1);
     worker
@@ -525,67 +1128,205 @@ async fn read_new_resets_epoch_before_reading_replacement_stream() {
     assert_eq!((unchanged.file_epoch, unchanged.committed_offset), (2, 4));
 }
 
-/// Scenario: the WAL fails immediately before either a truncate quarantine
-/// or a `read_new` reset transaction is written.
-/// Guarantees: both policies fail closed without releasing stale durable
-/// state, and reopen observes the exact old epoch and committed offset.
+/// Scenario: truncate-fail quarantine is durably synced, then injected reader
+/// cleanup fails before the quarantined reader can be released.
+/// Guarantees: the truncate outcome, quarantine action, and durable population
+/// are published exactly once before the worker fails closed.
+#[test]
+fn durable_truncate_quarantine_is_reported_before_reader_cleanup() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("truncate-cleanup-fault.log");
+    std::fs::write(&source, b"old\n").unwrap();
+    let mut runtime_config = runtime_config(
+        source.to_str().unwrap(),
+        &directory.path().join("checkpoint"),
+        1,
+    );
+    runtime_config.rotation.on_truncate = OnTruncate::Fail;
+    let mut runtime = WorkerRuntime::new(runtime_config).unwrap();
+    runtime.readers.take().unwrap().shutdown().unwrap();
+
+    let resolved_path = std::fs::canonicalize(&source).unwrap();
+    let opened = open_candidate(&resolved_path, false, 16, 0).unwrap();
+    let evidence = opened.evidence;
+    let locator = evidence.locator;
+    let file_id = FileId::from_bytes([93; 16]);
+    let _outcomes = runtime
+        .store
+        .register_files(vec![RegisterFile {
+            file_id,
+            file_epoch: 1,
+            committed_offset: 4,
+            fingerprint: evidence.fingerprint.clone(),
+            ignored_header_bytes: 0,
+            locator,
+            framing_profile_version: FRAMING_PROFILE_VERSION,
+            framing_profile_digest: runtime.config.framing_profile_digest,
+            framing_resume: FramingResume::Clean,
+            last_seen_time_unix_nano: 1,
+            advisory_path: evidence.advisory_path.clone(),
+        }])
+        .unwrap();
+    let mut readers = ReaderTable::new(ReaderSettings::from_runtime(&runtime.config)).unwrap();
+    readers
+        .insert(
+            DiscoveredCandidate {
+                matched_path: source,
+                resolved_path,
+                evidence: evidence.clone(),
+                modified: None,
+            },
+            ResolvedIdentity {
+                file_id,
+                file_epoch: 1,
+                committed_offset: 4,
+                framing_resume: FramingResume::Clean,
+                lifecycle_state: LifecycleState::Active,
+                matched_by: IdentityMatch::NewDiscovery,
+            },
+        )
+        .unwrap();
+    runtime.readers = Some(readers);
+    let truncation = DetectedTruncation {
+        file_id,
+        expected_file_epoch: 1,
+        expected_committed_offset: 4,
+        observed_size: 0,
+        observed_fingerprint: evidence.fingerprint,
+        locator,
+        present: true,
+    };
+    runtime.preflight_truncation(&truncation).unwrap();
+    runtime
+        .readers_mut()
+        .unwrap()
+        .fail_next_revoked_release_for_test();
+
+    let error = runtime
+        .apply_truncation(truncation)
+        .expect_err("injected reader cleanup must fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("injected revoked-reader release")
+    );
+    assert_eq!(
+        runtime
+            .telemetry
+            .counter_for_test(WorkerCounter::CopytruncateDetected),
+        1
+    );
+    assert_eq!(
+        runtime
+            .telemetry
+            .counter_for_test(WorkerCounter::CopytruncateFail),
+        1
+    );
+    assert_eq!(
+        runtime
+            .telemetry
+            .counter_for_test(WorkerCounter::QuarantineTruncate),
+        1
+    );
+    assert_eq!(
+        runtime
+            .telemetry
+            .gauge_for_test(WorkerGauge::FilesQuarantined),
+        1
+    );
+    let record = runtime.store.table().get(&file_id).unwrap();
+    assert_eq!(record.lifecycle_state, LifecycleState::Quarantined);
+    assert_eq!(
+        record.quarantine_evidence.as_ref().unwrap().reason_code,
+        QUARANTINE_REASON_TRUNCATE
+    );
+    runtime.shutdown_resources().unwrap();
+}
+
+/// Scenario: the WAL fails at append or required sync for either a truncate
+/// quarantine or a `read_new` reset transaction.
+/// Guarantees: detection is counted while successful outcomes remain zero,
+/// both policies fail closed, and reopen retains the old active frontier.
 #[tokio::test]
 async fn truncate_transitions_fail_closed_at_wal_fault_boundary() {
     for policy in [OnTruncate::Fail, OnTruncate::ReadNew] {
-        let directory = tempdir().unwrap();
-        let source = directory.path().join("fault-truncate.log");
-        std::fs::write(&source, b"old\n").unwrap();
-        let namespace = directory.path().join("checkpoint");
-        let mut runtime = runtime_config(source.to_str().unwrap(), &namespace, 1);
-        runtime.rotation.on_truncate = policy;
-        let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
-        let worker = spawn_worker_with_store_fault(
-            runtime.clone(),
-            event_tx,
+        for point in [
             FaultPoint::BeforeWalTransactionWrite,
-            2,
-        )
-        .unwrap();
+            FaultPoint::BeforeWalSync,
+        ] {
+            let directory = tempdir().unwrap();
+            let source = directory.path().join("fault-truncate.log");
+            std::fs::write(&source, b"old\n").unwrap();
+            let namespace = directory.path().join("checkpoint");
+            let mut runtime = runtime_config(source.to_str().unwrap(), &namespace, 1);
+            runtime.rotation.on_truncate = policy;
+            let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+            let worker =
+                spawn_worker_with_store_fault(runtime.clone(), event_tx, point, 2).unwrap();
+            let telemetry = Arc::clone(&worker.telemetry);
 
-        let batch = receive_batch(&mut events).await;
-        worker
-            .command_tx
-            .send(WorkerCommand::Commit {
-                batch_id: batch.batch_id,
-                attempt: batch.attempt,
-                explicit_loss: false,
-            })
-            .unwrap();
-        receive_commit(&mut events).await.3.unwrap();
-        std::fs::write(&source, b"new\n").unwrap();
-
-        let failure = loop {
-            let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
-                .await
-                .unwrap()
+            let batch = receive_batch(&mut events).await;
+            worker
+                .command_tx
+                .send(WorkerCommand::Commit {
+                    batch_id: batch.batch_id,
+                    attempt: batch.attempt,
+                    explicit_loss: false,
+                })
                 .unwrap();
-            match event {
-                WorkerEvent::Failed(message) => break message,
-                WorkerEvent::Stopped => panic!("worker stopped without fault evidence"),
-                WorkerEvent::Batch(_) | WorkerEvent::CommitResult { .. } | WorkerEvent::Drained => {
-                }
-            }
-        };
-        assert!(failure.contains("checkpoint"), "{failure}");
-        events.close();
-        drop(worker.command_tx);
-        assert!(
-            tokio::task::spawn_blocking(move || worker.join.join())
-                .await
-                .unwrap()
-                .unwrap()
-                .is_err()
-        );
+            receive_commit(&mut events).await.3.unwrap();
+            std::fs::write(&source, b"new\n").unwrap();
 
-        let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
-        let record = store.table().iter().next().unwrap().1;
-        assert_eq!((record.file_epoch, record.committed_offset), (1, 4));
-        assert_eq!(record.lifecycle_state, LifecycleState::Active);
+            let failure = loop {
+                let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                match event {
+                    WorkerEvent::Failed(message) => break message,
+                    WorkerEvent::Stopped => panic!("worker stopped without fault evidence"),
+                    WorkerEvent::Batch(_)
+                    | WorkerEvent::CommitResult { .. }
+                    | WorkerEvent::Drained => {}
+                }
+            };
+            assert!(failure.contains("checkpoint"), "{failure}");
+            assert_eq!(
+                telemetry.counter_for_test(WorkerCounter::CopytruncateDetected),
+                1
+            );
+            assert_eq!(
+                telemetry.counter_for_test(WorkerCounter::CopytruncateFail),
+                0
+            );
+            assert_eq!(
+                telemetry.counter_for_test(WorkerCounter::CopytruncateReadNew),
+                0
+            );
+            assert_eq!(
+                telemetry.counter_for_test(WorkerCounter::QuarantineTruncate),
+                0
+            );
+            assert_eq!(
+                telemetry.counter_for_test(WorkerCounter::CheckpointFailures),
+                u64::from(runtime.checkpoint.max_consecutive_failures) + 1
+            );
+            events.close();
+            drop(worker.command_tx);
+            assert!(
+                tokio::task::spawn_blocking(move || worker.join.join())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err()
+            );
+
+            let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
+            let record = store.table().iter().next().unwrap().1;
+            assert_eq!((record.file_epoch, record.committed_offset), (1, 4));
+            assert_eq!(record.lifecycle_state, LifecycleState::Active);
+        }
     }
 }
 

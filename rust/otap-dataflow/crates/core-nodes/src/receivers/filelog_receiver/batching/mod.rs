@@ -470,6 +470,7 @@ pub(crate) struct OpenBatch {
     settings: BatchSettings,
     record_count: u32,
     logical_bytes: u64,
+    source_bytes: u64,
     deadline: Option<Instant>,
     last_ready_at: Option<Instant>,
     logs: LogsRecordBatchBuilder,
@@ -526,6 +527,7 @@ impl OpenBatch {
             settings,
             record_count: 0,
             logical_bytes: 0,
+            source_bytes: 0,
             deadline: None,
             last_ready_at: None,
             logs: LogsRecordBatchBuilder::new(),
@@ -626,6 +628,20 @@ impl OpenBatch {
                 counter: "logical bytes",
             },
         )?;
+        let record_source_bytes = record
+            .framed
+            .frame_source_range
+            .end
+            .checked_sub(record.framed.frame_source_range.start)
+            .ok_or(BatchError::InvalidRecord {
+                file_id: record.file_id,
+                reason: "frame source range regressed",
+            })?;
+        let next_source_bytes = self.source_bytes.checked_add(record_source_bytes).ok_or(
+            BatchError::CounterOverflow {
+                counter: "source bytes",
+            },
+        )?;
 
         if self.record_count != 0 {
             if let Some(reason) = self.seal_after_append {
@@ -668,6 +684,7 @@ impl OpenBatch {
         self.apply_delta(delta_plan);
         self.record_count = next_count;
         self.logical_bytes = next_bytes;
+        self.source_bytes = next_source_bytes;
         self.deadline = Some(deadline);
         self.last_ready_at = Some(record.ready_at);
 
@@ -881,6 +898,7 @@ impl OpenBatch {
             deltas: Arc::from(self.deltas),
             record_count: self.record_count,
             logical_bytes: self.logical_bytes,
+            source_bytes: self.source_bytes,
         })
     }
 }
@@ -893,6 +911,7 @@ pub(crate) struct LogicalBatch {
     deltas: Arc<[ProgressDelta]>,
     record_count: u32,
     logical_bytes: u64,
+    source_bytes: u64,
 }
 
 impl LogicalBatch {
@@ -924,6 +943,11 @@ impl LogicalBatch {
     /// Exact logical-size sum.
     pub(crate) const fn logical_bytes(&self) -> u64 {
         self.logical_bytes
+    }
+
+    /// Source bytes represented by the retained records.
+    pub(crate) const fn source_bytes(&self) -> u64 {
+        self.source_bytes
     }
 }
 

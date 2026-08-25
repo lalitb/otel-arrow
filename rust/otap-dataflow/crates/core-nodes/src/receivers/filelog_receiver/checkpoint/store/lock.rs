@@ -49,6 +49,8 @@ pub struct NamespaceLock {
     /// descriptor is what releases it.
     file: File,
     path: PathBuf,
+    waited: Duration,
+    contentions: u64,
 }
 
 impl NamespaceLock {
@@ -88,6 +90,7 @@ impl NamespaceLock {
         )?;
 
         let started = Instant::now();
+        let mut contentions = 0u64;
         loop {
             // Called as an explicit trait call rather than `file.try_lock()`:
             // `std::fs::File` gained an inherent `try_lock` in Rust 1.89,
@@ -95,8 +98,17 @@ impl NamespaceLock {
             // a newer toolchain while failing to compile at this
             // workspace's 1.87 MSRV.
             match FileExt::try_lock(&file) {
-                Ok(()) => return Ok(Self { file, path }),
-                Err(TryLockError::WouldBlock) => {}
+                Ok(()) => {
+                    return Ok(Self {
+                        file,
+                        path,
+                        waited: started.elapsed(),
+                        contentions,
+                    });
+                }
+                Err(TryLockError::WouldBlock) => {
+                    contentions = contentions.saturating_add(1);
+                }
                 Err(TryLockError::Error(source)) => {
                     return Err(StoreError::Io {
                         operation: "lock the checkpoint namespace ownership lock",
@@ -128,6 +140,18 @@ impl NamespaceLock {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Time spent acquiring this namespace lock.
+    #[must_use]
+    pub const fn waited(&self) -> Duration {
+        self.waited
+    }
+
+    /// Failed immediate attempts before this lock was acquired.
+    #[must_use]
+    pub const fn contentions(&self) -> u64 {
+        self.contentions
     }
 
     /// Releases the lock explicitly, reporting a failure instead of hiding
