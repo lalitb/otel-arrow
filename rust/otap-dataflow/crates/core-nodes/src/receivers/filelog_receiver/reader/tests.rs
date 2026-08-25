@@ -337,10 +337,10 @@ fn removed_open_handle_is_not_an_lrs_victim() {
 
 /// Scenario: a closed logical reader's path is replaced by a different
 /// native file before the reader is scheduled again.
-/// Guarantees: reopen identity validation rejects the replacement before any
-/// source byte is read under the old durable identity.
+/// Guarantees: reopen identity validation reports the old reader as removed
+/// before any replacement byte is read under its durable identity.
 #[test]
-fn reopen_rejects_replacement_locator_before_reading() {
+fn reopen_reports_replacement_locator_as_descriptor_unavailable() {
     let directory = tempdir().unwrap();
     let first_path = directory.path().join("replace.log");
     let second_path = directory.path().join("other.log");
@@ -370,16 +370,13 @@ fn reopen_rejects_replacement_locator_before_reading() {
         .unwrap();
     let request = eviction(table.poll(now).unwrap());
     table.confirm_eviction(request).unwrap();
-    let error = table
-        .poll(now)
-        .expect_err("replacement locator must fail reopen");
     assert!(matches!(
-        error,
-        ReaderError::Reopen {
-            source: IdentityError::ReopenLocatorMismatch { .. },
-            ..
-        }
+        table.poll(now).unwrap(),
+        ReaderPoll::RemovedWithoutDescriptor {
+            file_id: unavailable
+        } if unavailable == file_id(9)
     ));
+    assert!(!table.frontier(file_id(9)).unwrap().present);
     table.shutdown().unwrap();
 }
 
@@ -832,6 +829,150 @@ fn eof_reports_size_regression_even_when_fingerprint_prefix_survives() {
     }
 }
 
+/// Scenario: a live file is rewritten to the same size after its original
+/// prefix was consumed, so size alone cannot reveal the replacement.
+/// Guarantees: EOF prefix revalidation reports bounded truncation evidence
+/// and never treats the rewritten stream as an ordinary append-only EOF.
+#[test]
+fn eof_reports_fingerprint_mismatch_without_size_regression() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("rewrite.log");
+    std::fs::write(&path, b"0123456789abcdef\n").unwrap();
+    let mut table = ReaderTable::new(settings(1, 1, 64)).unwrap();
+    table.insert(candidate(&path), resolved(26, 0)).unwrap();
+    let now = Instant::now();
+
+    let turn = data(table.poll(now).unwrap());
+    let consumed = turn.bytes().len();
+    table
+        .complete_turn(turn, consumed, TurnDisposition::Ready)
+        .unwrap();
+    std::fs::write(&path, b"fedcba9876543210\n").unwrap();
+
+    assert!(matches!(
+        table.poll(now).unwrap(),
+        ReaderPoll::Truncated {
+            file_id: rewritten,
+            observed_size: 17,
+            observed_fingerprint,
+            ..
+        } if rewritten == file_id(26) && observed_fingerprint == b"fedcba9876543210"
+    ));
+    table.shutdown().unwrap();
+}
+
+/// Scenario: a file changes between the two bounded EOF fingerprint
+/// observations.
+/// Guarantees: unstable evidence is classified for retry rather than as a
+/// receiver-terminal identity failure.
+#[test]
+fn unstable_eof_fingerprint_evidence_is_retryable() {
+    let result =
+        classify_fingerprint_observation(Err(IdentityError::CandidateChangedDuringIdentity {
+            path: Path::new("changing.log").to_path_buf(),
+        }))
+        .unwrap();
+    assert_eq!(result, FingerprintObservation::Retry);
+}
+
+/// Scenario: discovery queues evidence for a short file, then the retained
+/// descriptor observes a later append before the worker processes it.
+/// Guarantees: the queued size and fingerprint are refreshed from the live
+/// handle so stale sampling cannot be mistaken for truncation.
+#[test]
+fn queued_candidate_evidence_refreshes_from_resident_handle() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("queued.log");
+    std::fs::write(&path, b"a").unwrap();
+    let mut table = ReaderTable::new(settings(1, 1, 1)).unwrap();
+    table.insert(candidate(&path), resolved(54, 0)).unwrap();
+    let turn = data(table.poll(Instant::now()).unwrap());
+    table
+        .complete_turn(turn, 1, TurnDisposition::Paused)
+        .unwrap();
+    let mut queued = candidate(&path);
+    OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"b")
+        .unwrap();
+
+    assert_eq!(
+        table.refresh_candidate_evidence(&mut queued).unwrap(),
+        CandidateEvidenceRefresh::Refreshed
+    );
+    assert_eq!(queued.evidence.size, 2);
+    assert_eq!(queued.evidence.fingerprint, b"ab");
+    table.shutdown().unwrap();
+}
+
+/// Scenario: copy-truncate is observed for a present reader whose descriptor
+/// was evicted before the configured `read_new` reset.
+/// Guarantees: preflight accepts the nonresident reader and the persisted
+/// epoch/fingerprint state can reopen the same locator from offset zero.
+#[test]
+fn truncate_reset_reopens_present_nonresident_reader() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("nonresident-reset.log");
+    std::fs::write(&path, b"old\n").unwrap();
+    let mut table = ReaderTable::new(settings(1, 1, 4)).unwrap();
+    table.insert(candidate(&path), resolved(55, 4)).unwrap();
+    std::fs::write(&path, b"new\n").unwrap();
+
+    table.preflight_truncate_reset(file_id(55), 0, 4).unwrap();
+    table
+        .apply_preflighted_truncate_reset(file_id(55), 0, 4, 1, b"new\n".to_vec(), true)
+        .unwrap();
+    let turn = data(table.poll(Instant::now()).unwrap());
+    assert_eq!(turn.file_epoch(), 1);
+    assert_eq!(turn.source_offset(), 0);
+    assert_eq!(turn.bytes(), b"new\n");
+    table
+        .complete_turn(turn, 4, TurnDisposition::Paused)
+        .unwrap();
+    table.shutdown().unwrap();
+}
+
+/// Scenario: a removed reader's rotation deadline is earlier than its normal
+/// EOF probe interval.
+/// Guarantees: capping the scheduled probe makes the reader eligible at the
+/// rotation deadline without extending or duplicating its EOF index.
+#[test]
+fn eof_probe_can_be_capped_at_rotation_deadline() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("capped-eof.log");
+    std::fs::write(&path, b"a").unwrap();
+    let mut table = ReaderTable::new(settings(1, 1, 1)).unwrap();
+    table.insert(candidate(&path), resolved(56, 0)).unwrap();
+    let now = Instant::now();
+    let turn = data(table.poll(now).unwrap());
+    table
+        .complete_turn(turn, 1, TurnDisposition::Ready)
+        .unwrap();
+    let original = match table.poll(now).unwrap() {
+        ReaderPoll::EndOfFile { next_probe, .. } => next_probe,
+        other => panic!("expected EOF, got {other:?}"),
+    };
+    let capped = now.checked_add(Duration::from_millis(10)).unwrap();
+    assert!(capped < original);
+    table.cap_eof_deadline(file_id(56), capped).unwrap();
+    assert!(matches!(
+        table.poll(now).unwrap(),
+        ReaderPoll::Idle {
+            next_probe: Some(next)
+        } if next == capped
+    ));
+    assert!(matches!(
+        table.poll(capped).unwrap(),
+        ReaderPoll::EndOfFile {
+            file_id: observed,
+            ..
+        } if observed == file_id(56)
+    ));
+    table.shutdown().unwrap();
+}
+
 /// Scenario: identity revalidation fails for a still-present logical reader,
 /// and later policy has already persisted a durable quarantine.
 /// Guarantees: explicit revoke closes any descriptor, removes both indexes,
@@ -991,10 +1132,10 @@ fn deferred_eviction_requires_fresh_request() {
 
 /// Scenario: a temporarily closed path still names the same native file but
 /// its durable fingerprint prefix was rewritten before reopen.
-/// Guarantees: exact-locator equality alone cannot resume the old reader;
-/// fingerprint mismatch is reported before any rewritten byte is read.
+/// Guarantees: exact-locator equality alone cannot resume the old frontier;
+/// the verified handle reports truncation before any rewritten byte is read.
 #[test]
-fn reopen_rejects_same_locator_fingerprint_rewrite() {
+fn reopen_reports_same_locator_fingerprint_rewrite() {
     let directory = tempdir().unwrap();
     let first_path = directory.path().join("rewrite.log");
     let second_path = directory.path().join("other.log");
@@ -1029,11 +1170,13 @@ fn reopen_rejects_same_locator_fingerprint_rewrite() {
     let request = eviction(table.poll(now).unwrap());
     table.confirm_eviction(request).unwrap();
     assert!(matches!(
-        table.poll(now),
-        Err(ReaderError::Reopen {
-            source: IdentityError::ReopenFingerprintMismatch { .. },
+        table.poll(now).unwrap(),
+        ReaderPoll::Truncated {
+            file_id: rewritten,
+            observed_size: 3,
+            observed_fingerprint,
             ..
-        })
+        } if rewritten == file_id(34) && observed_fingerprint == b"xbc"
     ));
     table.shutdown().unwrap();
 }
@@ -1041,9 +1184,9 @@ fn reopen_rejects_same_locator_fingerprint_rewrite() {
 /// Scenario: a temporarily closed same-locator source shrinks below its
 /// committed offset while its stored fingerprint evidence is empty.
 /// Guarantees: reopen independently enforces committed-offset <= current
-/// size and refuses to read from the stale durable frontier.
+/// size and reports truncation before reading from the stale frontier.
 #[test]
-fn reopen_rejects_committed_offset_beyond_current_size() {
+fn reopen_reports_committed_offset_beyond_current_size() {
     let directory = tempdir().unwrap();
     let first_path = directory.path().join("shrink.log");
     let second_path = directory.path().join("other.log");
@@ -1082,15 +1225,14 @@ fn reopen_rejects_committed_offset_beyond_current_size() {
     let request = eviction(table.poll(now).unwrap());
     table.confirm_eviction(request).unwrap();
     assert!(matches!(
-        table.poll(now),
-        Err(ReaderError::Reopen {
-            source: IdentityError::ReopenOffsetBeyondSize {
-                committed_offset: 1,
-                size: 0,
-                ..
-            },
+        table.poll(now).unwrap(),
+        ReaderPoll::Truncated {
+            file_id: truncated,
+            committed_offset: 1,
+            read_offset: 1,
+            observed_size: 0,
             ..
-        })
+        } if truncated == file_id(36)
     ));
     table.shutdown().unwrap();
 }

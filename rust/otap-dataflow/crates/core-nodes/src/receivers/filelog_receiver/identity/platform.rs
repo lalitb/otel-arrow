@@ -79,9 +79,18 @@ pub(crate) fn open_candidate_at(
     })
 }
 
-/// Reopens an existing logical reader and validates the exact locator,
-/// durable fingerprint prefix, and committed source-byte frontier before
-/// returning the handle.
+/// Result of reopening a known native locator.
+pub(crate) enum ReopenCandidate {
+    /// The durable fingerprint and source frontier remain compatible.
+    Compatible(OpenedCandidate),
+    /// The locator still matches, but size or fingerprint evidence proves an
+    /// observable truncation that runtime policy must handle.
+    Truncated(OpenedCandidate),
+}
+
+/// Reopens an existing logical reader, validates the exact locator, and
+/// classifies durable fingerprint or source-frontier incompatibility as
+/// observable truncation while retaining the verified handle.
 pub(crate) fn reopen_candidate_at(
     open_path: &Path,
     advisory_path: &Path,
@@ -90,8 +99,8 @@ pub(crate) fn reopen_candidate_at(
     ignored_header_bytes: u32,
     expected_locator: Locator,
     durable_fingerprint: &[u8],
-    committed_offset: u64,
-) -> Result<OpenedCandidate, IdentityError> {
+    required_offset: u64,
+) -> Result<ReopenCandidate, IdentityError> {
     let opened = open_candidate_at(
         open_path,
         advisory_path,
@@ -106,22 +115,15 @@ pub(crate) fn reopen_candidate_at(
             found: opened.evidence.locator,
         });
     }
-    if !opened.evidence.fingerprint.starts_with(durable_fingerprint) {
-        return Err(IdentityError::ReopenFingerprintMismatch {
-            path: open_path.to_path_buf(),
-        });
+    if !opened.evidence.fingerprint.starts_with(durable_fingerprint)
+        || opened.evidence.size < required_offset
+    {
+        return Ok(ReopenCandidate::Truncated(opened));
     }
-    if opened.evidence.size < committed_offset {
-        return Err(IdentityError::ReopenOffsetBeyondSize {
-            path: open_path.to_path_buf(),
-            committed_offset,
-            size: opened.evidence.size,
-        });
-    }
-    Ok(opened)
+    Ok(ReopenCandidate::Compatible(opened))
 }
 
-fn collect_consistent_fingerprint(
+pub(crate) fn collect_consistent_fingerprint(
     file: &File,
     path: &Path,
     fingerprint_bytes: u16,
@@ -532,6 +534,29 @@ mod tests {
         let followed = open_candidate(&link, true, 16, 0).unwrap();
         let direct = open_candidate(&target, false, 16, 0).unwrap();
         assert_eq!(followed.evidence.locator, direct.evidence.locator);
+    }
+
+    #[cfg(unix)]
+    /// Scenario: a Unix source is unlinked while receiver and writer
+    /// descriptors remain open, then the writer appends late bytes.
+    /// Guarantees: the retained receiver descriptor reads the original inode
+    /// through the late append even though no path can reopen it.
+    #[test]
+    fn unix_retained_handle_reads_after_unlink_and_late_write() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("unlink.log");
+        std::fs::write(&path, b"old\n").unwrap();
+        let opened = open_candidate(&path, false, 16, 0).unwrap();
+        let mut writer = OpenOptions::new().append(true).open(&path).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        writer.write_all(b"late\n").unwrap();
+        writer.flush().unwrap();
+
+        let mut bytes = [0; 9];
+        assert_eq!(read_source_at(&opened.file, 0, &mut bytes).unwrap(), 9);
+        assert_eq!(&bytes, b"old\nlate\n");
+        assert_eq!(opened.file.metadata().unwrap().len(), 9);
     }
 
     /// Scenario: a candidate advisory path exceeds the durable format's

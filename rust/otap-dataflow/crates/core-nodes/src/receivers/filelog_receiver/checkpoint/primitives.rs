@@ -62,6 +62,12 @@ pub const REASON_CODE_RESERVED: u16 = 0x0000;
 /// Quarantine reason: recovery evidence existed but could not be inherited
 /// unambiguously and the configured policy was `fail`.
 pub const QUARANTINE_REASON_RECOVERY_MISMATCH: u16 = 0x0003;
+/// Quarantine reason: observable truncation was detected under the `fail`
+/// policy.
+pub const QUARANTINE_REASON_TRUNCATE: u16 = 0x0002;
+/// Quarantine reason: rotation removed a file after its native descriptor
+/// had already been evicted, so late writes could not be captured safely.
+pub const QUARANTINE_REASON_ROTATION_DESCRIPTOR_UNAVAILABLE: u16 = 0x0004;
 
 /// `update_metadata` presence bit: a runtime locator value is present.
 pub const METADATA_LOCATOR_PRESENT: u8 = 0x01;

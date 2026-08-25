@@ -336,7 +336,8 @@ This document defines these `reason_code` values for `quarantine_file` /
 | `0x0001` | decode-error `fail` policy quarantine |
 | `0x0002` | truncate `fail` policy quarantine |
 | `0x0003` | recovery-mismatch `fail` policy quarantine |
-| `0x0004`-`0x00FF` | reserved for future built-in reasons; profile incompatibility fails closed without mutating the record |
+| `0x0004` | rotation descriptor unavailable before removal quarantine |
+| `0x0005`-`0x00FF` | reserved for future built-in reasons; profile incompatibility fails closed without mutating the record |
 | `0x0100`-`0xFFFF` | available for distribution- or extension-defined reasons |
 
 `removal_reason` has no assigned values in v1 beyond the requirement that an

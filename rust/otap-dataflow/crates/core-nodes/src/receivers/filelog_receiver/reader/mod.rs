@@ -23,7 +23,10 @@ use super::config::RuntimeConfig;
 use super::discovery::DiscoveredCandidate;
 use super::identity::IdentityError;
 use super::identity::matcher::ResolvedIdentity;
-use super::identity::platform::{encode_advisory_path, read_source_at, reopen_candidate_at};
+use super::identity::platform::{
+    ReopenCandidate, collect_consistent_fingerprint, encode_advisory_path, read_source_at,
+    reopen_candidate_at,
+};
 use super::lease::{LeaseError, ReceiverLeaseScope, RuntimeFileLease, register_receiver_scope};
 
 /// Validated limits and identity parameters consumed by the reader table.
@@ -320,6 +323,19 @@ pub(crate) enum RemovalDisposition {
     DescriptorAbsent,
 }
 
+/// Result of refreshing queued discovery evidence from a live reader.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CandidateEvidenceRefresh {
+    /// The queued size and fingerprint now match a stable handle observation.
+    Refreshed,
+    /// No descriptor is resident, so the queued observation remains the only
+    /// available evidence and the reader frontier cannot advance meanwhile.
+    DescriptorAbsent,
+    /// The handle changed during bounded evidence collection and must be
+    /// retried after a bounded delay.
+    Retry,
+}
+
 /// Result of one scheduler poll.
 #[derive(Debug)]
 pub(crate) enum ReaderPoll {
@@ -349,6 +365,15 @@ pub(crate) enum ReaderPoll {
         read_offset: u64,
         /// Size observed from the same open handle.
         observed_size: u64,
+        /// Fresh bounded fingerprint evidence from the same open handle.
+        observed_fingerprint: Vec<u8>,
+    },
+    /// The file changed while EOF fingerprint evidence was sampled.
+    EvidenceUnstable {
+        /// Durable identity whose observation must be retried.
+        file_id: FileId,
+        /// Earliest automatic retry.
+        next_probe: Instant,
     },
     /// A descriptor can rotate only after caller-owned uncommitted state is
     /// discarded.
@@ -441,6 +466,9 @@ pub(crate) struct ReaderIdentityContext<'a> {
     pub(crate) file_epoch: u32,
     /// Ack-gated source offset that updated evidence must still contain.
     pub(crate) committed_offset: u64,
+    /// Current provisional source offset that updated evidence must still
+    /// contain.
+    pub(crate) read_offset: u64,
     /// Durable fingerprint prefix that updated evidence must extend.
     pub(crate) durable_fingerprint: &'a [u8],
 }
@@ -544,6 +572,32 @@ pub(crate) struct ReaderTable {
 struct ReadLimit {
     file_id: FileId,
     end_offset: u64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum FingerprintObservation {
+    Stable { fingerprint: Vec<u8>, size: u64 },
+    Retry,
+}
+
+enum OpenReaderOutcome {
+    Compatible,
+    Truncated {
+        observed_size: u64,
+        observed_fingerprint: Vec<u8>,
+    },
+}
+
+fn classify_fingerprint_observation(
+    observation: Result<(Vec<u8>, u64), IdentityError>,
+) -> Result<FingerprintObservation, ReaderError> {
+    match observation {
+        Ok((fingerprint, size)) => Ok(FingerprintObservation::Stable { fingerprint, size }),
+        Err(IdentityError::CandidateChangedDuringIdentity { .. }) => {
+            Ok(FingerprintObservation::Retry)
+        }
+        Err(error) => Err(ReaderError::Identity(error)),
+    }
 }
 
 impl ReaderTable {
@@ -892,14 +946,57 @@ impl ReaderTable {
                     .schedule = ScheduleState::DescriptorBlocked;
                 return Ok(ReaderPoll::DescriptorCapacityBlocked { file_id });
             }
-            if let Err(error) = self.open_reader(file_id) {
-                self.readers
-                    .get_mut(&file_id)
-                    .ok_or(ReaderError::Inconsistent {
-                        reason: "failed reopen target disappeared",
-                    })?
-                    .schedule = ScheduleState::Paused;
-                return Err(error);
+            match self.open_reader(file_id) {
+                Ok(OpenReaderOutcome::Compatible) => {}
+                Ok(OpenReaderOutcome::Truncated {
+                    observed_size,
+                    observed_fingerprint,
+                }) => {
+                    let reader = self
+                        .readers
+                        .get(&file_id)
+                        .ok_or(ReaderError::Inconsistent {
+                            reason: "truncated reopen target disappeared",
+                        })?;
+                    return Ok(ReaderPoll::Truncated {
+                        file_id,
+                        file_epoch: reader.file_epoch,
+                        committed_offset: reader.committed_offset,
+                        read_offset: reader.read_offset,
+                        observed_size,
+                        observed_fingerprint,
+                    });
+                }
+                Err(ReaderError::Reopen {
+                    source: IdentityError::CandidateChangedDuringIdentity { .. },
+                    ..
+                }) => {
+                    let next_probe = self.schedule_eof_probe(file_id, now)?;
+                    return Ok(ReaderPoll::EvidenceUnstable {
+                        file_id,
+                        next_probe,
+                    });
+                }
+                Err(ReaderError::Reopen { .. }) => {
+                    let reader =
+                        self.readers
+                            .get_mut(&file_id)
+                            .ok_or(ReaderError::Inconsistent {
+                                reason: "unavailable reopen target disappeared",
+                            })?;
+                    reader.present = false;
+                    reader.schedule = ScheduleState::Paused;
+                    return Ok(ReaderPoll::RemovedWithoutDescriptor { file_id });
+                }
+                Err(error) => {
+                    self.readers
+                        .get_mut(&file_id)
+                        .ok_or(ReaderError::Inconsistent {
+                            reason: "failed reopen target disappeared",
+                        })?
+                        .schedule = ScheduleState::Paused;
+                    return Err(error);
+                }
             }
         }
 
@@ -976,7 +1073,7 @@ impl ReaderTable {
 
         if count == 0 {
             self.read_buffer = Some(buffer);
-            let observed_size = {
+            let observation = {
                 let reader = self
                     .readers
                     .get(&file_id)
@@ -986,40 +1083,43 @@ impl ReaderTable {
                 let resident = reader.resident.as_ref().ok_or(ReaderError::Inconsistent {
                     reason: "EOF reader descriptor disappeared before metadata inspection",
                 })?;
-                resident
-                    .file
-                    .metadata()
-                    .map_err(|source| ReaderError::Metadata {
-                        file_id,
-                        path: diagnostic_path,
-                        source,
-                    })?
-                    .len()
+                classify_fingerprint_observation(collect_consistent_fingerprint(
+                    &resident.file,
+                    &diagnostic_path,
+                    self.settings.fingerprint_bytes,
+                    self.settings.ignored_header_bytes,
+                ))
             };
-            if observed_size < source_offset {
+            let (observed_fingerprint, observed_size) = match observation? {
+                FingerprintObservation::Stable { fingerprint, size } => (fingerprint, size),
+                FingerprintObservation::Retry => {
+                    let next_probe = self.schedule_eof_probe(file_id, now)?;
+                    return Ok(ReaderPoll::EvidenceUnstable {
+                        file_id,
+                        next_probe,
+                    });
+                }
+            };
+            let fingerprint_mismatch = {
+                let reader = self
+                    .readers
+                    .get(&file_id)
+                    .ok_or(ReaderError::Inconsistent {
+                        reason: "EOF reader disappeared after evidence collection",
+                    })?;
+                !observed_fingerprint.starts_with(&reader.durable_fingerprint)
+            };
+            if observed_size < source_offset || fingerprint_mismatch {
                 return Ok(ReaderPoll::Truncated {
                     file_id,
                     file_epoch,
                     committed_offset,
                     read_offset: source_offset,
                     observed_size,
+                    observed_fingerprint,
                 });
             }
-            let next_probe = now
-                .checked_add(self.settings.eof_probe_interval)
-                .ok_or(ReaderError::DeadlineOverflow)?;
-            let reader = self
-                .readers
-                .get_mut(&file_id)
-                .ok_or(ReaderError::Inconsistent {
-                    reason: "EOF reader disappeared",
-                })?;
-            reader.schedule = ScheduleState::Eof { next_probe };
-            if !self.eof_deadlines.insert((next_probe, file_id)) {
-                return Err(ReaderError::Inconsistent {
-                    reason: "EOF deadline was already present",
-                });
-            }
+            let next_probe = self.schedule_eof_probe(file_id, now)?;
             let _eof_observations =
                 increment(&mut self.counters.eof_observations, "EOF observations")?;
             return Ok(ReaderPoll::EndOfFile {
@@ -1189,6 +1289,54 @@ impl ReaderTable {
             });
         }
         self.ready.push_back(file_id);
+        Ok(())
+    }
+
+    /// Moves an EOF reader's next probe earlier without extending an existing
+    /// deadline.
+    pub(crate) fn cap_eof_deadline(
+        &mut self,
+        file_id: FileId,
+        deadline: Instant,
+    ) -> Result<(), ReaderError> {
+        let current = match self
+            .readers
+            .get(&file_id)
+            .ok_or(ReaderError::UnknownFile { file_id })?
+            .schedule
+        {
+            ScheduleState::Eof { next_probe } => next_probe,
+            ref state => {
+                return Err(ReaderError::InvalidState {
+                    file_id,
+                    operation: "cap EOF deadline",
+                    state: state.name(),
+                });
+            }
+        };
+        if deadline >= current {
+            return Ok(());
+        }
+        if self.eof_deadlines.contains(&(deadline, file_id)) {
+            return Err(ReaderError::Inconsistent {
+                reason: "capped EOF deadline already exists",
+            });
+        }
+        if !self.eof_deadlines.remove(&(current, file_id)) {
+            return Err(ReaderError::Inconsistent {
+                reason: "EOF reader lacks its prior deadline",
+            });
+        }
+        let inserted = self.eof_deadlines.insert((deadline, file_id));
+        debug_assert!(inserted, "preflighted EOF deadline insertion must succeed");
+        self.readers
+            .get_mut(&file_id)
+            .ok_or(ReaderError::Inconsistent {
+                reason: "EOF reader disappeared while capping its deadline",
+            })?
+            .schedule = ScheduleState::Eof {
+            next_probe: deadline,
+        };
         Ok(())
     }
 
@@ -1598,6 +1746,104 @@ impl ReaderTable {
         self.release_reader(file_id)
     }
 
+    /// Validates a durable truncate reset against unchanged live state.
+    pub(crate) fn preflight_truncate_reset(
+        &self,
+        file_id: FileId,
+        expected_file_epoch: u32,
+        expected_committed_offset: u64,
+    ) -> Result<(), ReaderError> {
+        self.preflight_lifecycle_transition(file_id)?;
+        let reader = self
+            .readers
+            .get(&file_id)
+            .ok_or(ReaderError::UnknownFile { file_id })?;
+        if reader.file_epoch != expected_file_epoch {
+            return Err(ReaderError::InvalidProgress {
+                file_id,
+                reason: "truncate reset epoch does not match the live reader",
+            });
+        }
+        if reader.committed_offset != expected_committed_offset {
+            return Err(ReaderError::InvalidProgress {
+                file_id,
+                reason: "truncate reset offset does not match durable progress",
+            });
+        }
+        if !reader.present {
+            return Err(ReaderError::InvalidState {
+                file_id,
+                operation: "reset after truncation",
+                state: "removed",
+            });
+        }
+        Ok(())
+    }
+
+    /// Applies a truncate reset already persisted under the exact preflighted
+    /// epoch and offset.
+    pub(crate) fn apply_preflighted_truncate_reset(
+        &mut self,
+        file_id: FileId,
+        expected_file_epoch: u32,
+        expected_committed_offset: u64,
+        resulting_epoch: u32,
+        fingerprint: Vec<u8>,
+        resume: bool,
+    ) -> Result<(), ReaderError> {
+        debug_assert!(
+            self.preflight_truncate_reset(file_id, expected_file_epoch, expected_committed_offset)
+                .is_ok()
+        );
+        self.remove_scheduling_state(file_id)?;
+        let reader = self
+            .readers
+            .get_mut(&file_id)
+            .ok_or(ReaderError::Inconsistent {
+                reason: "preflighted truncate-reset reader disappeared",
+            })?;
+        reader.file_epoch = resulting_epoch;
+        reader.committed_offset = 0;
+        reader.read_offset = 0;
+        reader.framing_resume = FramingResume::Clean;
+        reader.durable_fingerprint = fingerprint;
+        reader.paused_for_batch = false;
+        reader.schedule = if resume {
+            ScheduleState::Ready
+        } else {
+            ScheduleState::Paused
+        };
+        if resume {
+            self.ready.push_back(file_id);
+        }
+        Ok(())
+    }
+
+    /// Validates that a removed reader can be released after durable
+    /// finalization without discovering a stale scheduling index afterward.
+    pub(crate) fn preflight_release_finalized(&self, file_id: FileId) -> Result<(), ReaderError> {
+        self.preflight_lifecycle_transition(file_id)?;
+        if self
+            .readers
+            .get(&file_id)
+            .ok_or(ReaderError::UnknownFile { file_id })?
+            .present
+        {
+            return Err(ReaderError::InvalidState {
+                file_id,
+                operation: "release finalized reader",
+                state: "present",
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates that an active or removed reader can be released after a
+    /// durable quarantine transition.
+    pub(crate) fn preflight_release_revoked(&self, file_id: FileId) -> Result<(), ReaderError> {
+        self.preflight_lifecycle_transition(file_id)
+    }
+
     /// Returns a snapshot of bounded populations and monotonic activity.
     #[must_use]
     pub(crate) fn stats(&self) -> ReaderStats {
@@ -1677,6 +1923,52 @@ impl ReaderTable {
             .ok_or(ReaderError::UnknownLocator { locator })
     }
 
+    /// Returns the runtime locator owned by one live logical reader.
+    pub(crate) fn locator(&self, file_id: FileId) -> Result<Locator, ReaderError> {
+        self.readers
+            .get(&file_id)
+            .map(|reader| reader.locator)
+            .ok_or(ReaderError::UnknownFile { file_id })
+    }
+
+    /// Refreshes one queued `Updated` event from the retained native handle
+    /// so asynchronous discovery sampling cannot lag the worker frontier.
+    pub(crate) fn refresh_candidate_evidence(
+        &self,
+        candidate: &mut DiscoveredCandidate,
+    ) -> Result<CandidateEvidenceRefresh, ReaderError> {
+        let file_id = self.file_id_for_locator(candidate.evidence.locator)?;
+        let reader = self
+            .readers
+            .get(&file_id)
+            .ok_or(ReaderError::Inconsistent {
+                reason: "locator index points to a missing evidence-refresh reader",
+            })?;
+        if !reader.present {
+            return Err(ReaderError::InvalidState {
+                file_id,
+                operation: "refresh candidate evidence",
+                state: "removed",
+            });
+        }
+        let Some(resident) = reader.resident.as_ref() else {
+            return Ok(CandidateEvidenceRefresh::DescriptorAbsent);
+        };
+        match classify_fingerprint_observation(collect_consistent_fingerprint(
+            &resident.file,
+            &candidate.matched_path,
+            self.settings.fingerprint_bytes,
+            self.settings.ignored_header_bytes,
+        ))? {
+            FingerprintObservation::Stable { fingerprint, size } => {
+                candidate.evidence.fingerprint = fingerprint;
+                candidate.evidence.size = size;
+                Ok(CandidateEvidenceRefresh::Refreshed)
+            }
+            FingerprintObservation::Retry => Ok(CandidateEvidenceRefresh::Retry),
+        }
+    }
+
     /// Borrows the durable identity evidence associated with a live locator.
     pub(crate) fn identity_context(
         &self,
@@ -1693,6 +1985,7 @@ impl ReaderTable {
             file_id,
             file_epoch: reader.file_epoch,
             committed_offset: reader.committed_offset,
+            read_offset: reader.read_offset,
             durable_fingerprint: &reader.durable_fingerprint,
         })
     }
@@ -1755,15 +2048,8 @@ impl ReaderTable {
         Ok(())
     }
 
-    fn open_reader(&mut self, file_id: FileId) -> Result<(), ReaderError> {
-        let (
-            resolved_path,
-            matched_path,
-            locator,
-            durable_fingerprint,
-            committed_offset,
-            ever_opened,
-        ) = {
+    fn open_reader(&mut self, file_id: FileId) -> Result<OpenReaderOutcome, ReaderError> {
+        let (resolved_path, matched_path, locator, durable_fingerprint, read_offset, ever_opened) = {
             let reader = self
                 .readers
                 .get(&file_id)
@@ -1773,11 +2059,11 @@ impl ReaderTable {
                 reader.matched_path.clone(),
                 reader.locator,
                 reader.durable_fingerprint.clone(),
-                reader.committed_offset,
+                reader.read_offset,
                 reader.ever_opened,
             )
         };
-        let opened = reopen_candidate_at(
+        let reopened = reopen_candidate_at(
             &resolved_path,
             &matched_path,
             self.settings.follow_symlinks,
@@ -1785,9 +2071,19 @@ impl ReaderTable {
             self.settings.ignored_header_bytes,
             locator,
             &durable_fingerprint,
-            committed_offset,
+            read_offset,
         )
         .map_err(|source| ReaderError::Reopen { file_id, source })?;
+        let (opened, outcome) = match reopened {
+            ReopenCandidate::Compatible(opened) => (opened, OpenReaderOutcome::Compatible),
+            ReopenCandidate::Truncated(opened) => {
+                let outcome = OpenReaderOutcome::Truncated {
+                    observed_size: opened.evidence.size,
+                    observed_fingerprint: opened.evidence.fingerprint.clone(),
+                };
+                (opened, outcome)
+            }
+        };
         let reader = self
             .readers
             .get_mut(&file_id)
@@ -1815,7 +2111,7 @@ impl ReaderTable {
         } else {
             let _opens = increment(&mut self.counters.opens, "reader opens")?;
         }
-        Ok(())
+        Ok(outcome)
     }
 
     fn select_lrs_victim(&self, target_file_id: FileId) -> Option<FileId> {
@@ -1899,6 +2195,90 @@ impl ReaderTable {
                 state: state.name(),
             }),
         }
+    }
+
+    fn schedule_eof_probe(
+        &mut self,
+        file_id: FileId,
+        now: Instant,
+    ) -> Result<Instant, ReaderError> {
+        let next_probe = now
+            .checked_add(self.settings.eof_probe_interval)
+            .ok_or(ReaderError::DeadlineOverflow)?;
+        let reader = self
+            .readers
+            .get_mut(&file_id)
+            .ok_or(ReaderError::Inconsistent {
+                reason: "EOF reader disappeared",
+            })?;
+        if !matches!(reader.schedule, ScheduleState::Paused) {
+            return Err(ReaderError::InvalidState {
+                file_id,
+                operation: "schedule EOF probe",
+                state: reader.schedule.name(),
+            });
+        }
+        reader.schedule = ScheduleState::Eof { next_probe };
+        if !self.eof_deadlines.insert((next_probe, file_id)) {
+            return Err(ReaderError::Inconsistent {
+                reason: "EOF deadline was already present",
+            });
+        }
+        Ok(next_probe)
+    }
+
+    fn preflight_lifecycle_transition(&self, file_id: FileId) -> Result<(), ReaderError> {
+        if self.read_buffer.is_none() {
+            return Err(ReaderError::InvalidState {
+                file_id,
+                operation: "change lifecycle",
+                state: "a source turn is outstanding",
+            });
+        }
+        if self.pending_eviction.is_some_and(|request| {
+            request.target_file_id == file_id || request.victim_file_id == file_id
+        }) {
+            return Err(ReaderError::InvalidState {
+                file_id,
+                operation: "change lifecycle",
+                state: "an eviction decision is pending",
+            });
+        }
+        let reader = self
+            .readers
+            .get(&file_id)
+            .ok_or(ReaderError::UnknownFile { file_id })?;
+        match reader.schedule {
+            ScheduleState::Ready => {
+                if self
+                    .ready
+                    .iter()
+                    .filter(|queued| **queued == file_id)
+                    .count()
+                    != 1
+                {
+                    return Err(ReaderError::Inconsistent {
+                        reason: "ready lifecycle-transition reader lacks one queue entry",
+                    });
+                }
+            }
+            ScheduleState::Eof { next_probe } => {
+                if !self.eof_deadlines.contains(&(next_probe, file_id)) {
+                    return Err(ReaderError::Inconsistent {
+                        reason: "EOF lifecycle-transition reader lacks its deadline",
+                    });
+                }
+            }
+            ScheduleState::DescriptorBlocked | ScheduleState::Paused => {}
+            ScheduleState::InFlight { .. } => {
+                return Err(ReaderError::InvalidState {
+                    file_id,
+                    operation: "change lifecycle",
+                    state: reader.schedule.name(),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn cancel_eviction_involving(&mut self, file_id: FileId) -> Result<(), ReaderError> {

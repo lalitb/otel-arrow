@@ -53,6 +53,53 @@ impl CandidateInventory {
         self.fingerprint_counts_complete
     }
 
+    /// Replaces one live locator's full-fingerprint contribution after the
+    /// worker refreshes stale queued evidence from its retained descriptor.
+    pub(crate) fn replace_fingerprint_observation(
+        &mut self,
+        locator: Locator,
+        previous: &[u8],
+        refreshed: &[u8],
+        fingerprint_bytes: u16,
+    ) -> Result<(), IdentityError> {
+        if !self.live_locators.contains(&locator) {
+            return Err(IdentityError::InvalidEvidence {
+                reason: "refreshed candidate locator is absent from the reconciliation inventory",
+            });
+        }
+        if previous == refreshed {
+            return Ok(());
+        }
+
+        let full_len = usize::from(fingerprint_bytes);
+        if previous.len() == full_len {
+            let remove_previous = {
+                let count = self.full_fingerprint_counts.get_mut(previous).ok_or(
+                    IdentityError::InvalidEvidence {
+                        reason: "refreshed candidate fingerprint is absent from the inventory",
+                    },
+                )?;
+                *count = count.checked_sub(1).ok_or(IdentityError::InvalidEvidence {
+                    reason: "refreshed candidate fingerprint count underflowed",
+                })?;
+                *count == 0
+            };
+            if remove_previous {
+                let _ = self.full_fingerprint_counts.remove(previous);
+            }
+        }
+        if refreshed.len() == full_len {
+            let count = self
+                .full_fingerprint_counts
+                .entry(refreshed.to_vec())
+                .or_default();
+            *count = count.checked_add(1).ok_or(IdentityError::InvalidEvidence {
+                reason: "refreshed candidate fingerprint count overflowed",
+            })?;
+        }
+        Ok(())
+    }
+
     /// Builds an inventory only when the reconciliation owner has retained
     /// every eligible candidate and observed no scan overflow or unstable
     /// evidence.

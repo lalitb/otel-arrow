@@ -551,6 +551,18 @@ impl OpenBatch {
         self.deadline
     }
 
+    /// Returns the provisional progress frontier already represented by this
+    /// batch for one file.
+    pub(crate) fn progress_frontier(&self, file_id: FileId) -> Option<ProgressFrontier> {
+        let index = self.delta_index.get(&file_id).copied()?;
+        let delta = self.deltas.get(index)?;
+        Some(ProgressFrontier {
+            file_epoch: delta.expected_file_epoch,
+            offset: delta.final_offset,
+            framing_resume: delta.final_framing_resume,
+        })
+    }
+
     /// Whether a sparse nonempty batch must flush at `now`.
     pub(crate) fn is_flush_due(&self, now: Instant) -> bool {
         self.record_count != 0 && self.deadline.is_some_and(|deadline| now >= deadline)

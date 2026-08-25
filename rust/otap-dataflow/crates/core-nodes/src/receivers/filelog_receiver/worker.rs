@@ -19,13 +19,18 @@ use thiserror::Error;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use super::batching::{
-    BatchAppendOutcome, BatchError, LogicalBatch, OpenBatch, ProgressBase, RecordInput,
-    RecordNumberTable,
+    BatchAppendOutcome, BatchError, FinalizationOutcome, LogicalBatch, OpenBatch, ProgressBase,
+    ProgressFrontier, RecordInput, RecordNumberTable,
 };
-use super::checkpoint::primitives::{FileId, LifecycleState, Locator, WAL_MAX_OPS_PER_TX};
+use super::checkpoint::primitives::{
+    FileId, FramingResume, LifecycleState, Locator,
+    QUARANTINE_REASON_ROTATION_DESCRIPTOR_UNAVAILABLE, QUARANTINE_REASON_TRUNCATE,
+    TRUNCATE_RESET_REASON_READ_NEW, WAL_MAX_OPS_PER_TX,
+};
 use super::checkpoint::store::error::StoreError;
 use super::checkpoint::store::{CheckpointStore, StoreOptions};
-use super::config::RuntimeConfig;
+use super::checkpoint::wal::{Operation, QuarantineFile, ResetAfterTruncate, UpdateFingerprint};
+use super::config::{OnTruncate, RuntimeConfig};
 use super::discovery::scanner::DiscoveryPlan;
 use super::discovery::source::{DiscoveryHandle, FeedbackSendError, spawn_discovery};
 use super::discovery::{
@@ -38,8 +43,8 @@ use super::identity::matcher::{
     IdentityResolution, IdentitySettings, resolve_and_persist_with_admission,
 };
 use super::reader::{
-    ReaderError, ReaderFrontier, ReaderPoll, ReaderSettings, ReaderTable, RemovalDisposition,
-    TurnDisposition,
+    CandidateEvidenceRefresh, ReaderError, ReaderFrontier, ReaderPoll, ReaderSettings, ReaderTable,
+    RemovalDisposition, TurnDisposition,
 };
 
 const WORKER_COMMAND_CHANNEL_CAPACITY: usize = 8;
@@ -191,18 +196,18 @@ pub(super) enum WorkerError {
         next_attempt: u32,
     },
     #[error(
-        "filelog reader {file_id:?} observed truncation from read offset {read_offset} and committed offset {committed_offset} to size {observed_size}; Stage 12 truncation handling is not installed"
+        "filelog reader {file_id:?} observed truncation from read offset {read_offset} and committed offset {committed_offset} to size {observed_size}"
     )]
-    UnsupportedTruncation {
+    Truncation {
         file_id: FileId,
         committed_offset: u64,
         read_offset: u64,
         observed_size: u64,
     },
-    #[error(
-        "filelog removed reader {file_id:?} has no retained descriptor; Stage 12 late-write finalization is required before this transition can be handled safely"
-    )]
-    RemovedWithoutDescriptor { file_id: FileId },
+    #[error("filelog rotation deadline overflowed for {file_id:?}")]
+    RotationDeadlineOverflow { file_id: FileId },
+    #[error("filelog reconciliation retry deadline overflowed")]
+    ReconciliationRetryDeadlineOverflow,
     #[error(
         "filelog drain frontier {end_offset} for {file_id:?} is no longer readable at source offset {source_offset}"
     )]
@@ -212,7 +217,7 @@ pub(super) enum WorkerError {
         end_offset: u64,
     },
     #[error(
-        "filelog Updated evidence for locator {locator:?} and file {file_id:?} requires Stage 12 identity/truncation handling: {reason}"
+        "filelog Updated evidence for locator {locator:?} and file {file_id:?} is inconsistent: {reason}"
     )]
     UnsupportedUpdatedIdentity {
         locator: Locator,
@@ -243,14 +248,21 @@ enum HandoffControl {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AppendControl {
     Continue,
-    Seal,
+    SealBefore,
+    SealAfter,
+}
+
+impl AppendControl {
+    const fn requires_seal(self) -> bool {
+        !matches!(self, Self::Continue)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FramerBase {
     file_epoch: u32,
     committed_offset: u64,
-    framing_resume: super::checkpoint::FramingResume,
+    framing_resume: FramingResume,
 }
 
 struct ActiveFramer {
@@ -267,6 +279,23 @@ struct RetainedBatch {
 struct TurnFailure {
     consumed: usize,
     error: Box<WorkerError>,
+}
+
+#[derive(Clone, Debug)]
+struct DetectedTruncation {
+    file_id: FileId,
+    expected_file_epoch: u32,
+    expected_committed_offset: u64,
+    observed_size: u64,
+    observed_fingerprint: Vec<u8>,
+    locator: Locator,
+    present: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RotationWait {
+    stable_since: Instant,
+    deadline: Instant,
 }
 
 /// Starts the sole read/checkpoint OS thread.
@@ -346,6 +375,11 @@ struct WorkerRuntime {
     readers: Option<ReaderTable>,
     framers: HashMap<FileId, ActiveFramer>,
     inactive_locators: HashMap<Locator, FileId>,
+    rotation_waits: HashMap<FileId, RotationWait>,
+    pending_reconciliation: Option<ReconciliationBatch>,
+    pending_reconciliation_retry_at: Option<Instant>,
+    pending_finalizations: Vec<Locator>,
+    detected_truncations: Vec<DetectedTruncation>,
     open_batch: Option<OpenBatch>,
     record_numbers: RecordNumberTable,
     retained: Option<RetainedBatch>,
@@ -416,6 +450,15 @@ impl WorkerRuntime {
                 resource: "inactive locator table",
                 source,
             })?;
+        let mut rotation_waits = HashMap::new();
+        rotation_waits.try_reserve(max_readers).map_err(|source| {
+            WorkerError::AllocationFailed {
+                resource: "rotation wait table",
+                source,
+            }
+        })?;
+        let pending_finalizations = reserved_vec(max_readers, "pending discovery finalizations")?;
+        let detected_truncations = reserved_vec(max_candidate_events, "detected truncation batch")?;
         let candidate_evidence = reserved_vec(max_candidate_events, "candidate evidence batch")?;
         let frontier_snapshot = reserved_vec(max_readers, "reader frontier snapshot")?;
         let drain_order = reserved_vec(max_readers, "deterministic drain order")?;
@@ -449,6 +492,11 @@ impl WorkerRuntime {
             readers: Some(readers),
             framers,
             inactive_locators,
+            rotation_waits,
+            pending_reconciliation: None,
+            pending_reconciliation_retry_at: None,
+            pending_finalizations,
+            detected_truncations,
             open_batch: Some(open_batch),
             record_numbers,
             retained: None,
@@ -491,7 +539,7 @@ impl WorkerRuntime {
                 let wait = if self.maintenance_retry_pending {
                     COMMAND_POLL_INTERVAL
                 } else {
-                    self.next_wait(None)
+                    self.next_maintenance_wait()
                 };
                 match command_rx.recv_timeout(wait) {
                     Ok(command) => {
@@ -514,7 +562,7 @@ impl WorkerRuntime {
                 let wait = if self.checkpoint_commit_failed || self.maintenance_retry_pending {
                     COMMAND_POLL_INTERVAL
                 } else {
-                    self.next_wait(None)
+                    self.next_maintenance_wait()
                 };
                 match command_rx.recv_timeout(wait) {
                     Ok(command) => {
@@ -553,7 +601,7 @@ impl WorkerRuntime {
                 continue;
             }
 
-            if self.process_discovery_message(command_rx)? == LoopControl::Shutdown {
+            if self.process_discovery_message(event_tx, command_rx)? == LoopControl::Shutdown {
                 return Ok(());
             }
             if self.drain_requested {
@@ -611,17 +659,26 @@ impl WorkerRuntime {
                 }
                 ReaderPoll::Truncated {
                     file_id,
-                    file_epoch: _,
+                    file_epoch,
                     committed_offset,
                     read_offset,
                     observed_size,
+                    observed_fingerprint,
                 } => {
-                    return Err(WorkerError::UnsupportedTruncation {
+                    if self.handle_truncation(
                         file_id,
+                        file_epoch,
                         committed_offset,
                         read_offset,
                         observed_size,
-                    });
+                        observed_fingerprint,
+                        event_tx,
+                        command_rx,
+                    )? == LoopControl::Shutdown
+                    {
+                        return Ok(());
+                    }
+                    continue;
                 }
                 ReaderPoll::EvictionRequired(request) => {
                     if self.open_batch_record_count()? != 0 {
@@ -637,8 +694,11 @@ impl WorkerRuntime {
                 }
                 ReaderPoll::DescriptorCapacityBlocked { .. } => None,
                 ReaderPoll::RemovedWithoutDescriptor { file_id } => {
-                    return Err(WorkerError::RemovedWithoutDescriptor { file_id });
+                    let locator = self.contain_removed_without_descriptor(file_id)?;
+                    self.remember_inactive_locator(locator, file_id)?;
+                    continue;
                 }
+                ReaderPoll::EvidenceUnstable { .. } => continue,
                 ReaderPoll::Idle { next_probe } => next_probe,
             };
 
@@ -747,8 +807,19 @@ impl WorkerRuntime {
 
     fn process_discovery_message(
         &mut self,
+        event_tx: &tokio_mpsc::Sender<WorkerEvent>,
         command_rx: &Receiver<WorkerCommand>,
     ) -> Result<LoopControl, WorkerError> {
+        if self
+            .pending_reconciliation_retry_at
+            .is_some_and(|retry_at| Instant::now() < retry_at)
+        {
+            return Ok(LoopControl::Continue);
+        }
+        if let Some(batch) = self.pending_reconciliation.take() {
+            self.pending_reconciliation_retry_at = None;
+            return self.process_reconciliation(batch, event_tx, command_rx);
+        }
         let message = match self
             .discovery
             .as_ref()
@@ -766,7 +837,9 @@ impl WorkerRuntime {
             }
         };
         match message {
-            DiscoveryMessage::Batch(batch) => self.process_reconciliation(*batch, command_rx),
+            DiscoveryMessage::Batch(batch) => {
+                self.process_reconciliation(*batch, event_tx, command_rx)
+            }
             DiscoveryMessage::Failed(error) => Err(WorkerError::Discovery(error)),
             DiscoveryMessage::Stopped => Err(WorkerError::DiscoveryStopped),
         }
@@ -774,10 +847,34 @@ impl WorkerRuntime {
 
     fn process_reconciliation(
         &mut self,
-        batch: ReconciliationBatch,
+        mut batch: ReconciliationBatch,
+        event_tx: &tokio_mpsc::Sender<WorkerEvent>,
         command_rx: &Receiver<WorkerCommand>,
     ) -> Result<LoopControl, WorkerError> {
-        self.preflight_updated_candidates(&batch.events)?;
+        if !self.refresh_updated_candidates(&mut batch)? {
+            let retry_at = Instant::now()
+                .checked_add(COMMAND_POLL_INTERVAL)
+                .ok_or(WorkerError::ReconciliationRetryDeadlineOverflow)?;
+            self.defer_reconciliation(batch, Some(retry_at))?;
+            return Ok(LoopControl::Continue);
+        }
+        self.detect_updated_truncations(&batch.events)?;
+        for truncation in &self.detected_truncations {
+            if self
+                .open_batch
+                .as_ref()
+                .ok_or(WorkerError::MissingOpenBatch {
+                    operation: "checking truncation overlap",
+                })?
+                .progress_frontier(truncation.file_id)
+                .is_some()
+            {
+                self.defer_reconciliation(batch, None)?;
+                self.detected_truncations.clear();
+                return self.seal_open_batch(event_tx, command_rx);
+            }
+        }
+        self.apply_detected_truncations()?;
         self.candidate_evidence.clear();
         let candidate_count = batch
             .events
@@ -816,7 +913,15 @@ impl WorkerRuntime {
             });
         }
 
-        let mut feedback = feedback_with_capacity(batch.events.len())?;
+        let feedback_capacity = batch
+            .events
+            .len()
+            .checked_add(self.pending_finalizations.len())
+            .ok_or(WorkerError::Inconsistent {
+                reason: "discovery feedback capacity overflowed",
+            })?;
+        let mut feedback = feedback_with_capacity(feedback_capacity)?;
+        feedback.finalized.append(&mut self.pending_finalizations);
         let mut resolved = resolved.into_iter();
         for event in batch.events {
             match event {
@@ -874,7 +979,13 @@ impl WorkerRuntime {
                         Ok(file_id) => match self.readers_mut()?.mark_removed(locator)? {
                             RemovalDisposition::HandleRetained => {}
                             RemovalDisposition::DescriptorAbsent => {
-                                return Err(WorkerError::RemovedWithoutDescriptor { file_id });
+                                let released = self.contain_removed_without_descriptor(file_id)?;
+                                if released != locator {
+                                    return Err(WorkerError::Inconsistent {
+                                        reason: "removed reader containment released a different locator",
+                                    });
+                                }
+                                feedback.finalized.push(locator);
                             }
                         },
                         Err(ReaderError::UnknownLocator { .. }) => {
@@ -898,22 +1009,82 @@ impl WorkerRuntime {
         self.send_feedback_interruptibly(feedback, command_rx)
     }
 
-    fn preflight_updated_candidates(&self, events: &[CandidateEvent]) -> Result<(), WorkerError> {
+    fn refresh_updated_candidates(
+        &mut self,
+        batch: &mut ReconciliationBatch,
+    ) -> Result<bool, WorkerError> {
+        for event in &mut batch.events {
+            let CandidateEvent::Updated(candidate) = event else {
+                continue;
+            };
+            match self
+                .readers_ref()?
+                .file_id_for_locator(candidate.evidence.locator)
+            {
+                Ok(_) => {}
+                Err(ReaderError::UnknownLocator { .. }) => continue,
+                Err(error) => return Err(WorkerError::Reader(error)),
+            }
+            let previous_fingerprint = candidate.evidence.fingerprint.clone();
+            match self.readers_ref()?.refresh_candidate_evidence(candidate)? {
+                CandidateEvidenceRefresh::Refreshed => {
+                    batch.inventory.replace_fingerprint_observation(
+                        candidate.evidence.locator,
+                        &previous_fingerprint,
+                        &candidate.evidence.fingerprint,
+                        self.identity_settings.fingerprint_bytes,
+                    )?;
+                }
+                CandidateEvidenceRefresh::DescriptorAbsent => {}
+                CandidateEvidenceRefresh::Retry => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
+    fn defer_reconciliation(
+        &mut self,
+        batch: ReconciliationBatch,
+        retry_at: Option<Instant>,
+    ) -> Result<(), WorkerError> {
+        if self.pending_reconciliation.is_some() || self.pending_reconciliation_retry_at.is_some() {
+            return Err(WorkerError::Inconsistent {
+                reason: "more than one reconciliation batch was deferred",
+            });
+        }
+        self.pending_reconciliation = Some(batch);
+        self.pending_reconciliation_retry_at = retry_at;
+        Ok(())
+    }
+
+    fn detect_updated_truncations(&mut self, events: &[CandidateEvent]) -> Result<(), WorkerError> {
+        self.detected_truncations.clear();
         for event in events {
             let CandidateEvent::Updated(candidate) = event else {
                 continue;
             };
             let locator = candidate.evidence.locator;
-            let (file_id, committed_offset, durable_fingerprint, quarantined) = match self
-                .readers_ref()?
-                .identity_context(locator)
-            {
-                Ok(context) => (
-                    context.file_id,
-                    context.committed_offset,
-                    context.durable_fingerprint,
-                    false,
-                ),
+            let (
+                file_id,
+                file_epoch,
+                committed_offset,
+                read_offset,
+                durable_fingerprint,
+                quarantined,
+                present,
+            ) = match self.readers_ref()?.identity_context(locator) {
+                Ok(context) => {
+                    let frontier = self.readers_ref()?.frontier(context.file_id)?;
+                    (
+                        context.file_id,
+                        context.file_epoch,
+                        context.committed_offset,
+                        context.read_offset,
+                        context.durable_fingerprint.to_vec(),
+                        false,
+                        frontier.present,
+                    )
+                }
                 Err(ReaderError::UnknownLocator { .. }) => {
                     let file_id = *self.inactive_locators.get(&locator).ok_or(
                             WorkerError::Inconsistent {
@@ -927,9 +1098,12 @@ impl WorkerRuntime {
                         .ok_or(WorkerError::MissingCheckpointRecord { file_id })?;
                     (
                         file_id,
+                        record.file_epoch,
                         record.committed_offset,
-                        record.fingerprint.as_slice(),
+                        record.committed_offset,
+                        record.fingerprint.clone(),
                         record.lifecycle_state == LifecycleState::Quarantined,
+                        true,
                     )
                 }
                 Err(error) => return Err(WorkerError::Reader(error)),
@@ -963,24 +1137,352 @@ impl WorkerRuntime {
             if quarantined {
                 continue;
             }
-            if candidate.evidence.size < committed_offset {
-                return Err(WorkerError::UnsupportedUpdatedIdentity {
-                    locator,
-                    file_id,
-                    reason: "observed size is below durable committed progress",
-                });
-            }
-            if !candidate
-                .evidence
-                .fingerprint
-                .starts_with(durable_fingerprint)
+            if candidate.evidence.size < read_offset
+                || !candidate
+                    .evidence
+                    .fingerprint
+                    .starts_with(&durable_fingerprint)
             {
-                return Err(WorkerError::UnsupportedUpdatedIdentity {
-                    locator,
+                if self.detected_truncations.len() == self.detected_truncations.capacity() {
+                    return Err(WorkerError::Inconsistent {
+                        reason: "detected truncations exceed their configured bound",
+                    });
+                }
+                self.detected_truncations.push(DetectedTruncation {
                     file_id,
-                    reason: "fingerprint no longer extends durable evidence",
+                    expected_file_epoch: file_epoch,
+                    expected_committed_offset: committed_offset,
+                    observed_size: candidate.evidence.size,
+                    observed_fingerprint: candidate.evidence.fingerprint.clone(),
+                    locator,
+                    present,
                 });
             }
+        }
+        Ok(())
+    }
+
+    fn apply_detected_truncations(&mut self) -> Result<(), WorkerError> {
+        for index in 0..self.detected_truncations.len() {
+            let truncation = self.detected_truncations[index].clone();
+            self.preflight_truncation(&truncation)?;
+        }
+        for index in 0..self.detected_truncations.len() {
+            let truncation = self.detected_truncations[index].clone();
+            self.apply_truncation(truncation)?;
+        }
+        self.detected_truncations.clear();
+        Ok(())
+    }
+
+    fn preflight_truncation(&self, truncation: &DetectedTruncation) -> Result<(), WorkerError> {
+        if self.retained.is_some() {
+            return Err(WorkerError::Inconsistent {
+                reason: "truncate transition cannot run under a retained batch",
+            });
+        }
+        if self
+            .open_batch
+            .as_ref()
+            .ok_or(WorkerError::MissingOpenBatch {
+                operation: "preflighting truncation",
+            })?
+            .progress_frontier(truncation.file_id)
+            .is_some()
+        {
+            return Err(WorkerError::Inconsistent {
+                reason: "truncate transition overlaps an unacknowledged file delta",
+            });
+        }
+        let record = self.store.table().get(&truncation.file_id).ok_or(
+            WorkerError::MissingCheckpointRecord {
+                file_id: truncation.file_id,
+            },
+        )?;
+        if record.lifecycle_state != LifecycleState::Active
+            || record.file_epoch != truncation.expected_file_epoch
+            || record.committed_offset != truncation.expected_committed_offset
+            || record.locator != truncation.locator
+        {
+            return Err(WorkerError::Inconsistent {
+                reason: "truncate evidence no longer matches durable active state",
+            });
+        }
+        match self.config.rotation.on_truncate {
+            OnTruncate::Fail => self
+                .readers_ref()?
+                .preflight_release_revoked(truncation.file_id)?,
+            OnTruncate::ReadNew => {
+                let _resulting_epoch = truncation.expected_file_epoch.checked_add(1).ok_or(
+                    WorkerError::Inconsistent {
+                        reason: "file epoch overflowed during truncate reset",
+                    },
+                )?;
+                self.readers_ref()?.preflight_truncate_reset(
+                    truncation.file_id,
+                    truncation.expected_file_epoch,
+                    truncation.expected_committed_offset,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_truncation(&mut self, truncation: DetectedTruncation) -> Result<(), WorkerError> {
+        let reset_time_unix_nano = unix_nanos()?.1;
+        match self.config.rotation.on_truncate {
+            OnTruncate::Fail => {
+                let mut quarantines = reserved_vec(1, "truncate quarantine operation")?;
+                quarantines.push(QuarantineFile {
+                    file_id: truncation.file_id,
+                    expected_file_epoch: truncation.expected_file_epoch,
+                    reason_code: QUARANTINE_REASON_TRUNCATE,
+                    locator: truncation.locator,
+                    observed_size: truncation.observed_size,
+                    quarantine_epoch: truncation.expected_file_epoch,
+                    quarantine_time_unix_nano: reset_time_unix_nano,
+                });
+                let _outcomes = self.store.quarantine_files(quarantines)?;
+                self.store.sync()?;
+
+                let released = self.readers_mut()?.release_revoked(truncation.file_id)?;
+                if released != truncation.locator {
+                    return Err(WorkerError::Inconsistent {
+                        reason: "quarantined reader released a different locator",
+                    });
+                }
+                let _ = self.framers.remove(&truncation.file_id);
+                let _ = self.rotation_waits.remove(&truncation.file_id);
+                let _ = self.record_numbers.remove(truncation.file_id);
+                self.remove_drain_file(truncation.file_id);
+                if truncation.present {
+                    self.remember_inactive_locator(truncation.locator, truncation.file_id)?;
+                } else {
+                    self.queue_finalization_feedback(truncation.locator)?;
+                }
+                otel_warn!(
+                    "filelog_receiver.copytruncate_quarantined",
+                    checkpoint_id = self.config.checkpoint_id.as_str(),
+                    observed_size = truncation.observed_size,
+                    file_epoch = u64::from(truncation.expected_file_epoch)
+                );
+            }
+            OnTruncate::ReadNew => {
+                let resulting_epoch = truncation.expected_file_epoch.checked_add(1).ok_or(
+                    WorkerError::Inconsistent {
+                        reason: "file epoch overflowed during truncate reset",
+                    },
+                )?;
+                let expected_fingerprint = self
+                    .store
+                    .table()
+                    .get(&truncation.file_id)
+                    .ok_or(WorkerError::MissingCheckpointRecord {
+                        file_id: truncation.file_id,
+                    })?
+                    .fingerprint
+                    .clone();
+                let mut operations = reserved_vec(2, "truncate reset transaction")?;
+                operations.push(Operation::ResetAfterTruncate(ResetAfterTruncate {
+                    file_id: truncation.file_id,
+                    expected_active_epoch: truncation.expected_file_epoch,
+                    observed_truncated_size: truncation.observed_size,
+                    resulting_epoch,
+                    new_committed_offset: 0,
+                    new_framing_resume: FramingResume::Clean,
+                    reset_time_unix_nano,
+                    reason_code: TRUNCATE_RESET_REASON_READ_NEW,
+                }));
+                operations.push(Operation::UpdateFingerprint(UpdateFingerprint {
+                    file_id: truncation.file_id,
+                    expected_file_epoch: resulting_epoch,
+                    expected_fingerprint,
+                    new_fingerprint: truncation.observed_fingerprint.clone(),
+                }));
+                let _outcome = self.store.append(operations)?;
+                self.store.sync()?;
+
+                let resume = !self.drain_requested;
+                self.readers_mut()?.apply_preflighted_truncate_reset(
+                    truncation.file_id,
+                    truncation.expected_file_epoch,
+                    truncation.expected_committed_offset,
+                    resulting_epoch,
+                    truncation.observed_fingerprint,
+                    resume,
+                )?;
+                let _ = self.framers.remove(&truncation.file_id);
+                let _ = self.rotation_waits.remove(&truncation.file_id);
+                let _ = self.record_numbers.remove(truncation.file_id);
+                self.remove_drain_file(truncation.file_id);
+                otel_warn!(
+                    "filelog_receiver.copytruncate_reset",
+                    checkpoint_id = self.config.checkpoint_id.as_str(),
+                    observed_size = truncation.observed_size,
+                    previous_file_epoch = u64::from(truncation.expected_file_epoch),
+                    resulting_file_epoch = u64::from(resulting_epoch)
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn contain_removed_without_descriptor(
+        &mut self,
+        file_id: FileId,
+    ) -> Result<Locator, WorkerError> {
+        if self.retained.is_some()
+            || self
+                .open_batch
+                .as_ref()
+                .ok_or(WorkerError::MissingOpenBatch {
+                    operation: "containing descriptor-free rotation",
+                })?
+                .progress_frontier(file_id)
+                .is_some()
+        {
+            return Err(WorkerError::Inconsistent {
+                reason: "descriptor-free rotation overlaps unacknowledged progress",
+            });
+        }
+        let frontier = self.readers_ref()?.frontier(file_id)?;
+        if frontier.present || frontier.descriptor_resident {
+            return Err(WorkerError::Inconsistent {
+                reason: "descriptor-free rotation containment received a present or resident reader",
+            });
+        }
+        self.readers_ref()?.preflight_release_revoked(file_id)?;
+        let (expected_file_epoch, committed_offset, locator) = {
+            let record = self
+                .store
+                .table()
+                .get(&file_id)
+                .ok_or(WorkerError::MissingCheckpointRecord { file_id })?;
+            if record.lifecycle_state != LifecycleState::Active {
+                return Err(WorkerError::InactiveCheckpointRecord {
+                    file_id,
+                    state: record.lifecycle_state,
+                });
+            }
+            (record.file_epoch, record.committed_offset, record.locator)
+        };
+        let mut quarantines = reserved_vec(1, "descriptor-free rotation quarantine")?;
+        quarantines.push(QuarantineFile {
+            file_id,
+            expected_file_epoch,
+            reason_code: QUARANTINE_REASON_ROTATION_DESCRIPTOR_UNAVAILABLE,
+            locator,
+            observed_size: committed_offset,
+            quarantine_epoch: expected_file_epoch,
+            quarantine_time_unix_nano: unix_nanos()?.1,
+        });
+        let _outcomes = self.store.quarantine_files(quarantines)?;
+        self.store.sync()?;
+
+        let released = self.readers_mut()?.release_revoked(file_id)?;
+        if released != locator {
+            return Err(WorkerError::Inconsistent {
+                reason: "descriptor-free rotation released a different locator",
+            });
+        }
+        let _ = self.framers.remove(&file_id);
+        let _ = self.rotation_waits.remove(&file_id);
+        let _ = self.record_numbers.remove(file_id);
+        self.remove_drain_file(file_id);
+        otel_warn!(
+            "filelog_receiver.rotation_descriptor_unavailable",
+            checkpoint_id = self.config.checkpoint_id.as_str(),
+            committed_offset,
+            file_epoch = u64::from(expected_file_epoch)
+        );
+        Ok(locator)
+    }
+
+    fn handle_truncation(
+        &mut self,
+        file_id: FileId,
+        file_epoch: u32,
+        committed_offset: u64,
+        read_offset: u64,
+        observed_size: u64,
+        observed_fingerprint: Vec<u8>,
+        event_tx: &tokio_mpsc::Sender<WorkerEvent>,
+        command_rx: &Receiver<WorkerCommand>,
+    ) -> Result<LoopControl, WorkerError> {
+        if self
+            .open_batch
+            .as_ref()
+            .ok_or(WorkerError::MissingOpenBatch {
+                operation: "checking a polled truncation",
+            })?
+            .progress_frontier(file_id)
+            .is_some()
+        {
+            return self.seal_open_batch(event_tx, command_rx);
+        }
+        let frontier = self.readers_ref()?.frontier(file_id)?;
+        if frontier.file_epoch != file_epoch
+            || frontier.committed_offset != committed_offset
+            || frontier.read_offset != read_offset
+        {
+            return Err(WorkerError::Truncation {
+                file_id,
+                committed_offset,
+                read_offset,
+                observed_size,
+            });
+        }
+        let truncation = DetectedTruncation {
+            file_id,
+            expected_file_epoch: file_epoch,
+            expected_committed_offset: committed_offset,
+            observed_size,
+            observed_fingerprint,
+            locator: self.readers_ref()?.locator(file_id)?,
+            present: frontier.present,
+        };
+        self.preflight_truncation(&truncation)?;
+        self.apply_truncation(truncation)?;
+        Ok(LoopControl::Continue)
+    }
+
+    fn remove_drain_file(&mut self, file_id: FileId) {
+        let _ = self.drain_limits.remove(&file_id);
+        if let Some(index) = self
+            .drain_order
+            .iter()
+            .position(|candidate| *candidate == file_id)
+        {
+            let _ = self.drain_order.remove(index);
+        }
+    }
+
+    fn queue_finalization_feedback(&mut self, locator: Locator) -> Result<(), WorkerError> {
+        if self.pending_finalizations.contains(&locator) {
+            return Err(WorkerError::Inconsistent {
+                reason: "locator was queued twice for discovery finalization",
+            });
+        }
+        if self.pending_finalizations.len() == self.pending_finalizations.capacity() {
+            return Err(WorkerError::Inconsistent {
+                reason: "pending discovery finalizations exceed their configured bound",
+            });
+        }
+        self.pending_finalizations.push(locator);
+        Ok(())
+    }
+
+    fn remember_inactive_locator(
+        &mut self,
+        locator: Locator,
+        file_id: FileId,
+    ) -> Result<(), WorkerError> {
+        if let Some(existing) = self.inactive_locators.insert(locator, file_id)
+            && existing != file_id
+        {
+            return Err(WorkerError::Inconsistent {
+                reason: "inactive locator changed durable identity",
+            });
         }
         Ok(())
     }
@@ -1045,6 +1547,7 @@ impl WorkerRuntime {
         ready_clock: &mut impl FnMut() -> Instant,
     ) -> Result<LoopControl, WorkerError> {
         let file_id = turn.file_id();
+        let _ = self.rotation_waits.remove(&file_id);
         let base = FramerBase {
             file_epoch: turn.file_epoch(),
             committed_offset: turn.committed_offset(),
@@ -1106,7 +1609,8 @@ impl WorkerRuntime {
                 }
                 Ok(LoopControl::Continue)
             }
-            Ok((consumed, AppendControl::Seal)) => {
+            Ok((consumed, control @ (AppendControl::SealBefore | AppendControl::SealAfter))) => {
+                debug_assert!(control.requires_seal());
                 self.readers_mut()?
                     .complete_turn(turn, consumed, TurnDisposition::Paused)?;
                 self.seal_open_batch(event_tx, command_rx)
@@ -1160,7 +1664,9 @@ impl WorkerRuntime {
                         error: Box::new(error),
                     })? {
                     AppendControl::Continue => {}
-                    AppendControl::Seal => return Ok((consumed, AppendControl::Seal)),
+                    control @ (AppendControl::SealBefore | AppendControl::SealAfter) => {
+                        return Ok((consumed, control));
+                    }
                 }
             }
             if consumed < turn.bytes().len() {
@@ -1189,37 +1695,173 @@ impl WorkerRuntime {
         event_tx: &tokio_mpsc::Sender<WorkerEvent>,
         command_rx: &Receiver<WorkerCommand>,
     ) -> Result<LoopControl, WorkerError> {
-        let Some(mut active) = self.framers.remove(&file_id) else {
+        let mut active = self.framers.remove(&file_id);
+        if let Some(active) = active.as_mut() {
+            if active.base.file_epoch != file_epoch
+                || active.framer.next_expected_input_offset() != source_offset
+            {
+                return Err(WorkerError::Inconsistent {
+                    reason: "EOF state does not match its active framer",
+                });
+            }
+            active.framer.observe_eof(now)?;
+            loop {
+                let ready_at = Instant::now();
+                let step = active.framer.poll_timeout(ready_at)?;
+                let produced = step.output.is_some();
+                if let Some(record) = step.output {
+                    let control = self.append_record(file_id, active.base, record, ready_at)?;
+                    if control.requires_seal() {
+                        return self.seal_open_batch(event_tx, command_rx);
+                    }
+                }
+                if !produced {
+                    break;
+                }
+            }
+        }
+
+        if !self.rotation_finalization_due(file_id, now)? {
+            if let Some(active) = active
+                && self.framers.insert(file_id, active).is_some()
+            {
+                return Err(WorkerError::Inconsistent {
+                    reason: "EOF framer reappeared while being polled",
+                });
+            }
             return Ok(LoopControl::Continue);
-        };
-        if active.base.file_epoch != file_epoch
-            || active.framer.next_expected_input_offset() != source_offset
+        }
+
+        if let Some(active) = active.as_mut() {
+            loop {
+                let ready_at = Instant::now();
+                let step = active.framer.flush_rotation(ready_at)?;
+                let produced = step.output.is_some();
+                if let Some(record) = step.output {
+                    match self.append_record(file_id, active.base, record, ready_at)? {
+                        AppendControl::Continue => {}
+                        AppendControl::SealBefore => {
+                            return self.seal_open_batch(event_tx, command_rx);
+                        }
+                        AppendControl::SealAfter => {
+                            let remaining = if step.pending {
+                                active.framer.flush_rotation(Instant::now())?
+                            } else {
+                                super::framing::FlushStep {
+                                    output: None,
+                                    pending: false,
+                                }
+                            };
+                            if remaining.output.is_some() || remaining.pending {
+                                // Seal rewind reconstructs any lookahead output
+                                // from the first uncommitted source boundary.
+                                return self.seal_open_batch(event_tx, command_rx);
+                            }
+                            return self.finalize_removed_file(file_id, event_tx, command_rx);
+                        }
+                    }
+                }
+                if !produced {
+                    if step.pending
+                        && let Some(start) = active.framer.pending_source_start()
+                    {
+                        let dropped = active
+                            .framer
+                            .next_expected_input_offset()
+                            .checked_sub(start)
+                            .ok_or(WorkerError::Inconsistent {
+                                reason: "rotation pending range regressed",
+                            })?;
+                        otel_warn!(
+                            "filelog_receiver.rotation_partial_bytes_dropped",
+                            checkpoint_id = self.config.checkpoint_id.as_str(),
+                            dropped_bytes = dropped
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+
+        self.finalize_removed_file(file_id, event_tx, command_rx)
+    }
+
+    fn rotation_finalization_due(
+        &mut self,
+        file_id: FileId,
+        now: Instant,
+    ) -> Result<bool, WorkerError> {
+        let frontier = self.readers_ref()?.frontier(file_id)?;
+        if frontier.present {
+            let _ = self.rotation_waits.remove(&file_id);
+            return Ok(false);
+        }
+        if let Some(wait) = self.rotation_waits.get(&file_id).copied() {
+            debug_assert!(wait.stable_since <= wait.deadline);
+            if now >= wait.deadline {
+                return Ok(true);
+            }
+            self.readers_mut()?
+                .cap_eof_deadline(file_id, wait.deadline)?;
+            return Ok(false);
+        }
+        let deadline = now
+            .checked_add(self.config.rotation.rotate_wait)
+            .ok_or(WorkerError::RotationDeadlineOverflow { file_id })?;
+        if self
+            .rotation_waits
+            .insert(
+                file_id,
+                RotationWait {
+                    stable_since: now,
+                    deadline,
+                },
+            )
+            .is_some()
         {
             return Err(WorkerError::Inconsistent {
-                reason: "EOF state does not match its active framer",
+                reason: "rotation wait appeared during first EOF observation",
             });
         }
-        active.framer.observe_eof(now)?;
-        loop {
-            let ready_at = Instant::now();
-            let step = active.framer.poll_timeout(ready_at)?;
-            let produced = step.output.is_some();
-            if let Some(record) = step.output
-                && self.append_record(file_id, active.base, record, ready_at)?
-                    == AppendControl::Seal
-            {
-                return self.seal_open_batch(event_tx, command_rx);
-            }
-            if !produced {
-                break;
-            }
-        }
-        if self.framers.insert(file_id, active).is_some() {
-            return Err(WorkerError::Inconsistent {
-                reason: "EOF framer reappeared while being polled",
+        self.readers_mut()?.cap_eof_deadline(file_id, deadline)?;
+        Ok(false)
+    }
+
+    fn finalize_removed_file(
+        &mut self,
+        file_id: FileId,
+        event_tx: &tokio_mpsc::Sender<WorkerEvent>,
+        command_rx: &Receiver<WorkerCommand>,
+    ) -> Result<LoopControl, WorkerError> {
+        self.readers_ref()?.preflight_release_finalized(file_id)?;
+        let durable = current_progress(&self.store, file_id)?;
+        let frontier = self
+            .open_batch
+            .as_ref()
+            .ok_or(WorkerError::MissingOpenBatch {
+                operation: "reading a rotation finalization frontier",
+            })?
+            .progress_frontier(file_id)
+            .unwrap_or(ProgressFrontier {
+                file_epoch: durable.file_epoch,
+                offset: durable.committed_offset,
+                framing_resume: durable.framing_resume,
             });
+        let last_seen_time_unix_nano = unix_nanos()?.1;
+        let outcome = self
+            .open_batch
+            .as_mut()
+            .ok_or(WorkerError::MissingOpenBatch {
+                operation: "finalizing a removed file",
+            })?
+            .finalize_file(file_id, frontier, last_seen_time_unix_nano)?;
+        match outcome {
+            FinalizationOutcome::Merged => self.seal_open_batch(event_tx, command_rx),
+            FinalizationOutcome::Direct(delta) => {
+                self.commit_direct_progress(&delta)?;
+                Ok(LoopControl::Continue)
+            }
         }
-        Ok(LoopControl::Continue)
     }
 
     fn poll_due_framer(
@@ -1252,11 +1894,11 @@ impl WorkerRuntime {
             let ready_at = Instant::now();
             let step = active.framer.poll_timeout(ready_at)?;
             let produced = step.output.is_some();
-            if let Some(record) = step.output
-                && self.append_record(file_id, active.base, record, ready_at)?
-                    == AppendControl::Seal
-            {
-                return self.seal_open_batch(event_tx, command_rx).map(Some);
+            if let Some(record) = step.output {
+                let control = self.append_record(file_id, active.base, record, ready_at)?;
+                if control.requires_seal() {
+                    return self.seal_open_batch(event_tx, command_rx).map(Some);
+                }
             }
             if !produced {
                 break;
@@ -1335,7 +1977,7 @@ impl WorkerRuntime {
                     }
                 }
                 Ok(if seal.is_some() {
-                    AppendControl::Seal
+                    AppendControl::SealAfter
                 } else {
                     AppendControl::Continue
                 })
@@ -1347,7 +1989,7 @@ impl WorkerRuntime {
                 // The refused record and its uncommitted number reservation
                 // are deliberately discarded. Seal rewind causes its bytes
                 // to be reread after Ack.
-                Ok(AppendControl::Seal)
+                Ok(AppendControl::SealBefore)
             }
         }
     }
@@ -1474,9 +2116,16 @@ impl WorkerRuntime {
                 delta.expected_file_epoch(),
                 delta.final_offset(),
             )?;
+            if delta.finalize() {
+                self.readers_ref()?
+                    .preflight_release_finalized(delta.file_id())?;
+            }
         }
         self.readers_mut()?.preflight_batch_commit()?;
         let _outcomes = self.store.commit_progress(updates)?;
+        if logical.deltas().iter().any(|delta| delta.finalize()) {
+            self.store.sync()?;
+        }
 
         for delta in logical.deltas() {
             self.readers_mut()?.apply_preflighted_committed_progress(
@@ -1488,6 +2137,15 @@ impl WorkerRuntime {
         }
         let resume = !self.drain_requested;
         self.readers_mut()?.finish_preflighted_batch_commit(resume);
+        for delta in logical.deltas() {
+            if delta.finalize() {
+                let locator = self.readers_mut()?.release_finalized(delta.file_id())?;
+                self.queue_finalization_feedback(locator)?;
+                let _ = self.rotation_waits.remove(&delta.file_id());
+                let _ = self.record_numbers.remove(delta.file_id());
+                self.remove_drain_file(delta.file_id());
+            }
+        }
         Ok(())
     }
 
@@ -1525,17 +2183,27 @@ impl WorkerRuntime {
                         continue;
                     }
                     ReaderPoll::Truncated {
+                        file_epoch,
                         committed_offset,
                         read_offset,
                         observed_size,
+                        observed_fingerprint,
                         ..
                     } => {
-                        return Err(WorkerError::UnsupportedTruncation {
+                        let control = self.handle_truncation(
                             file_id,
+                            file_epoch,
                             committed_offset,
                             read_offset,
                             observed_size,
-                        });
+                            observed_fingerprint,
+                            event_tx,
+                            command_rx,
+                        )?;
+                        if control == LoopControl::Shutdown || self.retained.is_some() {
+                            return Ok(control);
+                        }
+                        continue;
                     }
                     ReaderPoll::EndOfFile { source_offset, .. } => {
                         return Err(WorkerError::DrainFrontierUnavailable {
@@ -1550,7 +2218,20 @@ impl WorkerRuntime {
                         continue;
                     }
                     ReaderPoll::RemovedWithoutDescriptor { file_id } => {
-                        return Err(WorkerError::RemovedWithoutDescriptor { file_id });
+                        let locator = self.contain_removed_without_descriptor(file_id)?;
+                        self.remember_inactive_locator(locator, file_id)?;
+                        continue;
+                    }
+                    ReaderPoll::EvidenceUnstable { next_probe, .. } => {
+                        match command_rx.recv_timeout(self.next_wait(Some(next_probe))) {
+                            Ok(command) => {
+                                return self.handle_command(command, event_tx, command_rx);
+                            }
+                            Err(RecvTimeoutError::Timeout) => continue,
+                            Err(RecvTimeoutError::Disconnected) => {
+                                return Ok(LoopControl::Shutdown);
+                            }
+                        }
                     }
                     ReaderPoll::DescriptorCapacityBlocked { .. } | ReaderPoll::Idle { .. } => {
                         return Err(WorkerError::Inconsistent {
@@ -1575,11 +2256,11 @@ impl WorkerRuntime {
                 let ready_at = Instant::now();
                 let step = active.framer.flush_drain(ready_at)?;
                 let produced = step.output.is_some();
-                if let Some(record) = step.output
-                    && self.append_record(file_id, active.base, record, ready_at)?
-                        == AppendControl::Seal
-                {
-                    return self.seal_open_batch(event_tx, command_rx);
+                if let Some(record) = step.output {
+                    let control = self.append_record(file_id, active.base, record, ready_at)?;
+                    if control.requires_seal() {
+                        return self.seal_open_batch(event_tx, command_rx);
+                    }
                 }
                 if !produced {
                     // `pending` with no output is an unflushable tail under
@@ -1712,12 +2393,14 @@ impl WorkerRuntime {
         let mut wait = COMMAND_POLL_INTERVAL;
         for deadline in [
             reader_deadline,
+            self.pending_reconciliation_retry_at,
             self.store.next_sync_deadline(),
             self.open_batch.as_ref().and_then(OpenBatch::deadline),
             self.framers
                 .values()
                 .filter_map(|active| active.framer.deadline())
                 .min(),
+            self.rotation_waits.values().map(|wait| wait.deadline).min(),
         ]
         .into_iter()
         .flatten()
@@ -1725,6 +2408,15 @@ impl WorkerRuntime {
             wait = wait.min(deadline.saturating_duration_since(now));
         }
         wait
+    }
+
+    fn next_maintenance_wait(&self) -> Duration {
+        let now = Instant::now();
+        self.store
+            .next_sync_deadline()
+            .map_or(COMMAND_POLL_INTERVAL, |deadline| {
+                COMMAND_POLL_INTERVAL.min(deadline.saturating_duration_since(now))
+            })
     }
 
     fn open_batch_record_count(&self) -> Result<u32, WorkerError> {
@@ -1789,6 +2481,10 @@ impl WorkerRuntime {
         &mut self,
         delta: &super::batching::ProgressDelta,
     ) -> Result<(), WorkerError> {
+        if delta.finalize() {
+            self.readers_ref()?
+                .preflight_release_finalized(delta.file_id())?;
+        }
         persist_direct_progress(&mut self.store, delta)?;
         self.readers_mut()?.observe_committed_progress(
             delta.file_id(),
@@ -1797,8 +2493,11 @@ impl WorkerRuntime {
             delta.final_framing_resume(),
         )?;
         if delta.finalize() {
-            let _ = self.readers_mut()?.release_finalized(delta.file_id())?;
+            let locator = self.readers_mut()?.release_finalized(delta.file_id())?;
+            self.queue_finalization_feedback(locator)?;
+            let _ = self.rotation_waits.remove(&delta.file_id());
             let _ = self.record_numbers.remove(delta.file_id());
+            self.remove_drain_file(delta.file_id());
         }
         Ok(())
     }
@@ -1926,6 +2625,9 @@ fn persist_direct_progress(
     let mut updates = reserved_vec(1, "direct checkpoint progress update")?;
     updates.push(update);
     let _outcomes = store.commit_progress(updates)?;
+    if delta.finalize() {
+        store.sync()?;
+    }
     Ok(())
 }
 

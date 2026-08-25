@@ -1438,10 +1438,11 @@ Late-write capture after removal requires the logical reader's descriptor to sti
 resident. Because `max_tracked_files` may exceed `max_open_files`, a present reader can
 have rotated its descriptor out before the path disappears. Such a reader cannot
 portably reopen an unlinked POSIX inode or a Windows delete-pending file by path. The
-receiver reports this condition and applies the explicit rotation failure policy rather
-than claiming late-write capture. Removed resident handles are pinned until finalization
-and are never selected as descriptor-rotation victims; closed readers waiting for their
-slots cannot starve those retained handles.
+receiver durably quarantines that exact `file_id`, releases its runtime lease only after
+the quarantine is synced, reports the per-file failure, and continues unrelated files
+rather than claiming late-write capture. Removed resident handles are pinned until
+finalization and are never selected as descriptor-rotation victims; closed readers
+waiting for their slots cannot starve those retained handles.
 
 The rotated identity is finalized after EOF plus `rotate_wait` (default 5 seconds,
 matching Fluent Bit's `Rotate_Wait` precedent). Its unterminated trailing bytes remain
@@ -1456,7 +1457,8 @@ Incompatible Windows sharing permissions are reported as file-access or rotation
 ### Copy-truncate
 
 Copy-truncate detection is best-effort. The receiver detects observable truncation when
-a poll finds `current_size < committed_offset` or fingerprint-prefix revalidation fails.
+a poll finds `current_size` below either the durable committed offset or the current
+provisional read offset, or fingerprint-prefix revalidation fails.
 
 A truncate-and-regrow operation that completes between observations may be
 indistinguishable from a normal append. No portable filesystem mechanism guarantees
