@@ -85,6 +85,10 @@ impl DiscoveryHandle {
         self.message_rx.recv_timeout(timeout)
     }
 
+    pub(crate) fn try_recv(&self) -> Result<DiscoveryMessage, std::sync::mpsc::TryRecvError> {
+        self.message_rx.try_recv()
+    }
+
     pub(crate) fn request_shutdown(&self) {
         self.shutdown_requested.store(true, Ordering::Relaxed);
         let _ = self.command_tx.try_send(DiscoveryCommand::Shutdown);

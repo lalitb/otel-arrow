@@ -510,6 +510,47 @@ fn stale_or_backward_progress_fails_closed() {
     table.shutdown().unwrap();
 }
 
+/// Scenario: a two-file checkpoint transaction contains one valid reader
+/// frontier and one frontier beyond the bytes consumed in memory.
+/// Guarantees: preflighting every reader detects the invalid member before
+/// either durable frontier is changed.
+#[test]
+fn multi_file_progress_preflight_prevents_partial_application() {
+    let directory = tempdir().unwrap();
+    let first_path = directory.path().join("first.log");
+    let second_path = directory.path().join("second.log");
+    std::fs::write(&first_path, b"abc").unwrap();
+    std::fs::write(&second_path, b"xyz").unwrap();
+    let mut table = ReaderTable::new(settings(2, 2, 3)).unwrap();
+    table
+        .insert(candidate(&first_path), resolved(57, 0))
+        .unwrap();
+    table
+        .insert(candidate(&second_path), resolved(58, 0))
+        .unwrap();
+    let now = Instant::now();
+
+    let first = data(table.poll(now).unwrap());
+    let first_id = first.file_id();
+    table
+        .complete_turn(first, 3, TurnDisposition::Paused)
+        .unwrap();
+    let second = data(table.poll(now).unwrap());
+    let second_id = second.file_id();
+    table
+        .complete_turn(second, 3, TurnDisposition::Paused)
+        .unwrap();
+
+    table.preflight_committed_progress(first_id, 0, 2).unwrap();
+    assert!(matches!(
+        table.preflight_committed_progress(second_id, 0, 4),
+        Err(ReaderError::InvalidProgress { .. })
+    ));
+    assert_eq!(table.frontier(first_id).unwrap().committed_offset, 0);
+    assert_eq!(table.frontier(second_id).unwrap().committed_offset, 0);
+    table.shutdown().unwrap();
+}
+
 /// Scenario: the scheduler's monotonic service sequence has exhausted its
 /// representation before another read turn.
 /// Guarantees: recency ordering fails closed instead of wrapping and
@@ -1304,7 +1345,7 @@ fn provisional_frontier_rewind_preserves_descriptor_and_accepts_later_ack() {
     table
         .observe_committed_progress(file_id(45), 0, 3, resume)
         .unwrap();
-    table.make_ready(file_id(45)).unwrap();
+    table.resume_after_batch_commit().unwrap();
     let replay = data(table.poll(now).unwrap());
     assert_eq!(replay.committed_offset(), 3);
     assert_eq!(replay.framing_resume(), resume);
@@ -1396,5 +1437,160 @@ fn provisional_frontier_rewind_rejects_outstanding_turn_and_eviction() {
         Err(ReaderError::InvalidState { .. })
     ));
     table.defer_eviction(request).unwrap();
+    table.shutdown().unwrap();
+}
+
+/// Scenario: two bounded readers expose different durable and provisional
+/// frontiers after only one consumes source bytes.
+/// Guarantees: allocation-free frontier iteration reports every reader
+/// exactly once with exact epoch, offsets, presence, descriptor, and
+/// batch-pause state.
+#[test]
+fn frontier_iteration_reports_exact_bounded_reader_state() {
+    let directory = tempdir().unwrap();
+    let first_path = directory.path().join("first.log");
+    let second_path = directory.path().join("second.log");
+    std::fs::write(&first_path, b"abcd").unwrap();
+    std::fs::write(&second_path, b"wxyz").unwrap();
+    let mut table = ReaderTable::new(settings(2, 2, 4)).unwrap();
+    table
+        .insert(candidate(&first_path), resolved(49, 0))
+        .unwrap();
+    table
+        .insert(candidate(&second_path), resolved(50, 1))
+        .unwrap();
+
+    let turn = data(table.poll(Instant::now()).unwrap());
+    assert_eq!(turn.file_id(), file_id(49));
+    table
+        .complete_turn(turn, 3, TurnDisposition::Paused)
+        .unwrap();
+    table
+        .rewind_provisional_frontier(file_id(49), 0, 2)
+        .unwrap();
+
+    let mut frontiers: Vec<_> = table.frontiers().collect();
+    frontiers.sort_unstable_by_key(|frontier| frontier.file_id);
+    assert_eq!(
+        frontiers,
+        vec![
+            ReaderFrontier {
+                file_id: file_id(49),
+                file_epoch: 0,
+                committed_offset: 0,
+                read_offset: 2,
+                framing_resume: FramingResume::Clean,
+                present: true,
+                descriptor_resident: true,
+                paused_for_batch: true,
+            },
+            ReaderFrontier {
+                file_id: file_id(50),
+                file_epoch: 0,
+                committed_offset: 1,
+                read_offset: 1,
+                framing_resume: FramingResume::Clean,
+                present: true,
+                descriptor_resident: false,
+                paused_for_batch: false,
+            },
+        ]
+    );
+    table.shutdown().unwrap();
+}
+
+/// Scenario: a reader owns matched and resolved paths until a removed
+/// identity is genuinely released.
+/// Guarantees: record context borrows the exact reader paths without a
+/// secondary map, and a stale lookup fails after release frees the bounded
+/// reader slot.
+#[test]
+fn record_context_is_exact_and_stale_after_reader_release() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("context.log");
+    std::fs::write(&path, b"a").unwrap();
+    let observed = candidate(&path);
+    let expected_resolved = observed.resolved_path.clone();
+    let locator = observed.evidence.locator;
+    let mut table = ReaderTable::new(settings(1, 1, 1)).unwrap();
+    table.insert(observed, resolved(51, 0)).unwrap();
+
+    let context = table.record_context(file_id(51)).unwrap();
+    assert_eq!(context.matched_path, path);
+    assert_eq!(context.resolved_path, expected_resolved);
+    let identity = table.identity_context(locator).unwrap();
+    assert_eq!(identity.file_id, file_id(51));
+    assert_eq!(identity.file_epoch, 0);
+    assert_eq!(identity.committed_offset, 0);
+    assert_eq!(identity.durable_fingerprint, b"a");
+    assert_eq!(
+        table.mark_removed(locator).unwrap(),
+        RemovalDisposition::DescriptorAbsent
+    );
+    assert_eq!(table.release_finalized(file_id(51)).unwrap(), locator);
+    assert!(matches!(
+        table.record_context(file_id(51)),
+        Err(ReaderError::UnknownFile { .. })
+    ));
+
+    table.shutdown().unwrap();
+}
+
+/// Scenario: drain replay captures a source frontier three bytes into a
+/// six-byte file.
+/// Guarantees: the reader-owned bounded poll returns exactly the captured
+/// prefix and never admits bytes beyond that drain frontier.
+#[test]
+fn bounded_drain_poll_stops_at_captured_frontier() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("drain-limit.log");
+    std::fs::write(&path, b"abcdef").unwrap();
+    let mut table = ReaderTable::new(settings(1, 1, 6)).unwrap();
+    table.insert(candidate(&path), resolved(52, 0)).unwrap();
+    table.pause(file_id(52)).unwrap();
+
+    let turn = data(table.poll_until(Instant::now(), file_id(52), 3).unwrap());
+    assert_eq!(turn.source_offset(), 0);
+    assert_eq!(turn.bytes(), b"abc");
+    table
+        .complete_turn(turn, 3, TurnDisposition::Paused)
+        .unwrap();
+    assert_eq!(table.frontier(file_id(52)).unwrap().read_offset, 3);
+    table.shutdown().unwrap();
+}
+
+/// Scenario: a sealed reader population is Ack-committed while receiver drain
+/// still has bounded replay work.
+/// Guarantees: clearing batch-pause markers without resume leaves the reader
+/// paused until drain explicitly selects it.
+#[test]
+fn batch_commit_can_preserve_pause_for_drain_replay() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("drain-paused.log");
+    std::fs::write(&path, b"abc").unwrap();
+    let mut table = ReaderTable::new(settings(1, 1, 3)).unwrap();
+    table.insert(candidate(&path), resolved(53, 0)).unwrap();
+    let turn = data(table.poll(Instant::now()).unwrap());
+    table
+        .complete_turn(turn, 3, TurnDisposition::Paused)
+        .unwrap();
+    table
+        .rewind_provisional_frontier(file_id(53), 0, 1)
+        .unwrap();
+    table
+        .observe_committed_progress(file_id(53), 0, 1, FramingResume::Clean)
+        .unwrap();
+    table.finish_batch_commit(false).unwrap();
+
+    assert!(matches!(
+        table.poll(Instant::now()).unwrap(),
+        ReaderPoll::Idle { .. }
+    ));
+    let replay = data(table.poll_until(Instant::now(), file_id(53), 3).unwrap());
+    assert_eq!(replay.source_offset(), 1);
+    assert_eq!(replay.bytes(), b"bc");
+    table
+        .complete_turn(replay, 2, TurnDisposition::Paused)
+        .unwrap();
     table.shutdown().unwrap();
 }

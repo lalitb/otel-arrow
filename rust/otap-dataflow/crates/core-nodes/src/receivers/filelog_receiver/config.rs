@@ -31,10 +31,6 @@ use super::checkpoint::primitives::{
 use super::checkpoint::store::limits::StoreLimits;
 
 /// URN for the filelog receiver.
-///
-/// Not yet registered with a `ReceiverFactory` / `distributed_slice`;
-/// [`FILELOG_RECEIVER_URN`] is exported so the delivery-wiring stage can
-/// register the factory without renaming the component.
 pub const FILELOG_RECEIVER_URN: &str = "urn:otel:receiver:filelog";
 
 /// Namespace root matching Appendix B's layout:
@@ -661,9 +657,9 @@ impl Default for RotationConfig {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CheckpointConfig {
-    /// Explicit stable checkpoint identifier. Defaults to the receiver's
-    /// configured node identity when omitted (resolved outside this type;
-    /// see [`RuntimeConfig::from_config`]).
+    /// Explicit stable checkpoint identifier. When omitted, the factory
+    /// supplies a stable digest of pipeline-group, pipeline, node, and
+    /// receiver-instance names.
     #[serde(default)]
     pub id: Option<String>,
     /// Interval between durable syncs. Zero means sync every Ack
@@ -1109,8 +1105,8 @@ pub(crate) struct RuntimeConfig {
     /// superseded by the resolved [`Self::checkpoint_id`]).
     pub(crate) checkpoint: CheckpointConfig,
     /// Resolved stable checkpoint identifier: the configured
-    /// `checkpoint.id`, or the caller-supplied default (typically the
-    /// node's configured identity) when omitted.
+    /// `checkpoint.id`, or the caller-supplied placement-derived default when
+    /// omitted.
     pub(crate) checkpoint_id: String,
     /// Resolved checkpoint namespace directory:
     /// `${engine.state_dir}/filelog/<percent-encoded checkpoint_id>/`.
@@ -1165,10 +1161,8 @@ impl RuntimeConfig {
     /// Validates `config` and resolves it into a runtime-ready form.
     ///
     /// `default_checkpoint_id` is used only when the user config omits
-    /// `checkpoint.id`; a later factory stage passes the pipeline's
-    /// configured node identity here so `checkpoint.id` "defaults to the
-    /// configured node identity" exactly as Appendix C documents. An empty
-    /// `default_checkpoint_id` requires the user config to set
+    /// `checkpoint.id`; the factory supplies its stable placement-derived
+    /// digest. An empty default requires the user config to set
     /// `checkpoint.id` explicitly.
     pub(crate) fn from_config(
         config: Config,
@@ -1259,8 +1253,8 @@ impl TryFrom<Config> for RuntimeConfig {
 
     /// Validates `config` without an externally supplied node identity, so
     /// `checkpoint.id` must be set explicitly. Use
-    /// [`RuntimeConfig::from_config`] once factory wiring can supply the
-    /// pipeline node identity as the Appendix C default.
+    /// [`RuntimeConfig::from_config`] when factory wiring can supply the
+    /// placement-derived default.
     fn try_from(config: Config) -> Result<Self, Self::Error> {
         Self::from_config(config, "")
     }
@@ -4013,10 +4007,9 @@ mod tests {
     }
 
     /// Scenario: `checkpoint.id` is omitted, but `from_config` is given a
-    /// default identity (as a future factory would supply the pipeline
-    /// node identity).
-    /// Guarantees: the default is used to resolve `checkpoint_id`, matching
-    /// the documented "defaults to the configured node identity" behavior.
+    /// caller-supplied factory default.
+    /// Guarantees: the default is used verbatim to resolve `checkpoint_id`
+    /// and its namespace.
     #[test]
     fn missing_checkpoint_id_uses_supplied_default() {
         let cfg = minimal_config();

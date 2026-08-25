@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::collections::{TryReserveError, hash_map::Entry};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
@@ -401,6 +401,50 @@ pub(crate) struct ReaderStats {
     pub(crate) eof_observations: u64,
 }
 
+/// Allocation-free snapshot of one logical reader's source frontiers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReaderFrontier {
+    /// Durable identity represented by the logical reader.
+    pub(crate) file_id: FileId,
+    /// Current durable stream epoch.
+    pub(crate) file_epoch: u32,
+    /// Ack-gated source-byte frontier.
+    pub(crate) committed_offset: u64,
+    /// Current provisional source-byte frontier.
+    pub(crate) read_offset: u64,
+    /// Durable framing state paired with `committed_offset`.
+    pub(crate) framing_resume: FramingResume,
+    /// Whether discovery still observes the locator.
+    pub(crate) present: bool,
+    /// Whether the late-write-capable native descriptor is resident.
+    pub(crate) descriptor_resident: bool,
+    /// Whether batch sealing paused this reader for an exact later resume.
+    pub(crate) paused_for_batch: bool,
+}
+
+/// Reader-owned path context used to project one framed record.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReaderRecordContext<'a> {
+    /// Operator-facing path that matched discovery.
+    pub(crate) matched_path: &'a Path,
+    /// Canonical target path opened by discovery.
+    pub(crate) resolved_path: &'a Path,
+}
+
+/// Reader-owned evidence needed to preflight one discovery update before it
+/// can mutate durable identity state.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReaderIdentityContext<'a> {
+    /// Durable identity currently associated with the runtime locator.
+    pub(crate) file_id: FileId,
+    /// Current durable stream epoch.
+    pub(crate) file_epoch: u32,
+    /// Ack-gated source offset that updated evidence must still contain.
+    pub(crate) committed_offset: u64,
+    /// Durable fingerprint prefix that updated evidence must extend.
+    pub(crate) durable_fingerprint: &'a [u8],
+}
+
 #[derive(Debug)]
 struct ActivityCounters {
     read_turns: u64,
@@ -475,6 +519,7 @@ struct LogicalReader {
     ever_opened: bool,
     resident: Option<ResidentReader>,
     schedule: ScheduleState,
+    paused_for_batch: bool,
 }
 
 /// Single-thread-owned logical-reader table and fair scheduler.
@@ -493,6 +538,12 @@ pub(crate) struct ReaderTable {
     pending_eviction: Option<EvictionRequest>,
     read_buffer: Option<Vec<u8>>,
     counters: ActivityCounters,
+}
+
+#[derive(Clone, Copy)]
+struct ReadLimit {
+    file_id: FileId,
+    end_offset: u64,
 }
 
 impl ReaderTable {
@@ -627,6 +678,7 @@ impl ReaderTable {
             ever_opened: false,
             resident: None,
             schedule: ScheduleState::Ready,
+            paused_for_batch: false,
         };
         match self.readers.entry(file_id) {
             Entry::Vacant(slot) => {
@@ -744,6 +796,32 @@ impl ReaderTable {
 
     /// Promotes due EOF readers, then serves at most one ready reader.
     pub(crate) fn poll(&mut self, now: Instant) -> Result<ReaderPoll, ReaderError> {
+        self.poll_inner(now, None)
+    }
+
+    /// Serves only `file_id` and never reads beyond the captured drain
+    /// frontier `end_offset`.
+    pub(crate) fn poll_until(
+        &mut self,
+        now: Instant,
+        file_id: FileId,
+        end_offset: u64,
+    ) -> Result<ReaderPoll, ReaderError> {
+        self.make_ready(file_id)?;
+        self.poll_inner(
+            now,
+            Some(ReadLimit {
+                file_id,
+                end_offset,
+            }),
+        )
+    }
+
+    fn poll_inner(
+        &mut self,
+        now: Instant,
+        limit: Option<ReadLimit>,
+    ) -> Result<ReaderPoll, ReaderError> {
         // This is a lock-free poison/integrity check. The process-wide
         // registry mutex remains off the source-byte data path.
         self.lease_scope.ensure_healthy_fast()?;
@@ -755,7 +833,9 @@ impl ReaderTable {
                 reason: "a source turn is outstanding",
             });
         }
-        self.activate_due(now)?;
+        if limit.is_none() {
+            self.activate_due(now)?;
+        }
         self.promote_descriptor_waiter()?;
 
         let Some(file_id) = self.ready.pop_front() else {
@@ -763,6 +843,11 @@ impl ReaderTable {
                 next_probe: self.eof_deadlines.first().map(|(deadline, _)| *deadline),
             });
         };
+        if limit.is_some_and(|limit| limit.file_id != file_id) {
+            return Err(ReaderError::Inconsistent {
+                reason: "bounded drain poll selected a different reader",
+            });
+        }
         {
             let reader = self
                 .readers
@@ -842,7 +927,28 @@ impl ReaderTable {
         let mut buffer = self.read_buffer.take().ok_or(ReaderError::Inconsistent {
             reason: "source buffer disappeared before a read",
         })?;
-        buffer.resize(self.settings.max_read_bytes_per_turn, 0);
+        let turn_bytes = match limit {
+            Some(limit) => {
+                let remaining = limit.end_offset.checked_sub(source_offset).ok_or(
+                    ReaderError::InvalidProgress {
+                        file_id,
+                        reason: "drain frontier precedes the current read offset",
+                    },
+                )?;
+                if remaining == 0 {
+                    self.read_buffer = Some(buffer);
+                    return Err(ReaderError::InvalidProgress {
+                        file_id,
+                        reason: "drain poll requested a turn at its exact frontier",
+                    });
+                }
+                usize::try_from(remaining)
+                    .unwrap_or(usize::MAX)
+                    .min(self.settings.max_read_bytes_per_turn)
+            }
+            None => self.settings.max_read_bytes_per_turn,
+        };
+        buffer.resize(turn_bytes, 0);
         let _read_turns = increment(&mut self.counters.read_turns, "source read turns")?;
         let read_result = {
             let reader = self
@@ -1250,6 +1356,7 @@ impl ReaderTable {
         debug_assert_eq!(reader.committed_offset, committed_offset);
         reader.read_offset = target_offset;
         reader.schedule = ScheduleState::Paused;
+        reader.paused_for_batch = true;
         self.counters.source_bytes_rewound = updated_rewound;
         Ok(())
     }
@@ -1263,9 +1370,26 @@ impl ReaderTable {
         committed_offset: u64,
         framing_resume: FramingResume,
     ) -> Result<(), ReaderError> {
+        self.preflight_committed_progress(file_id, file_epoch, committed_offset)?;
+        self.apply_preflighted_committed_progress(
+            file_id,
+            file_epoch,
+            committed_offset,
+            framing_resume,
+        );
+        Ok(())
+    }
+
+    /// Validates an Ack-gated reader transition without changing live state.
+    pub(crate) fn preflight_committed_progress(
+        &self,
+        file_id: FileId,
+        file_epoch: u32,
+        committed_offset: u64,
+    ) -> Result<(), ReaderError> {
         let reader = self
             .readers
-            .get_mut(&file_id)
+            .get(&file_id)
             .ok_or(ReaderError::UnknownFile { file_id })?;
         if file_epoch != reader.file_epoch {
             return Err(ReaderError::InvalidProgress {
@@ -1285,6 +1409,25 @@ impl ReaderTable {
                 reason: "committed offset exceeds bytes consumed in memory",
             });
         }
+        Ok(())
+    }
+
+    /// Applies a reader transition already validated against unchanged state.
+    pub(crate) fn apply_preflighted_committed_progress(
+        &mut self,
+        file_id: FileId,
+        file_epoch: u32,
+        committed_offset: u64,
+        framing_resume: FramingResume,
+    ) {
+        debug_assert!(
+            self.preflight_committed_progress(file_id, file_epoch, committed_offset)
+                .is_ok()
+        );
+        let reader = self
+            .readers
+            .get_mut(&file_id)
+            .expect("preflighted reader must remain present");
         reader.committed_offset = committed_offset;
         reader.framing_resume = framing_resume;
         if self
@@ -1293,7 +1436,47 @@ impl ReaderTable {
         {
             self.pending_eviction = None;
         }
+    }
+
+    /// Resumes exactly the readers paused by the most recent batch seal.
+    ///
+    /// Readers admitted while a batch was retained were never marked and
+    /// remain in their existing scheduling state.
+    pub(crate) fn resume_after_batch_commit(&mut self) -> Result<(), ReaderError> {
+        self.finish_batch_commit(true)
+    }
+
+    /// Clears the exact batch-pause population, optionally making it ready.
+    pub(crate) fn finish_batch_commit(&mut self, resume: bool) -> Result<(), ReaderError> {
+        self.preflight_batch_commit()?;
+        self.finish_preflighted_batch_commit(resume);
         Ok(())
+    }
+
+    /// Validates the batch-pause population without changing scheduling state.
+    pub(crate) fn preflight_batch_commit(&self) -> Result<(), ReaderError> {
+        for reader in self.readers.values() {
+            if reader.paused_for_batch && !matches!(reader.schedule, ScheduleState::Paused) {
+                return Err(ReaderError::Inconsistent {
+                    reason: "batch-paused reader is not in the paused schedule state",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Clears a batch-pause population already validated against unchanged state.
+    pub(crate) fn finish_preflighted_batch_commit(&mut self, resume: bool) {
+        debug_assert!(self.preflight_batch_commit().is_ok());
+        for reader in self.readers.values_mut() {
+            if reader.paused_for_batch {
+                reader.paused_for_batch = false;
+                if resume {
+                    reader.schedule = ScheduleState::Ready;
+                    self.ready.push_back(reader.file_id);
+                }
+            }
+        }
     }
 
     /// Confirms that caller-owned uncommitted state for the selected victim
@@ -1436,6 +1619,82 @@ impl ReaderTable {
             source_bytes_rewound: self.counters.source_bytes_rewound,
             eof_observations: self.counters.eof_observations,
         }
+    }
+
+    /// Iterates every logical reader without allocating or cloning path
+    /// state.
+    pub(crate) fn frontiers(&self) -> impl Iterator<Item = ReaderFrontier> + '_ {
+        self.readers.values().map(|reader| ReaderFrontier {
+            file_id: reader.file_id,
+            file_epoch: reader.file_epoch,
+            committed_offset: reader.committed_offset,
+            read_offset: reader.read_offset,
+            framing_resume: reader.framing_resume,
+            present: reader.present,
+            descriptor_resident: reader.resident.is_some(),
+            paused_for_batch: reader.paused_for_batch,
+        })
+    }
+
+    /// Returns one logical reader's current frontier without allocation.
+    pub(crate) fn frontier(&self, file_id: FileId) -> Result<ReaderFrontier, ReaderError> {
+        let reader = self
+            .readers
+            .get(&file_id)
+            .ok_or(ReaderError::UnknownFile { file_id })?;
+        Ok(ReaderFrontier {
+            file_id: reader.file_id,
+            file_epoch: reader.file_epoch,
+            committed_offset: reader.committed_offset,
+            read_offset: reader.read_offset,
+            framing_resume: reader.framing_resume,
+            present: reader.present,
+            descriptor_resident: reader.resident.is_some(),
+            paused_for_batch: reader.paused_for_batch,
+        })
+    }
+
+    /// Borrows the matched and resolved paths owned by one logical reader.
+    pub(crate) fn record_context(
+        &self,
+        file_id: FileId,
+    ) -> Result<ReaderRecordContext<'_>, ReaderError> {
+        let reader = self
+            .readers
+            .get(&file_id)
+            .ok_or(ReaderError::UnknownFile { file_id })?;
+        Ok(ReaderRecordContext {
+            matched_path: &reader.matched_path,
+            resolved_path: &reader.resolved_path,
+        })
+    }
+
+    /// Resolves a currently tracked runtime locator to its durable identity.
+    pub(crate) fn file_id_for_locator(&self, locator: Locator) -> Result<FileId, ReaderError> {
+        self.by_locator
+            .get(&locator)
+            .copied()
+            .ok_or(ReaderError::UnknownLocator { locator })
+    }
+
+    /// Borrows the durable identity evidence associated with a live locator.
+    pub(crate) fn identity_context(
+        &self,
+        locator: Locator,
+    ) -> Result<ReaderIdentityContext<'_>, ReaderError> {
+        let file_id = self.file_id_for_locator(locator)?;
+        let reader = self
+            .readers
+            .get(&file_id)
+            .ok_or(ReaderError::Inconsistent {
+                reason: "locator index points to a missing reader",
+            })?;
+        Ok(ReaderIdentityContext {
+            file_id,
+            file_epoch: reader.file_epoch,
+            committed_offset: reader.committed_offset,
+            durable_fingerprint: &reader.durable_fingerprint,
+        })
     }
 
     /// Releases all runtime leases and unregisters the receiver scope.

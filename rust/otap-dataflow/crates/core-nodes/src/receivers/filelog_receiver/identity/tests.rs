@@ -6,8 +6,9 @@ use std::collections::HashSet;
 use tempfile::{TempDir, tempdir};
 
 use super::matcher::{
-    CandidateInventory, FileIdSource, IdentityMatch, IdentitySettings, ResolvedIdentity,
-    resolve_and_persist as resolve_with_inventory,
+    CandidateInventory, FileIdSource, IdentityMatch, IdentityResolution, IdentitySettings,
+    ResolvedIdentity, resolve_and_persist as resolve_with_inventory,
+    resolve_and_persist_with_admission,
     resolve_and_persist_with_source as resolve_with_inventory_and_source,
 };
 use super::*;
@@ -49,6 +50,7 @@ fn settings() -> IdentitySettings {
         framing_profile_digest: DIGEST,
         max_candidates: 32,
         max_inventory_candidates: 64,
+        max_tracked_files: 32,
     }
 }
 
@@ -62,6 +64,31 @@ fn test_store(max_tracked_files: u32) -> (TempDir, CheckpointStore, StoreOptions
     options.fingerprint_bytes = 16;
     let store = CheckpointStore::open(options.clone()).unwrap();
     (directory, store, options)
+}
+
+/// Scenario: one reconciliation contains two genuinely new candidates while
+/// durable tracked-file capacity has one remaining slot.
+/// Guarantees: candidate order selects exactly one durable registration, the
+/// other outcome is Deferred, and no over-capacity operation reaches the WAL.
+#[test]
+fn admission_resolution_defers_new_identity_at_durable_capacity() {
+    let (_directory, mut store, _options) = test_store(1);
+    let candidates = vec![
+        evidence(locator(1), 4, b"aaaa", b"/a.log"),
+        evidence(locator(2), 4, b"bbbb", b"/b.log"),
+    ];
+    let inventory =
+        CandidateInventory::from_complete_reconciliation(&candidates, &HashSet::new(), 4);
+    let mut settings = settings();
+    settings.max_tracked_files = 1;
+
+    let resolutions =
+        resolve_and_persist_with_admission(&mut store, &candidates, &inventory, &settings, 10)
+            .unwrap();
+    assert!(matches!(resolutions[0], IdentityResolution::Resolved(_)));
+    assert_eq!(resolutions[1], IdentityResolution::Deferred);
+    assert_eq!(store.table().len(), 1);
+    assert_eq!(store.stats().wal_transactions, 1);
 }
 
 fn registration(

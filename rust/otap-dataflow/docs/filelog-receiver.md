@@ -1256,8 +1256,10 @@ offset/resume frontier matches exactly. If the file has no record in the open ba
 the worker returns a direct same-frontier finalizing delta for Stage 11 to persist
 without synthesizing an empty OTAP batch.
 
-The async half subscribes the batch to `ACKS | NACKS` with `(batch_id, attempt)` in
-`CallData`. Phase 1 enforces `max_in_flight_batches = 1`, the proven Ack-gating pattern.
+The async half subscribes the batch to `ACKS | NACKS` with exactly two nonzero
+`CallData` slots: `(batch_id, attempt)`. A completion with any other slot count, a zero
+value, a stale batch ID, or a stale attempt cannot advance progress. Phase 1 enforces
+`max_in_flight_batches = 1`, the proven Ack-gating pattern.
 
 - **Retention:** the worker retains a shallow clone of the in-flight batch. This is
   bounded by the declared in-flight memory budget; cloning does not duplicate Arrow
@@ -1296,9 +1298,13 @@ subscription before emission. `Interests::RETURN_DATA` is intentionally not requ
 
 ### Checkpoint storage
 
-Each receiver has an explicit stable `checkpoint.id`. It defaults to the configured
-node identity but can be pinned across node renames. The store uses a compact snapshot
-plus an append-only progress log:
+Each receiver has an explicit stable `checkpoint.id`. It defaults to a
+domain-separated SHA-256 digest of the configured pipeline-group ID, pipeline ID, node
+name, and receiver name, encoded as `auto-` followed by 64 lowercase hexadecimal
+characters. The default excludes the pipeline core and deployment generation, so a
+single-instance restart keeps the same namespace when ambient CPU availability
+changes. An explicit ID can be pinned across node or pipeline renames. The store uses a
+compact snapshot plus an append-only progress log:
 
 - register a file durably before reading it;
 - append only changed offsets after Ack;

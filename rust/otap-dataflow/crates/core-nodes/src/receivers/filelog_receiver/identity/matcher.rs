@@ -30,6 +30,7 @@ pub(crate) struct IdentitySettings {
     pub(crate) framing_profile_digest: [u8; 32],
     pub(crate) max_candidates: usize,
     pub(crate) max_inventory_candidates: usize,
+    pub(crate) max_tracked_files: usize,
 }
 
 /// Resolver-wide view of all live and pending candidates participating in
@@ -122,6 +123,7 @@ impl IdentitySettings {
                     + u64::from(config.limits.max_open_files),
             )
             .expect("validated candidate inventory population fits usize"),
+            max_tracked_files: config.limits.max_tracked_files as usize,
         }
     }
 }
@@ -149,6 +151,17 @@ pub(crate) struct ResolvedIdentity {
     pub(crate) framing_resume: FramingResume,
     pub(crate) lifecycle_state: LifecycleState,
     pub(crate) matched_by: IdentityMatch,
+}
+
+/// Capacity-aware result for one candidate in reconciliation order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IdentityResolution {
+    /// Durable identity operations succeeded and the candidate can be
+    /// associated with runtime state.
+    Resolved(ResolvedIdentity),
+    /// A genuinely new identity could not consume durable tracked capacity.
+    /// No operation for this candidate was persisted.
+    Deferred,
 }
 
 #[derive(Debug)]
@@ -188,6 +201,26 @@ pub(crate) fn resolve_and_persist(
     )
 }
 
+/// Resolves one complete reconciliation while deferring only new identities
+/// that cannot consume durable tracked-file capacity.
+pub(crate) fn resolve_and_persist_with_admission(
+    store: &mut CheckpointStore,
+    candidates: &[CandidateEvidence],
+    inventory: &CandidateInventory,
+    settings: &IdentitySettings,
+    now_unix_nano: u64,
+) -> Result<Vec<IdentityResolution>, IdentityError> {
+    resolve_with_source_mode(
+        store,
+        candidates,
+        inventory,
+        settings,
+        now_unix_nano,
+        &mut RandomFileIdSource,
+        true,
+    )
+}
+
 pub(super) fn resolve_and_persist_with_source(
     store: &mut CheckpointStore,
     candidates: &[CandidateEvidence],
@@ -196,6 +229,36 @@ pub(super) fn resolve_and_persist_with_source(
     now_unix_nano: u64,
     file_ids: &mut impl FileIdSource,
 ) -> Result<Vec<ResolvedIdentity>, IdentityError> {
+    let resolutions = resolve_with_source_mode(
+        store,
+        candidates,
+        inventory,
+        settings,
+        now_unix_nano,
+        file_ids,
+        false,
+    )?;
+    resolutions
+        .into_iter()
+        .map(|resolution| match resolution {
+            IdentityResolution::Resolved(resolved) => Ok(resolved),
+            IdentityResolution::Deferred => Err(IdentityError::InvalidEvidence {
+                reason: "non-admission identity resolution unexpectedly deferred a candidate",
+            }),
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_with_source_mode(
+    store: &mut CheckpointStore,
+    candidates: &[CandidateEvidence],
+    inventory: &CandidateInventory,
+    settings: &IdentitySettings,
+    now_unix_nano: u64,
+    file_ids: &mut impl FileIdSource,
+    defer_new_at_capacity: bool,
+) -> Result<Vec<IdentityResolution>, IdentityError> {
     validate_resumption_profiles(store, settings)?;
     validate_candidates(candidates, inventory, settings)?;
 
@@ -353,18 +416,40 @@ pub(super) fn resolve_and_persist_with_source(
         .map(|plan| plan.expect("every validated candidate receives an identity plan"))
         .collect();
     let mut operation_groups = Vec::new();
-    let mut resolved = Vec::with_capacity(plans.len());
+    let mut resolutions = Vec::with_capacity(plans.len());
+    let mut remaining_capacity = settings
+        .max_tracked_files
+        .checked_sub(store.table().len())
+        .ok_or(IdentityError::InvalidEvidence {
+            reason: "checkpoint table exceeds configured tracked-file capacity",
+        })?;
     for plan in plans {
+        let creates_identity = matches!(
+            plan.resolved.matched_by,
+            IdentityMatch::NewDiscovery | IdentityMatch::RecoveryMismatch
+        );
+        if defer_new_at_capacity && creates_identity && remaining_capacity == 0 {
+            resolutions.push(IdentityResolution::Deferred);
+            continue;
+        }
+        if creates_identity {
+            remaining_capacity =
+                remaining_capacity
+                    .checked_sub(1)
+                    .ok_or(IdentityError::InvalidEvidence {
+                        reason: "identity admission capacity accounting underflowed",
+                    })?;
+        }
         if !plan.operations.is_empty() {
             operation_groups.push(plan.operations);
         }
-        resolved.push(plan.resolved);
+        resolutions.push(IdentityResolution::Resolved(plan.resolved));
     }
     if !operation_groups.is_empty() {
         let _outcomes = store.append_atomic_groups(operation_groups)?;
     }
 
-    Ok(resolved)
+    Ok(resolutions)
 }
 
 fn validate_candidates(
