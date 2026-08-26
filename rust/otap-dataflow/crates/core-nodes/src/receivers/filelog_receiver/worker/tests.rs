@@ -6,11 +6,22 @@ use std::sync::mpsc::sync_channel;
 use std::time::Duration;
 use std::{fs::OpenOptions, io::Write};
 
-use otap_df_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
+use otap_df_pdata::{
+    otap::OtapArrowRecords,
+    otlp::{ProtoBuffer, ProtoBytesEncoder, logs::LogsProtoBytesEncoder},
+    proto::opentelemetry::{
+        arrow::v1::ArrowPayloadType,
+        collector::logs::v1::ExportLogsServiceRequest,
+        common::v1::{KeyValue, any_value::Value},
+        logs::v1::LogRecord,
+    },
+};
+use prost::Message;
 use serde_json::json;
 use tempfile::tempdir;
 
 use super::*;
+use crate::receivers::filelog_receiver::MaxLogSizeBehavior;
 use crate::receivers::filelog_receiver::batching::{FinalizationOutcome, ProgressFrontier};
 use crate::receivers::filelog_receiver::checkpoint::primitives::{
     FRAMING_PROFILE_VERSION, FramingResume, Locator, QUARANTINE_REASON_DECODE,
@@ -18,7 +29,10 @@ use crate::receivers::filelog_receiver::checkpoint::primitives::{
 };
 use crate::receivers::filelog_receiver::checkpoint::store::fault::FaultPoint;
 use crate::receivers::filelog_receiver::checkpoint::wal::{RegisterFile, UpdateProgress};
-use crate::receivers::filelog_receiver::config::{Config, OnDecodeError};
+use crate::receivers::filelog_receiver::config::{
+    ATTR_KEY_FLUSH_REASON, ATTR_KEY_FRAGMENT_ID, ATTR_KEY_FRAGMENT_INDEX, ATTR_KEY_FRAGMENT_LAST,
+    Config, OnDecodeError,
+};
 use crate::receivers::filelog_receiver::discovery::DiscoveredCandidate;
 use crate::receivers::filelog_receiver::discovery::scanner::DiscoveryPlan;
 use crate::receivers::filelog_receiver::discovery::source::spawn_discovery;
@@ -29,6 +43,15 @@ fn runtime_config(
     include: &str,
     namespace_dir: &std::path::Path,
     max_records: u32,
+) -> RuntimeConfig {
+    runtime_config_with(include, namespace_dir, max_records, |_| {})
+}
+
+fn runtime_config_with(
+    include: &str,
+    namespace_dir: &std::path::Path,
+    max_records: u32,
+    configure: impl FnOnce(&mut Config),
 ) -> RuntimeConfig {
     let mut config: Config = serde_json::from_value(json!({
         "include": [include],
@@ -43,9 +66,46 @@ fn runtime_config(
     config.limits.max_read_bytes_per_turn = 64;
     config.batch.max_records = max_records;
     config.batch.max_flush_period = Duration::from_secs(30);
+    configure(&mut config);
     let mut runtime = RuntimeConfig::from_config(config, "").unwrap();
     runtime.checkpoint_namespace_dir = namespace_dir.to_path_buf();
     runtime
+}
+
+fn decode_worker_records(records: &mut OtapArrowRecords) -> ExportLogsServiceRequest {
+    let mut encoder = LogsProtoBytesEncoder::new();
+    let mut buffer = ProtoBuffer::default();
+    encoder
+        .encode(records, &mut buffer)
+        .expect("worker OTAP logs encode to OTLP");
+    ExportLogsServiceRequest::decode(buffer.as_ref()).expect("worker OTLP logs decode")
+}
+
+fn only_log(request: &ExportLogsServiceRequest) -> &LogRecord {
+    let logs: Vec<&LogRecord> = request
+        .resource_logs
+        .iter()
+        .flat_map(|resource| &resource.scope_logs)
+        .flat_map(|scope| &scope.log_records)
+        .collect();
+    assert_eq!(logs.len(), 1);
+    logs[0]
+}
+
+fn log_body_bytes(log: &LogRecord) -> &[u8] {
+    match log.body.as_ref().and_then(|body| body.value.as_ref()) {
+        Some(Value::StringValue(value)) => value.as_bytes(),
+        Some(Value::BytesValue(value)) => value,
+        other => panic!("expected one string or byte log body, got {other:?}"),
+    }
+}
+
+fn log_attr<'a>(log: &'a LogRecord, key: &str) -> Option<&'a Value> {
+    log.attributes
+        .iter()
+        .find(|KeyValue { key: found, .. }| found == key)
+        .and_then(|attribute| attribute.value.as_ref())
+        .and_then(|value| value.value.as_ref())
 }
 
 /// Scenario: framed outputs and lifecycle transitions cover decode policies,
@@ -384,6 +444,180 @@ async fn discovery_to_ack_reopen_uses_same_retained_arrow_batch() {
             .is_err()
     );
     stop_worker(reopened, &mut events).await.unwrap();
+}
+
+/// Scenario: a split record's first fragment is Acked, the worker stops, and
+/// a new worker resumes the same unchanged source.
+/// Guarantees: the Ack persists continuation offset and index atomically, so
+/// restart emits the next fragment with the same ID and no duplicate bytes.
+#[tokio::test]
+async fn acked_split_fragment_resumes_across_worker_restart() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("fragment.log");
+    std::fs::write(&source, b"abcdefgh\n").unwrap();
+    let namespace = directory.path().join("checkpoint");
+    let runtime = runtime_config_with(source.to_str().unwrap(), &namespace, 1, |config| {
+        config.framing.max_line_bytes = 64;
+        config.framing.max_record_bytes = 4;
+        config.framing.max_log_size_behavior = MaxLogSizeBehavior::Split;
+    });
+
+    let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+    let worker = spawn_worker(runtime.clone(), event_tx).unwrap();
+    let mut first = receive_batch(&mut events).await;
+    let first_request = decode_worker_records(&mut first.records);
+    let first_log = only_log(&first_request);
+    assert_eq!(log_body_bytes(first_log), b"abcd");
+    let fragment_id = match log_attr(first_log, ATTR_KEY_FRAGMENT_ID) {
+        Some(Value::StringValue(value)) => value.clone(),
+        other => panic!("expected fragment ID, got {other:?}"),
+    };
+    assert_eq!(
+        log_attr(first_log, ATTR_KEY_FRAGMENT_INDEX),
+        Some(&Value::IntValue(0))
+    );
+    assert_eq!(
+        log_attr(first_log, ATTR_KEY_FRAGMENT_LAST),
+        Some(&Value::BoolValue(false))
+    );
+    worker
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: first.batch_id,
+            attempt: first.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    receive_commit(&mut events).await.3.unwrap();
+    stop_worker(worker, &mut events).await.unwrap();
+
+    let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
+    let checkpoint = store.table().iter().next().unwrap().1;
+    assert_eq!(checkpoint.committed_offset, 4);
+    assert_eq!(
+        checkpoint.framing_resume,
+        FramingResume::Continuation {
+            record_start_offset: 0,
+            next_fragment_index: 1,
+        }
+    );
+    drop(store);
+
+    let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+    let worker = spawn_worker(runtime.clone(), event_tx).unwrap();
+    let mut second = receive_batch(&mut events).await;
+    let second_request = decode_worker_records(&mut second.records);
+    let second_log = only_log(&second_request);
+    assert_eq!(log_body_bytes(second_log), b"efgh");
+    assert_eq!(
+        log_attr(second_log, ATTR_KEY_FRAGMENT_ID),
+        Some(&Value::StringValue(fragment_id))
+    );
+    assert_eq!(
+        log_attr(second_log, ATTR_KEY_FRAGMENT_INDEX),
+        Some(&Value::IntValue(1))
+    );
+    assert_eq!(
+        log_attr(second_log, ATTR_KEY_FRAGMENT_LAST),
+        Some(&Value::BoolValue(true))
+    );
+    worker
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: second.batch_id,
+            attempt: second.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    receive_commit(&mut events).await.3.unwrap();
+    stop_worker(worker, &mut events).await.unwrap();
+
+    let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
+    let checkpoint = store.table().iter().next().unwrap().1;
+    assert_eq!(checkpoint.committed_offset, 9);
+    assert_eq!(checkpoint.framing_resume, FramingResume::Clean);
+}
+
+/// Scenario: an unterminated record is timeout-flushed and Acked, then a new
+/// worker starts after a complete record is appended.
+/// Guarantees: restart begins at the Acked partial frontier and emits only
+/// newly appended bytes, without duplicating or skipping source content.
+#[tokio::test]
+async fn acked_partial_flush_resumes_cleanly_across_worker_restart() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("partial.log");
+    std::fs::write(&source, b"partial").unwrap();
+    let namespace = directory.path().join("checkpoint");
+    let runtime = runtime_config_with(source.to_str().unwrap(), &namespace, 1, |config| {
+        config.framing.force_flush_period = Duration::from_millis(10);
+    });
+
+    let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+    let worker = spawn_worker(runtime.clone(), event_tx).unwrap();
+    let mut partial = receive_batch(&mut events).await;
+    let partial_request = decode_worker_records(&mut partial.records);
+    let partial_log = only_log(&partial_request);
+    assert_eq!(log_body_bytes(partial_log), b"partial");
+    assert_eq!(
+        log_attr(partial_log, ATTR_KEY_FLUSH_REASON),
+        Some(&Value::StringValue("timeout".to_owned()))
+    );
+    worker
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: partial.batch_id,
+            attempt: partial.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    receive_commit(&mut events).await.3.unwrap();
+    stop_worker(worker, &mut events).await.unwrap();
+
+    {
+        let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
+        let checkpoint = store.table().iter().next().unwrap().1;
+        assert_eq!(checkpoint.committed_offset, 7);
+        assert_eq!(checkpoint.framing_resume, FramingResume::Clean);
+    }
+
+    OpenOptions::new()
+        .append(true)
+        .open(&source)
+        .unwrap()
+        .write_all(b"next\n")
+        .unwrap();
+    let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+    let worker = spawn_worker(runtime.clone(), event_tx).unwrap();
+    let mut next = receive_batch(&mut events).await;
+    let next_request = decode_worker_records(&mut next.records);
+    let next_log = only_log(&next_request);
+    assert_eq!(log_body_bytes(next_log), b"next");
+    assert!(log_attr(next_log, ATTR_KEY_FLUSH_REASON).is_none());
+    for key in [
+        ATTR_KEY_FRAGMENT_ID,
+        ATTR_KEY_FRAGMENT_INDEX,
+        ATTR_KEY_FRAGMENT_LAST,
+    ] {
+        assert!(
+            log_attr(next_log, key).is_none(),
+            "clean restart unexpectedly emitted fragment attribute {key}"
+        );
+    }
+    worker
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: next.batch_id,
+            attempt: next.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    receive_commit(&mut events).await.3.unwrap();
+    stop_worker(worker, &mut events).await.unwrap();
+
+    let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
+    let checkpoint = store.table().iter().next().unwrap().1;
+    assert_eq!(checkpoint.committed_offset, 12);
+    assert_eq!(checkpoint.framing_resume, FramingResume::Clean);
 }
 
 /// Scenario: two readable files share a receiver whose first record exactly

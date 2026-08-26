@@ -1204,6 +1204,85 @@ fn progress_sync_follows_the_configured_interval() {
     assert_eq!(committed_offset(&reopened, 1), 128);
 }
 
+/// Scenario: an Ack appends offset and continuation progress under a deferred
+/// sync interval, and a crash leaves the prior WAL, a torn append prefix, or
+/// the complete append.
+/// Guarantees: recovery yields the complete old or Acked framing tuple, never
+/// a partial transaction, mixed offset/resume state, or progress beyond the Ack.
+#[test]
+fn deferred_ack_crash_images_recover_old_or_complete_progress() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    let mut store = CheckpointStore::open(StoreOptions {
+        sync_interval: NEVER_ELAPSES,
+        ..options(&path)
+    })
+    .expect("namespace opens");
+    let _registered = store
+        .register_files(vec![registration(1)])
+        .expect("registers");
+    let wal_path = path.join(wal_file_name(store.generation()));
+    let prior_durable_image = fs::read(&wal_path).expect("prior WAL reads");
+    let outcomes = store
+        .commit_progress(vec![UpdateProgress {
+            new_framing_resume: FramingResume::Continuation {
+                record_start_offset: 96,
+                next_fragment_index: 2,
+            },
+            ..progress(1, 0, 128)
+        }])
+        .expect("Ack progress appends");
+    assert!(!outcomes[0].synced);
+    let complete_append_image = fs::read(&wal_path).expect("appended WAL reads");
+    drop(store);
+
+    write_bytes(&wal_path, &prior_durable_image);
+    let prior = open(&path);
+    let prior_record = prior.table().get(&file_id(1)).expect("record is tracked");
+    assert_eq!(
+        (prior_record.committed_offset, prior_record.framing_resume),
+        (0, FramingResume::Clean)
+    );
+    drop(prior);
+
+    let torn_len =
+        prior_durable_image.len() + (complete_append_image.len() - prior_durable_image.len()) / 2;
+    assert!(torn_len > prior_durable_image.len());
+    assert!(torn_len < complete_append_image.len());
+    write_bytes(&wal_path, &complete_append_image[..torn_len]);
+    let torn = open(&path);
+    let torn_record = torn.table().get(&file_id(1)).expect("record is tracked");
+    assert_eq!(
+        (torn_record.committed_offset, torn_record.framing_resume),
+        (0, FramingResume::Clean)
+    );
+    assert_eq!(
+        torn.recovery().torn_tail_bytes,
+        torn_len - prior_durable_image.len()
+    );
+    drop(torn);
+
+    write_bytes(&wal_path, &complete_append_image);
+    let complete = open(&path);
+    let complete_record = complete
+        .table()
+        .get(&file_id(1))
+        .expect("record is tracked");
+    assert_eq!(
+        (
+            complete_record.committed_offset,
+            complete_record.framing_resume
+        ),
+        (
+            128,
+            FramingResume::Continuation {
+                record_start_offset: 96,
+                next_fragment_index: 2,
+            }
+        )
+    );
+}
+
 /// Scenario: registration, truncate reset, quarantine, quarantine reset, and
 /// removal issued under a sync interval that cannot elapse during the test.
 /// Guarantees: the operations whose effect must be durable before it is
