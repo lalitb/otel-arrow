@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, TryReserveError};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, sync_channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, SystemTimeError, UNIX_EPOCH};
@@ -33,7 +34,9 @@ use super::checkpoint::store::{CheckpointStore, StoreOptions, StoreStats};
 use super::checkpoint::wal::{Operation, QuarantineFile, ResetAfterTruncate, UpdateFingerprint};
 use super::config::{OnTruncate, RuntimeConfig};
 use super::discovery::scanner::DiscoveryPlan;
-use super::discovery::source::{DiscoveryHandle, FeedbackSendError, spawn_discovery};
+use super::discovery::source::{
+    DiscoveryHandle, FeedbackSendError, spawn_discovery_with_shutdown_signal,
+};
 use super::discovery::{
     CandidateEvent, DiscoveryError, DiscoveryFeedback, DiscoveryMessage, ReconciliationBatch,
 };
@@ -41,7 +44,8 @@ use super::framing::{DecodeError, DecodeOutcome, FlushReason, FramedRecord, Fram
 use super::identity::CandidateEvidence;
 use super::identity::IdentityError;
 use super::identity::matcher::{
-    IdentityMatch, IdentityResolution, IdentitySettings, resolve_and_persist_with_admission,
+    IdentityMatch, IdentityResolution, IdentitySettings,
+    resolve_and_persist_with_admission_cancellable,
 };
 use super::lease::LeaseError;
 use super::reader::{
@@ -109,11 +113,14 @@ pub(super) struct WorkerHandle {
     pub(super) command_tx: SyncSender<WorkerCommand>,
     pub(super) join: JoinHandle<Result<(), WorkerError>>,
     pub(super) telemetry: Arc<WorkerTelemetryBridge>,
+    pub(super) shutdown_requested: Arc<AtomicBool>,
 }
 
 /// Fail-closed worker setup, source, durability, and protocol errors.
 #[derive(Debug, Error)]
 pub(super) enum WorkerError {
+    #[error("filelog worker startup was cancelled")]
+    StartupCancelled,
     #[error("could not spawn filelog read/checkpoint thread: {source}")]
     ThreadSpawn {
         #[source]
@@ -326,15 +333,26 @@ pub(super) fn spawn_worker(
     let (command_tx, command_rx) = sync_channel(WORKER_COMMAND_CHANNEL_CAPACITY);
     let telemetry = Arc::new(WorkerTelemetryBridge::default());
     let worker_telemetry = Arc::clone(&telemetry);
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let worker_shutdown_requested = Arc::clone(&shutdown_requested);
     let thread_name = "otap-filelog-worker".to_owned();
     let join = std::thread::Builder::new()
         .name(thread_name)
-        .spawn(move || worker_thread(config, event_tx, command_rx, worker_telemetry))
+        .spawn(move || {
+            worker_thread(
+                config,
+                event_tx,
+                command_rx,
+                worker_telemetry,
+                worker_shutdown_requested,
+            )
+        })
         .map_err(|source| WorkerError::ThreadSpawn { source })?;
     Ok(WorkerHandle {
         command_tx,
         join,
         telemetry,
+        shutdown_requested,
     })
 }
 
@@ -348,6 +366,8 @@ fn spawn_worker_with_store_fault(
     let (command_tx, command_rx) = sync_channel(WORKER_COMMAND_CHANNEL_CAPACITY);
     let telemetry = Arc::new(WorkerTelemetryBridge::default());
     let worker_telemetry = Arc::clone(&telemetry);
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let worker_shutdown_requested = Arc::clone(&shutdown_requested);
     let join = std::thread::Builder::new()
         .name("otap-filelog-fault-test".to_owned())
         .spawn(move || {
@@ -356,6 +376,7 @@ fn spawn_worker_with_store_fault(
                 point,
                 matching_occurrences_to_skip,
                 worker_telemetry,
+                worker_shutdown_requested,
             );
             run_worker_thread(worker, event_tx, command_rx)
         })
@@ -364,6 +385,7 @@ fn spawn_worker_with_store_fault(
         command_tx,
         join,
         telemetry,
+        shutdown_requested,
     })
 }
 
@@ -372,8 +394,10 @@ fn worker_thread(
     event_tx: tokio_mpsc::Sender<WorkerEvent>,
     command_rx: Receiver<WorkerCommand>,
     telemetry: Arc<WorkerTelemetryBridge>,
+    shutdown_requested: Arc<AtomicBool>,
 ) -> Result<(), WorkerError> {
-    let worker = WorkerRuntime::new_with_telemetry(config, Arc::clone(&telemetry));
+    let worker =
+        WorkerRuntime::new_with_telemetry(config, Arc::clone(&telemetry), shutdown_requested);
     match &worker {
         Err(WorkerError::Store(StoreError::NamespaceLocked { waited, .. })) => {
             telemetry.add(WorkerCounter::NamespaceLockFailures, 1);
@@ -404,6 +428,7 @@ fn run_worker_thread(
             drop(worker);
             (result, drained)
         }
+        Err(WorkerError::StartupCancelled) => (Ok(()), false),
         Err(error) => (Err(error), false),
     };
     if result.is_ok() && drained {
@@ -450,6 +475,7 @@ struct WorkerRuntime {
     health_events: HealthEventLimiter,
     observed_store: ObservedStoreStats,
     partial_bytes_pending: u64,
+    shutdown_requested: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -477,16 +503,32 @@ struct PendingDecodeQuarantine {
 }
 
 impl WorkerRuntime {
+    fn cancellation_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::Acquire)
+    }
+
     fn new(config: RuntimeConfig) -> Result<Self, WorkerError> {
-        Self::new_with_telemetry(config, Arc::new(WorkerTelemetryBridge::default()))
+        Self::new_with_telemetry(
+            config,
+            Arc::new(WorkerTelemetryBridge::default()),
+            Arc::new(AtomicBool::new(false)),
+        )
     }
 
     fn new_with_telemetry(
         config: RuntimeConfig,
         telemetry: Arc<WorkerTelemetryBridge>,
+        shutdown_requested: Arc<AtomicBool>,
     ) -> Result<Self, WorkerError> {
-        let store = CheckpointStore::open(StoreOptions::from_runtime_config(&config))?;
-        Self::with_store(config, store, telemetry)
+        let cancellation = Arc::clone(&shutdown_requested);
+        let store =
+            CheckpointStore::open_cancellable(StoreOptions::from_runtime_config(&config), || {
+                cancellation.load(Ordering::Acquire)
+            })?;
+        let Some(store) = store else {
+            return Err(WorkerError::StartupCancelled);
+        };
+        Self::with_store(config, store, telemetry, shutdown_requested)
     }
 
     #[cfg(test)]
@@ -495,20 +537,25 @@ impl WorkerRuntime {
         point: super::checkpoint::store::fault::FaultPoint,
         matching_occurrences_to_skip: usize,
         telemetry: Arc<WorkerTelemetryBridge>,
+        shutdown_requested: Arc<AtomicBool>,
     ) -> Result<Self, WorkerError> {
         let store = CheckpointStore::open_with_fault_after(
             StoreOptions::from_runtime_config(&config),
             point,
             matching_occurrences_to_skip,
         )?;
-        Self::with_store(config, store, telemetry)
+        Self::with_store(config, store, telemetry, shutdown_requested)
     }
 
     fn with_store(
         config: RuntimeConfig,
         store: CheckpointStore,
         telemetry: Arc<WorkerTelemetryBridge>,
+        shutdown_requested: Arc<AtomicBool>,
     ) -> Result<Self, WorkerError> {
+        if shutdown_requested.load(Ordering::Acquire) {
+            return Err(WorkerError::StartupCancelled);
+        }
         let max_readers = usize::try_from(config.limits.max_tracked_files).map_err(|_| {
             WorkerError::Inconsistent {
                 reason: "validated max_tracked_files does not fit usize",
@@ -567,12 +614,29 @@ impl WorkerRuntime {
                 source,
             })?;
 
+        if shutdown_requested.load(Ordering::Acquire) {
+            return Err(WorkerError::StartupCancelled);
+        }
         let identity_settings = IdentitySettings::from_runtime(&config);
         let discovery_plan = DiscoveryPlan::from_runtime(&config)?;
-        let readers = ReaderTable::new(ReaderSettings::from_runtime(&config))?;
+        if shutdown_requested.load(Ordering::Acquire) {
+            return Err(WorkerError::StartupCancelled);
+        }
+        let readers = ReaderTable::new_with_shutdown_signal(
+            ReaderSettings::from_runtime(&config),
+            Arc::clone(&shutdown_requested),
+        )?;
         let open_batch = OpenBatch::new(&config)?;
         let record_numbers = RecordNumberTable::new(max_readers)?;
-        let discovery = spawn_discovery(discovery_plan)?;
+        if shutdown_requested.load(Ordering::Acquire) {
+            return Err(WorkerError::StartupCancelled);
+        }
+        let discovery =
+            spawn_discovery_with_shutdown_signal(discovery_plan, Arc::clone(&shutdown_requested))?;
+        if shutdown_requested.load(Ordering::Acquire) {
+            drop(discovery);
+            return Err(WorkerError::StartupCancelled);
+        }
 
         let mut worker = Self {
             config,
@@ -608,6 +672,7 @@ impl WorkerRuntime {
             health_events: HealthEventLimiter::default(),
             observed_store: ObservedStoreStats::default(),
             partial_bytes_pending: 0,
+            shutdown_requested,
         };
         worker.publish_observations();
         Ok(worker)
@@ -619,6 +684,9 @@ impl WorkerRuntime {
         command_rx: &Receiver<WorkerCommand>,
     ) -> Result<(), WorkerError> {
         loop {
+            if self.cancellation_requested() {
+                return Ok(());
+            }
             match command_rx.try_recv() {
                 Ok(command) => {
                     if self.handle_command(command, event_tx, command_rx)? == LoopControl::Shutdown
@@ -728,8 +796,12 @@ impl WorkerRuntime {
 
             let poll = self.readers_mut()?.poll(now);
             self.publish_reader_gauges();
+            if self.cancellation_requested() {
+                return Ok(());
+            }
             let poll = poll?;
             let next_reader_probe = match poll {
+                ReaderPoll::Cancelled => return Ok(()),
                 ReaderPoll::Data(turn) => {
                     self.telemetry.add(
                         WorkerCounter::SourceBytesRead,
@@ -807,7 +879,12 @@ impl WorkerRuntime {
                     None
                 }
                 ReaderPoll::RemovedWithoutDescriptor { file_id } => {
-                    let locator = self.contain_removed_without_descriptor(file_id)?;
+                    if self.cancellation_requested() {
+                        return Ok(());
+                    }
+                    let Some(locator) = self.contain_removed_without_descriptor(file_id)? else {
+                        return Ok(());
+                    };
                     self.remember_inactive_locator(locator, file_id)?;
                     continue;
                 }
@@ -834,6 +911,9 @@ impl WorkerRuntime {
         event_tx: &tokio_mpsc::Sender<WorkerEvent>,
         command_rx: &Receiver<WorkerCommand>,
     ) -> Result<LoopControl, WorkerError> {
+        if self.cancellation_requested() {
+            return Ok(LoopControl::Shutdown);
+        }
         match command {
             WorkerCommand::Shutdown => Ok(LoopControl::Shutdown),
             WorkerCommand::Drain => {
@@ -845,7 +925,11 @@ impl WorkerRuntime {
                 attempt,
                 explicit_loss,
             } => {
-                let result = self.commit_retained(batch_id, attempt);
+                let result = match self.commit_retained(batch_id, attempt) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => return Ok(LoopControl::Shutdown),
+                    Err(error) => Err(error),
+                };
                 let committed = result.is_ok();
                 self.checkpoint_commit_failed = result.is_err();
                 if result.is_ok() {
@@ -863,10 +947,12 @@ impl WorkerRuntime {
                 let quarantine = if committed {
                     self.finish_pending_decode_quarantine()
                 } else {
-                    Ok(())
+                    Ok(true)
                 };
                 let control = handoff?;
-                quarantine?;
+                if !quarantine? {
+                    return Ok(LoopControl::Shutdown);
+                }
                 if control == HandoffControl::Shutdown {
                     return Ok(LoopControl::Shutdown);
                 }
@@ -1059,14 +1145,27 @@ impl WorkerRuntime {
         event_tx: &tokio_mpsc::Sender<WorkerEvent>,
         command_rx: &Receiver<WorkerCommand>,
     ) -> Result<LoopControl, WorkerError> {
-        if !self.refresh_updated_candidates(&mut batch)? {
+        if self.cancellation_requested() {
+            return Ok(LoopControl::Shutdown);
+        }
+        let refreshed = self.refresh_updated_candidates(&mut batch);
+        if self.cancellation_requested() {
+            return Ok(LoopControl::Shutdown);
+        }
+        if !refreshed? {
             let retry_at = Instant::now()
                 .checked_add(COMMAND_POLL_INTERVAL)
                 .ok_or(WorkerError::ReconciliationRetryDeadlineOverflow)?;
             self.defer_reconciliation(batch, Some(retry_at))?;
             return Ok(LoopControl::Continue);
         }
+        if self.cancellation_requested() {
+            return Ok(LoopControl::Shutdown);
+        }
         self.detect_updated_truncations(&batch.events)?;
+        if self.cancellation_requested() {
+            return Ok(LoopControl::Shutdown);
+        }
         for truncation in &self.detected_truncations {
             if self
                 .open_batch
@@ -1082,7 +1181,9 @@ impl WorkerRuntime {
                 return self.seal_open_batch(event_tx, command_rx);
             }
         }
-        self.apply_detected_truncations()?;
+        if !self.apply_detected_truncations()? {
+            return Ok(LoopControl::Shutdown);
+        }
         self.candidate_evidence.clear();
         let candidate_count = batch
             .events
@@ -1108,15 +1209,29 @@ impl WorkerRuntime {
             }
         }
         let now_unix_nano = unix_nanos()?.1;
-        let resolved = resolve_and_persist_with_admission(
+        if self.cancellation_requested() {
+            return Ok(LoopControl::Shutdown);
+        }
+        let shutdown_requested = Arc::clone(&self.shutdown_requested);
+        let resolved = resolve_and_persist_with_admission_cancellable(
             &mut self.store,
             &self.candidate_evidence,
             &batch.inventory,
             &self.identity_settings,
             now_unix_nano,
+            || shutdown_requested.load(Ordering::Acquire),
         )
         .map_err(WorkerError::Identity);
+        if self.cancellation_requested() {
+            return Ok(LoopControl::Shutdown);
+        }
         let resolved = self.observe_direct_checkpoint_result(resolved)?;
+        let Some(resolved) = resolved else {
+            return Ok(LoopControl::Shutdown);
+        };
+        if self.cancellation_requested() {
+            return Ok(LoopControl::Shutdown);
+        }
         if resolved.len() != self.candidate_evidence.len() {
             return Err(WorkerError::Inconsistent {
                 reason: "identity resolution count differs from candidate event count",
@@ -1170,6 +1285,9 @@ impl WorkerRuntime {
         feedback.finalized.append(&mut self.pending_finalizations);
         let mut resolved = resolved.into_iter();
         for event in batch.events {
+            if self.cancellation_requested() {
+                return Ok(LoopControl::Shutdown);
+            }
             match event {
                 CandidateEvent::Observed(candidate) => {
                     let resolution = next_resolution(&mut resolved)?;
@@ -1246,7 +1364,11 @@ impl WorkerRuntime {
                         Ok(file_id) => match self.readers_mut()?.mark_removed(locator)? {
                             RemovalDisposition::HandleRetained => {}
                             RemovalDisposition::DescriptorAbsent => {
-                                let released = self.contain_removed_without_descriptor(file_id)?;
+                                let Some(released) =
+                                    self.contain_removed_without_descriptor(file_id)?
+                                else {
+                                    return Ok(LoopControl::Shutdown);
+                                };
                                 if released != locator {
                                     return Err(WorkerError::Inconsistent {
                                         reason: "removed reader containment released a different locator",
@@ -1307,6 +1429,9 @@ impl WorkerRuntime {
         batch: &mut ReconciliationBatch,
     ) -> Result<bool, WorkerError> {
         for event in &mut batch.events {
+            if self.cancellation_requested() {
+                return Ok(false);
+            }
             let CandidateEvent::Updated(candidate) = event else {
                 continue;
             };
@@ -1319,7 +1444,12 @@ impl WorkerRuntime {
                 Err(error) => return Err(WorkerError::Reader(error)),
             }
             let previous_fingerprint = candidate.evidence.fingerprint.clone();
-            match self.readers_ref()?.refresh_candidate_evidence(candidate)? {
+            let refreshed = self.readers_ref()?.refresh_candidate_evidence(candidate);
+            if self.cancellation_requested() {
+                return Ok(false);
+            }
+            match refreshed? {
+                CandidateEvidenceRefresh::Cancelled => return Ok(false),
                 CandidateEvidenceRefresh::Refreshed => {
                     batch.inventory.replace_fingerprint_observation(
                         candidate.evidence.locator,
@@ -1353,6 +1483,10 @@ impl WorkerRuntime {
     fn detect_updated_truncations(&mut self, events: &[CandidateEvent]) -> Result<(), WorkerError> {
         self.detected_truncations.clear();
         for event in events {
+            if self.cancellation_requested() {
+                self.detected_truncations.clear();
+                return Ok(());
+            }
             let CandidateEvent::Updated(candidate) = event else {
                 continue;
             };
@@ -1455,17 +1589,28 @@ impl WorkerRuntime {
         Ok(())
     }
 
-    fn apply_detected_truncations(&mut self) -> Result<(), WorkerError> {
+    fn apply_detected_truncations(&mut self) -> Result<bool, WorkerError> {
         for index in 0..self.detected_truncations.len() {
+            if self.cancellation_requested() {
+                self.detected_truncations.clear();
+                return Ok(false);
+            }
             let truncation = self.detected_truncations[index].clone();
             self.preflight_truncation(&truncation)?;
         }
         for index in 0..self.detected_truncations.len() {
+            if self.cancellation_requested() {
+                self.detected_truncations.clear();
+                return Ok(false);
+            }
             let truncation = self.detected_truncations[index].clone();
-            self.apply_truncation(truncation)?;
+            if !self.apply_truncation(truncation)? {
+                self.detected_truncations.clear();
+                return Ok(false);
+            }
         }
         self.detected_truncations.clear();
-        Ok(())
+        Ok(true)
     }
 
     fn preflight_truncation(&self, truncation: &DetectedTruncation) -> Result<(), WorkerError> {
@@ -1521,7 +1666,7 @@ impl WorkerRuntime {
         Ok(())
     }
 
-    fn apply_truncation(&mut self, truncation: DetectedTruncation) -> Result<(), WorkerError> {
+    fn apply_truncation(&mut self, truncation: DetectedTruncation) -> Result<bool, WorkerError> {
         record_truncation_detection(&self.telemetry);
         let reset_time_unix_nano = unix_nanos()?.1;
         match self.config.rotation.on_truncate {
@@ -1536,6 +1681,9 @@ impl WorkerRuntime {
                     quarantine_epoch: truncation.expected_file_epoch,
                     quarantine_time_unix_nano: reset_time_unix_nano,
                 });
+                if self.cancellation_requested() {
+                    return Ok(false);
+                }
                 let result = self
                     .store
                     .quarantine_files(quarantines)
@@ -1602,6 +1750,9 @@ impl WorkerRuntime {
                     expected_fingerprint,
                     new_fingerprint: truncation.observed_fingerprint.clone(),
                 }));
+                if self.cancellation_requested() {
+                    return Ok(false);
+                }
                 let result = self.store.append(operations).map_err(WorkerError::Store);
                 let _outcome = self.observe_direct_checkpoint_result(result)?;
                 let result = self.store.sync().map_err(WorkerError::Store);
@@ -1633,13 +1784,13 @@ impl WorkerRuntime {
             }
         }
         self.publish_observations();
-        Ok(())
+        Ok(true)
     }
 
     fn contain_removed_without_descriptor(
         &mut self,
         file_id: FileId,
-    ) -> Result<Locator, WorkerError> {
+    ) -> Result<Option<Locator>, WorkerError> {
         if self.retained.is_some()
             || self
                 .open_batch
@@ -1685,6 +1836,9 @@ impl WorkerRuntime {
             quarantine_epoch: expected_file_epoch,
             quarantine_time_unix_nano: unix_nanos()?.1,
         });
+        if self.cancellation_requested() {
+            return Ok(None);
+        }
         let result = self
             .store
             .quarantine_files(quarantines)
@@ -1712,7 +1866,7 @@ impl WorkerRuntime {
         let _ = self.rotation_waits.remove(&file_id);
         let _ = self.record_numbers.remove(file_id);
         self.remove_drain_file(file_id);
-        Ok(locator)
+        Ok(Some(locator))
     }
 
     fn handle_truncation(
@@ -1759,7 +1913,12 @@ impl WorkerRuntime {
             present: frontier.present,
         };
         self.preflight_truncation(&truncation)?;
-        self.apply_truncation(truncation)?;
+        if self.cancellation_requested() {
+            return Ok(LoopControl::Shutdown);
+        }
+        if !self.apply_truncation(truncation)? {
+            return Ok(LoopControl::Shutdown);
+        }
         Ok(LoopControl::Continue)
     }
 
@@ -1810,6 +1969,9 @@ impl WorkerRuntime {
         command_rx: &Receiver<WorkerCommand>,
     ) -> Result<LoopControl, WorkerError> {
         loop {
+            if self.cancellation_requested() {
+                return Ok(LoopControl::Shutdown);
+            }
             let discovery = self.discovery.as_ref().ok_or(WorkerError::Inconsistent {
                 reason: "discovery handle is missing",
             })?;
@@ -1960,6 +2122,9 @@ impl WorkerRuntime {
                 )?;
                 if let Some(observed_size) = fatal_decode_size {
                     self.discard_framer(file_id);
+                    if self.cancellation_requested() {
+                        return Ok(LoopControl::Shutdown);
+                    }
                     if self.open_batch_record_count()? != 0 {
                         if self
                             .pending_decode_quarantine
@@ -1975,7 +2140,9 @@ impl WorkerRuntime {
                         }
                         return self.seal_open_batch(event_tx, command_rx);
                     }
-                    self.quarantine_decode_failure(file_id, observed_size)?;
+                    if !self.quarantine_decode_failure(file_id, observed_size)? {
+                        return Ok(LoopControl::Shutdown);
+                    }
                     return Ok(LoopControl::Continue);
                 }
                 Err(*failure.error)
@@ -1987,7 +2154,7 @@ impl WorkerRuntime {
         &mut self,
         file_id: FileId,
         observed_size: u64,
-    ) -> Result<(), WorkerError> {
+    ) -> Result<bool, WorkerError> {
         if self.retained.is_some() || self.open_batch_record_count()? != 0 {
             return Err(WorkerError::Inconsistent {
                 reason: "decode quarantine overlaps provisional batch progress",
@@ -2019,6 +2186,9 @@ impl WorkerRuntime {
             quarantine_epoch: file_epoch,
             quarantine_time_unix_nano: unix_nanos()?.1,
         });
+        if self.cancellation_requested() {
+            return Ok(false);
+        }
         let result = self
             .store
             .quarantine_files(quarantines)
@@ -2051,12 +2221,12 @@ impl WorkerRuntime {
         } else {
             self.queue_finalization_feedback(locator)?;
         }
-        Ok(())
+        Ok(true)
     }
 
-    fn finish_pending_decode_quarantine(&mut self) -> Result<(), WorkerError> {
+    fn finish_pending_decode_quarantine(&mut self) -> Result<bool, WorkerError> {
         let Some(pending) = self.pending_decode_quarantine.take() else {
-            return Ok(());
+            return Ok(true);
         };
         self.quarantine_decode_failure(pending.file_id, pending.observed_size)
     }
@@ -2273,6 +2443,9 @@ impl WorkerRuntime {
         event_tx: &tokio_mpsc::Sender<WorkerEvent>,
         command_rx: &Receiver<WorkerCommand>,
     ) -> Result<LoopControl, WorkerError> {
+        if self.cancellation_requested() {
+            return Ok(LoopControl::Shutdown);
+        }
         self.readers_ref()?.preflight_release_finalized(file_id)?;
         let durable = current_progress(&self.store, file_id)?;
         let frontier = self
@@ -2295,10 +2468,15 @@ impl WorkerRuntime {
                 operation: "finalizing a removed file",
             })?
             .finalize_file(file_id, frontier, last_seen_time_unix_nano)?;
+        if self.cancellation_requested() {
+            return Ok(LoopControl::Shutdown);
+        }
         match outcome {
             FinalizationOutcome::Merged => self.seal_open_batch(event_tx, command_rx),
             FinalizationOutcome::Direct(delta) => {
-                self.commit_direct_progress(&delta)?;
+                if !self.commit_direct_progress(&delta)? {
+                    return Ok(LoopControl::Shutdown);
+                }
                 Ok(LoopControl::Continue)
             }
         }
@@ -2649,7 +2827,7 @@ impl WorkerRuntime {
         }
     }
 
-    fn commit_retained(&mut self, batch_id: u64, attempt: u32) -> Result<(), WorkerError> {
+    fn commit_retained(&mut self, batch_id: u64, attempt: u32) -> Result<bool, WorkerError> {
         let retained = self
             .retained
             .take()
@@ -2668,13 +2846,13 @@ impl WorkerRuntime {
         }
 
         let result = self.commit_logical_batch(&retained.logical);
-        if result.is_err() {
+        if !matches!(result, Ok(true)) {
             self.retained = Some(retained);
         }
         result
     }
 
-    fn commit_logical_batch(&mut self, logical: &LogicalBatch) -> Result<(), WorkerError> {
+    fn commit_logical_batch(&mut self, logical: &LogicalBatch) -> Result<bool, WorkerError> {
         let mut updates = reserved_vec(self.max_progress_updates, "checkpoint progress updates")?;
         for delta in logical.deltas() {
             updates
@@ -2686,12 +2864,18 @@ impl WorkerRuntime {
                 delta.expected_file_epoch(),
                 delta.final_offset(),
             )?;
+            if self.cancellation_requested() {
+                return Ok(false);
+            }
             if delta.finalize() {
                 self.readers_ref()?
                     .preflight_release_finalized(delta.file_id())?;
             }
         }
         self.readers_mut()?.preflight_batch_commit()?;
+        if self.cancellation_requested() {
+            return Ok(false);
+        }
         let _outcomes = self.store.commit_progress(updates)?;
         if logical.deltas().iter().any(|delta| delta.finalize()) {
             self.store.sync()?;
@@ -2717,7 +2901,7 @@ impl WorkerRuntime {
                 record_rotation_finalization_telemetry(&self.telemetry);
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     fn drive_drain(
@@ -2725,6 +2909,9 @@ impl WorkerRuntime {
         event_tx: &tokio_mpsc::Sender<WorkerEvent>,
         command_rx: &Receiver<WorkerCommand>,
     ) -> Result<LoopControl, WorkerError> {
+        if self.cancellation_requested() {
+            return Ok(LoopControl::Shutdown);
+        }
         if self.retained.is_some() {
             return Ok(LoopControl::Continue);
         }
@@ -2733,6 +2920,9 @@ impl WorkerRuntime {
         }
 
         while let Some(file_id) = self.drain_order.last().copied() {
+            if self.cancellation_requested() {
+                return Ok(LoopControl::Shutdown);
+            }
             let end_offset = *self
                 .drain_limits
                 .get(&file_id)
@@ -2745,8 +2935,12 @@ impl WorkerRuntime {
                     .readers_mut()?
                     .poll_until(Instant::now(), file_id, end_offset);
                 self.publish_reader_gauges();
+                if self.cancellation_requested() {
+                    return Ok(LoopControl::Shutdown);
+                }
                 let poll = poll?;
                 match poll {
+                    ReaderPoll::Cancelled => return Ok(LoopControl::Shutdown),
                     ReaderPoll::Data(turn) => {
                         self.telemetry.add(
                             WorkerCounter::SourceBytesRead,
@@ -2795,7 +2989,10 @@ impl WorkerRuntime {
                         continue;
                     }
                     ReaderPoll::RemovedWithoutDescriptor { file_id } => {
-                        let locator = self.contain_removed_without_descriptor(file_id)?;
+                        let Some(locator) = self.contain_removed_without_descriptor(file_id)?
+                        else {
+                            return Ok(LoopControl::Shutdown);
+                        };
                         self.remember_inactive_locator(locator, file_id)?;
                         continue;
                     }
@@ -2923,21 +3120,49 @@ impl WorkerRuntime {
     }
 
     fn maintain_store(&mut self) -> Result<(), WorkerError> {
+        if self.cancellation_requested() {
+            return Ok(());
+        }
         let generation_before = self.store.generation();
         let cleanup_pending = !self.store.retired_generations().is_empty();
         let started = Instant::now();
         let mut cleaned_generations = 0usize;
         let mut cleanup_attempted = false;
-        let result = match self.store.sync_if_due() {
+        if self.cancellation_requested() {
+            return Ok(());
+        }
+        let sync_result = self.store.sync_if_due();
+        if self.cancellation_requested() {
+            return Ok(());
+        }
+        let shutdown_requested = Arc::clone(&self.shutdown_requested);
+        let result = match sync_result {
             Err(error) => Err(error),
             Ok(_) if cleanup_pending => {
                 cleanup_attempted = true;
-                self.store.cleanup_retired_generations().map(|cleaned| {
-                    cleaned_generations = cleaned;
-                })
+                self.store
+                    .cleanup_retired_generations_cancellable(|| {
+                        shutdown_requested.load(Ordering::Acquire)
+                    })
+                    .map(|cleaned| {
+                        cleaned.map(|cleaned| {
+                            cleaned_generations = cleaned;
+                        })
+                    })
             }
-            Ok(_) => self.store.compact_if_due().map(|_| ()),
+            Ok(_) => self
+                .store
+                .compact_if_due_cancellable(|| shutdown_requested.load(Ordering::Acquire))
+                .map(|compacted| compacted.map(|_| ())),
         };
+        let result = match result {
+            Ok(Some(())) => Ok(()),
+            Ok(None) => return Ok(()),
+            Err(error) => Err(error),
+        };
+        if self.cancellation_requested() {
+            return Ok(());
+        }
         record_checkpoint_maintenance_telemetry(
             &self.telemetry,
             generation_before,
@@ -3216,7 +3441,8 @@ impl WorkerRuntime {
         let mut first_error = None;
         if let Some(discovery) = self.discovery.take() {
             discovery.request_shutdown();
-            if discovery.into_join_handle().join().is_err() {
+            let join = discovery.into_join_handle();
+            if join.is_finished() && join.join().is_err() {
                 first_error = Some(WorkerError::DiscoveryThreadPanicked);
             }
         }
@@ -3256,10 +3482,13 @@ impl WorkerRuntime {
     fn commit_direct_progress(
         &mut self,
         delta: &super::batching::ProgressDelta,
-    ) -> Result<(), WorkerError> {
+    ) -> Result<bool, WorkerError> {
         if delta.finalize() {
             self.readers_ref()?
                 .preflight_release_finalized(delta.file_id())?;
+        }
+        if self.cancellation_requested() {
+            return Ok(false);
         }
         let result = persist_direct_progress(&mut self.store, delta);
         self.observe_direct_checkpoint_result(result)?;
@@ -3278,7 +3507,7 @@ impl WorkerRuntime {
             record_rotation_finalization_telemetry(&self.telemetry);
         }
         self.publish_observations();
-        Ok(())
+        Ok(true)
     }
 }
 

@@ -8,12 +8,13 @@ use tempfile::{TempDir, tempdir};
 use super::matcher::{
     CandidateInventory, FileIdSource, IdentityMatch, IdentityResolution, IdentitySettings,
     ResolvedIdentity, resolve_and_persist as resolve_with_inventory,
-    resolve_and_persist_with_admission,
+    resolve_and_persist_with_admission, resolve_and_persist_with_admission_cancellable,
     resolve_and_persist_with_source as resolve_with_inventory_and_source,
 };
 use super::*;
 use crate::receivers::filelog_receiver::checkpoint::primitives::{
     FRAMING_PROFILE_VERSION, FramingResume, LifecycleState, QUARANTINE_REASON_RECOVERY_MISMATCH,
+    WAL_MAX_OPS_PER_TX,
 };
 use crate::receivers::filelog_receiver::checkpoint::store::fault::FaultPoint;
 use crate::receivers::filelog_receiver::checkpoint::store::{CheckpointStore, StoreOptions};
@@ -89,6 +90,84 @@ fn admission_resolution_defers_new_identity_at_durable_capacity() {
     assert_eq!(resolutions[1], IdentityResolution::Deferred);
     assert_eq!(store.table().len(), 1);
     assert_eq!(store.stats().wal_transactions, 1);
+}
+
+/// Scenario: cancellation becomes visible after identity planning but before
+/// a reconciliation can append its atomic registration group.
+/// Guarantees: the cancellable resolver returns no runtime resolutions and
+/// leaves both the checkpoint table and WAL transaction count unchanged.
+#[test]
+fn admission_resolution_cancellation_preempts_persistence() {
+    let (_directory, mut store, _options) = test_store(1);
+    let candidates = vec![evidence(locator(1), 4, b"aaaa", b"/a.log")];
+    let inventory =
+        CandidateInventory::from_complete_reconciliation(&candidates, &HashSet::new(), 4);
+    let mut settings = settings();
+    settings.max_tracked_files = 1;
+
+    let resolutions = resolve_and_persist_with_admission_cancellable(
+        &mut store,
+        &candidates,
+        &inventory,
+        &settings,
+        10,
+        || true,
+    )
+    .unwrap();
+
+    assert!(resolutions.is_none());
+    assert!(store.table().is_empty());
+    assert_eq!(store.stats().wal_transactions, 0);
+}
+
+/// Scenario: one identity reconciliation spans two WAL transactions and
+/// cancellation becomes visible after the first transaction is durable.
+/// Guarantees: the resolver exposes no partial runtime resolutions while
+/// restart recovers exactly the completed registration prefix.
+#[test]
+fn admission_resolution_cancellation_hides_durable_transaction_prefix() {
+    let candidate_count = usize::from(WAL_MAX_OPS_PER_TX) + 1;
+    let (_directory, mut store, options) = test_store(candidate_count as u32);
+    let candidates: Vec<CandidateEvidence> = (0..candidate_count)
+        .map(|index| {
+            evidence(
+                locator(index as u64 + 1),
+                4,
+                b"aaaa",
+                format!("/candidate-{index}.log").as_bytes(),
+            )
+        })
+        .collect();
+    let inventory =
+        CandidateInventory::from_complete_reconciliation(&candidates, &HashSet::new(), 4);
+    let mut settings = settings();
+    settings.max_candidates = candidate_count;
+    settings.max_inventory_candidates = candidate_count;
+    settings.max_tracked_files = candidate_count;
+    let mut cancellation_checks = 0usize;
+
+    let resolutions = resolve_and_persist_with_admission_cancellable(
+        &mut store,
+        &candidates,
+        &inventory,
+        &settings,
+        10,
+        || {
+            let cancelled = cancellation_checks >= 2;
+            cancellation_checks += 1;
+            cancelled
+        },
+    )
+    .unwrap();
+
+    assert!(resolutions.is_none());
+    assert_eq!(store.table().len(), usize::from(WAL_MAX_OPS_PER_TX));
+    assert_eq!(store.stats().wal_transactions, 1);
+    assert_eq!(cancellation_checks, 3);
+    drop(store);
+
+    let recovered = CheckpointStore::open(options).unwrap();
+    assert_eq!(recovered.table().len(), usize::from(WAL_MAX_OPS_PER_TX));
 }
 
 fn registration(

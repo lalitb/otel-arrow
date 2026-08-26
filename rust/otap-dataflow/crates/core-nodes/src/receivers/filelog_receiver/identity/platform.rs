@@ -47,12 +47,42 @@ pub(crate) fn open_candidate_at(
     fingerprint_bytes: u16,
     ignored_header_bytes: u32,
 ) -> Result<OpenedCandidate, IdentityError> {
-    let file = open_read_only(open_path, follow_symlinks).map_err(|source| IdentityError::Io {
+    open_candidate_at_cancellable(
+        open_path,
+        advisory_path,
+        follow_symlinks,
+        fingerprint_bytes,
+        ignored_header_bytes,
+        || false,
+    )
+    .map(|opened| opened.expect("non-cancellable candidate open cannot be cancelled"))
+}
+
+pub(crate) fn open_candidate_at_cancellable(
+    open_path: &Path,
+    advisory_path: &Path,
+    follow_symlinks: bool,
+    fingerprint_bytes: u16,
+    ignored_header_bytes: u32,
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<Option<OpenedCandidate>, IdentityError> {
+    if cancelled() {
+        return Ok(None);
+    }
+    let file = open_read_only(open_path, follow_symlinks);
+    if cancelled() {
+        return Ok(None);
+    }
+    let file = file.map_err(|source| IdentityError::Io {
         operation: "open candidate",
         path: open_path.to_path_buf(),
         source,
     })?;
-    let metadata = file.metadata().map_err(|source| IdentityError::Io {
+    let metadata = file.metadata();
+    if cancelled() {
+        return Ok(None);
+    }
+    let metadata = metadata.map_err(|source| IdentityError::Io {
         operation: "read candidate metadata",
         path: open_path.to_path_buf(),
         source,
@@ -63,12 +93,27 @@ pub(crate) fn open_candidate_at(
         });
     }
 
-    let locator = locator_from_handle(&file, open_path, follow_symlinks)?;
-    let (fingerprint, size) =
-        collect_consistent_fingerprint(&file, open_path, fingerprint_bytes, ignored_header_bytes)?;
+    let Some(locator) =
+        locator_from_handle_cancellable(&file, open_path, follow_symlinks, &mut cancelled)?
+    else {
+        return Ok(None);
+    };
+    let Some((fingerprint, size)) = collect_consistent_fingerprint_cancellable(
+        &file,
+        open_path,
+        fingerprint_bytes,
+        ignored_header_bytes,
+        &mut cancelled,
+    )?
+    else {
+        return Ok(None);
+    };
+    if cancelled() {
+        return Ok(None);
+    }
     let advisory_path = encode_advisory_path(advisory_path)?;
 
-    Ok(OpenedCandidate {
+    Ok(Some(OpenedCandidate {
         file,
         evidence: CandidateEvidence {
             locator,
@@ -76,7 +121,7 @@ pub(crate) fn open_candidate_at(
             fingerprint,
             advisory_path,
         },
-    })
+    }))
 }
 
 /// Result of reopening a known native locator.
@@ -101,13 +146,46 @@ pub(crate) fn reopen_candidate_at(
     durable_fingerprint: &[u8],
     required_offset: u64,
 ) -> Result<ReopenCandidate, IdentityError> {
-    let opened = open_candidate_at(
+    reopen_candidate_at_cancellable(
         open_path,
         advisory_path,
         follow_symlinks,
         fingerprint_bytes,
         ignored_header_bytes,
-    )?;
+        expected_locator,
+        durable_fingerprint,
+        required_offset,
+        || false,
+    )
+    .map(|opened| opened.expect("non-cancellable candidate reopen cannot be cancelled"))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reopen_candidate_at_cancellable(
+    open_path: &Path,
+    advisory_path: &Path,
+    follow_symlinks: bool,
+    fingerprint_bytes: u16,
+    ignored_header_bytes: u32,
+    expected_locator: Locator,
+    durable_fingerprint: &[u8],
+    required_offset: u64,
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<Option<ReopenCandidate>, IdentityError> {
+    let Some(opened) = open_candidate_at_cancellable(
+        open_path,
+        advisory_path,
+        follow_symlinks,
+        fingerprint_bytes,
+        ignored_header_bytes,
+        &mut cancelled,
+    )?
+    else {
+        return Ok(None);
+    };
+    if cancelled() {
+        return Ok(None);
+    }
     if opened.evidence.locator != expected_locator {
         return Err(IdentityError::ReopenLocatorMismatch {
             path: open_path.to_path_buf(),
@@ -118,9 +196,9 @@ pub(crate) fn reopen_candidate_at(
     if !opened.evidence.fingerprint.starts_with(durable_fingerprint)
         || opened.evidence.size < required_offset
     {
-        return Ok(ReopenCandidate::Truncated(opened));
+        return Ok(Some(ReopenCandidate::Truncated(opened)));
     }
-    Ok(ReopenCandidate::Compatible(opened))
+    Ok(Some(ReopenCandidate::Compatible(opened)))
 }
 
 pub(crate) fn collect_consistent_fingerprint(
@@ -129,30 +207,45 @@ pub(crate) fn collect_consistent_fingerprint(
     fingerprint_bytes: u16,
     ignored_header_bytes: u32,
 ) -> Result<(Vec<u8>, u64), IdentityError> {
-    let observe = || -> Result<(Vec<u8>, u64), IdentityError> {
-        let fingerprint = read_fingerprint(
-            file,
-            u64::from(ignored_header_bytes),
-            usize::from(fingerprint_bytes),
-        )
-        .map_err(|source| IdentityError::Io {
-            operation: "read candidate fingerprint",
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let size = file
-            .metadata()
-            .map_err(|source| IdentityError::Io {
-                operation: "refresh candidate metadata",
-                path: path.to_path_buf(),
-                source,
-            })?
-            .len();
-        Ok((fingerprint, size))
-    };
+    collect_consistent_fingerprint_cancellable(
+        file,
+        path,
+        fingerprint_bytes,
+        ignored_header_bytes,
+        &mut || false,
+    )
+    .map(|observation| {
+        observation.expect("non-cancellable fingerprint collection cannot be cancelled")
+    })
+}
 
-    let (first_fingerprint, first_size) = observe()?;
-    let (second_fingerprint, second_size) = observe()?;
+pub(crate) fn collect_consistent_fingerprint_cancellable(
+    file: &File,
+    path: &Path,
+    fingerprint_bytes: u16,
+    ignored_header_bytes: u32,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<(Vec<u8>, u64)>, IdentityError> {
+    let Some((first_fingerprint, first_size)) = observe_fingerprint_cancellable(
+        file,
+        path,
+        fingerprint_bytes,
+        ignored_header_bytes,
+        &mut *cancelled,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some((second_fingerprint, second_size)) = observe_fingerprint_cancellable(
+        file,
+        path,
+        fingerprint_bytes,
+        ignored_header_bytes,
+        &mut *cancelled,
+    )?
+    else {
+        return Ok(None);
+    };
     if fingerprint_observations_are_compatible(
         &first_fingerprint,
         first_size,
@@ -161,11 +254,52 @@ pub(crate) fn collect_consistent_fingerprint(
         fingerprint_bytes,
         ignored_header_bytes,
     ) {
-        return Ok((second_fingerprint, second_size));
+        return Ok(Some((second_fingerprint, second_size)));
     }
     Err(IdentityError::CandidateChangedDuringIdentity {
         path: path.to_path_buf(),
     })
+}
+
+fn observe_fingerprint_cancellable(
+    file: &File,
+    path: &Path,
+    fingerprint_bytes: u16,
+    ignored_header_bytes: u32,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<(Vec<u8>, u64)>, IdentityError> {
+    if cancelled() {
+        return Ok(None);
+    }
+    let fingerprint = read_fingerprint_cancellable(
+        file,
+        u64::from(ignored_header_bytes),
+        usize::from(fingerprint_bytes),
+        &mut *cancelled,
+    )
+    .map_err(|source| IdentityError::Io {
+        operation: "read candidate fingerprint",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let Some(fingerprint) = fingerprint else {
+        return Ok(None);
+    };
+    if cancelled() {
+        return Ok(None);
+    }
+    let size = file.metadata();
+    if cancelled() {
+        return Ok(None);
+    }
+    let size = size
+        .map_err(|source| IdentityError::Io {
+            operation: "refresh candidate metadata",
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    Ok(Some((fingerprint, size)))
 }
 
 fn fingerprint_length_is_consistent(
@@ -240,30 +374,39 @@ fn open_read_only(_path: &Path, _follow_symlinks: bool) -> io::Result<File> {
 }
 
 #[cfg(unix)]
-fn locator_from_handle(
+fn locator_from_handle_cancellable(
     file: &File,
     path: &Path,
     _follow_symlinks: bool,
-) -> Result<Locator, IdentityError> {
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<Locator>, IdentityError> {
     use std::os::unix::fs::MetadataExt;
 
-    let metadata = file.metadata().map_err(|source| IdentityError::Io {
+    if cancelled() {
+        return Ok(None);
+    }
+    let metadata = file.metadata();
+    if cancelled() {
+        return Ok(None);
+    }
+    let metadata = metadata.map_err(|source| IdentityError::Io {
         operation: "extract POSIX file identity",
         path: path.to_path_buf(),
         source,
     })?;
-    Ok(Locator::PosixDevIno {
+    Ok(Some(Locator::PosixDevIno {
         dev: metadata.dev(),
         ino: metadata.ino(),
-    })
+    }))
 }
 
 #[cfg(windows)]
-fn locator_from_handle(
+fn locator_from_handle_cancellable(
     file: &File,
     path: &Path,
     follow_symlinks: bool,
-) -> Result<Locator, IdentityError> {
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<Locator>, IdentityError> {
     use std::mem::{size_of, zeroed};
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -273,11 +416,19 @@ fn locator_from_handle(
 
     let handle = file.as_raw_handle();
     let mut basic: BY_HANDLE_FILE_INFORMATION = unsafe { zeroed() };
-    if unsafe { GetFileInformationByHandle(handle, &mut basic) } == 0 {
+    if cancelled() {
+        return Ok(None);
+    }
+    let basic_succeeded = unsafe { GetFileInformationByHandle(handle, &mut basic) };
+    let basic_error = (basic_succeeded == 0).then(io::Error::last_os_error);
+    if cancelled() {
+        return Ok(None);
+    }
+    if let Some(source) = basic_error {
         return Err(IdentityError::Io {
             operation: "validate Windows candidate handle",
             path: path.to_path_buf(),
-            source: io::Error::last_os_error(),
+            source,
         });
     }
     if !follow_symlinks && basic.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
@@ -287,73 +438,114 @@ fn locator_from_handle(
     }
 
     let mut identity: FILE_ID_INFO = unsafe { zeroed() };
-    if unsafe {
+    if cancelled() {
+        return Ok(None);
+    }
+    let identity_succeeded = unsafe {
         GetFileInformationByHandleEx(
             handle,
             FileIdInfo,
             (&raw mut identity).cast(),
             size_of::<FILE_ID_INFO>() as u32,
         )
-    } == 0
-    {
+    };
+    let identity_error = (identity_succeeded == 0).then(io::Error::last_os_error);
+    if cancelled() {
+        return Ok(None);
+    }
+    if let Some(source) = identity_error {
         return Err(IdentityError::Io {
             operation: "extract Windows file identity",
             path: path.to_path_buf(),
-            source: io::Error::last_os_error(),
+            source,
         });
     }
 
-    Ok(Locator::WindowsVolumeFileId {
+    Ok(Some(Locator::WindowsVolumeFileId {
         volume_serial: identity.VolumeSerialNumber,
         file_id: identity.FileId.Identifier,
-    })
+    }))
 }
 
 #[cfg(not(any(unix, windows)))]
-fn locator_from_handle(
+fn locator_from_handle_cancellable(
     _file: &File,
     path: &Path,
     _follow_symlinks: bool,
-) -> Result<Locator, IdentityError> {
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<Locator>, IdentityError> {
+    if cancelled() {
+        return Ok(None);
+    }
     Err(IdentityError::UnsupportedPlatform {
         path: path.to_path_buf(),
     })
 }
 
 #[cfg(unix)]
-fn read_fingerprint(file: &File, offset: u64, maximum: usize) -> io::Result<Vec<u8>> {
+fn read_fingerprint_cancellable(
+    file: &File,
+    offset: u64,
+    maximum: usize,
+    cancelled: &mut impl FnMut() -> bool,
+) -> io::Result<Option<Vec<u8>>> {
     use std::os::unix::fs::FileExt;
 
-    read_bounded_at(maximum, |buffer, relative| {
-        file.read_at(buffer, offset + relative)
-    })
+    read_bounded_at_cancellable(
+        maximum,
+        |buffer, relative| file.read_at(buffer, offset + relative),
+        cancelled,
+    )
 }
 
 #[cfg(windows)]
-fn read_fingerprint(file: &File, offset: u64, maximum: usize) -> io::Result<Vec<u8>> {
+fn read_fingerprint_cancellable(
+    file: &File,
+    offset: u64,
+    maximum: usize,
+    cancelled: &mut impl FnMut() -> bool,
+) -> io::Result<Option<Vec<u8>>> {
     use std::os::windows::fs::FileExt;
 
-    read_bounded_at(maximum, |buffer, relative| {
-        file.seek_read(buffer, offset + relative)
-    })
+    read_bounded_at_cancellable(
+        maximum,
+        |buffer, relative| file.seek_read(buffer, offset + relative),
+        cancelled,
+    )
 }
 
 #[cfg(not(any(unix, windows)))]
-fn read_fingerprint(_file: &File, _offset: u64, _maximum: usize) -> io::Result<Vec<u8>> {
+fn read_fingerprint_cancellable(
+    _file: &File,
+    _offset: u64,
+    _maximum: usize,
+    cancelled: &mut impl FnMut() -> bool,
+) -> io::Result<Option<Vec<u8>>> {
+    if cancelled() {
+        return Ok(None);
+    }
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "filelog identity is supported only on Unix and Windows",
     ))
 }
 
-fn read_bounded_at(
+fn read_bounded_at_cancellable(
     maximum: usize,
     mut read_at: impl FnMut(&mut [u8], u64) -> io::Result<usize>,
-) -> io::Result<Vec<u8>> {
+    cancelled: &mut impl FnMut() -> bool,
+) -> io::Result<Option<Vec<u8>>> {
     let mut bytes = vec![0; maximum];
     let mut read = 0usize;
     while read < maximum {
-        match read_at(&mut bytes[read..], read as u64) {
+        if cancelled() {
+            return Ok(None);
+        }
+        let result = read_at(&mut bytes[read..], read as u64);
+        if cancelled() {
+            return Ok(None);
+        }
+        match result {
             Ok(0) => break,
             Ok(count) => {
                 read = read.checked_add(count).ok_or_else(|| {
@@ -365,20 +557,32 @@ fn read_bounded_at(
         }
     }
     bytes.truncate(read);
-    Ok(bytes)
+    Ok(Some(bytes))
 }
 
 /// Performs one bounded positioned source read, retrying only interrupted
 /// system calls. A short read or zero-byte EOF returns control to the fair
 /// reader scheduler.
 #[cfg(unix)]
-pub(crate) fn read_source_at(file: &File, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
+pub(crate) fn read_source_at_cancellable(
+    file: &File,
+    offset: u64,
+    buffer: &mut [u8],
+    cancelled: &mut impl FnMut() -> bool,
+) -> io::Result<Option<usize>> {
     use std::os::unix::fs::FileExt;
 
     loop {
-        match file.read_at(buffer, offset) {
+        if cancelled() {
+            return Ok(None);
+        }
+        let result = file.read_at(buffer, offset);
+        if cancelled() {
+            return Ok(None);
+        }
+        match result {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            result => return result,
+            result => return result.map(Some),
         }
     }
 }
@@ -387,13 +591,25 @@ pub(crate) fn read_source_at(file: &File, offset: u64, buffer: &mut [u8]) -> io:
 /// system calls. A short read or zero-byte EOF returns control to the fair
 /// reader scheduler.
 #[cfg(windows)]
-pub(crate) fn read_source_at(file: &File, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
+pub(crate) fn read_source_at_cancellable(
+    file: &File,
+    offset: u64,
+    buffer: &mut [u8],
+    cancelled: &mut impl FnMut() -> bool,
+) -> io::Result<Option<usize>> {
     use std::os::windows::fs::FileExt;
 
     loop {
-        match file.seek_read(buffer, offset) {
+        if cancelled() {
+            return Ok(None);
+        }
+        let result = file.seek_read(buffer, offset);
+        if cancelled() {
+            return Ok(None);
+        }
+        match result {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            result => return result,
+            result => return result.map(Some),
         }
     }
 }
@@ -401,7 +617,15 @@ pub(crate) fn read_source_at(file: &File, offset: u64, buffer: &mut [u8]) -> io:
 /// Reports unsupported source reading on targets without a Phase 1 locator
 /// contract.
 #[cfg(not(any(unix, windows)))]
-pub(crate) fn read_source_at(_file: &File, _offset: u64, _buffer: &mut [u8]) -> io::Result<usize> {
+pub(crate) fn read_source_at_cancellable(
+    _file: &File,
+    _offset: u64,
+    _buffer: &mut [u8],
+    cancelled: &mut impl FnMut() -> bool,
+) -> io::Result<Option<usize>> {
+    if cancelled() {
+        return Ok(None);
+    }
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "filelog reading is supported only on Unix and Windows",
@@ -472,6 +696,52 @@ mod tests {
             candidate.file.metadata().unwrap().len(),
             candidate.evidence.size
         );
+    }
+
+    /// Scenario: cancellation becomes visible after one fingerprint read but
+    /// before its paired metadata observation.
+    /// Guarantees: identity sampling returns cancellation without starting
+    /// the metadata call or a second fingerprint observation.
+    #[test]
+    fn fingerprint_sampling_stops_between_filesystem_operations() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cancel.log");
+        std::fs::write(&path, b"payload").unwrap();
+        let file = File::open(&path).unwrap();
+        let mut cancellation_checks = 0usize;
+
+        let observation =
+            collect_consistent_fingerprint_cancellable(&file, &path, 4, 0, &mut || {
+                let cancelled = cancellation_checks != 0;
+                cancellation_checks += 1;
+                cancelled
+            })
+            .unwrap();
+
+        assert!(observation.is_none());
+        assert_eq!(cancellation_checks, 2);
+    }
+
+    /// Scenario: cancellation becomes visible after the first platform
+    /// handle query used to derive a source locator.
+    /// Guarantees: locator sampling returns cancellation before any later
+    /// handle query, including the Windows file-ID query.
+    #[test]
+    fn locator_sampling_stops_between_handle_queries() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("locator.log");
+        std::fs::write(&path, b"payload").unwrap();
+        let file = File::open(&path).unwrap();
+        let mut cancellation_checks = 0usize;
+
+        let locator = locator_from_handle_cancellable(&file, &path, false, &mut || {
+            cancellation_checks += 1;
+            cancellation_checks == 2
+        })
+        .unwrap();
+
+        assert!(locator.is_none());
+        assert_eq!(cancellation_checks, 2);
     }
 
     /// Scenario: a file grows from a short fingerprint to the configured
@@ -554,7 +824,12 @@ mod tests {
         writer.flush().unwrap();
 
         let mut bytes = [0; 9];
-        assert_eq!(read_source_at(&opened.file, 0, &mut bytes).unwrap(), 9);
+        assert_eq!(
+            read_source_at_cancellable(&opened.file, 0, &mut bytes, &mut || false)
+                .unwrap()
+                .unwrap(),
+            9
+        );
         assert_eq!(&bytes, b"old\nlate\n");
         assert_eq!(opened.file.metadata().unwrap().len(), 9);
     }

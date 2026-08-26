@@ -830,10 +830,45 @@ rather than submitting repeated long-lived work to Tokio's shared blocking pool.
 caps a stuck filesystem's thread and queue impact.
 
 The async task never calls a blocking channel send or synchronously joins a worker.
-Worker shutdown is requested over the bounded command channel. Drain continues polling
-control and downstream completion; any final thread join uses a non-blocking lifecycle
-path and is bounded by the engine drain deadline. A blocked or failed worker produces a
-terminal receiver event rather than parking the pipeline runtime indefinitely.
+Worker shutdown first asserts an out-of-band cancellation flag shared with discovery,
+then uses one non-blocking command attempt, closes the event receiver, and drops the
+command sender. The worker checks cancellation before dequeuing a checkpoint commit,
+resend, or drain work, so FIFO commands buffered before forced shutdown cannot advance
+progress afterward. Discovery checks the same signal during traversal, handoff, and
+bounded 50 ms wait slices without waiting for the read worker to resume.
+
+The worker rechecks cancellation between filesystem calls inside source reads,
+identity sampling, and checkpoint artifact recovery, and immediately before every new
+checkpoint transaction. A transaction or individual filesystem call that already
+crossed that boundary may complete. If a large identity reconciliation spans multiple
+WAL transactions, cancellation stops before the next transaction and can leave only a
+complete durable prefix for restart reconciliation; the worker does not install
+partial runtime state. Shutdown checkpoint draining only syncs state already written
+and does not synthesize new progress, quarantine, reset, registration, or finalization
+transitions.
+
+Periodic checkpoint maintenance rechecks cancellation after an interval sync, between
+retired-generation unlinks, and before generation staging and marker publication. Once
+directory creation or an atomic generation or marker publication has begun, its
+required parent-sync or publication durability sequence completes; cancellation is
+observed before the next independently recoverable operation. Interrupted cleanup
+retains its complete retired-generation list for an idempotent retry.
+
+Checkpoint startup observes the same cancellation before and after each namespace-lock
+attempt and between recovery stages. A cancelled waiter drops a lock acquired
+concurrently with cancellation before stale-file cleanup or recovery mutation, so it
+cannot later become a detached namespace owner that delays a replacement receiver.
+
+Drain continues polling control and downstream completion. Final teardown polls the
+read worker's completion state only until the active drain or shutdown deadline; it
+joins only after completion is already observable. Discovery is likewise joined only
+when already complete. If either dedicated thread remains blocked in a kernel
+filesystem operation, its join handle is dropped rather than occupying Tokio's blocking
+pool or parking the pipeline runtime; crossing the read-worker deadline emits a fixed
+warning. At most the fixed read/checkpoint and discovery threads for that receiver can
+remain detached. The namespace lock, runtime leases, and descriptors owned by a
+detached read worker can remain live until it returns, so a replacement instance
+remains subject to `ownership_timeout`.
 
 Phase 1 does not pin workers or make NUMA-locality claims; the operating system controls
 placement. NUMA-aware scheduling may be considered later based on measured filesystem,

@@ -38,7 +38,7 @@ use super::layout::{
     snapshot_file_name, temp_file_name, wal_file_name,
 };
 use super::limits::{ARTIFACT_BYTES_CEILING, RECOVERY_WORKING_BYTES_CEILING, StoreLimits};
-use super::{CheckpointStore, StoreOptions};
+use super::{AtomicGroupAppendOutcome, CheckpointStore, StoreOptions};
 use crate::receivers::filelog_receiver::config::{
     CheckpointConfig, Config, IdentityConfig, LimitsConfig, RuntimeConfig,
 };
@@ -306,6 +306,47 @@ fn atomic_group_packing_never_splits_a_group() {
     );
 }
 
+/// Scenario: a grouped identity plan spans two maximum-sized WAL
+/// transactions and cancellation becomes visible after the first append.
+/// Guarantees: no second transaction starts, the explicit outcome identifies
+/// one completed durable prefix, and restart recovers exactly that prefix.
+#[test]
+fn atomic_group_cancellation_stops_before_the_next_transaction() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    let mut store_options = options(&path);
+    store_options.max_tracked_files = u32::from(WAL_MAX_OPS_PER_TX) + 1;
+    let registrations = distinct_registrations(usize::from(WAL_MAX_OPS_PER_TX) + 1);
+    let final_file_id = registrations.last().expect("final registration").file_id;
+    let groups = registrations
+        .into_iter()
+        .map(|registration| vec![Operation::RegisterFile(registration)])
+        .collect();
+    let cancellation_checks = std::cell::Cell::new(0usize);
+    let mut store = CheckpointStore::open(store_options.clone()).expect("namespace initializes");
+
+    let outcome = store
+        .append_atomic_groups_cancellable(groups, || {
+            let current = cancellation_checks.get();
+            cancellation_checks.set(current + 1);
+            current != 0
+        })
+        .expect("grouped append stops cleanly");
+
+    let AtomicGroupAppendOutcome::Cancelled { completed } = outcome else {
+        panic!("expected cancellation after the first transaction");
+    };
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].operations, usize::from(WAL_MAX_OPS_PER_TX));
+    assert_eq!(store.table().len(), usize::from(WAL_MAX_OPS_PER_TX));
+    assert!(store.table().get(&final_file_id).is_none());
+    drop(store);
+
+    let recovered = CheckpointStore::open(store_options).expect("namespace recovers");
+    assert_eq!(recovered.table().len(), usize::from(WAL_MAX_OPS_PER_TX));
+    assert!(recovered.table().get(&final_file_id).is_none());
+}
+
 /// Scenario: 4,095 valid registrations fill the first grouped WAL
 /// transaction and a `register_file + quarantine_file` pair starts the
 /// second transaction, where every WAL persistence boundary is faulted.
@@ -507,6 +548,35 @@ fn unix_permissions_and_symlink_targets_are_safe() {
     symlink(&victim, &lock_path).expect("lock symlink is planted");
     assert!(CheckpointStore::open(options(&path)).is_err());
     assert_eq!(fs::read(&victim).expect("victim reads"), b"must survive");
+}
+
+/// Scenario: an initialized Unix namespace and its parent grant their owner
+/// search and write permission but not directory reads.
+/// Guarantees: reopening repairs the namespace mode before enumerating it and
+/// adds no parent-read requirement for incomplete-creation durability work.
+#[cfg(unix)]
+#[test]
+fn established_namespace_reopens_through_execute_only_parent() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let parent = dir.path().join("execute-only");
+    fs::create_dir(&parent).expect("parent is created");
+    let path = parent.join("namespace");
+    drop(open(&path));
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o300)).expect("namespace mode changes");
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o300)).expect("parent mode changes");
+
+    let reopened = open(&path);
+    assert_eq!(reopened.generation(), 0);
+    assert_eq!(
+        fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
+        0o700
+    );
+    drop(reopened);
+
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))
+        .expect("parent mode is restored for cleanup");
 }
 
 /// Scenario: an authoritative checkpoint WAL acquires a second hard link
@@ -1610,6 +1680,37 @@ fn compaction_keeps_the_previous_generation_until_cleanup() {
     assert!(reopened.retired_generations().is_empty());
 }
 
+/// Scenario: cancellation becomes visible after cleanup removes the retired
+/// snapshot but before it removes the retired WAL.
+/// Guarantees: cleanup starts no later unlink, retains the complete retired
+/// list, and an uncancelled retry resumes idempotently.
+#[test]
+fn retired_generation_cleanup_cancellation_stops_between_unlinks() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    let mut store = open(&path);
+    store.compact().expect("compaction succeeds");
+    let retired_snapshot = path.join(snapshot_file_name(0));
+    let retired_wal = path.join(wal_file_name(0));
+
+    let outcome = store
+        .cleanup_retired_generations_cancellable(|| !retired_snapshot.exists())
+        .expect("cancellation is not a cleanup error");
+
+    assert!(outcome.is_none());
+    assert!(!retired_snapshot.exists());
+    assert!(retired_wal.is_file());
+    assert_eq!(store.retired_generations(), [0]);
+    assert_eq!(
+        store
+            .cleanup_retired_generations()
+            .expect("cleanup retry succeeds"),
+        1
+    );
+    assert!(!retired_wal.exists());
+    assert!(store.retired_generations().is_empty());
+}
+
 /// Scenario: compaction interrupted at each persistence boundary in turn --
 /// every snapshot, WAL, marker, and directory-sync step.
 /// Guarantees: whatever step fails, reopening selects one complete
@@ -2182,6 +2283,52 @@ fn namespace_ownership_is_exclusive_and_bounded() {
     assert_eq!(successor.generation(), 0);
 }
 
+/// Scenario: a cancellable store open is waiting behind a live namespace
+/// owner when shutdown is asserted and the owner then releases the lock.
+/// Guarantees: the cancelled waiter returns without acquiring or cleaning
+/// the namespace, and an uncancelled successor can recover it immediately.
+#[test]
+fn cancelled_namespace_waiter_never_acquires_or_mutates_after_release() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    let owner = open(&path);
+    let stale_temp = path.join(temp_file_name(CURRENT_FILE_NAME));
+    write_bytes(&stale_temp, b"stale");
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let waiter_cancelled = std::sync::Arc::clone(&cancelled);
+    let (check_tx, check_rx) = std::sync::mpsc::channel();
+    let contended = StoreOptions {
+        ownership_timeout: Duration::from_secs(5),
+        ownership_retry_interval: Duration::from_millis(10),
+        ..options(&path)
+    };
+    let waiter = std::thread::spawn(move || {
+        CheckpointStore::open_cancellable(contended, || {
+            let _ = check_tx.send(());
+            waiter_cancelled.load(std::sync::atomic::Ordering::Acquire)
+        })
+    });
+
+    for _ in 0..7 {
+        check_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("waiter did not reach its first contended lock attempt");
+    }
+    cancelled.store(true, std::sync::atomic::Ordering::Release);
+    drop(owner);
+
+    let opened = waiter
+        .join()
+        .expect("waiter thread joins")
+        .expect("open succeeds");
+    assert!(opened.is_none());
+    assert!(stale_temp.exists());
+
+    let successor = open(&path);
+    assert_eq!(successor.generation(), 0);
+    assert!(!stale_temp.exists());
+}
+
 /// Scenario: transactions that are empty, larger than the format allows, or
 /// carry an operation that cannot replay against current durable state.
 /// Guarantees: each is refused before any byte reaches the WAL, so the
@@ -2271,6 +2418,39 @@ fn compaction_threshold_triggers_a_new_generation() {
     assert_eq!(reopened.recovery().snapshot_records, 1);
     assert_eq!(reopened.recovery().transactions_replayed, 0);
     assert_eq!(committed_offset(&reopened, 1), 256);
+}
+
+/// Scenario: cancellation becomes visible after a due compaction stages its
+/// complete snapshot/WAL pair but before it publishes `CURRENT`.
+/// Guarantees: compaction does not start marker publication, keeps the live
+/// handle on the old generation, and restart still selects the old state.
+#[test]
+fn compaction_cancellation_stops_before_marker_publication() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    let next_snapshot = path.join(snapshot_file_name(1));
+    let next_wal = path.join(wal_file_name(1));
+    let mut store = CheckpointStore::open(StoreOptions {
+        compact_after_transactions: 1,
+        ..options(&path)
+    })
+    .expect("namespace opens");
+    let _registered = store
+        .register_files(vec![registration(1)])
+        .expect("registers");
+
+    let outcome = store
+        .compact_if_due_cancellable(|| next_snapshot.is_file() && next_wal.is_file())
+        .expect("cancellation is not a compaction error");
+
+    assert!(outcome.is_none());
+    assert_eq!(store.generation(), 0);
+    assert_eq!(committed_offset(&store, 1), 0);
+    drop(store);
+
+    let reopened = open(&path);
+    assert_eq!(reopened.generation(), 0);
+    assert_eq!(committed_offset(&reopened, 1), 0);
 }
 
 /// Scenario: the size bounds a store resolves from its options, for the
@@ -2582,6 +2762,59 @@ fn artifact_growth_during_a_bounded_read_is_rejected() {
             ..
         }
     ));
+}
+
+/// Scenario: checkpoint recovery cancellation becomes visible immediately
+/// after the first chunk of a multi-chunk artifact read.
+/// Guarantees: the bounded reader returns its cancellation outcome before
+/// issuing a second read or returning a partial artifact as complete.
+#[test]
+fn artifact_read_cancellation_stops_between_chunks() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("artifact");
+    let bytes = vec![0x5a; 16 * 1024];
+    write_bytes(&path, &bytes);
+    let file = fs::File::open(&path).expect("artifact opens");
+    let mut cancellation_checks = 0usize;
+
+    let result = super::fsio::read_bounded_contents_cancellable(
+        file,
+        bytes.len(),
+        &path,
+        "test artifact",
+        bytes.len() as u64,
+        &mut || {
+            cancellation_checks += 1;
+            cancellation_checks >= 3
+        },
+    )
+    .expect("cancellation is not a read error");
+
+    assert!(result.is_none());
+    assert_eq!(cancellation_checks, 3);
+}
+
+/// Scenario: cancellation becomes visible after the first of two missing
+/// checkpoint namespace directories is created.
+/// Guarantees: namespace creation returns its cancellation outcome without
+/// issuing the next directory-creation operation.
+#[test]
+fn namespace_creation_cancellation_stops_between_directories() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let first = dir.path().join("first");
+    let namespace = first.join("namespace");
+    let mut cancellation_checks = 0usize;
+
+    let result = super::fsio::create_namespace_dir_cancellable(&namespace, &mut || {
+        cancellation_checks += 1;
+        first.is_dir()
+    })
+    .expect("cancellation is not a namespace creation error");
+
+    assert!(result.is_none());
+    assert!(cancellation_checks > 0);
+    assert!(first.is_dir());
+    assert!(!namespace.exists());
 }
 
 /// Scenario: a test-only snapshot cap is tightened below the current

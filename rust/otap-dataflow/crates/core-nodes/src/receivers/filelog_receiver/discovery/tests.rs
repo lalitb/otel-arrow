@@ -11,7 +11,7 @@ use tempfile::TempDir;
 
 use super::admission::AdmissionController;
 use super::scanner::{DiscoveryPlan, FilesystemScanner, validate_candidate_path_stability};
-use super::source::spawn_discovery;
+use super::source::{spawn_discovery, spawn_discovery_with_shutdown_signal};
 use super::*;
 use crate::receivers::filelog_receiver::checkpoint::primitives::{
     FRAMING_PROFILE_VERSION, FileId, FramingResume,
@@ -1031,6 +1031,81 @@ fn dedicated_source_orders_batches_and_shuts_down() {
         .unwrap();
 }
 
+/// Scenario: the owning read worker remains unavailable while async teardown
+/// asserts the cancellation signal shared directly with discovery.
+/// Guarantees: discovery exits without requiring its command channel or the
+/// read worker to resume first.
+#[test]
+fn shared_shutdown_signal_stops_discovery_out_of_band() {
+    let directory = TempDir::new().unwrap();
+    std::fs::write(directory.path().join("source.log"), b"line").unwrap();
+    let config = runtime_config(
+        directory.path(),
+        vec![pattern(directory.path(), "*.log")],
+        vec![],
+    );
+    let plan = DiscoveryPlan::from_runtime(&config).unwrap();
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let handle =
+        spawn_discovery_with_shutdown_signal(plan, Arc::clone(&shutdown_requested)).unwrap();
+
+    assert!(matches!(
+        handle.recv_timeout(Duration::from_secs(5)).unwrap(),
+        DiscoveryMessage::Batch(_)
+    ));
+    shutdown_requested.store(true, Ordering::Release);
+    assert!(matches!(
+        handle.recv_timeout(Duration::from_secs(5)).unwrap(),
+        DiscoveryMessage::Stopped
+    ));
+    handle
+        .into_join_handle()
+        .join()
+        .map_err(|_| DiscoveryError::ThreadPanicked)
+        .unwrap();
+}
+
+/// Scenario: candidate sampling is gated after its first handle observation
+/// while out-of-band discovery cancellation is asserted.
+/// Guarantees: reconciliation stops before canonicalization, resampling, or
+/// metadata lookup can begin and reports the explicit shutdown outcome.
+#[test]
+fn shared_shutdown_signal_stops_mid_candidate_sampling() {
+    let directory = TempDir::new().unwrap();
+    std::fs::write(directory.path().join("source.log"), b"line").unwrap();
+    let config = runtime_config(
+        directory.path(),
+        vec![pattern(directory.path(), "*.log")],
+        vec![],
+    );
+    let plan = DiscoveryPlan::from_runtime(&config).unwrap();
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let mut scanner =
+        FilesystemScanner::with_shutdown_signal(plan.clone(), Arc::clone(&shutdown_requested));
+    let gate = scanner.gate_next_candidate_after_first_sample_for_test();
+    let mut admission = AdmissionController::new(
+        plan.max_pending_candidates(),
+        plan.max_tracked_files(),
+        plan.max_candidate_events(),
+        plan.fingerprint_bytes(),
+    )
+    .unwrap();
+    let reconciliation =
+        std::thread::spawn(move || scanner.reconcile(&mut admission, SystemTime::now()));
+
+    assert!(
+        gate.wait_until_entered(Duration::from_secs(5)),
+        "scanner did not reach the gated candidate sample"
+    );
+    shutdown_requested.store(true, Ordering::Release);
+    gate.release();
+
+    assert!(matches!(
+        reconciliation.join().unwrap(),
+        Err(DiscoveryError::ShutdownRequested)
+    ));
+}
+
 /// Scenario: an exact literal include names one regular file rather than a
 /// directory root.
 /// Guarantees: depth-zero file roots are evaluated and admitted instead of
@@ -1109,7 +1184,7 @@ fn scanner_honors_cooperative_shutdown_before_reconciliation() {
         plan.fingerprint_bytes(),
     )
     .unwrap();
-    shutdown_requested.store(true, Ordering::Relaxed);
+    shutdown_requested.store(true, Ordering::Release);
 
     assert!(matches!(
         scanner.reconcile(&mut admission, SystemTime::now()),

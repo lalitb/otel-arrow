@@ -11,7 +11,9 @@ use crate::receivers::filelog_receiver::checkpoint::primitives::{
     Locator, QUARANTINE_REASON_RECOVERY_MISMATCH,
 };
 use crate::receivers::filelog_receiver::checkpoint::snapshot::SnapshotRecord;
-use crate::receivers::filelog_receiver::checkpoint::store::CheckpointStore;
+use crate::receivers::filelog_receiver::checkpoint::store::{
+    AtomicGroupAppendOutcome, CheckpointStore,
+};
 use crate::receivers::filelog_receiver::checkpoint::wal::{
     Operation, QuarantineFile, RegisterFile, UpdateFingerprint, UpdateMetadata,
 };
@@ -265,6 +267,30 @@ pub(crate) fn resolve_and_persist_with_admission(
         now_unix_nano,
         &mut RandomFileIdSource,
         true,
+        &mut || false,
+    )
+    .map(|resolved| resolved.expect("non-cancellable identity resolution cannot be cancelled"))
+}
+
+/// Resolves one complete reconciliation but abandons all planned operations
+/// when cancellation becomes visible immediately before persistence.
+pub(crate) fn resolve_and_persist_with_admission_cancellable(
+    store: &mut CheckpointStore,
+    candidates: &[CandidateEvidence],
+    inventory: &CandidateInventory,
+    settings: &IdentitySettings,
+    now_unix_nano: u64,
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<Option<Vec<IdentityResolution>>, IdentityError> {
+    resolve_with_source_mode(
+        store,
+        candidates,
+        inventory,
+        settings,
+        now_unix_nano,
+        &mut RandomFileIdSource,
+        true,
+        &mut cancelled,
     )
 }
 
@@ -284,7 +310,9 @@ pub(super) fn resolve_and_persist_with_source(
         now_unix_nano,
         file_ids,
         false,
+        &mut || false,
     )?;
+    let resolutions = resolutions.expect("non-cancellable identity resolution cannot be cancelled");
     resolutions
         .into_iter()
         .map(|resolution| match resolution {
@@ -305,7 +333,8 @@ fn resolve_with_source_mode(
     now_unix_nano: u64,
     file_ids: &mut impl FileIdSource,
     defer_new_at_capacity: bool,
-) -> Result<Vec<IdentityResolution>, IdentityError> {
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<Vec<IdentityResolution>>, IdentityError> {
     validate_resumption_profiles(store, settings)?;
     validate_candidates(candidates, inventory, settings)?;
 
@@ -492,11 +521,17 @@ fn resolve_with_source_mode(
         }
         resolutions.push(IdentityResolution::Resolved(plan.resolved));
     }
+    if cancelled() {
+        return Ok(None);
+    }
     if !operation_groups.is_empty() {
-        let _outcomes = store.append_atomic_groups(operation_groups)?;
+        match store.append_atomic_groups_cancellable(operation_groups, &mut *cancelled)? {
+            AtomicGroupAppendOutcome::Completed(_outcomes) => {}
+            AtomicGroupAppendOutcome::Cancelled { .. } => return Ok(None),
+        }
     }
 
-    Ok(resolutions)
+    Ok(Some(resolutions))
 }
 
 fn validate_candidates(

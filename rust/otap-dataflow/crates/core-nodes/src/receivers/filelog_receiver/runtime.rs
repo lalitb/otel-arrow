@@ -5,6 +5,7 @@
 
 use std::future::pending;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::time::{Duration, Instant as StdInstant};
 
@@ -37,6 +38,7 @@ use super::worker::{
 
 const WORKER_COMMAND_RETRY_LIMIT: usize = 200;
 const WORKER_COMMAND_RETRY_DELAY: Duration = Duration::from_millis(10);
+const WORKER_JOIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Runtime receiver constructed only after factory validation.
 pub(super) struct FilelogReceiver {
@@ -203,7 +205,7 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                             );
                         }
                     }
-                    shutdown_worker(&mut worker, &mut event_rx, &effect_handler).await?;
+                    shutdown_worker(&mut worker, &mut event_rx, &effect_handler, deadline).await?;
                     effect_handler.notify_receiver_drained().await?;
                     if let Some(metrics) = metrics.as_mut() {
                         add_counter_saturating(&mut metrics.drains, 1);
@@ -236,7 +238,16 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                             ).await? {
                                 DecisionOutcome::Continue => {}
                                 DecisionOutcome::Fail(key) => {
-                                    shutdown_worker(&mut worker, &mut event_rx, &effect_handler).await?;
+                                    shutdown_worker(
+                                        &mut worker,
+                                        &mut event_rx,
+                                        &effect_handler,
+                                        worker_cleanup_deadline(
+                                            drain_deadline,
+                                            config.drain_timeout,
+                                        ),
+                                    )
+                                    .await?;
                                     return Err(terminal_error(
                                         &effect_handler,
                                         format!(
@@ -275,7 +286,16 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                             ).await? {
                                 DecisionOutcome::Continue => {}
                                 DecisionOutcome::Fail(key) => {
-                                    shutdown_worker(&mut worker, &mut event_rx, &effect_handler).await?;
+                                    shutdown_worker(
+                                        &mut worker,
+                                        &mut event_rx,
+                                        &effect_handler,
+                                        worker_cleanup_deadline(
+                                            drain_deadline,
+                                            config.drain_timeout,
+                                        ),
+                                    )
+                                    .await?;
                                     return Err(terminal_error(
                                         &effect_handler,
                                         format!(
@@ -300,7 +320,13 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                             );
                         }
                         Ok(NodeControlMsg::Shutdown { deadline, .. }) => {
-                            shutdown_worker(&mut worker, &mut event_rx, &effect_handler).await?;
+                            shutdown_worker(
+                                &mut worker,
+                                &mut event_rx,
+                                &effect_handler,
+                                deadline,
+                            )
+                            .await?;
                             if let Some(metrics) = metrics.as_mut() {
                                 add_counter_saturating(&mut metrics.shutdowns, 1);
                             }
@@ -316,7 +342,13 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                             | NodeControlMsg::DelayedData { .. }
                             | NodeControlMsg::MemoryPressureChanged { .. }) => {}
                         Err(error) => {
-                            shutdown_worker(&mut worker, &mut event_rx, &effect_handler).await?;
+                            shutdown_worker(
+                                &mut worker,
+                                &mut event_rx,
+                                &effect_handler,
+                                worker_cleanup_deadline(drain_deadline, config.drain_timeout),
+                            )
+                            .await?;
                             return Err(Error::ChannelRecvError(error));
                         }
                     }
@@ -359,7 +391,16 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                                     .as_mut()
                                     .is_some_and(|pending| pending.begin_send(key));
                                 if !accepted {
-                                    shutdown_worker(&mut worker, &mut event_rx, &effect_handler).await?;
+                                    shutdown_worker(
+                                        &mut worker,
+                                        &mut event_rx,
+                                        &effect_handler,
+                                        worker_cleanup_deadline(
+                                            drain_deadline,
+                                            config.drain_timeout,
+                                        ),
+                                    )
+                                    .await?;
                                     return Err(terminal_error(
                                         &effect_handler,
                                         format!(
@@ -369,7 +410,16 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                                     ));
                                 }
                             } else if key.attempt != 1 {
-                                shutdown_worker(&mut worker, &mut event_rx, &effect_handler).await?;
+                                shutdown_worker(
+                                    &mut worker,
+                                    &mut event_rx,
+                                    &effect_handler,
+                                    worker_cleanup_deadline(
+                                        drain_deadline,
+                                        config.drain_timeout,
+                                    ),
+                                )
+                                .await?;
                                 return Err(terminal_error(
                                     &effect_handler,
                                     "filelog worker emitted a noninitial attempt without pending state",
@@ -396,7 +446,16 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                                             .as_mut()
                                             .is_some_and(|pending| pending.send_succeeded(key))
                                         {
-                                            shutdown_worker(&mut worker, &mut event_rx, &effect_handler).await?;
+                                            shutdown_worker(
+                                                &mut worker,
+                                                &mut event_rx,
+                                                &effect_handler,
+                                                worker_cleanup_deadline(
+                                                    drain_deadline,
+                                                    config.drain_timeout,
+                                                ),
+                                            )
+                                            .await?;
                                             return Err(terminal_error(
                                                 &effect_handler,
                                                 "filelog resend completed outside the expected sending state",
@@ -407,7 +466,13 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                                     }
                                 }
                                 SendOutcome::DrainDeadline(deadline) => {
-                                    shutdown_worker(&mut worker, &mut event_rx, &effect_handler).await?;
+                                    shutdown_worker(
+                                        &mut worker,
+                                        &mut event_rx,
+                                        &effect_handler,
+                                        deadline,
+                                    )
+                                    .await?;
                                     effect_handler.notify_receiver_drained().await?;
                                     if let Some(metrics) = metrics.as_mut() {
                                         add_counter_saturating(&mut metrics.drains, 1);
@@ -416,7 +481,13 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                                     return Ok(terminal_state(deadline, &mut metrics, &worker_telemetry));
                                 }
                                 SendOutcome::Shutdown(deadline) => {
-                                    shutdown_worker(&mut worker, &mut event_rx, &effect_handler).await?;
+                                    shutdown_worker(
+                                        &mut worker,
+                                        &mut event_rx,
+                                        &effect_handler,
+                                        deadline,
+                                    )
+                                    .await?;
                                     if let Some(metrics) = metrics.as_mut() {
                                         add_counter_saturating(&mut metrics.shutdowns, 1);
                                     }
@@ -439,7 +510,16 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                                 .filter(|pending| pending.key() == key)
                                 .and_then(PendingBatch::awaiting_commit);
                             if expected_loss != Some(explicit_loss) {
-                                shutdown_worker(&mut worker, &mut event_rx, &effect_handler).await?;
+                                shutdown_worker(
+                                    &mut worker,
+                                    &mut event_rx,
+                                    &effect_handler,
+                                    worker_cleanup_deadline(
+                                        drain_deadline,
+                                        config.drain_timeout,
+                                    ),
+                                )
+                                .await?;
                                 return Err(terminal_error(
                                     &effect_handler,
                                     format!(
@@ -483,7 +563,16 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                                         let message = format!(
                                             "filelog checkpoint commit for batch {batch_id} attempt {attempt} failed {consecutive_checkpoint_failures} consecutive times: {error}"
                                         );
-                                        shutdown_worker(&mut worker, &mut event_rx, &effect_handler).await?;
+                                        shutdown_worker(
+                                            &mut worker,
+                                            &mut event_rx,
+                                            &effect_handler,
+                                            worker_cleanup_deadline(
+                                                drain_deadline,
+                                                config.drain_timeout,
+                                            ),
+                                        )
+                                        .await?;
                                         return Err(terminal_error(&effect_handler, message));
                                     }
                                     send_worker_command(
@@ -500,14 +589,29 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                         }
                         Some(WorkerEvent::Drained) => {
                             if pending_batch.is_some() {
-                                shutdown_worker(&mut worker, &mut event_rx, &effect_handler).await?;
+                                shutdown_worker(
+                                    &mut worker,
+                                    &mut event_rx,
+                                    &effect_handler,
+                                    worker_cleanup_deadline(
+                                        drain_deadline,
+                                        config.drain_timeout,
+                                    ),
+                                )
+                                .await?;
                                 return Err(terminal_error(
                                     &effect_handler,
                                     "filelog worker reported drained with a pending batch",
                                 ));
                             }
                             let deadline = drain_deadline.unwrap_or_else(StdInstant::now);
-                            shutdown_worker(&mut worker, &mut event_rx, &effect_handler).await?;
+                            shutdown_worker(
+                                &mut worker,
+                                &mut event_rx,
+                                &effect_handler,
+                                deadline,
+                            )
+                            .await?;
                             effect_handler.notify_receiver_drained().await?;
                             if let Some(metrics) = metrics.as_mut() {
                                 add_counter_saturating(&mut metrics.drains, 1);
@@ -516,11 +620,23 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                             return Ok(terminal_state(deadline, &mut metrics, &worker_telemetry));
                         }
                         Some(WorkerEvent::Failed(message)) => {
-                            close_and_join_worker(&mut worker, &mut event_rx, &effect_handler).await?;
+                            close_and_join_worker(
+                                &mut worker,
+                                &mut event_rx,
+                                &effect_handler,
+                                worker_cleanup_deadline(drain_deadline, config.drain_timeout),
+                            )
+                            .await?;
                             return Err(terminal_error(&effect_handler, message));
                         }
                         Some(WorkerEvent::Stopped) | None => {
-                            close_and_join_worker(&mut worker, &mut event_rx, &effect_handler).await?;
+                            close_and_join_worker(
+                                &mut worker,
+                                &mut event_rx,
+                                &effect_handler,
+                                worker_cleanup_deadline(drain_deadline, config.drain_timeout),
+                            )
+                            .await?;
                             return Err(terminal_error(
                                 &effect_handler,
                                 "filelog read/checkpoint worker stopped unexpectedly",
@@ -534,7 +650,13 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
         .await;
 
         let result = if worker.is_some() {
-            let cleanup = shutdown_worker(&mut worker, &mut event_rx, &effect_handler).await;
+            let cleanup = shutdown_worker(
+                &mut worker,
+                &mut event_rx,
+                &effect_handler,
+                worker_cleanup_deadline(drain_deadline, config.drain_timeout),
+            )
+            .await;
             match (result, cleanup) {
                 (Ok(terminal), Ok(())) => Ok(terminal),
                 (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
@@ -881,6 +1003,16 @@ fn receiver_drain_deadline(engine_deadline: StdInstant, drain_timeout: Duration)
         .map_or(engine_deadline, |local| engine_deadline.min(local))
 }
 
+fn worker_cleanup_deadline(
+    lifecycle_deadline: Option<StdInstant>,
+    cleanup_timeout: Duration,
+) -> StdInstant {
+    lifecycle_deadline.unwrap_or_else(|| {
+        let now = StdInstant::now();
+        now.checked_add(cleanup_timeout).unwrap_or(now)
+    })
+}
+
 fn worker_sender(worker: &Option<WorkerHandle>) -> Result<&SyncSender<WorkerCommand>, Error> {
     worker
         .as_ref()
@@ -927,35 +1059,51 @@ async fn shutdown_worker(
     worker: &mut Option<WorkerHandle>,
     event_rx: &mut tokio::sync::mpsc::Receiver<WorkerEvent>,
     effect_handler: &local::EffectHandler<OtapPdata>,
+    deadline: StdInstant,
 ) -> Result<(), Error> {
     if let Some(handle) = worker.as_ref() {
-        let _ =
-            send_worker_command(&handle.command_tx, WorkerCommand::Shutdown, effect_handler).await;
+        handle.shutdown_requested.store(true, Ordering::Release);
+        let _ = handle.command_tx.try_send(WorkerCommand::Shutdown);
     }
-    close_and_join_worker(worker, event_rx, effect_handler).await
+    close_and_join_worker(worker, event_rx, effect_handler, deadline).await
 }
 
 async fn close_and_join_worker(
     worker: &mut Option<WorkerHandle>,
     event_rx: &mut tokio::sync::mpsc::Receiver<WorkerEvent>,
     effect_handler: &local::EffectHandler<OtapPdata>,
+    deadline: StdInstant,
 ) -> Result<(), Error> {
-    event_rx.close();
     let Some(worker) = worker.take() else {
+        event_rx.close();
         return Ok(());
     };
+    worker.shutdown_requested.store(true, Ordering::Release);
+    event_rx.close();
     let receiver_id = effect_handler.receiver_id();
     drop(worker.command_tx);
-    let worker_result = tokio::task::spawn_blocking(move || worker.join.join())
-        .await
-        .map_err(|error| {
-            receiver_error(
-                receiver_id.clone(),
-                format!("filelog worker join task failed: {error}"),
-            )
-        })?
-        .map_err(|_| receiver_error(receiver_id.clone(), "filelog worker thread panicked"))?;
-    worker_result.map_err(|error| receiver_error(receiver_id, error.to_string()))
+    let join = worker.join;
+    loop {
+        if join.is_finished() {
+            let worker_result = join.join().map_err(|_| {
+                receiver_error(receiver_id.clone(), "filelog worker thread panicked")
+            })?;
+            return worker_result.map_err(|error| receiver_error(receiver_id, error.to_string()));
+        }
+        let now = StdInstant::now();
+        if now >= deadline {
+            otel_warn!(
+                "filelog_receiver.worker_detached",
+                reason = "lifecycle_deadline"
+            );
+            drop(join);
+            return Ok(());
+        }
+        let next_poll = now
+            .checked_add(WORKER_JOIN_POLL_INTERVAL)
+            .map_or(deadline, |candidate| candidate.min(deadline));
+        tokio::time::sleep_until(tokio::time::Instant::from_std(next_poll)).await;
+    }
 }
 
 fn report_metrics(
@@ -1214,6 +1362,7 @@ mod tests {
     use crate::receivers::filelog_receiver::checkpoint::store::{CheckpointStore, StoreOptions};
     use crate::receivers::filelog_receiver::config::Config;
     use crate::receivers::filelog_receiver::telemetry::WorkerCounter;
+    use crate::receivers::filelog_receiver::worker::WorkerError;
 
     fn runtime_config() -> RuntimeConfig {
         let config: Config = serde_json::from_value(json!({
@@ -1260,6 +1409,59 @@ mod tests {
             .position(|field| field.name == name)
             .expect("terminal metric exists");
         snapshot.get_metrics()[index].clone()
+    }
+
+    /// Scenario: a worker thread remains gated beyond the active lifecycle
+    /// deadline while async teardown closes both of its bounded channels.
+    /// Guarantees: teardown returns by the deadline, detaches the finished
+    /// handle without occupying Tokio's blocking pool, and the worker can exit.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_join_deadline_detaches_blocked_thread() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            release_rx.recv().expect("test releases blocked worker");
+            finished_tx.send(()).expect("worker completion is observed");
+            Ok::<(), WorkerError>(())
+        });
+        let (command_tx, _command_rx) = std::sync::mpsc::sync_channel(1);
+        let shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut worker = Some(WorkerHandle {
+            command_tx,
+            join,
+            telemetry: Arc::new(WorkerTelemetryBridge::default()),
+            shutdown_requested: Arc::clone(&shutdown_requested),
+        });
+        let (_event_tx, mut event_rx) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+        let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
+        let (runtime_tx, _runtime_rx) = runtime_ctrl_msg_channel(1);
+        let effect_handler = local::EffectHandler::new(
+            test_node("filelog"),
+            HashMap::new(),
+            None,
+            runtime_tx,
+            metrics_reporter,
+        );
+        let deadline = StdInstant::now() + Duration::from_millis(10);
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            close_and_join_worker(&mut worker, &mut event_rx, &effect_handler, deadline),
+        )
+        .await
+        .expect("teardown obeys its lifecycle deadline")
+        .unwrap();
+
+        assert!(worker.is_none());
+        assert!(shutdown_requested.load(Ordering::Acquire));
+        assert!(matches!(
+            finished_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        release_tx.send(()).unwrap();
+        finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detached worker eventually exits");
     }
 
     /// Scenario: initial send, resend, Ack, retryable Nack, exhausted Nack,

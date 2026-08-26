@@ -277,6 +277,21 @@ pub struct AppendOutcome {
     pub compaction_due: bool,
 }
 
+/// Result of a cancellation-aware grouped append.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AtomicGroupAppendOutcome {
+    /// Every preflighted atomic group was appended.
+    Completed(Vec<AppendOutcome>),
+    /// Cancellation stopped the append before its next transaction.
+    ///
+    /// The listed transaction prefix is already durable according to each
+    /// transaction's normal persistence policy.
+    Cancelled {
+        /// Transactions completed before cancellation became visible.
+        completed: Vec<AppendOutcome>,
+    },
+}
+
 /// Durable and in-memory accounting for one store instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreStats {
@@ -489,7 +504,18 @@ impl CheckpointStore {
     /// `options`, taking exclusive ownership of it and recovering its
     /// durable state.
     pub fn open(options: StoreOptions) -> Result<Self, StoreError> {
-        Self::open_inner(options, FaultPlan::disabled())
+        Self::open_cancellable(options, || false)
+            .map(|store| store.expect("non-cancellable checkpoint open cannot be cancelled"))
+    }
+
+    /// Opens and recovers a checkpoint namespace while allowing lifecycle
+    /// cancellation to abandon lock acquisition and recovery between
+    /// durable stages.
+    pub(crate) fn open_cancellable(
+        options: StoreOptions,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<Option<Self>, StoreError> {
+        Self::open_inner(options, FaultPlan::disabled(), &mut cancelled)
     }
 
     /// Opens the namespace with `point` armed, so the first time the durable
@@ -500,7 +526,8 @@ impl CheckpointStore {
         options: StoreOptions,
         point: FaultPoint,
     ) -> Result<Self, StoreError> {
-        Self::open_inner(options, FaultPlan::armed(point))
+        Self::open_inner(options, FaultPlan::armed(point), &mut || false)
+            .map(|store| store.expect("non-cancellable checkpoint open cannot be cancelled"))
     }
 
     /// Opens the namespace with `point` armed after the requested number of
@@ -515,10 +542,16 @@ impl CheckpointStore {
         Self::open_inner(
             options,
             FaultPlan::armed_after(point, matching_occurrences_to_skip),
+            &mut || false,
         )
+        .map(|store| store.expect("non-cancellable checkpoint open cannot be cancelled"))
     }
 
-    fn open_inner(options: StoreOptions, mut faults: FaultPlan) -> Result<Self, StoreError> {
+    fn open_inner(
+        options: StoreOptions,
+        mut faults: FaultPlan,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<Option<Self>, StoreError> {
         // Resolved before anything is created or locked: options whose
         // worst-case artifacts could not be read back must not be used to
         // take ownership of a namespace at all.
@@ -552,16 +585,40 @@ impl CheckpointStore {
                 reason: "it is longer than the format's namespace_id maximum",
             });
         }
-        fsio::create_namespace_dir(&namespace_dir)?;
-        let lock =
-            NamespaceLock::acquire(&namespace_dir, ownership_timeout, ownership_retry_interval)?;
+        if cancelled() {
+            return Ok(None);
+        }
+        let Some(()) = fsio::create_namespace_dir_cancellable(&namespace_dir, &mut *cancelled)?
+        else {
+            return Ok(None);
+        };
+        let Some(lock) = NamespaceLock::acquire_cancellable(
+            &namespace_dir,
+            ownership_timeout,
+            ownership_retry_interval,
+            &mut *cancelled,
+        )?
+        else {
+            return Ok(None);
+        };
         // Only safe once this writer owns the namespace: a temporary file
         // could otherwise belong to a live writer's in-flight publication.
-        let removed_temp_files = layout::remove_stale_temp_files(&namespace_dir)?;
+        let Some(removed_temp_files) =
+            layout::remove_stale_temp_files(&namespace_dir, &mut *cancelled)?
+        else {
+            return Ok(None);
+        };
 
         let marker_path = namespace_dir.join(CURRENT_FILE_NAME);
-        let marker_bytes =
-            fsio::read_file_bounded(&marker_path, "CURRENT marker", MARKER_READ_MAX_BYTES)?;
+        let Some(marker_bytes) = fsio::read_file_bounded_cancellable(
+            &marker_path,
+            "CURRENT marker",
+            MARKER_READ_MAX_BYTES,
+            &mut *cancelled,
+        )?
+        else {
+            return Ok(None);
+        };
         let selection = match marker_bytes {
             Some(bytes) => {
                 let generation =
@@ -576,22 +633,47 @@ impl CheckpointStore {
                     adopted_without_marker: false,
                 }
             }
-            None => Self::select_without_marker(&namespace_dir, &mut faults, &limits)?,
+            None => {
+                let Some(selection) = Self::select_without_marker(
+                    &namespace_dir,
+                    &mut faults,
+                    &limits,
+                    &mut *cancelled,
+                )?
+                else {
+                    return Ok(None);
+                };
+                selection
+            }
         };
+        if cancelled() {
+            return Ok(None);
+        }
 
         let generation = selection.generation;
         let wal_path = namespace_dir.join(wal_file_name(generation));
-        let loaded = Self::load_generation(
+        let Some(loaded) = Self::load_generation(
             &namespace_dir,
             generation,
             &namespace_id,
             &limits,
             max_tracked_files,
             fingerprint_bytes,
-        )?;
+            &mut *cancelled,
+        )?
+        else {
+            return Ok(None);
+        };
         if loaded.torn_tail_bytes > 0 {
+            if cancelled() {
+                return Ok(None);
+            }
             faults.check(FaultPoint::BeforeTornTailTruncate)?;
-            fsio::truncate_file(&wal_path, loaded.wal_valid_len)?;
+            let Some(()) =
+                fsio::truncate_file_cancellable(&wal_path, loaded.wal_valid_len, &mut *cancelled)?
+            else {
+                return Ok(None);
+            };
             faults.check(FaultPoint::AfterTornTailTruncate)?;
         }
         if selection.adopted_without_marker {
@@ -600,15 +682,29 @@ impl CheckpointStore {
             // namespace invariant that a marker always selects the
             // authoritative generation, so the next open takes the ordinary
             // path instead of relying on the first-store fallback again.
+            if cancelled() {
+                return Ok(None);
+            }
             Self::publish_marker(&namespace_dir, generation, &mut faults)
                 .map_err(|failure| failure.error)?;
         }
-        let wal = fsio::open_for_append(&wal_path)?;
+        if cancelled() {
+            return Ok(None);
+        }
+        let Some(wal) = fsio::open_for_append_cancellable(&wal_path, &mut *cancelled)? else {
+            return Ok(None);
+        };
 
-        let retired_generations: Vec<u64> = layout::scan_generations(&namespace_dir)?
+        let Some(generations) = layout::scan_generations(&namespace_dir, &mut *cancelled)? else {
+            return Ok(None);
+        };
+        let retired_generations: Vec<u64> = generations
             .into_keys()
             .filter(|found| *found != generation)
             .collect();
+        if cancelled() {
+            return Ok(None);
+        }
 
         let recovery = RecoveryReport {
             generation,
@@ -621,7 +717,7 @@ impl CheckpointStore {
             retired_generations: retired_generations.clone(),
         };
 
-        Ok(Self {
+        Ok(Some(Self {
             namespace_dir,
             namespace_id,
             sync_interval,
@@ -660,7 +756,7 @@ impl CheckpointStore {
             faults,
             unusable: None,
             recovery,
-        })
+        }))
     }
 
     /// Rejects a configuration that is narrower than the selected durable
@@ -710,8 +806,11 @@ impl CheckpointStore {
         dir: &Path,
         faults: &mut FaultPlan,
         limits: &StoreLimits,
-    ) -> Result<Selection, StoreError> {
-        let scan = layout::scan_generations(dir)?;
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<Option<Selection>, StoreError> {
+        let Some(scan) = layout::scan_generations(dir, &mut *cancelled)? else {
+            return Ok(None);
+        };
         // Any file belonging to a later generation, complete or not, proves
         // the namespace has been compacted, which in turn proves a marker
         // once existed. Its absence is then unexplained, so nothing here is
@@ -733,24 +832,35 @@ impl CheckpointStore {
         // can be missing.
         let initial_pair = scan.get(&INITIAL_GENERATION).copied().unwrap_or_default();
         if initial_pair.is_complete() {
-            return Ok(Selection {
+            return Ok(Some(Selection {
                 generation: INITIAL_GENERATION,
                 created: false,
                 adopted_without_marker: true,
-            });
+            }));
         }
 
         // Either an empty namespace, or an initial generation whose pair was
         // never completed. Neither was ever authoritative (no marker has ever
         // named it), so creating the initial generation cannot discard
         // durable progress.
-        Self::verify_incomplete_initial_pair_is_empty(dir, limits)?;
-        Self::create_generation(dir, INITIAL_GENERATION, &[], limits, faults)?;
-        Ok(Selection {
+        if !Self::verify_incomplete_initial_pair_is_empty(dir, limits, &mut *cancelled)? {
+            return Ok(None);
+        }
+        if !Self::create_generation_cancellable(
+            dir,
+            INITIAL_GENERATION,
+            &[],
+            limits,
+            faults,
+            &mut *cancelled,
+        )? {
+            return Ok(None);
+        }
+        Ok(Some(Selection {
             generation: INITIAL_GENERATION,
             created: true,
             adopted_without_marker: false,
-        })
+        }))
     }
 
     /// Refuses to overwrite an incomplete initial generation that carries
@@ -767,11 +877,19 @@ impl CheckpointStore {
     fn verify_incomplete_initial_pair_is_empty(
         dir: &Path,
         limits: &StoreLimits,
-    ) -> Result<(), StoreError> {
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<bool, StoreError> {
         let snapshot_path = dir.join(snapshot_file_name(INITIAL_GENERATION));
-        if let Some(bytes) =
-            fsio::read_file_bounded(&snapshot_path, "snapshot", limits.max_snapshot_bytes)?
-        {
+        let Some(snapshot) = fsio::read_file_bounded_cancellable(
+            &snapshot_path,
+            "snapshot",
+            limits.max_snapshot_bytes,
+            &mut *cancelled,
+        )?
+        else {
+            return Ok(false);
+        };
+        if let Some(bytes) = snapshot {
             let snapshot = decode_snapshot(&bytes).map_err(|source| StoreError::Decode {
                 artifact: "snapshot",
                 path: snapshot_path.clone(),
@@ -793,8 +911,20 @@ impl CheckpointStore {
                 });
             }
         }
+        if cancelled() {
+            return Ok(false);
+        }
         let wal_path = dir.join(wal_file_name(INITIAL_GENERATION));
-        if let Some(bytes) = fsio::read_file_bounded(&wal_path, "WAL", limits.max_wal_bytes)? {
+        let Some(wal) = fsio::read_file_bounded_cancellable(
+            &wal_path,
+            "WAL",
+            limits.max_wal_bytes,
+            &mut *cancelled,
+        )?
+        else {
+            return Ok(false);
+        };
+        if let Some(bytes) = wal {
             let wal_generation =
                 decode_wal_header(&bytes).map_err(|source| StoreError::Decode {
                     artifact: "WAL",
@@ -828,7 +958,7 @@ impl CheckpointStore {
                 });
             }
         }
-        Ok(())
+        Ok(!cancelled())
     }
 
     /// Loads and validates one complete generation: its snapshot as the
@@ -845,13 +975,21 @@ impl CheckpointStore {
         limits: &StoreLimits,
         max_tracked_files: u32,
         fingerprint_bytes: u64,
-    ) -> Result<LoadedGeneration, StoreError> {
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<Option<LoadedGeneration>, StoreError> {
         let snapshot_path = dir.join(snapshot_file_name(generation));
         let wal_path = dir.join(wal_file_name(generation));
 
-        let Some(snapshot_bytes) =
-            fsio::read_file_bounded(&snapshot_path, "snapshot", limits.max_snapshot_bytes)?
+        let Some(snapshot_bytes) = fsio::read_file_bounded_cancellable(
+            &snapshot_path,
+            "snapshot",
+            limits.max_snapshot_bytes,
+            &mut *cancelled,
+        )?
         else {
+            return Ok(None);
+        };
+        let Some(snapshot_bytes) = snapshot_bytes else {
             return Err(StoreError::IncompleteGeneration {
                 dir: dir.to_path_buf(),
                 generation,
@@ -894,11 +1032,22 @@ impl CheckpointStore {
                 }
             })?;
         drop(snapshot_bytes);
+        if cancelled() {
+            return Ok(None);
+        }
         Self::validate_recovered_configuration(&table, dir, max_tracked_files, fingerprint_bytes)?;
         Self::reject_recovered_reserved_reason_codes(&table, dir, generation)?;
 
-        let Some(wal_bytes) = fsio::read_file_bounded(&wal_path, "WAL", limits.max_wal_bytes)?
+        let Some(wal_bytes) = fsio::read_file_bounded_cancellable(
+            &wal_path,
+            "WAL",
+            limits.max_wal_bytes,
+            &mut *cancelled,
+        )?
         else {
+            return Ok(None);
+        };
+        let Some(wal_bytes) = wal_bytes else {
             return Err(StoreError::IncompleteGeneration {
                 dir: dir.to_path_buf(),
                 generation,
@@ -925,6 +1074,9 @@ impl CheckpointStore {
         let mut transactions_replayed = 0usize;
         let mut torn_tail_bytes = 0usize;
         while cursor < wal_bytes.len() {
+            if cancelled() {
+                return Ok(None);
+            }
             let remaining = &wal_bytes[cursor..];
             if remaining.len() >= size_of::<u32>() {
                 let mut encoded_len = [0u8; size_of::<u32>()];
@@ -1047,14 +1199,17 @@ impl CheckpointStore {
         let wal_valid_len = u64::try_from(cursor)
             .map_err(|_| StoreError::AccountingOverflow { bytes: u64::MAX })?;
 
-        Ok(LoadedGeneration {
+        if cancelled() {
+            return Ok(None);
+        }
+        Ok(Some(LoadedGeneration {
             table,
             snapshot_records,
             transactions_replayed,
             torn_tail_bytes,
             wal_valid_len,
             next_sequence: expected_sequence,
-        })
+        }))
     }
 
     /// Fails closed when recovered durable state carries the reserved
@@ -1127,15 +1282,29 @@ impl CheckpointStore {
 
     /// Writes and syncs a complete generation (snapshot plus empty WAL) and
     /// then atomically makes it authoritative.
-    fn create_generation(
+    fn create_generation_cancellable(
         dir: &Path,
         generation: u64,
         records: &[SnapshotRecord],
         limits: &StoreLimits,
         faults: &mut FaultPlan,
-    ) -> Result<(), StoreError> {
-        Self::stage_generation(dir, generation, records, limits, faults)?;
-        Self::publish_marker(dir, generation, faults).map_err(|failure| failure.error)
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<bool, StoreError> {
+        if !Self::stage_generation_cancellable(
+            dir,
+            generation,
+            records,
+            limits,
+            faults,
+            &mut *cancelled,
+        )? {
+            return Ok(false);
+        }
+        if cancelled() {
+            return Ok(false);
+        }
+        Self::publish_marker(dir, generation, faults).map_err(|failure| failure.error)?;
+        Ok(true)
     }
 
     /// Steps 1-3 of Appendix B's compaction sequence: write the complete new
@@ -1154,6 +1323,20 @@ impl CheckpointStore {
         limits: &StoreLimits,
         faults: &mut FaultPlan,
     ) -> Result<(), StoreError> {
+        Self::stage_generation_cancellable(dir, generation, records, limits, faults, &mut || false)
+            .map(|completed| {
+                debug_assert!(completed, "non-cancellable generation staging completes");
+            })
+    }
+
+    fn stage_generation_cancellable(
+        dir: &Path,
+        generation: u64,
+        records: &[SnapshotRecord],
+        limits: &StoreLimits,
+        faults: &mut FaultPlan,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<bool, StoreError> {
         let snapshot_bytes =
             encode_snapshot(generation, records).map_err(|source| StoreError::Encode {
                 artifact: "snapshot",
@@ -1176,25 +1359,41 @@ impl CheckpointStore {
             source,
         })?;
 
-        fsio::write_file_atomically(
+        if cancelled() {
+            return Ok(false);
+        }
+        let snapshot_result = fsio::write_file_atomically(
             dir,
             &snapshot_file_name(generation),
             &snapshot_bytes,
             faults,
             AtomicWriteFaults::SNAPSHOT,
         )
-        .map_err(|failure| failure.error)?;
-        fsio::write_file_atomically(
+        .map_err(|failure| failure.error);
+        if cancelled() {
+            return Ok(false);
+        }
+        snapshot_result?;
+        let wal_result = fsio::write_file_atomically(
             dir,
             &wal_file_name(generation),
             &wal_bytes,
             faults,
             AtomicWriteFaults::WAL,
         )
-        .map_err(|failure| failure.error)?;
+        .map_err(|failure| failure.error);
+        if cancelled() {
+            return Ok(false);
+        }
+        wal_result?;
         faults.check(FaultPoint::BeforeGenerationDirSync)?;
-        fsio::sync_directory(dir)?;
-        faults.check(FaultPoint::AfterGenerationDirSync)
+        let synced = fsio::sync_directory(dir);
+        if cancelled() {
+            return Ok(false);
+        }
+        synced?;
+        faults.check(FaultPoint::AfterGenerationDirSync)?;
+        Ok(true)
     }
 
     /// Steps 4-5 of Appendix B's compaction sequence: atomically replace
@@ -1454,6 +1653,25 @@ impl CheckpointStore {
         &mut self,
         groups: Vec<Vec<Operation>>,
     ) -> Result<Vec<AppendOutcome>, StoreError> {
+        match self.append_atomic_groups_cancellable(groups, || false)? {
+            AtomicGroupAppendOutcome::Completed(outcomes) => Ok(outcomes),
+            AtomicGroupAppendOutcome::Cancelled { .. } => {
+                unreachable!("a non-cancellable grouped append cannot be cancelled")
+            }
+        }
+    }
+
+    /// Appends caller-defined atomic groups while checking cancellation
+    /// immediately before every format-bounded WAL transaction.
+    ///
+    /// Cancellation can leave a complete durable transaction prefix, but
+    /// never a partial caller-defined atomic group. Recovery safely resumes
+    /// from that prefix without treating the entire plan as applied.
+    pub(crate) fn append_atomic_groups_cancellable(
+        &mut self,
+        groups: Vec<Vec<Operation>>,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<AtomicGroupAppendOutcome, StoreError> {
         self.ensure_usable("append grouped checkpoint transactions")?;
         let (operations, transaction_lengths) = pack_atomic_groups(groups)?;
         let mut offset = 0usize;
@@ -1468,9 +1686,14 @@ impl CheckpointStore {
         let mut operations = operations.into_iter();
         for length in transaction_lengths {
             let transaction: Vec<Operation> = operations.by_ref().take(length).collect();
+            if cancelled() {
+                return Ok(AtomicGroupAppendOutcome::Cancelled {
+                    completed: outcomes,
+                });
+            }
             outcomes.push(self.append(transaction)?);
         }
-        Ok(outcomes)
+        Ok(AtomicGroupAppendOutcome::Completed(outcomes))
     }
 
     /// Registers newly discovered files. Every registration in one call is
@@ -1766,12 +1989,25 @@ impl CheckpointStore {
 
     /// Compacts if a configured threshold is met, reporting whether it did.
     pub fn compact_if_due(&mut self) -> Result<bool, StoreError> {
+        self.compact_if_due_cancellable(&mut || false)
+            .map(|compacted| compacted.expect("non-cancellable compaction cannot be cancelled"))
+    }
+
+    pub(crate) fn compact_if_due_cancellable(
+        &mut self,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<Option<bool>, StoreError> {
+        if cancelled() {
+            return Ok(None);
+        }
         self.ensure_usable("check whether checkpoint compaction is due")?;
         if !self.compaction_due() {
-            return Ok(false);
+            return Ok(Some(false));
         }
-        self.compact()?;
-        Ok(true)
+        let Some(()) = self.compact_cancellable(&mut cancelled)? else {
+            return Ok(None);
+        };
+        Ok(Some(true))
     }
 
     /// Compacts the namespace: writes and syncs a complete new generation
@@ -1782,6 +2018,17 @@ impl CheckpointStore {
     /// point in this sequence leaves recovery with either the complete old
     /// generation or the complete new one.
     pub fn compact(&mut self) -> Result<(), StoreError> {
+        self.compact_cancellable(&mut || false)
+            .map(|compacted| compacted.expect("non-cancellable compaction cannot be cancelled"))
+    }
+
+    fn compact_cancellable(
+        &mut self,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<Option<()>, StoreError> {
+        if cancelled() {
+            return Ok(None);
+        }
         self.ensure_usable("compact the checkpoint namespace")?;
         if let Some(generation) = self.retired_generations.first().copied() {
             return Err(StoreError::RetiredGenerationCleanupRequired {
@@ -1793,7 +2040,11 @@ impl CheckpointStore {
         // replaced; sync it first so a failure part way through compaction
         // cannot lose it from the old generation either.
         if self.unsynced_transactions > 0 {
-            self.sync_wal()?;
+            let synced = self.sync_wal();
+            if cancelled() {
+                return Ok(None);
+            }
+            synced?;
         }
 
         let previous = self.generation;
@@ -1804,31 +2055,35 @@ impl CheckpointStore {
             })?;
 
         let records = self.table.snapshot_records();
-        Self::stage_generation(
+        if cancelled() {
+            return Ok(None);
+        }
+        let staged = Self::stage_generation(
             &self.namespace_dir,
             next,
             &records,
             &self.limits,
             &mut self.faults,
-        )?;
+        );
+        if cancelled() {
+            return Ok(None);
+        }
+        staged?;
 
-        if let Err(failure) = Self::publish_marker(&self.namespace_dir, next, &mut self.faults) {
+        let wal_path = self.namespace_dir.join(wal_file_name(next));
+        let Some(wal) = fsio::open_for_append_cancellable(&wal_path, &mut *cancelled)? else {
+            return Ok(None);
+        };
+
+        let published = Self::publish_marker(&self.namespace_dir, next, &mut self.faults);
+        let cancelled_after_publish = cancelled();
+        if let Err(failure) = published {
             if failure.destination_may_have_changed {
                 self.unusable =
                     Some("CURRENT was repointed or may have changed when publication failed");
             }
             return Err(failure.error);
         }
-
-        let wal_path = self.namespace_dir.join(wal_file_name(next));
-        let wal = match fsio::open_for_append(&wal_path) {
-            Ok(wal) => wal,
-            Err(error) => {
-                self.unusable =
-                    Some("the newly compacted generation's WAL could not be opened for appending");
-                return Err(error);
-            }
-        };
 
         // Replacing the handle closes the previous generation's WAL, which
         // Windows requires before that file can be removed by cleanup.
@@ -1841,7 +2096,11 @@ impl CheckpointStore {
         self.unsynced_transactions = 0;
         self.last_sync = Instant::now();
         self.retired_generations.push(previous);
-        Ok(())
+        if cancelled_after_publish {
+            Ok(None)
+        } else {
+            Ok(Some(()))
+        }
     }
 
     /// Generations kept on disk after compaction, oldest first.
@@ -1863,9 +2122,20 @@ impl CheckpointStore {
     /// after both files disappeared but their directory updates were not
     /// known durable.
     pub fn cleanup_retired_generations(&mut self) -> Result<usize, StoreError> {
+        self.cleanup_retired_generations_cancellable(&mut || false)
+            .map(|cleaned| cleaned.expect("non-cancellable cleanup cannot be cancelled"))
+    }
+
+    pub(crate) fn cleanup_retired_generations_cancellable(
+        &mut self,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<Option<usize>, StoreError> {
+        if cancelled() {
+            return Ok(None);
+        }
         self.ensure_usable("clean up retired checkpoint generations")?;
         if self.retired_generations.is_empty() {
-            return Ok(0);
+            return Ok(Some(0));
         }
         let completed = self.retired_generations.len();
         for generation in self.retired_generations.iter().copied() {
@@ -1876,31 +2146,56 @@ impl CheckpointStore {
                     reason: "the authoritative generation appeared in the retired list",
                 });
             }
-            let _removed =
-                Self::remove_generation_files(&self.namespace_dir, generation, &mut self.faults)?;
+            let Some(_removed) = Self::remove_generation_files_cancellable(
+                &self.namespace_dir,
+                generation,
+                &mut self.faults,
+                &mut cancelled,
+            )?
+            else {
+                return Ok(None);
+            };
         }
         // Keep the complete pending list until the directory sync succeeds.
         // A retry after either an unlink or sync failure can therefore
         // repeat idempotent removals and retry the durability boundary.
         self.faults.check(FaultPoint::BeforeRetiredDirectorySync)?;
-        fsio::sync_directory(&self.namespace_dir)?;
+        let Some(()) = fsio::sync_directory_cancellable(&self.namespace_dir, &mut cancelled)?
+        else {
+            return Ok(None);
+        };
         self.retired_generations.clear();
-        Ok(completed)
+        Ok(Some(completed))
     }
 
     /// Removes one retired generation's snapshot/WAL pair, reporting
     /// whether either file was present.
-    fn remove_generation_files(
+    fn remove_generation_files_cancellable(
         dir: &Path,
         generation: u64,
         faults: &mut FaultPlan,
-    ) -> Result<bool, StoreError> {
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<Option<bool>, StoreError> {
+        if cancelled() {
+            return Ok(None);
+        }
         faults.check(FaultPoint::BeforeRetiredGenerationRemoval)?;
         let snapshot_removed =
-            fsio::remove_file_if_present(&dir.join(snapshot_file_name(generation)))?;
+            fsio::remove_file_if_present(&dir.join(snapshot_file_name(generation)));
+        if cancelled() {
+            return Ok(None);
+        }
+        let snapshot_removed = snapshot_removed?;
         faults.check(FaultPoint::AfterRetiredSnapshotRemoval)?;
-        let wal_removed = fsio::remove_file_if_present(&dir.join(wal_file_name(generation)))?;
-        Ok(snapshot_removed || wal_removed)
+        if cancelled() {
+            return Ok(None);
+        }
+        let wal_removed = fsio::remove_file_if_present(&dir.join(wal_file_name(generation)));
+        if cancelled() {
+            return Ok(None);
+        }
+        let wal_removed = wal_removed?;
+        Ok(Some(snapshot_removed || wal_removed))
     }
 
     fn ensure_usable(&self, operation: &'static str) -> Result<(), StoreError> {

@@ -862,6 +862,7 @@ fn due_sync_failure_does_not_count_unattempted_cleanup() {
         FaultPoint::BeforeWalSync,
         1,
         Arc::clone(&telemetry),
+        Arc::new(AtomicBool::new(false)),
     )
     .unwrap();
     let file_id = FileId::from_bytes([88; 16]);
@@ -2013,7 +2014,10 @@ fn pre_discovery_path_replacement_uses_per_file_containment() {
             file_id: unavailable
         } if unavailable == file_id
     ));
-    let released = runtime.contain_removed_without_descriptor(file_id).unwrap();
+    let released = runtime
+        .contain_removed_without_descriptor(file_id)
+        .unwrap()
+        .expect("descriptor quarantine was not cancelled");
     runtime
         .remember_inactive_locator(released, file_id)
         .unwrap();
@@ -2057,6 +2061,199 @@ fn paused_source_deadlines_do_not_zero_the_command_wait() {
     assert_eq!(runtime.next_wait(None), Duration::ZERO);
     assert!(runtime.next_maintenance_wait() > Duration::ZERO);
     runtime.shutdown_resources().unwrap();
+}
+
+/// Scenario: Drain and a matching Ack commit are buffered while out-of-band
+/// forced-shutdown cancellation is asserted before the worker resumes.
+/// Guarantees: priority cancellation dequeues neither command and restart
+/// observes no durable progress from the retained batch.
+#[test]
+fn forced_shutdown_preempts_queued_commit_progress() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("forced-shutdown.log");
+    std::fs::write(&source, b"line\n").unwrap();
+    let namespace = directory.path().join("checkpoint");
+    let config = runtime_config(source.to_str().unwrap(), &namespace, 1);
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let mut runtime = WorkerRuntime::new_with_telemetry(
+        config.clone(),
+        Arc::new(WorkerTelemetryBridge::default()),
+        Arc::clone(&shutdown_requested),
+    )
+    .unwrap();
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+    let (command_tx, command_rx) = sync_channel(4);
+    let deadline = Instant::now() + Duration::from_secs(5);
+
+    while runtime.retained.is_none() {
+        assert_eq!(
+            runtime
+                .process_discovery_message(&event_tx, &command_rx)
+                .unwrap(),
+            LoopControl::Continue
+        );
+        let now = Instant::now();
+        match runtime.readers_mut().unwrap().poll(now).unwrap() {
+            ReaderPoll::Data(turn) => {
+                assert_eq!(
+                    runtime
+                        .process_turn(turn, now, &event_tx, &command_rx)
+                        .unwrap(),
+                    LoopControl::Continue
+                );
+            }
+            ReaderPoll::EndOfFile {
+                file_id,
+                file_epoch,
+                source_offset,
+                ..
+            } => {
+                assert_eq!(
+                    runtime
+                        .process_eof(
+                            file_id,
+                            file_epoch,
+                            source_offset,
+                            now,
+                            &event_tx,
+                            &command_rx,
+                        )
+                        .unwrap(),
+                    LoopControl::Continue
+                );
+            }
+            ReaderPoll::Idle { .. } | ReaderPoll::DescriptorCapacityBlocked { .. } => {
+                std::thread::yield_now();
+            }
+            other => panic!("unexpected reader state before retention: {other:?}"),
+        }
+        assert!(Instant::now() < deadline, "worker did not retain a batch");
+    }
+    let batch = match event_rx.try_recv().unwrap() {
+        WorkerEvent::Batch(batch) => batch,
+        other => panic!("expected retained batch, got {other:?}"),
+    };
+    command_tx.send(WorkerCommand::Drain).unwrap();
+    command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: batch.batch_id,
+            attempt: batch.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    shutdown_requested.store(true, Ordering::Release);
+
+    runtime.run(&event_tx, &command_rx).unwrap();
+
+    assert!(matches!(command_rx.try_recv(), Ok(WorkerCommand::Drain)));
+    assert!(matches!(
+        command_rx.try_recv(),
+        Ok(WorkerCommand::Commit { .. })
+    ));
+    runtime.shutdown_resources().unwrap();
+    drop(runtime);
+    drop(event_rx);
+    let store = CheckpointStore::open(StoreOptions::from_runtime_config(&config)).unwrap();
+    let record = store.table().iter().next().unwrap().1;
+    assert_eq!(record.committed_offset, 0);
+    assert_eq!(record.lifecycle_state, LifecycleState::Active);
+}
+
+/// Scenario: worker startup is waiting for a checkpoint namespace owned by
+/// another store when forced-shutdown cancellation is asserted.
+/// Guarantees: lock acquisition exits cleanly before ownership_timeout,
+/// emits no failure event, and leaves the namespace available to a successor.
+#[test]
+fn forced_shutdown_preempts_checkpoint_namespace_wait() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("namespace-wait.log");
+    std::fs::write(&source, b"line\n").unwrap();
+    let namespace = directory.path().join("checkpoint");
+    let config = runtime_config(source.to_str().unwrap(), &namespace, 1);
+    let owner =
+        CheckpointStore::open(StoreOptions::from_runtime_config(&config)).expect("owner opens");
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+    let worker = spawn_worker(config.clone(), event_tx).unwrap();
+
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        !worker.join.is_finished(),
+        "worker unexpectedly finished while namespace remained owned"
+    );
+    worker.shutdown_requested.store(true, Ordering::Release);
+    drop(worker.command_tx);
+    worker.join.join().unwrap().unwrap();
+
+    assert!(matches!(event_rx.try_recv(), Ok(WorkerEvent::Stopped)));
+    assert!(event_rx.try_recv().is_err());
+    drop(owner);
+    let successor =
+        CheckpointStore::open(StoreOptions::from_runtime_config(&config)).expect("successor opens");
+    assert_eq!(successor.generation(), 0);
+}
+
+/// Scenario: a selected source is gated immediately before its read syscall
+/// while forced-shutdown cancellation is asserted.
+/// Guarantees: no source read, decode quarantine, or checkpoint progress
+/// starts after cancellation becomes observable.
+#[test]
+fn forced_shutdown_after_blocked_poll_suppresses_decode_quarantine() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("blocked-poll.log");
+    std::fs::write(&source, [0xff, b'\n']).unwrap();
+    let namespace = directory.path().join("checkpoint");
+    let mut config = runtime_config(source.to_str().unwrap(), &namespace, 1);
+    config.on_decode_error = OnDecodeError::Fail;
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let telemetry = Arc::new(WorkerTelemetryBridge::default());
+    let mut runtime = WorkerRuntime::new_with_telemetry(
+        config.clone(),
+        Arc::clone(&telemetry),
+        Arc::clone(&shutdown_requested),
+    )
+    .unwrap();
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+    let (command_tx, command_rx) = sync_channel(4);
+    let deadline = Instant::now() + Duration::from_secs(5);
+
+    while runtime.readers_ref().unwrap().stats().tracked_readers == 0 {
+        assert!(Instant::now() < deadline, "discovery did not admit source");
+        assert_eq!(
+            runtime
+                .process_discovery_message(&event_tx, &command_rx)
+                .unwrap(),
+            LoopControl::Continue
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let poll_gate = runtime
+        .readers_mut()
+        .unwrap()
+        .gate_next_source_read_for_test();
+    let worker = std::thread::spawn(move || {
+        let result = runtime.run(&event_tx, &command_rx);
+        let shutdown_result = runtime.shutdown_resources();
+        result.and(shutdown_result)
+    });
+
+    assert!(
+        poll_gate.wait_until_entered(Duration::from_secs(5)),
+        "worker did not reach the gated source read"
+    );
+    shutdown_requested.store(true, Ordering::Release);
+    poll_gate.release();
+    worker.join().unwrap().unwrap();
+    drop(command_tx);
+
+    assert_eq!(
+        telemetry.counter_for_test(WorkerCounter::SourceBytesRead),
+        0
+    );
+    let store = CheckpointStore::open(StoreOptions::from_runtime_config(&config)).unwrap();
+    let record = store.table().iter().next().unwrap().1;
+    assert_eq!(record.committed_offset, 0);
+    assert_eq!(record.lifecycle_state, LifecycleState::Active);
+    assert!(record.quarantine_evidence.is_none());
 }
 
 /// Scenario: two files each hold a drain-flushable unterminated record while
@@ -2147,9 +2344,11 @@ fn drain_replays_flushable_records_across_multiple_batches() {
         other => panic!("expected first drain batch, got {other:?}"),
     };
     assert_eq!(first.record_count, 1);
-    runtime
-        .commit_retained(first.batch_id, first.attempt)
-        .unwrap();
+    assert!(
+        runtime
+            .commit_retained(first.batch_id, first.attempt)
+            .unwrap()
+    );
 
     assert_eq!(
         runtime.drive_drain(&event_tx, &command_rx).unwrap(),
@@ -2161,9 +2360,11 @@ fn drain_replays_flushable_records_across_multiple_batches() {
     };
     assert_eq!(second.record_count, 1);
     assert_ne!(first.batch_id, second.batch_id);
-    runtime
-        .commit_retained(second.batch_id, second.attempt)
-        .unwrap();
+    assert!(
+        runtime
+            .commit_retained(second.batch_id, second.attempt)
+            .unwrap()
+    );
 
     assert_eq!(
         runtime.drive_drain(&event_tx, &command_rx).unwrap(),
@@ -2256,9 +2457,11 @@ fn seal_before_discards_and_rereads_queued_turn_output() {
     assert_eq!(first.record_count, 1);
     let frontier = runtime.readers_ref().unwrap().frontiers().next().unwrap();
     assert_eq!((frontier.committed_offset, frontier.read_offset), (0, 4));
-    runtime
-        .commit_retained(first.batch_id, first.attempt)
-        .unwrap();
+    assert!(
+        runtime
+            .commit_retained(first.batch_id, first.attempt)
+            .unwrap()
+    );
 
     let replay = match runtime.readers_mut().unwrap().poll(Instant::now()).unwrap() {
         ReaderPoll::Data(turn) => turn,
@@ -2284,9 +2487,11 @@ fn seal_before_discards_and_rereads_queued_turn_output() {
         other => panic!("expected replay batch, got {other:?}"),
     };
     assert_eq!(second.record_count, 1);
-    runtime
-        .commit_retained(second.batch_id, second.attempt)
-        .unwrap();
+    assert!(
+        runtime
+            .commit_retained(second.batch_id, second.attempt)
+            .unwrap()
+    );
     assert_eq!(
         runtime
             .store

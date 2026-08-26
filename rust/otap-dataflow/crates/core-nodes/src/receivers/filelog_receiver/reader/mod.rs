@@ -14,6 +14,10 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::collections::{TryReserveError, hash_map::Entry};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
@@ -24,8 +28,8 @@ use super::discovery::DiscoveredCandidate;
 use super::identity::IdentityError;
 use super::identity::matcher::ResolvedIdentity;
 use super::identity::platform::{
-    ReopenCandidate, collect_consistent_fingerprint, encode_advisory_path, read_source_at,
-    reopen_candidate_at,
+    ReopenCandidate, collect_consistent_fingerprint_cancellable, encode_advisory_path,
+    read_source_at_cancellable, reopen_candidate_at_cancellable,
 };
 use super::lease::{LeaseError, ReceiverLeaseScope, RuntimeFileLease, register_receiver_scope};
 
@@ -326,6 +330,8 @@ pub(crate) enum RemovalDisposition {
 /// Result of refreshing queued discovery evidence from a live reader.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CandidateEvidenceRefresh {
+    /// Lifecycle cancellation stopped evidence sampling.
+    Cancelled,
     /// The queued size and fingerprint now match a stable handle observation.
     Refreshed,
     /// No descriptor is resident, so the queued observation remains the only
@@ -339,6 +345,9 @@ pub(crate) enum CandidateEvidenceRefresh {
 /// Result of one scheduler poll.
 #[derive(Debug)]
 pub(crate) enum ReaderPoll {
+    /// Lifecycle cancellation stopped the poll before another source
+    /// operation could begin.
+    Cancelled,
     /// One bounded source-byte turn is ready for decoding/framing.
     Data(ReadTurn),
     /// One reader observed temporary EOF and has a bounded next probe.
@@ -580,8 +589,55 @@ pub(crate) struct ReaderTable {
     read_buffer: Option<Vec<u8>>,
     counters: ActivityCounters,
     lease_observations: LeaseObservations,
+    shutdown_requested: Arc<AtomicBool>,
     #[cfg(test)]
     fail_next_revoked_release: bool,
+    #[cfg(test)]
+    next_source_read_gate: Option<ReaderPollGate>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ReaderPollGateState {
+    entered: bool,
+    released: bool,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ReaderPollGate {
+    state: Arc<(Mutex<ReaderPollGateState>, Condvar)>,
+}
+
+#[cfg(test)]
+impl ReaderPollGate {
+    fn block(&self) {
+        let (state, condition) = &*self.state;
+        let mut state = state.lock().expect("reader poll gate lock poisoned");
+        state.entered = true;
+        condition.notify_all();
+        while !state.released {
+            state = condition
+                .wait(state)
+                .expect("reader poll gate lock poisoned while blocked");
+        }
+    }
+
+    pub(crate) fn wait_until_entered(&self, timeout: Duration) -> bool {
+        let (state, condition) = &*self.state;
+        let state = state.lock().expect("reader poll gate lock poisoned");
+        let (state, _) = condition
+            .wait_timeout_while(state, timeout, |state| !state.entered)
+            .expect("reader poll gate lock poisoned while waiting");
+        state.entered
+    }
+
+    pub(crate) fn release(&self) {
+        let (state, condition) = &*self.state;
+        let mut state = state.lock().expect("reader poll gate lock poisoned");
+        state.released = true;
+        condition.notify_all();
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -620,6 +676,15 @@ impl ReaderTable {
     /// Creates a bounded table and reserves its one shared source-read
     /// buffer before any file can be admitted.
     pub(crate) fn new(settings: ReaderSettings) -> Result<Self, ReaderError> {
+        Self::new_with_shutdown_signal(settings, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Creates a bounded table that observes the worker's out-of-band
+    /// lifecycle cancellation signal between source operations.
+    pub(crate) fn new_with_shutdown_signal(
+        settings: ReaderSettings,
+        shutdown_requested: Arc<AtomicBool>,
+    ) -> Result<Self, ReaderError> {
         if settings.max_readers == 0 {
             return Err(ReaderError::InvalidSettings {
                 reason: "max_readers must be greater than zero",
@@ -693,9 +758,16 @@ impl ReaderTable {
             read_buffer: Some(read_buffer),
             counters: ActivityCounters::new(),
             lease_observations: LeaseObservations::default(),
+            shutdown_requested,
             #[cfg(test)]
             fail_next_revoked_release: false,
+            #[cfg(test)]
+            next_source_read_gate: None,
         })
+    }
+
+    fn cancellation_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::Acquire)
     }
 
     /// Adds one durably resolved active identity and acquires its runtime
@@ -928,6 +1000,9 @@ impl ReaderTable {
         now: Instant,
         limit: Option<ReadLimit>,
     ) -> Result<ReaderPoll, ReaderError> {
+        if self.cancellation_requested() {
+            return Ok(ReaderPoll::Cancelled);
+        }
         // This is a lock-free poison/integrity check. The process-wide
         // registry mutex remains off the source-byte data path.
         self.lease_scope.ensure_healthy_fast()?;
@@ -1001,12 +1076,17 @@ impl ReaderTable {
                 }
                 return Ok(ReaderPoll::DescriptorCapacityBlocked { file_id });
             }
-            match self.open_reader(file_id) {
-                Ok(OpenReaderOutcome::Compatible) => {}
-                Ok(OpenReaderOutcome::Truncated {
+            let opened = self.open_reader(file_id);
+            if self.cancellation_requested() {
+                return Ok(ReaderPoll::Cancelled);
+            }
+            match opened {
+                Ok(None) => return Ok(ReaderPoll::Cancelled),
+                Ok(Some(OpenReaderOutcome::Compatible)) => {}
+                Ok(Some(OpenReaderOutcome::Truncated {
                     observed_size,
                     observed_fingerprint,
-                }) => {
+                })) => {
                     let reader = self
                         .readers
                         .get(&file_id)
@@ -1066,6 +1146,9 @@ impl ReaderTable {
             }
         }
 
+        if self.cancellation_requested() {
+            return Ok(ReaderPoll::Cancelled);
+        }
         let service_sequence = increment(&mut self.service_sequence, "reader service sequence")?;
         let (file_epoch, committed_offset, framing_resume, source_offset, diagnostic_path) = {
             let reader = self
@@ -1112,6 +1195,14 @@ impl ReaderTable {
             None => self.settings.max_read_bytes_per_turn,
         };
         buffer.resize(turn_bytes, 0);
+        #[cfg(test)]
+        if let Some(gate) = self.next_source_read_gate.take() {
+            gate.block();
+        }
+        if self.cancellation_requested() {
+            self.read_buffer = Some(buffer);
+            return Ok(ReaderPoll::Cancelled);
+        }
         let _read_turns = increment(&mut self.counters.read_turns, "source read turns")?;
         let read_result = {
             let reader = self
@@ -1123,10 +1214,20 @@ impl ReaderTable {
             let resident = reader.resident.as_ref().ok_or(ReaderError::Inconsistent {
                 reason: "selected reader descriptor disappeared before a read",
             })?;
-            read_source_at(&resident.file, source_offset, &mut buffer)
+            read_source_at_cancellable(&resident.file, source_offset, &mut buffer, &mut || {
+                self.cancellation_requested()
+            })
         };
+        if self.cancellation_requested() {
+            self.read_buffer = Some(buffer);
+            return Ok(ReaderPoll::Cancelled);
+        }
         let count = match read_result {
-            Ok(count) => count,
+            Ok(Some(count)) => count,
+            Ok(None) => {
+                self.read_buffer = Some(buffer);
+                return Ok(ReaderPoll::Cancelled);
+            }
             Err(source) => {
                 self.read_buffer = Some(buffer);
                 return Err(ReaderError::Read {
@@ -1139,6 +1240,9 @@ impl ReaderTable {
 
         if count == 0 {
             self.read_buffer = Some(buffer);
+            if self.cancellation_requested() {
+                return Ok(ReaderPoll::Cancelled);
+            }
             let observation = {
                 let reader = self
                     .readers
@@ -1149,13 +1253,21 @@ impl ReaderTable {
                 let resident = reader.resident.as_ref().ok_or(ReaderError::Inconsistent {
                     reason: "EOF reader descriptor disappeared before metadata inspection",
                 })?;
-                classify_fingerprint_observation(collect_consistent_fingerprint(
+                let observation = collect_consistent_fingerprint_cancellable(
                     &resident.file,
                     &diagnostic_path,
                     self.settings.fingerprint_bytes,
                     self.settings.ignored_header_bytes,
-                ))
+                    &mut || self.cancellation_requested(),
+                );
+                let Some(observation) = observation? else {
+                    return Ok(ReaderPoll::Cancelled);
+                };
+                classify_fingerprint_observation(Ok(observation))
             };
+            if self.cancellation_requested() {
+                return Ok(ReaderPoll::Cancelled);
+            }
             let (observed_fingerprint, observed_size) = match observation? {
                 FingerprintObservation::Stable { fingerprint, size } => (fingerprint, size),
                 FingerprintObservation::Retry => {
@@ -1836,6 +1948,14 @@ impl ReaderTable {
         self.fail_next_revoked_release = true;
     }
 
+    #[cfg(test)]
+    /// Blocks the next source read until the returned gate is released.
+    pub(crate) fn gate_next_source_read_for_test(&mut self) -> ReaderPollGate {
+        let gate = ReaderPollGate::default();
+        self.next_source_read_gate = Some(gate.clone());
+        gate
+    }
+
     /// Validates a durable truncate reset against unchanged live state.
     pub(crate) fn preflight_truncate_reset(
         &self,
@@ -2052,12 +2172,17 @@ impl ReaderTable {
         let Some(resident) = reader.resident.as_ref() else {
             return Ok(CandidateEvidenceRefresh::DescriptorAbsent);
         };
-        match classify_fingerprint_observation(collect_consistent_fingerprint(
+        let observation = collect_consistent_fingerprint_cancellable(
             &resident.file,
             &candidate.matched_path,
             self.settings.fingerprint_bytes,
             self.settings.ignored_header_bytes,
-        ))? {
+            &mut || self.cancellation_requested(),
+        )?;
+        let Some(observation) = observation else {
+            return Ok(CandidateEvidenceRefresh::Cancelled);
+        };
+        match classify_fingerprint_observation(Ok(observation))? {
             FingerprintObservation::Stable { fingerprint, size } => {
                 candidate.evidence.fingerprint = fingerprint;
                 candidate.evidence.size = size;
@@ -2148,7 +2273,7 @@ impl ReaderTable {
         Ok(())
     }
 
-    fn open_reader(&mut self, file_id: FileId) -> Result<OpenReaderOutcome, ReaderError> {
+    fn open_reader(&mut self, file_id: FileId) -> Result<Option<OpenReaderOutcome>, ReaderError> {
         let (resolved_path, matched_path, locator, durable_fingerprint, read_offset, ever_opened) = {
             let reader = self
                 .readers
@@ -2163,7 +2288,7 @@ impl ReaderTable {
                 reader.ever_opened,
             )
         };
-        let reopened = reopen_candidate_at(
+        let reopened = reopen_candidate_at_cancellable(
             &resolved_path,
             &matched_path,
             self.settings.follow_symlinks,
@@ -2172,8 +2297,12 @@ impl ReaderTable {
             locator,
             &durable_fingerprint,
             read_offset,
+            || self.cancellation_requested(),
         )
         .map_err(|source| ReaderError::Reopen { file_id, source })?;
+        let Some(reopened) = reopened else {
+            return Ok(None);
+        };
         let (opened, outcome) = match reopened {
             ReopenCandidate::Compatible(opened) => (opened, OpenReaderOutcome::Compatible),
             ReopenCandidate::Truncated(opened) => {
@@ -2211,7 +2340,7 @@ impl ReaderTable {
         } else {
             let _opens = increment(&mut self.counters.opens, "reader opens")?;
         }
-        Ok(outcome)
+        Ok(Some(outcome))
     }
 
     fn select_lrs_victim(&self, target_file_id: FileId) -> Option<FileId> {

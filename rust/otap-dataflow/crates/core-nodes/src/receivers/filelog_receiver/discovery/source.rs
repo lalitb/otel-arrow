@@ -16,7 +16,7 @@ use super::{DiscoveryError, DiscoveryFeedback, DiscoveryMessage};
 const EVENT_CHANNEL_CAPACITY: usize = 1;
 const COMMAND_CHANNEL_CAPACITY: usize = 2;
 const FULL_CHANNEL_COMMAND_POLL: Duration = Duration::from_millis(50);
-const UNREPRESENTABLE_DEADLINE_WAIT: Duration = Duration::from_secs(60 * 60);
+const SHUTDOWN_SIGNAL_POLL: Duration = Duration::from_millis(50);
 
 #[derive(Debug)]
 enum DiscoveryCommand {
@@ -90,7 +90,7 @@ impl DiscoveryHandle {
     }
 
     pub(crate) fn request_shutdown(&self) {
-        self.shutdown_requested.store(true, Ordering::Relaxed);
+        self.shutdown_requested.store(true, Ordering::Release);
         let _ = self.command_tx.try_send(DiscoveryCommand::Shutdown);
     }
 
@@ -110,6 +110,14 @@ impl Drop for DiscoveryHandle {
 /// Spawns one fixed blocking thread so filesystem stalls cannot consume the
 /// async runtime's shared blocking pool.
 pub(crate) fn spawn_discovery(plan: DiscoveryPlan) -> Result<DiscoveryHandle, DiscoveryError> {
+    spawn_discovery_with_shutdown_signal(plan, Arc::new(AtomicBool::new(false)))
+}
+
+/// Spawns discovery with a cancellation signal shared by its owning worker.
+pub(crate) fn spawn_discovery_with_shutdown_signal(
+    plan: DiscoveryPlan,
+    shutdown_requested: Arc<AtomicBool>,
+) -> Result<DiscoveryHandle, DiscoveryError> {
     let admission = AdmissionController::new(
         plan.max_pending_candidates(),
         plan.max_tracked_files(),
@@ -120,7 +128,6 @@ pub(crate) fn spawn_discovery(plan: DiscoveryPlan) -> Result<DiscoveryHandle, Di
     // owns all mutable scan/admission state, so no shared mutex is needed.
     let (command_tx, command_rx) = sync_channel(COMMAND_CHANNEL_CAPACITY);
     let (message_tx, message_rx) = sync_channel(EVENT_CHANNEL_CAPACITY);
-    let shutdown_requested = Arc::new(AtomicBool::new(false));
     let thread_shutdown_requested = Arc::clone(&shutdown_requested);
     let join = std::thread::Builder::new()
         .name("otap-filelog-discovery".to_owned())
@@ -181,7 +188,7 @@ fn discovery_loop(
 
         let deadline = Instant::now().checked_add(poll_interval);
         loop {
-            if shutdown_requested.load(Ordering::Relaxed) {
+            if shutdown_requested.load(Ordering::Acquire) {
                 let _ = message_tx.try_send(DiscoveryMessage::Stopped);
                 return;
             }
@@ -215,10 +222,10 @@ fn next_poll_wait(deadline: Option<Instant>, now: Instant) -> Option<Duration> {
             if remaining.is_zero() {
                 None
             } else {
-                Some(remaining)
+                Some(remaining.min(SHUTDOWN_SIGNAL_POLL))
             }
         }
-        None => Some(UNREPRESENTABLE_DEADLINE_WAIT),
+        None => Some(SHUTDOWN_SIGNAL_POLL),
     }
 }
 
@@ -237,7 +244,7 @@ fn send_batch_interruptibly(
     let mut message = DiscoveryMessage::Batch(Box::new(batch));
     let mut scan_requested = false;
     loop {
-        if shutdown_requested.load(Ordering::Relaxed) {
+        if shutdown_requested.load(Ordering::Acquire) {
             return Ok(SendBatch::Shutdown);
         }
         match message_tx.try_send(message) {
@@ -270,7 +277,7 @@ fn send_failure(
 ) {
     let mut message = DiscoveryMessage::Failed(error);
     loop {
-        if shutdown_requested.load(Ordering::Relaxed) {
+        if shutdown_requested.load(Ordering::Acquire) {
             return;
         }
         match message_tx.try_send(message) {
@@ -401,7 +408,7 @@ mod tests {
     fn unrepresentable_poll_deadline_does_not_expire_immediately() {
         assert_eq!(
             next_poll_wait(None, Instant::now()),
-            Some(UNREPRESENTABLE_DEADLINE_WAIT)
+            Some(SHUTDOWN_SIGNAL_POLL)
         );
     }
 }

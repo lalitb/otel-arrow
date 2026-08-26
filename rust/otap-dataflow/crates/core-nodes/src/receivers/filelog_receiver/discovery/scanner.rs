@@ -7,6 +7,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, SystemTime};
 
 use globset::GlobMatcher;
@@ -17,7 +19,7 @@ use super::{DiscoveredCandidate, DiscoveryError, DiscoveryIssue, ReconciliationB
 use crate::receivers::filelog_receiver::config::{RuntimeConfig, glob_literal_prefix};
 use crate::receivers::filelog_receiver::identity::IdentityError;
 use crate::receivers::filelog_receiver::identity::platform::{
-    encode_advisory_path, open_candidate_at,
+    encode_advisory_path, open_candidate_at_cancellable,
 };
 
 #[derive(Debug, Clone)]
@@ -174,6 +176,52 @@ impl DiscoveryPlan {
 pub(crate) struct FilesystemScanner {
     plan: DiscoveryPlan,
     shutdown_requested: Arc<AtomicBool>,
+    #[cfg(test)]
+    next_candidate_sample_gate: Mutex<Option<CandidateSamplingGate>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct CandidateSamplingGateState {
+    entered: bool,
+    released: bool,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CandidateSamplingGate {
+    state: Arc<(Mutex<CandidateSamplingGateState>, Condvar)>,
+}
+
+#[cfg(test)]
+impl CandidateSamplingGate {
+    fn block(&self) {
+        let (state, condition) = &*self.state;
+        let mut state = state.lock().expect("candidate sampling gate lock poisoned");
+        state.entered = true;
+        condition.notify_all();
+        while !state.released {
+            state = condition
+                .wait(state)
+                .expect("candidate sampling gate lock poisoned while blocked");
+        }
+    }
+
+    pub(crate) fn wait_until_entered(&self, timeout: Duration) -> bool {
+        let (state, condition) = &*self.state;
+        let state = state.lock().expect("candidate sampling gate lock poisoned");
+        let (state, _) = condition
+            .wait_timeout_while(state, timeout, |state| !state.entered)
+            .expect("candidate sampling gate lock poisoned while waiting");
+        state.entered
+    }
+
+    pub(crate) fn release(&self) {
+        let (state, condition) = &*self.state;
+        let mut state = state.lock().expect("candidate sampling gate lock poisoned");
+        state.released = true;
+        condition.notify_all();
+    }
 }
 
 impl FilesystemScanner {
@@ -181,6 +229,8 @@ impl FilesystemScanner {
         Self {
             plan,
             shutdown_requested: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            next_candidate_sample_gate: Mutex::new(None),
         }
     }
 
@@ -191,11 +241,25 @@ impl FilesystemScanner {
         Self {
             plan,
             shutdown_requested,
+            #[cfg(test)]
+            next_candidate_sample_gate: Mutex::new(None),
         }
     }
 
     pub(crate) fn plan(&self) -> &DiscoveryPlan {
         &self.plan
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gate_next_candidate_after_first_sample_for_test(
+        &mut self,
+    ) -> CandidateSamplingGate {
+        let gate = CandidateSamplingGate::default();
+        *self
+            .next_candidate_sample_gate
+            .lock()
+            .expect("candidate sampling gate lock poisoned") = Some(gate.clone());
+        gate
     }
 
     /// Runs one reconciliation pass into the bounded admission controller.
@@ -209,8 +273,9 @@ impl FilesystemScanner {
         let Some(resolved_excludes) = self.resolve_excludes(admission)? else {
             return admission.finish_scan();
         };
-        let checkpoint_namespace = match canonicalize_optional(&self.plan.checkpoint_namespace_dir)
-        {
+        let checkpoint_namespace = canonicalize_optional(&self.plan.checkpoint_namespace_dir);
+        self.ensure_running()?;
+        let checkpoint_namespace = match checkpoint_namespace {
             Ok(path) => path,
             Err(source) => {
                 admission.record_issue(DiscoveryIssue::Io {
@@ -242,9 +307,12 @@ impl FilesystemScanner {
         checkpoint_namespace: Option<&Path>,
         admission: &mut AdmissionController,
     ) -> Result<(), DiscoveryError> {
+        self.ensure_running()?;
         let mut lexical_root_is_symlink = false;
         if !self.plan.follow_symlinks {
-            match std::fs::symlink_metadata(&include.lexical_root) {
+            let metadata = std::fs::symlink_metadata(&include.lexical_root);
+            self.ensure_running()?;
+            match metadata {
                 Ok(metadata) => lexical_root_is_symlink = metadata.file_type().is_symlink(),
                 Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
                 Err(source) => {
@@ -257,7 +325,9 @@ impl FilesystemScanner {
                 }
             }
         }
-        let resolved_root = match std::fs::canonicalize(&include.lexical_root) {
+        let resolved_root = std::fs::canonicalize(&include.lexical_root);
+        self.ensure_running()?;
+        let resolved_root = match resolved_root {
             Ok(path) => path,
             Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(source) => {
@@ -270,7 +340,9 @@ impl FilesystemScanner {
             }
         };
         if lexical_root_is_symlink {
-            match std::fs::metadata(&resolved_root) {
+            let metadata = std::fs::metadata(&resolved_root);
+            self.ensure_running()?;
+            match metadata {
                 Ok(metadata) if metadata.is_dir() => {}
                 Ok(_) => return Ok(()),
                 Err(source) => {
@@ -294,7 +366,9 @@ impl FilesystemScanner {
             .into_iter();
         loop {
             self.ensure_running()?;
-            let Some(entry) = entries.next() else {
+            let entry = entries.next();
+            self.ensure_running()?;
+            let Some(entry) = entry else {
                 break;
             };
             let entry = match entry {
@@ -326,7 +400,9 @@ impl FilesystemScanner {
             };
 
             if entry.file_type().is_dir() {
-                let resolved_directory = match std::fs::canonicalize(entry.path()) {
+                let resolved_directory = std::fs::canonicalize(entry.path());
+                self.ensure_running()?;
+                let resolved_directory = match resolved_directory {
                     Ok(path) => path,
                     Err(source) => {
                         admission.record_issue(DiscoveryIssue::Io {
@@ -402,13 +478,15 @@ impl FilesystemScanner {
                 continue;
             }
 
-            let candidate = match self.collect_stable_candidate(
+            let candidate = self.collect_stable_candidate(
                 &matched_path,
                 &resolved_path,
                 &resolved_root,
                 resolved_excludes,
                 checkpoint_namespace,
-            ) {
+            );
+            self.ensure_running()?;
+            let candidate = match candidate {
                 Ok(Some(candidate)) => candidate,
                 Ok(None) => continue,
                 Err(issue) => {
@@ -429,21 +507,48 @@ impl FilesystemScanner {
         resolved_excludes: &[ResolvedExclude],
         checkpoint_namespace: Option<&Path>,
     ) -> Result<Option<DiscoveredCandidate>, DiscoveryIssue> {
-        let first = open_candidate_at(
+        if self.cancellation_requested() {
+            return Ok(None);
+        }
+        let first = open_candidate_at_cancellable(
             resolved_path,
             matched_path,
             false,
             self.plan.fingerprint_bytes,
             self.plan.ignored_header_bytes,
-        )?;
+            || self.cancellation_requested(),
+        );
+        if self.cancellation_requested() {
+            return Ok(None);
+        }
+        let Some(first) = first? else {
+            return Ok(None);
+        };
         let first_evidence = first.evidence;
         drop(first.file);
+        #[cfg(test)]
+        let gate = self
+            .next_candidate_sample_gate
+            .lock()
+            .expect("candidate sampling gate lock poisoned")
+            .take();
+        #[cfg(test)]
+        if let Some(gate) = gate {
+            gate.block();
+        }
+        if self.cancellation_requested() {
+            return Ok(None);
+        }
         let resolved_again =
             std::fs::canonicalize(matched_path).map_err(|source| DiscoveryIssue::Io {
                 operation: "revalidate resolved candidate",
                 path: matched_path.to_path_buf(),
                 source,
-            })?;
+            });
+        if self.cancellation_requested() {
+            return Ok(None);
+        }
+        let resolved_again = resolved_again?;
         validate_candidate_path_stability(
             matched_path,
             resolved_path,
@@ -459,13 +564,23 @@ impl FilesystemScanner {
         ) {
             return Ok(None);
         }
-        let second = open_candidate_at(
+        if self.cancellation_requested() {
+            return Ok(None);
+        }
+        let second = open_candidate_at_cancellable(
             &resolved_again,
             matched_path,
             false,
             self.plan.fingerprint_bytes,
             self.plan.ignored_header_bytes,
-        )?;
+            || self.cancellation_requested(),
+        );
+        if self.cancellation_requested() {
+            return Ok(None);
+        }
+        let Some(second) = second? else {
+            return Ok(None);
+        };
         if first_evidence.locator != second.evidence.locator
             || second.evidence.size < first_evidence.size
             || !second
@@ -482,19 +597,27 @@ impl FilesystemScanner {
         let modified = if self.plan.ignore_older_than.is_zero() {
             None
         } else {
-            let metadata = second
-                .file
-                .metadata()
-                .map_err(|source| DiscoveryIssue::Io {
-                    operation: "read candidate metadata",
-                    path: matched_path.to_path_buf(),
-                    source,
-                })?;
-            Some(metadata.modified().map_err(|source| DiscoveryIssue::Io {
+            if self.cancellation_requested() {
+                return Ok(None);
+            }
+            let metadata = second.file.metadata().map_err(|source| DiscoveryIssue::Io {
+                operation: "read candidate metadata",
+                path: matched_path.to_path_buf(),
+                source,
+            });
+            if self.cancellation_requested() {
+                return Ok(None);
+            }
+            let metadata = metadata?;
+            let modified = metadata.modified().map_err(|source| DiscoveryIssue::Io {
                 operation: "read candidate modification time",
                 path: matched_path.to_path_buf(),
                 source,
-            })?)
+            });
+            if self.cancellation_requested() {
+                return Ok(None);
+            }
+            Some(modified?)
         };
         Ok(Some(DiscoveredCandidate {
             matched_path: matched_path.to_path_buf(),
@@ -532,7 +655,9 @@ impl FilesystemScanner {
         let mut resolved = Vec::with_capacity(self.plan.exclude_patterns.len());
         for exclude in &self.plan.exclude_patterns {
             self.ensure_running()?;
-            let resolved_root = match canonicalize_optional(&exclude.lexical_root) {
+            let resolved_root = canonicalize_optional(&exclude.lexical_root);
+            self.ensure_running()?;
+            let resolved_root = match resolved_root {
                 Ok(path) => path,
                 Err(source) => {
                     admission.record_issue(DiscoveryIssue::Io {
@@ -553,11 +678,15 @@ impl FilesystemScanner {
     }
 
     fn ensure_running(&self) -> Result<(), DiscoveryError> {
-        if self.shutdown_requested.load(Ordering::Relaxed) {
+        if self.cancellation_requested() {
             Err(DiscoveryError::ShutdownRequested)
         } else {
             Ok(())
         }
+    }
+
+    fn cancellation_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::Acquire)
     }
 }
 

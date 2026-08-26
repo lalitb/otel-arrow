@@ -64,6 +64,25 @@ impl NamespaceLock {
         timeout: Duration,
         retry_interval: Duration,
     ) -> Result<Self, StoreError> {
+        Self::acquire_cancellable(dir, timeout, retry_interval, || false)
+            .map(|lock| lock.expect("non-cancellable namespace acquisition cannot be cancelled"))
+    }
+
+    /// Acquires exclusive namespace ownership, abandoning the wait when
+    /// `cancelled` becomes true.
+    ///
+    /// Cancellation is checked around every potentially blocking filesystem
+    /// operation and immediately before and after every lock attempt. A lock
+    /// acquired concurrently with cancellation is dropped before returning.
+    pub(crate) fn acquire_cancellable(
+        dir: &Path,
+        timeout: Duration,
+        retry_interval: Duration,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<Option<Self>, StoreError> {
+        if cancelled() {
+            return Ok(None);
+        }
         let path = dir.join(OWNERSHIP_LOCK_FILE_NAME);
         let mut options = OpenOptions::new();
         let _ = options.read(true).write(true).create(true).truncate(false);
@@ -78,33 +97,48 @@ impl NamespaceLock {
             use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
             let _ = options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
         }
-        let file = options.open(&path).map_err(|source| StoreError::Io {
+        let file = options.open(&path);
+        if cancelled() {
+            return Ok(None);
+        }
+        let file = file.map_err(|source| StoreError::Io {
             operation: "open the checkpoint namespace ownership lock",
             path: path.clone(),
             source,
         })?;
-        fsio::secure_checkpoint_file(
+        let Some(()) = fsio::secure_checkpoint_file_cancellable(
             &file,
             &path,
             "validate the checkpoint namespace ownership lock",
-        )?;
+            &mut cancelled,
+        )?
+        else {
+            return Ok(None);
+        };
 
         let started = Instant::now();
         let mut contentions = 0u64;
         loop {
+            if cancelled() {
+                return Ok(None);
+            }
             // Called as an explicit trait call rather than `file.try_lock()`:
             // `std::fs::File` gained an inherent `try_lock` in Rust 1.89,
             // which would silently take precedence over the trait method on
             // a newer toolchain while failing to compile at this
             // workspace's 1.87 MSRV.
-            match FileExt::try_lock(&file) {
+            let attempt = FileExt::try_lock(&file);
+            if cancelled() {
+                return Ok(None);
+            }
+            match attempt {
                 Ok(()) => {
-                    return Ok(Self {
+                    return Ok(Some(Self {
                         file,
                         path,
                         waited: started.elapsed(),
                         contentions,
-                    });
+                    }));
                 }
                 Err(TryLockError::WouldBlock) => {
                     contentions = contentions.saturating_add(1);

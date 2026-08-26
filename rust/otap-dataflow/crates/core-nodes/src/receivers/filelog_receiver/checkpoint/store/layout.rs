@@ -142,14 +142,27 @@ pub(crate) fn is_namespace_temp_file(name: &str) -> bool {
 ///
 /// Entries that are not this namespace's own generation files are ignored:
 /// the store never deletes or interprets a file it did not create.
-pub(crate) fn scan_generations(dir: &Path) -> Result<BTreeMap<u64, GenerationFiles>, StoreError> {
+pub(crate) fn scan_generations(
+    dir: &Path,
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<Option<BTreeMap<u64, GenerationFiles>>, StoreError> {
+    if cancelled() {
+        return Ok(None);
+    }
     let mut found: BTreeMap<u64, GenerationFiles> = BTreeMap::new();
-    let entries = std::fs::read_dir(dir).map_err(|source| StoreError::Io {
+    let entries = std::fs::read_dir(dir);
+    if cancelled() {
+        return Ok(None);
+    }
+    let entries = entries.map_err(|source| StoreError::Io {
         operation: "list the checkpoint namespace directory",
         path: dir.to_path_buf(),
         source,
     })?;
     for entry in entries {
+        if cancelled() {
+            return Ok(None);
+        }
         let entry = entry.map_err(|source| StoreError::Io {
             operation: "read a checkpoint namespace directory entry",
             path: dir.to_path_buf(),
@@ -178,7 +191,7 @@ pub(crate) fn scan_generations(dir: &Path) -> Result<BTreeMap<u64, GenerationFil
             files.wal = true;
         }
     }
-    Ok(found)
+    Ok(Some(found))
 }
 
 /// Removes every temporary file this store owns in `dir`, returning the
@@ -188,14 +201,27 @@ pub(crate) fn scan_generations(dir: &Path) -> Result<BTreeMap<u64, GenerationFil
 /// temporary file can never belong to a live writer. A temporary file is an
 /// abandoned artifact of an interrupted write: it was never renamed into
 /// place, so it is by construction not part of any recoverable generation.
-pub(crate) fn remove_stale_temp_files(dir: &Path) -> Result<usize, StoreError> {
+pub(crate) fn remove_stale_temp_files(
+    dir: &Path,
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<Option<usize>, StoreError> {
+    if cancelled() {
+        return Ok(None);
+    }
     let mut stale: Vec<PathBuf> = Vec::new();
-    let entries = std::fs::read_dir(dir).map_err(|source| StoreError::Io {
+    let entries = std::fs::read_dir(dir);
+    if cancelled() {
+        return Ok(None);
+    }
+    let entries = entries.map_err(|source| StoreError::Io {
         operation: "list the checkpoint namespace directory",
         path: dir.to_path_buf(),
         source,
     })?;
     for entry in entries {
+        if cancelled() {
+            return Ok(None);
+        }
         let entry = entry.map_err(|source| StoreError::Io {
             operation: "read a checkpoint namespace directory entry",
             path: dir.to_path_buf(),
@@ -217,11 +243,18 @@ pub(crate) fn remove_stale_temp_files(dir: &Path) -> Result<usize, StoreError> {
         stale.push(dir.join(name));
     }
     for path in &stale {
-        std::fs::remove_file(path).map_err(|source| StoreError::Io {
+        if cancelled() {
+            return Ok(None);
+        }
+        let removed = std::fs::remove_file(path);
+        if cancelled() {
+            return Ok(None);
+        }
+        removed.map_err(|source| StoreError::Io {
             operation: "remove an abandoned checkpoint temporary file",
             path: path.to_path_buf(),
             source,
         })?;
     }
-    Ok(stale.len())
+    Ok(Some(stale.len()))
 }

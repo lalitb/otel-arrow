@@ -119,12 +119,22 @@ struct ReplaceFileError {
 
 /// Creates the checkpoint namespace directory (and any missing parent),
 /// with restrictive permissions on Unix. Succeeds if it already exists.
-pub(crate) fn create_namespace_dir(dir: &Path) -> Result<(), StoreError> {
+pub(crate) fn create_namespace_dir_cancellable(
+    dir: &Path,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<()>, StoreError> {
     let mut missing_directories = Vec::new();
     let mut candidate = dir;
-    loop {
-        match std::fs::symlink_metadata(candidate) {
-            Ok(_) => break,
+    let existing_boundary = loop {
+        if cancelled() {
+            return Ok(None);
+        }
+        let metadata = std::fs::symlink_metadata(candidate);
+        if cancelled() {
+            return Ok(None);
+        }
+        match metadata {
+            Ok(_) => break candidate.to_path_buf(),
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
                 missing_directories.push(candidate.to_path_buf());
             }
@@ -140,21 +150,123 @@ pub(crate) fn create_namespace_dir(dir: &Path) -> Result<(), StoreError> {
             Some(parent) if !parent.as_os_str().is_empty() => parent,
             _ => Path::new("."),
         };
+    };
+
+    let namespace_presecured = missing_directories.is_empty();
+    if namespace_presecured {
+        let Some(()) = secure_namespace_dir_cancellable(dir, &mut *cancelled)? else {
+            return Ok(None);
+        };
+    }
+    let sync_existing_boundary = if namespace_presecured {
+        if cancelled() {
+            return Ok(None);
+        }
+        let entries = std::fs::read_dir(dir);
+        if cancelled() {
+            return Ok(None);
+        }
+        match entries {
+            Ok(mut entries) => {
+                let first = entries.next();
+                if cancelled() {
+                    return Ok(None);
+                }
+                match first {
+                    None => true,
+                    Some(Ok(_)) => false,
+                    Some(Err(source)) => {
+                        return Err(StoreError::Io {
+                            operation: "inspect an existing checkpoint namespace entry",
+                            path: dir.to_path_buf(),
+                            source,
+                        });
+                    }
+                }
+            }
+            Err(source) => {
+                return Err(StoreError::Io {
+                    operation: "inspect an existing checkpoint namespace",
+                    path: dir.to_path_buf(),
+                    source,
+                });
+            }
+        }
+    } else {
+        true
+    };
+
+    // A prior interrupted attempt may have created this empty boundary but
+    // failed while syncing its parent. Retrying that parent sync before
+    // creating a child makes directory creation resumably durable.
+    if sync_existing_boundary && let Some(parent) = existing_boundary.parent() {
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        let Some(()) = sync_directory_cancellable(parent, &mut *cancelled)? else {
+            return Ok(None);
+        };
     }
 
     let mut builder = std::fs::DirBuilder::new();
-    let _ = builder.recursive(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt as _;
         let _ = builder.mode(NAMESPACE_DIR_MODE);
     }
-    builder.create(dir).map_err(|source| StoreError::Io {
-        operation: "create the checkpoint namespace directory",
-        path: dir.to_path_buf(),
-        source,
-    })?;
-    let metadata = std::fs::symlink_metadata(dir).map_err(|source| StoreError::Io {
+    for missing in missing_directories.iter().rev() {
+        if cancelled() {
+            return Ok(None);
+        }
+        let created = builder.create(missing);
+        if let Err(source) = created
+            && source.kind() != std::io::ErrorKind::AlreadyExists
+        {
+            if cancelled() {
+                return Ok(None);
+            }
+            return Err(StoreError::Io {
+                operation: "create the checkpoint namespace directory",
+                path: missing.clone(),
+                source,
+            });
+        }
+        // Once mkdir starts, finish its parent durability boundary even if
+        // cancellation arrives during the call. A retry cannot otherwise
+        // distinguish this directory from one that was durable already.
+        if let Some(parent) = missing.parent() {
+            sync_directory(if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            })?;
+        }
+        if cancelled() {
+            return Ok(None);
+        }
+    }
+    if !namespace_presecured {
+        let Some(()) = secure_namespace_dir_cancellable(dir, &mut *cancelled)? else {
+            return Ok(None);
+        };
+    }
+    Ok(Some(()))
+}
+
+fn secure_namespace_dir_cancellable(
+    dir: &Path,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<()>, StoreError> {
+    if cancelled() {
+        return Ok(None);
+    }
+    let metadata = std::fs::symlink_metadata(dir);
+    if cancelled() {
+        return Ok(None);
+    }
+    let metadata = metadata.map_err(|source| StoreError::Io {
         operation: "inspect the checkpoint namespace directory",
         path: dir.to_path_buf(),
         source,
@@ -180,26 +292,21 @@ pub(crate) fn create_namespace_dir(dir: &Path) -> Result<(), StoreError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(NAMESPACE_DIR_MODE))
-            .map_err(|source| StoreError::Io {
-                operation: "set private checkpoint namespace permissions",
-                path: dir.to_path_buf(),
-                source,
-            })?;
-    }
-    // Persist every newly created directory entry from the existing
-    // ancestor downward. Syncing only the namespace itself would not make
-    // the namespace name durable in its parent after first creation.
-    for created in missing_directories.iter().rev() {
-        if let Some(parent) = created.parent() {
-            sync_directory(if parent.as_os_str().is_empty() {
-                Path::new(".")
-            } else {
-                parent
-            })?;
+        if cancelled() {
+            return Ok(None);
         }
+        let permissions =
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(NAMESPACE_DIR_MODE));
+        if cancelled() {
+            return Ok(None);
+        }
+        permissions.map_err(|source| StoreError::Io {
+            operation: "set private checkpoint namespace permissions",
+            path: dir.to_path_buf(),
+            source,
+        })?;
     }
-    Ok(())
+    Ok(Some(()))
 }
 
 /// Applies platform flags that open the named object itself rather than
@@ -224,7 +331,24 @@ pub(super) fn secure_checkpoint_file(
     path: &Path,
     operation: &'static str,
 ) -> Result<(), StoreError> {
-    let metadata = file.metadata().map_err(|source| StoreError::Io {
+    secure_checkpoint_file_cancellable(file, path, operation, &mut || false)
+        .map(|secured| secured.expect("non-cancellable file validation cannot be cancelled"))
+}
+
+pub(super) fn secure_checkpoint_file_cancellable(
+    file: &File,
+    path: &Path,
+    operation: &'static str,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<()>, StoreError> {
+    if cancelled() {
+        return Ok(None);
+    }
+    let metadata = file.metadata();
+    if cancelled() {
+        return Ok(None);
+    }
+    let metadata = metadata.map_err(|source| StoreError::Io {
         operation,
         path: path.to_path_buf(),
         source,
@@ -250,6 +374,9 @@ pub(super) fn secure_checkpoint_file(
         // storage of exactly the structure the API initializes.
         let succeeded =
             unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) };
+        if cancelled() {
+            return Ok(None);
+        }
         if succeeded == 0 {
             return Err(StoreError::Io {
                 operation: "inspect a Windows checkpoint file handle",
@@ -282,14 +409,21 @@ pub(super) fn secure_checkpoint_file(
                 reason: "checkpoint artifacts must not have multiple hard links",
             });
         }
-        file.set_permissions(std::fs::Permissions::from_mode(CHECKPOINT_FILE_MODE))
-            .map_err(|source| StoreError::Io {
-                operation: "set private checkpoint file permissions",
-                path: path.to_path_buf(),
-                source,
-            })?;
+        if cancelled() {
+            return Ok(None);
+        }
+        let permissions =
+            file.set_permissions(std::fs::Permissions::from_mode(CHECKPOINT_FILE_MODE));
+        if cancelled() {
+            return Ok(None);
+        }
+        permissions.map_err(|source| StoreError::Io {
+            operation: "set private checkpoint file permissions",
+            path: path.to_path_buf(),
+            source,
+        })?;
     }
-    Ok(())
+    Ok(Some(()))
 }
 
 /// Opens a new temporary checkpoint file without following or truncating an
@@ -509,16 +643,37 @@ fn replace_file(temp_path: &Path, final_path: &Path) -> Result<(), ReplaceFileEr
 /// Quiver durability code in this repository.
 #[cfg(unix)]
 pub(crate) fn sync_directory(dir: &Path) -> Result<(), StoreError> {
-    let handle = File::open(dir).map_err(|source| StoreError::Io {
+    sync_directory_cancellable(dir, &mut || false)
+        .map(|synced| synced.expect("non-cancellable directory sync cannot be cancelled"))
+}
+
+#[cfg(unix)]
+pub(crate) fn sync_directory_cancellable(
+    dir: &Path,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<()>, StoreError> {
+    if cancelled() {
+        return Ok(None);
+    }
+    let handle = File::open(dir);
+    if cancelled() {
+        return Ok(None);
+    }
+    let handle = handle.map_err(|source| StoreError::Io {
         operation: "open the checkpoint namespace directory for sync",
         path: dir.to_path_buf(),
         source,
     })?;
-    handle.sync_all().map_err(|source| StoreError::Io {
+    let synced = handle.sync_all();
+    if cancelled() {
+        return Ok(None);
+    }
+    synced.map_err(|source| StoreError::Io {
         operation: "sync the checkpoint namespace directory",
         path: dir.to_path_buf(),
         source,
-    })
+    })?;
+    Ok(Some(()))
 }
 
 /// See the Unix implementation; this is a documented no-op on platforms
@@ -536,20 +691,36 @@ pub(crate) fn sync_directory(_dir: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Reads `path` in full, refusing any file longer than `max` bytes before
-/// allocating a buffer for it. Returns `Ok(None)` if the file does not
-/// exist; every other failure is reported.
-pub(crate) fn read_file_bounded(
+#[cfg(not(unix))]
+pub(crate) fn sync_directory_cancellable(
+    _dir: &Path,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<()>, StoreError> {
+    if cancelled() { Ok(None) } else { Ok(Some(())) }
+}
+
+/// Reads `path` in full while allowing lifecycle cancellation between every
+/// filesystem operation and buffered read. The outer `Option` reports
+/// cancellation; the inner `Option` reports an artifact that does not exist.
+pub(crate) fn read_file_bounded_cancellable(
     path: &Path,
     artifact: &'static str,
     max: u64,
-) -> Result<Option<Vec<u8>>, StoreError> {
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<Option<Option<Vec<u8>>>, StoreError> {
+    if cancelled() {
+        return Ok(None);
+    }
     let mut options = OpenOptions::new();
     let _ = options.read(true);
     no_follow(&mut options);
-    let file = match options.open(path) {
+    let opened = options.open(path);
+    if cancelled() {
+        return Ok(None);
+    }
+    let file = match opened {
         Ok(file) => file,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Some(None)),
         Err(source) => {
             return Err(StoreError::Io {
                 operation: "open a checkpoint file",
@@ -558,8 +729,20 @@ pub(crate) fn read_file_bounded(
             });
         }
     };
-    secure_checkpoint_file(&file, path, "validate a checkpoint file")?;
-    let metadata = file.metadata().map_err(|source| StoreError::Io {
+    let Some(()) = secure_checkpoint_file_cancellable(
+        &file,
+        path,
+        "validate a checkpoint file",
+        &mut cancelled,
+    )?
+    else {
+        return Ok(None);
+    };
+    let metadata = file.metadata();
+    if cancelled() {
+        return Ok(None);
+    }
+    let metadata = metadata.map_err(|source| StoreError::Io {
         operation: "read checkpoint file metadata",
         path: path.to_path_buf(),
         source,
@@ -582,19 +765,38 @@ pub(crate) fn read_file_bounded(
         len,
         max,
     })?;
-    let buffer = read_bounded_contents(file, capacity, path, artifact, max)?;
-    Ok(Some(buffer))
+    let Some(buffer) =
+        read_bounded_contents_cancellable(file, capacity, path, artifact, max, &mut cancelled)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Some(buffer)))
 }
 
 /// Reads at most `max + 1` bytes so growth after metadata inspection is
 /// detected rather than decoded as a silently truncated artifact.
 pub(super) fn read_bounded_contents(
-    mut file: File,
+    file: File,
     capacity: usize,
     path: &Path,
     artifact: &'static str,
     max: u64,
 ) -> Result<Vec<u8>, StoreError> {
+    read_bounded_contents_cancellable(file, capacity, path, artifact, max, &mut || false)
+        .map(|buffer| buffer.expect("non-cancellable checkpoint read cannot be cancelled"))
+}
+
+pub(super) fn read_bounded_contents_cancellable(
+    mut file: File,
+    capacity: usize,
+    path: &Path,
+    artifact: &'static str,
+    max: u64,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<Vec<u8>>, StoreError> {
+    if cancelled() {
+        return Ok(None);
+    }
     let max_capacity = usize::try_from(max).map_err(|_| StoreError::FileTooLarge {
         artifact,
         path: path.to_path_buf(),
@@ -614,15 +816,20 @@ pub(super) fn read_bounded_contents(
 
     let mut chunk = [0u8; 8 * 1024];
     loop {
+        if cancelled() {
+            return Ok(None);
+        }
         let remaining = max_capacity.saturating_sub(buffer.len());
         let read_capacity = remaining.saturating_add(1).min(chunk.len());
-        let read = file
-            .read(&mut chunk[..read_capacity])
-            .map_err(|source| StoreError::Io {
-                operation: "read a checkpoint file",
-                path: path.to_path_buf(),
-                source,
-            })?;
+        let read = file.read(&mut chunk[..read_capacity]);
+        if cancelled() {
+            return Ok(None);
+        }
+        let read = read.map_err(|source| StoreError::Io {
+            operation: "read a checkpoint file",
+            path: path.to_path_buf(),
+            source,
+        })?;
         if read == 0 {
             break;
         }
@@ -639,6 +846,9 @@ pub(super) fn read_bounded_contents(
                 max,
             });
         }
+        if cancelled() {
+            return Ok(None);
+        }
         buffer
             .try_reserve_exact(read)
             .map_err(|source| StoreError::Allocation {
@@ -649,51 +859,93 @@ pub(super) fn read_bounded_contents(
             })?;
         buffer.extend_from_slice(&chunk[..read]);
     }
-    Ok(buffer)
+    Ok(Some(buffer))
 }
 
 /// Truncates `path` to `len` bytes and syncs it, discarding a structurally
 /// incomplete trailing WAL region so subsequent appends continue from the
 /// last complete transaction.
-pub(crate) fn truncate_file(path: &Path, len: u64) -> Result<(), StoreError> {
+pub(crate) fn truncate_file_cancellable(
+    path: &Path,
+    len: u64,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<()>, StoreError> {
+    if cancelled() {
+        return Ok(None);
+    }
     let mut options = OpenOptions::new();
     let _ = options.write(true);
     no_follow(&mut options);
-    let file = options.open(path).map_err(|source| StoreError::Io {
+    let file = options.open(path);
+    if cancelled() {
+        return Ok(None);
+    }
+    let file = file.map_err(|source| StoreError::Io {
         operation: "open a checkpoint WAL to discard its torn tail",
         path: path.to_path_buf(),
         source,
     })?;
-    secure_checkpoint_file(
+    let Some(()) = secure_checkpoint_file_cancellable(
         &file,
         path,
         "validate a checkpoint WAL before truncating it",
-    )?;
-    file.set_len(len).map_err(|source| StoreError::Io {
+        &mut *cancelled,
+    )?
+    else {
+        return Ok(None);
+    };
+    let truncated = file.set_len(len);
+    if cancelled() {
+        return Ok(None);
+    }
+    truncated.map_err(|source| StoreError::Io {
         operation: "truncate a checkpoint WAL to its last complete transaction",
         path: path.to_path_buf(),
         source,
     })?;
-    file.sync_all().map_err(|source| StoreError::Io {
+    let synced = file.sync_all();
+    if cancelled() {
+        return Ok(None);
+    }
+    synced.map_err(|source| StoreError::Io {
         operation: "sync a truncated checkpoint WAL",
         path: path.to_path_buf(),
         source,
-    })
+    })?;
+    Ok(Some(()))
 }
 
 /// Opens an existing WAL for appending. Every write lands at the current end
 /// of file, so a concurrent reader always sees whole prefixes.
-pub(crate) fn open_for_append(path: &Path) -> Result<File, StoreError> {
+pub(crate) fn open_for_append_cancellable(
+    path: &Path,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<File>, StoreError> {
+    if cancelled() {
+        return Ok(None);
+    }
     let mut options = OpenOptions::new();
     let _ = options.append(true);
     no_follow(&mut options);
-    let file = options.open(path).map_err(|source| StoreError::Io {
+    let file = options.open(path);
+    if cancelled() {
+        return Ok(None);
+    }
+    let file = file.map_err(|source| StoreError::Io {
         operation: "open the checkpoint WAL for appending",
         path: path.to_path_buf(),
         source,
     })?;
-    secure_checkpoint_file(&file, path, "validate a checkpoint WAL before appending")?;
-    Ok(file)
+    let Some(()) = secure_checkpoint_file_cancellable(
+        &file,
+        path,
+        "validate a checkpoint WAL before appending",
+        &mut *cancelled,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(file))
 }
 
 /// Removes `path`, reporting whether it existed. A file that is already gone
