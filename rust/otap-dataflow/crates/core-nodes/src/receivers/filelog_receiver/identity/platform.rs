@@ -226,6 +226,43 @@ pub(crate) fn collect_consistent_fingerprint_cancellable(
     ignored_header_bytes: u32,
     cancelled: &mut impl FnMut() -> bool,
 ) -> Result<Option<(Vec<u8>, u64)>, IdentityError> {
+    collect_consistent_fingerprint_cancellable_inner(
+        file,
+        path,
+        fingerprint_bytes,
+        ignored_header_bytes,
+        cancelled,
+        || {},
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn collect_consistent_fingerprint_cancellable_with_hook(
+    file: &File,
+    path: &Path,
+    fingerprint_bytes: u16,
+    ignored_header_bytes: u32,
+    cancelled: &mut impl FnMut() -> bool,
+    after_first_observation: impl FnOnce(),
+) -> Result<Option<(Vec<u8>, u64)>, IdentityError> {
+    collect_consistent_fingerprint_cancellable_inner(
+        file,
+        path,
+        fingerprint_bytes,
+        ignored_header_bytes,
+        cancelled,
+        after_first_observation,
+    )
+}
+
+fn collect_consistent_fingerprint_cancellable_inner(
+    file: &File,
+    path: &Path,
+    fingerprint_bytes: u16,
+    ignored_header_bytes: u32,
+    cancelled: &mut impl FnMut() -> bool,
+    after_first_observation: impl FnOnce(),
+) -> Result<Option<(Vec<u8>, u64)>, IdentityError> {
     let Some((first_fingerprint, first_size)) = observe_fingerprint_cancellable(
         file,
         path,
@@ -236,6 +273,7 @@ pub(crate) fn collect_consistent_fingerprint_cancellable(
     else {
         return Ok(None);
     };
+    after_first_observation();
     let Some((second_fingerprint, second_size)) = observe_fingerprint_cancellable(
         file,
         path,

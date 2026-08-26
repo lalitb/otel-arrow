@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::Path;
 
 use tempfile::tempdir;
@@ -890,12 +890,56 @@ fn eof_reports_fingerprint_mismatch_without_size_regression() {
 /// receiver-terminal identity failure.
 #[test]
 fn unstable_eof_fingerprint_evidence_is_retryable() {
-    let result =
-        classify_fingerprint_observation(Err(IdentityError::CandidateChangedDuringIdentity {
+    let result = classify_cancellable_fingerprint_observation(Err(
+        IdentityError::CandidateChangedDuringIdentity {
             path: Path::new("changing.log").to_path_buf(),
-        }))
-        .unwrap();
+        },
+    ))
+    .unwrap()
+    .unwrap();
     assert_eq!(result, FingerprintObservation::Retry);
+}
+
+/// Scenario: a queued candidate's retained handle observes a same-size
+/// rewrite between its two bounded fingerprint samples.
+/// Guarantees: refresh returns a retry outcome, leaves the queued evidence
+/// unchanged, and does not promote unstable identity evidence to an error.
+#[test]
+fn queued_candidate_refresh_retries_unstable_evidence() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("unstable-queued.log");
+    std::fs::write(&path, b"a").unwrap();
+    let mut table = ReaderTable::new(settings(1, 1, 1)).unwrap();
+    table.insert(candidate(&path), resolved(57, 0)).unwrap();
+    let turn = data(table.poll(Instant::now()).unwrap());
+    table
+        .complete_turn(turn, 1, TurnDisposition::Paused)
+        .unwrap();
+    let mut queued = candidate(&path);
+    let original = queued.evidence.clone();
+    let gate = table.gate_next_evidence_refresh_after_first_sample_for_test();
+    let writer_gate = gate.clone();
+    let writer_path = path.clone();
+    let writer = std::thread::spawn(move || {
+        let result = if writer_gate.wait_until_entered(Duration::from_secs(1)) {
+            std::fs::write(writer_path, b"b")
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "evidence refresh did not reach its sampling gate",
+            ))
+        };
+        writer_gate.release();
+        result
+    });
+
+    assert_eq!(
+        table.refresh_candidate_evidence(&mut queued).unwrap(),
+        CandidateEvidenceRefresh::Retry
+    );
+    writer.join().unwrap().unwrap();
+    assert_eq!(queued.evidence, original);
+    table.shutdown().unwrap();
 }
 
 /// Scenario: discovery queues evidence for a short file, then the retained

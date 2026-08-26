@@ -27,6 +27,8 @@ use super::config::RuntimeConfig;
 use super::discovery::DiscoveredCandidate;
 use super::identity::IdentityError;
 use super::identity::matcher::ResolvedIdentity;
+#[cfg(test)]
+use super::identity::platform::collect_consistent_fingerprint_cancellable_with_hook;
 use super::identity::platform::{
     ReopenCandidate, collect_consistent_fingerprint_cancellable, encode_advisory_path,
     read_source_at_cancellable, reopen_candidate_at_cancellable,
@@ -594,6 +596,8 @@ pub(crate) struct ReaderTable {
     fail_next_revoked_release: bool,
     #[cfg(test)]
     next_source_read_gate: Option<ReaderPollGate>,
+    #[cfg(test)]
+    next_evidence_refresh_gate: Mutex<Option<ReaderPollGate>>,
 }
 
 #[cfg(test)]
@@ -669,6 +673,16 @@ fn classify_fingerprint_observation(
             Ok(FingerprintObservation::Retry)
         }
         Err(error) => Err(ReaderError::Identity(error)),
+    }
+}
+
+fn classify_cancellable_fingerprint_observation(
+    observation: Result<Option<(Vec<u8>, u64)>, IdentityError>,
+) -> Result<Option<FingerprintObservation>, ReaderError> {
+    match observation {
+        Ok(Some(observation)) => classify_fingerprint_observation(Ok(observation)).map(Some),
+        Ok(None) => Ok(None),
+        Err(error) => classify_fingerprint_observation(Err(error)).map(Some),
     }
 }
 
@@ -763,6 +777,8 @@ impl ReaderTable {
             fail_next_revoked_release: false,
             #[cfg(test)]
             next_source_read_gate: None,
+            #[cfg(test)]
+            next_evidence_refresh_gate: Mutex::new(None),
         })
     }
 
@@ -1260,15 +1276,16 @@ impl ReaderTable {
                     self.settings.ignored_header_bytes,
                     &mut || self.cancellation_requested(),
                 );
-                let Some(observation) = observation? else {
+                let Some(observation) = classify_cancellable_fingerprint_observation(observation)?
+                else {
                     return Ok(ReaderPoll::Cancelled);
                 };
-                classify_fingerprint_observation(Ok(observation))
+                observation
             };
             if self.cancellation_requested() {
                 return Ok(ReaderPoll::Cancelled);
             }
-            let (observed_fingerprint, observed_size) = match observation? {
+            let (observed_fingerprint, observed_size) = match observation {
                 FingerprintObservation::Stable { fingerprint, size } => (fingerprint, size),
                 FingerprintObservation::Retry => {
                     let next_probe = self.schedule_eof_probe(file_id, now)?;
@@ -1956,6 +1973,17 @@ impl ReaderTable {
         gate
     }
 
+    #[cfg(test)]
+    /// Blocks the next candidate-evidence refresh after its first observation.
+    pub(crate) fn gate_next_evidence_refresh_after_first_sample_for_test(&self) -> ReaderPollGate {
+        let gate = ReaderPollGate::default();
+        *self
+            .next_evidence_refresh_gate
+            .lock()
+            .expect("evidence refresh gate lock poisoned") = Some(gate.clone());
+        gate
+    }
+
     /// Validates a durable truncate reset against unchanged live state.
     pub(crate) fn preflight_truncate_reset(
         &self,
@@ -2172,17 +2200,39 @@ impl ReaderTable {
         let Some(resident) = reader.resident.as_ref() else {
             return Ok(CandidateEvidenceRefresh::DescriptorAbsent);
         };
+        #[cfg(not(test))]
         let observation = collect_consistent_fingerprint_cancellable(
             &resident.file,
             &candidate.matched_path,
             self.settings.fingerprint_bytes,
             self.settings.ignored_header_bytes,
             &mut || self.cancellation_requested(),
-        )?;
-        let Some(observation) = observation else {
+        );
+        #[cfg(test)]
+        let observation = collect_consistent_fingerprint_cancellable_with_hook(
+            &resident.file,
+            &candidate.matched_path,
+            self.settings.fingerprint_bytes,
+            self.settings.ignored_header_bytes,
+            &mut || self.cancellation_requested(),
+            || {
+                let gate = self
+                    .next_evidence_refresh_gate
+                    .lock()
+                    .expect("evidence refresh gate lock poisoned")
+                    .take();
+                if let Some(gate) = gate {
+                    gate.block();
+                }
+            },
+        );
+        if self.cancellation_requested() {
+            return Ok(CandidateEvidenceRefresh::Cancelled);
+        }
+        let Some(observation) = classify_cancellable_fingerprint_observation(observation)? else {
             return Ok(CandidateEvidenceRefresh::Cancelled);
         };
-        match classify_fingerprint_observation(Ok(observation))? {
+        match observation {
             FingerprintObservation::Stable { fingerprint, size } => {
                 candidate.evidence.fingerprint = fingerprint;
                 candidate.evidence.size = size;
