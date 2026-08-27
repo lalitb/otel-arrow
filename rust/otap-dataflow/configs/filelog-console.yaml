@@ -1,0 +1,30 @@
+version: otel_dataflow/v1
+engine: {}
+policies:
+  resources:
+    core_allocation:
+      type: core_count
+      count: 1
+groups:
+  default:
+    pipelines:
+      main:
+        nodes:
+          filelog:
+            type: receiver:filelog
+            config:
+              include: ["/tmp/otel-arrow-filelog/*.log"]
+              start_at: beginning
+              checkpoint:
+                id: filelog-console
+
+          console:
+            type: exporter:console
+            config:
+              format: record_json
+              color: false
+              unicode: false
+
+        connections:
+          - from: filelog
+            to: console

@@ -52,6 +52,7 @@ Receivers ingest data into a pipeline.
 
 | Type                                                                                 | Feature     | Stability    | Description                                                          |
 | ------------------------------------------------------------------------------------ | ----------- | ------------ | -------------------------------------------------------------------- |
+| [`receiver:filelog`](src/receivers/filelog_receiver/README.md)                       | default     | experimental | Tails local files with Ack-gated durable checkpoints.                |
 | [`receiver:host_metrics`](src/receivers/host_metrics_receiver/README.md)             | default     | experimental | Emits Linux `system.*` host metrics from procfs and sysfs.           |
 | [`receiver:internal_telemetry`](src/receivers/internal_telemetry_receiver/README.md) | default     | experimental | Consumes internal engine log events for observability pipelines.     |
 | [`receiver:journald`](src/receivers/journald_receiver/README.md)                     | default     | experimental | Reads local `systemd-journald` records with journald source filters. |

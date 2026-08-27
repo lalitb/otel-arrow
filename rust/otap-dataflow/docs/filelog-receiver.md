@@ -1567,6 +1567,25 @@ and EOF scheduling state, the runtime-lease guard, and collection allocation ove
 At most one `ReadTurn` owns the shared buffer; returning the turn transfers that same
 allocation back to the scheduler rather than retaining a second copy.
 
+The ignored `receiver_memory_stress_reports_bounded_peak_rss` test measures the complete
+receiver in a fresh subprocess so fixture construction does not contaminate its RSS
+window. A release-mode run on 2026-08-26 on an arm64 Mac16,8 with macOS 26.6.2 used 128
+simultaneously open preserve-raw UTF-8 framers at 256 KiB line and record limits, plus
+one trigger file and a prefilled downstream channel. Both the live gauge and historical
+peak reported exactly 67,092,608 pending source bytes. The checked two-copy framer
+formula was 541,071,408 bytes and the reader-table formula was 1,717,153 bytes. The
+synchronous framing-state RSS was 184,680,448 bytes; the 1 ms sampler observed a
+187,252,736-byte peak, or 174,751,744 bytes above the 12,500,992-byte baseline. The
+receiver reached the blocked send after 3,567,394 microseconds. These values are
+reference evidence, not portable RSS or latency guarantees; allocator behavior,
+filesystem caching, test-binary state, hardware, and host load vary. Reproduce the
+workload with:
+
+```console
+cargo test --release -p otap-df-core-nodes \
+  receiver_memory_stress_reports_bounded_peak_rss -- --ignored --nocapture
+```
+
 ## Lifecycle and drain
 
 The sequence below follows the engine's actual orchestration
@@ -2295,8 +2314,10 @@ defines the canonical serialization, digest algorithm, and compatibility vectors
 
 ## Appendix C: Complete Phase 1 configuration
 
-This is the complete proposed shape, not a compatibility promise. Source behavior stays
-under the receiver and timestamp interpretation stays under a processor.
+This is the complete implemented Phase 1 shape, not a compatibility promise. Source
+behavior stays under the receiver and timestamp interpretation stays under a processor.
+For a runnable native pipeline, see
+[`configs/filelog-console.yaml`](../configs/filelog-console.yaml).
 
 ```yaml
 receivers:
