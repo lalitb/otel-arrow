@@ -21,21 +21,23 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use super::super::current_marker::encode_current_marker;
 use super::super::primitives::{
-    ADVISORY_PATH_MAX_BYTES, FINGERPRINT_MAX_BYTES, FileId, FramingResume, LifecycleState, Locator,
-    NAMESPACE_ID_MAX_BYTES, REASON_CODE_RESERVED, TRUNCATE_RESET_REASON_READ_NEW,
-    WAL_MAX_OPS_PER_TX,
+    ADVISORY_PATH_MAX_BYTES, ByteReader, FINGERPRINT_MAX_BYTES, FileId, FramingResume,
+    LifecycleState, Locator, NAMESPACE_ID_MAX_BYTES, REASON_CODE_RESERVED,
+    TRUNCATE_RESET_REASON_READ_NEW, WAL_MAX_OPS_PER_TX, crc32c,
 };
-use super::super::snapshot::{SnapshotRecord, encode_snapshot};
+use super::super::snapshot::{SNAPSHOT_HEADER_LEN, SnapshotRecord, encode_snapshot};
 use super::super::wal::{
     Operation, QuarantineFile, RegisterFile, RemoveFile, ResetAfterTruncate, ResetQuarantineAction,
-    ResetQuarantinedFile, Transaction, UpdateProgress, encode_wal,
+    ResetQuarantinedFile, Transaction, UpdateProgress, WAL_HEADER_LEN, encode_wal,
 };
 use super::error::StoreError;
 use super::fault::FaultPoint;
 use super::layout::{
-    CURRENT_FILE_NAME, MAX_GENERATIONS_ON_DISK, MAX_TEMP_FILES, OWNERSHIP_LOCK_FILE_NAME,
-    snapshot_file_name, temp_file_name, wal_file_name,
+    CURRENT_BACKUP_FILE_NAME, CURRENT_FILE_NAME, CURRENT_TEMP_FILE_NAME, MAX_GENERATIONS_ON_DISK,
+    MAX_TEMP_FILES, OWNERSHIP_LOCK_FILE_NAME, backup_file_name, snapshot_file_name, temp_file_name,
+    wal_file_name,
 };
 use super::limits::{ARTIFACT_BYTES_CEILING, RECOVERY_WORKING_BYTES_CEILING, StoreLimits};
 use super::{AtomicGroupAppendOutcome, CheckpointStore, StoreOptions};
@@ -174,6 +176,98 @@ fn incomplete_initial_generation_rejects_foreign_or_torn_survivors() {
             reason: "its surviving WAL has a torn tail",
             ..
         }
+    ));
+}
+
+/// Scenario: a markerless initial generation retains only a malicious
+/// snapshot declaring `u32::MAX` records, or only a complete WAL
+/// transaction whose declared frame is one byte over the configured bound.
+/// Guarantees: recovery applies the tracked-record and transaction-byte
+/// gates before record allocation or transaction decoding, even on the
+/// incomplete-first-generation path.
+#[test]
+fn incomplete_initial_generation_enforces_header_level_decode_bounds() {
+    let dir = tempfile::tempdir().expect("temp dir");
+
+    let snapshot_only = dir.path().join("snapshot-only");
+    let snapshot_options = StoreOptions {
+        max_tracked_files: 1,
+        ..options(&snapshot_only)
+    };
+    drop(
+        CheckpointStore::open(snapshot_options.clone())
+            .expect("the bounded namespace is initially created"),
+    );
+    fs::remove_file(snapshot_only.join(CURRENT_FILE_NAME)).expect("removes the marker");
+    fs::remove_file(snapshot_only.join(wal_file_name(0))).expect("removes the WAL");
+    let snapshot_path = snapshot_only.join(snapshot_file_name(0));
+    let mut snapshot = fs::read(&snapshot_path).expect("snapshot reads");
+    snapshot[20..24].copy_from_slice(&u32::MAX.to_be_bytes());
+    let header_crc = crc32c(&snapshot[..24]);
+    snapshot[24..28].copy_from_slice(&header_crc.to_be_bytes());
+    write_bytes(&snapshot_path, &snapshot);
+
+    assert!(matches!(
+        CheckpointStore::open(snapshot_options)
+            .expect_err("the malicious record count fails before decode"),
+        StoreError::RecoveredTrackedFilesExceedMaximum {
+            tracked,
+            max: 1,
+            ..
+        } if tracked == u32::MAX as usize
+    ));
+
+    let wal_only = dir.path().join("wal-only");
+    let wal_options = StoreOptions {
+        compact_after_bytes: 1,
+        ..options(&wal_only)
+    };
+    let limits = wal_options.limits().expect("the test limits are valid");
+    drop(
+        CheckpointStore::open(wal_options.clone())
+            .expect("the bounded namespace is initially created"),
+    );
+    fs::remove_file(wal_only.join(CURRENT_FILE_NAME)).expect("removes the marker");
+    fs::remove_file(wal_only.join(snapshot_file_name(0))).expect("removes the snapshot");
+
+    let oversized_transaction_len = limits
+        .max_transaction_bytes
+        .checked_add(1)
+        .expect("the test frame length is representable");
+    let body_len = oversized_transaction_len
+        .checked_sub(8)
+        .expect("transaction framing is included");
+    let body_len_u32 = u32::try_from(body_len).expect("the configured transaction fits u32");
+    let body_len_usize = usize::try_from(body_len).expect("the test can allocate the frame");
+    let mut transaction = Vec::with_capacity(body_len_usize + 8);
+    transaction.extend_from_slice(&body_len_u32.to_be_bytes());
+    transaction.resize(4 + body_len_usize, 0);
+    let transaction_crc = crc32c(&transaction);
+    transaction.extend_from_slice(&transaction_crc.to_be_bytes());
+    assert_eq!(transaction.len() as u64, oversized_transaction_len);
+
+    let wal_path = wal_only.join(wal_file_name(0));
+    let mut wal = fs::OpenOptions::new()
+        .append(true)
+        .open(&wal_path)
+        .expect("WAL opens");
+    wal.write_all(&transaction)
+        .expect("complete oversized transaction appends");
+    drop(wal);
+    assert!(
+        fs::metadata(&wal_path).expect("WAL metadata").len() <= limits.max_wal_bytes,
+        "the artifact-level bound must not mask the transaction-level bound"
+    );
+
+    assert!(matches!(
+        CheckpointStore::open(wal_options)
+            .expect_err("the oversized complete transaction fails before decode"),
+        StoreError::FileTooLarge {
+            artifact: "WAL transaction",
+            len,
+            max,
+            ..
+        } if len == oversized_transaction_len && max == limits.max_transaction_bytes
     ));
 }
 
@@ -600,6 +694,98 @@ fn hard_linked_checkpoint_artifacts_are_rejected() {
     ));
 }
 
+/// Scenario: a markerless Unix namespace contains a FIFO at the exact
+/// `CURRENT.tmp` publication name and no process has opened its write end.
+/// Guarantees: startup opens checkpoint artifacts nonblocking and rejects
+/// the special file through handle metadata instead of waiting indefinitely
+/// while holding namespace ownership.
+#[cfg(unix)]
+#[test]
+fn unix_fifo_checkpoint_artifact_is_rejected_without_blocking() {
+    use std::sync::mpsc;
+    use std::thread;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    drop(open(&path));
+    fs::remove_file(path.join(CURRENT_FILE_NAME)).expect("CURRENT is removed");
+    let fifo_path = path.join(CURRENT_TEMP_FILE_NAME);
+    make_fifo(&fifo_path);
+
+    let (tx, rx) = mpsc::channel();
+    let open_path = path.clone();
+    let opener = thread::spawn(move || {
+        let result = CheckpointStore::open(options(&open_path));
+        let rejected = matches!(result, Err(StoreError::UnsafeFilesystemObject { .. }));
+        tx.send(rejected).expect("result receiver remains live");
+    });
+
+    match rx.recv_timeout(Duration::from_secs(1)) {
+        Ok(rejected) => assert!(rejected, "the FIFO must be rejected as unsafe"),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let _writer = fs::OpenOptions::new()
+                .write(true)
+                .open(&fifo_path)
+                .expect("a writer unblocks the legacy blocking open");
+            opener.join().expect("opener exits after being unblocked");
+            panic!("checkpoint startup blocked on the FIFO");
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            opener.join().expect("opener panic is propagated");
+            panic!("checkpoint opener disconnected without a result");
+        }
+    }
+    opener.join().expect("opener exits");
+}
+
+/// Scenario: a Unix namespace contains a FIFO at the exact
+/// `ownership.lock` name.
+/// Guarantees: ownership acquisition opens the named object nonblocking and
+/// rejects it as non-regular before attempting a lock or waiting for the
+/// ownership timeout.
+#[cfg(unix)]
+#[test]
+fn unix_fifo_ownership_lock_is_rejected_without_waiting() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    fs::create_dir(&path).expect("namespace is created");
+    let lock_path = path.join(OWNERSHIP_LOCK_FILE_NAME);
+    make_fifo(&lock_path);
+
+    let started = Instant::now();
+    let error = CheckpointStore::open(options(&path)).expect_err("the FIFO lock is rejected");
+    assert!(matches!(
+        error,
+        StoreError::UnsafeFilesystemObject { path, .. } if path == lock_path
+    ));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "special-file rejection must not consume the ownership timeout"
+    );
+}
+
+/// Scenario: a missing Unix checkpoint namespace has a component one byte
+/// larger than the primary targets' 255-byte filesystem limit.
+/// Guarantees: startup queries the containing filesystem and reports the
+/// component bound before attempting to create an unusable namespace.
+#[cfg(unix)]
+#[test]
+fn unix_namespace_creation_enforces_the_filesystem_component_limit() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("a".repeat(256));
+
+    let error = CheckpointStore::open(options(&path))
+        .expect_err("the overlong namespace component is rejected");
+    assert!(matches!(
+        error,
+        StoreError::NamespaceComponentTooLong {
+            path: rejected,
+            len: 256,
+            max,
+        } if rejected == path && max < 256
+    ));
+}
+
 /// Scenario: a Windows checkpoint namespace path is a directory reparse
 /// point rather than a real directory.
 /// Guarantees: opening rejects the reparse point before creating or
@@ -703,6 +889,83 @@ fn records(store: &CheckpointStore) -> Vec<SnapshotRecord> {
 
 fn write_bytes(path: &PathBuf, bytes: &[u8]) {
     fs::write(path, bytes).expect("test fixture write succeeds");
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code, reason = "libc exposes no safe FIFO constructor")]
+fn make_fifo(path: &Path) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let fifo_name = CString::new(path.as_os_str().as_bytes()).expect("path has no NUL");
+    // SAFETY: `fifo_name` is a live NUL-terminated path and the mode is a
+    // valid permission bitmask.
+    let created = unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) };
+    assert_eq!(
+        created,
+        0,
+        "FIFO creation failed: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+fn patch_first_transaction_operation_u16(
+    transaction: &mut [u8],
+    field_offset_in_payload: usize,
+    value: u16,
+) {
+    const TRANSACTION_PREFIX_LEN: usize = 4 + 8 + 2;
+    let operation_start = TRANSACTION_PREFIX_LEN;
+    let operation_len = u32::from_be_bytes(
+        transaction[operation_start..operation_start + 4]
+            .try_into()
+            .expect("operation length is present"),
+    ) as usize;
+    let payload_start = operation_start + 4;
+    let field_start = payload_start + field_offset_in_payload;
+    transaction[field_start..field_start + 2].copy_from_slice(&value.to_be_bytes());
+
+    let operation_crc_start = payload_start + operation_len;
+    let operation_crc = crc32c(&transaction[operation_start..operation_crc_start]);
+    transaction[operation_crc_start..operation_crc_start + 4]
+        .copy_from_slice(&operation_crc.to_be_bytes());
+
+    let transaction_crc_start = transaction.len() - 4;
+    let transaction_crc = crc32c(&transaction[..transaction_crc_start]);
+    transaction[transaction_crc_start..].copy_from_slice(&transaction_crc.to_be_bytes());
+}
+
+fn patch_first_snapshot_quarantine_reason(snapshot: &mut [u8], value: u16) {
+    let record_start = SNAPSHOT_HEADER_LEN;
+    let record_len = u32::from_be_bytes(
+        snapshot[record_start..record_start + 4]
+            .try_into()
+            .expect("record length is present"),
+    ) as usize;
+    let payload_start = record_start + 4;
+    let reason_offset = {
+        let mut input = ByteReader::new(&snapshot[payload_start..payload_start + record_len]);
+        let _file_id = input.read_exact(16).expect("file id");
+        let _file_epoch = input.read_u32().expect("file epoch");
+        let _committed_offset = input.read_u64().expect("committed offset");
+        let fingerprint_len = input.read_u16().expect("fingerprint length") as usize;
+        let _fingerprint = input
+            .read_exact(fingerprint_len)
+            .expect("fingerprint bytes");
+        let _ignored_header_bytes = input.read_u32().expect("ignored header bytes");
+        let _locator = Locator::read(&mut input).expect("locator");
+        let _framing_profile_version = input.read_u16().expect("framing profile version");
+        let _framing_profile_digest = input.read_exact(32).expect("framing profile digest");
+        let _framing_resume = FramingResume::read(&mut input).expect("framing resume");
+        assert_eq!(input.read_u8().expect("lifecycle state"), 0x03);
+        input.position()
+    };
+    let reason_start = payload_start + reason_offset;
+    snapshot[reason_start..reason_start + 2].copy_from_slice(&value.to_be_bytes());
+
+    let record_crc_start = payload_start + record_len;
+    let record_crc = crc32c(&snapshot[record_start..record_crc_start]);
+    snapshot[record_crc_start..record_crc_start + 4].copy_from_slice(&record_crc.to_be_bytes());
 }
 
 /// Grows `path` to `len` bytes without writing them. The store checks a
@@ -1972,6 +2235,233 @@ fn missing_marker_adopts_a_pair_only_for_a_first_store_namespace() {
     }
 }
 
+/// Scenario: `CURRENT` is missing during initial namespace creation after
+/// its checksum-valid generation-0 marker was left at `CURRENT.tmp`.
+/// Guarantees: recovery bounded-validates the temporary marker and target
+/// pair, adopts generation 0, and publishes that same evidence without first
+/// deleting the only surviving marker.
+#[test]
+fn missing_current_adopts_a_valid_authoritative_marker_temp() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    drop(open(&path));
+
+    fs::rename(
+        path.join(CURRENT_FILE_NAME),
+        path.join(CURRENT_TEMP_FILE_NAME),
+    )
+    .expect("simulates the authority-uncertain Windows postcondition");
+
+    let reopened = open(&path);
+    assert_eq!(reopened.generation(), 0);
+    assert!(reopened.recovery().adopted_without_marker);
+    assert!(reopened.table().is_empty());
+    assert!(path.join(CURRENT_FILE_NAME).is_file());
+    assert!(!path.join(CURRENT_TEMP_FILE_NAME).exists());
+}
+
+/// Scenario: the exact Windows error-1177 postcondition leaves the old
+/// marker under `CURRENT.bak`, the new marker under `CURRENT.tmp`, and no
+/// `CURRENT`, while both consecutive generation pairs remain complete.
+/// Guarantees: recovery validates the deterministic backup as the target's
+/// predecessor, adopts the replacement, and removes both bounded recovery
+/// names after restoring `CURRENT`.
+#[test]
+fn missing_current_resolves_a_valid_windows_backup_postcondition() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    let seeded = seeded_namespace(&path);
+    let mut store = open(&path);
+    store.compact().expect("compaction succeeds");
+    drop(store);
+
+    fs::rename(
+        path.join(CURRENT_FILE_NAME),
+        path.join(CURRENT_TEMP_FILE_NAME),
+    )
+    .expect("new marker moves back to its replacement name");
+    write_bytes(
+        &path.join(CURRENT_BACKUP_FILE_NAME),
+        &encode_current_marker(0),
+    );
+
+    let reopened = open(&path);
+    assert_eq!(reopened.generation(), 1);
+    assert_eq!(records(&reopened), seeded);
+    assert!(path.join(CURRENT_FILE_NAME).is_file());
+    assert!(!path.join(CURRENT_TEMP_FILE_NAME).exists());
+    assert!(!path.join(CURRENT_BACKUP_FILE_NAME).exists());
+}
+
+/// Scenario: a compacted namespace has consecutive complete generations and
+/// a successor marker at `CURRENT.tmp`, but no `CURRENT` or deterministic
+/// predecessor backup.
+/// Guarantees: recovery does not infer successor authority from generation
+/// files alone, because the temporary generation may predate later writes to
+/// the missing predecessor marker's generation.
+#[test]
+fn missing_current_rejects_a_backup_less_successor_marker() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    let mut store = open(&path);
+    store.compact().expect("compaction succeeds");
+    drop(store);
+    fs::rename(
+        path.join(CURRENT_FILE_NAME),
+        path.join(CURRENT_TEMP_FILE_NAME),
+    )
+    .expect("successor marker moves back to its temporary name");
+
+    assert!(matches!(
+        CheckpointStore::open(options(&path))
+            .expect_err("a successor without predecessor evidence is ambiguous"),
+        StoreError::MissingMarker {
+            highest_generation: 1,
+            ..
+        }
+    ));
+    assert!(path.join(CURRENT_TEMP_FILE_NAME).is_file());
+}
+
+/// Scenario: a valid `CURRENT` selects a complete generation while a
+/// checksum-valid stale `CURRENT.tmp` names the previous complete
+/// generation.
+/// Guarantees: the fully validated `CURRENT` remains authoritative and the
+/// stale marker temp is removed only after its selected pair has loaded.
+#[test]
+fn valid_current_wins_over_a_conflicting_marker_temp() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    let seeded = seeded_namespace(&path);
+    let mut store = open(&path);
+    store.compact().expect("compaction succeeds");
+    drop(store);
+    write_bytes(
+        &path.join(CURRENT_TEMP_FILE_NAME),
+        &encode_current_marker(0),
+    );
+    write_bytes(
+        &path.join(CURRENT_BACKUP_FILE_NAME),
+        &encode_current_marker(0),
+    );
+
+    let reopened = open(&path);
+    assert_eq!(reopened.generation(), 1);
+    assert_eq!(records(&reopened), seeded);
+    assert_eq!(reopened.recovery().removed_temp_files, 2);
+    assert!(!path.join(CURRENT_TEMP_FILE_NAME).exists());
+    assert!(!path.join(CURRENT_BACKUP_FILE_NAME).exists());
+}
+
+/// Scenario: `CURRENT` is present but corrupt while `CURRENT.tmp` is a
+/// checksum-valid marker for a complete generation.
+/// Guarantees: recovery never falls back from corrupt authoritative state
+/// to a temporary candidate, and preserves the candidate for diagnosis
+/// rather than deleting evidence before authority is established.
+#[test]
+fn corrupt_current_does_not_fall_back_to_or_delete_marker_temp() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    drop(open(&path));
+    write_bytes(
+        &path.join(CURRENT_TEMP_FILE_NAME),
+        &encode_current_marker(0),
+    );
+    let marker_path = path.join(CURRENT_FILE_NAME);
+    let mut marker = fs::read(&marker_path).expect("CURRENT reads");
+    marker[0] ^= 0xff;
+    write_bytes(&marker_path, &marker);
+
+    assert!(matches!(
+        CheckpointStore::open(options(&path)).expect_err("corrupt CURRENT fails closed"),
+        StoreError::Decode {
+            artifact: "CURRENT marker",
+            ..
+        }
+    ));
+    assert!(path.join(CURRENT_TEMP_FILE_NAME).is_file());
+}
+
+/// Scenario: `CURRENT` is missing and `CURRENT.tmp` exceeds the bounded
+/// marker read limit while a complete initial generation remains on disk.
+/// Guarantees: startup rejects the temporary marker before buffering or
+/// decoding it and preserves the oversized evidence instead of falling
+/// back to the otherwise recoverable pair.
+#[test]
+fn missing_current_bounded_reads_the_marker_temp() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    drop(open(&path));
+    fs::remove_file(path.join(CURRENT_FILE_NAME)).expect("removes CURRENT");
+    write_bytes(
+        &path.join(CURRENT_TEMP_FILE_NAME),
+        &vec![0; super::MARKER_READ_MAX_BYTES as usize + 1],
+    );
+
+    assert!(matches!(
+        CheckpointStore::open(options(&path)).expect_err("oversized marker temp fails closed"),
+        StoreError::FileTooLarge {
+            artifact: "CURRENT temporary marker",
+            len,
+            max,
+            ..
+        } if len == super::MARKER_READ_MAX_BYTES + 1 && max == super::MARKER_READ_MAX_BYTES
+    ));
+    assert!(path.join(CURRENT_TEMP_FILE_NAME).is_file());
+}
+
+/// Scenario: `CURRENT` is missing and a checksum-valid `CURRENT.tmp` names
+/// generation 0 even though a later complete generation is also present.
+/// Guarantees: an arbitrary stale marker temp is not adopted from an
+/// ambiguous layout; recovery fails closed and preserves the evidence.
+#[test]
+fn missing_current_rejects_an_ambiguous_stale_marker_temp() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    let mut store = open(&path);
+    store.compact().expect("compaction succeeds");
+    drop(store);
+    fs::remove_file(path.join(CURRENT_FILE_NAME)).expect("removes CURRENT");
+    write_bytes(
+        &path.join(CURRENT_TEMP_FILE_NAME),
+        &encode_current_marker(0),
+    );
+
+    assert!(matches!(
+        CheckpointStore::open(options(&path)).expect_err("ambiguous marker temp fails closed"),
+        StoreError::MissingMarker {
+            highest_generation: 1,
+            ..
+        }
+    ));
+    assert!(path.join(CURRENT_TEMP_FILE_NAME).is_file());
+}
+
+/// Scenario: `CURRENT` and `CURRENT.tmp` are absent but a deterministic
+/// Windows replacement backup remains beside a complete generation pair.
+/// Guarantees: recovery does not guess that the backup is authoritative,
+/// fails closed, and preserves the marker evidence for diagnosis.
+#[test]
+fn missing_current_does_not_adopt_a_backup_without_its_replacement() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    drop(open(&path));
+    fs::rename(
+        path.join(CURRENT_FILE_NAME),
+        path.join(CURRENT_BACKUP_FILE_NAME),
+    )
+    .expect("CURRENT becomes the isolated backup");
+
+    assert!(matches!(
+        CheckpointStore::open(options(&path)).expect_err("backup-only authority is ambiguous"),
+        StoreError::MissingMarker {
+            highest_generation: 0,
+            ..
+        }
+    ));
+    assert!(path.join(CURRENT_BACKUP_FILE_NAME).is_file());
+}
+
 /// Scenario: a marker-less namespace whose initial generation is missing one
 /// half of its pair, once where the surviving half is empty and once where
 /// it already holds durable transactions.
@@ -2219,10 +2709,15 @@ fn temporary_file_cleanup_removes_only_this_namespace_temporaries() {
     let path = dir.path().join("namespace");
     drop(open(&path));
 
-    let mut owned = vec![temp_file_name(CURRENT_FILE_NAME)];
+    let mut owned = vec![
+        temp_file_name(CURRENT_FILE_NAME),
+        backup_file_name(CURRENT_FILE_NAME),
+    ];
     for generation in 1..=MAX_GENERATIONS_ON_DISK as u64 {
-        owned.push(temp_file_name(&snapshot_file_name(generation)));
-        owned.push(temp_file_name(&wal_file_name(generation)));
+        for final_name in [snapshot_file_name(generation), wal_file_name(generation)] {
+            owned.push(temp_file_name(&final_name));
+            owned.push(backup_file_name(&final_name));
+        }
     }
     assert_eq!(owned.len(), MAX_TEMP_FILES);
     let foreign = [
@@ -2261,10 +2756,15 @@ fn excessive_temporary_file_population_is_rejected_without_cleanup() {
     let path = dir.path().join("namespace");
     drop(open(&path));
 
-    let mut names = vec![temp_file_name(CURRENT_FILE_NAME)];
+    let mut names = vec![
+        temp_file_name(CURRENT_FILE_NAME),
+        backup_file_name(CURRENT_FILE_NAME),
+    ];
     for generation in 0..MAX_GENERATIONS_ON_DISK as u64 + 1 {
-        names.push(temp_file_name(&snapshot_file_name(generation)));
-        names.push(temp_file_name(&wal_file_name(generation)));
+        for final_name in [snapshot_file_name(generation), wal_file_name(generation)] {
+            names.push(temp_file_name(&final_name));
+            names.push(backup_file_name(&final_name));
+        }
     }
     names.truncate(MAX_TEMP_FILES + 1);
     for name in &names {
@@ -2499,6 +2999,46 @@ fn compaction_threshold_triggers_a_new_generation() {
     assert_eq!(committed_offset(&reopened, 1), 256);
 }
 
+/// Scenario: byte-driven compaction is configured at one byte on a fresh
+/// WAL, then after its first transaction and again immediately after
+/// compaction.
+/// Guarantees: the fixed 24-byte WAL header never triggers compaction by
+/// itself, while the first transaction crosses the one-byte body threshold
+/// and transaction-count threshold behavior remains independent.
+#[test]
+fn byte_compaction_threshold_ignores_an_empty_wal_header() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    let mut store = CheckpointStore::open(StoreOptions {
+        compact_after_bytes: 1,
+        compact_after_transactions: u32::MAX,
+        ..options(&path)
+    })
+    .expect("namespace opens");
+
+    assert_eq!(store.stats().wal_bytes, WAL_HEADER_LEN as u64);
+    assert!(!store.compaction_due());
+    assert!(!store.compact_if_due().expect("empty WAL is not due"));
+
+    let registered = store
+        .register_files(vec![registration(1)])
+        .expect("first transaction appends");
+    assert!(registered[0].compaction_due);
+    assert!(store.compaction_due());
+
+    store.compact().expect("compaction succeeds");
+    assert_eq!(store.stats().wal_transactions, 0);
+    assert_eq!(store.stats().wal_bytes, WAL_HEADER_LEN as u64);
+    assert!(!store.compaction_due());
+    assert!(!store.compact_if_due().expect("new empty WAL is not due"));
+
+    let progressed = store
+        .commit_progress(vec![progress(1, 0, 1)])
+        .expect("the new WAL's first transaction appends");
+    assert!(progressed[0].compaction_due);
+    assert!(store.compaction_due());
+}
+
 /// Scenario: cancellation becomes visible after a due compaction stages its
 /// complete snapshot/WAL pair but before it publishes `CURRENT`.
 /// Guarantees: compaction does not start marker publication, keeps the live
@@ -2582,13 +3122,11 @@ fn store_limits_are_derived_from_the_configured_bounds() {
     assert!(!unbounded_wal.exists(), "the namespace must not be created");
 }
 
-/// Scenario: progress transactions appended one at a time to a namespace
-/// with a small compaction threshold, up to and past the transaction that
-/// crosses it.
-/// Guarantees: exactly one transaction takes the WAL from under the
-/// threshold to at or over it, the WAL never leaves the cap recovery reads
-/// it back with, and compacting at that point starts an empty WAL whose
-/// state still reopens intact.
+/// Scenario: progress transactions are appended one at a time until the WAL
+/// body, excluding its fixed header, crosses a small compaction threshold.
+/// Guarantees: exactly one transaction takes the WAL body from under the
+/// threshold to at or over it, the WAL never leaves the recovery cap, and
+/// compacting at that point starts an empty WAL whose state reopens intact.
 #[test]
 fn crossing_the_compaction_threshold_keeps_the_wal_within_its_recovery_cap() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -2609,13 +3147,18 @@ fn crossing_the_compaction_threshold_keeps_the_wal_within_its_recovery_cap() {
     let mut crossings = 0usize;
     while !store.compaction_due() {
         let before = store.stats().wal_bytes;
-        assert!(before < 4_096, "the loop must stop at the threshold");
+        let before_body = before - WAL_HEADER_LEN as u64;
+        assert!(
+            before_body < 4_096,
+            "the loop must stop at the body threshold"
+        );
         let outcomes = store
             .commit_progress(vec![progress(1, offset, offset + 64)])
             .expect("progress succeeds");
         offset += 64;
         let after = store.stats().wal_bytes;
-        if after >= 4_096 {
+        let after_body = after - WAL_HEADER_LEN as u64;
+        if after_body >= 4_096 {
             crossings += 1;
             assert!(outcomes[0].compaction_due);
         }
@@ -3064,6 +3607,7 @@ fn windows_compaction_atomically_replaces_current() {
         .expect("registers");
     store.compact().expect("CURRENT replacement succeeds");
     assert_eq!(store.generation(), 1);
+    assert!(!path.join(CURRENT_BACKUP_FILE_NAME).exists());
     drop(store);
 
     let reopened = open(&path);
@@ -3072,9 +3616,10 @@ fn windows_compaction_atomically_replaces_current() {
 }
 
 /// Scenario: Windows reports each documented `ReplaceFileW` failure class
-/// that can occur after one or both pathnames have already changed.
-/// Guarantees: errors 1176 and 1177 are classified as authority-uncertain,
-/// while ordinary failures remain retryable against the current generation.
+/// while a deterministic backup name is supplied.
+/// Guarantees: only error 1177 is authority-uncertain; errors 1175 and 1176
+/// retain the original names and remain retryable against the current
+/// generation.
 #[cfg(windows)]
 #[test]
 fn windows_replace_failure_classifies_uncertain_authority() {
@@ -3083,7 +3628,7 @@ fn windows_replace_failure_classifies_uncertain_authority() {
         ERROR_UNABLE_TO_REMOVE_REPLACED,
     };
 
-    assert!(super::fsio::windows_replace_failure_may_have_changed(
+    assert!(!super::fsio::windows_replace_failure_may_have_changed(
         i32::try_from(ERROR_UNABLE_TO_MOVE_REPLACEMENT).ok()
     ));
     assert!(super::fsio::windows_replace_failure_may_have_changed(
@@ -3400,17 +3945,17 @@ fn reserved_reason_codes_are_refused_on_every_public_path() {
 /// from the final table.
 #[test]
 fn recovered_wal_rejects_every_reserved_reason_code() {
-    let mut quarantine = quarantine(1);
-    quarantine.reason_code = REASON_CODE_RESERVED;
-    for (name, operation, expected_field) in [
+    for (name, operation, reason_offset, expected_field) in [
         (
             "quarantine",
-            Operation::QuarantineFile(quarantine),
+            Operation::QuarantineFile(quarantine(1)),
+            1 + 16 + 4,
             "quarantine_file.reason_code",
         ),
         (
             "removal",
-            Operation::RemoveFile(removal(1, REASON_CODE_RESERVED)),
+            Operation::RemoveFile(removal(1, 0x0001)),
+            1 + 16 + 4 + 1,
             "remove_file.removal_reason",
         ),
     ] {
@@ -3422,12 +3967,17 @@ fn recovered_wal_rejects_every_reserved_reason_code() {
             .expect("registers");
         drop(store);
 
-        let transaction = Transaction {
+        let mut transaction = Transaction {
             sequence: 2,
             operations: vec![operation],
         }
         .encode()
         .expect("the structurally valid transaction encodes");
+        patch_first_transaction_operation_u16(
+            &mut transaction,
+            reason_offset,
+            REASON_CODE_RESERVED,
+        );
         let wal_path = path.join(wal_file_name(0));
         let mut wal = fs::OpenOptions::new()
             .append(true)
@@ -3490,18 +4040,13 @@ fn recovered_snapshot_rejects_reserved_reason_before_wal_can_erase_it() {
             .quarantine_files(vec![quarantine(1)])
             .expect("quarantines");
         store.compact().expect("quarantine snapshot is published");
-        let mut snapshot_records = records(&store);
-        snapshot_records[0]
-            .quarantine_evidence
-            .as_mut()
-            .expect("the snapshot record is quarantined")
-            .reason_code = REASON_CODE_RESERVED;
+        let snapshot_records = records(&store);
         drop(store);
 
-        write_bytes(
-            &path.join(snapshot_file_name(1)),
-            &encode_snapshot(1, &snapshot_records).expect("the snapshot encodes"),
-        );
+        let mut snapshot =
+            encode_snapshot(1, &snapshot_records).expect("the valid snapshot encodes");
+        patch_first_snapshot_quarantine_reason(&mut snapshot, REASON_CODE_RESERVED);
+        write_bytes(&path.join(snapshot_file_name(1)), &snapshot);
         let transaction = Transaction {
             sequence: 1,
             operations: vec![operation],

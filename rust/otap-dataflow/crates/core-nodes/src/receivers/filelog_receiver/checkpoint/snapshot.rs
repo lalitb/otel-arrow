@@ -11,7 +11,7 @@
 use super::error::{DecodeError, EncodeError};
 use super::primitives::{
     ADVISORY_PATH_MAX_BYTES, ByteReader, ByteWriter, FINGERPRINT_MAX_BYTES, FileId, FramingResume,
-    LifecycleState, Locator, SNAPSHOT_FOOTER_MAGIC, SNAPSHOT_MAGIC, crc32c,
+    LifecycleState, Locator, REASON_CODE_RESERVED, SNAPSHOT_FOOTER_MAGIC, SNAPSHOT_MAGIC, crc32c,
 };
 
 /// Fixed width of the snapshot header, in bytes.
@@ -22,7 +22,8 @@ pub const SNAPSHOT_FOOTER_LEN: usize = 24;
 /// Immutable quarantine evidence, present only for a `Quarantined` record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuarantineEvidence {
-    /// Opaque diagnostic reason code.
+    /// Opaque diagnostic reason code; encoders reject the reserved value
+    /// `0x0000`.
     pub reason_code: u16,
     /// Observed file size at the moment of quarantine.
     pub observed_size: u64,
@@ -84,6 +85,11 @@ impl SnapshotRecord {
         out.write_u8(self.lifecycle_state.to_wire());
         match (&self.lifecycle_state, &self.quarantine_evidence) {
             (LifecycleState::Quarantined, Some(evidence)) => {
+                if evidence.reason_code == REASON_CODE_RESERVED {
+                    return Err(EncodeError::ReservedReasonCode {
+                        field: "quarantine_evidence.reason_code",
+                    });
+                }
                 out.write_u16(evidence.reason_code);
                 out.write_u64(evidence.observed_size);
                 out.write_u32(evidence.quarantine_epoch);

@@ -1386,15 +1386,20 @@ and recovery model**. The exact byte encoding is a separate Phase 1 deliverable.
   form the transaction length declared by the final header. A complete transaction
   with a checksum mismatch, corruption before the tail, sequence regression, bad
   snapshot checksum, or unknown version fails closed.
-- **Compaction is not on every Ack.** When WAL bytes or transaction count crosses a
-  configured threshold, the worker writes and fsyncs a new generation-named snapshot
-  and empty WAL, fsyncs the directory, then atomically replaces and fsyncs `CURRENT`.
-  The previous generation remains intact until the new pair and marker are durable;
-  obsolete generations are removed only in a later cleanup. Recovery follows `CURRENT`
-  and verifies that both files carry that generation. If the marker is missing during
-  first-store creation, it selects the highest complete pair; an invalid selected pair
-  otherwise fails closed rather than guessing from modification time. Compaction
-  duration is measured because a large tracked-file table can delay the next Phase 1 batch.
+- **Compaction is not on every Ack.** When WAL body bytes (excluding the fixed 24-byte
+  header) or transaction count crosses a configured threshold, the worker writes and
+  fsyncs a new generation-named snapshot and empty WAL, fsyncs the directory, then
+  atomically replaces and fsyncs `CURRENT`. An empty WAL is never byte-due regardless of
+  how small the byte threshold is. The previous generation remains intact until the new
+  pair and marker are durable; obsolete generations are removed only in a later cleanup.
+  Recovery follows `CURRENT` and verifies that both files carry that generation. If the
+  marker is missing during first-store creation, it selects the complete initial pair.
+  A missing marker may also adopt a bounded, checksum-valid generation-0 `CURRENT.tmp`
+  after interrupted creation. A later generation requires a matching `CURRENT.bak`
+  predecessor in the exact Windows publication layout described below; an
+  invalid or ambiguous selection otherwise fails closed rather than guessing from
+  modification time. Compaction duration is measured because a large tracked-file table
+  can delay the next Phase 1 batch.
 - **Publication is platform-specific but preserves one-generation selection.** Unix
   installs same-directory temporary files with atomic `rename` and syncs the namespace
   directory. Windows uses `ReplaceFileW` when `CURRENT` already exists and
@@ -1403,17 +1408,25 @@ and recovery model**. The exact byte encoding is a separate Phase 1 deliverable.
   modes cannot block publication. Direct Win32 calls receive absolute extended-length
   paths resolved from the existing namespace parent, so publication is not limited by
   legacy `MAX_PATH` handling and preserves drive and UNC path forms. `ReplaceFileW`
-  errors 1176 and 1177 can change one or both names despite reporting failure; either
-  error makes the live store unusable until reopen determines the authoritative
-  generation. `std::fs` cannot sync a Windows directory handle, so the directory-sync
-  step is a documented no-op there after the temporary file itself is synced. Atomic
-  replacement is preserved, while power-loss durability of the directory entry relies
-  on the local filesystem's metadata journaling and is weaker evidence than Unix
-  directory `fsync`. Windows CI must execute first creation, replacement of an existing
-  `CURRENT`, long-path publication, every compaction fault point, reopen after
-  interrupted cleanup, namespace-lock contention, and sharing-violation failure; a
-  platform power-cut test remains required before claiming equivalent crash-durability
-  evidence.
+  error 1177 can rename the old `CURRENT` to the deterministic `CURRENT.bak` name while
+  leaving the replacement at `CURRENT.tmp` despite reporting failure. That error makes
+  the live store unusable until reopen resolves both recovery names. With the backup
+  name supplied, errors 1175 and 1176 retain the original names and remain retryable. A
+  valid, fully recoverable `CURRENT` always wins. If `CURRENT` is
+  missing, a generation-0 temporary marker is adopted only when its checksum is valid
+  and it names the sole complete pair. A later temporary generation is adopted only
+  with its complete predecessor and a valid `CURRENT.bak` marker naming that
+  predecessor. Corrupt, incomplete, backup-less successor, extra-generation, and conflicting
+  layouts fail closed without deleting the bounded marker evidence. `std::fs`
+  cannot sync a Windows directory handle, so the directory-sync step is a documented
+  no-op there after the temporary file itself is synced. Atomic replacement is
+  preserved, while power-loss durability of the directory entry relies on the local
+  filesystem's metadata journaling and is weaker evidence than Unix directory `fsync`.
+  Windows CI must execute first creation, replacement of an existing `CURRENT`,
+  long-path publication, every compaction fault point, synthetic 1177
+  postconditions, reopen after interrupted cleanup, namespace-lock contention, and
+  sharing-violation failure; a platform power-cut test remains required before claiming
+  equivalent crash-durability evidence.
 - **Retention is applied during compaction.** A record may be removed only when it has
   been absent from discovery and all open/in-flight state longer than
   `checkpoint.retention`. Wall-clock time is required across restart, so a large forward
@@ -2040,15 +2053,23 @@ conformance tests pass.
 The Phase 1 namespace is:
 
 ```text
-${engine.state_dir}/filelog/<checkpoint.id>/
+${engine.state_dir}/filelog/@v1/<lowercase-hex-checkpoint-id>/
   CURRENT
   offsets-<generation>.snapshot
   offsets-<generation>.wal
   ownership.lock
 ```
 
-The ID is percent-encoded using the journald path convention. The namespace lock
-prevents two active configurations sharing an ID from writing concurrently.
+The `@v1` component is outside the earlier draft's accepted ID alphabet, so the version
+directory cannot itself be a legacy flat namespace. Every byte of the accepted ASCII ID
+is encoded as two lowercase hexadecimal digits, with no case folding or safe-character
+passthrough. This is injective on case-insensitive filesystems (`AppLogs` and `applogs`
+cannot alias). The common 255-byte path-segment bound limits configured IDs to 127
+bytes. This is new unreleased Phase 1 state, so no migration from the earlier draft's
+percent-encoded directories is promised. On Unix, startup also checks the containing
+filesystem's reported component limit before creating a missing namespace, so a
+narrower mounted-filesystem bound fails explicitly. The namespace lock prevents two
+active configurations sharing an exact ID from writing concurrently.
 
 ### Format overview
 
@@ -2202,12 +2223,19 @@ Detailed transition and replay rules:
 
 ### Recovery algorithm
 
-1. Read `CURRENT`, then load and validate the selected snapshot generation, version,
-   bounds, and integrity check.
-2. Replay complete WAL transactions atomically in strictly increasing sequence order.
-3. Discard only a structurally incomplete final transaction, as identified by the exact
+1. While holding the namespace lock, preserve `CURRENT.tmp` and `CURRENT.bak` until
+   marker authority is established. Read `CURRENT`, then load and validate the selected snapshot generation,
+   version, bounds, and integrity check. A present but corrupt or incomplete `CURRENT`
+   fails closed without falling back to the temporary marker.
+2. If `CURRENT` is absent, adopt a generation-0 `CURRENT.tmp` only after a bounded marker
+   read proves it names the sole complete pair. Adopt a later temporary generation only
+   when a valid `CURRENT.bak` names its complete predecessor and no other generation is
+   recognized. Fully validate the selected pair before installing the temporary marker;
+   every ambiguous layout fails closed without deleting either recovery name.
+3. Replay complete WAL transactions atomically in strictly increasing sequence order.
+4. Discard only a structurally incomplete final transaction, as identified by the exact
    encoding specification's transaction-boundary rules.
-4. Fail recovery closed on every other integrity, bounds, ordering, version, unknown
+5. Fail recovery closed on every other integrity, bounds, ordering, version, unknown
    operation, or state-transition error.
 
 No update from a transaction becomes visible unless its complete transaction validates.
@@ -2224,7 +2252,9 @@ encoding.
 Compaction writes and syncs a complete new snapshot/WAL generation before atomically
 selecting it through `CURRENT`. The previously selected generation remains recoverable
 until the new generation and marker are durable. Cleanup never makes an incomplete
-generation authoritative.
+generation authoritative. The byte threshold counts only bytes after the fixed WAL
+header and requires at least one transaction; the transaction threshold is evaluated
+independently.
 
 Cleanup is resumable: the complete pending-generation list is retained until every
 unlink and the final directory sync succeed. A retry therefore repeats already completed
@@ -2234,7 +2264,8 @@ compaction until cleanup succeeds, which bounds normal operation to the active p
 one retired pair. Recovery accepts at most three recognized generations so it can also
 clean one incomplete staged generation or state left by the earlier implementation
 without admitting an unbounded directory population. It likewise refuses more than
-seven recognized temporary artifacts before deleting any of them.
+fourteen recognized temporary/backup artifacts before deleting generation staging or
+resolving the separately preserved `CURRENT.tmp` / `CURRENT.bak` evidence.
 
 Every stored format carries an explicit version. An incompatible encoding or semantic
 change requires a new version, an explicit migration policy, and compatibility vectors.
@@ -2277,21 +2308,22 @@ The multipliers cover decoded records, hash-table storage, decoded operations, a
 touched-record scratch map in addition to the encoded buffer. Every term and sum uses
 checked arithmetic. Each artifact and the combined model must remain within a fixed
 1 GiB admission ceiling. Config validation rejects a larger result before a namespace is
-opened and names the knobs to reduce. The defaults bound the snapshot at 52,390,036
-bytes, the WAL at 88,477,738 bytes, a transaction at 21,368,850 bytes, and the combined
-model at 331,123,246 bytes.
+opened and names the knobs to reduce. The defaults bound the snapshot at 52,430,052
+bytes, the WAL at 88,494,122 bytes, a transaction at 21,385,234 bytes, and the combined
+model at 331,325,214 bytes.
 
 The ignored
 `checkpoint_recovery_stress_reports_latency_and_peak_memory` test makes this evidence
-reproducible in a fresh subprocess. A release-mode boundary run on 2026-08-23 on an
-arm64 Mac16,8 with macOS 26.6 used 63,087 maximum-path records and a 266,290,279-byte
-snapshot. Its modeled working set was 1,073,740,948 bytes (876 bytes below the ceiling);
-recovery took 659,968 microseconds and the 1 ms RSS sampler observed a 599,097,344-byte
-increase. These are reference measurements, not a latency or RSS guarantee; allocators,
-filesystems, hardware, and WAL shape vary. Reproduce the boundary case with:
+reproducible in a fresh subprocess. A release-mode boundary run on 2026-08-27 on an
+arm64 Mac16,8 with macOS 26.6 used 63,027 maximum-path records and a 266,289,127-byte
+snapshot. Its modeled working set was 1,073,728,180 bytes (13,644 bytes below the
+ceiling); recovery took 643,722 microseconds and the 1 ms RSS sampler observed a
+601,669,632-byte increase. These are reference measurements, not a latency or RSS
+guarantee; allocators, filesystems, hardware, and WAL shape vary. Reproduce the boundary
+case with:
 
 ```console
-OTAP_FILELOG_CHECKPOINT_STRESS_RECORDS=63087 cargo test --release \
+OTAP_FILELOG_CHECKPOINT_STRESS_RECORDS=63027 cargo test --release \
   -p otap-df-core-nodes \
   checkpoint_recovery_stress_reports_latency_and_peak_memory \
   -- --ignored --nocapture

@@ -437,12 +437,11 @@ pub fn transaction_bytes(fingerprint_bytes: u64) -> Result<u64, LimitsError> {
 /// The largest WAL file a store that honors its compaction threshold can
 /// produce.
 ///
-/// Compaction becomes due once the live WAL reaches `compact_after_bytes`,
-/// so the largest WAL a caller can leave behind is one that was still just
-/// under the threshold and then took one maximal transaction. The header
-/// term additionally covers the degenerate configuration whose threshold is
-/// smaller than a freshly created WAL's header, where compaction is due
-/// immediately and the first transaction still has to fit.
+/// Compaction becomes byte-due once the live WAL body reaches
+/// `compact_after_bytes`, so the largest WAL a caller can leave behind is
+/// one whose body was still just under the threshold and then took one
+/// maximal transaction. The fixed header is accounted separately and never
+/// makes an empty WAL due.
 pub fn wal_bytes(compact_after_bytes: u64, fingerprint_bytes: u64) -> Result<u64, LimitsError> {
     let transaction = transaction_bytes(fingerprint_bytes)?;
     sum(

@@ -89,7 +89,9 @@ impl NamespaceLock {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            let _ = options.mode(LOCK_FILE_MODE).custom_flags(libc::O_NOFOLLOW);
+            let _ = options
+                .mode(LOCK_FILE_MODE)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
         #[cfg(windows)]
         {

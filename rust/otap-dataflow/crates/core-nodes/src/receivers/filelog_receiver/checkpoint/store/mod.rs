@@ -122,7 +122,10 @@ use crate::receivers::filelog_receiver::config::{
 use error::StoreError;
 use fault::{FaultPlan, FaultPoint};
 use fsio::{AtomicWriteError, AtomicWriteFaults};
-use layout::{CURRENT_FILE_NAME, INITIAL_GENERATION, snapshot_file_name, wal_file_name};
+use layout::{
+    CURRENT_BACKUP_FILE_NAME, CURRENT_FILE_NAME, CURRENT_TEMP_FILE_NAME, INITIAL_GENERATION,
+    snapshot_file_name, wal_file_name,
+};
 use limits::StoreLimits;
 use lock::NamespaceLock;
 
@@ -144,7 +147,8 @@ const DEFAULT_OWNERSHIP_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 /// that cannot be reopened.
 #[derive(Debug, Clone)]
 pub struct StoreOptions {
-    /// Namespace directory: `${engine.state_dir}/filelog/<checkpoint.id>/`.
+    /// Namespace directory:
+    /// `${engine.state_dir}/filelog/@v1/<encoded checkpoint.id>/`.
     pub namespace_dir: PathBuf,
     /// The exact resolved `checkpoint.id` this namespace belongs to.
     /// Administrative `remove_file` operations are validated against it.
@@ -154,7 +158,8 @@ pub struct StoreOptions {
     /// post-crash duplicate window; it never creates a loss window, because
     /// progress is only ever recorded for already-acknowledged data.
     pub sync_interval: Duration,
-    /// Compact once the live WAL reaches this many bytes.
+    /// Compact once the live WAL body, excluding its fixed header, reaches
+    /// this many bytes and contains at least one transaction.
     pub compact_after_bytes: u64,
     /// Compact once the live WAL reaches this many transactions.
     pub compact_after_transactions: u32,
@@ -243,9 +248,9 @@ pub struct RecoveryReport {
     pub generation: u64,
     /// Whether this open created the namespace's initial generation.
     pub created: bool,
-    /// Whether this open adopted a complete initial generation that had no
-    /// `CURRENT` marker, which is the state an interrupted first creation
-    /// leaves behind.
+    /// Whether this open adopted a complete generation that had no
+    /// `CURRENT` marker, either from interrupted first creation or from a
+    /// validated `CURRENT.tmp` publication postcondition.
     pub adopted_without_marker: bool,
     /// Records recovered from the snapshot before WAL replay.
     pub snapshot_records: usize,
@@ -603,7 +608,7 @@ impl CheckpointStore {
         };
         // Only safe once this writer owns the namespace: a temporary file
         // could otherwise belong to a live writer's in-flight publication.
-        let Some(removed_temp_files) =
+        let Some(mut removed_temp_files) =
             layout::remove_stale_temp_files(&namespace_dir, &mut *cancelled)?
         else {
             return Ok(None);
@@ -619,6 +624,7 @@ impl CheckpointStore {
         else {
             return Ok(None);
         };
+        let marker_present = marker_bytes.is_some();
         let selection = match marker_bytes {
             Some(bytes) => {
                 let generation =
@@ -631,19 +637,75 @@ impl CheckpointStore {
                     generation,
                     created: false,
                     adopted_without_marker: false,
+                    marker_temp_authoritative: false,
                 }
             }
             None => {
-                let Some(selection) = Self::select_without_marker(
-                    &namespace_dir,
-                    &mut faults,
-                    &limits,
+                let marker_temp_path = namespace_dir.join(CURRENT_TEMP_FILE_NAME);
+                let marker_backup_path = namespace_dir.join(CURRENT_BACKUP_FILE_NAME);
+                let Some(marker_temp_bytes) = fsio::read_file_bounded_cancellable(
+                    &marker_temp_path,
+                    "CURRENT temporary marker",
+                    MARKER_READ_MAX_BYTES,
                     &mut *cancelled,
                 )?
                 else {
                     return Ok(None);
                 };
-                selection
+                let Some(marker_backup_bytes) = fsio::read_file_bounded_cancellable(
+                    &marker_backup_path,
+                    "CURRENT backup marker",
+                    MARKER_READ_MAX_BYTES,
+                    &mut *cancelled,
+                )?
+                else {
+                    return Ok(None);
+                };
+                match (marker_temp_bytes, marker_backup_bytes) {
+                    (Some(bytes), marker_backup_bytes) => {
+                        let Some(selection) = Self::select_from_temporary_marker(
+                            &namespace_dir,
+                            &marker_temp_path,
+                            &bytes,
+                            &marker_backup_path,
+                            marker_backup_bytes.as_deref(),
+                            &mut *cancelled,
+                        )?
+                        else {
+                            return Ok(None);
+                        };
+                        selection
+                    }
+                    (None, Some(_)) => {
+                        let Some(generations) =
+                            layout::scan_generations(&namespace_dir, &mut *cancelled)?
+                        else {
+                            return Ok(None);
+                        };
+                        return Err(StoreError::MissingMarker {
+                            dir: namespace_dir,
+                            marker: CURRENT_FILE_NAME,
+                            highest_generation: generations
+                                .keys()
+                                .next_back()
+                                .copied()
+                                .unwrap_or(INITIAL_GENERATION),
+                        });
+                    }
+                    (None, None) => {
+                        let Some(selection) = Self::select_without_marker(
+                            &namespace_dir,
+                            &mut faults,
+                            &limits,
+                            max_tracked_files,
+                            &mut *cancelled,
+                        )?
+                        else {
+                            return Ok(None);
+                        };
+                        selection
+                    }
+                }
             }
         };
         if cancelled() {
@@ -676,7 +738,29 @@ impl CheckpointStore {
             };
             faults.check(FaultPoint::AfterTornTailTruncate)?;
         }
-        if selection.adopted_without_marker {
+        if marker_present {
+            // A checksum-valid CURRENT is not enough to discard other
+            // marker evidence: retain CURRENT.tmp and CURRENT.bak until the
+            // selected generation passes complete bounded validation.
+            let Some(removed) =
+                Self::remove_marker_recovery_files(&namespace_dir, &mut *cancelled)?
+            else {
+                return Ok(None);
+            };
+            removed_temp_files += removed;
+        } else if selection.marker_temp_authoritative {
+            // Windows ReplaceFileW failures 1176 and 1177 can remove
+            // CURRENT while leaving the synced replacement under
+            // CURRENT.tmp. The candidate marker and its exact generation
+            // layout were checked before load, and the selected pair has
+            // now passed full bounded validation, so finish that interrupted
+            // publication without first deleting the only marker evidence.
+            if cancelled() {
+                return Ok(None);
+            }
+            Self::publish_existing_marker_temp(&namespace_dir).map_err(|failure| failure.error)?;
+            removed_temp_files += 1;
+        } else if selection.adopted_without_marker {
             // Finish the interrupted creation now that the adopted pair has
             // been validated in full: naming it in `CURRENT` restores the
             // namespace invariant that a marker always selects the
@@ -787,6 +871,115 @@ impl CheckpointStore {
         Ok(())
     }
 
+    fn remove_marker_recovery_files(
+        dir: &Path,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<Option<usize>, StoreError> {
+        if cancelled() {
+            return Ok(None);
+        }
+        let mut removed = 0usize;
+        for name in [CURRENT_TEMP_FILE_NAME, CURRENT_BACKUP_FILE_NAME] {
+            removed += usize::from(fsio::remove_file_if_present(&dir.join(name))?);
+            if cancelled() {
+                return Ok(None);
+            }
+        }
+        Ok(Some(removed))
+    }
+
+    /// Selects the generation named by `CURRENT.tmp` only when the missing
+    /// `CURRENT`, optional `CURRENT.bak`, and generation population exactly
+    /// match a publication postcondition this store can produce.
+    ///
+    /// Generation 0 may be the sole pair after interrupted first
+    /// publication. A later candidate must be the complete successor of one
+    /// complete previous generation, with no other recognized generations.
+    /// Any other layout is ambiguous and retains both recovery names for
+    /// operator diagnosis.
+    fn select_from_temporary_marker(
+        dir: &Path,
+        marker_temp_path: &Path,
+        marker_temp_bytes: &[u8],
+        marker_backup_path: &Path,
+        marker_backup_bytes: Option<&[u8]>,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<Option<Selection>, StoreError> {
+        let generation =
+            decode_current_marker(marker_temp_bytes).map_err(|source| StoreError::Decode {
+                artifact: "CURRENT temporary marker",
+                path: marker_temp_path.to_path_buf(),
+                source,
+            })?;
+        let Some(generations) = layout::scan_generations(dir, &mut *cancelled)? else {
+            return Ok(None);
+        };
+        let candidate = generations.get(&generation).copied().unwrap_or_default();
+        if !candidate.is_complete() {
+            return Err(StoreError::IncompleteGeneration {
+                dir: dir.to_path_buf(),
+                generation,
+                missing: candidate.missing(),
+            });
+        }
+
+        let backup_generation = marker_backup_bytes
+            .map(|bytes| {
+                decode_current_marker(bytes).map_err(|source| StoreError::Decode {
+                    artifact: "CURRENT backup marker",
+                    path: marker_backup_path.to_path_buf(),
+                    source,
+                })
+            })
+            .transpose()?;
+        let exact_publication_layout = if generation == INITIAL_GENERATION {
+            generations.len() == 1 && backup_generation.is_none()
+        } else {
+            let previous = generation - 1;
+            let Some(found) = backup_generation else {
+                return Err(StoreError::MissingMarker {
+                    dir: dir.to_path_buf(),
+                    marker: CURRENT_FILE_NAME,
+                    highest_generation: generations
+                        .keys()
+                        .next_back()
+                        .copied()
+                        .unwrap_or(generation),
+                });
+            };
+            if found != previous {
+                return Err(StoreError::GenerationMismatch {
+                    artifact: "CURRENT backup marker",
+                    path: marker_backup_path.to_path_buf(),
+                    expected: previous,
+                    found,
+                });
+            }
+            generations.len() == 2
+                && generations
+                    .get(&previous)
+                    .is_some_and(|files| files.is_complete())
+        };
+        if !exact_publication_layout {
+            return Err(StoreError::MissingMarker {
+                dir: dir.to_path_buf(),
+                marker: CURRENT_FILE_NAME,
+                highest_generation: generations
+                    .keys()
+                    .next_back()
+                    .copied()
+                    .unwrap_or(generation),
+            });
+        }
+
+        Ok(Some(Selection {
+            generation,
+            created: false,
+            adopted_without_marker: true,
+            marker_temp_authoritative: true,
+        }))
+    }
+
     /// Chooses a generation for a namespace whose `CURRENT` marker is
     /// absent, creating the initial generation when the namespace is new.
     ///
@@ -806,6 +999,7 @@ impl CheckpointStore {
         dir: &Path,
         faults: &mut FaultPlan,
         limits: &StoreLimits,
+        max_tracked_files: u32,
         cancelled: &mut impl FnMut() -> bool,
     ) -> Result<Option<Selection>, StoreError> {
         let Some(scan) = layout::scan_generations(dir, &mut *cancelled)? else {
@@ -836,6 +1030,7 @@ impl CheckpointStore {
                 generation: INITIAL_GENERATION,
                 created: false,
                 adopted_without_marker: true,
+                marker_temp_authoritative: false,
             }));
         }
 
@@ -843,7 +1038,12 @@ impl CheckpointStore {
         // never completed. Neither was ever authoritative (no marker has ever
         // named it), so creating the initial generation cannot discard
         // durable progress.
-        if !Self::verify_incomplete_initial_pair_is_empty(dir, limits, &mut *cancelled)? {
+        if !Self::verify_incomplete_initial_pair_is_empty(
+            dir,
+            limits,
+            max_tracked_files,
+            &mut *cancelled,
+        )? {
             return Ok(None);
         }
         if !Self::create_generation_cancellable(
@@ -860,6 +1060,7 @@ impl CheckpointStore {
             generation: INITIAL_GENERATION,
             created: true,
             adopted_without_marker: false,
+            marker_temp_authoritative: false,
         }))
     }
 
@@ -877,6 +1078,7 @@ impl CheckpointStore {
     fn verify_incomplete_initial_pair_is_empty(
         dir: &Path,
         limits: &StoreLimits,
+        max_tracked_files: u32,
         cancelled: &mut impl FnMut() -> bool,
     ) -> Result<bool, StoreError> {
         let snapshot_path = dir.join(snapshot_file_name(INITIAL_GENERATION));
@@ -890,26 +1092,39 @@ impl CheckpointStore {
             return Ok(false);
         };
         if let Some(bytes) = snapshot {
-            let snapshot = decode_snapshot(&bytes).map_err(|source| StoreError::Decode {
+            let header = decode_snapshot_header(&bytes).map_err(|source| StoreError::Decode {
                 artifact: "snapshot",
                 path: snapshot_path.clone(),
                 source,
             })?;
-            if !snapshot.records.is_empty() {
+            if header.generation != INITIAL_GENERATION {
+                return Err(StoreError::GenerationMismatch {
+                    artifact: "snapshot",
+                    path: snapshot_path,
+                    expected: INITIAL_GENERATION,
+                    found: header.generation,
+                });
+            }
+            if header.record_count > max_tracked_files {
+                return Err(StoreError::RecoveredTrackedFilesExceedMaximum {
+                    dir: dir.to_path_buf(),
+                    tracked: header.record_count as usize,
+                    max: max_tracked_files,
+                });
+            }
+            if header.record_count != 0 {
                 return Err(StoreError::IncompleteInitialGeneration {
                     dir: dir.to_path_buf(),
                     marker: CURRENT_FILE_NAME,
                     reason: "its snapshot already holds records",
                 });
             }
-            if snapshot.generation != INITIAL_GENERATION {
-                return Err(StoreError::GenerationMismatch {
-                    artifact: "snapshot",
-                    path: snapshot_path,
-                    expected: INITIAL_GENERATION,
-                    found: snapshot.generation,
-                });
-            }
+            let snapshot = decode_snapshot(&bytes).map_err(|source| StoreError::Decode {
+                artifact: "snapshot",
+                path: snapshot_path.clone(),
+                source,
+            })?;
+            debug_assert!(snapshot.records.is_empty());
         }
         if cancelled() {
             return Ok(false);
@@ -940,13 +1155,14 @@ impl CheckpointStore {
                 });
             }
             if bytes.len() > WAL_HEADER_LEN {
-                let scan = scan_one_transaction(&bytes[WAL_HEADER_LEN..]).map_err(|source| {
-                    StoreError::Decode {
+                let remaining = &bytes[WAL_HEADER_LEN..];
+                Self::validate_declared_transaction_size(remaining, &wal_path, limits)?;
+                let scan =
+                    scan_one_transaction(remaining).map_err(|source| StoreError::Decode {
                         artifact: "WAL",
                         path: wal_path.clone(),
                         source,
-                    }
-                })?;
+                    })?;
                 let reason = match scan {
                     TransactionScan::Complete(_, _) => "its WAL already holds transactions",
                     TransactionScan::TornTail(_) => "its surviving WAL has a torn tail",
@@ -959,6 +1175,34 @@ impl CheckpointStore {
             }
         }
         Ok(!cancelled())
+    }
+
+    /// Enforces the configured transaction bound from the four-byte length
+    /// prefix before a complete frame can be decoded into operations.
+    fn validate_declared_transaction_size(
+        bytes: &[u8],
+        wal_path: &Path,
+        limits: &StoreLimits,
+    ) -> Result<(), StoreError> {
+        if bytes.len() < size_of::<u32>() {
+            return Ok(());
+        }
+        let mut encoded_len = [0u8; size_of::<u32>()];
+        encoded_len.copy_from_slice(&bytes[..size_of::<u32>()]);
+        // The declared body is surrounded by the four-byte length and
+        // four-byte CRC fields.
+        let transaction_bytes = u64::from(u32::from_be_bytes(encoded_len))
+            .checked_add(8)
+            .ok_or(StoreError::AccountingOverflow { bytes: u64::MAX })?;
+        if transaction_bytes > limits.max_transaction_bytes {
+            return Err(StoreError::FileTooLarge {
+                artifact: "WAL transaction",
+                path: wal_path.to_path_buf(),
+                len: transaction_bytes,
+                max: limits.max_transaction_bytes,
+            });
+        }
+        Ok(())
     }
 
     /// Loads and validates one complete generation: its snapshot as the
@@ -1078,24 +1322,7 @@ impl CheckpointStore {
                 return Ok(None);
             }
             let remaining = &wal_bytes[cursor..];
-            if remaining.len() >= size_of::<u32>() {
-                let mut encoded_len = [0u8; size_of::<u32>()];
-                encoded_len.copy_from_slice(&remaining[..size_of::<u32>()]);
-                // The declared body is surrounded by the four-byte length
-                // and four-byte CRC fields.
-                let transaction_bytes =
-                    u64::from(u32::from_be_bytes(encoded_len))
-                        .checked_add(8)
-                        .ok_or(StoreError::AccountingOverflow { bytes: u64::MAX })?;
-                if transaction_bytes > limits.max_transaction_bytes {
-                    return Err(StoreError::FileTooLarge {
-                        artifact: "WAL transaction",
-                        path: wal_path.clone(),
-                        len: transaction_bytes,
-                        max: limits.max_transaction_bytes,
-                    });
-                }
-            }
+            Self::validate_declared_transaction_size(remaining, &wal_path, limits)?;
             match scan_one_transaction(remaining).map_err(|source| StoreError::Decode {
                 artifact: "WAL",
                 path: wal_path.clone(),
@@ -1433,6 +1660,16 @@ impl CheckpointStore {
             })
     }
 
+    /// Finishes publication of a bounded, checksum-valid `CURRENT.tmp`
+    /// whose complete target generation has already been loaded.
+    fn publish_existing_marker_temp(dir: &Path) -> Result<(), AtomicWriteError> {
+        fsio::publish_existing_temp_file(dir, CURRENT_FILE_NAME)?;
+        fsio::sync_directory(dir).map_err(|error| AtomicWriteError {
+            error,
+            destination_may_have_changed: true,
+        })
+    }
+
     /// The namespace directory this store owns.
     #[must_use]
     pub fn namespace_dir(&self) -> &Path {
@@ -1501,7 +1738,8 @@ impl CheckpointStore {
     /// Whether a compaction threshold is met.
     #[must_use]
     pub fn compaction_due(&self) -> bool {
-        self.wal_bytes >= self.compact_after_bytes
+        (self.wal_transactions > 0
+            && self.wal_bytes.saturating_sub(WAL_HEADER_LEN as u64) >= self.compact_after_bytes)
             || self.wal_transactions >= u64::from(self.compact_after_transactions)
     }
 
@@ -2629,6 +2867,7 @@ struct Selection {
     generation: u64,
     created: bool,
     adopted_without_marker: bool,
+    marker_temp_authoritative: bool,
 }
 
 /// One validated generation, recovered into memory.

@@ -29,11 +29,11 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::error::StoreError;
 use super::fault::{FaultPlan, FaultPoint};
-use super::layout::temp_file_name;
+use super::layout::{backup_file_name, temp_file_name};
 
 /// Directory mode for the checkpoint namespace on Unix.
 #[cfg(unix)]
@@ -138,6 +138,12 @@ pub(crate) fn create_namespace_dir_cancellable(
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
                 missing_directories.push(candidate.to_path_buf());
             }
+            #[cfg(unix)]
+            Err(source) if source.raw_os_error() == Some(libc::ENAMETOOLONG) => {
+                // Defer this failure until the nearest existing ancestor can
+                // report its actual per-component limit via fpathconf.
+                missing_directories.push(candidate.to_path_buf());
+            }
             Err(source) => {
                 return Err(StoreError::Io {
                     operation: "inspect a checkpoint namespace ancestor",
@@ -153,6 +159,9 @@ pub(crate) fn create_namespace_dir_cancellable(
     };
 
     let namespace_presecured = missing_directories.is_empty();
+    if !namespace_presecured {
+        validate_missing_namespace_component_lengths(&existing_boundary, &missing_directories)?;
+    }
     if namespace_presecured {
         let Some(()) = secure_namespace_dir_cancellable(dir, &mut *cancelled)? else {
             return Ok(None);
@@ -255,6 +264,67 @@ pub(crate) fn create_namespace_dir_cancellable(
     Ok(Some(()))
 }
 
+#[cfg(unix)]
+#[allow(unsafe_code, reason = "POSIX fpathconf requires a raw file descriptor")]
+fn validate_missing_namespace_component_lengths(
+    existing_boundary: &Path,
+    missing_directories: &[PathBuf],
+) -> Result<(), StoreError> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut options = OpenOptions::new();
+    let _ = options
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+    let boundary = options
+        .open(existing_boundary)
+        .map_err(|source| StoreError::Io {
+            operation: "open a checkpoint namespace ancestor for component-limit validation",
+            path: existing_boundary.to_path_buf(),
+            source,
+        })?;
+    // SAFETY: `boundary` owns a live file descriptor for the duration of
+    // this call, and `_PC_NAME_MAX` does not write through any pointer.
+    let reported = unsafe { libc::fpathconf(boundary.as_raw_fd(), libc::_PC_NAME_MAX) };
+    if reported <= 0 {
+        // POSIX permits -1 for an indeterminate/unbounded value. Namespace
+        // creation still surfaces any concrete filesystem error.
+        return Ok(());
+    }
+    let max = usize::try_from(reported).map_err(|_| StoreError::Io {
+        operation: "interpret a checkpoint filesystem component limit",
+        path: existing_boundary.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "filesystem component limit does not fit usize",
+        ),
+    })?;
+    for path in missing_directories {
+        let Some(component) = path.file_name() else {
+            continue;
+        };
+        let len = component.as_bytes().len();
+        if len > max {
+            return Err(StoreError::NamespaceComponentTooLong {
+                path: path.clone(),
+                len,
+                max,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_missing_namespace_component_lengths(
+    _existing_boundary: &Path,
+    _missing_directories: &[PathBuf],
+) -> Result<(), StoreError> {
+    Ok(())
+}
+
 fn secure_namespace_dir_cancellable(
     dir: &Path,
     cancelled: &mut impl FnMut() -> bool,
@@ -309,13 +379,13 @@ fn secure_namespace_dir_cancellable(
     Ok(Some(()))
 }
 
-/// Applies platform flags that open the named object itself rather than
-/// following a final-component symlink or reparse point.
+/// Applies platform flags that open the named object itself without blocking
+/// on a special file before handle-based validation can reject it.
 fn no_follow(options: &mut OpenOptions) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        let _ = options.custom_flags(libc::O_NOFOLLOW);
+        let _ = options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     #[cfg(windows)]
     {
@@ -460,6 +530,7 @@ pub(crate) fn write_file_atomically(
     faults: AtomicWriteFaults,
 ) -> Result<(), AtomicWriteError> {
     let temp_path = dir.join(temp_file_name(final_name));
+    let backup_path = dir.join(backup_file_name(final_name));
     let final_path = dir.join(final_name);
 
     plan.check(faults.before_write)
@@ -470,6 +541,11 @@ pub(crate) fn write_file_atomically(
     // itself rather than its target, and create_new below prevents a race
     // from turning into truncation of an injected object.
     let _removed = remove_file_if_present(&temp_path).map_err(AtomicWriteError::staged)?;
+    // Windows replacement uses one deterministic backup name so even error
+    // 1177 cannot create an unbounded, unknowable orphan. A usable store has
+    // already resolved marker authority, and generation backups are never
+    // authoritative, so a leftover is safe to remove before a new attempt.
+    let _removed_backup = remove_file_if_present(&backup_path).map_err(AtomicWriteError::staged)?;
     let mut file = create_file(&temp_path, "create a checkpoint temporary file")
         .map_err(AtomicWriteError::staged)?;
     file.write_all(bytes).map_err(|source| {
@@ -495,10 +571,64 @@ pub(crate) fn write_file_atomically(
     plan.check(faults.after_sync)
         .map_err(AtomicWriteError::staged)?;
 
-    replace_file(&temp_path, &final_path).map_err(|failure| {
+    install_temp_file(&temp_path, &final_path, &backup_path)?;
+
+    plan.check(faults.after_publish)
+        .map_err(AtomicWriteError::published)
+}
+
+/// Syncs and installs an already-written same-directory temporary file.
+///
+/// Recovery uses this only after bounded validation establishes that
+/// `CURRENT.tmp`, together with any matching `CURRENT.bak`, is valid marker
+/// evidence for a complete generation.
+/// Syncing again also completes recovery from an interruption after the
+/// temporary marker was written but before its original sync boundary.
+pub(crate) fn publish_existing_temp_file(
+    dir: &Path,
+    final_name: &str,
+) -> Result<(), AtomicWriteError> {
+    let temp_path = dir.join(temp_file_name(final_name));
+    let backup_path = dir.join(backup_file_name(final_name));
+    let final_path = dir.join(final_name);
+
+    let mut options = OpenOptions::new();
+    let _ = options.read(true).write(true);
+    no_follow(&mut options);
+    let file = options.open(&temp_path).map_err(|source| {
+        AtomicWriteError::staged(StoreError::Io {
+            operation: "open a validated checkpoint temporary file for publication",
+            path: temp_path.clone(),
+            source,
+        })
+    })?;
+    secure_checkpoint_file(
+        &file,
+        &temp_path,
+        "validate a checkpoint temporary file before publication",
+    )
+    .map_err(AtomicWriteError::staged)?;
+    file.sync_all().map_err(|source| {
+        AtomicWriteError::staged(StoreError::Io {
+            operation: "sync a checkpoint temporary file before publication",
+            path: temp_path.clone(),
+            source,
+        })
+    })?;
+    drop(file);
+
+    install_temp_file(&temp_path, &final_path, &backup_path)
+}
+
+fn install_temp_file(
+    temp_path: &Path,
+    final_path: &Path,
+    backup_path: &Path,
+) -> Result<(), AtomicWriteError> {
+    replace_file(temp_path, final_path, backup_path).map_err(|failure| {
         let error = StoreError::Io {
             operation: "atomically install a checkpoint temporary file",
-            path: final_path.clone(),
+            path: final_path.to_path_buf(),
             source: failure.source,
         };
         if failure.destination_may_have_changed {
@@ -507,14 +637,18 @@ pub(crate) fn write_file_atomically(
             AtomicWriteError::staged(error)
         }
     })?;
-
-    plan.check(faults.after_publish)
+    remove_file_if_present(backup_path)
         .map_err(AtomicWriteError::published)
+        .map(|_| ())
 }
 
 /// Installs `temp_path` at `final_path` atomically on the current platform.
 #[cfg(not(windows))]
-fn replace_file(temp_path: &Path, final_path: &Path) -> Result<(), ReplaceFileError> {
+fn replace_file(
+    temp_path: &Path,
+    final_path: &Path,
+    _backup_path: &Path,
+) -> Result<(), ReplaceFileError> {
     std::fs::rename(temp_path, final_path).map_err(|source| ReplaceFileError {
         source,
         destination_may_have_changed: false,
@@ -532,19 +666,19 @@ fn replace_file(temp_path: &Path, final_path: &Path) -> Result<(), ReplaceFileEr
 /// call, satisfying `ReplaceFileW`'s sharing requirements.
 #[cfg(windows)]
 pub(super) fn windows_replace_failure_may_have_changed(raw_os_error: Option<i32>) -> bool {
-    use windows_sys::Win32::Foundation::{
-        ERROR_UNABLE_TO_MOVE_REPLACEMENT, ERROR_UNABLE_TO_MOVE_REPLACEMENT_2,
-    };
+    use windows_sys::Win32::Foundation::ERROR_UNABLE_TO_MOVE_REPLACEMENT_2;
 
     raw_os_error
         .and_then(|code| u32::try_from(code).ok())
-        .is_some_and(|code| {
-            code == ERROR_UNABLE_TO_MOVE_REPLACEMENT || code == ERROR_UNABLE_TO_MOVE_REPLACEMENT_2
-        })
+        .is_some_and(|code| code == ERROR_UNABLE_TO_MOVE_REPLACEMENT_2)
 }
 
 #[cfg(windows)]
-fn replace_file(temp_path: &Path, final_path: &Path) -> Result<(), ReplaceFileError> {
+fn replace_file(
+    temp_path: &Path,
+    final_path: &Path,
+    backup_path: &Path,
+) -> Result<(), ReplaceFileError> {
     use std::os::windows::ffi::OsStrExt as _;
     use std::ptr;
 
@@ -588,6 +722,10 @@ fn replace_file(temp_path: &Path, final_path: &Path) -> Result<(), ReplaceFileEr
         source,
         destination_may_have_changed: false,
     })?;
+    let backup = wide(backup_path).map_err(|source| ReplaceFileError {
+        source,
+        destination_may_have_changed: false,
+    })?;
     let destination_exists = match std::fs::symlink_metadata(final_path) {
         Ok(_) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -600,15 +738,16 @@ fn replace_file(temp_path: &Path, final_path: &Path) -> Result<(), ReplaceFileEr
     };
 
     // SAFETY: both path buffers are NUL-terminated and remain alive for the
-    // call. The optional backup and exclusion pointers are null. The
-    // temporary file handle was closed after sync_all, and this store never
-    // keeps a handle to CURRENT open while publishing it.
+    // call. The exclusion pointers are null. The deterministic backup name
+    // bounds the otherwise unspecified renamed-original postcondition of
+    // error 1177. The temporary file handle was closed after sync_all, and
+    // this store never keeps a handle to CURRENT open while publishing it.
     let succeeded = unsafe {
         if destination_exists {
             ReplaceFileW(
                 final_path_wide.as_ptr(),
                 temp.as_ptr(),
-                ptr::null(),
+                backup.as_ptr(),
                 0,
                 ptr::null(),
                 ptr::null(),

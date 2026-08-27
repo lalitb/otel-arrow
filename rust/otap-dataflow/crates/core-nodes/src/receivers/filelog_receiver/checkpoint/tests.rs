@@ -12,8 +12,8 @@
 use super::apply::CheckpointTable;
 use super::error::{ApplyError, DecodeError, EncodeError};
 use super::primitives::{
-    FileId, FramingResume, LifecycleState, Locator, TRUNCATE_RESET_REASON_READ_NEW,
-    WAL_MAX_OPS_PER_TX, crc32c,
+    FileId, FramingResume, LifecycleState, Locator, REASON_CODE_RESERVED,
+    TRUNCATE_RESET_REASON_READ_NEW, WAL_MAX_OPS_PER_TX, crc32c,
 };
 use super::snapshot::{self, QuarantineEvidence, SNAPSHOT_FOOTER_LEN, SnapshotRecord};
 use super::test_vectors::*;
@@ -1414,7 +1414,7 @@ fn unknown_remove_file_expected_prior_state_fails_closed() {
         file_id: FileId([105; 16]),
         expected_file_epoch: 1,
         expected_prior_state: LifecycleState::Active,
-        removal_reason: 0,
+        removal_reason: 1,
         removal_time_unix_nano: 1,
         administrative: false,
         namespace_id: None,
@@ -1764,7 +1764,7 @@ fn remove_file_forbidden_namespace_present_fails_closed() {
         file_id: FileId([118; 16]),
         expected_file_epoch: 1,
         expected_prior_state: LifecycleState::Active,
-        removal_reason: 0,
+        removal_reason: 1,
         removal_time_unix_nano: 1,
         administrative: false,
         namespace_id: None,
@@ -1796,7 +1796,7 @@ fn remove_file_required_namespace_missing_fails_closed() {
         file_id: FileId([119; 16]),
         expected_file_epoch: 1,
         expected_prior_state: LifecycleState::Quarantined,
-        removal_reason: 0,
+        removal_reason: 1,
         removal_time_unix_nano: 1,
         administrative: true,
         namespace_id: Some(NAMESPACE.to_owned()),
@@ -1830,7 +1830,7 @@ fn remove_file_invalid_utf8_namespace_fails_closed() {
         file_id: FileId([120; 16]),
         expected_file_epoch: 1,
         expected_prior_state: LifecycleState::Quarantined,
-        removal_reason: 0,
+        removal_reason: 1,
         removal_time_unix_nano: 1,
         administrative: true,
         namespace_id: Some("ns".to_owned()),
@@ -2106,6 +2106,78 @@ fn encode_non_quarantined_record_with_evidence_fails_closed() {
     assert!(matches!(
         err,
         EncodeError::UnexpectedQuarantineEvidence { .. }
+    ));
+}
+
+/// Scenario: a quarantined snapshot record carries reserved reason code
+/// `0x0000` with otherwise complete quarantine evidence.
+/// Guarantees: the snapshot encoder rejects the reserved value at its own
+/// public boundary instead of relying on store-level append validation.
+#[test]
+fn snapshot_encoder_rejects_reserved_quarantine_reason() {
+    let mut record = sample_snapshot_record(FileId([135; 16]));
+    record.lifecycle_state = LifecycleState::Quarantined;
+    record.quarantine_evidence = Some(QuarantineEvidence {
+        reason_code: REASON_CODE_RESERVED,
+        observed_size: 1,
+        quarantine_epoch: 1,
+        quarantine_time_unix_nano: 1,
+    });
+
+    assert!(matches!(
+        record.encode().expect_err("reserved reason must fail"),
+        EncodeError::ReservedReasonCode {
+            field: "quarantine_evidence.reason_code"
+        }
+    ));
+}
+
+/// Scenario: a `quarantine_file` WAL operation carries reserved reason code
+/// `0x0000`.
+/// Guarantees: operation encoding fails before producing a frame, including
+/// when callers use the codec directly without a `CheckpointStore`.
+#[test]
+fn quarantine_operation_encoder_rejects_reserved_reason() {
+    let operation = Operation::QuarantineFile(QuarantineFile {
+        file_id: FileId([136; 16]),
+        expected_file_epoch: 1,
+        reason_code: REASON_CODE_RESERVED,
+        locator: Locator::Unspecified,
+        observed_size: 1,
+        quarantine_epoch: 1,
+        quarantine_time_unix_nano: 1,
+    });
+
+    assert!(matches!(
+        operation.encode().expect_err("reserved reason must fail"),
+        EncodeError::ReservedReasonCode {
+            field: "quarantine_file.reason_code"
+        }
+    ));
+}
+
+/// Scenario: a `remove_file` WAL operation carries reserved removal reason
+/// `0x0000`.
+/// Guarantees: operation encoding rejects the reserved value for ordinary
+/// and administrative callers before any frame bytes are returned.
+#[test]
+fn remove_operation_encoder_rejects_reserved_reason() {
+    let operation = Operation::RemoveFile(RemoveFile {
+        file_id: FileId([137; 16]),
+        expected_file_epoch: 1,
+        expected_prior_state: LifecycleState::Active,
+        removal_reason: REASON_CODE_RESERVED,
+        removal_time_unix_nano: 1,
+        administrative: false,
+        namespace_id: None,
+        audit_reason: None,
+    });
+
+    assert!(matches!(
+        operation.encode().expect_err("reserved reason must fail"),
+        EncodeError::ReservedReasonCode {
+            field: "remove_file.removal_reason"
+        }
     ));
 }
 

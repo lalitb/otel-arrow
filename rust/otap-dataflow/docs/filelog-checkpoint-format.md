@@ -64,16 +64,42 @@ normalized, fixed- or bounded-length wire value.
 The on-disk namespace layout matches Appendix B:
 
 ```text
-${engine.state_dir}/filelog/<checkpoint.id>/
+${engine.state_dir}/filelog/@v1/<encoded-checkpoint-id>/
   CURRENT
   offsets-<generation>.snapshot
   offsets-<generation>.wal
   ownership.lock
 ```
 
-- `<checkpoint.id>` is percent-encoded using the existing journald path
-  convention (see `journald_receiver::checkpoint::encode_path_segment`); this
-  document does not change that convention.
+- The fixed `@v1` directory makes the namespace path disjoint from the earlier
+  flat percent-encoded implementation draft. `@` was outside that draft's
+  accepted ID alphabet, so this directory cannot itself be a legacy flat
+  namespace.
+- `<encoded-checkpoint-id>` contains exactly two lowercase hexadecimal digits
+  for every byte of the exact accepted ASCII `checkpoint.id`. There is no
+  case folding or safe-character passthrough.
+  Consequently the mapping is reversible and injective even on
+  case-insensitive filesystems: distinct byte strings always produce
+  distinct lowercase-only path segments. Encoding every byte also prevents
+  `/`, `\`, `.`, `..`, NUL, or any other input from becoming a path
+  separator, traversal component, or platform-reserved bare name.
+- The encoded segment MUST be at most 255 bytes (the common filesystem
+  `NAME_MAX`). Because every input byte expands to 2 bytes, the implemented
+  configuration accepts at most 127 bytes: `2 * 127 = 254`. Length arithmetic
+  MUST be checked before allocation.
+  This path bound is intentionally tighter than the 256-byte
+  `NAMESPACE_ID_MAX_BYTES` wire-field bound. Before creating missing namespace
+  directories on Unix, the store also queries the containing filesystem's
+  actual component limit and rejects an encoded leaf that exceeds a narrower
+  mounted-filesystem bound.
+
+Exact path-encoding vectors:
+
+| `checkpoint.id` bytes | Encoded path segment |
+| --- | --- |
+| `AppLogs` (`41 70 70 4c 6f 67 73`) | `4170704c6f6773` |
+| `applogs` (`61 70 70 6c 6f 67 73`) | `6170706c6f6773` |
+
 - `<generation>` is the ASCII decimal rendering of a `u64` generation number
   with no leading zeros (`0`, `1`, `2`, ... `18446744073709551615`). A
   generation number is assigned once, at compaction time, and is never
@@ -92,9 +118,7 @@ Recovery always reads `CURRENT` first to select the generation, then loads
 `offsets-<generation>.wal` from sequence `1`. A generation directory MAY
 contain snapshot/WAL files for more than one generation simultaneously during
 compaction (the previous generation stays present and valid until `CURRENT`
-is atomically repointed); this document only defines the byte format of each
-individual file, not the atomic-replacement procedure for `CURRENT` itself,
-which is a durable-checkpoint-store concern.
+is atomically repointed).
 
 ## The `CURRENT` marker
 
@@ -115,6 +139,42 @@ a nonzero `flags` value (v1 defines no flag bits), or a CRC-32C mismatch. All
 of these are corruption/fail-closed conditions; there is no torn-tail
 leniency for `CURRENT` because it is written and synced as a single small
 atomic replacement, never appended to.
+
+`CURRENT.tmp` is the same-directory publication name and, when present, has
+the exact same 24-byte marker format as `CURRENT`. On Windows,
+`CURRENT.bak` is the deterministic backup name supplied to `ReplaceFileW`;
+when present, it also has the marker format. All three marker names use a
+4096-byte artifact read cap before the decoder enforces the exact 24-byte
+length. Startup resolves recovery names only while holding `ownership.lock`,
+using these deterministic rules:
+
+1. If `CURRENT` exists, startup validates it and its complete selected
+   generation. A corrupt or incomplete `CURRENT` selection fails closed and
+   MUST NOT fall back to `CURRENT.tmp`. Only after the `CURRENT` selection
+   validates may `CURRENT.tmp` and `CURRENT.bak` be removed as stale.
+2. If `CURRENT` and both recovery names are absent, only the separately
+   documented interrupted-initial-creation rule may recover generation 0.
+   A backup without its replacement is ambiguous and fails closed.
+3. If `CURRENT` is absent and `CURRENT.tmp` exists, startup bounded-reads and
+   validates its marker checksum before interpreting the generation. It may
+   adopt generation 0 only when it is the sole complete pair and no backup
+   exists. It may adopt generation `n > 0` only when `CURRENT.bak` is a valid
+   marker for `n - 1` and the only recognized generations are the complete
+   `n - 1` and `n` pairs. The candidate pair is then fully validated before
+   the existing temporary marker is synced and atomically installed as
+   `CURRENT`.
+4. A corrupt temporary marker, an incomplete candidate, a non-successor,
+   extra recognized generations, a mismatched backup, or any other ambiguous
+   layout fails closed without deleting either recovery name.
+
+The third rule covers the documented Windows `ReplaceFileW` error 1177
+postcondition, where replacement can report failure after renaming the old
+`CURRENT` to the bounded `CURRENT.bak` name while leaving the replacement at
+`CURRENT.tmp`. With a backup name supplied, errors 1175 and 1176 retain the
+original names and are retryable.
+It does not make arbitrary temporary files authoritative: marker checksum,
+pair completeness, exact generation population, full generation validation,
+and exclusive namespace ownership are all required.
 
 ## Magic values, versions, and fixed widths at a glance
 
@@ -342,6 +402,11 @@ This document defines these `reason_code` values for `quarantine_file` /
 
 `removal_reason` has no assigned values in v1 beyond the requirement that an
 encoder MUST NOT write `0x0000`; `0x0000` is reserved exactly as above.
+The prohibition is enforced independently by the snapshot-record encoder for
+`quarantine_evidence.reason_code` and by the WAL-operation encoder for both
+`quarantine_file.reason_code` and `remove_file.removal_reason`. Decoders still
+accept every `u16`, including zero, because these fields do not control byte
+layout.
 
 ## WAL file format
 
@@ -1022,6 +1087,8 @@ action without ambiguity:
   native-identity-keyed state from another product; per `filelog-receiver.md`,
   such an importer, if any, is a separate, explicitly versioned tool outside
   the receiver.
+- Phase 1 has not been released, so the `@v1/<lowercase-hex>` namespace path
+  mapping has no legacy percent-encoded directory migration promise.
 
 ## Golden and conformance vectors
 
@@ -1050,6 +1117,8 @@ round-tripping through this crate's own encoder). They cover:
 - decoding a Windows-locator snapshot record and a POSIX-locator snapshot
   record on the same (arbitrary host) platform, demonstrating that decoding
   never depends on the host's own native locator type; and
+- the exact lowercase-hex checkpoint-id path vectors above, including two ids
+  that differ only by ASCII case; and
 - the two framing-profile digest compatibility vectors above.
 
 The snapshot/WAL byte fixtures intentionally retain opaque legacy

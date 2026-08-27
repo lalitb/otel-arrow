@@ -13,7 +13,7 @@ use super::error::{DecodeError, EncodeError};
 use super::primitives::{
     ADVISORY_PATH_MAX_BYTES, AUDIT_REASON_MAX_BYTES, ByteReader, ByteWriter, FINGERPRINT_MAX_BYTES,
     FORMAT_VERSION, FileId, FramingResume, LifecycleState, Locator, NAMESPACE_ID_MAX_BYTES,
-    WAL_MAGIC, WAL_MAX_OPS_PER_TX, crc32c,
+    REASON_CODE_RESERVED, WAL_MAGIC, WAL_MAX_OPS_PER_TX, crc32c,
 };
 
 /// Fixed width of the WAL header, in bytes.
@@ -125,7 +125,8 @@ pub struct QuarantineFile {
     pub file_id: FileId,
     /// The epoch the caller expects is currently active.
     pub expected_file_epoch: u32,
-    /// Opaque diagnostic reason code.
+    /// Opaque diagnostic reason code; encoders reject the reserved value
+    /// `0x0000`.
     pub reason_code: u16,
     /// The immutable quarantine locator.
     pub locator: Locator,
@@ -206,7 +207,8 @@ pub struct RemoveFile {
     pub expected_file_epoch: u32,
     /// The lifecycle state the caller expects the record is currently in.
     pub expected_prior_state: LifecycleState,
-    /// Opaque diagnostic removal reason.
+    /// Opaque diagnostic removal reason; encoders reject the reserved value
+    /// `0x0000`.
     pub removal_reason: u16,
     /// Removal timestamp, in Unix nanoseconds.
     pub removal_time_unix_nano: u64,
@@ -355,6 +357,11 @@ impl Operation {
                 }
             }
             Operation::QuarantineFile(op) => {
+                if op.reason_code == REASON_CODE_RESERVED {
+                    return Err(EncodeError::ReservedReasonCode {
+                        field: "quarantine_file.reason_code",
+                    });
+                }
                 out.write_u8(OP_QUARANTINE_FILE);
                 out.write_bytes(&op.file_id.0);
                 out.write_u32(op.expected_file_epoch);
@@ -385,6 +392,11 @@ impl Operation {
                 )?;
             }
             Operation::RemoveFile(op) => {
+                if op.removal_reason == REASON_CODE_RESERVED {
+                    return Err(EncodeError::ReservedReasonCode {
+                        field: "remove_file.removal_reason",
+                    });
+                }
                 out.write_u8(OP_REMOVE_FILE);
                 out.write_bytes(&op.file_id.0);
                 out.write_u32(op.expected_file_epoch);

@@ -6,12 +6,13 @@
 //! [`DecodeError`] covers structural failures found while parsing raw bytes
 //! (bad magic, unsupported version, checksum mismatch, a length exceeding a
 //! bound, an unknown structural discriminant, invalid UTF-8, and arithmetic
-//! that would overflow). [`EncodeError`] covers the analogous structural
-//! failure while writing (a field value exceeding its documented maximum
-//! length). [`ApplyError`] covers semantic/business-rule failures found
+//! that would overflow). [`EncodeError`] covers analogous failures while
+//! writing, including an oversized field or a value the format reserves
+//! encoders from producing. [`ApplyError`] covers semantic/business-rule failures found
 //! while replaying an already-decoded operation against the in-memory
 //! checkpoint table (a stale epoch, a conflicting record, an impossible
-//! transition). Keeping these separate matches the specification's
+//! transition). Reserved reason codes remain structurally valid to decode.
+//! Keeping these separate matches the specification's
 //! distinction between decode-time structural failures and apply-time
 //! semantic failures (see `docs/filelog-checkpoint-format.md`, "Reason
 //! codes are not structural").
@@ -197,6 +198,13 @@ pub enum EncodeError {
     #[error("field {field} is required to be non-empty but was empty")]
     RequiredFieldEmpty {
         /// The field name.
+        field: &'static str,
+    },
+    /// A quarantine or removal reason used the value `0x0000`, which this
+    /// format reserves and forbids encoders from producing.
+    #[error("field {field} uses reserved reason code 0x0000")]
+    ReservedReasonCode {
+        /// The reason-code field that carried the reserved value.
         field: &'static str,
     },
     /// A transaction was constructed with zero operations, which this

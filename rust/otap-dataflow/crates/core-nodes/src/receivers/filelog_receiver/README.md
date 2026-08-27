@@ -167,13 +167,18 @@ the receiver cannot reconstruct them.
 The namespace is:
 
 ```text
-${engine.state_dir}/filelog/<percent-encoded checkpoint.id>/
+${engine.state_dir}/filelog/@v1/<lowercase-hex checkpoint.id bytes>/
 ```
 
 If `checkpoint.id` is omitted, the engine derives a stable ID from the pipeline
 and node placement. Set an explicit ID when placement names may change.
 `${engine.state_dir}` expands from the engine state directory and defaults to
-`.otap-state`.
+`.otap-state`. The `@v1` component is outside the earlier draft's accepted ID
+alphabet, so the version directory cannot itself be a legacy flat namespace.
+Every accepted ASCII ID byte is encoded as two lowercase hexadecimal digits,
+so IDs that differ only by case cannot alias on case-insensitive filesystems.
+IDs are limited to 127 bytes; Unix startup also enforces a narrower component
+limit reported by the mounted state filesystem.
 
 Treat the namespace as one storage-engine unit:
 

@@ -34,29 +34,25 @@ use super::checkpoint::store::limits::StoreLimits;
 pub const FILELOG_RECEIVER_URN: &str = "urn:otel:receiver:filelog";
 
 /// Namespace root matching Appendix B's layout:
-/// `${engine.state_dir}/filelog/<checkpoint.id>/`.
+/// `${engine.state_dir}/filelog/@v1/<encoded checkpoint.id>/`.
 const CHECKPOINT_NAMESPACE_ROOT: &str = "${engine.state_dir}/filelog";
+/// Version directory separating this encoding from the earlier flat draft.
+///
+/// `@` was outside that draft's accepted ID alphabet, so this component
+/// cannot itself be an older flat namespace.
+const CHECKPOINT_NAMESPACE_VERSION: &str = "@v1";
 
-/// Common `NAME_MAX` (maximum bytes in a single path component) enforced by
-/// most POSIX filesystems (ext4, APFS, NTFS-under-WSL, etc). The percent-encoded
-/// checkpoint-id path segment must stay within this bound even though the
-/// checkpoint format's own `NAMESPACE_ID_MAX_BYTES` (256) is one byte larger,
-/// so a config that validates cleanly never fails later with an OS-level
-/// "file name too long" error.
+/// Common portable `NAME_MAX` (maximum bytes in a single path component)
+/// enforced by ext4, APFS, NTFS-under-WSL, and other primary targets.
+///
+/// Some mounted filesystems expose a smaller limit. Store opening queries
+/// the actual Unix filesystem before creating a missing namespace component
+/// and reports that narrower limit explicitly.
 const COMMON_PATH_SEGMENT_MAX_BYTES: usize = 255;
 
-/// Effective maximum length, in bytes, of the resolved `checkpoint.id`'s
-/// percent-encoded path segment: the tighter of the checkpoint format's
-/// `NAMESPACE_ID_MAX_BYTES` (the on-disk `namespace_id_bytes` field bound)
-/// and the common filesystem `NAME_MAX`. Neither the design nor
-/// `docs/filelog-checkpoint-format.md` documents a different maximum, so the
-/// tighter of the two applies.
-const CHECKPOINT_ID_SEGMENT_MAX_BYTES: usize =
-    if NAMESPACE_ID_MAX_BYTES <= COMMON_PATH_SEGMENT_MAX_BYTES {
-        NAMESPACE_ID_MAX_BYTES
-    } else {
-        COMMON_PATH_SEGMENT_MAX_BYTES
-    };
+/// Effective maximum length, in bytes, of the encoded `checkpoint.id` path
+/// segment.
+const CHECKPOINT_ID_SEGMENT_MAX_BYTES: usize = COMMON_PATH_SEGMENT_MAX_BYTES;
 
 /// Minimum accepted `identity.fingerprint_bytes`.
 const MIN_FINGERPRINT_BYTES: u64 = 16;
@@ -669,7 +665,8 @@ pub struct CheckpointConfig {
         with = "humantime_serde"
     )]
     pub sync_interval: Duration,
-    /// Compact once the progress log reaches this many bytes.
+    /// Compact once the progress-log body, excluding its fixed header,
+    /// reaches this many bytes and contains at least one transaction.
     #[serde(
         default = "CheckpointConfig::default_compact_after_bytes",
         deserialize_with = "deserialize_byte_size"
@@ -1109,7 +1106,7 @@ pub(crate) struct RuntimeConfig {
     /// omitted.
     pub(crate) checkpoint_id: String,
     /// Resolved checkpoint namespace directory:
-    /// `${engine.state_dir}/filelog/<percent-encoded checkpoint_id>/`.
+    /// `${engine.state_dir}/filelog/@v1/<lowercase-hex checkpoint_id>/`.
     pub(crate) checkpoint_namespace_dir: PathBuf,
     /// Retry budget for a Nacked or resent batch.
     pub(crate) retry: RetryConfig,
@@ -2118,29 +2115,27 @@ fn resolve_checkpoint_id(
             (the checkpoint format's NAMESPACE_ID_MAX_BYTES)"
         )));
     }
-    // The id is also used, percent-encoded, as a single filesystem path
-    // component (Appendix B, "Namespace layout"). Enforce the tighter of
-    // NAMESPACE_ID_MAX_BYTES and the common 255-byte NAME_MAX so a
-    // configuration that validates here never fails later with an OS-level
-    // "file name too long" error; this checks the actual encoded segment
-    // rather than assuming the charset restriction above never expands
-    // under percent-encoding.
-    let encoded_len = encode_path_segment(id).len();
+    // The id is also encoded byte-for-byte as a single filesystem path
+    // component (Appendix B, "Namespace layout"). Check the expansion with
+    // overflow-safe arithmetic before allocating the encoded segment.
+    let encoded_len = checkpoint_id_path_segment_len(id).ok_or_else(|| {
+        invalid("checkpoint.id's encoded path segment length overflows addressable capacity")
+    })?;
     if encoded_len > CHECKPOINT_ID_SEGMENT_MAX_BYTES {
         return Err(invalid(&format!(
-            "checkpoint.id's percent-encoded path segment is {encoded_len} bytes, exceeding \
-            {CHECKPOINT_ID_SEGMENT_MAX_BYTES} bytes (the tighter of NAMESPACE_ID_MAX_BYTES and \
-            the common 255-byte filesystem NAME_MAX)"
+            "checkpoint.id's lowercase-hex path segment is {encoded_len} bytes, exceeding \
+            the common {CHECKPOINT_ID_SEGMENT_MAX_BYTES}-byte filesystem NAME_MAX"
         )));
     }
     Ok(id.to_owned())
 }
 
 /// Computes the stable Phase 1 checkpoint namespace directory for
-/// `checkpoint_id`: `${engine.state_dir}/filelog/<percent-encoded id>/`
-/// (Appendix B, "Namespace layout"). Mirrors the journald receiver's
-/// `${engine.state_dir}` expansion and percent-encoding convention so both
-/// receivers resolve the token identically.
+/// `checkpoint_id`: `${engine.state_dir}/filelog/@v1/<lowercase hex>/`
+/// (Appendix B, "Namespace layout"). The version directory makes this
+/// namespace disjoint from the earlier flat percent-encoded draft. Every
+/// byte of the exact id is encoded, so distinct ids remain distinct on
+/// case-insensitive filesystems.
 ///
 /// Normalizes away a leading `CurDir` (`.`) path component so a
 /// `${engine.state_dir}` expansion that happens to start with `./` (for
@@ -2151,7 +2146,11 @@ fn resolve_checkpoint_id(
 /// normalization applied to include patterns via [`glob_literal_prefix`].
 fn checkpoint_namespace_dir(checkpoint_id: &str) -> PathBuf {
     let mut path = expand_state_dir(Path::new(CHECKPOINT_NAMESPACE_ROOT));
-    path.push(encode_path_segment(checkpoint_id));
+    path.push(CHECKPOINT_NAMESPACE_VERSION);
+    path.push(
+        encode_checkpoint_id_path_segment(checkpoint_id)
+            .expect("a validated checkpoint id has a representable encoded length"),
+    );
     strip_leading_curdir(&path)
 }
 
@@ -2184,32 +2183,24 @@ fn strip_leading_curdir(path: &Path) -> PathBuf {
     components.collect()
 }
 
-fn encode_path_segment(value: &str) -> String {
-    if value.is_empty() {
-        return "%".to_owned();
-    }
-    let encode_all = matches!(value, "." | "..");
-    let mut encoded = String::with_capacity(value.len());
+fn checkpoint_id_path_segment_len(value: &str) -> Option<usize> {
+    value.len().checked_mul(2)
+}
+
+fn encode_checkpoint_id_path_segment(value: &str) -> Option<String> {
+    let encoded_len = checkpoint_id_path_segment_len(value)?;
+    let mut encoded = String::with_capacity(encoded_len);
     for byte in value.bytes() {
-        if !encode_all && is_checkpoint_path_safe_byte(byte) {
-            encoded.push(char::from(byte));
-        } else {
-            encoded.push('%');
-            encoded.push(char::from(hex_digit(byte >> 4)));
-            encoded.push(char::from(hex_digit(byte & 0x0f)));
-        }
+        encoded.push(char::from(lowercase_hex_digit(byte >> 4)));
+        encoded.push(char::from(lowercase_hex_digit(byte & 0x0f)));
     }
-    encoded
+    Some(encoded)
 }
 
-fn is_checkpoint_path_safe_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
-}
-
-fn hex_digit(value: u8) -> u8 {
+fn lowercase_hex_digit(value: u8) -> u8 {
     match value {
         0..=9 => b'0' + value,
-        10..=15 => b'A' + (value - 10),
+        10..=15 => b'a' + (value - 10),
         _ => unreachable!("nibble must be in range"),
     }
 }
@@ -4019,47 +4010,83 @@ mod tests {
 
     /// Scenario: `checkpoint.id` contains a character outside the accepted
     /// ASCII alphanumeric / `_` / `-` / `.` set.
-    /// Guarantees: an unsafe checkpoint id is rejected before it can reach
-    /// the namespace-path helper.
+    /// Guarantees: an unsupported checkpoint id is rejected before it can
+    /// reach namespace-path derivation.
     #[test]
-    fn checkpoint_id_rejects_unsafe_characters() {
+    fn checkpoint_id_rejects_unsupported_characters() {
         let mut cfg = minimal_config();
         cfg.checkpoint.id = Some("app logs/../etc".to_owned());
         assert!(RuntimeConfig::from_config(cfg, "node-1").is_err());
     }
 
-    /// Scenario: `checkpoint.id` is exactly `CHECKPOINT_ID_SEGMENT_MAX_BYTES`
-    /// (255) ASCII-safe bytes, and one byte more (256 bytes).
-    /// Guarantees: 255 bytes validates (its percent-encoded path segment is
-    /// 1:1 with the safe-charset id and so is also 255 bytes), and 256
-    /// bytes is rejected -- even though it is still `<=
-    /// NAMESPACE_ID_MAX_BYTES` (256) -- because its encoded path segment
-    /// would exceed the common 255-byte filesystem `NAME_MAX`, the tighter
-    /// of the two documented bounds.
+    /// Scenario: two accepted checkpoint ids differ only by ASCII case on a
+    /// filesystem that may compare path names case-insensitively.
+    /// Guarantees: byte-wise lowercase-hex encoding keeps their path
+    /// segments distinct even after ASCII case folding, and the exact
+    /// version-1 path vectors remain stable.
+    #[test]
+    fn checkpoint_id_encoding_is_case_insensitive_filesystem_injective() {
+        let mixed = encode_checkpoint_id_path_segment("AppLogs").expect("length is representable");
+        let lower = encode_checkpoint_id_path_segment("applogs").expect("length is representable");
+
+        assert_eq!(mixed, "4170704c6f6773");
+        assert_eq!(lower, "6170706c6f6773");
+        assert_eq!(mixed, mixed.to_ascii_lowercase());
+        assert_eq!(lower, lower.to_ascii_lowercase());
+        assert_ne!(mixed.to_ascii_lowercase(), lower.to_ascii_lowercase());
+        assert_ne!(
+            checkpoint_namespace_dir("AppLogs"),
+            checkpoint_namespace_dir("applogs")
+        );
+        let new_a = checkpoint_namespace_dir("a");
+        let legacy_version_id = expand_state_dir(Path::new(CHECKPOINT_NAMESPACE_ROOT)).join("v1");
+        assert_ne!(new_a, legacy_version_id);
+        assert!(
+            !CHECKPOINT_NAMESPACE_VERSION
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')),
+            "the version component must be outside the legacy ID alphabet"
+        );
+        assert_eq!(
+            new_a,
+            strip_leading_curdir(
+                &expand_state_dir(Path::new(CHECKPOINT_NAMESPACE_ROOT))
+                    .join(CHECKPOINT_NAMESPACE_VERSION)
+                    .join("61")
+            )
+        );
+    }
+
+    /// Scenario: `checkpoint.id` is the longest byte string whose
+    /// version-prefix-plus-two-hex-digits-per-byte path segment fits the
+    /// common 255-byte `NAME_MAX`, and then one byte longer.
+    /// Guarantees: the exact boundary validates, the next byte is rejected,
+    /// and the length formula includes the encoding prefix without overflow
+    /// or off-by-one loss.
     #[test]
     fn checkpoint_id_encoded_segment_boundary_is_enforced() {
         assert_eq!(CHECKPOINT_ID_SEGMENT_MAX_BYTES, 255);
+        let max_id_bytes = CHECKPOINT_ID_SEGMENT_MAX_BYTES / 2;
+        assert_eq!(max_id_bytes, 127);
 
         let mut cfg = minimal_config();
-        cfg.checkpoint.id = Some("a".repeat(255));
+        cfg.checkpoint.id = Some("a".repeat(max_id_bytes));
         assert!(RuntimeConfig::from_config(cfg, "node-1").is_ok());
 
         let mut cfg = minimal_config();
-        cfg.checkpoint.id = Some("a".repeat(256));
+        cfg.checkpoint.id = Some("a".repeat(max_id_bytes + 1));
         let err = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
-        assert!(err.to_string().contains("percent-encoded path segment"));
+        assert!(err.to_string().contains("lowercase-hex path segment"));
     }
 
-    /// Scenario: `checkpoint.id` is exactly `NAMESPACE_ID_MAX_BYTES` (256)
-    /// bytes but constructed so its raw length, not its encoded length, is
-    /// the first bound crossed.
-    /// Guarantees: the raw `NAMESPACE_ID_MAX_BYTES` check and the tighter
-    /// encoded-segment check agree; a 256-byte id is rejected by one or the
-    /// other regardless of which fires first.
+    /// Scenario: `checkpoint.id` exceeds `NAMESPACE_ID_MAX_BYTES` by one
+    /// byte.
+    /// Guarantees: the durable administrative namespace-id field's raw
+    /// bound is enforced independently of the tighter encoded path bound.
     #[test]
     fn checkpoint_id_never_exceeds_namespace_id_max_bytes() {
         let mut cfg = minimal_config();
-        cfg.checkpoint.id = Some("a".repeat(NAMESPACE_ID_MAX_BYTES));
+        cfg.checkpoint.id = Some("a".repeat(NAMESPACE_ID_MAX_BYTES + 1));
         assert!(RuntimeConfig::from_config(cfg, "node-1").is_err());
     }
 

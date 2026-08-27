@@ -43,6 +43,20 @@ pub enum StoreError {
         /// The violated filesystem invariant.
         reason: &'static str,
     },
+    /// A namespace component cannot be represented on the filesystem that
+    /// will contain it.
+    #[error(
+        "checkpoint namespace component {path} is {len} bytes, exceeding this filesystem's \
+         {max}-byte component limit"
+    )]
+    NamespaceComponentTooLong {
+        /// The component path that would be created.
+        path: PathBuf,
+        /// Encoded component length in bytes.
+        len: usize,
+        /// Filesystem-reported maximum component length in bytes.
+        max: usize,
+    },
     /// The namespace ownership lock is held by another writer and was not
     /// released within the configured bounded wait.
     #[error(

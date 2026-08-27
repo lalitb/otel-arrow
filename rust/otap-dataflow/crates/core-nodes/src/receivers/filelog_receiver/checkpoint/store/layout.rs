@@ -7,7 +7,7 @@
 //! Appendix B and `docs/filelog-checkpoint-format.md`:
 //!
 //! ```text
-//! ${engine.state_dir}/filelog/<checkpoint.id>/
+//! ${engine.state_dir}/filelog/@v1/<encoded checkpoint.id>/
 //!   CURRENT
 //!   offsets-<generation>.snapshot
 //!   offsets-<generation>.wal
@@ -26,6 +26,10 @@ use super::error::StoreError;
 
 /// Name of the marker file that selects the active generation.
 pub const CURRENT_FILE_NAME: &str = "CURRENT";
+/// Same-directory temporary name used while publishing [`CURRENT_FILE_NAME`].
+pub(crate) const CURRENT_TEMP_FILE_NAME: &str = "CURRENT.tmp";
+/// Deterministic backup name supplied to Windows `ReplaceFileW`.
+pub(crate) const CURRENT_BACKUP_FILE_NAME: &str = "CURRENT.bak";
 /// Name of the advisory namespace ownership lock file.
 pub const OWNERSHIP_LOCK_FILE_NAME: &str = "ownership.lock";
 /// The generation number a namespace is created with.
@@ -38,12 +42,13 @@ pub const INITIAL_GENERATION: u64 = 0;
 /// and cleaned, while hostile directory populations remain bounded.
 pub const MAX_GENERATIONS_ON_DISK: usize = 3;
 /// Maximum abandoned temporary artifacts recovery will process.
-pub(crate) const MAX_TEMP_FILES: usize = 1 + (MAX_GENERATIONS_ON_DISK * 2);
+pub(crate) const MAX_TEMP_FILES: usize = 2 + (MAX_GENERATIONS_ON_DISK * 4);
 
 const GENERATION_PREFIX: &str = "offsets-";
 const SNAPSHOT_EXTENSION: &str = ".snapshot";
 const WAL_EXTENSION: &str = ".wal";
 const TEMP_EXTENSION: &str = ".tmp";
+const BACKUP_EXTENSION: &str = ".bak";
 
 /// File name of `generation`'s snapshot.
 #[must_use]
@@ -64,6 +69,13 @@ pub fn wal_file_name(generation: u64) -> String {
 #[must_use]
 pub(crate) fn temp_file_name(final_name: &str) -> String {
     format!("{final_name}{TEMP_EXTENSION}")
+}
+
+/// Returns the deterministic Windows replacement-backup name for
+/// `final_name`.
+#[must_use]
+pub(crate) fn backup_file_name(final_name: &str) -> String {
+    format!("{final_name}{BACKUP_EXTENSION}")
 }
 
 /// Which files of a generation's snapshot/WAL pair are present on disk.
@@ -121,17 +133,20 @@ fn classify_generation_file(name: &str) -> Option<(u64, bool)> {
     parse_generation(digits).map(|generation| (generation, false))
 }
 
-/// Whether `name` is a temporary file this store itself writes, and is
-/// therefore safe to delete during recovery.
+/// Whether `name` is a temporary file this store itself writes.
 ///
-/// Only the exact names the store produces qualify: `CURRENT.tmp`, and
-/// `offsets-<generation>.snapshot.tmp` / `offsets-<generation>.wal.tmp` for
-/// a strictly formatted generation number. Any other file -- including an
-/// unrelated `*.tmp` file, the marker, a live generation pair, and the
-/// ownership lock -- is left untouched.
+/// Only the exact temporary and Windows replacement-backup names the store
+/// produces qualify. Any unrelated `*.tmp` / `*.bak` file, the marker, a
+/// live generation pair, and the ownership lock are left untouched.
+/// Generation staging artifacts are safe to delete under the ownership lock;
+/// `CURRENT.tmp` and `CURRENT.bak` require marker-authority selection first.
 #[must_use]
 pub(crate) fn is_namespace_temp_file(name: &str) -> bool {
-    let Some(final_name) = name.strip_suffix(TEMP_EXTENSION) else {
+    let final_name = if let Some(final_name) = name.strip_suffix(TEMP_EXTENSION) {
+        final_name
+    } else if let Some(final_name) = name.strip_suffix(BACKUP_EXTENSION) {
+        final_name
+    } else {
         return false;
     };
     final_name == CURRENT_FILE_NAME || classify_generation_file(final_name).is_some()
@@ -194,13 +209,18 @@ pub(crate) fn scan_generations(
     Ok(Some(found))
 }
 
-/// Removes every temporary file this store owns in `dir`, returning the
-/// number removed.
+/// Removes every generation-artifact temporary file this store owns in
+/// `dir`, returning the number removed.
 ///
-/// This runs only while the namespace ownership lock is held, so a
-/// temporary file can never belong to a live writer. A temporary file is an
-/// abandoned artifact of an interrupted write: it was never renamed into
-/// place, so it is by construction not part of any recoverable generation.
+/// This runs only while the namespace ownership lock is held, so a removed
+/// generation temporary can never belong to a live writer. It was never
+/// renamed into place and is not part of any recoverable generation.
+///
+/// `CURRENT.tmp` and `CURRENT.bak` are counted against [`MAX_TEMP_FILES`] but
+/// deliberately preserved. On Windows, `ReplaceFileW` error 1176 can leave
+/// a retryable temporary marker, while error 1177 can leave authority
+/// evidence under both names. The store resolves marker authority before
+/// removing or publishing them.
 pub(crate) fn remove_stale_temp_files(
     dir: &Path,
     mut cancelled: impl FnMut() -> bool,
@@ -209,6 +229,7 @@ pub(crate) fn remove_stale_temp_files(
         return Ok(None);
     }
     let mut stale: Vec<PathBuf> = Vec::new();
+    let mut recognized = 0usize;
     let entries = std::fs::read_dir(dir);
     if cancelled() {
         return Ok(None);
@@ -234,11 +255,15 @@ pub(crate) fn remove_stale_temp_files(
         if !is_namespace_temp_file(name) {
             continue;
         }
-        if stale.len() >= MAX_TEMP_FILES {
+        if recognized >= MAX_TEMP_FILES {
             return Err(StoreError::TooManyTemporaryFiles {
                 dir: dir.to_path_buf(),
                 max: MAX_TEMP_FILES,
             });
+        }
+        recognized += 1;
+        if matches!(name, CURRENT_TEMP_FILE_NAME | CURRENT_BACKUP_FILE_NAME) {
+            continue;
         }
         stale.push(dir.join(name));
     }
