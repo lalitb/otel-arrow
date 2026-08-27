@@ -3,6 +3,7 @@
 
 //! Path-pattern planning and incremental filesystem scanning.
 
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,11 +16,13 @@ use globset::GlobMatcher;
 use walkdir::WalkDir;
 
 use super::admission::AdmissionController;
-use super::{DiscoveredCandidate, DiscoveryError, DiscoveryIssue, ReconciliationBatch};
+use super::{
+    DiscoveredCandidate, DiscoveryError, DiscoveryIssue, ReconciliationBatch, RevocationReason,
+};
 use crate::receivers::filelog_receiver::config::{RuntimeConfig, glob_literal_prefix};
 use crate::receivers::filelog_receiver::identity::IdentityError;
 use crate::receivers::filelog_receiver::identity::platform::{
-    encode_advisory_path, open_candidate_at_cancellable,
+    encode_advisory_path, open_candidate_at_cancellable, open_locator_at_cancellable,
 };
 
 #[derive(Debug, Clone)]
@@ -39,6 +42,11 @@ struct ResolvedExclude {
     lexical_root: PathBuf,
     resolved_root: Option<PathBuf>,
     matcher: GlobMatcher,
+}
+
+enum StableCandidateObservation {
+    Eligible(DiscoveredCandidate),
+    Revoked(crate::receivers::filelog_receiver::checkpoint::Locator),
 }
 
 /// Fully compiled and bounded filesystem-discovery plan.
@@ -178,6 +186,10 @@ pub(crate) struct FilesystemScanner {
     shutdown_requested: Arc<AtomicBool>,
     #[cfg(test)]
     next_candidate_sample_gate: Mutex<Option<CandidateSamplingGate>>,
+    #[cfg(test)]
+    next_candidate_open_gate: Mutex<Option<CandidateSamplingGate>>,
+    #[cfg(test)]
+    next_candidate_resolution_gate: Mutex<Option<CandidateSamplingGate>>,
 }
 
 #[cfg(test)]
@@ -231,6 +243,10 @@ impl FilesystemScanner {
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             next_candidate_sample_gate: Mutex::new(None),
+            #[cfg(test)]
+            next_candidate_open_gate: Mutex::new(None),
+            #[cfg(test)]
+            next_candidate_resolution_gate: Mutex::new(None),
         }
     }
 
@@ -243,6 +259,10 @@ impl FilesystemScanner {
             shutdown_requested,
             #[cfg(test)]
             next_candidate_sample_gate: Mutex::new(None),
+            #[cfg(test)]
+            next_candidate_open_gate: Mutex::new(None),
+            #[cfg(test)]
+            next_candidate_resolution_gate: Mutex::new(None),
         }
     }
 
@@ -262,6 +282,30 @@ impl FilesystemScanner {
         gate
     }
 
+    #[cfg(test)]
+    pub(crate) fn gate_next_candidate_before_first_open_for_test(
+        &mut self,
+    ) -> CandidateSamplingGate {
+        let gate = CandidateSamplingGate::default();
+        *self
+            .next_candidate_open_gate
+            .lock()
+            .expect("candidate open gate lock poisoned") = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gate_next_candidate_before_resolution_for_test(
+        &mut self,
+    ) -> CandidateSamplingGate {
+        let gate = CandidateSamplingGate::default();
+        *self
+            .next_candidate_resolution_gate
+            .lock()
+            .expect("candidate resolution gate lock poisoned") = Some(gate.clone());
+        gate
+    }
+
     /// Runs one reconciliation pass into the bounded admission controller.
     pub(crate) fn reconcile(
         &mut self,
@@ -278,7 +322,7 @@ impl FilesystemScanner {
         let checkpoint_namespace = match checkpoint_namespace {
             Ok(path) => path,
             Err(source) => {
-                admission.record_issue(DiscoveryIssue::Io {
+                admission.record_denial_issue(DiscoveryIssue::Io {
                     operation: "resolve checkpoint namespace",
                     path: self.plan.checkpoint_namespace_dir.clone(),
                     source,
@@ -286,6 +330,22 @@ impl FilesystemScanner {
                 return admission.finish_scan();
             }
         };
+        let mut scanned_exclude_roots = HashSet::with_capacity(resolved_excludes.len());
+        for exclude in &resolved_excludes {
+            let Some(resolved_root) = exclude.resolved_root.as_deref() else {
+                continue;
+            };
+            if scanned_exclude_roots.insert(resolved_root) {
+                self.ensure_running()?;
+                self.scan_exclude_root(
+                    resolved_root,
+                    generation,
+                    &resolved_excludes,
+                    checkpoint_namespace.as_deref(),
+                    admission,
+                )?;
+            }
+        }
         for include in &self.plan.include_roots {
             self.ensure_running()?;
             self.scan_include(
@@ -297,6 +357,139 @@ impl FilesystemScanner {
             )?;
         }
         admission.finish_scan()
+    }
+
+    fn scan_exclude_root(
+        &self,
+        resolved_root: &Path,
+        generation: u64,
+        resolved_excludes: &[ResolvedExclude],
+        checkpoint_namespace: Option<&Path>,
+        admission: &mut AdmissionController,
+    ) -> Result<(), DiscoveryError> {
+        let maximum_depth = if self.plan.recursive {
+            self.plan.max_recursion_depth
+        } else {
+            1
+        };
+        let mut entries = WalkDir::new(resolved_root)
+            .follow_links(self.plan.follow_symlinks)
+            .max_depth(maximum_depth)
+            .into_iter();
+        loop {
+            self.ensure_running()?;
+            let entry = entries.next();
+            self.ensure_running()?;
+            let Some(entry) = entry else {
+                break;
+            };
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(source) => {
+                    let path = source
+                        .path()
+                        .map_or_else(|| resolved_root.to_path_buf(), Path::to_path_buf);
+                    admission.record_denial_issue(DiscoveryIssue::Walk { path, source })?;
+                    continue;
+                }
+            };
+            let matched_path = entry.path();
+            if entry.depth() == 0 && entry.file_type().is_dir() {
+                if self.path_is_checkpoint_excluded(
+                    matched_path,
+                    matched_path,
+                    checkpoint_namespace,
+                ) {
+                    entries.skip_current_dir();
+                }
+                continue;
+            }
+            if entry.file_type().is_dir() {
+                let resolved_directory = std::fs::canonicalize(entry.path());
+                self.ensure_running()?;
+                let resolved_directory = match resolved_directory {
+                    Ok(path) => path,
+                    Err(source) => {
+                        admission.record_denial_issue(DiscoveryIssue::Io {
+                            operation: "resolve excluded directory",
+                            path: matched_path.to_path_buf(),
+                            source,
+                        })?;
+                        entries.skip_current_dir();
+                        continue;
+                    }
+                };
+                if let Err(issue) = validate_walk_entry_path_stability(
+                    matched_path,
+                    entry.path(),
+                    &resolved_directory,
+                    resolved_root,
+                    self.plan.follow_symlinks,
+                ) {
+                    admission.record_denial_issue(issue)?;
+                    entries.skip_current_dir();
+                    continue;
+                }
+                if self.path_is_checkpoint_excluded(
+                    matched_path,
+                    &resolved_directory,
+                    checkpoint_namespace,
+                ) {
+                    entries.skip_current_dir();
+                }
+                continue;
+            }
+            if !self.path_matches_user_exclude(matched_path, matched_path, resolved_excludes) {
+                continue;
+            }
+            if !self.plan.follow_symlinks && entry.path_is_symlink() {
+                continue;
+            }
+            let resolved_path = match std::fs::canonicalize(entry.path()) {
+                Ok(path) => path,
+                Err(source) => {
+                    admission.record_denial_issue(DiscoveryIssue::Io {
+                        operation: "resolve excluded candidate",
+                        path: matched_path.to_path_buf(),
+                        source,
+                    })?;
+                    continue;
+                }
+            };
+            self.ensure_running()?;
+            if let Err(issue) = validate_walk_entry_path_stability(
+                matched_path,
+                entry.path(),
+                &resolved_path,
+                resolved_root,
+                self.plan.follow_symlinks,
+            ) {
+                admission.record_denial_issue(issue)?;
+                continue;
+            }
+            if self.path_is_checkpoint_excluded(matched_path, &resolved_path, checkpoint_namespace)
+            {
+                continue;
+            }
+            let locator = self.collect_stable_revoked_locator(
+                matched_path,
+                &resolved_path,
+                resolved_root,
+                resolved_excludes,
+                checkpoint_namespace,
+            );
+            self.ensure_running()?;
+            match locator {
+                Ok(Some(locator)) => admission.observe_revoked(
+                    generation,
+                    locator,
+                    RevocationReason::ExcludedByPolicy,
+                )?,
+                Ok(None) => {}
+                Err(issue) => admission.record_denial_issue(issue)?,
+            }
+        }
+        Ok(())
     }
 
     fn scan_include(
@@ -414,9 +607,9 @@ impl FilesystemScanner {
                         continue;
                     }
                 };
-                if let Err(issue) = validate_candidate_path_stability(
+                if let Err(issue) = validate_walk_entry_path_stability(
                     &matched_path,
-                    &resolved_directory,
+                    entry.path(),
                     &resolved_directory,
                     &resolved_root,
                     self.plan.follow_symlinks,
@@ -425,52 +618,108 @@ impl FilesystemScanner {
                     entries.skip_current_dir();
                     continue;
                 }
-                if self.path_is_excluded(
+                let checkpoint_excluded = self.path_is_checkpoint_excluded(
                     &matched_path,
                     &resolved_directory,
-                    resolved_excludes,
                     checkpoint_namespace,
-                ) {
+                );
+                if checkpoint_excluded {
                     entries.skip_current_dir();
                 }
                 continue;
             }
-            if !include.matcher.is_match(&matched_path) {
+            let include_matches = include.matcher.is_match(&matched_path);
+            let lexically_excluded =
+                self.path_matches_user_exclude(&matched_path, entry.path(), resolved_excludes);
+            if !include_matches && !lexically_excluded {
                 continue;
             }
-            admission.increment_matched_paths()?;
+            if include_matches {
+                admission.increment_matched_paths()?;
+            }
             if !self.plan.follow_symlinks && entry.path_is_symlink() {
                 continue;
             }
 
+            #[cfg(test)]
+            let gate = self
+                .next_candidate_resolution_gate
+                .lock()
+                .expect("candidate resolution gate lock poisoned")
+                .take();
+            #[cfg(test)]
+            if let Some(gate) = gate {
+                gate.block();
+            }
+            self.ensure_running()?;
             let resolved_path = match std::fs::canonicalize(entry.path()) {
                 Ok(path) => path,
                 Err(source) => {
-                    admission.record_issue(DiscoveryIssue::Io {
-                        operation: "resolve matched candidate",
+                    let issue = DiscoveryIssue::Io {
+                        operation: if lexically_excluded {
+                            "resolve excluded candidate"
+                        } else {
+                            "resolve matched candidate"
+                        },
                         path: matched_path,
                         source,
-                    })?;
+                    };
+                    if lexically_excluded {
+                        admission.record_denial_issue(issue)?;
+                    } else {
+                        admission.record_issue(issue)?;
+                    }
                     continue;
                 }
             };
             self.ensure_running()?;
-            if let Err(issue) = validate_candidate_path_stability(
+            if let Err(issue) = validate_walk_entry_path_stability(
                 &matched_path,
-                &resolved_path,
+                entry.path(),
                 &resolved_path,
                 &resolved_root,
                 self.plan.follow_symlinks,
             ) {
-                admission.record_issue(issue)?;
+                if lexically_excluded {
+                    admission.record_denial_issue(issue)?;
+                } else {
+                    admission.record_issue(issue)?;
+                }
                 continue;
             }
-            if self.path_is_excluded(
-                &matched_path,
-                &resolved_path,
-                resolved_excludes,
-                checkpoint_namespace,
-            ) {
+            if self.path_is_checkpoint_excluded(&matched_path, &resolved_path, checkpoint_namespace)
+            {
+                continue;
+            }
+            if self.path_matches_user_exclude(&matched_path, &resolved_path, resolved_excludes) {
+                let locator = self.collect_stable_revoked_locator(
+                    &matched_path,
+                    &resolved_path,
+                    &resolved_root,
+                    resolved_excludes,
+                    checkpoint_namespace,
+                );
+                self.ensure_running()?;
+                match locator {
+                    Ok(Some(locator)) => admission.observe_revoked(
+                        generation,
+                        locator,
+                        RevocationReason::ExcludedByPolicy,
+                    )?,
+                    Ok(None) => {}
+                    Err(issue) => admission.record_denial_issue(issue)?,
+                }
+                continue;
+            }
+            if lexically_excluded {
+                admission.record_denial_issue(DiscoveryIssue::Identity(
+                    IdentityError::CandidateChangedDuringIdentity {
+                        path: matched_path.clone(),
+                    },
+                ))?;
+                continue;
+            }
+            if !include_matches {
                 continue;
             }
             if let Err(source) = encode_advisory_path(&resolved_path) {
@@ -478,7 +727,7 @@ impl FilesystemScanner {
                 continue;
             }
 
-            let candidate = self.collect_stable_candidate(
+            let observation = self.collect_stable_candidate(
                 &matched_path,
                 &resolved_path,
                 &resolved_root,
@@ -486,17 +735,92 @@ impl FilesystemScanner {
                 checkpoint_namespace,
             );
             self.ensure_running()?;
-            let candidate = match candidate {
-                Ok(Some(candidate)) => candidate,
+            let observation = match observation {
+                Ok(Some(observation)) => observation,
                 Ok(None) => continue,
                 Err(issue) => {
                     admission.record_issue(issue)?;
                     continue;
                 }
             };
-            admission.observe(generation, candidate, self.plan.ignore_older_than)?;
+            match observation {
+                StableCandidateObservation::Eligible(candidate) => {
+                    admission.observe(generation, candidate, self.plan.ignore_older_than)?;
+                }
+                StableCandidateObservation::Revoked(locator) => admission.observe_revoked(
+                    generation,
+                    locator,
+                    RevocationReason::ExcludedByPolicy,
+                )?,
+            }
         }
         Ok(())
+    }
+
+    fn collect_stable_revoked_locator(
+        &self,
+        matched_path: &Path,
+        resolved_path: &Path,
+        resolved_root: &Path,
+        resolved_excludes: &[ResolvedExclude],
+        checkpoint_namespace: Option<&Path>,
+    ) -> Result<Option<crate::receivers::filelog_receiver::checkpoint::Locator>, DiscoveryIssue>
+    {
+        if self.cancellation_requested() {
+            return Ok(None);
+        }
+        let first = open_locator_at_cancellable(resolved_path, matched_path, false, || {
+            self.cancellation_requested()
+        });
+        if self.cancellation_requested() {
+            return Ok(None);
+        }
+        let Some(first) = first? else {
+            return Ok(None);
+        };
+        let resolved_again =
+            std::fs::canonicalize(matched_path).map_err(|source| DiscoveryIssue::Io {
+                operation: "revalidate excluded candidate",
+                path: matched_path.to_path_buf(),
+                source,
+            });
+        if self.cancellation_requested() {
+            return Ok(None);
+        }
+        let resolved_again = resolved_again?;
+        validate_candidate_path_stability(
+            matched_path,
+            resolved_path,
+            &resolved_again,
+            resolved_root,
+            self.plan.follow_symlinks,
+        )?;
+        if self.path_is_checkpoint_excluded(matched_path, &resolved_again, checkpoint_namespace)
+            || !self.path_matches_user_exclude(matched_path, &resolved_again, resolved_excludes)
+        {
+            return Err(DiscoveryIssue::Identity(
+                IdentityError::CandidateChangedDuringIdentity {
+                    path: matched_path.to_path_buf(),
+                },
+            ));
+        }
+        let second = open_locator_at_cancellable(&resolved_again, matched_path, false, || {
+            self.cancellation_requested()
+        });
+        if self.cancellation_requested() {
+            return Ok(None);
+        }
+        let Some(second) = second? else {
+            return Ok(None);
+        };
+        if first != second {
+            return Err(DiscoveryIssue::Identity(
+                IdentityError::CandidateChangedDuringIdentity {
+                    path: matched_path.to_path_buf(),
+                },
+            ));
+        }
+        Ok(Some(second))
     }
 
     fn collect_stable_candidate(
@@ -506,7 +830,20 @@ impl FilesystemScanner {
         resolved_root: &Path,
         resolved_excludes: &[ResolvedExclude],
         checkpoint_namespace: Option<&Path>,
-    ) -> Result<Option<DiscoveredCandidate>, DiscoveryIssue> {
+    ) -> Result<Option<StableCandidateObservation>, DiscoveryIssue> {
+        if self.cancellation_requested() {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        let gate = self
+            .next_candidate_open_gate
+            .lock()
+            .expect("candidate open gate lock poisoned")
+            .take();
+        #[cfg(test)]
+        if let Some(gate) = gate {
+            gate.block();
+        }
         if self.cancellation_requested() {
             return Ok(None);
         }
@@ -556,13 +893,31 @@ impl FilesystemScanner {
             resolved_root,
             self.plan.follow_symlinks,
         )?;
-        if self.path_is_excluded(
-            matched_path,
-            &resolved_again,
-            resolved_excludes,
-            checkpoint_namespace,
-        ) {
-            return Ok(None);
+        if self.path_is_checkpoint_excluded(matched_path, &resolved_again, checkpoint_namespace) {
+            return Err(DiscoveryIssue::Identity(
+                IdentityError::CandidateChangedDuringIdentity {
+                    path: matched_path.to_path_buf(),
+                },
+            ));
+        }
+        if self.path_matches_user_exclude(matched_path, &resolved_again, resolved_excludes) {
+            let second = open_locator_at_cancellable(&resolved_again, matched_path, false, || {
+                self.cancellation_requested()
+            });
+            if self.cancellation_requested() {
+                return Ok(None);
+            }
+            let Some(second) = second? else {
+                return Ok(None);
+            };
+            if first_evidence.locator != second {
+                return Err(DiscoveryIssue::Identity(
+                    IdentityError::CandidateChangedDuringIdentity {
+                        path: matched_path.to_path_buf(),
+                    },
+                ));
+            }
+            return Ok(Some(StableCandidateObservation::Revoked(second)));
         }
         if self.cancellation_requested() {
             return Ok(None);
@@ -619,12 +974,14 @@ impl FilesystemScanner {
             }
             Some(modified?)
         };
-        Ok(Some(DiscoveredCandidate {
-            matched_path: matched_path.to_path_buf(),
-            resolved_path: resolved_again,
-            evidence: second.evidence,
-            modified,
-        }))
+        Ok(Some(StableCandidateObservation::Eligible(
+            DiscoveredCandidate {
+                matched_path: matched_path.to_path_buf(),
+                resolved_path: resolved_again,
+                evidence: second.evidence,
+                modified,
+            },
+        )))
     }
 
     fn path_is_excluded(
@@ -634,17 +991,37 @@ impl FilesystemScanner {
         resolved_excludes: &[ResolvedExclude],
         checkpoint_namespace: Option<&Path>,
     ) -> bool {
+        self.path_matches_user_exclude(matched_path, resolved_path, resolved_excludes)
+            || self.path_is_checkpoint_excluded(matched_path, resolved_path, checkpoint_namespace)
+    }
+
+    fn path_matches_user_exclude(
+        &self,
+        matched_path: &Path,
+        resolved_path: &Path,
+        resolved_excludes: &[ResolvedExclude],
+    ) -> bool {
         resolved_excludes.iter().any(|exclude| {
-            exclude.matcher.is_match(matched_path)
-                || exclude.matcher.is_match(resolved_path)
+            matcher_matches_path_or_ancestor(&exclude.matcher, matched_path)
+                || matcher_matches_path_or_ancestor(&exclude.matcher, resolved_path)
                 || exclude.resolved_root.as_ref().is_some_and(|root| {
                     resolved_path.strip_prefix(root).is_ok_and(|relative| {
-                        exclude
-                            .matcher
-                            .is_match(join_root(&exclude.lexical_root, relative))
+                        matcher_matches_path_or_ancestor(
+                            &exclude.matcher,
+                            &join_root(&exclude.lexical_root, relative),
+                        )
                     })
                 })
-        }) || checkpoint_namespace.is_some_and(|namespace| resolved_path.starts_with(namespace))
+        })
+    }
+
+    fn path_is_checkpoint_excluded(
+        &self,
+        matched_path: &Path,
+        resolved_path: &Path,
+        checkpoint_namespace: Option<&Path>,
+    ) -> bool {
+        checkpoint_namespace.is_some_and(|namespace| resolved_path.starts_with(namespace))
             || matched_path.starts_with(&self.plan.checkpoint_namespace_dir)
     }
 
@@ -660,7 +1037,7 @@ impl FilesystemScanner {
             let resolved_root = match resolved_root {
                 Ok(path) => path,
                 Err(source) => {
-                    admission.record_issue(DiscoveryIssue::Io {
+                    admission.record_denial_issue(DiscoveryIssue::Io {
                         operation: "resolve exclude root",
                         path: exclude.lexical_root.clone(),
                         source,
@@ -690,6 +1067,27 @@ impl FilesystemScanner {
     }
 }
 
+fn validate_walk_entry_path_stability(
+    matched_path: &Path,
+    walked_path: &Path,
+    resolved_path: &Path,
+    resolved_root: &Path,
+    follow_symlinks: bool,
+) -> Result<(), DiscoveryIssue> {
+    let expected_resolved_path = if follow_symlinks {
+        resolved_path
+    } else {
+        walked_path
+    };
+    validate_candidate_path_stability(
+        matched_path,
+        expected_resolved_path,
+        resolved_path,
+        resolved_root,
+        follow_symlinks,
+    )
+}
+
 pub(super) fn validate_candidate_path_stability(
     matched_path: &Path,
     resolved_path: &Path,
@@ -708,6 +1106,10 @@ pub(super) fn validate_candidate_path_stability(
     } else {
         Ok(())
     }
+}
+
+fn matcher_matches_path_or_ancestor(matcher: &GlobMatcher, path: &Path) -> bool {
+    path.ancestors().any(|ancestor| matcher.is_match(ancestor))
 }
 
 fn canonicalize_optional(path: &Path) -> io::Result<Option<PathBuf>> {

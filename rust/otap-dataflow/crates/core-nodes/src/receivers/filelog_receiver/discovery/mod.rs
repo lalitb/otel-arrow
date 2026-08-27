@@ -34,6 +34,13 @@ pub(crate) struct DiscoveredCandidate {
     pub(crate) modified: Option<SystemTime>,
 }
 
+/// Positive policy evidence that makes a retained locator ineligible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RevocationReason {
+    /// At least one observed path for the locator matched an operator exclude.
+    ExcludedByPolicy,
+}
+
 /// Ordered candidate transition consumed by the read/checkpoint worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CandidateEvent {
@@ -47,6 +54,14 @@ pub(crate) enum CandidateEvent {
         /// Runtime locator that is no longer eligible by path.
         locator: Locator,
     },
+    /// The locator was positively observed through an ineligible path. Unlike
+    /// removal, this transition stops late-write capture immediately.
+    Revoked {
+        /// Runtime locator that became ineligible.
+        locator: Locator,
+        /// Positive policy evidence requiring revocation.
+        reason: RevocationReason,
+    },
 }
 
 impl CandidateEvent {
@@ -55,7 +70,7 @@ impl CandidateEvent {
             CandidateEvent::Observed(candidate) | CandidateEvent::Updated(candidate) => {
                 Some(candidate)
             }
-            CandidateEvent::Removed { .. } => None,
+            CandidateEvent::Removed { .. } | CandidateEvent::Revoked { .. } => None,
         }
     }
 }
@@ -153,6 +168,9 @@ pub(crate) struct DiscoveryFeedback {
     pub(crate) deferred: Vec<Locator>,
     /// Locators whose logical reader and runtime lease are fully finalized.
     pub(crate) finalized: Vec<Locator>,
+    /// Locators whose policy revocation has stopped and released runtime
+    /// reading while leaving their durable checkpoint lifecycle active.
+    pub(crate) revoked: Vec<Locator>,
 }
 
 /// Messages emitted by the dedicated discovery thread.

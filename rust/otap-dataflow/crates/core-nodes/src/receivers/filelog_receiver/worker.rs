@@ -1102,6 +1102,7 @@ impl WorkerRuntime {
                 CandidateEvent::Observed(_) => observed = observed.saturating_add(1),
                 CandidateEvent::Updated(_) => updated = updated.saturating_add(1),
                 CandidateEvent::Removed { .. } => removed = removed.saturating_add(1),
+                CandidateEvent::Revoked { .. } => {}
             }
         }
         self.telemetry
@@ -1147,6 +1148,10 @@ impl WorkerRuntime {
     ) -> Result<LoopControl, WorkerError> {
         if self.cancellation_requested() {
             return Ok(LoopControl::Shutdown);
+        }
+        if self.freeze_policy_revocations(&batch.events)? {
+            self.defer_reconciliation(batch, None)?;
+            return self.seal_open_batch(event_tx, command_rx);
         }
         let refreshed = self.refresh_updated_candidates(&mut batch);
         if self.cancellation_requested() {
@@ -1205,7 +1210,7 @@ impl WorkerRuntime {
                 CandidateEvent::Observed(candidate) | CandidateEvent::Updated(candidate) => {
                     self.candidate_evidence.push(candidate.evidence.clone());
                 }
-                CandidateEvent::Removed { .. } => {}
+                CandidateEvent::Removed { .. } | CandidateEvent::Revoked { .. } => {}
             }
         }
         let now_unix_nano = unix_nanos()?.1;
@@ -1308,19 +1313,23 @@ impl WorkerRuntime {
                         feedback.durable.push(locator);
                         continue;
                     }
+                    if let Some(detached_file_id) = self.inactive_locators.get(&locator)
+                        && *detached_file_id != identity.file_id
+                    {
+                        return Err(WorkerError::Inconsistent {
+                            reason: "observed locator changed detached durable identity",
+                        });
+                    }
+                    let file_id = identity.file_id;
                     let insert_result = self.readers_mut()?.insert(candidate, identity);
-                    let lease = self.readers_mut()?.take_lease_observations();
-                    self.telemetry
-                        .add(WorkerCounter::RuntimeLeaseWaits, lease.attempts);
-                    self.telemetry
-                        .add(WorkerCounter::RuntimeLeaseWaitNs, lease.wait_ns);
-                    self.telemetry
-                        .add(WorkerCounter::RuntimeLeaseFailures, lease.failures);
-                    self.telemetry
-                        .add(WorkerCounter::RuntimeLeaseContentions, lease.contentions);
+                    self.record_runtime_lease_observations()?;
                     match insert_result {
-                        Ok(()) => feedback.durable.push(locator),
+                        Ok(()) => {
+                            let _detached = self.inactive_locators.remove(&locator);
+                            feedback.durable.push(locator);
+                        }
                         Err(ReaderError::ReaderCapacityExhausted { .. }) => {
+                            self.remember_inactive_locator(locator, file_id)?;
                             feedback.deferred.push(locator);
                         }
                         Err(error) => {
@@ -1340,14 +1349,45 @@ impl WorkerRuntime {
                     };
                     let locator = candidate.evidence.locator;
                     if identity.lifecycle_state == LifecycleState::Active {
-                        let path_changed = self
-                            .readers_ref()?
-                            .record_context(identity.file_id)?
-                            .matched_path
-                            != candidate.matched_path;
-                        self.readers_mut()?.update(candidate, &identity)?;
-                        if path_changed {
-                            self.telemetry.add(WorkerCounter::RotationMoveCreate, 1);
+                        match self.readers_ref()?.file_id_for_locator(locator) {
+                            Ok(file_id) => {
+                                if file_id != identity.file_id {
+                                    return Err(WorkerError::Inconsistent {
+                                        reason: "updated locator resolved to a different reader",
+                                    });
+                                }
+                                let path_changed = self
+                                    .readers_ref()?
+                                    .record_context(identity.file_id)?
+                                    .matched_path
+                                    != candidate.matched_path;
+                                self.readers_mut()?.update(candidate, &identity)?;
+                                if path_changed {
+                                    self.telemetry.add(WorkerCounter::RotationMoveCreate, 1);
+                                }
+                            }
+                            Err(ReaderError::UnknownLocator { .. }) => {
+                                let detached_file_id = *self
+                                    .inactive_locators
+                                    .get(&locator)
+                                    .ok_or(WorkerError::Inconsistent {
+                                        reason: "re-eligible locator has no detached durable identity",
+                                    })?;
+                                if detached_file_id != identity.file_id {
+                                    return Err(WorkerError::Inconsistent {
+                                        reason: "re-eligible locator changed detached durable identity",
+                                    });
+                                }
+                                let insert_result = self.readers_mut()?.insert(candidate, identity);
+                                self.record_runtime_lease_observations()?;
+                                if let Err(error) = insert_result {
+                                    self.observe_reader_error(&error);
+                                    return Err(WorkerError::Reader(error));
+                                }
+                                let removed = self.inactive_locators.remove(&locator);
+                                debug_assert_eq!(removed, Some(detached_file_id));
+                            }
+                            Err(error) => return Err(WorkerError::Reader(error)),
                         }
                     } else if let Some(existing) =
                         self.inactive_locators.insert(locator, identity.file_id)
@@ -1380,10 +1420,48 @@ impl WorkerRuntime {
                         Err(ReaderError::UnknownLocator { .. }) => {
                             if self.inactive_locators.remove(&locator).is_none() {
                                 return Err(WorkerError::Inconsistent {
-                                    reason: "removed locator belongs to neither a reader nor inactive state",
+                                    reason: "removed locator belongs to neither a reader nor detached state",
                                 });
                             }
                             feedback.finalized.push(locator);
+                        }
+                        Err(error) => return Err(WorkerError::Reader(error)),
+                    }
+                }
+                CandidateEvent::Revoked { locator, reason: _ } => {
+                    match self.readers_ref()?.file_id_for_locator(locator) {
+                        Ok(file_id) => {
+                            self.readers_ref()?.preflight_release_revoked(file_id)?;
+                            self.readers_mut()?.pause(file_id)?;
+                            let contributed = self
+                                .open_batch
+                                .as_ref()
+                                .ok_or(WorkerError::MissingOpenBatch {
+                                    operation: "checking policy revocation overlap",
+                                })?
+                                .progress_frontier(file_id)
+                                .is_some();
+                            if contributed {
+                                return Err(WorkerError::Inconsistent {
+                                    reason: "policy revocation still overlaps an open batch after preemption",
+                                });
+                            } else {
+                                self.discard_framer(file_id);
+                                let released = self.readers_mut()?.release_revoked(file_id)?;
+                                if released != locator {
+                                    return Err(WorkerError::Inconsistent {
+                                        reason: "policy revocation released a different locator",
+                                    });
+                                }
+                                let _ = self.rotation_waits.remove(&file_id);
+                                let _ = self.record_numbers.remove(file_id);
+                                self.remove_drain_file(file_id);
+                                self.remember_inactive_locator(locator, file_id)?;
+                                feedback.revoked.push(locator);
+                            }
+                        }
+                        Err(ReaderError::UnknownLocator { .. }) => {
+                            feedback.revoked.push(locator);
                         }
                         Err(error) => return Err(WorkerError::Reader(error)),
                     }
@@ -1422,6 +1500,52 @@ impl WorkerRuntime {
                 suppressed_events = suppressed
             );
         }
+    }
+
+    fn freeze_policy_revocations(
+        &mut self,
+        events: &[CandidateEvent],
+    ) -> Result<bool, WorkerError> {
+        let mut overlaps_open_batch = false;
+        for event in events {
+            let CandidateEvent::Revoked { locator, .. } = event else {
+                continue;
+            };
+            match self.readers_ref()?.file_id_for_locator(*locator) {
+                Ok(file_id) => {
+                    self.readers_ref()?.preflight_release_revoked(file_id)?;
+                    self.readers_mut()?.pause(file_id)?;
+                    overlaps_open_batch |= self
+                        .open_batch
+                        .as_ref()
+                        .ok_or(WorkerError::MissingOpenBatch {
+                            operation: "preempting policy revocation",
+                        })?
+                        .progress_frontier(file_id)
+                        .is_some();
+                }
+                Err(ReaderError::UnknownLocator { .. }) => {
+                    // The matching Observed transition may still be awaiting
+                    // durable/deferred feedback, in which case no reader
+                    // exists yet and there is nothing runtime-owned to pause.
+                }
+                Err(error) => return Err(WorkerError::Reader(error)),
+            }
+        }
+        Ok(overlaps_open_batch)
+    }
+
+    fn record_runtime_lease_observations(&mut self) -> Result<(), WorkerError> {
+        let lease = self.readers_mut()?.take_lease_observations();
+        self.telemetry
+            .add(WorkerCounter::RuntimeLeaseWaits, lease.attempts);
+        self.telemetry
+            .add(WorkerCounter::RuntimeLeaseWaitNs, lease.wait_ns);
+        self.telemetry
+            .add(WorkerCounter::RuntimeLeaseFailures, lease.failures);
+        self.telemetry
+            .add(WorkerCounter::RuntimeLeaseContentions, lease.contentions);
+        Ok(())
     }
 
     fn refresh_updated_candidates(
@@ -1515,7 +1639,7 @@ impl WorkerRuntime {
                 Err(ReaderError::UnknownLocator { .. }) => {
                     let file_id = *self.inactive_locators.get(&locator).ok_or(
                             WorkerError::Inconsistent {
-                                reason: "Updated locator belongs to neither a reader nor inactive state",
+                                reason: "Updated locator belongs to neither a reader nor detached state",
                             },
                         )?;
                     let record = self
@@ -1957,7 +2081,7 @@ impl WorkerRuntime {
             && existing != file_id
         {
             return Err(WorkerError::Inconsistent {
-                reason: "inactive locator changed durable identity",
+                reason: "detached locator changed durable identity",
             });
         }
         Ok(())
@@ -3585,6 +3709,7 @@ fn feedback_with_capacity(capacity: usize) -> Result<DiscoveryFeedback, WorkerEr
         rejected: reserved_vec(capacity, "discovery rejected feedback")?,
         deferred: reserved_vec(capacity, "discovery deferred feedback")?,
         finalized: reserved_vec(capacity, "discovery finalized feedback")?,
+        revoked: reserved_vec(capacity, "discovery revocation feedback")?,
     })
 }
 

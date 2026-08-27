@@ -21,6 +21,11 @@ pub(crate) struct OpenedCandidate {
     pub(crate) evidence: CandidateEvidence,
 }
 
+struct OpenedLocator {
+    file: File,
+    locator: Locator,
+}
+
 /// Opens one candidate without write access and collects all identity
 /// evidence from the resulting handle.
 pub(crate) fn open_candidate(
@@ -29,8 +34,15 @@ pub(crate) fn open_candidate(
     fingerprint_bytes: u16,
     ignored_header_bytes: u32,
 ) -> Result<OpenedCandidate, IdentityError> {
-    open_candidate_at(
+    let expected_resolved_path =
+        std::fs::canonicalize(path).map_err(|source| IdentityError::Io {
+            operation: "resolve candidate before handle-bound open",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    open_candidate_at_expected(
         path,
+        &expected_resolved_path,
         path,
         follow_symlinks,
         fingerprint_bytes,
@@ -66,6 +78,120 @@ pub(crate) fn open_candidate_at_cancellable(
     ignored_header_bytes: u32,
     mut cancelled: impl FnMut() -> bool,
 ) -> Result<Option<OpenedCandidate>, IdentityError> {
+    open_candidate_at_expected_cancellable(
+        open_path,
+        open_path,
+        advisory_path,
+        follow_symlinks,
+        fingerprint_bytes,
+        ignored_header_bytes,
+        &mut cancelled,
+    )
+}
+
+fn open_candidate_at_expected(
+    open_path: &Path,
+    expected_resolved_path: &Path,
+    advisory_path: &Path,
+    follow_symlinks: bool,
+    fingerprint_bytes: u16,
+    ignored_header_bytes: u32,
+) -> Result<OpenedCandidate, IdentityError> {
+    open_candidate_at_expected_cancellable(
+        open_path,
+        expected_resolved_path,
+        advisory_path,
+        follow_symlinks,
+        fingerprint_bytes,
+        ignored_header_bytes,
+        &mut || false,
+    )
+    .map(|opened| opened.expect("non-cancellable candidate open cannot be cancelled"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_candidate_at_expected_cancellable(
+    open_path: &Path,
+    expected_resolved_path: &Path,
+    advisory_path: &Path,
+    follow_symlinks: bool,
+    fingerprint_bytes: u16,
+    ignored_header_bytes: u32,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<OpenedCandidate>, IdentityError> {
+    let Some(opened) = open_verified_locator_at_expected_cancellable(
+        open_path,
+        expected_resolved_path,
+        advisory_path,
+        follow_symlinks,
+        &mut *cancelled,
+    )?
+    else {
+        return Ok(None);
+    };
+    let OpenedLocator { file, locator } = opened;
+    let path_before_evidence = expected_resolved_path;
+    let Some((fingerprint, size)) = collect_consistent_fingerprint_cancellable(
+        &file,
+        open_path,
+        fingerprint_bytes,
+        ignored_header_bytes,
+        &mut *cancelled,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(path_after_evidence) =
+        resolved_path_from_handle_cancellable(&file, open_path, &mut *cancelled)?
+    else {
+        return Ok(None);
+    };
+    if !resolved_paths_equal(path_before_evidence, &path_after_evidence) {
+        return Err(IdentityError::CandidateChangedDuringIdentity {
+            path: advisory_path.to_path_buf(),
+        });
+    }
+    if cancelled() {
+        return Ok(None);
+    }
+    let advisory_path = encode_advisory_path(advisory_path)?;
+
+    Ok(Some(OpenedCandidate {
+        file,
+        evidence: CandidateEvidence {
+            locator,
+            size,
+            fingerprint,
+            advisory_path,
+        },
+    }))
+}
+
+/// Opens one already-authorized path and returns only its handle-derived
+/// locator. No fingerprint or source-content bytes are read.
+pub(crate) fn open_locator_at_cancellable(
+    open_path: &Path,
+    advisory_path: &Path,
+    follow_symlinks: bool,
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<Option<Locator>, IdentityError> {
+    open_verified_locator_at_expected_cancellable(
+        open_path,
+        open_path,
+        advisory_path,
+        follow_symlinks,
+        &mut cancelled,
+    )
+    .map(|opened| opened.map(|opened| opened.locator))
+}
+
+fn open_verified_locator_at_expected_cancellable(
+    open_path: &Path,
+    expected_resolved_path: &Path,
+    advisory_path: &Path,
+    follow_symlinks: bool,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<OpenedLocator>, IdentityError> {
     if cancelled() {
         return Ok(None);
     }
@@ -94,34 +220,21 @@ pub(crate) fn open_candidate_at_cancellable(
     }
 
     let Some(locator) =
-        locator_from_handle_cancellable(&file, open_path, follow_symlinks, &mut cancelled)?
+        locator_from_handle_cancellable(&file, open_path, follow_symlinks, &mut *cancelled)?
     else {
         return Ok(None);
     };
-    let Some((fingerprint, size)) = collect_consistent_fingerprint_cancellable(
-        &file,
-        open_path,
-        fingerprint_bytes,
-        ignored_header_bytes,
-        &mut cancelled,
-    )?
+    let Some(resolved_path) =
+        resolved_path_from_handle_cancellable(&file, open_path, &mut *cancelled)?
     else {
         return Ok(None);
     };
-    if cancelled() {
-        return Ok(None);
+    if !resolved_paths_equal(&resolved_path, expected_resolved_path) {
+        return Err(IdentityError::CandidateChangedDuringIdentity {
+            path: advisory_path.to_path_buf(),
+        });
     }
-    let advisory_path = encode_advisory_path(advisory_path)?;
-
-    Ok(Some(OpenedCandidate {
-        file,
-        evidence: CandidateEvidence {
-            locator,
-            size,
-            fingerprint,
-            advisory_path,
-        },
-    }))
+    Ok(Some(OpenedLocator { file, locator }))
 }
 
 /// Result of reopening a known native locator.
@@ -409,6 +522,249 @@ fn open_read_only(_path: &Path, _follow_symlinks: bool) -> io::Result<File> {
         io::ErrorKind::Unsupported,
         "filelog identity is supported only on Unix and Windows",
     ))
+}
+
+fn resolved_paths_equal(left: &Path, right: &Path) -> bool {
+    left == right
+}
+
+#[cfg(target_os = "linux")]
+fn resolved_path_from_handle_cancellable(
+    file: &File,
+    path: &Path,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<std::path::PathBuf>, IdentityError> {
+    use std::os::fd::AsRawFd as _;
+
+    if cancelled() {
+        return Ok(None);
+    }
+    let link = std::path::PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+    let resolved = std::fs::read_link(&link);
+    if cancelled() {
+        return Ok(None);
+    }
+    let resolved = resolved.map_err(|source| IdentityError::Io {
+        operation: "resolve the opened Linux candidate handle through procfs",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !resolved.is_absolute() {
+        return Err(IdentityError::Io {
+            operation: "validate the opened Linux candidate handle path",
+            path: path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                "procfs returned a non-absolute candidate handle path",
+            ),
+        });
+    }
+    Ok(Some(resolved))
+}
+
+#[cfg(target_os = "macos")]
+#[allow(
+    unsafe_code,
+    reason = "macOS F_GETPATH requires a raw descriptor and output buffer"
+)]
+fn resolved_path_from_handle_cancellable(
+    file: &File,
+    path: &Path,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<std::path::PathBuf>, IdentityError> {
+    use std::ffi::{CStr, OsString};
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStringExt as _;
+
+    if cancelled() {
+        return Ok(None);
+    }
+    let mut buffer = [0u8; libc::PATH_MAX as usize];
+    // SAFETY: `file` owns a live descriptor and `buffer` is writable for
+    // PATH_MAX bytes, which is the contract of F_GETPATH.
+    let result = unsafe {
+        libc::fcntl(
+            file.as_raw_fd(),
+            libc::F_GETPATH,
+            buffer.as_mut_ptr().cast::<i8>(),
+        )
+    };
+    let source = (result == -1).then(io::Error::last_os_error);
+    if cancelled() {
+        return Ok(None);
+    }
+    if let Some(source) = source {
+        return Err(IdentityError::Io {
+            operation: "resolve the opened macOS candidate handle with F_GETPATH",
+            path: path.to_path_buf(),
+            source,
+        });
+    }
+    let resolved = {
+        // SAFETY: successful F_GETPATH writes a NUL-terminated path into the
+        // fixed-size output buffer.
+        let bytes = unsafe { CStr::from_ptr(buffer.as_ptr().cast::<i8>()) }.to_bytes();
+        std::path::PathBuf::from(OsString::from_vec(bytes.to_vec()))
+    };
+    if !resolved.is_absolute() {
+        return Err(IdentityError::Io {
+            operation: "validate the opened macOS candidate handle path",
+            path: path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                "F_GETPATH returned a non-absolute candidate handle path",
+            ),
+        });
+    }
+    Ok(Some(resolved))
+}
+
+#[cfg(windows)]
+#[allow(
+    unsafe_code,
+    reason = "GetFinalPathNameByHandleW requires a raw handle and output buffer"
+)]
+fn resolved_path_from_handle_cancellable(
+    file: &File,
+    path: &Path,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<std::path::PathBuf>, IdentityError> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use std::ptr;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+    };
+
+    const MAX_FINAL_PATH_WIDE_UNITS: u32 = 32_768;
+
+    if cancelled() {
+        return Ok(None);
+    }
+    // SAFETY: `file` owns a live handle. A zero-sized query with a null
+    // buffer asks Windows for the required UTF-16 capacity.
+    let required = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle(),
+            ptr::null_mut(),
+            0,
+            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+        )
+    };
+    let source = (required == 0).then(io::Error::last_os_error);
+    if cancelled() {
+        return Ok(None);
+    }
+    if let Some(source) = source {
+        return Err(IdentityError::Io {
+            operation: "size the opened Windows candidate handle path",
+            path: path.to_path_buf(),
+            source,
+        });
+    }
+    if required > MAX_FINAL_PATH_WIDE_UNITS {
+        return Err(IdentityError::Io {
+            operation: "bound the opened Windows candidate handle path",
+            path: path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows candidate handle path exceeds the supported extended-path bound",
+            ),
+        });
+    }
+    let capacity = required;
+    let capacity_usize = usize::try_from(capacity).map_err(|_| IdentityError::Io {
+        operation: "size the opened Windows candidate handle path buffer",
+        path: path.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows candidate handle path length does not fit usize",
+        ),
+    })?;
+    let mut buffer = vec![0u16; capacity_usize];
+    // SAFETY: `buffer` is writable for `capacity` UTF-16 units and the live
+    // handle remains valid throughout the call.
+    let written = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle(),
+            buffer.as_mut_ptr(),
+            capacity,
+            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+        )
+    };
+    let source = (written == 0).then(io::Error::last_os_error);
+    if cancelled() {
+        return Ok(None);
+    }
+    if let Some(source) = source {
+        return Err(IdentityError::Io {
+            operation: "resolve the opened Windows candidate handle path",
+            path: path.to_path_buf(),
+            source,
+        });
+    }
+    if written >= capacity {
+        return Err(IdentityError::Io {
+            operation: "validate the opened Windows candidate handle path length",
+            path: path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows candidate handle path changed during resolution",
+            ),
+        });
+    }
+    buffer.truncate(usize::try_from(written).map_err(|_| IdentityError::Io {
+        operation: "decode the opened Windows candidate handle path",
+        path: path.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows candidate handle path length does not fit usize",
+        ),
+    })?);
+    let resolved = std::path::PathBuf::from(OsString::from_wide(&buffer));
+    if !resolved.is_absolute() {
+        return Err(IdentityError::Io {
+            operation: "validate the opened Windows candidate handle path",
+            path: path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows returned a non-absolute candidate handle path",
+            ),
+        });
+    }
+    Ok(Some(resolved))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn resolved_path_from_handle_cancellable(
+    _file: &File,
+    path: &Path,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<std::path::PathBuf>, IdentityError> {
+    if cancelled() {
+        Ok(None)
+    } else {
+        Err(IdentityError::UnsupportedPlatform {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn resolved_path_from_handle_cancellable(
+    _file: &File,
+    path: &Path,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<std::path::PathBuf>, IdentityError> {
+    if cancelled() {
+        Ok(None)
+    } else {
+        Err(IdentityError::UnsupportedPlatform {
+            path: path.to_path_buf(),
+        })
+    }
 }
 
 #[cfg(unix)]

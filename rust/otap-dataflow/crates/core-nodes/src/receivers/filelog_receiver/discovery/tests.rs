@@ -81,7 +81,9 @@ fn observed_candidates(batch: &ReconciliationBatch) -> Vec<&DiscoveredCandidate>
         .iter()
         .filter_map(|event| match event {
             CandidateEvent::Observed(candidate) => Some(candidate),
-            CandidateEvent::Updated(_) | CandidateEvent::Removed { .. } => None,
+            CandidateEvent::Updated(_)
+            | CandidateEvent::Removed { .. }
+            | CandidateEvent::Revoked { .. } => None,
         })
         .collect()
 }
@@ -175,7 +177,7 @@ fn include_exclude_and_checkpoint_rules_are_enforced() {
     let config = runtime_config(
         root,
         vec![pattern(root, "**/*"), pattern(root, "root.log")],
-        vec![pattern(root, "excluded/**")],
+        vec![pattern(root, "excluded")],
     );
     let plan = DiscoveryPlan::from_runtime(&config).unwrap();
     assert!(plan.likely_self_ingestion());
@@ -303,6 +305,91 @@ fn symlink_policy_and_resolved_target_excludes_are_enforced() {
         observed_candidates(&batch)[0].resolved_path,
         std::fs::canonicalize(target).unwrap()
     );
+}
+
+#[cfg(any(unix, windows))]
+/// Scenario: discovery authorizes a canonical in-root candidate, then an
+/// attacker replaces one ancestor with a directory link to an excluded
+/// out-of-root file before the first candidate open.
+/// Guarantees: the opened handle's native final path is compared with the
+/// authorized target before fingerprint bytes are read, so the redirected
+/// object is not admitted and the scan cannot provide absence evidence.
+#[test]
+fn ancestor_link_replacement_cannot_redirect_an_authorized_open() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let include_root = root.path().join("include");
+    let candidate_dir = include_root.join("current");
+    let parked_dir = root.path().join("parked");
+    let excluded_dir = outside.path().join("excluded");
+    std::fs::create_dir_all(&candidate_dir).unwrap();
+    std::fs::create_dir(&excluded_dir).unwrap();
+    std::fs::write(candidate_dir.join("app.log"), b"allowed").unwrap();
+    std::fs::write(excluded_dir.join("app.log"), b"secret").unwrap();
+
+    let config = runtime_config(
+        root.path(),
+        vec![pattern(&include_root, "**/*.log")],
+        vec![pattern(&excluded_dir, "**")],
+    );
+    let (mut scanner, mut admission) = scanner_and_admission(&config);
+    let gate = scanner.gate_next_candidate_before_first_open_for_test();
+    let scan = std::thread::spawn(move || scanner.reconcile(&mut admission, SystemTime::now()));
+    assert!(
+        gate.wait_until_entered(Duration::from_secs(5)),
+        "scanner did not reach the pre-open gate"
+    );
+
+    std::fs::rename(&candidate_dir, &parked_dir).unwrap();
+    symlink_dir(&excluded_dir, &candidate_dir).unwrap();
+    gate.release();
+
+    let batch = scan.join().unwrap().unwrap();
+    assert!(observed_candidates(&batch).is_empty());
+    assert!(batch.stats.scan_errors >= 1);
+    assert!(!batch.stats.complete);
+    assert_eq!(
+        std::fs::read(parked_dir.join("app.log")).unwrap(),
+        b"allowed"
+    );
+}
+
+#[cfg(any(unix, windows))]
+/// Scenario: discovery observes a regular candidate beneath its canonical
+/// traversal root, then an attacker replaces an ancestor with a directory
+/// link to a different in-root file before candidate resolution.
+/// Guarantees: no-follow discovery compares canonicalization with the exact
+/// walked path, rejects the redirected object before opening it, and marks
+/// the scan incomplete.
+#[test]
+fn ancestor_link_replacement_cannot_redirect_within_include_root() {
+    let root = tempfile::tempdir().unwrap();
+    let include_root = root.path().join("include");
+    let candidate_dir = include_root.join("current");
+    let parked_dir = root.path().join("parked");
+    let redirected_dir = include_root.join("private");
+    std::fs::create_dir_all(&candidate_dir).unwrap();
+    std::fs::create_dir(&redirected_dir).unwrap();
+    std::fs::write(candidate_dir.join("app.log"), b"allowed").unwrap();
+    std::fs::write(redirected_dir.join("app.log"), b"secret").unwrap();
+
+    let config = runtime_config(root.path(), vec![pattern(&candidate_dir, "*.log")], vec![]);
+    let (mut scanner, mut admission) = scanner_and_admission(&config);
+    let gate = scanner.gate_next_candidate_before_resolution_for_test();
+    let scan = std::thread::spawn(move || scanner.reconcile(&mut admission, SystemTime::now()));
+    assert!(
+        gate.wait_until_entered(Duration::from_secs(5)),
+        "scanner did not reach the pre-resolution gate"
+    );
+
+    std::fs::rename(&candidate_dir, &parked_dir).unwrap();
+    symlink_dir(&redirected_dir, &candidate_dir).unwrap();
+    gate.release();
+
+    let batch = scan.join().unwrap().unwrap();
+    assert!(observed_candidates(&batch).is_empty());
+    assert!(batch.stats.scan_errors >= 1);
+    assert!(!batch.stats.complete);
 }
 
 #[cfg(any(unix, windows))]
@@ -752,6 +839,322 @@ fn removed_locator_stays_live_until_reader_finalization() {
         })
         .unwrap();
     assert!(!admission.tracked_locators().contains(&locator));
+}
+
+/// Scenario: a durably admitted file is moved beneath a user-excluded
+/// directory while retaining the same native locator, then moved back to an
+/// eligible path after runtime acknowledges the revocation.
+/// Guarantees: discovery emits positive `Revoked` evidence instead of
+/// `Removed`, retains no excluded content evidence, and later emits `Updated`
+/// for the same locator without creating a new identity.
+#[test]
+fn excluded_move_revokes_then_reeligibility_updates_same_locator() {
+    let directory = tempfile::tempdir().unwrap();
+    let allowed = directory.path().join("allowed");
+    let denied = directory.path().join("denied");
+    std::fs::create_dir(&allowed).unwrap();
+    std::fs::create_dir(&denied).unwrap();
+    let original = allowed.join("app.log");
+    let excluded = denied.join("app.bin");
+    std::fs::write(&original, b"line\n").unwrap();
+    let config = runtime_config(
+        directory.path(),
+        vec![pattern(directory.path(), "**/*.log")],
+        vec![pattern(&denied, "**")],
+    );
+    let (mut scanner, mut admission) = scanner_and_admission(&config);
+
+    let admitted = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+    let locator = event_locators(&admitted)[0];
+    admission
+        .apply_feedback(durable_feedback(&admitted))
+        .unwrap();
+    std::fs::rename(&original, &excluded).unwrap();
+
+    let revoked = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+    assert!(matches!(
+        revoked.events.as_slice(),
+        [CandidateEvent::Revoked {
+            locator: found,
+            reason: RevocationReason::ExcludedByPolicy,
+        }] if *found == locator
+    ));
+    assert!(revoked.stats.complete);
+    admission
+        .apply_feedback(DiscoveryFeedback {
+            revoked: vec![locator],
+            ..DiscoveryFeedback::default()
+        })
+        .unwrap();
+
+    let still_excluded = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+    assert!(still_excluded.events.is_empty());
+    std::fs::rename(&excluded, &original).unwrap();
+
+    let reeligible = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+    assert!(matches!(
+        reeligible.events.as_slice(),
+        [CandidateEvent::Updated(candidate)]
+            if candidate.evidence.locator == locator
+                && candidate.matched_path == original
+    ));
+}
+
+/// Scenario: an active file remains eligible through its original path while
+/// a hard link to the same native locator appears beneath an excluded path.
+/// Guarantees: the excluded alias revokes the locator even though another
+/// alias remains eligible, independent of traversal order.
+#[test]
+fn excluded_hard_link_revokes_an_eligible_alias() {
+    let directory = tempfile::tempdir().unwrap();
+    let allowed = directory.path().join("allowed");
+    let denied = directory.path().join("denied");
+    std::fs::create_dir(&allowed).unwrap();
+    std::fs::create_dir(&denied).unwrap();
+    let original = allowed.join("app.log");
+    std::fs::write(&original, b"line\n").unwrap();
+    let config = runtime_config(
+        directory.path(),
+        vec![pattern(directory.path(), "**/*.log")],
+        vec![pattern(&denied, "**")],
+    );
+    let (mut scanner, mut admission) = scanner_and_admission(&config);
+    let admitted = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+    let locator = event_locators(&admitted)[0];
+    admission
+        .apply_feedback(durable_feedback(&admitted))
+        .unwrap();
+
+    std::fs::hard_link(&original, denied.join("alias.bin")).unwrap();
+    let revoked = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+
+    assert!(matches!(
+        revoked.events.as_slice(),
+        [CandidateEvent::Revoked {
+            locator: found,
+            reason: RevocationReason::ExcludedByPolicy,
+        }] if *found == locator
+    ));
+}
+
+/// Scenario: the first scan sees both an eligible path and an excluded hard
+/// link for one previously unknown native locator.
+/// Guarantees: per-scan denial suppresses initial admission regardless of
+/// traversal order, so no content from the multiply named file is exported
+/// before policy can revoke it.
+#[test]
+fn excluded_hard_link_suppresses_first_admission() {
+    let directory = tempfile::tempdir().unwrap();
+    let allowed = directory.path().join("allowed");
+    let denied = directory.path().join("denied");
+    std::fs::create_dir(&allowed).unwrap();
+    std::fs::create_dir(&denied).unwrap();
+    let original = allowed.join("app.log");
+    std::fs::write(&original, b"secret\n").unwrap();
+    std::fs::hard_link(&original, denied.join("alias.bin")).unwrap();
+    let config = runtime_config(
+        directory.path(),
+        vec![pattern(directory.path(), "**/*.log")],
+        vec![pattern(&denied, "**")],
+    );
+    let (mut scanner, mut admission) = scanner_and_admission(&config);
+
+    let batch = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+
+    assert!(batch.events.is_empty());
+    assert!(admission.tracked_locators().is_empty());
+}
+
+/// Scenario: an include root and a disjoint exclude root contain hard links
+/// to one previously unknown file, and the excluded alias does not match the
+/// include extension.
+/// Guarantees: the locator-only exclude-root pass runs before candidate
+/// fingerprinting, so the external alias suppresses initial admission
+/// without retaining excluded content evidence.
+#[test]
+fn external_excluded_hard_link_suppresses_first_admission() {
+    let included = tempfile::tempdir().unwrap();
+    let excluded = tempfile::tempdir().unwrap();
+    let original = included.path().join("app.log");
+    std::fs::write(&original, b"secret\n").unwrap();
+    std::fs::hard_link(&original, excluded.path().join("alias.bin")).unwrap();
+    let config = runtime_config(
+        included.path(),
+        vec![pattern(included.path(), "**/*.log")],
+        vec![pattern(excluded.path(), "**")],
+    );
+    let (mut scanner, mut admission) = scanner_and_admission(&config);
+
+    let batch = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+
+    assert!(batch.events.is_empty());
+    assert!(batch.stats.complete, "{:?}", batch.stats);
+    assert!(admission.tracked_locators().is_empty());
+}
+
+/// Scenario: an eligible alias and an excluded alias name one already tracked
+/// locator in each possible observation order.
+/// Guarantees: positive exclusion wins deterministically, cancels any
+/// same-generation update, and blocks re-eligibility until runtime
+/// acknowledges the revocation.
+#[test]
+fn excluded_alias_wins_over_eligible_alias_in_either_order() {
+    let mut admission = AdmissionController::new(1, 1, 1, 16).unwrap();
+    let original = fake_candidate(7);
+    let locator = original.evidence.locator;
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe(generation, original.clone(), Duration::ZERO)
+        .unwrap();
+    let admitted = admission.finish_scan().unwrap();
+    admission
+        .apply_feedback(durable_feedback(&admitted))
+        .unwrap();
+
+    let mut changed = original.clone();
+    changed.matched_path = PathBuf::from("eligible-alias.log");
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe(generation, changed.clone(), Duration::ZERO)
+        .unwrap();
+    admission
+        .observe_revoked(generation, locator, RevocationReason::ExcludedByPolicy)
+        .unwrap();
+    let eligible_first = admission.finish_scan().unwrap();
+    assert!(matches!(
+        eligible_first.events.as_slice(),
+        [CandidateEvent::Revoked { locator: found, .. }] if *found == locator
+    ));
+    admission
+        .apply_feedback(DiscoveryFeedback {
+            revoked: vec![locator],
+            ..DiscoveryFeedback::default()
+        })
+        .unwrap();
+
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe(generation, changed.clone(), Duration::ZERO)
+        .unwrap();
+    let reeligible = admission.finish_scan().unwrap();
+    assert!(matches!(
+        reeligible.events.as_slice(),
+        [CandidateEvent::Updated(_)]
+    ));
+    admission
+        .apply_feedback(durable_feedback(&reeligible))
+        .unwrap();
+
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe_revoked(generation, locator, RevocationReason::ExcludedByPolicy)
+        .unwrap();
+    admission
+        .observe(generation, changed, Duration::ZERO)
+        .unwrap();
+    let excluded_first = admission.finish_scan().unwrap();
+    assert!(matches!(
+        excluded_first.events.as_slice(),
+        [CandidateEvent::Revoked { locator: found, .. }] if *found == locator
+    ));
+}
+
+/// Scenario: a scan encounters arbitrarily many excluded locators that were
+/// never retained by discovery.
+/// Guarantees: unknown exclusion evidence consumes no tracked, pending, or
+/// event capacity.
+#[test]
+fn unknown_excluded_locators_consume_no_admission_capacity() {
+    let mut admission = AdmissionController::new(1, 1, 1, 16).unwrap();
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    for number in 1..=128 {
+        admission
+            .observe_revoked(
+                generation,
+                fake_candidate(number).evidence.locator,
+                RevocationReason::ExcludedByPolicy,
+            )
+            .unwrap();
+    }
+    admission
+        .observe(generation, fake_candidate(200), Duration::ZERO)
+        .unwrap();
+    let batch = admission.finish_scan().unwrap();
+
+    assert!(batch.events.is_empty());
+    assert!(!batch.stats.complete);
+    assert!(admission.tracked_locators().is_empty());
+    assert_eq!(admission.pending_len(), 0);
+}
+
+/// Scenario: positive exclusion arrives after an `Observed` event was handed
+/// off but before worker feedback says whether the candidate became durable.
+/// Guarantees: deferred admission followed by revocation feedback releases
+/// the non-durable discovery entry, so later eligibility starts with a fresh
+/// `Observed` transition rather than an invalid `Updated` transition.
+#[test]
+fn revocation_releases_a_candidate_deferred_before_durability() {
+    let mut admission = AdmissionController::new(1, 1, 1, 16).unwrap();
+    let candidate = fake_candidate(9);
+    let locator = candidate.evidence.locator;
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe(generation, candidate.clone(), Duration::ZERO)
+        .unwrap();
+    let observed = admission.finish_scan().unwrap();
+    assert!(matches!(
+        observed.events.as_slice(),
+        [CandidateEvent::Observed(_)]
+    ));
+
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe_revoked(generation, locator, RevocationReason::ExcludedByPolicy)
+        .unwrap();
+    let revoked = admission.finish_scan().unwrap();
+    assert!(matches!(
+        revoked.events.as_slice(),
+        [CandidateEvent::Revoked { .. }]
+    ));
+    admission
+        .apply_feedback(DiscoveryFeedback {
+            deferred: vec![locator],
+            ..DiscoveryFeedback::default()
+        })
+        .unwrap();
+    admission
+        .apply_feedback(DiscoveryFeedback {
+            revoked: vec![locator],
+            ..DiscoveryFeedback::default()
+        })
+        .unwrap();
+    assert!(!admission.tracked_locators().contains(&locator));
+
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe(generation, candidate, Duration::ZERO)
+        .unwrap();
+    let reeligible = admission.finish_scan().unwrap();
+    assert!(matches!(
+        reeligible.events.as_slice(),
+        [CandidateEvent::Observed(_)]
+    ));
 }
 
 /// Scenario: a traversal issue prevents a reconciliation pass from observing
