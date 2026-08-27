@@ -2785,6 +2785,7 @@ impl WorkerRuntime {
             })?;
             self.frontier_snapshot.extend(readers.frontiers());
         }
+        self.readers_mut()?.prepare_batch_pause_order()?;
         for index in 0..self.frontier_snapshot.len() {
             let frontier = self.frontier_snapshot[index];
             let target = match self.rewind_targets.get(&frontier.file_id) {

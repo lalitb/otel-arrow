@@ -588,6 +588,8 @@ pub(crate) struct ReaderTable {
     turn_sequence: u64,
     eviction_sequence: u64,
     pending_eviction: Option<EvictionRequest>,
+    deferred_eviction_target: Option<FileId>,
+    batch_pause_order_prepared: bool,
     read_buffer: Option<Vec<u8>>,
     counters: ActivityCounters,
     lease_observations: LeaseObservations,
@@ -769,6 +771,8 @@ impl ReaderTable {
             turn_sequence: 0,
             eviction_sequence: 0,
             pending_eviction: None,
+            deferred_eviction_target: None,
+            batch_pause_order_prepared: false,
             read_buffer: Some(read_buffer),
             counters: ActivityCounters::new(),
             lease_observations: LeaseObservations::default(),
@@ -1567,7 +1571,11 @@ impl ReaderTable {
             std::mem::replace(&mut reader.schedule, ScheduleState::Paused)
         };
         match prior_state {
-            ScheduleState::Ready => self.remove_ready(file_id)?,
+            ScheduleState::Ready => {
+                if !self.batch_pause_order_prepared {
+                    self.remove_ready(file_id)?;
+                }
+            }
             ScheduleState::Eof { next_probe } => {
                 if !self.eof_deadlines.remove(&(next_probe, file_id)) {
                     return Err(ReaderError::Inconsistent {
@@ -1701,7 +1709,17 @@ impl ReaderTable {
                 counter: "source bytes rewound",
             })?;
 
-        self.remove_scheduling_state(file_id)?;
+        if !(self.batch_pause_order_prepared
+            && matches!(
+                self.readers
+                    .get(&file_id)
+                    .ok_or(ReaderError::UnknownFile { file_id })?
+                    .schedule,
+                ScheduleState::Ready
+            ))
+        {
+            self.remove_scheduling_state(file_id)?;
+        }
         let reader = self
             .readers
             .get_mut(&file_id)
@@ -1817,21 +1835,101 @@ impl ReaderTable {
                 });
             }
         }
+        if self.batch_pause_order_prepared
+            && (self.ready.len() != self.readers.len()
+                || self.ready.iter().any(|file_id| {
+                    self.readers.get(file_id).is_none_or(|reader| {
+                        !reader.paused_for_batch
+                            || !matches!(reader.schedule, ScheduleState::Paused)
+                    })
+                }))
+        {
+            return Err(ReaderError::Inconsistent {
+                reason: "prepared batch resume order does not cover every paused reader",
+            });
+        }
+        if let Some(file_id) = self.deferred_eviction_target {
+            let reader = self
+                .readers
+                .get(&file_id)
+                .ok_or(ReaderError::Inconsistent {
+                    reason: "deferred eviction target is missing",
+                })?;
+            if !reader.paused_for_batch || !matches!(reader.schedule, ScheduleState::Paused) {
+                return Err(ReaderError::Inconsistent {
+                    reason: "deferred eviction target is not paused for the retained batch",
+                });
+            }
+        }
         Ok(())
     }
 
     /// Clears a batch-pause population already validated against unchanged state.
     pub(crate) fn finish_preflighted_batch_commit(&mut self, resume: bool) {
         debug_assert!(self.preflight_batch_commit().is_ok());
+        let deferred_eviction_target = self.deferred_eviction_target.take();
+        let order_prepared = std::mem::take(&mut self.batch_pause_order_prepared);
         for reader in self.readers.values_mut() {
             if reader.paused_for_batch {
                 reader.paused_for_batch = false;
                 if resume {
                     reader.schedule = ScheduleState::Ready;
-                    self.ready.push_back(reader.file_id);
+                    if order_prepared {
+                        continue;
+                    }
+                    if deferred_eviction_target == Some(reader.file_id) {
+                        self.ready.push_front(reader.file_id);
+                    } else {
+                        self.ready.push_back(reader.file_id);
+                    }
                 }
             }
         }
+        if order_prepared && !resume {
+            self.ready.clear();
+        }
+    }
+
+    /// Captures the current fair scheduler order before a receiver-wide batch
+    /// pause rewinds every logical reader.
+    pub(crate) fn prepare_batch_pause_order(&mut self) -> Result<(), ReaderError> {
+        if self.batch_pause_order_prepared {
+            return Err(ReaderError::Inconsistent {
+                reason: "batch pause order was already prepared",
+            });
+        }
+        if self
+            .readers
+            .values()
+            .any(|reader| matches!(reader.schedule, ScheduleState::InFlight { .. }))
+        {
+            return Err(ReaderError::Inconsistent {
+                reason: "batch pause order cannot include an in-flight source turn",
+            });
+        }
+
+        if let Some(file_id) = self.deferred_eviction_target {
+            self.ready.push_front(file_id);
+        }
+        self.ready
+            .extend(self.eof_deadlines.iter().map(|(_, file_id)| *file_id));
+        self.ready.extend(self.descriptor_blocked.iter().copied());
+        self.ready.extend(
+            self.readers
+                .values()
+                .filter(|reader| {
+                    matches!(reader.schedule, ScheduleState::Paused)
+                        && self.deferred_eviction_target != Some(reader.file_id)
+                })
+                .map(|reader| reader.file_id),
+        );
+        if self.ready.len() != self.readers.len() {
+            return Err(ReaderError::Inconsistent {
+                reason: "scheduler states do not form one complete batch resume order",
+            });
+        }
+        self.batch_pause_order_prepared = true;
+        Ok(())
     }
 
     /// Confirms that caller-owned uncommitted state for the selected victim
@@ -1897,8 +1995,8 @@ impl ReaderTable {
         Ok(())
     }
 
-    /// Defers one pending eviction and pauses its target, allowing a later
-    /// batch boundary or lifecycle decision to make the target ready again.
+    /// Defers one pending eviction and joins its target to the current
+    /// batch-pause population so only the matching batch outcome can resume it.
     pub(crate) fn defer_eviction(&mut self, request: EvictionRequest) -> Result<(), ReaderError> {
         if self.pending_eviction != Some(request) {
             return Err(ReaderError::InvalidTurn {
@@ -1906,8 +2004,28 @@ impl ReaderTable {
                 ticket: request.ticket,
             });
         }
+        if self
+            .readers
+            .get(&request.target_file_id)
+            .is_some_and(|reader| reader.paused_for_batch)
+            || self.deferred_eviction_target.is_some()
+        {
+            return Err(ReaderError::InvalidState {
+                file_id: request.target_file_id,
+                operation: "defer eviction",
+                state: "already paused for a batch",
+            });
+        }
         self.pending_eviction = None;
-        self.pause(request.target_file_id)
+        self.pause(request.target_file_id)?;
+        self.readers
+            .get_mut(&request.target_file_id)
+            .ok_or(ReaderError::Inconsistent {
+                reason: "deferred eviction target disappeared",
+            })?
+            .paused_for_batch = true;
+        self.deferred_eviction_target = Some(request.target_file_id);
+        Ok(())
     }
 
     /// Releases a removed logical reader only after later rotation policy has

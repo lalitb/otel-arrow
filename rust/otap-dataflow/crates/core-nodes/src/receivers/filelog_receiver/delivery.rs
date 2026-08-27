@@ -488,4 +488,189 @@ mod tests {
             }
         );
     }
+
+    #[derive(Clone, Copy)]
+    enum TraceCompletion {
+        Ack,
+        RetryableNack,
+        PermanentNack,
+        StaleAck,
+        StaleNack,
+        MalformedAck,
+        MalformedNack,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ModelPhase {
+        AwaitingCompletion,
+        AwaitingCommit,
+        Terminal,
+    }
+
+    fn expected_trace_decision(
+        event: TraceCompletion,
+        phase: ModelPhase,
+        current: BatchKey,
+        policy: OnNack,
+    ) -> DeliveryDecision {
+        match event {
+            TraceCompletion::StaleAck | TraceCompletion::StaleNack => {
+                DeliveryDecision::Ignored(CompletionIgnore::Stale)
+            }
+            TraceCompletion::MalformedAck | TraceCompletion::MalformedNack => {
+                DeliveryDecision::Ignored(CompletionIgnore::Malformed)
+            }
+            TraceCompletion::Ack => match phase {
+                ModelPhase::AwaitingCompletion => DeliveryDecision::Commit {
+                    key: current,
+                    explicit_loss: false,
+                    exhausted: false,
+                },
+                ModelPhase::AwaitingCommit | ModelPhase::Terminal => {
+                    DeliveryDecision::Ignored(CompletionIgnore::Duplicate)
+                }
+            },
+            TraceCompletion::RetryableNack => match phase {
+                ModelPhase::AwaitingCompletion if current.attempt < 3 => DeliveryDecision::Retry {
+                    current,
+                    next_attempt: current.attempt + 1,
+                    backoff: if current.attempt == 1 {
+                        Duration::from_millis(10)
+                    } else {
+                        Duration::from_millis(20)
+                    },
+                },
+                ModelPhase::AwaitingCompletion => match policy {
+                    OnNack::Fail => DeliveryDecision::Fail {
+                        key: current,
+                        exhausted: true,
+                    },
+                    OnNack::DropAndContinue => DeliveryDecision::Commit {
+                        key: current,
+                        explicit_loss: true,
+                        exhausted: true,
+                    },
+                },
+                ModelPhase::AwaitingCommit | ModelPhase::Terminal => {
+                    DeliveryDecision::Ignored(CompletionIgnore::Duplicate)
+                }
+            },
+            TraceCompletion::PermanentNack => match phase {
+                ModelPhase::AwaitingCompletion => match policy {
+                    OnNack::Fail => DeliveryDecision::Fail {
+                        key: current,
+                        exhausted: false,
+                    },
+                    OnNack::DropAndContinue => DeliveryDecision::Commit {
+                        key: current,
+                        explicit_loss: true,
+                        exhausted: false,
+                    },
+                },
+                ModelPhase::AwaitingCommit | ModelPhase::Terminal => {
+                    DeliveryDecision::Ignored(CompletionIgnore::Duplicate)
+                }
+            },
+        }
+    }
+
+    fn exercise_completion_trace(
+        encoded_trace: usize,
+        trace_len: usize,
+        policy: OnNack,
+        events: &[TraceCompletion],
+    ) {
+        let retry = RetryConfig {
+            max_attempts: 3,
+            initial_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(25),
+        };
+        let mut pending = PendingBatch::after_send(key(77, 1));
+        let mut phase = ModelPhase::AwaitingCompletion;
+        let mut attempt = 1;
+        let mut remaining = encoded_trace;
+
+        for step in 0..trace_len {
+            let event = events[remaining % events.len()];
+            remaining /= events.len();
+            let current = key(77, attempt);
+            let expected = expected_trace_decision(event, phase, current, policy);
+            let actual = match event {
+                TraceCompletion::Ack => pending.on_ack(&call_data(current)),
+                TraceCompletion::RetryableNack => pending.on_nack(
+                    &call_data(current),
+                    false,
+                    NackCause::RouteFull,
+                    &retry,
+                    policy,
+                ),
+                TraceCompletion::PermanentNack => pending.on_nack(
+                    &call_data(current),
+                    true,
+                    NackCause::RouteFull,
+                    &retry,
+                    policy,
+                ),
+                TraceCompletion::StaleAck => pending.on_ack(&call_data(key(76, attempt))),
+                TraceCompletion::StaleNack => pending.on_nack(
+                    &call_data(key(76, attempt)),
+                    false,
+                    NackCause::RouteFull,
+                    &retry,
+                    policy,
+                ),
+                TraceCompletion::MalformedAck => pending.on_ack(&CallData::new()),
+                TraceCompletion::MalformedNack => pending.on_nack(
+                    &CallData::new(),
+                    false,
+                    NackCause::RouteFull,
+                    &retry,
+                    policy,
+                ),
+            };
+            assert_eq!(
+                actual, expected,
+                "trace={encoded_trace}, len={trace_len}, step={step}, policy={policy:?}"
+            );
+
+            match actual {
+                DeliveryDecision::Retry { next_attempt, .. } => {
+                    let next = key(77, next_attempt);
+                    assert_eq!(pending.retry_elapsed(), Some(next));
+                    assert!(pending.begin_send(next));
+                    assert!(pending.send_succeeded(next));
+                    attempt = next_attempt;
+                    phase = ModelPhase::AwaitingCompletion;
+                }
+                DeliveryDecision::Commit { .. } => phase = ModelPhase::AwaitingCommit,
+                DeliveryDecision::Fail { .. } => phase = ModelPhase::Terminal,
+                DeliveryDecision::Ignored(_) => {}
+            }
+        }
+    }
+
+    /// Scenario: every completion trace of length zero through five is
+    /// enumerated across Ack, retryable/permanent Nack, stale, and malformed
+    /// inputs under both terminal policies.
+    /// Guarantees: only the model's exact current completion can commit,
+    /// retry, or fail; retries remain bounded and all other events are inert.
+    #[test]
+    fn bounded_completion_traces_match_delivery_model() {
+        let events = [
+            TraceCompletion::Ack,
+            TraceCompletion::RetryableNack,
+            TraceCompletion::PermanentNack,
+            TraceCompletion::StaleAck,
+            TraceCompletion::StaleNack,
+            TraceCompletion::MalformedAck,
+            TraceCompletion::MalformedNack,
+        ];
+        for policy in [OnNack::Fail, OnNack::DropAndContinue] {
+            for trace_len in 0..=5 {
+                for encoded_trace in 0..events.len().pow(trace_len as u32) {
+                    exercise_completion_trace(encoded_trace, trace_len, policy, &events);
+                }
+            }
+        }
+    }
 }

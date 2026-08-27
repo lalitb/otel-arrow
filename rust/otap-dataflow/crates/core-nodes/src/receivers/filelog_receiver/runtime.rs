@@ -44,6 +44,8 @@ const WORKER_JOIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 pub(super) struct FilelogReceiver {
     config: RuntimeConfig,
     pub(super) metrics: Option<MetricSet<FilelogReceiverMetrics>>,
+    #[cfg(test)]
+    blocked_send_started: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl FilelogReceiver {
@@ -51,6 +53,8 @@ impl FilelogReceiver {
         Self {
             config,
             metrics: None,
+            #[cfg(test)]
+            blocked_send_started: None,
         }
     }
 }
@@ -144,6 +148,8 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
         let FilelogReceiver {
             config,
             mut metrics,
+            #[cfg(test)]
+            mut blocked_send_started,
         } = *self;
         if let Some(metrics) = metrics.as_mut() {
             add_counter_saturating(&mut metrics.starts, 1);
@@ -439,6 +445,8 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                                 &mut metrics,
                                 &worker_telemetry,
                                 &mut health_events,
+                                #[cfg(test)]
+                                &mut blocked_send_started,
                             ).await? {
                                 SendOutcome::Sent => {
                                     if resend {
@@ -815,6 +823,7 @@ async fn send_batch(
     metrics: &mut Option<MetricSet<FilelogReceiverMetrics>>,
     worker_telemetry: &WorkerTelemetryBridge,
     health_events: &mut HealthEventLimiter,
+    #[cfg(test)] blocked_send_started: &mut Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<SendOutcome, Error> {
     let WorkerBatch {
         batch_id: _,
@@ -849,6 +858,10 @@ async fn send_batch(
             Ok(SendOutcome::Sent)
         }
         Err(TypedError::ChannelSendError(SendError::Full(pdata))) => {
+            #[cfg(test)]
+            if let Some(started) = blocked_send_started.take() {
+                let _ = started.send(());
+            }
             let backpressure_started = StdInstant::now();
             if let Some(suppressed) =
                 admit_health_event(health_events, metrics, HealthEventCategory::Backpressure)
@@ -1713,6 +1726,14 @@ mod tests {
     }
 
     fn source_runtime(source: &std::path::Path, namespace_dir: &std::path::Path) -> RuntimeConfig {
+        source_runtime_with(source, namespace_dir, |_| {})
+    }
+
+    fn source_runtime_with(
+        source: &std::path::Path,
+        namespace_dir: &std::path::Path,
+        configure: impl FnOnce(&mut Config),
+    ) -> RuntimeConfig {
         let mut config: Config = serde_json::from_value(json!({
             "include": [source.to_str().unwrap()],
             "checkpoint": { "id": "runtime-source-test" }
@@ -1726,6 +1747,7 @@ mod tests {
         config.limits.max_read_bytes_per_turn = 64;
         config.batch.max_records = 1;
         config.drain_timeout = Duration::from_secs(10);
+        configure(&mut config);
         let mut runtime = RuntimeConfig::from_config(config, "").unwrap();
         runtime.checkpoint_namespace_dir = namespace_dir.to_path_buf();
         runtime
@@ -1770,6 +1792,7 @@ mod tests {
         let mut metrics = None;
         let worker_telemetry = WorkerTelemetryBridge::default();
         let mut health_events = HealthEventLimiter::default();
+        let mut blocked_send_started = None;
 
         let outcome = send_batch(
             worker_batch(),
@@ -1784,6 +1807,7 @@ mod tests {
             &mut metrics,
             &worker_telemetry,
             &mut health_events,
+            &mut blocked_send_started,
         )
         .await
         .unwrap();
@@ -1837,6 +1861,7 @@ mod tests {
         let mut metrics = None;
         let worker_telemetry = WorkerTelemetryBridge::default();
         let mut health_events = HealthEventLimiter::default();
+        let mut blocked_send_started = None;
 
         let outcome = send_batch(
             worker_batch(),
@@ -1851,6 +1876,7 @@ mod tests {
             &mut metrics,
             &worker_telemetry,
             &mut health_events,
+            &mut blocked_send_started,
         )
         .await
         .unwrap();
@@ -1860,6 +1886,222 @@ mod tests {
             Err(std::sync::mpsc::TryRecvError::Empty)
         ));
         assert!(pending_batch.is_none());
+    }
+
+    #[derive(Clone, Copy)]
+    enum FullOutputControl {
+        Drain,
+        Shutdown,
+    }
+
+    fn assert_full_output_interrupts_complete_receiver(control: FullOutputControl) {
+        let (tokio_runtime, local_tasks) = setup_test_runtime();
+        tokio_runtime.block_on(local_tasks.run_until(async {
+            let directory = tempdir().unwrap();
+            let source = directory.path().join("blocked.log");
+            std::fs::write(&source, b"line\n").unwrap();
+            let runtime = source_runtime(&source, &directory.path().join("checkpoint"));
+            let reopened_runtime = runtime.clone();
+
+            let (control_tx, control_rx) = mpsc::Channel::new(8);
+            let control_rx =
+                local::ControlChannel::new(EngineReceiver::Local(LocalReceiver::mpsc(control_rx)));
+            let (output_tx, output_rx) = mpsc::Channel::new(1);
+            output_tx.send(dummy_pdata()).unwrap();
+            let mut outputs = HashMap::new();
+            let _ = outputs.insert(
+                Cow::Borrowed("out"),
+                EngineSender::Local(LocalSender::mpsc(output_tx)),
+            );
+            let (runtime_tx, mut runtime_rx) = runtime_ctrl_msg_channel(4);
+            let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
+            let effect_handler = local::EffectHandler::new(
+                test_node("filelog"),
+                outputs,
+                Some(Cow::Borrowed("out")),
+                runtime_tx,
+                metrics_reporter,
+            );
+            let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+            let receiver = tokio::task::spawn_local(async move {
+                let mut filelog = FilelogReceiver::new(runtime);
+                filelog.metrics = registered_metrics();
+                filelog.blocked_send_started = Some(blocked_tx);
+                Box::new(filelog).start(control_rx, effect_handler).await
+            });
+
+            tokio::time::timeout(Duration::from_secs(5), blocked_rx)
+                .await
+                .expect("receiver reaches the full downstream channel")
+                .expect("blocked-send observation remains live");
+            let deadline = StdInstant::now() + Duration::from_millis(100);
+            match control {
+                FullOutputControl::Drain => {
+                    control_tx
+                        .send_async(NodeControlMsg::DrainIngress {
+                            deadline,
+                            reason: "test blocked drain".to_owned(),
+                        })
+                        .await
+                        .unwrap();
+                }
+                FullOutputControl::Shutdown => {
+                    control_tx
+                        .send_async(NodeControlMsg::Shutdown {
+                            deadline,
+                            reason: "test blocked shutdown".to_owned(),
+                        })
+                        .await
+                        .unwrap();
+                }
+            }
+
+            let terminal = tokio::time::timeout(Duration::from_secs(5), receiver)
+                .await
+                .expect("blocked receiver obeys lifecycle control")
+                .unwrap()
+                .unwrap();
+            assert_eq!(terminal.deadline(), deadline);
+            assert_eq!(terminal.metrics().len(), 1);
+            assert_eq!(
+                terminal_metric_value(&terminal.metrics()[0], "source.bytes.read"),
+                otap_df_telemetry::metrics::MetricValue::U64(5)
+            );
+            assert_eq!(
+                terminal_metric_value(&terminal.metrics()[0], "batches.emitted"),
+                otap_df_telemetry::metrics::MetricValue::U64(0)
+            );
+            match control {
+                FullOutputControl::Drain => {
+                    assert_eq!(
+                        terminal_metric_value(&terminal.metrics()[0], "lifecycle.drains"),
+                        otap_df_telemetry::metrics::MetricValue::U64(1)
+                    );
+                    assert!(matches!(
+                        runtime_rx.recv().await.unwrap(),
+                        RuntimeControlMsg::ReceiverDrained { .. }
+                    ));
+                }
+                FullOutputControl::Shutdown => {
+                    assert_eq!(
+                        terminal_metric_value(&terminal.metrics()[0], "lifecycle.shutdowns"),
+                        otap_df_telemetry::metrics::MetricValue::U64(1)
+                    );
+                    assert!(runtime_rx.recv().await.is_err());
+                }
+            }
+            let _occupying_batch = output_rx.recv().await.unwrap();
+            assert!(output_rx.try_recv().is_err());
+            let store = CheckpointStore::open(StoreOptions::from_runtime_config(&reopened_runtime))
+                .unwrap();
+            assert_eq!(store.table().len(), 1);
+            assert_eq!(store.table().iter().next().unwrap().1.committed_offset, 0);
+        }));
+    }
+
+    /// Scenario: the complete receiver has produced a real filelog batch but
+    /// its capacity-one downstream channel is already full when Drain arrives.
+    /// Guarantees: Drain interrupts the blocked send by its deadline, reports
+    /// drained, emits no filelog batch, and preserves the un-Acked checkpoint.
+    #[test]
+    fn drain_interrupts_complete_receiver_with_full_output() {
+        assert_full_output_interrupts_complete_receiver(FullOutputControl::Drain);
+    }
+
+    /// Scenario: the complete receiver has produced a real filelog batch but
+    /// its capacity-one downstream channel is already full when Shutdown arrives.
+    /// Guarantees: Shutdown interrupts the blocked send by its deadline without
+    /// a drained notification, emits no filelog batch, and preserves checkpoint.
+    #[test]
+    fn shutdown_interrupts_complete_receiver_with_full_output() {
+        assert_full_output_interrupts_complete_receiver(FullOutputControl::Shutdown);
+    }
+
+    /// Scenario: four active files are durably registered and one emitted
+    /// batch receives a permanent Nack under the default fail policy.
+    /// Guarantees: the complete receiver terminates, records the Nack, and
+    /// advances neither the refused file nor any unrelated active file.
+    #[test]
+    fn permanent_nack_with_multiple_active_files_preserves_all_checkpoints() {
+        let (tokio_runtime, local_tasks) = setup_test_runtime();
+        tokio_runtime.block_on(local_tasks.run_until(async {
+            let directory = tempdir().unwrap();
+            for name in ["a.log", "b.log", "c.log", "d.log"] {
+                std::fs::write(directory.path().join(name), format!("{name}\n")).unwrap();
+            }
+            let pattern = directory.path().join("*.log");
+            let runtime =
+                source_runtime_with(&pattern, &directory.path().join("checkpoint"), |config| {
+                    config.limits.max_tracked_files = 4;
+                    config.limits.max_pending_candidates = 4;
+                    config.limits.max_open_files = 4;
+                });
+            let reopened_runtime = runtime.clone();
+
+            let (control_tx, control_rx) = mpsc::Channel::new(8);
+            let control_rx =
+                local::ControlChannel::new(EngineReceiver::Local(LocalReceiver::mpsc(control_rx)));
+            let (output_tx, output_rx) = mpsc::Channel::new(1);
+            let mut outputs = HashMap::new();
+            let _ = outputs.insert(
+                Cow::Borrowed("out"),
+                EngineSender::Local(LocalSender::mpsc(output_tx)),
+            );
+            let (runtime_tx, _runtime_rx) = runtime_ctrl_msg_channel(4);
+            let (metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(2);
+            let effect_handler = local::EffectHandler::new(
+                test_node("filelog"),
+                outputs,
+                Some(Cow::Borrowed("out")),
+                runtime_tx,
+                metrics_reporter,
+            );
+            let receiver = tokio::task::spawn_local(async move {
+                let mut filelog = FilelogReceiver::new(runtime);
+                filelog.metrics = registered_metrics();
+                Box::new(filelog).start(control_rx, effect_handler).await
+            });
+
+            let forwarded = tokio::time::timeout(Duration::from_secs(5), output_rx.recv())
+                .await
+                .expect("one filelog batch is emitted")
+                .unwrap();
+            let (_, nack) = next_nack(NackMsg::new_permanent(
+                "permanent downstream refusal",
+                forwarded,
+            ))
+            .expect("filelog subscribed to Nack");
+            control_tx
+                .send_async(NodeControlMsg::Nack(nack))
+                .await
+                .unwrap();
+
+            let result = tokio::time::timeout(Duration::from_secs(5), receiver)
+                .await
+                .expect("permanent Nack terminates the receiver")
+                .unwrap();
+            let error = match result {
+                Ok(_) => panic!("on_nack=fail must return a terminal error"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("terminal Nack"));
+            let snapshot = metrics_rx.recv_async().await.unwrap();
+            assert_eq!(
+                terminal_metric_value(&snapshot, "batches.nacked"),
+                otap_df_telemetry::metrics::MetricValue::U64(1)
+            );
+            assert_eq!(
+                terminal_metric_value(&snapshot, "lifecycle.failures"),
+                otap_df_telemetry::metrics::MetricValue::U64(1)
+            );
+
+            let store = CheckpointStore::open(StoreOptions::from_runtime_config(&reopened_runtime))
+                .unwrap();
+            assert_eq!(store.table().len(), 4);
+            for checkpoint in store.table().iter().map(|(_, checkpoint)| checkpoint) {
+                assert_eq!(checkpoint.committed_offset, 0);
+            }
+        }));
     }
 
     /// Scenario: DrainIngress reaches the complete local receiver after one

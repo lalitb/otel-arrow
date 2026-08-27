@@ -1,11 +1,13 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::mpsc::sync_channel;
 use std::time::Duration;
 use std::{fs::OpenOptions, io::Write};
 
+use otap_df_engine::testing::setup_test_runtime;
 use otap_df_pdata::{
     otap::OtapArrowRecords,
     otlp::{ProtoBuffer, ProtoBytesEncoder, logs::LogsProtoBytesEncoder},
@@ -31,7 +33,7 @@ use crate::receivers::filelog_receiver::checkpoint::store::fault::FaultPoint;
 use crate::receivers::filelog_receiver::checkpoint::wal::{RegisterFile, UpdateProgress};
 use crate::receivers::filelog_receiver::config::{
     ATTR_KEY_FLUSH_REASON, ATTR_KEY_FRAGMENT_ID, ATTR_KEY_FRAGMENT_INDEX, ATTR_KEY_FRAGMENT_LAST,
-    Config, OnDecodeError,
+    ATTR_KEY_LOG_FILE_NAME, Config, OnDecodeError,
 };
 use crate::receivers::filelog_receiver::discovery::DiscoveredCandidate;
 use crate::receivers::filelog_receiver::discovery::scanner::DiscoveryPlan;
@@ -293,12 +295,38 @@ async fn wait_for_worker_counter(
     .expect("worker telemetry counter timeout");
 }
 
+async fn wait_for_worker_counter_at_least(
+    telemetry: &WorkerTelemetryBridge,
+    counter: WorkerCounter,
+    minimum: u64,
+) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if telemetry.counter_for_test(counter) >= minimum {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("worker telemetry counter minimum timeout");
+}
+
 async fn wait_for_worker_gauge(
     telemetry: &WorkerTelemetryBridge,
     gauge: WorkerGauge,
     expected: u64,
 ) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    wait_for_worker_gauge_with_timeout(telemetry, gauge, expected, Duration::from_secs(5)).await;
+}
+
+async fn wait_for_worker_gauge_with_timeout(
+    telemetry: &WorkerTelemetryBridge,
+    gauge: WorkerGauge,
+    expected: u64,
+    timeout: Duration,
+) {
+    tokio::time::timeout(timeout, async {
         loop {
             if telemetry.gauge_for_test(gauge) == expected {
                 break;
@@ -1792,6 +1820,475 @@ async fn move_create_reads_replacement_and_late_write_before_finalization() {
             (LifecycleState::RotatedFinalized, 9),
         ]
     );
+}
+
+#[cfg(unix)]
+/// Scenario: a matched file is unlinked while both the worker and a writer
+/// retain open descriptors, then the writer appends one complete late record.
+/// Guarantees: the worker reads and Ack-commits the unlinked inode through its
+/// descriptor before finalizing that identity at the stable rotation frontier.
+#[tokio::test]
+async fn unlink_reads_acked_late_write_before_finalization() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("unlinked.log");
+    std::fs::write(&source, b"old\n").unwrap();
+    let mut late_writer = OpenOptions::new().append(true).open(&source).unwrap();
+    let namespace = directory.path().join("checkpoint");
+    let mut runtime = runtime_config(source.to_str().unwrap(), &namespace, 1);
+    runtime.rotation.rotate_wait = Duration::from_millis(100);
+    let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+    let worker = spawn_worker(runtime.clone(), event_tx).unwrap();
+    let telemetry = Arc::clone(&worker.telemetry);
+
+    let initial = receive_batch(&mut events).await;
+    worker
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: initial.batch_id,
+            attempt: initial.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    receive_commit(&mut events).await.3.unwrap();
+
+    std::fs::remove_file(&source).unwrap();
+    wait_for_worker_gauge(&telemetry, WorkerGauge::FilesRemovedWaiting, 1).await;
+    late_writer.write_all(b"late\n").unwrap();
+    late_writer.flush().unwrap();
+    let late = receive_batch(&mut events).await;
+    worker
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: late.batch_id,
+            attempt: late.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    receive_commit(&mut events).await.3.unwrap();
+    drop(late_writer);
+
+    wait_for_worker_gauge(&telemetry, WorkerGauge::FilesRemovedWaiting, 0).await;
+    stop_worker(worker, &mut events).await.unwrap();
+
+    let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
+    assert_eq!(store.table().len(), 1);
+    let record = store.table().iter().next().unwrap().1;
+    assert_eq!(record.committed_offset, 9);
+    assert_eq!(record.lifecycle_state, LifecycleState::RotatedFinalized);
+}
+
+#[cfg(windows)]
+/// Scenario: a Windows writer and the worker both permit read, write, and
+/// delete sharing before the matched name is removed and a late write occurs.
+/// Guarantees: name removal or delete-pending state does not revoke the live
+/// reader; the late record is Acked before the identity finalizes at offset 9.
+#[tokio::test]
+async fn windows_compatible_delete_pending_reads_late_write_before_finalization() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("delete-pending.log");
+    std::fs::write(&source, b"old\n").unwrap();
+    let mut late_writer = OpenOptions::new()
+        .append(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(&source)
+        .unwrap();
+    let namespace = directory.path().join("checkpoint");
+    let mut runtime = runtime_config(source.to_str().unwrap(), &namespace, 1);
+    runtime.rotation.rotate_wait = Duration::from_millis(100);
+    let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+    let worker = spawn_worker(runtime.clone(), event_tx).unwrap();
+    let telemetry = Arc::clone(&worker.telemetry);
+
+    let initial = receive_batch(&mut events).await;
+    worker
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: initial.batch_id,
+            attempt: initial.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    receive_commit(&mut events).await.3.unwrap();
+
+    std::fs::remove_file(&source).unwrap();
+    wait_for_worker_gauge(&telemetry, WorkerGauge::FilesRemovedWaiting, 1).await;
+    late_writer.write_all(b"late\n").unwrap();
+    late_writer.flush().unwrap();
+    let late = receive_batch(&mut events).await;
+    worker
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: late.batch_id,
+            attempt: late.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    receive_commit(&mut events).await.3.unwrap();
+    drop(late_writer);
+
+    wait_for_worker_gauge(&telemetry, WorkerGauge::FilesRemovedWaiting, 0).await;
+    stop_worker(worker, &mut events).await.unwrap();
+
+    let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
+    assert_eq!(store.table().len(), 1);
+    let record = store.table().iter().next().unwrap().1;
+    assert_eq!(record.committed_offset, 9);
+    assert_eq!(record.lifecycle_state, LifecycleState::RotatedFinalized);
+}
+
+#[cfg(windows)]
+/// Scenario: an existing Windows writer denies every sharing mode while the
+/// worker repeatedly discovers a matched file, then releases its handle.
+/// Guarantees: sharing violations are counted without reading or registering
+/// the file, and normal admission resumes without checkpoint loss after release.
+#[tokio::test]
+async fn windows_incompatible_sharing_defers_worker_admission_until_release() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("exclusive.log");
+    std::fs::write(&source, b"line\n").unwrap();
+    let exclusive = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(0)
+        .open(&source)
+        .unwrap();
+    let namespace = directory.path().join("checkpoint");
+    let runtime = runtime_config(source.to_str().unwrap(), &namespace, 1);
+    let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+    let worker = spawn_worker(runtime.clone(), event_tx).unwrap();
+
+    wait_for_worker_counter_at_least(&worker.telemetry, WorkerCounter::DiscoveryScanErrors, 1)
+        .await;
+    assert_eq!(
+        worker
+            .telemetry
+            .counter_for_test(WorkerCounter::SourceBytesRead),
+        0
+    );
+    assert_eq!(
+        worker.telemetry.gauge_for_test(WorkerGauge::FilesTracked),
+        0
+    );
+
+    drop(exclusive);
+    let admitted = receive_batch(&mut events).await;
+    worker
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: admitted.batch_id,
+            attempt: admitted.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    receive_commit(&mut events).await.3.unwrap();
+    stop_worker(worker, &mut events).await.unwrap();
+
+    let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
+    assert_eq!(store.table().len(), 1);
+    assert_eq!(store.table().iter().next().unwrap().1.committed_offset, 5);
+}
+
+/// Scenario: one continuously readable file competes with at least two
+/// thousand one-record files while descriptor residency is capped at 32.
+/// Guarantees: every cold file reaches an Acked batch within a bounded number
+/// of hot records, and tracked, pending, and open populations respect limits.
+#[test]
+#[ignore = "resource-intensive thousands-file fairness stress"]
+fn thousands_of_files_preserve_fair_progress_and_resource_bounds() {
+    const FILES_ENV: &str = "OTAP_FILELOG_FAIRNESS_STRESS_FILES";
+    let cold_files = std::env::var(FILES_ENV)
+        .map(|value| value.parse::<usize>().expect("stress file count is valid"))
+        .unwrap_or(2_000);
+    assert!(cold_files > 0);
+    let total_files = cold_files.checked_add(1).expect("file count fits usize");
+    let total_files_u32 = u32::try_from(total_files).expect("file count fits u32");
+    let max_open_files = 32u32.min(total_files_u32);
+
+    let (tokio_runtime, local_tasks) = setup_test_runtime();
+    tokio_runtime.block_on(local_tasks.run_until(async {
+        let directory = tempdir().unwrap();
+        let hot_name = "0000-hot.log";
+        let hot_path = directory.path().join(hot_name);
+        std::fs::write(&hot_path, b"").unwrap();
+        for index in 0..cold_files {
+            std::fs::write(directory.path().join(format!("cold-{index:05}.log")), b"").unwrap();
+        }
+
+        let pattern = directory.path().join("*.log");
+        let namespace = directory.path().join("checkpoint");
+        let runtime = runtime_config_with(pattern.to_str().unwrap(), &namespace, 16, |config| {
+            config.limits.max_tracked_files = total_files_u32;
+            config.limits.max_pending_candidates = total_files_u32;
+            config.limits.max_open_files = max_open_files;
+            config.limits.max_read_bytes_per_turn = 5;
+            config.batch.max_flush_period = Duration::from_millis(20);
+        });
+        let (event_tx, mut events) =         tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+        let worker = spawn_worker(runtime.clone(), event_tx).unwrap();
+        let registration_started = Instant::now();
+        wait_for_worker_gauge_with_timeout(
+        &worker.telemetry,
+        WorkerGauge::FilesTracked,
+        u64::from(total_files_u32),
+        Duration::from_secs(60),
+        )
+        .await;
+        let registration_elapsed = registration_started.elapsed();
+
+        std::fs::write(
+        &hot_path,
+        "hot0\n".repeat(cold_files.checked_add(256).unwrap()),
+        )
+        .unwrap();
+        for index in 0..cold_files {
+        std::fs::write(
+            directory.path().join(format!("cold-{index:05}.log")),
+            b"cold\n",
+        )
+        .unwrap();
+        }
+
+        let started = Instant::now();
+        let mut cold_seen = HashSet::with_capacity(cold_files);
+        let mut hot_before_all_cold = 0usize;
+        let mut records_before_all_cold = 0usize;
+        let maximum_records = cold_files
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(128))
+            .expect("stress record bound fits");
+        while cold_seen.len() < cold_files {
+            let mut batch = receive_batch(&mut events).await;
+            let request = decode_worker_records(&mut batch.records);
+            for log in request
+                .resource_logs
+                .iter()
+                .flat_map(|resource| &resource.scope_logs)
+                .flat_map(|scope| &scope.log_records)
+            {
+                if cold_seen.len() == cold_files {
+                    break;
+                }
+                let name = match log_attr(log, ATTR_KEY_LOG_FILE_NAME) {
+                    Some(Value::StringValue(value)) => value,
+                    other => panic!("expected UTF-8 file name, got {other:?}"),
+                };
+                records_before_all_cold = records_before_all_cold
+                    .checked_add(1)
+                    .expect("stress record count fits");
+                if name == hot_name {
+                    hot_before_all_cold = hot_before_all_cold
+                        .checked_add(1)
+                        .expect("hot record count fits");
+                } else {
+                    let inserted = cold_seen.insert(name.clone());
+                    assert!(inserted, "cold file emitted more than one source record");
+                }
+                assert!(
+                    records_before_all_cold <= maximum_records,
+                    "hot input starved cold-file progress: cold_seen={}, hot={hot_before_all_cold}, \
+                     records={records_before_all_cold}, maximum={maximum_records}",
+                    cold_seen.len()
+                );
+                if records_before_all_cold.is_multiple_of(500) {
+                    eprintln!(
+                        "filelog fairness progress: cold_seen={} \
+                         records={records_before_all_cold} hot={hot_before_all_cold}",
+                        cold_seen.len()
+                    );
+                }
+            }
+            worker
+                .command_tx
+                .send(WorkerCommand::Commit {
+                    batch_id: batch.batch_id,
+                    attempt: batch.attempt,
+                    explicit_loss: false,
+                })
+                .unwrap();
+            receive_commit(&mut events).await.3.unwrap();
+        }
+
+        assert!(hot_before_all_cold <= cold_files);
+        assert_eq!(
+            worker.telemetry.gauge_for_test(WorkerGauge::FilesTracked),
+            u64::from(total_files_u32)
+        );
+        assert!(
+            worker.telemetry.gauge_for_test(WorkerGauge::FilesPending)
+                <= u64::from(total_files_u32)
+        );
+        assert!(
+            worker.telemetry.gauge_for_test(WorkerGauge::FilesOpen) <= u64::from(max_open_files)
+        );
+        eprintln!(
+            "filelog fairness stress: cold_files={cold_files} \
+             records_before_all_cold={records_before_all_cold} \
+             hot_before_all_cold={hot_before_all_cold} \
+             max_open_files={max_open_files} registration_micros={} elapsed_micros={}",
+            registration_elapsed.as_micros(),
+            started.elapsed().as_micros()
+        );
+        stop_worker(worker, &mut events).await.unwrap();
+
+        let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
+        assert_eq!(store.table().len(), total_files);
+        assert!(
+            store
+                .table()
+                .iter()
+                .all(|(_, checkpoint)| checkpoint.committed_offset > 0)
+        );
+    }));
+}
+
+#[cfg(unix)]
+/// Scenario: a bounded population is registered and Acked, every matched file
+/// is move/create rotated at once, and checkpoint compaction is due after each
+/// transaction.
+/// Guarantees: the storm preserves all old and replacement identities,
+/// finalizes every old descriptor, and repeatedly compacts without data loss.
+#[test]
+#[ignore = "resource-intensive registration, rotation, and compaction storm"]
+fn registration_rotation_and_compaction_storm_preserves_every_identity() {
+    const FILES_ENV: &str = "OTAP_FILELOG_STORM_FILES";
+    let files = std::env::var(FILES_ENV)
+        .map(|value| value.parse::<usize>().expect("storm file count is valid"))
+        .unwrap_or(128);
+    assert!(files > 0);
+    let tracked = files.checked_mul(2).expect("tracked population fits");
+    let files_u32 = u32::try_from(files).expect("storm file count fits u32");
+    let tracked_u32 = u32::try_from(tracked).expect("tracked population fits u32");
+
+    let (tokio_runtime, local_tasks) = setup_test_runtime();
+    tokio_runtime.block_on(local_tasks.run_until(async {
+        let directory = tempdir().unwrap();
+        for index in 0..files {
+            std::fs::write(
+                directory.path().join(format!("storm-{index:05}.log")),
+                format!("old-{index:05}\n"),
+            )
+            .unwrap();
+        }
+        let pattern = directory.path().join("storm-*.log");
+        let namespace = directory.path().join("checkpoint");
+        let runtime = runtime_config_with(pattern.to_str().unwrap(), &namespace, 64, |config| {
+            config.limits.max_tracked_files = tracked_u32;
+            config.limits.max_pending_candidates = tracked_u32;
+            config.limits.max_open_files = files_u32;
+            config.batch.max_flush_period = Duration::from_millis(20);
+            config.rotation.rotate_wait = Duration::from_millis(20);
+            config.checkpoint.compact_after_transactions = 1;
+        });
+        let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+        let worker = spawn_worker(runtime.clone(), event_tx).unwrap();
+
+        let started = Instant::now();
+        let mut initial_records = 0usize;
+        while initial_records < files {
+            let batch = receive_batch(&mut events).await;
+            initial_records = initial_records
+                .checked_add(usize::try_from(batch.record_count).expect("record count fits usize"))
+                .expect("initial record count fits");
+            assert!(initial_records <= files);
+            worker
+                .command_tx
+                .send(WorkerCommand::Commit {
+                    batch_id: batch.batch_id,
+                    attempt: batch.attempt,
+                    explicit_loss: false,
+                })
+                .unwrap();
+            receive_commit(&mut events).await.3.unwrap();
+        }
+        wait_for_worker_counter_at_least(
+            &worker.telemetry,
+            WorkerCounter::CheckpointCompactions,
+            1,
+        )
+        .await;
+        let initial_compactions = worker
+            .telemetry
+            .counter_for_test(WorkerCounter::CheckpointCompactions);
+
+        for index in 0..files {
+            let source = directory.path().join(format!("storm-{index:05}.log"));
+            std::fs::rename(
+                &source,
+                directory.path().join(format!("storm-{index:05}.log.1")),
+            )
+            .unwrap();
+            std::fs::write(&source, format!("new-{index:05}\n")).unwrap();
+        }
+
+        let mut replacement_records = 0usize;
+        while replacement_records < files {
+            let batch = receive_batch(&mut events).await;
+            replacement_records = replacement_records
+                .checked_add(usize::try_from(batch.record_count).expect("record count fits usize"))
+                .expect("replacement record count fits");
+            assert!(replacement_records <= files);
+            worker
+                .command_tx
+                .send(WorkerCommand::Commit {
+                    batch_id: batch.batch_id,
+                    attempt: batch.attempt,
+                    explicit_loss: false,
+                })
+                .unwrap();
+            receive_commit(&mut events).await.3.unwrap();
+        }
+        wait_for_worker_counter_at_least(
+            &worker.telemetry,
+            WorkerCounter::RotationFinalizations,
+            u64::from(files_u32),
+        )
+        .await;
+        wait_for_worker_counter_at_least(
+            &worker.telemetry,
+            WorkerCounter::CheckpointCompactions,
+            initial_compactions
+                .checked_add(1)
+                .expect("compaction target fits u64"),
+        )
+        .await;
+        let compactions = worker
+            .telemetry
+            .counter_for_test(WorkerCounter::CheckpointCompactions);
+        eprintln!(
+            "filelog storm: files={files} tracked={tracked} \
+             compactions={compactions} elapsed_micros={}",
+            started.elapsed().as_micros()
+        );
+        stop_worker(worker, &mut events).await.unwrap();
+
+        let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
+        assert_eq!(store.table().len(), tracked);
+        let active = store
+            .table()
+            .iter()
+            .filter(|(_, record)| record.lifecycle_state == LifecycleState::Active)
+            .count();
+        let finalized = store
+            .table()
+            .iter()
+            .filter(|(_, record)| record.lifecycle_state == LifecycleState::RotatedFinalized)
+            .count();
+        assert_eq!(active, files);
+        assert_eq!(finalized, files);
+        assert!(
+            store
+                .table()
+                .iter()
+                .all(|(_, checkpoint)| checkpoint.committed_offset > 0)
+        );
+    }));
 }
 
 #[cfg(unix)]

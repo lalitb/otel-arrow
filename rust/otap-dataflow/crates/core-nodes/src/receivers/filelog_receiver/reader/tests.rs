@@ -109,6 +109,62 @@ fn round_robin_turns_bound_bytes_and_preserve_file_order() {
     table.shutdown().unwrap();
 }
 
+/// Scenario: sealing a receiver-wide batch rewinds three ready readers in an
+/// order different from their established round-robin queue.
+/// Guarantees: the Ack resume preserves the exact pre-seal queue order rather
+/// than rebuilding it from unordered reader-table iteration.
+#[test]
+fn batch_pause_preserves_exact_ready_queue_order() {
+    let directory = tempdir().unwrap();
+    let paths: Vec<_> = (1..=3)
+        .map(|seed| {
+            let path = directory.path().join(format!("{seed}.log"));
+            std::fs::write(&path, b"ab").unwrap();
+            path
+        })
+        .collect();
+    let mut table = ReaderTable::new(settings(3, 3, 1)).unwrap();
+    for seed in 1..=3 {
+        table
+            .insert(candidate(&paths[usize::from(seed - 1)]), resolved(seed, 0))
+            .unwrap();
+    }
+    let now = Instant::now();
+
+    for expected in [1, 2] {
+        let turn = data(table.poll(now).unwrap());
+        assert_eq!(turn.file_id(), file_id(expected));
+        table
+            .complete_turn(turn, 1, TurnDisposition::Ready)
+            .unwrap();
+    }
+    assert_eq!(
+        table.ready.iter().copied().collect::<Vec<_>>(),
+        [file_id(3), file_id(1), file_id(2)]
+    );
+
+    table.prepare_batch_pause_order().unwrap();
+    for seed in [2, 1, 3] {
+        table
+            .rewind_provisional_frontier(file_id(seed), 0, 0)
+            .unwrap();
+    }
+    assert_eq!(
+        table.ready.iter().copied().collect::<Vec<_>>(),
+        [file_id(3), file_id(1), file_id(2)]
+    );
+    table.finish_batch_commit(true).unwrap();
+
+    for expected in [3, 1, 2] {
+        let turn = data(table.poll(now).unwrap());
+        assert_eq!(turn.file_id(), file_id(expected));
+        table
+            .complete_turn(turn, 0, TurnDisposition::Ready)
+            .unwrap();
+    }
+    table.shutdown().unwrap();
+}
+
 /// Scenario: framing consumes only a prefix of a bounded source turn before
 /// reaching an external batch boundary.
 /// Guarantees: the scheduler advances by exactly that prefix and rereads the
@@ -1155,10 +1211,10 @@ fn read_turn_exposes_continuation_frontier_across_reopen() {
     table.shutdown().unwrap();
 }
 
-/// Scenario: a caller defers an LRS eviction until an external batch
-/// boundary, then retries the target.
-/// Guarantees: deferral pauses the target, stale confirmation is rejected,
-/// and the later request receives a fresh correlation ticket.
+/// Scenario: a caller defers an LRS eviction because a batch is open, then
+/// commits that batch and retries the descriptor-blocked target.
+/// Guarantees: deferral joins the target to the batch-pause population, the
+/// commit resumes it, and its fresh eviction request rejects the stale ticket.
 #[test]
 fn deferred_eviction_requires_fresh_request() {
     let directory = tempdir().unwrap();
@@ -1189,8 +1245,19 @@ fn deferred_eviction_requires_fresh_request() {
         table.confirm_eviction(original),
         Err(ReaderError::InvalidTurn { .. })
     ));
-    table.pause(file_id(30)).unwrap();
-    table.make_ready(file_id(31)).unwrap();
+    assert!(
+        table
+            .frontier(file_id(31))
+            .expect("target frontier exists")
+            .paused_for_batch
+    );
+    table.finish_batch_commit(true).unwrap();
+    assert!(
+        !table
+            .frontier(file_id(31))
+            .expect("resumed target frontier exists")
+            .paused_for_batch
+    );
     let replacement = eviction(table.poll(now).unwrap());
     assert_ne!(replacement, original);
     table.confirm_eviction(replacement).unwrap();
