@@ -455,6 +455,8 @@ impl WorkerGauge {
 pub(super) struct WorkerTelemetryBridge {
     counters: [AtomicU64; WorkerCounter::COUNT],
     gauges: [AtomicU64; WorkerGauge::COUNT],
+    #[cfg(test)]
+    peak_partial_bytes_pending: AtomicU64,
 }
 
 impl Default for WorkerTelemetryBridge {
@@ -462,6 +464,8 @@ impl Default for WorkerTelemetryBridge {
         Self {
             counters: [const { AtomicU64::new(0) }; WorkerCounter::COUNT],
             gauges: [const { AtomicU64::new(0) }; WorkerGauge::COUNT],
+            #[cfg(test)]
+            peak_partial_bytes_pending: AtomicU64::new(0),
         }
     }
 }
@@ -481,6 +485,12 @@ impl WorkerTelemetryBridge {
     /// Publishes one current gauge.
     pub(super) fn set(&self, gauge: WorkerGauge, value: u64) {
         self.gauges[gauge as usize].store(value, Ordering::Relaxed);
+        #[cfg(test)]
+        if matches!(gauge, WorkerGauge::PartialBytesPending) {
+            let _ = self
+                .peak_partial_bytes_pending
+                .fetch_max(value, Ordering::Relaxed);
+        }
     }
 
     /// Drains every counter exactly once and refreshes every current gauge.
@@ -613,6 +623,11 @@ impl WorkerTelemetryBridge {
     #[cfg(test)]
     pub(super) fn gauge_for_test(&self, gauge: WorkerGauge) -> u64 {
         self.gauges[gauge as usize].load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(super) fn peak_partial_bytes_pending_for_test(&self) -> u64 {
+        self.peak_partial_bytes_pending.load(Ordering::Acquire)
     }
 }
 

@@ -45,7 +45,9 @@ pub(super) struct FilelogReceiver {
     config: RuntimeConfig,
     pub(super) metrics: Option<MetricSet<FilelogReceiverMetrics>>,
     #[cfg(test)]
-    blocked_send_started: Option<tokio::sync::oneshot::Sender<()>>,
+    blocked_send_started: Option<tokio::sync::oneshot::Sender<StdInstant>>,
+    #[cfg(test)]
+    worker_telemetry_ready: Option<tokio::sync::oneshot::Sender<Arc<WorkerTelemetryBridge>>>,
 }
 
 impl FilelogReceiver {
@@ -55,6 +57,8 @@ impl FilelogReceiver {
             metrics: None,
             #[cfg(test)]
             blocked_send_started: None,
+            #[cfg(test)]
+            worker_telemetry_ready: None,
         }
     }
 }
@@ -150,6 +154,8 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
             mut metrics,
             #[cfg(test)]
             mut blocked_send_started,
+            #[cfg(test)]
+            mut worker_telemetry_ready,
         } = *self;
         if let Some(metrics) = metrics.as_mut() {
             add_counter_saturating(&mut metrics.starts, 1);
@@ -174,6 +180,10 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
             }
         };
         let worker_telemetry = Arc::clone(&worker_handle.telemetry);
+        #[cfg(test)]
+        if let Some(sender) = worker_telemetry_ready.take() {
+            let _ = sender.send(Arc::clone(&worker_telemetry));
+        }
         let mut worker = Some(worker_handle);
         let mut pending_batch = None;
         let mut retry_deadline = None;
@@ -823,7 +833,7 @@ async fn send_batch(
     metrics: &mut Option<MetricSet<FilelogReceiverMetrics>>,
     worker_telemetry: &WorkerTelemetryBridge,
     health_events: &mut HealthEventLimiter,
-    #[cfg(test)] blocked_send_started: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    #[cfg(test)] blocked_send_started: &mut Option<tokio::sync::oneshot::Sender<StdInstant>>,
 ) -> Result<SendOutcome, Error> {
     let WorkerBatch {
         batch_id: _,
@@ -858,11 +868,11 @@ async fn send_batch(
             Ok(SendOutcome::Sent)
         }
         Err(TypedError::ChannelSendError(SendError::Full(pdata))) => {
+            let backpressure_started = StdInstant::now();
             #[cfg(test)]
             if let Some(started) = blocked_send_started.take() {
-                let _ = started.send(());
+                let _ = started.send(backpressure_started);
             }
-            let backpressure_started = StdInstant::now();
             if let Some(suppressed) =
                 admit_health_event(health_events, metrics, HealthEventCategory::Backpressure)
             {
@@ -1371,11 +1381,12 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::receivers::filelog_receiver::StartAt;
+    use crate::receivers::filelog_receiver::checkpoint::primitives::ADVISORY_PATH_MAX_BYTES;
     use crate::receivers::filelog_receiver::checkpoint::store::{CheckpointStore, StoreOptions};
-    use crate::receivers::filelog_receiver::config::Config;
-    use crate::receivers::filelog_receiver::telemetry::WorkerCounter;
+    use crate::receivers::filelog_receiver::config::{Config, peak_framer_payload_bytes};
+    use crate::receivers::filelog_receiver::telemetry::{WorkerCounter, WorkerGauge};
     use crate::receivers::filelog_receiver::worker::WorkerError;
+    use crate::receivers::filelog_receiver::{OnDecodeError, StartAt};
 
     fn runtime_config() -> RuntimeConfig {
         let config: Config = serde_json::from_value(json!({
@@ -1422,6 +1433,10 @@ mod tests {
             .position(|field| field.name == name)
             .expect("terminal metric exists");
         snapshot.get_metrics()[index].clone()
+    }
+
+    fn peak_resident_set_bytes() -> Option<u64> {
+        memory_stats::memory_stats().and_then(|stats| u64::try_from(stats.physical_mem).ok())
     }
 
     /// Scenario: a worker thread remains gated beyond the active lifecycle
@@ -1930,7 +1945,7 @@ mod tests {
                 Box::new(filelog).start(control_rx, effect_handler).await
             });
 
-            tokio::time::timeout(Duration::from_secs(5), blocked_rx)
+            let _blocked_at = tokio::time::timeout(Duration::from_secs(5), blocked_rx)
                 .await
                 .expect("receiver reaches the full downstream channel")
                 .expect("blocked-send observation remains live");
@@ -2015,6 +2030,314 @@ mod tests {
     #[test]
     fn shutdown_interrupts_complete_receiver_with_full_output() {
         assert_full_output_interrupts_complete_receiver(FullOutputControl::Shutdown);
+    }
+
+    /// Scenario: a fresh subprocess drives a large complete receiver through
+    /// near-limit line-plus-multiline buffering and into a full downstream
+    /// channel, using 128 buffering files by default.
+    /// Guarantees: every file is tracked and open, the intended aggregate
+    /// framing peak is observed before batch sealing, and the run reports the
+    /// checked multiplied payload bounds, blocked-send latency, and peak RSS.
+    #[test]
+    #[ignore = "resource-intensive full-receiver memory measurement"]
+    fn receiver_memory_stress_reports_bounded_peak_rss() {
+        const CHILD_ROOT_ENV: &str = "OTAP_FILELOG_RECEIVER_STRESS_CHILD_ROOT";
+        const REPORT_PATH_ENV: &str = "OTAP_FILELOG_RECEIVER_STRESS_REPORT_PATH";
+        const FILES_ENV: &str = "OTAP_FILELOG_RECEIVER_STRESS_FILES";
+        const BYTES_ENV: &str = "OTAP_FILELOG_RECEIVER_STRESS_BYTES";
+        const FRAMER_PAYLOAD_COPIES: usize = 2;
+        const TEST_NAME: &str = "receivers::filelog_receiver::runtime::tests::\
+                                 receiver_memory_stress_reports_bounded_peak_rss";
+
+        let buffer_files = std::env::var(FILES_ENV)
+            .map(|value| value.parse::<usize>().expect("stress file count is valid"))
+            .unwrap_or(128);
+        let buffer_bytes = std::env::var(BYTES_ENV)
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .expect("stress framing bound is valid")
+            })
+            .unwrap_or(256 * 1024);
+        assert!(buffer_files > 0);
+        assert!(buffer_bytes >= 128);
+        let total_files = buffer_files
+            .checked_add(1)
+            .expect("tracked file population fits usize");
+        let line_payload_bytes = buffer_bytes
+            .checked_sub(64)
+            .expect("stress line payload fits");
+        let file_payload_bytes = line_payload_bytes
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(1))
+            .expect("stress file payload fits usize");
+        let expected_partial_bytes = u64::try_from(file_payload_bytes)
+            .expect("file payload fits u64")
+            .checked_mul(u64::try_from(buffer_files).expect("file count fits u64"))
+            .expect("aggregate partial bytes fit u64");
+
+        if let Some(root) = std::env::var_os(CHILD_ROOT_ENV) {
+            let root = std::path::PathBuf::from(root);
+            let pattern = root.join("*.log");
+            let mut config: Config = serde_json::from_value(json!({
+                "include": [pattern.to_str().expect("stress glob is UTF-8")],
+                "checkpoint": { "id": "runtime-memory-stress" }
+            }))
+            .expect("stress config deserializes");
+            let total_files_u32 =
+                u32::try_from(total_files).expect("tracked file population fits u32");
+            config.start_at = StartAt::Beginning;
+            config.discovery.poll_interval = Duration::from_millis(50);
+            config.identity.fingerprint_bytes = 32;
+            config.on_decode_error = OnDecodeError::PreserveRaw;
+            config.framing.max_line_bytes =
+                u64::try_from(buffer_bytes).expect("line bound fits u64");
+            config.framing.max_record_bytes =
+                u64::try_from(buffer_bytes).expect("record bound fits u64");
+            config.framing.force_flush_period = Duration::ZERO;
+            config.framing.multiline.line_end_pattern = Some("^END$".to_owned());
+            config.framing.max_multiline_lines = 4;
+            config.limits.max_tracked_files = total_files_u32;
+            config.limits.max_pending_candidates = total_files_u32;
+            config.limits.max_open_files = total_files_u32;
+            config.limits.max_read_bytes_per_turn =
+                u64::try_from(file_payload_bytes).expect("read-turn bound fits u64");
+            config.batch.max_records = 1;
+            config.batch.max_bytes = u64::try_from(buffer_bytes)
+                .expect("batch base fits u64")
+                .checked_mul(2)
+                .and_then(|bytes| bytes.checked_add(64 * 1024))
+                .expect("batch bound fits u64");
+            config.batch.max_flush_period = Duration::from_secs(60);
+            config.drain_timeout = Duration::from_secs(10);
+            let mut runtime =
+                RuntimeConfig::from_config(config, "").expect("stress config validates");
+            runtime.checkpoint_namespace_dir = root.join("checkpoint");
+
+            let peak_before =
+                peak_resident_set_bytes().expect("baseline RSS measurement is available");
+            let sampling = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let sample_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let peak = Arc::new(std::sync::atomic::AtomicU64::new(peak_before));
+            let sampler_running = Arc::clone(&sampling);
+            let sampler_observed = Arc::clone(&sample_observed);
+            let sampler_peak = Arc::clone(&peak);
+            let sampler = std::thread::spawn(move || {
+                while sampler_running.load(Ordering::Relaxed) {
+                    if let Some(resident) = peak_resident_set_bytes() {
+                        sampler_observed.store(true, Ordering::Relaxed);
+                        let _ = sampler_peak.fetch_max(resident, Ordering::Relaxed);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            });
+
+            let (
+                framing_pending_bytes,
+                observed_partial_bytes,
+                tracked_files,
+                open_files,
+                blocked_after,
+                framing_peak_rss,
+            ) = {
+                let (tokio_runtime, local_tasks) = setup_test_runtime();
+                tokio_runtime.block_on(local_tasks.run_until(async {
+                    let (control_tx, control_rx) = mpsc::Channel::new(8);
+                    let control_rx = local::ControlChannel::new(EngineReceiver::Local(
+                        LocalReceiver::mpsc(control_rx),
+                    ));
+                    let (output_tx, _output_rx) = mpsc::Channel::new(1);
+                    output_tx.send(dummy_pdata()).unwrap();
+                    let mut outputs = HashMap::new();
+                    let _ = outputs.insert(
+                        Cow::Borrowed("out"),
+                        EngineSender::Local(LocalSender::mpsc(output_tx)),
+                    );
+                    let (runtime_tx, _runtime_rx) = runtime_ctrl_msg_channel(4);
+                    let (_metrics_rx, metrics_reporter) =
+                        MetricsReporter::create_new_and_receiver(1);
+                    let effect_handler = local::EffectHandler::new(
+                        test_node("filelog"),
+                        outputs,
+                        Some(Cow::Borrowed("out")),
+                        runtime_tx,
+                        metrics_reporter,
+                    );
+                    let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+                    let (telemetry_tx, telemetry_rx) = tokio::sync::oneshot::channel();
+                    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                    let receiver = tokio::task::spawn_local(async move {
+                        let _ = started_tx.send(StdInstant::now());
+                        let mut filelog = FilelogReceiver::new(runtime);
+                        filelog.blocked_send_started = Some(blocked_tx);
+                        filelog.worker_telemetry_ready = Some(telemetry_tx);
+                        Box::new(filelog).start(control_rx, effect_handler).await
+                    });
+                    let receiver_started =
+                        tokio::time::timeout(Duration::from_secs(10), started_rx)
+                            .await
+                            .expect("receiver task starts")
+                            .expect("receiver start observation remains live");
+                    let telemetry = tokio::time::timeout(Duration::from_secs(10), telemetry_rx)
+                        .await
+                        .expect("worker telemetry becomes available")
+                        .expect("worker setup succeeds");
+                    tokio::time::timeout(Duration::from_secs(120), async {
+                        loop {
+                            let tracked = telemetry.gauge_for_test(WorkerGauge::FilesTracked);
+                            let open = telemetry.gauge_for_test(WorkerGauge::FilesOpen);
+                            let pending =
+                                telemetry.gauge_for_test(WorkerGauge::PartialBytesPending);
+                            let expected_files =
+                                u64::try_from(buffer_files).expect("buffering file count fits u64");
+                            if tracked == expected_files && open == expected_files {
+                                assert!(
+                                    pending <= expected_partial_bytes,
+                                    "pending source bytes {pending} exceed the exact fixture \
+                                     total {expected_partial_bytes}"
+                                );
+                                if pending == expected_partial_bytes {
+                                    break;
+                                }
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("all buffering files reach their simultaneous peak");
+                    let framing_pending_bytes =
+                        telemetry.gauge_for_test(WorkerGauge::PartialBytesPending);
+                    assert_eq!(framing_pending_bytes, expected_partial_bytes);
+                    let framing_peak_rss = peak_resident_set_bytes()
+                        .expect("framing-peak RSS measurement is available");
+                    let _ = peak.fetch_max(framing_peak_rss, Ordering::Relaxed);
+                    std::fs::write(root.join("zzzz-trigger.log"), b"END\n")
+                        .expect("stress trigger is written");
+                    let blocked_at = tokio::time::timeout(Duration::from_secs(120), blocked_rx)
+                        .await
+                        .expect("receiver reaches the full downstream channel")
+                        .expect("blocked-send observation remains live");
+                    let blocked_after = blocked_at
+                        .checked_duration_since(receiver_started)
+                        .expect("blocked-send timestamp follows receiver start");
+
+                    let tracked_files = telemetry.gauge_for_test(WorkerGauge::FilesTracked);
+                    let open_files = telemetry.gauge_for_test(WorkerGauge::FilesOpen);
+                    let observed_partial_bytes = telemetry.peak_partial_bytes_pending_for_test();
+                    assert_eq!(
+                        tracked_files,
+                        u64::try_from(total_files).expect("tracked file count fits u64")
+                    );
+                    assert_eq!(
+                        open_files,
+                        u64::try_from(total_files).expect("open file count fits u64")
+                    );
+                    assert_eq!(
+                        observed_partial_bytes, expected_partial_bytes,
+                        "the historical pending-byte peak must equal the exact fixture total"
+                    );
+
+                    let deadline = StdInstant::now() + Duration::from_secs(10);
+                    control_tx
+                        .send_async(NodeControlMsg::Shutdown {
+                            deadline,
+                            reason: "memory stress complete".to_owned(),
+                        })
+                        .await
+                        .expect("shutdown control is sent");
+                    let terminal = tokio::time::timeout(Duration::from_secs(20), receiver)
+                        .await
+                        .expect("memory stress receiver stops")
+                        .expect("receiver task joins")
+                        .expect("receiver shuts down cleanly");
+                    assert_eq!(terminal.deadline(), deadline);
+                    (
+                        framing_pending_bytes,
+                        observed_partial_bytes,
+                        tracked_files,
+                        open_files,
+                        blocked_after,
+                        framing_peak_rss,
+                    )
+                }))
+            };
+            let final_rss = peak_resident_set_bytes().expect("final RSS measurement is available");
+            let _ = peak.fetch_max(final_rss, Ordering::Relaxed);
+            sampling.store(false, Ordering::Relaxed);
+            sampler.join().expect("RSS sampler joins");
+            assert!(
+                sample_observed.load(Ordering::Relaxed),
+                "the RSS sampler must observe the measured interval"
+            );
+            let sampled_peak_rss = peak.load(Ordering::Relaxed);
+
+            let peak_per_framer =
+                peak_framer_payload_bytes(buffer_bytes, buffer_bytes, FRAMER_PAYLOAD_COPIES)
+                    .expect("per-framer payload bound fits usize");
+            let modeled_framer_payload = peak_per_framer
+                .checked_mul(total_files)
+                .expect("aggregate framer payload bound fits usize");
+            let modeled_reader_payload = total_files
+                .checked_mul(
+                    32usize
+                        .checked_add(
+                            ADVISORY_PATH_MAX_BYTES
+                                .checked_mul(2)
+                                .expect("path payload fits usize"),
+                        )
+                        .and_then(|bytes| bytes.checked_add(1024))
+                        .expect("per-reader payload bound fits usize"),
+                )
+                .and_then(|bytes| bytes.checked_add(file_payload_bytes))
+                .expect("aggregate reader payload bound fits usize");
+            let report = format!(
+                "buffer_files={buffer_files} tracked_files={tracked_files} \
+                 open_files={open_files} max_line_bytes={buffer_bytes} \
+                 max_record_bytes={buffer_bytes} expected_partial_bytes={expected_partial_bytes} \
+                 framing_peak_pending_bytes={framing_pending_bytes} \
+                 observed_peak_partial_bytes={observed_partial_bytes} \
+                 framer_payload_copies={FRAMER_PAYLOAD_COPIES} \
+                 modeled_peak_framer_payload_bytes={modeled_framer_payload} \
+                 modeled_reader_payload_bytes={modeled_reader_payload} \
+                 blocked_after_micros={} peak_rss_before_bytes={} \
+                 framing_peak_rss_bytes={framing_peak_rss} sampled_peak_rss_bytes={} \
+                 peak_rss_delta_bytes={}\n",
+                blocked_after.as_micros(),
+                peak_before,
+                sampled_peak_rss,
+                sampled_peak_rss.saturating_sub(peak_before),
+            );
+            let report_path = std::path::PathBuf::from(
+                std::env::var_os(REPORT_PATH_ENV).expect("the child report path is configured"),
+            );
+            std::fs::write(report_path, report).expect("the child writes its measurement");
+            return;
+        }
+
+        let directory = tempdir().expect("stress directory");
+        let root = directory.path();
+        let mut payload = vec![b'r'; line_payload_bytes];
+        payload.push(b'\n');
+        payload.resize(file_payload_bytes, b'l');
+        for index in 0..buffer_files {
+            payload[..32].fill(b'r');
+            let prefix = format!("buffer-{index:020}");
+            payload[..prefix.len()].copy_from_slice(prefix.as_bytes());
+            std::fs::write(root.join(format!("buffer-{index:05}.log")), &payload)
+                .expect("stress buffer file is written");
+        }
+        let report_path = root.join("receiver-memory-report.txt");
+        let status = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+            .args(["--ignored", "--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ROOT_ENV, root)
+            .env(REPORT_PATH_ENV, &report_path)
+            .env(FILES_ENV, buffer_files.to_string())
+            .env(BYTES_ENV, buffer_bytes.to_string())
+            .status()
+            .expect("receiver memory measurement child starts");
+        assert!(status.success(), "receiver memory measurement child failed");
+        let report = std::fs::read_to_string(report_path).expect("the child produced its report");
+        eprintln!("filelog receiver memory measurement: {report}");
     }
 
     /// Scenario: four active files are durably registered and one emitted
