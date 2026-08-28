@@ -23,13 +23,30 @@ fn settings(max_readers: usize, max_open_files: usize, turn_bytes: usize) -> Rea
     }
 }
 
+fn settings_with_fingerprint(
+    max_readers: usize,
+    max_open_files: usize,
+    turn_bytes: usize,
+    fingerprint_bytes: u16,
+) -> ReaderSettings {
+    ReaderSettings {
+        fingerprint_bytes,
+        ..settings(max_readers, max_open_files, turn_bytes)
+    }
+}
+
 fn file_id(seed: u8) -> FileId {
     FileId::from_bytes([seed; 16])
 }
 
 fn candidate(path: &Path) -> DiscoveredCandidate {
+    candidate_with_fingerprint(path, 16)
+}
+
+fn candidate_with_fingerprint(path: &Path, fingerprint_bytes: u16) -> DiscoveredCandidate {
     let resolved_path = std::fs::canonicalize(path).expect("candidate canonicalizes");
-    let opened = open_candidate(&resolved_path, false, 16, 0).expect("candidate opens");
+    let opened =
+        open_candidate(&resolved_path, false, fingerprint_bytes, 0).expect("candidate opens");
     DiscoveredCandidate {
         matched_path: path.to_path_buf(),
         resolved_path,
@@ -39,6 +56,14 @@ fn candidate(path: &Path) -> DiscoveredCandidate {
 }
 
 fn resolved(seed: u8, offset: u64) -> ResolvedIdentity {
+    resolved_with_guard(seed, offset, CommittedFrontierGuard::empty())
+}
+
+fn resolved_with_guard(
+    seed: u8,
+    offset: u64,
+    committed_frontier_guard: CommittedFrontierGuard,
+) -> ResolvedIdentity {
     ResolvedIdentity {
         file_id: file_id(seed),
         file_epoch: 0,
@@ -46,7 +71,18 @@ fn resolved(seed: u8, offset: u64) -> ResolvedIdentity {
         framing_resume: FramingResume::Clean,
         lifecycle_state: LifecycleState::Active,
         matched_by: IdentityMatch::NewDiscovery,
+        committed_frontier_guard,
     }
+}
+
+/// Computes the real committed-frontier guard for a known literal prefix,
+/// for tests that admit a genuinely new identity at an offset that does not
+/// coincide with the candidate's own (EOF) window and so cannot rely on
+/// [`ReaderTable::insert`] adopting that window directly; the reader must
+/// then independently validate this guard once its descriptor opens.
+fn guard_for_prefix(prefix: &[u8]) -> CommittedFrontierGuard {
+    CommittedFrontierGuard::compute(prefix.len() as u64, prefix)
+        .expect("test prefix must fit the committed-frontier guard window")
 }
 
 fn data(poll: ReaderPoll) -> ReadTurn {
@@ -565,7 +601,12 @@ fn stale_or_backward_progress_fails_closed() {
     let path = directory.path().join("stale.log");
     std::fs::write(&path, b"abc").unwrap();
     let mut table = ReaderTable::new(settings(1, 1, 3)).unwrap();
-    table.insert(candidate(&path), resolved(15, 1)).unwrap();
+    table
+        .insert(
+            candidate(&path),
+            resolved_with_guard(15, 1, guard_for_prefix(b"a")),
+        )
+        .unwrap();
     let now = Instant::now();
 
     let turn = data(table.poll(now).unwrap());
@@ -1173,9 +1214,10 @@ fn read_turn_exposes_continuation_frontier_across_reopen() {
     std::fs::write(&second_path, b"z").unwrap();
     let resume = FramingResume::Continuation {
         record_start_offset: 0,
+        record_end_offset: 0,
         next_fragment_index: 2,
     };
-    let mut first_resolved = resolved(28, 1);
+    let mut first_resolved = resolved_with_guard(28, 1, guard_for_prefix(b"a"));
     first_resolved.framing_resume = resume;
     let mut table = ReaderTable::new(settings(2, 1, 1)).unwrap();
     table
@@ -1622,6 +1664,7 @@ fn provisional_frontier_rewind_preserves_descriptor_and_accepts_later_ack() {
 
     let resume = FramingResume::Continuation {
         record_start_offset: 1,
+        record_end_offset: 0,
         next_fragment_index: 2,
     };
     table
@@ -1649,7 +1692,12 @@ fn provisional_frontier_rewind_rejects_epoch_and_offset_bounds() {
     let path = directory.path().join("bounds.log");
     std::fs::write(&path, b"abcdef").unwrap();
     let mut table = ReaderTable::new(settings(1, 1, 4)).unwrap();
-    table.insert(candidate(&path), resolved(46, 1)).unwrap();
+    table
+        .insert(
+            candidate(&path),
+            resolved_with_guard(46, 1, guard_for_prefix(b"a")),
+        )
+        .unwrap();
     let now = Instant::now();
 
     let turn = data(table.poll(now).unwrap());
@@ -1874,5 +1922,345 @@ fn batch_commit_can_preserve_pause_for_drain_replay() {
     table
         .complete_turn(replay, 2, TurnDisposition::Paused)
         .unwrap();
+    table.shutdown().unwrap();
+}
+
+/// Scenario: the committed-frontier window accessor is called repeatedly
+/// after the descriptor has already served a real read that established it.
+/// Guarantees: every call is a bounded in-memory clone of reader-owned
+/// bytes; it never issues another positioned source read, eliminating
+/// post-Ack rereads.
+#[test]
+fn committed_frontier_window_accessor_never_rereads_the_source() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("no-reread.log");
+    std::fs::write(&path, b"abcxyz").unwrap();
+    let mut table = ReaderTable::new(settings(1, 1, 6)).unwrap();
+    table
+        .insert(
+            candidate(&path),
+            resolved_with_guard(70, 3, guard_for_prefix(b"abc")),
+        )
+        .unwrap();
+    let now = Instant::now();
+
+    let turn = data(table.poll(now).unwrap());
+    assert_eq!(turn.source_offset(), 3);
+    table
+        .complete_turn(turn, 3, TurnDisposition::Paused)
+        .unwrap();
+    assert_eq!(
+        table
+            .committed_frontier_window(file_id(70), 3)
+            .unwrap()
+            .bytes(),
+        b"abc"
+    );
+    let baseline = table.stats();
+
+    for _ in 0..5 {
+        let window = table.committed_frontier_window(file_id(70), 3).unwrap();
+        assert_eq!(window.bytes(), b"abc");
+    }
+
+    let after = table.stats();
+    assert_eq!(after.read_turns, baseline.read_turns);
+    assert_eq!(after.source_bytes_read, baseline.source_bytes_read);
+    assert_eq!(after.opens, baseline.opens);
+    assert_eq!(after.reopens, baseline.reopens);
+    table.shutdown().unwrap();
+}
+
+/// Scenario: a resident descriptor with an established committed-frontier
+/// window is evicted and later reopened while its content is unchanged.
+/// Guarantees: reopen independently re-validates the retained window
+/// against the durable guard and refreshes it from the newly (re)opened
+/// handle rather than blindly trusting stale bytes, and the refreshed
+/// window is byte-for-byte the same real evidence.
+#[test]
+fn descriptor_reopen_revalidates_and_refreshes_committed_frontier_window() {
+    let directory = tempdir().unwrap();
+    let first_path = directory.path().join("evict-revalidate.log");
+    let second_path = directory.path().join("other.log");
+    std::fs::write(&first_path, b"abcxyz").unwrap();
+    std::fs::write(&second_path, b"z").unwrap();
+    let mut table = ReaderTable::new(settings(2, 1, 6)).unwrap();
+    table
+        .insert(
+            candidate(&first_path),
+            resolved_with_guard(71, 3, guard_for_prefix(b"abc")),
+        )
+        .unwrap();
+    table
+        .insert(candidate(&second_path), resolved(72, 0))
+        .unwrap();
+    let now = Instant::now();
+
+    let first = data(table.poll(now).unwrap());
+    assert_eq!(first.file_id(), file_id(71));
+    table
+        .complete_turn(first, 3, TurnDisposition::Paused)
+        .unwrap();
+    assert_eq!(
+        table
+            .committed_frontier_window(file_id(71), 3)
+            .unwrap()
+            .bytes(),
+        b"abc"
+    );
+
+    table.make_ready(file_id(72)).unwrap();
+    let request = eviction(table.poll(now).unwrap());
+    assert_eq!(request.victim_file_id, file_id(71));
+    table.confirm_eviction(request).unwrap();
+
+    let second = data(table.poll(now).unwrap());
+    assert_eq!(second.file_id(), file_id(72));
+    table
+        .complete_turn(second, 1, TurnDisposition::Paused)
+        .unwrap();
+
+    table.make_ready(file_id(71)).unwrap();
+    let request = eviction(table.poll(now).unwrap());
+    assert_eq!(request.victim_file_id, file_id(72));
+    table.confirm_eviction(request).unwrap();
+
+    let reopened = data(table.poll(now).unwrap());
+    assert_eq!(reopened.file_id(), file_id(71));
+    assert_eq!(reopened.source_offset(), 3);
+    table
+        .complete_turn(reopened, 3, TurnDisposition::Paused)
+        .unwrap();
+    assert_eq!(
+        table
+            .committed_frontier_window(file_id(71), 3)
+            .unwrap()
+            .bytes(),
+        b"abc"
+    );
+    table.shutdown().unwrap();
+}
+
+/// Scenario: a resident descriptor is evicted, then bytes strictly inside
+/// its committed-frontier window (but past the durable fingerprint prefix)
+/// change on disk before reopen, while the file's size and fingerprint
+/// prefix stay identical.
+/// Guarantees: reopen classifies the mismatch through the same
+/// unavailable-reopen path as an incompatible fingerprint or locator; the
+/// reader is never allowed to silently resume from evidence that no longer
+/// matches what was durably recorded.
+#[test]
+fn descriptor_reopen_fails_closed_on_committed_frontier_guard_mismatch() {
+    let directory = tempdir().unwrap();
+    let first_path = directory.path().join("guard-mismatch.log");
+    let second_path = directory.path().join("other.log");
+    std::fs::write(&first_path, b"abcxyz").unwrap();
+    std::fs::write(&second_path, b"z").unwrap();
+    let mut table = ReaderTable::new(settings_with_fingerprint(2, 1, 6, 1)).unwrap();
+    table
+        .insert(
+            candidate_with_fingerprint(&first_path, 1),
+            resolved_with_guard(73, 3, guard_for_prefix(b"abc")),
+        )
+        .unwrap();
+    table
+        .insert(candidate_with_fingerprint(&second_path, 1), resolved(74, 0))
+        .unwrap();
+    let now = Instant::now();
+
+    let first = data(table.poll(now).unwrap());
+    assert_eq!(first.file_id(), file_id(73));
+    table
+        .complete_turn(first, 3, TurnDisposition::Paused)
+        .unwrap();
+
+    table.make_ready(file_id(74)).unwrap();
+    let request = eviction(table.poll(now).unwrap());
+    assert_eq!(request.victim_file_id, file_id(73));
+    table.confirm_eviction(request).unwrap();
+
+    // The 1-byte fingerprint prefix ("a") and the 6-byte size are both
+    // unchanged, so reopen's fingerprint/size check alone would accept
+    // this candidate; only committed-frontier guard validation can detect
+    // that the retained evidence no longer matches.
+    std::fs::write(&first_path, b"aXcxyz").unwrap();
+
+    let second = data(table.poll(now).unwrap());
+    assert_eq!(second.file_id(), file_id(74));
+    table
+        .complete_turn(second, 1, TurnDisposition::Paused)
+        .unwrap();
+
+    table.make_ready(file_id(73)).unwrap();
+    let request = eviction(table.poll(now).unwrap());
+    assert_eq!(request.victim_file_id, file_id(74));
+    table.confirm_eviction(request).unwrap();
+
+    assert!(matches!(
+        table.poll(now).unwrap(),
+        ReaderPoll::RemovedWithoutDescriptor {
+            file_id: unavailable
+        } if unavailable == file_id(73)
+    ));
+    assert!(!table.frontier(file_id(73)).unwrap().present);
+    table.shutdown().unwrap();
+}
+
+/// Scenario: a genuinely new identity admission supplies a durable guard
+/// that does not match the candidate's real committed-frontier evidence at
+/// a nonzero, mid-file offset (the restart/recovery shape: an existing
+/// identity resuming below its current size).
+/// Guarantees: the very first open independently validates against the
+/// supplied guard and fails closed exactly like a later reopen mismatch.
+#[test]
+fn restart_admission_fails_closed_on_wrong_committed_frontier_guard() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("restart-mismatch.log");
+    std::fs::write(&path, b"abcxyz").unwrap();
+    let mut table = ReaderTable::new(settings(1, 1, 6)).unwrap();
+    table
+        .insert(
+            candidate(&path),
+            resolved_with_guard(75, 3, guard_for_prefix(b"zzz")),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        table.poll(Instant::now()).unwrap(),
+        ReaderPoll::RemovedWithoutDescriptor {
+            file_id: unavailable
+        } if unavailable == file_id(75)
+    ));
+    assert!(!table.frontier(file_id(75)).unwrap().present);
+    table.shutdown().unwrap();
+}
+
+/// Scenario: discovery captures a new identity at EOF, then the same locator
+/// is rewritten behind an unchanged fingerprint prefix before the reader's
+/// separate first open.
+/// Guarantees: the first nonzero open revalidates the durable frontier guard
+/// against its own handle and cannot trust stale discovery-window bytes.
+#[test]
+fn first_nonzero_open_revalidates_new_identity_frontier_guard() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("new-identity-guard-race.log");
+    std::fs::write(&path, b"abc").unwrap();
+    let candidate = candidate_with_fingerprint(&path, 1);
+    let guard = candidate
+        .evidence
+        .committed_frontier_window
+        .guard()
+        .unwrap();
+    std::fs::write(&path, b"axy").unwrap();
+    let mut table = ReaderTable::new(settings_with_fingerprint(1, 1, 3, 1)).unwrap();
+    table
+        .insert(candidate, resolved_with_guard(76, 3, guard))
+        .unwrap();
+
+    assert!(matches!(
+        table.poll(Instant::now()).unwrap(),
+        ReaderPoll::RemovedWithoutDescriptor {
+            file_id: unavailable
+        } if unavailable == file_id(76)
+    ));
+    assert!(!table.frontier(file_id(76)).unwrap().present);
+    table.shutdown().unwrap();
+}
+
+/// Scenario: a reader with a real, nonzero committed-frontier window is
+/// reset after truncation.
+/// Guarantees: the retained window becomes exactly the empty window (never
+/// a stale nonzero-offset window), matching the reset offset of zero.
+#[test]
+fn truncate_reset_installs_empty_committed_frontier_window() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("truncate-empty-window.log");
+    std::fs::write(&path, b"old\n").unwrap();
+    let mut table = ReaderTable::new(settings(1, 1, 4)).unwrap();
+    table.insert(candidate(&path), resolved(80, 4)).unwrap();
+    assert_eq!(
+        table
+            .committed_frontier_window(file_id(80), 4)
+            .unwrap()
+            .bytes(),
+        b"old\n"
+    );
+
+    std::fs::write(&path, b"new\n").unwrap();
+    table.preflight_truncate_reset(file_id(80), 0, 4).unwrap();
+    table
+        .apply_preflighted_truncate_reset(file_id(80), 0, 4, 1, b"new\n".to_vec(), false)
+        .unwrap();
+
+    let window = table.committed_frontier_window(file_id(80), 0).unwrap();
+    assert_eq!(window, CommittedFrontierWindow::empty());
+    table.shutdown().unwrap();
+}
+
+/// Scenario: an Ack-resulting window is installed for the current committed
+/// offset, then an out-of-band window ending elsewhere is attempted.
+/// Guarantees: a matching offset replaces the retained bytes and the
+/// derived guard together; a mismatched offset is rejected without
+/// mutating either.
+#[test]
+fn install_committed_frontier_window_requires_matching_offset() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("install-window.log");
+    std::fs::write(&path, b"abcxyz").unwrap();
+    let mut table = ReaderTable::new(settings(1, 1, 6)).unwrap();
+    table.insert(candidate(&path), resolved(81, 0)).unwrap();
+
+    let window = CommittedFrontierWindow::new(0, Vec::new()).unwrap();
+    let wrong_offset = CommittedFrontierWindow::new(3, b"abc".to_vec()).unwrap();
+    assert!(matches!(
+        table.install_committed_frontier_window(file_id(81), Some(wrong_offset)),
+        Err(ReaderError::Inconsistent { .. })
+    ));
+    assert_eq!(
+        table.committed_frontier_window(file_id(81), 0).unwrap(),
+        window
+    );
+
+    // `None` (a zero-delta or finalize-only update) is always accepted and
+    // never mutates the retained window.
+    table
+        .install_committed_frontier_window(file_id(81), None)
+        .unwrap();
+    assert_eq!(
+        table.committed_frontier_window(file_id(81), 0).unwrap(),
+        window
+    );
+    table.shutdown().unwrap();
+}
+
+/// Scenario: a reader resumes a durable continuation whose exact known
+/// record end lies beyond the reopened handle's observed size, even though
+/// the size still covers the committed offset itself.
+/// Guarantees: reopen classifies this as truncation before any
+/// continuation bytes are emitted, exactly like a source shorter than
+/// bytes already consumed, rather than silently reinterpreting the
+/// deterministic boundary under scan-to-next-LF semantics.
+#[test]
+fn reopen_reports_truncation_when_size_is_below_known_continuation_end() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("continuation-truncated.log");
+    std::fs::write(&path, b"abcdef").unwrap();
+    let mut table = ReaderTable::new(settings(1, 1, 6)).unwrap();
+    let mut identity = resolved(90, 4);
+    identity.framing_resume = FramingResume::Continuation {
+        record_start_offset: 0,
+        record_end_offset: 20,
+        next_fragment_index: 1,
+    };
+    table.insert(candidate(&path), identity).unwrap();
+
+    assert!(matches!(
+        table.poll(Instant::now()).unwrap(),
+        ReaderPoll::Truncated {
+            committed_offset: 4,
+            observed_size: 6,
+            ..
+        }
+    ));
     table.shutdown().unwrap();
 }

@@ -22,10 +22,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::super::current_marker::encode_current_marker;
+use super::super::error::DecodeError;
 use super::super::primitives::{
-    ADVISORY_PATH_MAX_BYTES, ByteReader, FINGERPRINT_MAX_BYTES, FileId, FramingResume,
-    LifecycleState, Locator, NAMESPACE_ID_MAX_BYTES, REASON_CODE_RESERVED,
-    TRUNCATE_RESET_REASON_READ_NEW, WAL_MAX_OPS_PER_TX, crc32c,
+    ADVISORY_PATH_STORED_MAX_BYTES, AdvisoryPath, ByteReader, CommittedFrontierGuard,
+    FINGERPRINT_MAX_BYTES, FileId, FramingResume, LifecycleState, Locator, NAMESPACE_ID_MAX_BYTES,
+    REASON_CODE_RESERVED, TRUNCATE_RESET_REASON_READ_NEW, WAL_MAX_NON_PROGRESS_OPS_PER_TX,
+    WAL_MAX_OPS_PER_TX, crc32c,
 };
 use super::super::snapshot::{SNAPSHOT_HEADER_LEN, SnapshotRecord, encode_snapshot};
 use super::super::wal::{
@@ -41,6 +43,17 @@ use super::layout::{
 };
 use super::limits::{ARTIFACT_BYTES_CEILING, RECOVERY_WORKING_BYTES_CEILING, StoreLimits};
 use super::{AtomicGroupAppendOutcome, CheckpointStore, StoreOptions};
+
+/// Test-only zero-filled window guard: a deterministic, obviously-fake
+/// `CommittedFrontierGuard` for tests that only need a structurally valid
+/// guard and do not exercise real continuity evidence. Production code
+/// must never do this; see [`super::super::primitives::CommittedFrontierWindow`]
+/// for the real, non-fabricated runtime window.
+fn zero_guard(committed_offset: u64) -> CommittedFrontierGuard {
+    let window_len = committed_offset.min(64) as usize;
+    CommittedFrontierGuard::compute(committed_offset, &vec![0u8; window_len]).unwrap()
+}
+
 use crate::receivers::filelog_receiver::config::{
     CheckpointConfig, Config, IdentityConfig, LimitsConfig, RuntimeConfig,
 };
@@ -148,7 +161,7 @@ fn incomplete_initial_generation_rejects_foreign_or_torn_survivors() {
     fs::remove_file(foreign.join(wal_file_name(0))).expect("removes the WAL");
     write_bytes(
         &foreign.join(snapshot_file_name(0)),
-        &encode_snapshot(9, &[]).expect("foreign snapshot encodes"),
+        &encode_snapshot(9, NAMESPACE_ID, &[]).expect("foreign snapshot encodes"),
     );
     assert!(matches!(
         CheckpointStore::open(options(&foreign)).expect_err("foreign generation fails closed"),
@@ -202,9 +215,9 @@ fn incomplete_initial_generation_enforces_header_level_decode_bounds() {
     fs::remove_file(snapshot_only.join(wal_file_name(0))).expect("removes the WAL");
     let snapshot_path = snapshot_only.join(snapshot_file_name(0));
     let mut snapshot = fs::read(&snapshot_path).expect("snapshot reads");
-    snapshot[20..24].copy_from_slice(&u32::MAX.to_be_bytes());
-    let header_crc = crc32c(&snapshot[..24]);
-    snapshot[24..28].copy_from_slice(&header_crc.to_be_bytes());
+    snapshot[52..56].copy_from_slice(&u32::MAX.to_be_bytes());
+    let header_crc = crc32c(&snapshot[..56]);
+    snapshot[56..60].copy_from_slice(&header_crc.to_be_bytes());
     write_bytes(&snapshot_path, &snapshot);
 
     assert!(matches!(
@@ -234,14 +247,26 @@ fn incomplete_initial_generation_enforces_header_level_decode_bounds() {
         .max_transaction_bytes
         .checked_add(1)
         .expect("the test frame length is representable");
+    // The fixed 36-byte transaction envelope header plus the trailing
+    // 4-byte frame CRC surround the body.
     let body_len = oversized_transaction_len
-        .checked_sub(8)
+        .checked_sub(36 + 4)
         .expect("transaction framing is included");
     let body_len_u32 = u32::try_from(body_len).expect("the configured transaction fits u32");
     let body_len_usize = usize::try_from(body_len).expect("the test can allocate the frame");
-    let mut transaction = Vec::with_capacity(body_len_usize + 8);
+    let mut transaction = Vec::with_capacity(body_len_usize + 40);
+    transaction.extend_from_slice(b"FLOGTXN\0");
+    transaction.extend_from_slice(&1u16.to_be_bytes()); // tx_envelope_version
+    transaction.extend_from_slice(&0u16.to_be_bytes()); // tx_flags, reserved
+    transaction.extend_from_slice(&1u64.to_be_bytes()); // sequence
     transaction.extend_from_slice(&body_len_u32.to_be_bytes());
-    transaction.resize(4 + body_len_usize, 0);
+    transaction.extend_from_slice(&(body_len_u32 ^ 0xFFFF_FFFF).to_be_bytes());
+    transaction.extend_from_slice(&1u16.to_be_bytes()); // op_count (never reached)
+    transaction.extend_from_slice(&0u16.to_be_bytes()); // reserved
+    let header_crc = crc32c(&transaction);
+    transaction.extend_from_slice(&header_crc.to_be_bytes());
+    assert_eq!(transaction.len(), 36);
+    transaction.resize(36 + body_len_usize, 0);
     let transaction_crc = crc32c(&transaction);
     transaction.extend_from_slice(&transaction_crc.to_be_bytes());
     assert_eq!(transaction.len() as u64, oversized_transaction_len);
@@ -334,6 +359,7 @@ fn quarantine_removal_rejects_a_record_that_is_now_active() {
             action: ResetQuarantineAction::ResetToBeginning,
             resulting_epoch: 2,
             resulting_offset: 0,
+            new_committed_frontier_guard: zero_guard(0),
             new_framing_resume: FramingResume::Clean,
             reset_time_unix_nano: 4_000,
             audit_reason: "release".to_owned(),
@@ -357,6 +383,7 @@ fn registration(seed: u8) -> RegisterFile {
         file_id: file_id(seed),
         file_epoch: 1,
         committed_offset: 0,
+        committed_frontier_guard: CommittedFrontierGuard::empty(),
         fingerprint: vec![seed; 8],
         ignored_header_bytes: 0,
         locator: Locator::PosixDevIno {
@@ -367,7 +394,8 @@ fn registration(seed: u8) -> RegisterFile {
         framing_profile_digest: [0x11; 32],
         framing_resume: FramingResume::Clean,
         last_seen_time_unix_nano: 1_000,
-        advisory_path: format!("/var/log/app-{seed}.log").into_bytes(),
+        advisory_path: AdvisoryPath::from_unix_bytes(format!("/var/log/app-{seed}.log").as_bytes())
+            .unwrap(),
     }
 }
 
@@ -387,16 +415,19 @@ fn distinct_registrations(count: usize) -> Vec<RegisterFile> {
 #[test]
 fn atomic_group_packing_never_splits_a_group() {
     let operation = Operation::RegisterFile(registration(1));
-    let leading = vec![operation.clone(); usize::from(WAL_MAX_OPS_PER_TX) - 1];
+    let leading = vec![operation.clone(); usize::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX) - 1];
     let pair = vec![operation.clone(), operation];
 
     let (operations, transaction_lengths) =
         super::pack_atomic_groups(vec![leading, pair]).expect("groups pack");
 
-    assert_eq!(operations.len(), usize::from(WAL_MAX_OPS_PER_TX) + 1);
+    assert_eq!(
+        operations.len(),
+        usize::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX) + 1
+    );
     assert_eq!(
         transaction_lengths,
-        vec![usize::from(WAL_MAX_OPS_PER_TX) - 1, 2]
+        vec![usize::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX) - 1, 2]
     );
 }
 
@@ -409,8 +440,8 @@ fn atomic_group_cancellation_stops_before_the_next_transaction() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("namespace");
     let mut store_options = options(&path);
-    store_options.max_tracked_files = u32::from(WAL_MAX_OPS_PER_TX) + 1;
-    let registrations = distinct_registrations(usize::from(WAL_MAX_OPS_PER_TX) + 1);
+    store_options.max_tracked_files = u32::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX) + 1;
+    let registrations = distinct_registrations(usize::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX) + 1);
     let final_file_id = registrations.last().expect("final registration").file_id;
     let groups = registrations
         .into_iter()
@@ -431,13 +462,22 @@ fn atomic_group_cancellation_stops_before_the_next_transaction() {
         panic!("expected cancellation after the first transaction");
     };
     assert_eq!(completed.len(), 1);
-    assert_eq!(completed[0].operations, usize::from(WAL_MAX_OPS_PER_TX));
-    assert_eq!(store.table().len(), usize::from(WAL_MAX_OPS_PER_TX));
+    assert_eq!(
+        completed[0].operations,
+        usize::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX)
+    );
+    assert_eq!(
+        store.table().len(),
+        usize::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX)
+    );
     assert!(store.table().get(&final_file_id).is_none());
     drop(store);
 
     let recovered = CheckpointStore::open(store_options).expect("namespace recovers");
-    assert_eq!(recovered.table().len(), usize::from(WAL_MAX_OPS_PER_TX));
+    assert_eq!(
+        recovered.table().len(),
+        usize::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX)
+    );
     assert!(recovered.table().get(&final_file_id).is_none());
 }
 
@@ -821,7 +861,7 @@ fn windows_reparse_point_namespace_is_rejected() {
     assert!(matches!(error, StoreError::UnsafeFilesystemObject { .. }));
     assert_eq!(
         fs::read(&wal_target).expect("the target WAL remains readable"),
-        encode_wal(0, &[]).expect("the empty WAL encodes")
+        encode_wal(0, NAMESPACE_ID, &[]).expect("the empty WAL encodes")
     );
 }
 
@@ -831,6 +871,7 @@ fn progress(seed: u8, from: u64, to: u64) -> UpdateProgress {
         expected_committed_offset: from,
         expected_file_epoch: 1,
         new_committed_offset: to,
+        new_committed_frontier_guard: zero_guard(to),
         new_framing_resume: FramingResume::Clean,
         new_last_seen_time_unix_nano: 2_000,
         finalize: false,
@@ -914,8 +955,8 @@ fn patch_first_transaction_operation_u16(
     field_offset_in_payload: usize,
     value: u16,
 ) {
-    const TRANSACTION_PREFIX_LEN: usize = 4 + 8 + 2;
-    let operation_start = TRANSACTION_PREFIX_LEN;
+    const TRANSACTION_HEADER_LEN: usize = 36;
+    let operation_start = TRANSACTION_HEADER_LEN;
     let operation_len = u32::from_be_bytes(
         transaction[operation_start..operation_start + 4]
             .try_into()
@@ -948,6 +989,8 @@ fn patch_first_snapshot_quarantine_reason(snapshot: &mut [u8], value: u16) {
         let _file_id = input.read_exact(16).expect("file id");
         let _file_epoch = input.read_u32().expect("file epoch");
         let _committed_offset = input.read_u64().expect("committed offset");
+        let _committed_frontier_guard =
+            CommittedFrontierGuard::read(&mut input).expect("committed frontier guard");
         let fingerprint_len = input.read_u16().expect("fingerprint length") as usize;
         let _fingerprint = input
             .read_exact(fingerprint_len)
@@ -1001,7 +1044,8 @@ fn widest_registration(index: u64) -> RegisterFile {
             file_id: [0xAB; 16],
         },
         fingerprint: vec![0x5A; 16],
-        advisory_path: vec![b'p'; ADVISORY_PATH_MAX_BYTES],
+        advisory_path: AdvisoryPath::from_unix_bytes(&vec![b'p'; ADVISORY_PATH_STORED_MAX_BYTES])
+            .unwrap(),
         ..registration(1)
     }
 }
@@ -1104,7 +1148,7 @@ fn open_fails_closed_when_the_snapshot_declares_another_generation() {
     let _seeded = seeded_namespace(&path);
 
     // A snapshot encoded for generation 9, stored under generation 0's name.
-    let foreign = encode_snapshot(9, &[]).expect("encodes");
+    let foreign = encode_snapshot(9, NAMESPACE_ID, &[]).expect("encodes");
     write_bytes(&path.join(snapshot_file_name(0)), &foreign);
 
     let error = CheckpointStore::open(options(&path)).expect_err("mismatch fails closed");
@@ -1134,7 +1178,7 @@ fn open_fails_closed_when_the_wal_declares_another_generation() {
     let path = dir.path().join("namespace");
     let _seeded = seeded_namespace(&path);
 
-    let foreign = encode_wal(4, &[]).expect("encodes");
+    let foreign = encode_wal(4, NAMESPACE_ID, &[]).expect("encodes");
     write_bytes(&path.join(wal_file_name(0)), &foreign);
 
     let error = CheckpointStore::open(options(&path)).expect_err("mismatch fails closed");
@@ -1194,7 +1238,7 @@ fn registrations_batch_into_bounded_synced_transactions() {
     })
     .expect("namespace opens");
 
-    let count = usize::from(WAL_MAX_OPS_PER_TX) + 5;
+    let count = usize::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX) + 5;
     let registrations: Vec<RegisterFile> = (0..count)
         .map(|index| {
             let mut register = registration(1);
@@ -1207,7 +1251,10 @@ fn registrations_batch_into_bounded_synced_transactions() {
 
     let outcomes = store.register_files(registrations).expect("registers");
     assert_eq!(outcomes.len(), 2);
-    assert_eq!(outcomes[0].operations, usize::from(WAL_MAX_OPS_PER_TX));
+    assert_eq!(
+        outcomes[0].operations,
+        usize::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX)
+    );
     assert_eq!(outcomes[1].operations, 5);
     assert_eq!(outcomes[0].sequence, 1);
     assert_eq!(outcomes[1].sequence, 2);
@@ -1232,7 +1279,7 @@ fn registrations_batch_into_bounded_synced_transactions() {
 fn filesystem_failure_between_batch_chunks_recovers_a_retryable_prefix() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("namespace");
-    let count = usize::from(WAL_MAX_OPS_PER_TX) + 1;
+    let count = usize::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX) + 1;
     let store_options = StoreOptions {
         max_tracked_files: count as u32,
         ..options(&path)
@@ -1263,7 +1310,10 @@ fn filesystem_failure_between_batch_chunks_recovers_a_retryable_prefix() {
 
     let mut reopened =
         CheckpointStore::open(store_options.clone()).expect("durable prefix reopens");
-    assert_eq!(reopened.table().len(), usize::from(WAL_MAX_OPS_PER_TX));
+    assert_eq!(
+        reopened.table().len(),
+        usize::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX)
+    );
     assert_eq!(reopened.recovery().transactions_replayed, 1);
     assert!(reopened.table().get(&retry.file_id).is_none());
 
@@ -1288,7 +1338,7 @@ fn filesystem_failure_between_batch_chunks_recovers_a_retryable_prefix() {
 #[test]
 fn batched_registration_capacity_is_preflighted_across_all_chunks() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let count = usize::from(WAL_MAX_OPS_PER_TX) + 1;
+    let count = usize::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX) + 1;
 
     let exact_path = dir.path().join("exact");
     let exact_options = StoreOptions {
@@ -1312,7 +1362,7 @@ fn batched_registration_capacity_is_preflighted_across_all_chunks() {
 
     let over_path = dir.path().join("over");
     let over_options = StoreOptions {
-        max_tracked_files: WAL_MAX_OPS_PER_TX.into(),
+        max_tracked_files: WAL_MAX_NON_PROGRESS_OPS_PER_TX.into(),
         ..options(&over_path)
     };
     let mut over = CheckpointStore::open(over_options.clone()).expect("namespace opens");
@@ -1327,7 +1377,7 @@ fn batched_registration_capacity_is_preflighted_across_all_chunks() {
             registrations,
             max,
             ..
-        } if registrations == count && max == u32::from(WAL_MAX_OPS_PER_TX)
+        } if registrations == count && max == u32::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX)
     ));
     assert_eq!(over.table().len(), 0);
     assert_eq!(over.stats().wal_bytes, before.wal_bytes);
@@ -1356,7 +1406,7 @@ fn invalid_later_batched_operation_is_rejected_before_the_first_chunk() {
         .map(Operation::RegisterFile)
         .collect();
     let mut conflicting = distinct_registrations(1).pop().expect("one registration");
-    conflicting.advisory_path.push(b'x');
+    conflicting.advisory_path = AdvisoryPath::from_unix_bytes(b"/var/log/conflicting.log").unwrap();
     operations.push(Operation::RegisterFile(conflicting));
 
     let mut store = CheckpointStore::open(StoreOptions {
@@ -1384,7 +1434,7 @@ fn invalid_later_batched_operation_is_rejected_before_the_first_chunk() {
 fn batched_wal_capacity_is_preflighted_across_all_chunks() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("namespace");
-    let count = usize::from(WAL_MAX_OPS_PER_TX) + 128;
+    let count = usize::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX) + 128;
     let mut store = CheckpointStore::open(StoreOptions {
         compact_after_bytes: 1,
         fingerprint_bytes: 16,
@@ -1490,6 +1540,7 @@ fn deferred_ack_crash_images_recover_old_or_complete_progress() {
         .commit_progress(vec![UpdateProgress {
             new_framing_resume: FramingResume::Continuation {
                 record_start_offset: 96,
+                record_end_offset: 0,
                 next_fragment_index: 2,
             },
             ..progress(1, 0, 128)
@@ -1540,6 +1591,7 @@ fn deferred_ack_crash_images_recover_old_or_complete_progress() {
             128,
             FramingResume::Continuation {
                 record_start_offset: 96,
+                record_end_offset: 0,
                 next_fragment_index: 2,
             }
         )
@@ -1596,6 +1648,7 @@ fn required_operations_sync_immediately_despite_the_interval() {
             action: ResetQuarantineAction::ResetToBeginning,
             resulting_epoch: 2,
             resulting_offset: 0,
+            new_committed_frontier_guard: zero_guard(0),
             new_framing_resume: FramingResume::Clean,
             reset_time_unix_nano: 5_000,
             audit_reason: "operator released quarantine".to_owned(),
@@ -1652,6 +1705,7 @@ fn every_quarantine_reset_action_survives_reopen_and_compaction() {
                 action,
                 resulting_epoch,
                 resulting_offset,
+                new_committed_frontier_guard: zero_guard(resulting_offset),
                 new_framing_resume: FramingResume::Clean,
                 reset_time_unix_nano: 5_000,
                 audit_reason: format!("operator selected {name}"),
@@ -1710,6 +1764,7 @@ fn administrative_operations_require_an_audit_reason() {
             action: ResetQuarantineAction::KeepFailed,
             resulting_epoch: 1,
             resulting_offset: 0,
+            new_committed_frontier_guard: zero_guard(0),
             new_framing_resume: FramingResume::Clean,
             reset_time_unix_nano: 5_000,
             audit_reason: String::new(),
@@ -3198,13 +3253,13 @@ fn an_append_past_the_wal_cap_is_refused_and_succeeds_after_compaction() {
     let bounded = || StoreOptions {
         compact_after_bytes: 1,
         fingerprint_bytes: 16,
-        max_tracked_files: u32::from(WAL_MAX_OPS_PER_TX) + 128,
+        max_tracked_files: u32::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX) + 128,
         ..options(&path)
     };
     let mut store = CheckpointStore::open(bounded()).expect("namespace opens");
     let limits = store.limits();
 
-    let maximal: Vec<RegisterFile> = (0..u64::from(WAL_MAX_OPS_PER_TX))
+    let maximal: Vec<RegisterFile> = (0..u64::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX))
         .map(widest_registration)
         .collect();
     let maximal_bytes = Transaction {
@@ -3222,7 +3277,7 @@ fn an_append_past_the_wal_cap_is_refused_and_succeeds_after_compaction() {
 
     // Fill the WAL until one maximal transaction no longer fits within the
     // cap, using the store's own accounting rather than a hard-coded size.
-    let mut filler = u64::from(WAL_MAX_OPS_PER_TX);
+    let mut filler = u64::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX);
     while store.stats().wal_bytes + maximal_bytes <= limits.max_wal_bytes {
         let _registered = store
             .register_files(vec![widest_registration(filler)])
@@ -3263,7 +3318,10 @@ fn an_append_past_the_wal_cap_is_refused_and_succeeds_after_compaction() {
     store.compact().expect("compaction succeeds");
     let outcomes = store.register_files(maximal).expect("registers");
     assert_eq!(outcomes.len(), 1);
-    assert_eq!(outcomes[0].operations, usize::from(WAL_MAX_OPS_PER_TX));
+    assert_eq!(
+        outcomes[0].operations,
+        usize::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX)
+    );
     let wal_bytes = store.stats().wal_bytes;
     assert!(wal_bytes <= limits.max_wal_bytes);
     assert_eq!(
@@ -3273,7 +3331,10 @@ fn an_append_past_the_wal_cap_is_refused_and_succeeds_after_compaction() {
             .len()
     );
     let tracked = store.table().len();
-    assert_eq!(tracked, filled + usize::from(WAL_MAX_OPS_PER_TX));
+    assert_eq!(
+        tracked,
+        filled + usize::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX)
+    );
     drop(store);
 
     let reopened =
@@ -3343,10 +3404,19 @@ fn oversized_wal_transaction_is_rejected_before_decode() {
     let limits = options(&path)
         .limits()
         .expect("the default bounds are representable");
-    let declared_body = u32::try_from(limits.max_transaction_bytes - 7)
+    // `transaction_bytes = body_len + 36-byte header + 4-byte frame CRC`;
+    // choose `body_len` so the computed total is exactly one byte over the
+    // configured bound.
+    let declared_body = u32::try_from(limits.max_transaction_bytes - 39)
         .expect("the default transaction bound fits u32");
-    let mut bytes = encode_wal(0, &[]).expect("the WAL header encodes");
-    bytes.extend_from_slice(&declared_body.to_be_bytes());
+    let mut bytes = encode_wal(0, NAMESPACE_ID, &[]).expect("the WAL header encodes");
+    // A complete 36-byte transaction envelope header with `body_len` (at
+    // its fixed offset 20) set to the oversized value; the bound is
+    // enforced before the (here, absent) body is ever read, so no other
+    // header field needs to be valid.
+    let mut header = vec![0u8; 36];
+    header[20..24].copy_from_slice(&declared_body.to_be_bytes());
+    bytes.extend_from_slice(&header);
     write_bytes(&path.join(wal_file_name(0)), &bytes);
 
     let error =
@@ -3458,8 +3528,8 @@ fn compaction_refuses_to_publish_an_oversized_snapshot() {
     let _registered = store
         .register_files(vec![widest_registration(1), widest_registration(2)])
         .expect("registers");
-    let encoded =
-        encode_snapshot(1, &store.table().snapshot_records()).expect("the current table encodes");
+    let encoded = encode_snapshot(1, NAMESPACE_ID, &store.table().snapshot_records())
+        .expect("the current table encodes");
     store.limits.max_snapshot_bytes =
         u64::try_from(encoded.len() - 1).expect("snapshot length fits u64");
     let limits = store.limits();
@@ -4003,9 +4073,10 @@ fn recovered_wal_rejects_every_reserved_reason_code() {
 
 /// Scenario: a checksum-valid snapshot contains reserved quarantine evidence
 /// and its WAL immediately resets or administratively removes that record.
-/// Guarantees: recovery validates the snapshot before replay, so a later
-/// valid operation cannot erase the forbidden durable value before it is
-/// reported.
+/// Guarantees: recovery validates the snapshot's reachable-state invariants
+/// (including the quarantine evidence `reason_code != 0` invariant) before
+/// replay, so a later valid operation cannot erase the forbidden durable
+/// value before it is reported.
 #[test]
 fn recovered_snapshot_rejects_reserved_reason_before_wal_can_erase_it() {
     let reset = Operation::ResetQuarantinedFile(ResetQuarantinedFile {
@@ -4014,6 +4085,7 @@ fn recovered_snapshot_rejects_reserved_reason_before_wal_can_erase_it() {
         action: ResetQuarantineAction::ResetToBeginning,
         resulting_epoch: 2,
         resulting_offset: 0,
+        new_committed_frontier_guard: zero_guard(0),
         new_framing_resume: FramingResume::Clean,
         reset_time_unix_nano: 4_000,
         audit_reason: "operator reset".to_owned(),
@@ -4043,8 +4115,8 @@ fn recovered_snapshot_rejects_reserved_reason_before_wal_can_erase_it() {
         let snapshot_records = records(&store);
         drop(store);
 
-        let mut snapshot =
-            encode_snapshot(1, &snapshot_records).expect("the valid snapshot encodes");
+        let mut snapshot = encode_snapshot(1, NAMESPACE_ID, &snapshot_records)
+            .expect("the valid snapshot encodes");
         patch_first_snapshot_quarantine_reason(&mut snapshot, REASON_CODE_RESERVED);
         write_bytes(&path.join(snapshot_file_name(1)), &snapshot);
         let transaction = Transaction {
@@ -4067,9 +4139,9 @@ fn recovered_snapshot_rejects_reserved_reason_before_wal_can_erase_it() {
             .expect_err("the snapshot's reserved code fails recovery");
         assert!(matches!(
             error,
-            StoreError::ReservedReasonCodeRecovered {
-                file_id: found,
-                field: "quarantine_file.reason_code",
+            StoreError::Decode {
+                artifact: "snapshot",
+                source: DecodeError::InvalidSnapshotState { file_id: found, .. },
                 ..
             } if found == file_id(1)
         ));

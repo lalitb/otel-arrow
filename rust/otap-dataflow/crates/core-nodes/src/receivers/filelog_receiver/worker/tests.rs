@@ -26,8 +26,8 @@ use super::*;
 use crate::receivers::filelog_receiver::MaxLogSizeBehavior;
 use crate::receivers::filelog_receiver::batching::{FinalizationOutcome, ProgressFrontier};
 use crate::receivers::filelog_receiver::checkpoint::primitives::{
-    FRAMING_PROFILE_VERSION, FramingResume, Locator, QUARANTINE_REASON_DECODE,
-    QUARANTINE_REASON_TRUNCATE,
+    AdvisoryPath, CommittedFrontierGuard, FRAMING_PROFILE_VERSION, FramingResume, Locator,
+    QUARANTINE_REASON_DECODE, QUARANTINE_REASON_TRUNCATE,
 };
 use crate::receivers::filelog_receiver::checkpoint::store::fault::FaultPoint;
 use crate::receivers::filelog_receiver::checkpoint::wal::{RegisterFile, UpdateProgress};
@@ -40,6 +40,17 @@ use crate::receivers::filelog_receiver::discovery::scanner::DiscoveryPlan;
 use crate::receivers::filelog_receiver::discovery::source::spawn_discovery;
 use crate::receivers::filelog_receiver::identity::matcher::{IdentityMatch, ResolvedIdentity};
 use crate::receivers::filelog_receiver::identity::platform::open_candidate;
+
+/// Test-only zero-filled window guard: a deterministic, obviously-fake
+/// `CommittedFrontierGuard` for tests that only need a structurally valid
+/// guard and do not exercise real continuity evidence. Production code
+/// must never do this; see
+/// `crate::receivers::filelog_receiver::checkpoint::primitives::CommittedFrontierWindow`
+/// for the real, non-fabricated runtime window.
+fn zero_guard(committed_offset: u64) -> CommittedFrontierGuard {
+    let window_len = committed_offset.min(64) as usize;
+    CommittedFrontierGuard::compute(committed_offset, &vec![0u8; window_len]).unwrap()
+}
 
 fn runtime_config(
     include: &str,
@@ -526,6 +537,7 @@ async fn acked_split_fragment_resumes_across_worker_restart() {
         checkpoint.framing_resume,
         FramingResume::Continuation {
             record_start_offset: 0,
+            record_end_offset: 0,
             next_fragment_index: 1,
         }
     );
@@ -646,6 +658,74 @@ async fn acked_partial_flush_resumes_cleanly_across_worker_restart() {
     let checkpoint = store.table().iter().next().unwrap().1;
     assert_eq!(checkpoint.committed_offset, 12);
     assert_eq!(checkpoint.framing_resume, FramingResume::Clean);
+}
+
+/// Scenario: two sequential Acks advance one file's committed offset past
+/// its starting nonzero window, with the second advance well below the
+/// 64-byte guard window.
+/// Guarantees: the second Ack's durably persisted committed-frontier guard
+/// is computed from the real trailing bytes spanning both the first Ack's
+/// already-committed region and the newly consumed bytes -- never only the
+/// most recent write's bytes -- proving the reader-retained window combines
+/// prior and new evidence across a real Ack-driven framer reconstruction
+/// (the framer is discarded at every batch seal and rebuilt from the
+/// reader's retained bytes, never a reread of the source).
+#[tokio::test]
+async fn second_ack_below_64_bytes_combines_prior_and_new_committed_frontier_window() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("combine-window.log");
+    let line1 = vec![b'a'; 60];
+    let line2 = vec![b'b'; 10];
+    let mut content = Vec::new();
+    content.extend_from_slice(&line1);
+    content.push(b'\n');
+    content.extend_from_slice(&line2);
+    content.push(b'\n');
+    std::fs::write(&source, &content).unwrap();
+    let namespace = directory.path().join("checkpoint");
+    let runtime = runtime_config(source.to_str().unwrap(), &namespace, 1);
+
+    let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+    let worker = spawn_worker(runtime.clone(), event_tx).unwrap();
+
+    let mut first = receive_batch(&mut events).await;
+    let first_request = decode_worker_records(&mut first.records);
+    assert_eq!(log_body_bytes(only_log(&first_request)), line1.as_slice());
+    worker
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: first.batch_id,
+            attempt: first.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    receive_commit(&mut events).await.3.unwrap();
+
+    let mut second = receive_batch(&mut events).await;
+    let second_request = decode_worker_records(&mut second.records);
+    assert_eq!(log_body_bytes(only_log(&second_request)), line2.as_slice());
+    worker
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: second.batch_id,
+            attempt: second.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    receive_commit(&mut events).await.3.unwrap();
+    stop_worker(worker, &mut events).await.unwrap();
+
+    let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
+    let record = store.table().iter().next().unwrap().1;
+    assert_eq!(record.committed_offset, 72);
+    // The last 64 bytes ending at offset 72: the tail of the first line
+    // (skipping its first 8 bytes, already outside the window) plus its
+    // terminating LF, followed by the entire second line -- prior evidence
+    // from the first Ack combined with new evidence from the second.
+    let expected_bytes = content[content.len() - 64..].to_vec();
+    assert_eq!(expected_bytes.len(), 64);
+    let expected_guard = CommittedFrontierGuard::compute(72, &expected_bytes).unwrap();
+    assert_eq!(record.committed_frontier_guard, expected_guard);
 }
 
 /// Scenario: two readable files share a receiver whose first record exactly
@@ -1134,14 +1214,15 @@ fn due_sync_failure_does_not_count_unattempted_cleanup() {
             file_id,
             file_epoch: 1,
             committed_offset: 0,
+            committed_frontier_guard: zero_guard(0),
             fingerprint: b"0123456789abcdef".to_vec(),
             ignored_header_bytes: 0,
-            locator: Locator::Unspecified,
+            locator: Locator::PosixDevIno { dev: 1, ino: 88 },
             framing_profile_version: FRAMING_PROFILE_VERSION,
             framing_profile_digest: runtime.framing_profile_digest,
             framing_resume: FramingResume::Clean,
             last_seen_time_unix_nano: 1,
-            advisory_path: b"unused.log".to_vec(),
+            advisory_path: AdvisoryPath::from_unix_bytes(b"unused.log").unwrap(),
         }])
         .unwrap();
     worker.store.compact().unwrap();
@@ -1152,6 +1233,7 @@ fn due_sync_failure_does_not_count_unattempted_cleanup() {
             expected_committed_offset: 0,
             expected_file_epoch: 1,
             new_committed_offset: 0,
+            new_committed_frontier_guard: zero_guard(0),
             new_framing_resume: FramingResume::Clean,
             new_last_seen_time_unix_nano: 2,
             finalize: false,
@@ -1382,6 +1464,7 @@ async fn read_new_resets_epoch_before_reading_replacement_stream() {
         expected_committed_offset: 4,
         expected_file_epoch: 1,
         new_committed_offset: 8,
+        new_committed_frontier_guard: zero_guard(8),
         new_framing_resume: FramingResume::Clean,
         new_last_seen_time_unix_nano: record.last_seen_time_unix_nano,
         finalize: false,
@@ -1420,6 +1503,7 @@ fn durable_truncate_quarantine_is_reported_before_reader_cleanup() {
             file_id,
             file_epoch: 1,
             committed_offset: 4,
+            committed_frontier_guard: zero_guard(4),
             fingerprint: evidence.fingerprint.clone(),
             ignored_header_bytes: 0,
             locator,
@@ -1446,6 +1530,7 @@ fn durable_truncate_quarantine_is_reported_before_reader_cleanup() {
                 framing_resume: FramingResume::Clean,
                 lifecycle_state: LifecycleState::Active,
                 matched_by: IdentityMatch::NewDiscovery,
+                committed_frontier_guard: zero_guard(4),
             },
         )
         .unwrap();
@@ -2643,14 +2728,15 @@ fn direct_recordless_finalization_commits_without_otap() {
             file_id,
             file_epoch: 1,
             committed_offset: 17,
+            committed_frontier_guard: zero_guard(17),
             fingerprint: b"0123456789abcdef".to_vec(),
             ignored_header_bytes: 0,
-            locator: Locator::Unspecified,
+            locator: Locator::PosixDevIno { dev: 1, ino: 91 },
             framing_profile_version: FRAMING_PROFILE_VERSION,
             framing_profile_digest: runtime.framing_profile_digest,
             framing_resume: FramingResume::Clean,
             last_seen_time_unix_nano: 10,
-            advisory_path: b"finalize.log".to_vec(),
+            advisory_path: AdvisoryPath::from_unix_bytes(b"finalize.log").unwrap(),
         }])
         .unwrap();
     let mut open = OpenBatch::new(&runtime).unwrap();
@@ -2706,6 +2792,7 @@ fn pre_discovery_path_replacement_uses_per_file_containment() {
             file_id,
             file_epoch: 1,
             committed_offset: 0,
+            committed_frontier_guard: zero_guard(0),
             fingerprint: evidence.fingerprint.clone(),
             ignored_header_bytes: 0,
             locator,
@@ -2732,6 +2819,7 @@ fn pre_discovery_path_replacement_uses_per_file_containment() {
                 framing_resume: FramingResume::Clean,
                 lifecycle_state: LifecycleState::Active,
                 matched_by: IdentityMatch::NewDiscovery,
+                committed_frontier_guard: zero_guard(0),
             },
         )
         .unwrap();

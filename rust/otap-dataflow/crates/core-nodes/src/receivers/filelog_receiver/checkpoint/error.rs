@@ -140,15 +140,63 @@ pub enum DecodeError {
         /// The transaction's sequence number.
         sequence: u64,
     },
-    /// A transaction declared more operations than `WAL_MAX_OPS_PER_TX`.
+    /// A transaction declared more operations than the format allows for
+    /// its class (`WAL_MAX_OPS_PER_TX` for progress-only,
+    /// `WAL_MAX_NON_PROGRESS_OPS_PER_TX` for non-progress).
     #[error("transaction {sequence} declared {op_count} operations, exceeding the maximum {max}")]
     TooManyOperations {
         /// The transaction's sequence number.
         sequence: u64,
         /// The declared operation count.
         op_count: u16,
-        /// The maximum allowed.
+        /// The maximum allowed for this transaction's class.
         max: u16,
+    },
+    /// A transaction's operations mixed `update_progress` with any other
+    /// operation kind; every transaction must be either progress-only or
+    /// non-progress.
+    #[error("transaction {sequence} mixes update_progress with other operation kinds")]
+    MixedTransactionClass {
+        /// The transaction's sequence number.
+        sequence: u64,
+    },
+    /// A transaction's encoded body exceeded `WAL_MAX_TX_BODY_BYTES`
+    /// (16 MiB), or its declared `body_len` was outside
+    /// `TX_MIN_BODY_BYTES..=WAL_MAX_TX_BODY_BYTES`.
+    #[error("transaction {sequence} body is {len} bytes, exceeding the maximum {max}")]
+    TransactionBodyTooLarge {
+        /// The transaction's sequence number.
+        sequence: u64,
+        /// The declared or encoded body length.
+        len: u64,
+        /// The maximum allowed.
+        max: u64,
+    },
+    /// A WAL transaction header's `body_len` and `body_len_complement`
+    /// fields were not bitwise complements of one another.
+    #[error("transaction {sequence} has an inconsistent body_len complement")]
+    LengthComplementMismatch {
+        /// The transaction's sequence number.
+        sequence: u64,
+    },
+    /// A snapshot or WAL header's `namespace_digest` did not equal the
+    /// expected digest for the selected namespace.
+    #[error("{context} namespace_digest does not match the expected namespace")]
+    NamespaceMismatch {
+        /// Which artifact's header carried the mismatched digest.
+        context: &'static str,
+    },
+    /// A CRC-valid, structurally well-formed snapshot record violated a
+    /// documented reachable-state invariant (for example an epoch of `0`,
+    /// an inconsistent committed-frontier guard, or a lifecycle/evidence
+    /// mismatch). This is not a candidate for repair: the record is
+    /// discarded and recovery fails closed.
+    #[error("snapshot record for {file_id:?} violates a reachable-state invariant: {reason}")]
+    InvalidSnapshotState {
+        /// The file identity involved.
+        file_id: FileId,
+        /// A short, specific explanation.
+        reason: &'static str,
     },
     /// A field this format documents as mandatory and non-empty (for
     /// example `reset_quarantined_file.audit_reason`, or
@@ -177,6 +225,18 @@ pub enum DecodeError {
         file_id: FileId,
         /// Which collection this duplicate was found in.
         context: &'static str,
+    },
+    /// An `AdvisoryPath` value violated one of its documented structural
+    /// invariants: a reserved flag bit, an inconsistent kind/length/flag
+    /// combination, or a digest that failed to recompute for a value this
+    /// format requires to be verifiable (`Unavailable` or a complete,
+    /// untruncated path).
+    #[error("advisory path in {field} is structurally invalid: {reason}")]
+    InvalidAdvisoryPath {
+        /// The field name.
+        field: &'static str,
+        /// A short, specific explanation.
+        reason: &'static str,
     },
 }
 
@@ -214,16 +274,34 @@ pub enum EncodeError {
         /// The transaction's sequence number.
         sequence: u64,
     },
-    /// A transaction was constructed with more operations than
-    /// `WAL_MAX_OPS_PER_TX` (mirrors `DecodeError::TooManyOperations`).
+    /// A transaction was constructed with more operations than its class
+    /// allows (mirrors `DecodeError::TooManyOperations`).
     #[error("transaction {sequence} has {op_count} operations, exceeding the maximum {max}")]
     TooManyOperations {
         /// The transaction's sequence number.
         sequence: u64,
         /// The actual operation count.
         op_count: usize,
-        /// The maximum allowed.
+        /// The maximum allowed for this transaction's class.
         max: u16,
+    },
+    /// A transaction's operations mixed `update_progress` with any other
+    /// operation kind (mirrors `DecodeError::MixedTransactionClass`).
+    #[error("transaction {sequence} mixes update_progress with other operation kinds")]
+    MixedTransactionClass {
+        /// The transaction's sequence number.
+        sequence: u64,
+    },
+    /// A transaction's encoded body exceeded `WAL_MAX_TX_BODY_BYTES`
+    /// (16 MiB) (mirrors `DecodeError::TransactionBodyTooLarge`).
+    #[error("transaction {sequence} body is {len} bytes, exceeding the maximum {max}")]
+    TransactionBodyTooLarge {
+        /// The transaction's sequence number.
+        sequence: u64,
+        /// The encoded body length.
+        len: u64,
+        /// The maximum allowed.
+        max: u64,
     },
     /// Two records passed to `encode_snapshot` declared the same
     /// `file_id`; `file_id` must uniquely identify a record within a
@@ -248,6 +326,25 @@ pub enum EncodeError {
     UnexpectedQuarantineEvidence {
         /// The file identity involved.
         file_id: FileId,
+    },
+    /// A record violates a documented reachable-state invariant (mirrors
+    /// `DecodeError::InvalidSnapshotState`): the compaction/encode path
+    /// enforces the same invariants replay enforces, so an in-memory state
+    /// replay could never produce is refused at encode time too.
+    #[error("snapshot record for {file_id:?} violates a reachable-state invariant: {reason}")]
+    InvalidSnapshotState {
+        /// The file identity involved.
+        file_id: FileId,
+        /// A short, specific explanation.
+        reason: &'static str,
+    },
+    /// An `AdvisoryPath` value could not be constructed because the input
+    /// violated a documented invariant (for example empty native path
+    /// bytes/code units, or a length that overflows `u64`).
+    #[error("advisory path is invalid: {reason}")]
+    InvalidAdvisoryPath {
+        /// A short, specific explanation.
+        reason: &'static str,
     },
 }
 
@@ -334,6 +431,27 @@ pub enum ApplyError {
     MissingQuarantineEvidence {
         /// The operation name that encountered the inconsistent record.
         operation: &'static str,
+        /// The file identity involved.
+        file_id: FileId,
+    },
+    /// An operation's `committed_frontier_guard` (or
+    /// `new_committed_frontier_guard`) did not satisfy
+    /// `window_len == min(committed_offset, 64)`.
+    #[error("{operation} for {file_id:?} carries an invalid committed_frontier_guard: {reason}")]
+    InvalidCommittedFrontierGuard {
+        /// The operation name.
+        operation: &'static str,
+        /// The file identity involved.
+        file_id: FileId,
+        /// A short, specific explanation.
+        reason: &'static str,
+    },
+    /// `reset_quarantined_file`'s `action == keep_failed` attempted to
+    /// change any operational field of an already-quarantined record
+    /// (epoch, offset, guard, or framing-resume state); `keep_failed` MUST
+    /// be a byte-identical no-op besides the audit trail.
+    #[error("reset_quarantined_file keep_failed for {file_id:?} would change stored state")]
+    KeepFailedStateChange {
         /// The file identity involved.
         file_id: FileId,
     },

@@ -6,9 +6,10 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{CandidateEvidence, IdentityError};
+use crate::receivers::filelog_receiver::checkpoint::CommittedFrontierGuard;
 use crate::receivers::filelog_receiver::checkpoint::primitives::{
-    ADVISORY_PATH_MAX_BYTES, FRAMING_PROFILE_VERSION, FileId, FramingResume, LifecycleState,
-    Locator, QUARANTINE_REASON_RECOVERY_MISMATCH,
+    AdvisoryPath, FRAMING_PROFILE_VERSION, FileId, FramingResume, LifecycleState, Locator,
+    QUARANTINE_REASON_RECOVERY_MISMATCH,
 };
 use crate::receivers::filelog_receiver::checkpoint::snapshot::SnapshotRecord;
 use crate::receivers::filelog_receiver::checkpoint::store::{
@@ -200,6 +201,17 @@ pub(crate) struct ResolvedIdentity {
     pub(crate) framing_resume: FramingResume,
     pub(crate) lifecycle_state: LifecycleState,
     pub(crate) matched_by: IdentityMatch,
+    /// The durable committed-frontier guard paired with `committed_offset`.
+    ///
+    /// For [`IdentityMatch::NewDiscovery`] or [`IdentityMatch::RecoveryMismatch`],
+    /// this is real evidence already validated against the candidate's own
+    /// handle (empty at offset `0`, or the candidate's exact EOF window).
+    /// For [`IdentityMatch::ExactLocator`] or [`IdentityMatch::UniqueFingerprint`],
+    /// this is the guard already durably recorded for the resumed identity;
+    /// the reader must independently re-validate it against a freshly read
+    /// window once its own descriptor is opened, never trusting the
+    /// candidate's own (differently offset) evidence.
+    pub(crate) committed_frontier_guard: CommittedFrontierGuard,
 }
 
 /// Capacity-aware result for one candidate in reconciliation order.
@@ -349,7 +361,7 @@ fn resolve_with_source_mode(
 
     let mut records_by_locator: HashMap<Locator, Vec<&SnapshotRecord>> = HashMap::new();
     let mut records_by_fingerprint: HashMap<&[u8], Vec<&SnapshotRecord>> = HashMap::new();
-    let mut records_by_path: HashMap<&[u8], Vec<&SnapshotRecord>> = HashMap::new();
+    let mut records_by_path: HashMap<&AdvisoryPath, Vec<&SnapshotRecord>> = HashMap::new();
     let mut known_file_ids = HashSet::with_capacity(store.table().len());
     for (file_id, record) in store.table().iter() {
         let _ = known_file_ids.insert(*file_id);
@@ -362,7 +374,7 @@ fn resolve_with_source_mode(
             .or_default()
             .push(record);
         records_by_path
-            .entry(record.advisory_path.as_slice())
+            .entry(&record.advisory_path)
             .or_default()
             .push(record);
     }
@@ -580,11 +592,6 @@ fn validate_candidates(
                 reason: "candidate fingerprint exceeds configured evidence window",
             });
         }
-        if candidate.advisory_path.len() > ADVISORY_PATH_MAX_BYTES {
-            return Err(IdentityError::InvalidEvidence {
-                reason: "candidate advisory path exceeds the durable byte bound",
-            });
-        }
         let expected_fingerprint_len = u64::from(settings.fingerprint_bytes).min(
             candidate
                 .size
@@ -668,7 +675,7 @@ fn ensure_profile_compatible(
 fn has_unavailable_recovery_evidence(
     candidate: &CandidateEvidence,
     records_by_fingerprint: &HashMap<&[u8], Vec<&SnapshotRecord>>,
-    records_by_path: &HashMap<&[u8], Vec<&SnapshotRecord>>,
+    records_by_path: &HashMap<&AdvisoryPath, Vec<&SnapshotRecord>>,
     live_locators: &HashSet<Locator>,
 ) -> bool {
     if !candidate.fingerprint.is_empty() {
@@ -682,7 +689,7 @@ fn has_unavailable_recovery_evidence(
         }
     }
     records_by_path
-        .get(candidate.advisory_path.as_slice())
+        .get(&candidate.advisory_path)
         .is_some_and(|records| {
             records.iter().any(|record| {
                 record.lifecycle_state == LifecycleState::Active
@@ -740,15 +747,10 @@ fn plan_existing(
     }
     if record.lifecycle_state != LifecycleState::RotatedFinalized
         && (record.last_seen_time_unix_nano != now_unix_nano
-            || record.advisory_path != candidate.advisory_path
-            || (record.lifecycle_state == LifecycleState::Active
-                && record.locator != candidate.locator))
+            || record.advisory_path != candidate.advisory_path)
     {
         operations.push(Operation::UpdateMetadata(UpdateMetadata {
             file_id: record.file_id,
-            locator: (record.lifecycle_state == LifecycleState::Active
-                && record.locator != candidate.locator)
-                .then_some(candidate.locator),
             last_seen_time_unix_nano: now_unix_nano,
             advisory_path: (record.advisory_path != candidate.advisory_path)
                 .then(|| candidate.advisory_path.clone()),
@@ -762,6 +764,7 @@ fn plan_existing(
             framing_resume: record.framing_resume,
             lifecycle_state: record.lifecycle_state,
             matched_by,
+            committed_frontier_guard: record.committed_frontier_guard,
         },
         operations,
     }
@@ -776,10 +779,31 @@ fn plan_new(
     settings: &IdentitySettings,
     now_unix_nano: u64,
 ) -> PlannedIdentity {
+    // `committed_offset` is always `0` (`start_at: beginning`, or a
+    // recovery mismatch under `on_recovery_mismatch: beginning`/`fail`) or
+    // exactly `candidate.size` (`start_at: end`, or a recovery mismatch
+    // under `on_recovery_mismatch: skip_to_end`); see `initial_state`. The
+    // real committed-frontier window is exact empty evidence for the first
+    // case, and the exact trailing window already read from the same
+    // validated handle for the second -- never a fabricated placeholder.
+    let committed_frontier_guard = if committed_offset == 0 {
+        CommittedFrontierGuard::empty()
+    } else {
+        debug_assert_eq!(committed_offset, candidate.size);
+        debug_assert_eq!(
+            candidate.committed_frontier_window.end_offset(),
+            committed_offset
+        );
+        candidate
+            .committed_frontier_window
+            .guard()
+            .expect("candidate window was already validated against candidate.size")
+    };
     let register = RegisterFile {
         file_id,
         file_epoch: 1,
         committed_offset,
+        committed_frontier_guard,
         fingerprint: candidate.fingerprint.clone(),
         ignored_header_bytes: settings.ignored_header_bytes,
         locator: candidate.locator,
@@ -813,6 +837,7 @@ fn plan_new(
                 LifecycleState::Active
             },
             matched_by,
+            committed_frontier_guard,
         },
         operations,
     }

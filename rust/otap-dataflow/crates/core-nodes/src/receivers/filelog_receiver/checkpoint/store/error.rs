@@ -120,6 +120,15 @@ pub enum StoreError {
         /// The generation the artifact declared.
         found: u64,
     },
+    /// A stored artifact's `namespace_digest` did not equal the digest
+    /// expected for the selected `checkpoint.id`.
+    #[error("{artifact} at {path} has a namespace_digest that does not match this namespace")]
+    NamespaceMismatch {
+        /// Which artifact carried the mismatched digest.
+        artifact: &'static str,
+        /// The file that was read.
+        path: PathBuf,
+    },
     /// The selected generation is missing one of its two required files.
     #[error(
         "checkpoint generation {generation} in {dir} is incomplete: \

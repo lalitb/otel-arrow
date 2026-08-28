@@ -11,7 +11,9 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use super::checkpoint::{FileId, Locator, StoreError};
+use super::checkpoint::{
+    AdvisoryPath, CommittedFrontierWindow, EncodeError, FileId, Locator, StoreError,
+};
 
 /// Bounded identity evidence collected from one open regular-file handle.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,8 +25,14 @@ pub(crate) struct CandidateEvidence {
     /// Up to the configured number of evidence bytes after the ignored
     /// prefix.
     pub(crate) fingerprint: Vec<u8>,
-    /// Reversible, platform-specific advisory path bytes.
-    pub(crate) advisory_path: Vec<u8>,
+    /// Reversible, platform-specific advisory path.
+    pub(crate) advisory_path: AdvisoryPath,
+    /// The exact real committed-frontier window ending at `size`, read from
+    /// the same validated handle before registration. Never fabricated:
+    /// registering at offset `0` uses the empty window; a `start_at: end`
+    /// (or recovery-mismatch skip-to-end) registration at offset `size`
+    /// uses this real trailing evidence.
+    pub(crate) committed_frontier_window: CommittedFrontierWindow,
 }
 
 /// Identity collection, matching, or durable-registration failure.
@@ -89,23 +97,35 @@ pub(crate) enum IdentityError {
         /// Size observed from the reopened handle.
         size: u64,
     },
+    /// Reopening a logical reader read a committed-frontier window that
+    /// does not match the durably recorded guard: the size and fingerprint
+    /// prefix are unchanged, but the raw bytes immediately preceding the
+    /// committed offset are not the same evidence the checkpoint recorded.
+    #[error(
+        "filelog reader reopen at {path} committed-frontier window does not match the durable guard"
+    )]
+    ReopenFrontierGuardMismatch {
+        /// Reader path used for the reopen.
+        path: PathBuf,
+    },
     /// The current target cannot provide a supported native locator.
     #[error("filelog handle identity is unsupported on this platform: {path}")]
     UnsupportedPlatform {
         /// Candidate path.
         path: PathBuf,
     },
-    /// Reversible advisory path bytes exceed the durable bound.
-    #[error(
-        "filelog advisory path {path} encodes to {bytes} bytes, exceeding the {maximum}-byte maximum"
-    )]
-    AdvisoryPathTooLong {
+    /// A candidate's native path could not be turned into a durable
+    /// `AdvisoryPath` value (a genuine construction error, for example an
+    /// empty native representation); never raised merely because a path is
+    /// long, since an oversized path is durably truncated evidence, not an
+    /// error.
+    #[error("filelog advisory path {path} is invalid: {source}")]
+    InvalidAdvisoryPath {
         /// Candidate path.
         path: PathBuf,
-        /// Encoded byte count.
-        bytes: usize,
-        /// Durable maximum.
-        maximum: usize,
+        /// The underlying codec construction failure.
+        #[source]
+        source: EncodeError,
     },
     /// Candidate evidence violates the validated identity configuration.
     #[error("invalid filelog identity evidence: {reason}")]

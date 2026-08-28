@@ -10,7 +10,7 @@ use std::path::Path;
 
 use super::{CandidateEvidence, IdentityError};
 use crate::receivers::filelog_receiver::checkpoint::primitives::{
-    ADVISORY_PATH_MAX_BYTES, Locator,
+    AdvisoryPath, COMMITTED_FRONTIER_GUARD_WINDOW_BYTES, CommittedFrontierWindow, Locator,
 };
 
 /// An opened regular-file candidate and the evidence collected from that
@@ -141,6 +141,11 @@ fn open_candidate_at_expected_cancellable(
     else {
         return Ok(None);
     };
+    let Some(committed_frontier_window) =
+        read_committed_frontier_window_cancellable(&file, open_path, size, &mut *cancelled)?
+    else {
+        return Ok(None);
+    };
     let Some(path_after_evidence) =
         resolved_path_from_handle_cancellable(&file, open_path, &mut *cancelled)?
     else {
@@ -163,6 +168,7 @@ fn open_candidate_at_expected_cancellable(
             size,
             fingerprint,
             advisory_path,
+            committed_frontier_window,
         },
     }))
 }
@@ -330,6 +336,50 @@ pub(crate) fn collect_consistent_fingerprint(
     .map(|observation| {
         observation.expect("non-cancellable fingerprint collection cannot be cancelled")
     })
+}
+
+/// Reads the exact real committed-frontier window ending at `size` from
+/// `file`: the last `min(size, 64)` raw bytes immediately preceding it.
+///
+/// This is the real evidence used at registration instead of a fabricated
+/// placeholder: `size` is the exact offset a fresh registration's
+/// `committed_offset` will use for `start_at: end` (or a recovery-mismatch
+/// skip-to-end), so the window read here is byte-for-byte the same
+/// evidence [`CommittedFrontierGuard::compute`] would need.
+///
+/// [`CommittedFrontierGuard::compute`]: crate::receivers::filelog_receiver::checkpoint::primitives::CommittedFrontierGuard::compute
+fn read_committed_frontier_window_cancellable(
+    file: &File,
+    path: &Path,
+    size: u64,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<CommittedFrontierWindow>, IdentityError> {
+    let window_len = size.min(u64::from(COMMITTED_FRONTIER_GUARD_WINDOW_BYTES)) as usize;
+    let offset = size - window_len as u64;
+    let Some(bytes) =
+        read_fingerprint_cancellable(file, offset, window_len, cancelled).map_err(|source| {
+            IdentityError::Io {
+                operation: "read candidate committed-frontier window",
+                path: path.to_path_buf(),
+                source,
+            }
+        })?
+    else {
+        return Ok(None);
+    };
+    if bytes.len() != window_len {
+        // The file shrank between the fingerprint observation and this
+        // read; the caller's own consistency checks (a subsequent
+        // fingerprint re-observation) will reject the candidate.
+        return Err(IdentityError::CandidateChangedDuringIdentity {
+            path: path.to_path_buf(),
+        });
+    }
+    CommittedFrontierWindow::new(size, bytes)
+        .map(Some)
+        .map_err(|_| IdentityError::CandidateChangedDuringIdentity {
+            path: path.to_path_buf(),
+        })
 }
 
 pub(crate) fn collect_consistent_fingerprint_cancellable(
@@ -877,7 +927,7 @@ fn locator_from_handle_cancellable(
 }
 
 #[cfg(unix)]
-fn read_fingerprint_cancellable(
+pub(crate) fn read_fingerprint_cancellable(
     file: &File,
     offset: u64,
     maximum: usize,
@@ -893,7 +943,7 @@ fn read_fingerprint_cancellable(
 }
 
 #[cfg(windows)]
-fn read_fingerprint_cancellable(
+pub(crate) fn read_fingerprint_cancellable(
     file: &File,
     offset: u64,
     maximum: usize,
@@ -909,7 +959,7 @@ fn read_fingerprint_cancellable(
 }
 
 #[cfg(not(any(unix, windows)))]
-fn read_fingerprint_cancellable(
+pub(crate) fn read_fingerprint_cancellable(
     _file: &File,
     _offset: u64,
     _maximum: usize,
@@ -1027,39 +1077,75 @@ pub(crate) fn read_source_at_cancellable(
 }
 
 #[cfg(unix)]
-pub(crate) fn encode_advisory_path(path: &Path) -> Result<Vec<u8>, IdentityError> {
+pub(crate) fn encode_advisory_path(path: &Path) -> Result<AdvisoryPath, IdentityError> {
     use std::os::unix::ffi::OsStrExt;
 
-    bounded_path_bytes(path, path.as_os_str().as_bytes().to_vec())
+    AdvisoryPath::from_unix_bytes(path.as_os_str().as_bytes()).map_err(|source| {
+        IdentityError::InvalidAdvisoryPath {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
 }
 
 #[cfg(windows)]
-pub(crate) fn encode_advisory_path(path: &Path) -> Result<Vec<u8>, IdentityError> {
+pub(crate) fn encode_advisory_path(path: &Path) -> Result<AdvisoryPath, IdentityError> {
     use std::os::windows::ffi::OsStrExt;
 
-    let mut bytes = Vec::new();
-    for code_unit in path.as_os_str().encode_wide() {
-        bytes.extend_from_slice(&code_unit.to_be_bytes());
-    }
-    bounded_path_bytes(path, bytes)
+    // Collects the native UTF-16 code units once; `AdvisoryPath` then
+    // derives the digest and stored suffix directly from this buffer
+    // (streaming the digest per code unit and copying only the bounded
+    // stored suffix), so no further full-length copy is made.
+    let units: Vec<u16> = path.as_os_str().encode_wide().collect();
+    AdvisoryPath::from_windows_utf16_units(&units).map_err(|source| {
+        IdentityError::InvalidAdvisoryPath {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
 }
 
 #[cfg(not(any(unix, windows)))]
-pub(crate) fn encode_advisory_path(path: &Path) -> Result<Vec<u8>, IdentityError> {
+pub(crate) fn encode_advisory_path(path: &Path) -> Result<AdvisoryPath, IdentityError> {
     Err(IdentityError::UnsupportedPlatform {
         path: path.to_path_buf(),
     })
 }
 
-fn bounded_path_bytes(path: &Path, bytes: Vec<u8>) -> Result<Vec<u8>, IdentityError> {
-    if bytes.len() > ADVISORY_PATH_MAX_BYTES {
-        return Err(IdentityError::AdvisoryPathTooLong {
-            path: path.to_path_buf(),
-            bytes: bytes.len(),
-            maximum: ADVISORY_PATH_MAX_BYTES,
-        });
-    }
-    Ok(bytes)
+/// Returns the complete, unbounded native-byte representation of `path`:
+/// raw Unix `OsStr` bytes, or little-endian-serialized Windows UTF-16 code
+/// units.
+///
+/// Distinct from [`encode_advisory_path`]: this never truncates. It is for
+/// callers that still hold the live, complete native path and need a
+/// lossless textual/byte encoding of it (OTAP provenance attributes), not
+/// the bounded durable [`AdvisoryPath`] evidence -- an oversized durable
+/// value is truncated evidence, but a live provenance attribute either
+/// carries the complete path or, per the format's provenance contract,
+/// none of it.
+#[cfg(unix)]
+pub(crate) fn native_path_bytes(path: &Path) -> Result<Vec<u8>, IdentityError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    Ok(path.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(windows)]
+pub(crate) fn native_path_bytes(path: &Path) -> Result<Vec<u8>, IdentityError> {
+    use std::os::windows::ffi::OsStrExt;
+
+    Ok(path
+        .as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect())
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn native_path_bytes(path: &Path) -> Result<Vec<u8>, IdentityError> {
+    Err(IdentityError::UnsupportedPlatform {
+        path: path.to_path_buf(),
+    })
 }
 
 #[cfg(test)]
@@ -1176,7 +1262,8 @@ mod tests {
         let path = directory.path().join(name);
         let encoded = encode_advisory_path(&path).unwrap();
 
-        assert_eq!(encoded, path.as_os_str().as_bytes());
+        assert_eq!(encoded.stored_path_bytes(), path.as_os_str().as_bytes());
+        assert!(!encoded.is_truncated());
     }
 
     #[cfg(unix)]
@@ -1229,16 +1316,33 @@ mod tests {
     }
 
     /// Scenario: a candidate advisory path exceeds the durable format's
-    /// byte bound.
-    /// Guarantees: path encoding reports the exact bound violation instead
-    /// of truncating two distinct paths to the same diagnostic evidence.
+    /// stored-byte bound.
+    /// Guarantees: path encoding still succeeds -- an oversized path is
+    /// durably truncated evidence, never rejected -- and the resulting
+    /// value reports `is_truncated()` with the exact final
+    /// `ADVISORY_PATH_STORED_MAX_BYTES` bytes stored.
     #[test]
-    fn oversized_advisory_path_is_rejected() {
-        let path = PathBuf::from("x".repeat(ADVISORY_PATH_MAX_BYTES + 1));
-        assert!(matches!(
-            encode_advisory_path(&path),
-            Err(IdentityError::AdvisoryPathTooLong { .. })
-        ));
+    fn oversized_advisory_path_is_truncated_not_rejected() {
+        use crate::receivers::filelog_receiver::checkpoint::primitives::ADVISORY_PATH_STORED_MAX_BYTES;
+
+        let long_name = "x".repeat(ADVISORY_PATH_STORED_MAX_BYTES + 1);
+        let path = PathBuf::from(&long_name);
+        let encoded = encode_advisory_path(&path).unwrap();
+        assert!(encoded.is_truncated());
+        assert_eq!(
+            encoded.stored_path_bytes().len(),
+            ADVISORY_PATH_STORED_MAX_BYTES
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let full = path.as_os_str().as_bytes();
+            assert_eq!(encoded.full_path_len(), full.len() as u64);
+            assert_eq!(
+                encoded.stored_path_bytes(),
+                &full[full.len() - ADVISORY_PATH_STORED_MAX_BYTES..]
+            );
+        }
     }
 
     /// Scenario: a fingerprint read reaches an early EOF but the following
@@ -1279,20 +1383,23 @@ mod tests {
     #[cfg(windows)]
     /// Scenario: a Windows advisory path contains both BMP and surrogate-pair
     /// UTF-16 code units.
-    /// Guarantees: path evidence is the reversible big-endian byte encoding
-    /// of native UTF-16 units, not a lossy UTF-8 conversion.
+    /// Guarantees: path evidence is the reversible little-endian byte
+    /// encoding of native UTF-16 units (`AdvisoryPathKind::WindowsUtf16Le`),
+    /// not a lossy UTF-8 conversion.
     #[test]
-    fn windows_advisory_path_uses_big_endian_utf16_units() {
+    fn windows_advisory_path_uses_little_endian_utf16_units() {
         use std::os::windows::ffi::OsStrExt;
 
         let path = PathBuf::from("C:\\logs\\snowman-\u{2603}-rocket-\u{1f680}.log");
         let expected: Vec<u8> = path
             .as_os_str()
             .encode_wide()
-            .flat_map(u16::to_be_bytes)
+            .flat_map(u16::to_le_bytes)
             .collect();
 
-        assert_eq!(encode_advisory_path(&path).unwrap(), expected);
+        let encoded = encode_advisory_path(&path).unwrap();
+        assert_eq!(encoded.stored_path_bytes(), expected.as_slice());
+        assert!(!encoded.is_truncated());
     }
 
     #[cfg(windows)]

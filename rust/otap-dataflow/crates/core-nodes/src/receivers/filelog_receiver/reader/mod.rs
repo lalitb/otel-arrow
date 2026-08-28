@@ -22,16 +22,18 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
-use super::checkpoint::{FileId, FramingResume, LifecycleState, Locator};
+use super::checkpoint::{
+    CommittedFrontierGuard, CommittedFrontierWindow, FileId, FramingResume, LifecycleState, Locator,
+};
 use super::config::RuntimeConfig;
 use super::discovery::DiscoveredCandidate;
 use super::identity::IdentityError;
-use super::identity::matcher::ResolvedIdentity;
+use super::identity::matcher::{IdentityMatch, ResolvedIdentity};
 #[cfg(test)]
 use super::identity::platform::collect_consistent_fingerprint_cancellable_with_hook;
 use super::identity::platform::{
     ReopenCandidate, collect_consistent_fingerprint_cancellable, encode_advisory_path,
-    read_source_at_cancellable, reopen_candidate_at_cancellable,
+    read_fingerprint_cancellable, read_source_at_cancellable, reopen_candidate_at_cancellable,
 };
 use super::lease::{LeaseError, ReceiverLeaseScope, RuntimeFileLease, register_receiver_scope};
 
@@ -565,6 +567,16 @@ struct LogicalReader {
     committed_offset: u64,
     read_offset: u64,
     framing_resume: FramingResume,
+    /// The durable committed-frontier guard paired with `committed_offset`.
+    /// Never mutated except atomically alongside `committed_offset`.
+    committed_frontier_guard: CommittedFrontierGuard,
+    /// The exact real raw bytes backing `committed_frontier_guard`, owned by
+    /// this reader so a framer can be (re)constructed after Ack, Nack
+    /// rewind, batch seal, descriptor eviction, drain rewind, or carry-over
+    /// without ever rereading the source. `None` only until the descriptor
+    /// has been opened at least once and the window validated against
+    /// `committed_frontier_guard`.
+    committed_frontier_window: Option<CommittedFrontierWindow>,
     present: bool,
     ever_opened: bool,
     resident: Option<ResidentReader>,
@@ -848,6 +860,40 @@ impl ReaderTable {
         };
         let file_id = resolved.file_id;
         let locator = candidate.evidence.locator;
+        // A genuinely new identity's committed offset is always either `0`
+        // (`start_at: beginning`) or exactly the candidate's current size
+        // (`start_at: end`, or a recovery-mismatch skip-to-end): in both
+        // cases the candidate's own evidence, already read from this same
+        // validated handle, is real committed-frontier evidence and never
+        // needs to be reread once a descriptor is opened. An existing
+        // durable identity resumed mid-file (`ExactLocator` /
+        // `UniqueFingerprint`) has no such evidence at `committed_offset`;
+        // its real window is read and validated once this reader's own
+        // descriptor is (re)opened, in `open_reader`.
+        let committed_frontier_window = if resolved.committed_offset == 0 {
+            Some(CommittedFrontierWindow::empty())
+        } else if matches!(
+            resolved.matched_by,
+            IdentityMatch::NewDiscovery | IdentityMatch::RecoveryMismatch
+        ) && resolved.committed_offset
+            == candidate.evidence.committed_frontier_window.end_offset()
+        {
+            Some(candidate.evidence.committed_frontier_window.clone())
+        } else {
+            None
+        };
+        // Whenever a window is already trusted, its own guard is the only
+        // consistent evidence for later reopen validation: it is derived
+        // from the exact same bytes, never a separately supplied value that
+        // could disagree with what was actually adopted. Only the deferred
+        // (not yet trusted) case relies on the caller-supplied durable
+        // guard, since no window exists yet to derive one from.
+        let committed_frontier_guard = match &committed_frontier_window {
+            Some(window) => window.guard().map_err(|_| ReaderError::Inconsistent {
+                reason: "trusted committed-frontier window failed to produce a guard",
+            })?,
+            None => resolved.committed_frontier_guard,
+        };
         let reader = LogicalReader {
             file_id,
             file_epoch: resolved.file_epoch,
@@ -859,6 +905,8 @@ impl ReaderTable {
             committed_offset: resolved.committed_offset,
             read_offset: resolved.committed_offset,
             framing_resume: resolved.framing_resume,
+            committed_frontier_guard,
+            committed_frontier_window,
             present: true,
             ever_opened: false,
             resident: None,
@@ -2162,6 +2210,8 @@ impl ReaderTable {
         reader.committed_offset = 0;
         reader.read_offset = 0;
         reader.framing_resume = FramingResume::Clean;
+        reader.committed_frontier_guard = CommittedFrontierGuard::empty();
+        reader.committed_frontier_window = Some(CommittedFrontierWindow::empty());
         reader.durable_fingerprint = fingerprint;
         reader.paused_for_batch = false;
         reader.schedule = if resume {
@@ -2293,6 +2343,82 @@ impl ReaderTable {
             .get(&file_id)
             .map(|reader| reader.locator)
             .ok_or(ReaderError::UnknownFile { file_id })
+    }
+
+    /// Returns the exact real committed-frontier window this reader already
+    /// owns, ending at `committed_offset`: a bounded in-memory clone with no
+    /// filesystem I/O.
+    ///
+    /// This is the seed used to construct a fresh [`Framer`] after Ack, Nack
+    /// rewind, batch seal, descriptor eviction, drain rewind, or carry-over,
+    /// so its rolling checkpoint window is real evidence from the moment of
+    /// construction, never a fabricated placeholder and never a post-Ack
+    /// reread. The window is established once, either at admission (a
+    /// genuinely new identity's own evidence) or at the first
+    /// (re)validated descriptor open (an existing identity's real window
+    /// read and checked against its durable guard); callers only invoke
+    /// this once a read has already been served for the file in this
+    /// worker lifetime, by which point the window is always present.
+    ///
+    /// [`Framer`]: crate::receivers::filelog_receiver::framing::Framer
+    pub(crate) fn committed_frontier_window(
+        &self,
+        file_id: FileId,
+        committed_offset: u64,
+    ) -> Result<CommittedFrontierWindow, ReaderError> {
+        let reader = self
+            .readers
+            .get(&file_id)
+            .ok_or(ReaderError::UnknownFile { file_id })?;
+        let window =
+            reader
+                .committed_frontier_window
+                .as_ref()
+                .ok_or(ReaderError::InvalidState {
+                    file_id,
+                    operation: "read committed-frontier seed window",
+                    state: "committed-frontier window is not yet established",
+                })?;
+        if window.end_offset() != committed_offset {
+            return Err(ReaderError::Inconsistent {
+                reason: "retained committed-frontier window does not match the requested offset",
+            });
+        }
+        Ok(window.clone())
+    }
+
+    /// Installs the exact real committed-frontier window resulting from a
+    /// committed Ack, once the checkpoint append/apply has already
+    /// succeeded and the matching offset/resume advance has been applied.
+    ///
+    /// The caller supplies `None` for a zero-delta or finalize-only update
+    /// (the offset does not change), which leaves the retained window
+    /// unchanged bit-for-bit; it supplies `Some` only when real progress
+    /// happened, with the exact window the batching pipeline already owns
+    /// for the new offset.
+    pub(crate) fn install_committed_frontier_window(
+        &mut self,
+        file_id: FileId,
+        window: Option<CommittedFrontierWindow>,
+    ) -> Result<(), ReaderError> {
+        let Some(window) = window else {
+            return Ok(());
+        };
+        let reader = self
+            .readers
+            .get_mut(&file_id)
+            .ok_or(ReaderError::UnknownFile { file_id })?;
+        if window.end_offset() != reader.committed_offset {
+            return Err(ReaderError::Inconsistent {
+                reason: "installed committed-frontier window does not end at the committed offset",
+            });
+        }
+        let guard = window.guard().map_err(|_| ReaderError::Inconsistent {
+            reason: "installed committed-frontier window failed to produce a guard",
+        })?;
+        reader.committed_frontier_guard = guard;
+        reader.committed_frontier_window = Some(window);
+        Ok(())
     }
 
     /// Refreshes one queued `Updated` event from the retained native handle
@@ -2452,7 +2578,18 @@ impl ReaderTable {
                 reader.matched_path.clone(),
                 reader.locator,
                 reader.durable_fingerprint.clone(),
-                reader.read_offset,
+                // A resumed continuation's exact known record end (when
+                // present) is a durable promise that at least that many
+                // source bytes exist; a reopened handle observably shorter
+                // than it must be classified as truncated before any
+                // continuation bytes are emitted, exactly like a source
+                // shorter than bytes already consumed.
+                match reader.framing_resume {
+                    FramingResume::Continuation {
+                        record_end_offset, ..
+                    } if record_end_offset != 0 => reader.read_offset.max(record_end_offset),
+                    _ => reader.read_offset,
+                },
                 reader.ever_opened,
             )
         };
@@ -2481,6 +2618,44 @@ impl ReaderTable {
                 (opened, outcome)
             }
         };
+        // A truncated outcome is about to reset the reader's committed
+        // frontier (and its window) through the truncate-reset path, so the
+        // stale window never needs revalidation here. Every compatible
+        // nonzero frontier is read from this exact validated handle and
+        // checked against the durable guard before serving data. Offset zero
+        // uses its canonical empty window without filesystem I/O.
+        let refreshed_window = if matches!(outcome, OpenReaderOutcome::Compatible) {
+            let (committed_offset, committed_frontier_guard, needs_refresh) = {
+                let reader = self
+                    .readers
+                    .get(&file_id)
+                    .ok_or(ReaderError::Inconsistent {
+                        reason: "reopened reader disappeared before frontier validation",
+                    })?;
+                (
+                    reader.committed_offset,
+                    reader.committed_frontier_guard,
+                    reader.committed_offset != 0 || reader.committed_frontier_window.is_none(),
+                )
+            };
+            if needs_refresh {
+                let Some(window) = self.read_and_validate_committed_frontier_window(
+                    file_id,
+                    &resolved_path,
+                    &opened.file,
+                    committed_offset,
+                    committed_frontier_guard,
+                )?
+                else {
+                    return Ok(None);
+                };
+                Some(window)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let reader = self
             .readers
             .get_mut(&file_id)
@@ -2497,6 +2672,9 @@ impl ReaderTable {
             last_served_sequence: 0,
         });
         reader.ever_opened = true;
+        if let Some(window) = refreshed_window {
+            reader.committed_frontier_window = Some(window);
+        }
         self.open_count = self
             .open_count
             .checked_add(1)
@@ -2509,6 +2687,65 @@ impl ReaderTable {
             let _opens = increment(&mut self.counters.opens, "reader opens")?;
         }
         Ok(Some(outcome))
+    }
+
+    /// Reads the exact real committed-frontier window ending at
+    /// `committed_offset` from `file` (a just-(re)opened, identity-validated
+    /// handle) and checks its computed guard against `expected_guard`.
+    ///
+    /// Returns `Ok(None)` only on lifecycle cancellation. A window whose
+    /// guard does not match durable evidence is classified through the same
+    /// reopen-mismatch path as an incompatible fingerprint or locator: the
+    /// reader is never allowed to silently resume from evidence that does
+    /// not match what was durably recorded.
+    fn read_and_validate_committed_frontier_window(
+        &self,
+        file_id: FileId,
+        path: &Path,
+        file: &std::fs::File,
+        committed_offset: u64,
+        expected_guard: CommittedFrontierGuard,
+    ) -> Result<Option<CommittedFrontierWindow>, ReaderError> {
+        let window_len = committed_offset.min(u64::from(
+            super::checkpoint::primitives::COMMITTED_FRONTIER_GUARD_WINDOW_BYTES,
+        )) as usize;
+        let offset = committed_offset - window_len as u64;
+        let Some(bytes) = read_fingerprint_cancellable(file, offset, window_len, &mut || {
+            self.cancellation_requested()
+        })
+        .map_err(|source| ReaderError::Read {
+            file_id,
+            path: path.to_path_buf(),
+            source,
+        })?
+        else {
+            return Ok(None);
+        };
+        if bytes.len() != window_len {
+            return Err(ReaderError::Reopen {
+                file_id,
+                source: IdentityError::ReopenFrontierGuardMismatch {
+                    path: path.to_path_buf(),
+                },
+            });
+        }
+        let window = CommittedFrontierWindow::new(committed_offset, bytes).map_err(|_| {
+            ReaderError::Inconsistent {
+                reason: "committed-frontier window length does not match its offset",
+            }
+        })?;
+        let guard = window.guard().map_err(|_| ReaderError::Inconsistent {
+            reason: "committed-frontier window failed to produce a guard",
+        })?;
+        if guard != expected_guard {
+            return Err(ReaderError::Reopen {
+                file_id,
+                source: IdentityError::ReopenFrontierGuardMismatch {
+                    path: path.to_path_buf(),
+                },
+            });
+        }
+        Ok(Some(window))
     }
 
     fn select_lrs_victim(&self, target_file_id: FileId) -> Option<FileId> {

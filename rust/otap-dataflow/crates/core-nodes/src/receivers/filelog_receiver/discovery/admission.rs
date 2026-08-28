@@ -944,11 +944,18 @@ fn candidate_signature(candidate: &DiscoveredCandidate) -> [u8; 32] {
     let evidence = &candidate.evidence;
     let resolved_path = candidate.resolved_path.as_os_str().as_encoded_bytes();
     let mut hasher = blake3::Hasher::new();
-    let _ = hasher.update(b"otel-arrow-filelog-discovery-signature-v2\0");
+    let _ = hasher.update(b"otel-arrow-filelog-discovery-signature-v3\0");
     let _ = hasher.update(&(evidence.fingerprint.len() as u64).to_be_bytes());
     let _ = hasher.update(&evidence.fingerprint);
-    let _ = hasher.update(&(evidence.advisory_path.len() as u64).to_be_bytes());
-    let _ = hasher.update(&evidence.advisory_path);
+    // Hashes the advisory path's full kind, length, and digest alongside
+    // its stored suffix bytes, never the stored suffix alone: two
+    // differently-truncated paths that happen to share a stored suffix
+    // must never collide into the same discovery signature.
+    let _ = hasher.update(&[evidence.advisory_path.kind().to_wire()]);
+    let _ = hasher.update(&evidence.advisory_path.full_path_len().to_be_bytes());
+    let _ = hasher.update(&evidence.advisory_path.full_path_digest());
+    let _ = hasher.update(&(evidence.advisory_path.stored_path_bytes().len() as u64).to_be_bytes());
+    let _ = hasher.update(evidence.advisory_path.stored_path_bytes());
     let _ = hasher.update(&(resolved_path.len() as u64).to_be_bytes());
     let _ = hasher.update(resolved_path);
     *hasher.finalize().as_bytes()

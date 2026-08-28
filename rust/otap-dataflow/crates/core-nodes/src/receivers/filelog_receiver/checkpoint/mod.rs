@@ -43,7 +43,10 @@ mod tests;
 
 pub use apply::{CheckpointTable, TableRecord};
 pub use error::{ApplyError, DecodeError, EncodeError};
-pub use primitives::{FileId, FramingResume, LifecycleState, Locator};
+pub use primitives::{
+    AdvisoryPath, AdvisoryPathKind, CommittedFrontierGuard, CommittedFrontierWindow, FileId,
+    FramingResume, LifecycleState, Locator,
+};
 pub use snapshot::{QuarantineEvidence, SnapshotContents, SnapshotRecord};
 pub use store::error::StoreError;
 pub use store::limits::StoreLimits;

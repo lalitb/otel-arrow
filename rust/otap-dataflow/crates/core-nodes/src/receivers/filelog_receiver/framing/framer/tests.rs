@@ -4,17 +4,26 @@
 use std::time::{Duration, Instant};
 
 use super::{
-    DecodeOutcome, FlushReason, FramedBody, FramedRecord, Framer, FramerError, fragment_id,
+    CommittedFrontierWindow, DecodeOutcome, FlushReason, FramedBody, FramedRecord, Framer,
+    FramerError, fragment_id,
 };
 use crate::receivers::filelog_receiver::{
     Config, Encoding, MaxLogSizeBehavior, OnDecodeError,
-    checkpoint::{FileId, FramingResume},
+    checkpoint::{CommittedFrontierGuard, FileId, FramingResume},
     config::RuntimeConfig,
 };
 
 const FILE_ID: FileId = FileId::from_bytes([
     0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
 ]);
+
+/// Test-only zero-filled committed-frontier seed window: a deterministic,
+/// obviously-fake window for tests that only exercise framing behavior and
+/// do not exercise real continuity evidence.
+fn zero_window(end_offset: u64) -> CommittedFrontierWindow {
+    let window_len = end_offset.min(64) as usize;
+    CommittedFrontierWindow::new(end_offset, vec![0u8; window_len]).unwrap()
+}
 
 #[derive(Clone)]
 struct TestSettings {
@@ -70,6 +79,7 @@ fn framer(settings: &TestSettings, now: Instant) -> Framer {
         0,
         FramingResume::Clean,
         true,
+        zero_window(0),
         now,
     )
     .expect("test framer must construct")
@@ -82,6 +92,17 @@ fn resumed_framer(
     index: u32,
     now: Instant,
 ) -> Result<Framer, FramerError> {
+    resumed_framer_with_end(settings, committed, record_start, 0, index, now)
+}
+
+fn resumed_framer_with_end(
+    settings: &TestSettings,
+    committed: u64,
+    record_start: u64,
+    record_end: u64,
+    index: u32,
+    now: Instant,
+) -> Result<Framer, FramerError> {
     Framer::from_runtime(
         FILE_ID,
         7,
@@ -89,9 +110,11 @@ fn resumed_framer(
         committed,
         FramingResume::Continuation {
             record_start_offset: record_start,
+            record_end_offset: record_end,
             next_fragment_index: index,
         },
         false,
+        zero_window(committed),
         now,
     )
 }
@@ -662,6 +685,7 @@ fn physical_line_split_preserves_all_bytes() {
         outputs[0].resulting_resume,
         FramingResume::Continuation {
             record_start_offset: 0,
+            record_end_offset: 0,
             next_fragment_index: 1
         }
     );
@@ -1106,6 +1130,164 @@ fn impossible_continuation_states_are_rejected() {
     );
 }
 
+/// Scenario: Durable continuation carries a nonzero known record end that
+/// does not lie strictly beyond the committed offset it resumes at.
+/// Guarantees: Both an end equal to and an end before the committed offset
+/// fail construction with a structured error instead of being silently
+/// accepted or reinterpreted as the scan-to-next-LF sentinel.
+#[test]
+fn resumed_continuation_rejects_a_record_end_not_after_the_committed_offset() {
+    let now = Instant::now();
+    let settings = TestSettings {
+        encoding: Encoding::Raw,
+        ..TestSettings::default()
+    };
+    assert_eq!(
+        resumed_framer_with_end(&settings, 10, 0, 10, 1, now).unwrap_err(),
+        FramerError::ContinuationRecordEnd {
+            record_end_offset: 10,
+            committed_offset: 10
+        }
+    );
+    assert_eq!(
+        resumed_framer_with_end(&settings, 10, 0, 5, 1, now).unwrap_err(),
+        FramerError::ContinuationRecordEnd {
+            record_end_offset: 5,
+            committed_offset: 10
+        }
+    );
+}
+
+/// Scenario: A resumed continuation carries a nonzero exact known record
+/// end, and the remaining bytes contain an embedded LF strictly before it.
+/// Guarantees: Normal newline termination is suppressed; the embedded LF is
+/// ordinary bounded-fragment content, and only the fragment whose source
+/// range ends exactly at the known end is `last`, with a resulting Clean
+/// resume.
+#[test]
+fn resumed_continuation_with_known_end_ignores_embedded_lf_and_ends_exactly_at_boundary() {
+    let now = Instant::now();
+    let settings = TestSettings {
+        encoding: Encoding::Raw,
+        ..TestSettings::default()
+    };
+    let mut framer = resumed_framer_with_end(&settings, 4, 0, 10, 1, now)
+        .expect("resume with a known end must construct");
+    let outputs = feed(&mut framer, b"ab\ncde", now);
+    assert_eq!(outputs.len(), 1);
+    let record = &outputs[0];
+    assert_eq!(bytes(record), b"ab\ncde");
+    assert_eq!(record.checkpoint_end, 10);
+    let fragment = record
+        .fragment
+        .as_ref()
+        .expect("a continuing fragment must carry split metadata");
+    assert!(fragment.last);
+    assert_eq!(fragment.index, 1);
+    assert_eq!(record.resulting_resume, FramingResume::Clean);
+}
+
+/// Scenario: A resumed continuation's exact known end still requires more
+/// than one bounded fragment (the remaining span exceeds `max_record_bytes`).
+/// Guarantees: Every nonfinal fragment carries the same known end forward
+/// unchanged (never resetting to the scan-to-next-LF sentinel), fragment
+/// indices are stable and sequential, and only the fragment reaching the
+/// exact end is `last` with a resulting Clean state.
+#[test]
+fn resumed_continuation_with_known_end_emits_multiple_bounded_fragments_before_the_final_one() {
+    let now = Instant::now();
+    let settings = TestSettings {
+        encoding: Encoding::Raw,
+        max_line: 4,
+        max_record: 4,
+        behavior: MaxLogSizeBehavior::Split,
+        ..TestSettings::default()
+    };
+    // Resume at offset 4 with an exact known end 10 bytes further on
+    // (offset 14): more than `max_record_bytes` (4) remains, so it must
+    // still emit bounded nonfinal fragments before the final exact-end one.
+    let mut framer = resumed_framer_with_end(&settings, 4, 0, 14, 1, now)
+        .expect("resume with a known end must construct");
+    let outputs = feed(&mut framer, b"abcdefghij", now);
+    assert_eq!(outputs.len(), 3);
+    assert_eq!(bytes(&outputs[0]), b"abcd");
+    assert_eq!(bytes(&outputs[1]), b"efgh");
+    assert_eq!(bytes(&outputs[2]), b"ij");
+    let first = outputs[0].fragment.as_ref().unwrap();
+    let second = outputs[1].fragment.as_ref().unwrap();
+    let third = outputs[2].fragment.as_ref().unwrap();
+    assert_eq!((first.index, first.last), (1, false));
+    assert_eq!((second.index, second.last), (2, false));
+    assert_eq!((third.index, third.last), (3, true));
+    assert_eq!(first.id, second.id);
+    assert_eq!(second.id, third.id);
+    assert_eq!(
+        outputs[0].resulting_resume,
+        FramingResume::Continuation {
+            record_start_offset: 0,
+            record_end_offset: 14,
+            next_fragment_index: 2,
+        }
+    );
+    assert_eq!(
+        outputs[1].resulting_resume,
+        FramingResume::Continuation {
+            record_start_offset: 0,
+            record_end_offset: 14,
+            next_fragment_index: 3,
+        }
+    );
+    assert_eq!(outputs[2].resulting_resume, FramingResume::Clean);
+    assert_eq!(outputs[2].checkpoint_end, 14);
+}
+
+/// Scenario: A decoded scalar spans a resumed continuation's exact known
+/// record end.
+/// Guarantees: The framer fails closed instead of splitting the scalar or
+/// reinterpreting the boundary as scan-to-next-LF.
+#[test]
+fn resumed_continuation_with_known_end_fails_closed_on_unit_overshoot() {
+    let now = Instant::now();
+    let settings = TestSettings::default();
+    let mut framer = resumed_framer_with_end(&settings, 4, 0, 6, 1, now)
+        .expect("resume with a known end must construct");
+    let err = framer
+        .step("\u{20ac}".as_bytes(), now)
+        .expect_err("a unit crossing the exact record end must fail closed");
+    assert_eq!(
+        err,
+        FramerError::ContinuationRecordEndOverrun {
+            record_end: 6,
+            unit_end: 7,
+        }
+    );
+}
+
+/// Scenario: A resumed continuation with a known end observes only a
+/// temporary EOF before the boundary is reached.
+/// Guarantees: The framer never fabricates a final fragment at the idle
+/// timeout; it remains pending and fully recoverable, exactly like the
+/// scan-to-next-LF case.
+#[test]
+fn resumed_continuation_with_known_end_stays_pending_on_temporary_eof() {
+    let start = Instant::now();
+    let settings = TestSettings {
+        encoding: Encoding::Raw,
+        flush_period: Duration::from_millis(10),
+        ..TestSettings::default()
+    };
+    let mut framer = resumed_framer_with_end(&settings, 4, 0, 10, 1, start)
+        .expect("resume with a known end must construct");
+    assert!(feed(&mut framer, b"ab", start).is_empty());
+    framer.observe_eof(start).unwrap();
+    let poll = framer
+        .poll_timeout(start + Duration::from_millis(10))
+        .unwrap();
+    assert!(poll.output.is_none());
+    assert!(poll.pending);
+    assert_eq!(framer.pending_source_start(), Some(4));
+}
+
 /// Scenario: Durable continuation is paired with truncate policy, or BOM probing is requested at a nonzero offset.
 /// Guarantees: Both impossible runtime/checkpoint combinations fail before decoder or framing state is constructed.
 #[test]
@@ -1133,6 +1315,7 @@ fn incompatible_resume_and_stream_start_states_are_rejected() {
             10,
             FramingResume::Clean,
             true,
+            zero_window(10),
             now,
         )
         .unwrap_err(),
@@ -1242,8 +1425,17 @@ fn construction_preflights_force_flush_deadline() {
     let mut runtime = runtime(&TestSettings::default());
     runtime.framing.force_flush_period = Duration::MAX;
 
-    let error = Framer::new(FILE_ID, 7, &runtime, 0, FramingResume::Clean, true, now)
-        .expect_err("Duration::MAX must exceed the host Instant domain");
+    let error = Framer::new(
+        FILE_ID,
+        7,
+        &runtime,
+        0,
+        FramingResume::Clean,
+        true,
+        zero_window(0),
+        now,
+    )
+    .expect_err("Duration::MAX must exceed the host Instant domain");
     assert_eq!(error, FramerError::DeadlineOverflow);
 }
 
@@ -1372,4 +1564,66 @@ fn rotation_and_drain_hooks_flush_when_enabled() {
         .expect("drain must flush");
     assert_eq!(drain.flush_reason, Some(FlushReason::Drain));
     assert_eq!(text(&drain), "two");
+}
+
+/// Scenario: a Framer is constructed at restart with a real, distinguishable
+/// (non-zero-filled) committed-frontier seed window at a nonzero offset,
+/// then frames a record whose owned span advances by fewer than 64 bytes.
+/// Guarantees: the emitted record's checkpoint window is the exact real
+/// `min(checkpoint_end, 64)` bytes ending at that new offset -- the seed's
+/// retained tail combined with the newly consumed bytes -- never a
+/// fabricated or zero-filled placeholder, and its guard is independently
+/// reproducible from those exact bytes.
+#[test]
+fn checkpoint_window_combines_restart_seed_with_bytes_advanced_below_64() {
+    let now = Instant::now();
+    let settings = TestSettings::default();
+    let seed_bytes: Vec<u8> = (0u8..64).collect();
+    let seed = CommittedFrontierWindow::new(1000, seed_bytes.clone()).unwrap();
+    let mut framer = Framer::new(
+        FILE_ID,
+        7,
+        &runtime(&settings),
+        1000,
+        FramingResume::Clean,
+        false,
+        seed,
+        now,
+    )
+    .expect("restart with a real seed window must construct");
+
+    // Advance by 5 new bytes, well below the 64-byte window.
+    let outputs = feed(&mut framer, b"abcd\n", now);
+    let record = outputs.first().expect("newline framing must emit a record");
+    assert_eq!(record.checkpoint_end, 1005);
+
+    // Expected window: the last 59 seed bytes followed by the 5 newly
+    // consumed bytes, ending at the new offset 1005.
+    let mut expected_bytes = seed_bytes[5..].to_vec();
+    expected_bytes.extend_from_slice(b"abcd\n");
+    assert_eq!(expected_bytes.len(), 64);
+    let expected = CommittedFrontierWindow::new(1005, expected_bytes).unwrap();
+    assert_eq!(record.checkpoint_window, expected);
+    assert_eq!(
+        record.checkpoint_window.guard().unwrap(),
+        expected.guard().unwrap()
+    );
+}
+
+/// Scenario: a Framer restarts at offset zero and frames its first record.
+/// Guarantees: the first checkpoint window is the exact empty window (no
+/// preceding bytes exist), so its guard equals
+/// `CommittedFrontierGuard::empty()`.
+#[test]
+fn checkpoint_window_at_offset_zero_is_exactly_empty() {
+    let now = Instant::now();
+    let mut framer = framer(&TestSettings::default(), now);
+    let outputs = feed(&mut framer, b"abc\n", now);
+    let record = outputs.first().expect("newline framing must emit a record");
+    assert_eq!(record.checkpoint_end, 4);
+    assert_eq!(record.checkpoint_window.bytes(), b"abc\n");
+    assert_eq!(
+        record.checkpoint_window.guard().unwrap(),
+        CommittedFrontierGuard::compute(4, b"abc\n").unwrap()
+    );
 }

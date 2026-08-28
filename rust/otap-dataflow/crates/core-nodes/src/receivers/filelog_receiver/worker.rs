@@ -2177,6 +2177,17 @@ impl WorkerRuntime {
                 active
             }
             None => {
+                let seed_window = match self
+                    .readers_mut()?
+                    .committed_frontier_window(file_id, base.committed_offset)
+                {
+                    Ok(window) => window,
+                    Err(error) => {
+                        self.readers_mut()?
+                            .complete_turn(turn, 0, TurnDisposition::Paused)?;
+                        return Err(WorkerError::Reader(error));
+                    }
+                };
                 let framer = match Framer::from_runtime(
                     file_id,
                     base.file_epoch,
@@ -2184,6 +2195,7 @@ impl WorkerRuntime {
                     base.committed_offset,
                     base.framing_resume,
                     base.committed_offset == 0,
+                    seed_window,
                     now,
                 ) {
                     Ok(framer) => framer,
@@ -3013,6 +3025,10 @@ impl WorkerRuntime {
                 delta.final_offset(),
                 delta.final_framing_resume(),
             );
+            self.readers_mut()?.install_committed_frontier_window(
+                delta.file_id(),
+                delta.final_window().cloned(),
+            )?;
         }
         let resume = !self.drain_requested;
         self.readers_mut()?.finish_preflighted_batch_commit(resume);
@@ -3757,6 +3773,7 @@ fn current_progress(store: &CheckpointStore, file_id: FileId) -> Result<Progress
         committed_offset: record.committed_offset,
         framing_resume: record.framing_resume,
         last_seen_time_unix_nano: record.last_seen_time_unix_nano,
+        committed_frontier_guard: record.committed_frontier_guard,
     })
 }
 

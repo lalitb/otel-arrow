@@ -13,8 +13,9 @@ use super::matcher::{
 };
 use super::*;
 use crate::receivers::filelog_receiver::checkpoint::primitives::{
-    FRAMING_PROFILE_VERSION, FramingResume, LifecycleState, QUARANTINE_REASON_RECOVERY_MISMATCH,
-    WAL_MAX_OPS_PER_TX,
+    AdvisoryPath, CommittedFrontierGuard, CommittedFrontierWindow, FRAMING_PROFILE_VERSION,
+    FramingResume, LifecycleState, QUARANTINE_REASON_RECOVERY_MISMATCH,
+    WAL_MAX_NON_PROGRESS_OPS_PER_TX,
 };
 use crate::receivers::filelog_receiver::checkpoint::store::fault::FaultPoint;
 use crate::receivers::filelog_receiver::checkpoint::store::{CheckpointStore, StoreOptions};
@@ -24,6 +25,25 @@ use crate::receivers::filelog_receiver::checkpoint::wal::{
 use crate::receivers::filelog_receiver::config::{OnRecoveryMismatch, StartAt};
 
 const DIGEST: [u8; 32] = [0x44; 32];
+
+/// Test-only zero-filled window guard: a deterministic, obviously-fake
+/// `CommittedFrontierGuard` for tests that only need a structurally valid
+/// guard and do not exercise real continuity evidence. Production code
+/// must never do this; see
+/// `crate::receivers::filelog_receiver::checkpoint::primitives::CommittedFrontierWindow`
+/// for the real, non-fabricated runtime window.
+fn zero_guard(committed_offset: u64) -> CommittedFrontierGuard {
+    let window_len = committed_offset.min(64) as usize;
+    CommittedFrontierGuard::compute(committed_offset, &vec![0u8; window_len]).unwrap()
+}
+
+/// Test-only zero-filled committed-frontier window: a deterministic,
+/// obviously-fake window for tests that only need a structurally valid
+/// value and do not exercise real continuity evidence.
+fn zero_window(end_offset: u64) -> CommittedFrontierWindow {
+    let window_len = end_offset.min(64) as usize;
+    CommittedFrontierWindow::new(end_offset, vec![0u8; window_len]).unwrap()
+}
 
 fn locator(number: u64) -> Locator {
     Locator::PosixDevIno {
@@ -37,7 +57,28 @@ fn evidence(locator: Locator, size: u64, fingerprint: &[u8], path: &[u8]) -> Can
         locator,
         size,
         fingerprint: fingerprint.to_vec(),
-        advisory_path: path.to_vec(),
+        advisory_path: AdvisoryPath::from_unix_bytes(path).unwrap(),
+        committed_frontier_window: zero_window(size),
+    }
+}
+
+/// Builds evidence carrying a real, distinguishable (non-zero-filled)
+/// committed-frontier window ending at `size`, so a test can tell real
+/// evidence apart from a fabricated placeholder.
+fn evidence_with_window(
+    locator: Locator,
+    size: u64,
+    fingerprint: &[u8],
+    path: &[u8],
+) -> CandidateEvidence {
+    let window_len = size.min(64) as usize;
+    let bytes: Vec<u8> = (0..window_len).map(|index| (index + 1) as u8).collect();
+    CandidateEvidence {
+        locator,
+        size,
+        fingerprint: fingerprint.to_vec(),
+        advisory_path: AdvisoryPath::from_unix_bytes(path).unwrap(),
+        committed_frontier_window: CommittedFrontierWindow::new(size, bytes).unwrap(),
     }
 }
 
@@ -126,7 +167,7 @@ fn admission_resolution_cancellation_preempts_persistence() {
 /// restart recovers exactly the completed registration prefix.
 #[test]
 fn admission_resolution_cancellation_hides_durable_transaction_prefix() {
-    let candidate_count = usize::from(WAL_MAX_OPS_PER_TX) + 1;
+    let candidate_count = usize::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX) + 1;
     let (_directory, mut store, options) = test_store(candidate_count as u32);
     let candidates: Vec<CandidateEvidence> = (0..candidate_count)
         .map(|index| {
@@ -161,13 +202,19 @@ fn admission_resolution_cancellation_hides_durable_transaction_prefix() {
     .unwrap();
 
     assert!(resolutions.is_none());
-    assert_eq!(store.table().len(), usize::from(WAL_MAX_OPS_PER_TX));
+    assert_eq!(
+        store.table().len(),
+        usize::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX)
+    );
     assert_eq!(store.stats().wal_transactions, 1);
     assert_eq!(cancellation_checks, 3);
     drop(store);
 
     let recovered = CheckpointStore::open(options).unwrap();
-    assert_eq!(recovered.table().len(), usize::from(WAL_MAX_OPS_PER_TX));
+    assert_eq!(
+        recovered.table().len(),
+        usize::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX)
+    );
 }
 
 fn registration(
@@ -181,6 +228,7 @@ fn registration(
         file_id,
         file_epoch: 1,
         committed_offset: offset,
+        committed_frontier_guard: zero_guard(offset),
         fingerprint: fingerprint.to_vec(),
         ignored_header_bytes: 0,
         locator,
@@ -188,7 +236,7 @@ fn registration(
         framing_profile_digest: DIGEST,
         framing_resume: FramingResume::Clean,
         last_seen_time_unix_nano: 1,
-        advisory_path: path.to_vec(),
+        advisory_path: AdvisoryPath::from_unix_bytes(path).unwrap(),
     })
 }
 
@@ -278,7 +326,10 @@ fn exact_locator_resumes_checkpoint_and_grows_evidence_without_rekeying() {
     assert_eq!(resolved[0].matched_by, IdentityMatch::ExactLocator);
     let record = store.table().get(&file_id).unwrap();
     assert_eq!(record.fingerprint, b"abcd");
-    assert_eq!(record.advisory_path, b"new.log");
+    assert_eq!(
+        record.advisory_path,
+        AdvisoryPath::from_unix_bytes(b"new.log").unwrap()
+    );
     assert_eq!(record.last_seen_time_unix_nano, 9);
 }
 
@@ -314,8 +365,12 @@ fn exact_locator_accepts_empty_and_short_fingerprints() {
 /// Scenario: one complete fingerprint maps to one active checkpoint whose
 /// old locator is absent, then the same setup is repeated while that old
 /// locator is reported live.
-/// Guarantees: fingerprint reconnect changes only runtime metadata when
-/// unique, and a live prior locator prevents a second reader inheriting it.
+/// Guarantees: fingerprint reconnect matches the identity and updates its
+/// advisory path, but the locator is immutable for a `file_id` in this
+/// version (`update_metadata` never carries one), so it is left exactly as
+/// registered even though the candidate presents a different locator; a
+/// live prior locator still prevents a second reader inheriting the
+/// identity at all.
 #[test]
 fn fingerprint_reconnect_requires_previous_locator_to_be_absent() {
     let (_directory, mut store, _options) = test_store(8);
@@ -333,7 +388,9 @@ fn fingerprint_reconnect_requires_previous_locator_to_be_absent() {
     .unwrap();
     assert_eq!(resolved[0].file_id, file_id);
     assert_eq!(resolved[0].matched_by, IdentityMatch::UniqueFingerprint);
-    assert_eq!(store.table().get(&file_id).unwrap().locator, locator(40));
+    // The locator is immutable for this `file_id`: it stays exactly as
+    // registered, never adopting the reconnecting candidate's locator.
+    assert_eq!(store.table().get(&file_id).unwrap().locator, old_locator);
 
     let (_directory, mut store, _options) = test_store(8);
     register(&mut store, file_id, old_locator, 2, b"same", b"old");
@@ -348,6 +405,58 @@ fn fingerprint_reconnect_requires_previous_locator_to_be_absent() {
     .unwrap();
     assert_ne!(resolved[0].file_id, file_id);
     assert_eq!(resolved[0].matched_by, IdentityMatch::RecoveryMismatch);
+}
+
+/// Scenario: a brand-new file is registered at `start_at: beginning`
+/// (`committed_offset == 0`).
+/// Guarantees: the durable `committed_frontier_guard` is the exact empty
+/// guard, never a fabricated placeholder computed from the offset alone.
+#[test]
+fn new_discovery_at_beginning_uses_the_exact_empty_guard() {
+    let (_directory, mut store, _options) = test_store(8);
+    let candidate = evidence_with_window(locator(20), 0, b"", b"new.log");
+
+    let resolved = resolve_and_persist(
+        &mut store,
+        &[candidate],
+        &no_live_locators(),
+        &settings(),
+        1,
+    )
+    .unwrap();
+
+    assert_eq!(resolved[0].committed_offset, 0);
+    let record = store.table().get(&resolved[0].file_id).unwrap();
+    assert_eq!(
+        record.committed_frontier_guard,
+        CommittedFrontierGuard::empty()
+    );
+}
+
+/// Scenario: a brand-new file is registered at `start_at: end`
+/// (`committed_offset == candidate.size`), with real, non-zero-filled
+/// committed-frontier window evidence read from the same validated handle.
+/// Guarantees: the durable `committed_frontier_guard` is computed from
+/// that exact real evidence -- not a fabricated all-zero placeholder for
+/// the same offset, and not the empty guard.
+#[test]
+fn new_discovery_at_end_uses_the_real_captured_window() {
+    let (_directory, mut store, _options) = test_store(8);
+    let mut config = settings();
+    config.start_at = StartAt::End;
+    let candidate = evidence_with_window(locator(21), 100, b"abcd", b"new.log");
+    let expected_guard = candidate.committed_frontier_window.guard().unwrap();
+
+    let resolved =
+        resolve_and_persist(&mut store, &[candidate], &no_live_locators(), &config, 1).unwrap();
+
+    assert_eq!(resolved[0].committed_offset, 100);
+    let record = store.table().get(&resolved[0].file_id).unwrap();
+    assert_eq!(record.committed_frontier_guard, expected_guard);
+    // A fabricated all-zero window for the same offset must not collide
+    // with the real evidence's guard.
+    let fabricated_guard = zero_guard(100);
+    assert_ne!(record.committed_frontier_guard, fabricated_guard);
 }
 
 /// Scenario: two simultaneously live files have the same complete initial

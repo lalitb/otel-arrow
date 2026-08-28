@@ -11,13 +11,15 @@
 
 use super::error::{DecodeError, EncodeError};
 use super::primitives::{
-    ADVISORY_PATH_MAX_BYTES, AUDIT_REASON_MAX_BYTES, ByteReader, ByteWriter, FINGERPRINT_MAX_BYTES,
-    FORMAT_VERSION, FileId, FramingResume, LifecycleState, Locator, NAMESPACE_ID_MAX_BYTES,
-    REASON_CODE_RESERVED, WAL_MAGIC, WAL_MAX_OPS_PER_TX, crc32c,
+    AUDIT_REASON_MAX_BYTES, AdvisoryPath, ByteReader, ByteWriter, CommittedFrontierGuard,
+    FINGERPRINT_MAX_BYTES, FORMAT_VERSION, FileId, FramingResume, LifecycleState, Locator,
+    NAMESPACE_ID_MAX_BYTES, REASON_CODE_RESERVED, TX_ENVELOPE_VERSION, TX_FRAME_CRC_BYTES,
+    TX_HEADER_BYTES, TX_MAGIC, TX_MIN_BODY_BYTES, WAL_MAGIC, WAL_MAX_NON_PROGRESS_OPS_PER_TX,
+    WAL_MAX_OPS_PER_TX, WAL_MAX_TX_BODY_BYTES, crc32c, namespace_digest,
 };
 
 /// Fixed width of the WAL header, in bytes.
-pub const WAL_HEADER_LEN: usize = 24;
+pub const WAL_HEADER_LEN: usize = 56;
 
 /// `register_file` (`op_code = 0x01`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +30,9 @@ pub struct RegisterFile {
     pub file_epoch: u32,
     /// Initial committed offset.
     pub committed_offset: u64,
+    /// Continuity evidence for the raw source bytes preceding
+    /// `committed_offset`.
+    pub committed_frontier_guard: CommittedFrontierGuard,
     /// Initial fingerprint matching evidence.
     pub fingerprint: Vec<u8>,
     /// Number of header bytes ignored for fingerprinting.
@@ -44,7 +49,7 @@ pub struct RegisterFile {
     /// Initial last-seen timestamp, in Unix nanoseconds.
     pub last_seen_time_unix_nano: u64,
     /// Initial advisory path.
-    pub advisory_path: Vec<u8>,
+    pub advisory_path: AdvisoryPath,
 }
 
 /// `update_progress` (`op_code = 0x02`).
@@ -58,6 +63,9 @@ pub struct UpdateProgress {
     pub expected_file_epoch: u32,
     /// The new committed offset (monotonic, non-decreasing).
     pub new_committed_offset: u64,
+    /// Continuity evidence for the raw source bytes preceding
+    /// `new_committed_offset`, applied atomically with the offset.
+    pub new_committed_frontier_guard: CommittedFrontierGuard,
     /// The new framing-resume state, applied atomically with the offset.
     pub new_framing_resume: FramingResume,
     /// The new last-seen timestamp, in Unix nanoseconds.
@@ -105,17 +113,19 @@ pub struct UpdateFingerprint {
 }
 
 /// `update_metadata` (`op_code = 0x05`).
+///
+/// Never carries a locator: the locator is immutable for a given `file_id`
+/// once registered (a changed locator requires a new `file_id` under the
+/// identity contract, not this operation).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateMetadata {
     /// The file identity this update applies to.
     pub file_id: FileId,
-    /// The replacement runtime locator, if `LOCATOR_PRESENT` is set.
-    pub locator: Option<Locator>,
     /// The new last-seen timestamp, in Unix nanoseconds (always applied to
     /// an `Active` record; applied to a `Quarantined` record as well).
     pub last_seen_time_unix_nano: u64,
     /// The replacement advisory path, if `PATH_PRESENT` is set.
-    pub advisory_path: Option<Vec<u8>>,
+    pub advisory_path: Option<AdvisoryPath>,
 }
 
 /// `quarantine_file` (`op_code = 0x06`).
@@ -187,6 +197,9 @@ pub struct ResetQuarantinedFile {
     pub resulting_epoch: u32,
     /// The resulting committed offset.
     pub resulting_offset: u64,
+    /// Continuity evidence for the raw source bytes preceding
+    /// `resulting_offset`.
+    pub new_committed_frontier_guard: CommittedFrontierGuard,
     /// The resulting framing-resume state; MUST be `Clean` for either reset
     /// action (validated at apply time).
     pub new_framing_resume: FramingResume,
@@ -252,7 +265,6 @@ const OP_QUARANTINE_FILE: u8 = 0x06;
 const OP_RESET_QUARANTINED_FILE: u8 = 0x07;
 const OP_REMOVE_FILE: u8 = 0x08;
 
-const METADATA_LOCATOR_PRESENT: u8 = super::primitives::METADATA_LOCATOR_PRESENT;
 const METADATA_PATH_PRESENT: u8 = super::primitives::METADATA_PATH_PRESENT;
 const METADATA_PRESENCE_RESERVED_MASK: u8 = super::primitives::METADATA_PRESENCE_RESERVED_MASK;
 
@@ -280,6 +292,7 @@ impl Operation {
                 out.write_bytes(&op.file_id.0);
                 out.write_u32(op.file_epoch);
                 out.write_u64(op.committed_offset);
+                op.committed_frontier_guard.write(&mut out);
                 out.write_var_bytes(
                     "register_file.fingerprint",
                     &op.fingerprint,
@@ -291,11 +304,7 @@ impl Operation {
                 out.write_bytes(&op.framing_profile_digest);
                 op.framing_resume.write(&mut out);
                 out.write_u64(op.last_seen_time_unix_nano);
-                out.write_var_bytes(
-                    "register_file.advisory_path",
-                    &op.advisory_path,
-                    ADVISORY_PATH_MAX_BYTES,
-                )?;
+                op.advisory_path.write(&mut out);
             }
             Operation::UpdateProgress(op) => {
                 out.write_u8(OP_UPDATE_PROGRESS);
@@ -303,6 +312,7 @@ impl Operation {
                 out.write_u64(op.expected_committed_offset);
                 out.write_u32(op.expected_file_epoch);
                 out.write_u64(op.new_committed_offset);
+                op.new_committed_frontier_guard.write(&mut out);
                 op.new_framing_resume.write(&mut out);
                 out.write_u64(op.new_last_seen_time_unix_nano);
                 out.write_u8(u8::from(op.finalize));
@@ -337,23 +347,13 @@ impl Operation {
                 out.write_u8(OP_UPDATE_METADATA);
                 out.write_bytes(&op.file_id.0);
                 let mut presence = 0u8;
-                if op.locator.is_some() {
-                    presence |= METADATA_LOCATOR_PRESENT;
-                }
                 if op.advisory_path.is_some() {
                     presence |= METADATA_PATH_PRESENT;
                 }
                 out.write_u8(presence);
-                if let Some(locator) = &op.locator {
-                    locator.write(&mut out);
-                }
                 out.write_u64(op.last_seen_time_unix_nano);
                 if let Some(path) = &op.advisory_path {
-                    out.write_var_bytes(
-                        "update_metadata.advisory_path",
-                        path,
-                        ADVISORY_PATH_MAX_BYTES,
-                    )?;
+                    path.write(&mut out);
                 }
             }
             Operation::QuarantineFile(op) => {
@@ -383,6 +383,7 @@ impl Operation {
                 out.write_u8(op.action.to_wire());
                 out.write_u32(op.resulting_epoch);
                 out.write_u64(op.resulting_offset);
+                op.new_committed_frontier_guard.write(&mut out);
                 op.new_framing_resume.write(&mut out);
                 out.write_u64(op.reset_time_unix_nano);
                 out.write_var_bytes(
@@ -468,6 +469,7 @@ impl Operation {
             OP_REGISTER_FILE => {
                 let file_epoch = input.read_u32()?;
                 let committed_offset = input.read_u64()?;
+                let committed_frontier_guard = CommittedFrontierGuard::read(&mut input)?;
                 let fingerprint = input
                     .read_var_bytes("register_file.fingerprint", FINGERPRINT_MAX_BYTES)?
                     .to_vec();
@@ -478,13 +480,12 @@ impl Operation {
                 framing_profile_digest.copy_from_slice(input.read_exact(32)?);
                 let framing_resume = FramingResume::read(&mut input)?;
                 let last_seen_time_unix_nano = input.read_u64()?;
-                let advisory_path = input
-                    .read_var_bytes("register_file.advisory_path", ADVISORY_PATH_MAX_BYTES)?
-                    .to_vec();
+                let advisory_path = AdvisoryPath::read(&mut input)?;
                 Operation::RegisterFile(RegisterFile {
                     file_id,
                     file_epoch,
                     committed_offset,
+                    committed_frontier_guard,
                     fingerprint,
                     ignored_header_bytes,
                     locator,
@@ -499,6 +500,7 @@ impl Operation {
                 let expected_committed_offset = input.read_u64()?;
                 let expected_file_epoch = input.read_u32()?;
                 let new_committed_offset = input.read_u64()?;
+                let new_committed_frontier_guard = CommittedFrontierGuard::read(&mut input)?;
                 let new_framing_resume = FramingResume::read(&mut input)?;
                 let new_last_seen_time_unix_nano = input.read_u64()?;
                 let finalize = read_bool(&mut input, "update_progress.finalize")?;
@@ -507,6 +509,7 @@ impl Operation {
                     expected_committed_offset,
                     expected_file_epoch,
                     new_committed_offset,
+                    new_committed_frontier_guard,
                     new_framing_resume,
                     new_last_seen_time_unix_nano,
                     finalize,
@@ -557,27 +560,14 @@ impl Operation {
                         value: presence as u64,
                     });
                 }
-                let locator = if presence & METADATA_LOCATOR_PRESENT != 0 {
-                    Some(Locator::read(&mut input)?)
-                } else {
-                    None
-                };
                 let last_seen_time_unix_nano = input.read_u64()?;
                 let advisory_path = if presence & METADATA_PATH_PRESENT != 0 {
-                    Some(
-                        input
-                            .read_var_bytes(
-                                "update_metadata.advisory_path",
-                                ADVISORY_PATH_MAX_BYTES,
-                            )?
-                            .to_vec(),
-                    )
+                    Some(AdvisoryPath::read(&mut input)?)
                 } else {
                     None
                 };
                 Operation::UpdateMetadata(UpdateMetadata {
                     file_id,
-                    locator,
                     last_seen_time_unix_nano,
                     advisory_path,
                 })
@@ -604,6 +594,7 @@ impl Operation {
                 let action = ResetQuarantineAction::from_wire(input.read_u8()?)?;
                 let resulting_epoch = input.read_u32()?;
                 let resulting_offset = input.read_u64()?;
+                let new_committed_frontier_guard = CommittedFrontierGuard::read(&mut input)?;
                 let new_framing_resume = FramingResume::read(&mut input)?;
                 let reset_time_unix_nano = input.read_u64()?;
                 let audit_reason = input.read_var_string(
@@ -621,6 +612,7 @@ impl Operation {
                     action,
                     resulting_epoch,
                     resulting_offset,
+                    new_committed_frontier_guard,
                     new_framing_resume,
                     reset_time_unix_nano,
                     audit_reason: audit_reason.to_owned(),
@@ -727,8 +719,63 @@ fn read_bool(input: &mut ByteReader<'_>, field: &'static str) -> Result<bool, De
     }
 }
 
+/// Whether a transaction's operations are all `update_progress` (the
+/// progress-only class), contain no `update_progress` at all (the
+/// non-progress class), or mix the two (always invalid; see
+/// `docs/filelog-checkpoint-format.md`, "Transaction framing").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionClass {
+    /// Every operation is `update_progress`; bounded by
+    /// [`WAL_MAX_OPS_PER_TX`].
+    ProgressOnly,
+    /// No operation is `update_progress`; bounded by
+    /// [`WAL_MAX_NON_PROGRESS_OPS_PER_TX`].
+    NonProgress,
+}
+
+impl TransactionClass {
+    /// The maximum operation count this class allows.
+    #[must_use]
+    pub const fn max_ops(self) -> u16 {
+        match self {
+            TransactionClass::ProgressOnly => WAL_MAX_OPS_PER_TX,
+            TransactionClass::NonProgress => WAL_MAX_NON_PROGRESS_OPS_PER_TX,
+        }
+    }
+}
+
+/// The outcome of classifying a transaction's operations: exactly one
+/// class, or a reason it has none.
+pub(crate) enum ClassifyOutcome {
+    /// A valid, single-class transaction.
+    Class(TransactionClass),
+    /// The operation list was empty.
+    Empty,
+    /// The operation list mixed `update_progress` with another kind.
+    Mixed,
+}
+
+/// Classifies `operations` as progress-only or non-progress, or reports why
+/// it does not have exactly one class (empty, or a mix of the two).
+pub(crate) fn classify_operations(operations: &[Operation]) -> ClassifyOutcome {
+    if operations.is_empty() {
+        return ClassifyOutcome::Empty;
+    }
+    let progress_count = operations
+        .iter()
+        .filter(|op| matches!(op, Operation::UpdateProgress(_)))
+        .count();
+    if progress_count == operations.len() {
+        ClassifyOutcome::Class(TransactionClass::ProgressOnly)
+    } else if progress_count == 0 {
+        ClassifyOutcome::Class(TransactionClass::NonProgress)
+    } else {
+        ClassifyOutcome::Mixed
+    }
+}
+
 /// One decoded, validated WAL transaction: a strictly sequenced, atomic
-/// batch of one or more operations.
+/// batch of one or more operations, all of one [`TransactionClass`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transaction {
     /// Strictly increasing transaction sequence number (starts at `1`).
@@ -738,63 +785,84 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    fn encode_body(&self) -> Result<Vec<u8>, EncodeError> {
-        // Reject an empty or over-long operation list before writing
-        // anything, rather than silently truncating `operations.len()`
-        // through a lossy `as u16` cast (which would otherwise let a
-        // caller-supplied count greater than `u16::MAX` wrap around to a
-        // smaller, wrong `op_count` on the wire).
-        if self.operations.is_empty() {
-            return Err(EncodeError::EmptyTransaction {
-                sequence: self.sequence,
-            });
-        }
-        if self.operations.len() > WAL_MAX_OPS_PER_TX as usize {
+    /// This transaction's [`TransactionClass`], validated against the
+    /// per-class operation-count maximum.
+    pub(crate) fn class(&self) -> Result<TransactionClass, EncodeError> {
+        let class = match classify_operations(&self.operations) {
+            ClassifyOutcome::Class(class) => class,
+            ClassifyOutcome::Empty => {
+                return Err(EncodeError::EmptyTransaction {
+                    sequence: self.sequence,
+                });
+            }
+            ClassifyOutcome::Mixed => {
+                return Err(EncodeError::MixedTransactionClass {
+                    sequence: self.sequence,
+                });
+            }
+        };
+        if self.operations.len() > class.max_ops() as usize {
             return Err(EncodeError::TooManyOperations {
                 sequence: self.sequence,
                 op_count: self.operations.len(),
-                max: WAL_MAX_OPS_PER_TX,
+                max: class.max_ops(),
             });
         }
-        let mut out = ByteWriter::new();
-        out.write_u64(self.sequence);
-        // Checked exact: bounded above by `WAL_MAX_OPS_PER_TX` (a `u16`)
-        // just above.
-        out.write_u16(self.operations.len() as u16);
-        for operation in &self.operations {
-            out.write_bytes(&operation.encode()?);
-        }
-        Ok(out.into_bytes())
+        Ok(class)
     }
 
-    /// Encodes this transaction as a self-delimiting `tx_len || tx_body ||
-    /// tx_crc32c` frame.
+    fn encode_body(&self) -> Result<Vec<u8>, EncodeError> {
+        // Validates class and the per-class operation-count maximum before
+        // any byte is written.
+        let _class = self.class()?;
+        let mut body = Vec::new();
+        for operation in &self.operations {
+            body.extend_from_slice(&operation.encode()?);
+        }
+        if body.len() as u64 > WAL_MAX_TX_BODY_BYTES {
+            return Err(EncodeError::TransactionBodyTooLarge {
+                sequence: self.sequence,
+                len: body.len() as u64,
+                max: WAL_MAX_TX_BODY_BYTES,
+            });
+        }
+        Ok(body)
+    }
+
+    /// Encodes this transaction as a self-delimiting `transaction_header ||
+    /// operation_body || frame_crc32c` frame: a fixed 36-byte envelope
+    /// header, the concatenated operation frames, then a 4-byte
+    /// `frame_crc32c` covering both.
     pub fn encode(&self) -> Result<Vec<u8>, EncodeError> {
         let body = self.encode_body()?;
+        // `WAL_MAX_TX_BODY_BYTES` (16 MiB) fits comfortably in `u32`, so
+        // this cast is exact after the check in `encode_body`.
+        let body_len = body.len() as u32;
+        let op_count = self.operations.len() as u16; // bounded by `class()` above.
+        let mut header = ByteWriter::new();
+        header.write_bytes(TX_MAGIC);
+        header.write_u16(TX_ENVELOPE_VERSION);
+        header.write_u16(0); // tx_flags, reserved
+        header.write_u64(self.sequence);
+        header.write_u32(body_len);
+        header.write_u32(body_len ^ 0xFFFF_FFFF);
+        header.write_u16(op_count);
+        header.write_u16(0); // reserved
+        let header_crc = crc32c(header.as_bytes());
+        header.write_u32(header_crc);
+        debug_assert_eq!(header.as_bytes().len(), TX_HEADER_BYTES);
+
         let mut out = ByteWriter::new();
-        out.write_u32(body.len() as u32);
+        out.write_bytes(header.as_bytes());
         out.write_bytes(&body);
-        let crc = crc32c(out.as_bytes());
-        out.write_u32(crc);
+        let frame_crc = crc32c(out.as_bytes());
+        out.write_u32(frame_crc);
         Ok(out.into_bytes())
     }
 
-    fn decode_body(body: &[u8]) -> Result<Self, DecodeError> {
-        let mut reader = ByteReader::new(body);
-        let sequence = reader.read_u64()?;
-        let op_count = reader.read_u16()?;
-        if op_count == 0 {
-            return Err(DecodeError::EmptyTransaction { sequence });
-        }
-        if op_count > WAL_MAX_OPS_PER_TX {
-            return Err(DecodeError::TooManyOperations {
-                sequence,
-                op_count,
-                max: WAL_MAX_OPS_PER_TX,
-            });
-        }
+    fn decode_body(sequence: u64, op_count: u16, body: &[u8]) -> Result<Self, DecodeError> {
         let mut operations = Vec::with_capacity(op_count as usize);
-        let mut cursor = reader.position();
+        let mut cursor = 0usize;
         for _ in 0..op_count {
             let remaining = body.get(cursor..).ok_or(DecodeError::Truncated {
                 needed: 1,
@@ -809,6 +877,22 @@ impl Transaction {
                 context: "wal_transaction",
                 declared: body.len(),
                 consumed: cursor,
+            });
+        }
+        let class = match classify_operations(&operations) {
+            ClassifyOutcome::Class(class) => class,
+            ClassifyOutcome::Empty => {
+                return Err(DecodeError::EmptyTransaction { sequence });
+            }
+            ClassifyOutcome::Mixed => {
+                return Err(DecodeError::MixedTransactionClass { sequence });
+            }
+        };
+        if operations.len() > class.max_ops() as usize {
+            return Err(DecodeError::TooManyOperations {
+                sequence,
+                op_count,
+                max: class.max_ops(),
             });
         }
         Ok(Transaction {
@@ -833,35 +917,120 @@ pub(crate) enum TransactionScan {
 /// structurally complete frame with an invalid checksum, or invalid
 /// contents once validated), per
 /// `docs/filelog-checkpoint-format.md#torn-tail-versus-corruption`.
-pub(crate) fn scan_one_transaction(bytes: &[u8]) -> Result<TransactionScan, DecodeError> {
+///
+/// Validates transaction magic, envelope version, flags, reserved, length
+/// complement, header CRC, and `sequence` against `expected_sequence`, all
+/// from the complete 36-byte header, before ever using `body_len` to
+/// classify the remaining suffix as complete or torn -- exactly the
+/// envelope validation order the format specifies. This also means a
+/// CRC-valid header carrying the wrong sequence is always corruption, even
+/// when the body or trailing frame CRC that follows it is itself
+/// incomplete: an out-of-sequence header can never be misclassified as a
+/// torn tail just because what follows it looks truncated.
+pub(crate) fn scan_one_transaction(
+    bytes: &[u8],
+    expected_sequence: u64,
+) -> Result<TransactionScan, DecodeError> {
     let remaining = bytes.len();
-    if remaining < 4 {
+    if remaining < TX_HEADER_BYTES {
         return Ok(TransactionScan::TornTail(remaining));
     }
-    let mut reader = ByteReader::new(bytes);
-    let tx_len = reader.read_u32()? as usize;
-    let after_len = remaining - 4;
-    let needed = tx_len
-        .checked_add(4)
-        .ok_or(DecodeError::ArithmeticOverflow {
-            context: "tx_len + trailing crc",
-        })?;
-    if after_len < needed {
-        return Ok(TransactionScan::TornTail(remaining));
-    }
-    let body = reader.read_exact(tx_len)?;
-    let stored_crc = reader.read_u32()?;
-    let consumed = reader.position();
-    let computed_crc = crc32c(&bytes[0..consumed - 4]);
-    if stored_crc != computed_crc {
-        return Err(DecodeError::ChecksumMismatch {
-            context: "wal_transaction",
-            expected: stored_crc,
-            computed: computed_crc,
+    let header = &bytes[0..TX_HEADER_BYTES];
+    let mut reader = ByteReader::new(header);
+    let magic = reader.read_exact(8)?;
+    if magic != TX_MAGIC {
+        return Err(DecodeError::BadMagic {
+            context: "WAL transaction header",
         });
     }
-    let transaction = Transaction::decode_body(body)?;
-    Ok(TransactionScan::Complete(transaction, consumed))
+    let envelope_version = reader.read_u16()?;
+    if envelope_version != TX_ENVELOPE_VERSION {
+        return Err(DecodeError::UnsupportedFormatVersion {
+            context: "WAL transaction envelope",
+            found: envelope_version,
+        });
+    }
+    let tx_flags = reader.read_u16()?;
+    if tx_flags != 0 {
+        return Err(DecodeError::ReservedFieldNonZero {
+            field: "wal_transaction.tx_flags",
+            value: tx_flags as u64,
+        });
+    }
+    let sequence = reader.read_u64()?;
+    let body_len = reader.read_u32()?;
+    let body_len_complement = reader.read_u32()?;
+    if body_len_complement != (body_len ^ 0xFFFF_FFFF) {
+        return Err(DecodeError::LengthComplementMismatch { sequence });
+    }
+    let op_count = reader.read_u16()?;
+    let reserved = reader.read_u16()?;
+    if reserved != 0 {
+        return Err(DecodeError::ReservedFieldNonZero {
+            field: "wal_transaction.reserved",
+            value: reserved as u64,
+        });
+    }
+    let stored_header_crc = reader.read_u32()?;
+    let computed_header_crc = crc32c(&header[0..32]);
+    if stored_header_crc != computed_header_crc {
+        return Err(DecodeError::ChecksumMismatch {
+            context: "wal_transaction_header",
+            expected: stored_header_crc,
+            computed: computed_header_crc,
+        });
+    }
+    // The header is now fully validated (magic, version, flags, reserved,
+    // length complement, and CRC), so `sequence` is trustworthy evidence,
+    // not yet-unverified bytes. Checking it here, before `body_len` is ever
+    // used to decide torn-tail-versus-complete, ensures a valid-CRC header
+    // with the wrong sequence is always corruption, never a torn tail.
+    if sequence != expected_sequence {
+        return Err(DecodeError::SequenceOutOfOrder {
+            expected: expected_sequence,
+            found: sequence,
+        });
+    }
+    if !(TX_MIN_BODY_BYTES..=WAL_MAX_TX_BODY_BYTES as u32).contains(&body_len) {
+        return Err(DecodeError::TransactionBodyTooLarge {
+            sequence,
+            len: u64::from(body_len),
+            max: WAL_MAX_TX_BODY_BYTES,
+        });
+    }
+    if op_count == 0 {
+        return Err(DecodeError::EmptyTransaction { sequence });
+    }
+    if op_count > WAL_MAX_OPS_PER_TX {
+        return Err(DecodeError::TooManyOperations {
+            sequence,
+            op_count,
+            max: WAL_MAX_OPS_PER_TX,
+        });
+    }
+    let needed = TX_HEADER_BYTES
+        .checked_add(body_len as usize)
+        .and_then(|value| value.checked_add(TX_FRAME_CRC_BYTES))
+        .ok_or(DecodeError::ArithmeticOverflow {
+            context: "36 + body_len + 4",
+        })?;
+    if remaining < needed {
+        return Ok(TransactionScan::TornTail(remaining));
+    }
+    let frame_crc_offset = needed - TX_FRAME_CRC_BYTES;
+    let body = &bytes[TX_HEADER_BYTES..frame_crc_offset];
+    let mut frame_crc_reader = ByteReader::new(&bytes[frame_crc_offset..needed]);
+    let stored_frame_crc = frame_crc_reader.read_u32()?;
+    let computed_frame_crc = crc32c(&bytes[0..frame_crc_offset]);
+    if stored_frame_crc != computed_frame_crc {
+        return Err(DecodeError::ChecksumMismatch {
+            context: "wal_transaction_frame",
+            expected: stored_frame_crc,
+            computed: computed_frame_crc,
+        });
+    }
+    let transaction = Transaction::decode_body(sequence, op_count, body)?;
+    Ok(TransactionScan::Complete(transaction, needed))
 }
 
 /// The fully decoded contents of one WAL generation.
@@ -877,12 +1046,21 @@ pub struct WalContents {
     pub torn_tail_bytes: usize,
 }
 
+/// Validated fixed-width fields from one WAL header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WalHeader {
+    /// Generation declared by the WAL.
+    pub(crate) generation: u64,
+    /// Namespace digest declared by the WAL header.
+    pub(crate) namespace_digest: [u8; 32],
+}
+
 /// Decodes and validates the fixed-width WAL header, returning its
-/// generation.
+/// generation and namespace digest.
 ///
 /// The durable store calls this once, then scans and applies one transaction
 /// at a time so recovery does not retain every decoded operation in memory.
-pub(crate) fn decode_wal_header(bytes: &[u8]) -> Result<u64, DecodeError> {
+pub(crate) fn decode_wal_header(bytes: &[u8]) -> Result<WalHeader, DecodeError> {
     if bytes.len() < WAL_HEADER_LEN {
         return Err(DecodeError::Truncated {
             needed: WAL_HEADER_LEN,
@@ -911,8 +1089,10 @@ pub(crate) fn decode_wal_header(bytes: &[u8]) -> Result<u64, DecodeError> {
         });
     }
     let generation = reader.read_u64()?;
+    let mut namespace_digest = [0u8; 32];
+    namespace_digest.copy_from_slice(reader.read_exact(32)?);
     let stored_header_crc = reader.read_u32()?;
-    let computed_header_crc = crc32c(&bytes[0..20]);
+    let computed_header_crc = crc32c(&bytes[0..52]);
     if stored_header_crc != computed_header_crc {
         return Err(DecodeError::ChecksumMismatch {
             context: "wal_header",
@@ -920,49 +1100,59 @@ pub(crate) fn decode_wal_header(bytes: &[u8]) -> Result<u64, DecodeError> {
             computed: computed_header_crc,
         });
     }
-    Ok(generation)
+    Ok(WalHeader {
+        generation,
+        namespace_digest,
+    })
 }
 
 /// Encodes a complete WAL file (header plus every transaction) for the
-/// given `generation`.
-pub fn encode_wal(generation: u64, transactions: &[Transaction]) -> Result<Vec<u8>, EncodeError> {
+/// given `generation` and `checkpoint_id` (namespace).
+pub fn encode_wal(
+    generation: u64,
+    checkpoint_id: &str,
+    transactions: &[Transaction],
+) -> Result<Vec<u8>, EncodeError> {
     let mut out = ByteWriter::new();
     out.write_bytes(WAL_MAGIC);
     out.write_u16(FORMAT_VERSION);
     out.write_u16(0); // flags, reserved
     out.write_u64(generation);
+    out.write_bytes(&namespace_digest(checkpoint_id));
     let header_crc = crc32c(out.as_bytes());
     out.write_u32(header_crc);
+    debug_assert_eq!(out.as_bytes().len(), WAL_HEADER_LEN);
     for transaction in transactions {
         out.write_bytes(&transaction.encode()?);
     }
     Ok(out.into_bytes())
 }
 
-/// Decodes and validates a complete WAL file: the header (no torn-tail
-/// leniency), then every transaction in strictly increasing sequence order,
-/// applying the torn-tail-versus-corruption distinction to the final
-/// transaction only.
-pub fn decode_wal(bytes: &[u8]) -> Result<WalContents, DecodeError> {
-    let generation = decode_wal_header(bytes)?;
+/// Decodes and validates a complete WAL file against `expected_namespace_digest`:
+/// the header (no torn-tail leniency), then every transaction in strictly
+/// increasing sequence order, applying the torn-tail-versus-corruption
+/// distinction to the final transaction only.
+pub fn decode_wal(
+    bytes: &[u8],
+    expected_namespace_digest: &[u8; 32],
+) -> Result<WalContents, DecodeError> {
+    let header = decode_wal_header(bytes)?;
+    if &header.namespace_digest != expected_namespace_digest {
+        return Err(DecodeError::NamespaceMismatch { context: "WAL" });
+    }
+    let generation = header.generation;
 
     let mut cursor = WAL_HEADER_LEN;
     let mut transactions = Vec::new();
     let mut expected_sequence: u64 = 1;
     let mut torn_tail_bytes = 0usize;
     while cursor < bytes.len() {
-        match scan_one_transaction(&bytes[cursor..])? {
+        match scan_one_transaction(&bytes[cursor..], expected_sequence)? {
             TransactionScan::TornTail(n) => {
                 torn_tail_bytes = n;
                 break;
             }
             TransactionScan::Complete(transaction, consumed) => {
-                if transaction.sequence != expected_sequence {
-                    return Err(DecodeError::SequenceOutOfOrder {
-                        expected: expected_sequence,
-                        found: transaction.sequence,
-                    });
-                }
                 expected_sequence =
                     expected_sequence
                         .checked_add(1)

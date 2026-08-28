@@ -1381,7 +1381,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::receivers::filelog_receiver::checkpoint::primitives::ADVISORY_PATH_MAX_BYTES;
+    use crate::receivers::filelog_receiver::checkpoint::primitives::ADVISORY_PATH_STORED_MAX_BYTES;
     use crate::receivers::filelog_receiver::checkpoint::store::{CheckpointStore, StoreOptions};
     use crate::receivers::filelog_receiver::config::{Config, peak_framer_payload_bytes};
     use crate::receivers::filelog_receiver::telemetry::{WorkerCounter, WorkerGauge};
@@ -2281,7 +2281,7 @@ mod tests {
                 .checked_mul(
                     32usize
                         .checked_add(
-                            ADVISORY_PATH_MAX_BYTES
+                            ADVISORY_PATH_STORED_MAX_BYTES
                                 .checked_mul(2)
                                 .expect("path payload fits usize"),
                         )

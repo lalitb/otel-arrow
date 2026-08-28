@@ -28,8 +28,10 @@
 //! clamped bound would silently claim that an unrepresentable artifact fits.
 
 use super::super::primitives::{
-    ADVISORY_PATH_MAX_BYTES, AUDIT_REASON_MAX_BYTES, FINGERPRINT_MAX_BYTES, NAMESPACE_ID_MAX_BYTES,
-    WAL_MAX_OPS_PER_TX,
+    ADVISORY_PATH_FIXED_BYTES, ADVISORY_PATH_STORED_MAX_BYTES, AUDIT_REASON_MAX_BYTES,
+    COMMITTED_FRONTIER_GUARD_LEN, FINGERPRINT_MAX_BYTES, NAMESPACE_ID_MAX_BYTES,
+    TX_FRAME_CRC_BYTES, TX_HEADER_BYTES, WAL_MAX_NON_PROGRESS_OPS_PER_TX, WAL_MAX_OPS_PER_TX,
+    WAL_MAX_TX_BODY_BYTES,
 };
 use super::super::snapshot::{SNAPSHOT_FOOTER_LEN, SNAPSHOT_HEADER_LEN};
 use super::super::wal::WAL_HEADER_LEN;
@@ -74,17 +76,26 @@ const RECOVERY_REMEDY: &str = "reduce limits.max_tracked_files, \
 /// `record_len` + `record_crc32c` around a snapshot record payload, and
 /// `op_len` + `op_crc32c` around a WAL operation payload.
 const FRAME_OVERHEAD_BYTES: u64 = 4 + 4;
-/// `tx_len` + `sequence` + `op_count` + `tx_crc32c` around a transaction's
-/// operation frames.
-const TRANSACTION_OVERHEAD_BYTES: u64 = 4 + 8 + 2 + 4;
+/// The fixed 36-byte transaction envelope header plus the trailing 4-byte
+/// `frame_crc32c` around a transaction's operation frames. `sequence` and
+/// `op_count` live inside the fixed header in this version, not as
+/// additional body-prefix fields.
+const TRANSACTION_OVERHEAD_BYTES: u64 = TX_HEADER_BYTES as u64 + TX_FRAME_CRC_BYTES as u64;
 /// The `u16` length prefix of one variable-length field.
 const VAR_LEN_PREFIX_BYTES: u64 = 2;
 /// Widest encoded `locator`: the Windows variant (`kind`, `volume_serial`,
 /// 16-byte file id). The POSIX variant is eight bytes shorter.
 const LOCATOR_MAX_BYTES: u64 = 1 + 8 + 16;
 /// Widest encoded `framing_resume`: the continuation variant (`kind`,
-/// `record_start_offset`, `next_fragment_index`).
-const FRAMING_RESUME_MAX_BYTES: u64 = 1 + 8 + 4;
+/// `record_start_offset`, `record_end_offset`, `next_fragment_index`).
+const FRAMING_RESUME_MAX_BYTES: u64 = 1 + 8 + 8 + 4;
+/// Encoded width of `framing_resume` when it is required to be `Clean`
+/// (`register_file`'s initial framing-resume state): the one-byte `kind`
+/// discriminant alone.
+const FRAMING_RESUME_CLEAN_BYTES: u64 = 1;
+/// Fixed encoded width of a `CommittedFrontierGuard`: `window_len: u16`
+/// plus a 32-byte digest.
+const COMMITTED_FRONTIER_GUARD_BYTES: u64 = COMMITTED_FRONTIER_GUARD_LEN as u64;
 /// Quarantine evidence, present only in a quarantined snapshot record:
 /// `reason_code`, `observed_size`, `quarantine_epoch`,
 /// `quarantine_time_unix_nano`.
@@ -103,14 +114,16 @@ const DECODED_TRANSACTION_MULTIPLIER: u64 = 4;
 
 /// Fixed-width part of one snapshot record payload, taking the widest
 /// variant of every union-shaped field and including quarantine evidence:
-/// `file_id`, `file_epoch`, `committed_offset`, the fingerprint length
-/// prefix, `ignored_header_bytes`, `locator`, `framing_profile_version`,
-/// `framing_profile_digest`, `framing_resume`, `lifecycle_state`,
-/// quarantine evidence, `last_seen_time_unix_nano`, and the advisory-path
-/// length prefix.
+/// `file_id`, `file_epoch`, `committed_offset`, the committed-frontier
+/// guard, the fingerprint length prefix, `ignored_header_bytes`, `locator`,
+/// `framing_profile_version`, `framing_profile_digest`, `framing_resume`,
+/// `lifecycle_state`, quarantine evidence, `last_seen_time_unix_nano`, and
+/// the advisory path's fixed encoded overhead (`ADVISORY_PATH_FIXED_BYTES`;
+/// `stored_path_bytes` is added separately by the caller).
 const SNAPSHOT_RECORD_FIXED_BYTES: u64 = 16
     + 4
     + 8
+    + COMMITTED_FRONTIER_GUARD_BYTES
     + VAR_LEN_PREFIX_BYTES
     + 4
     + LOCATOR_MAX_BYTES
@@ -120,37 +133,48 @@ const SNAPSHOT_RECORD_FIXED_BYTES: u64 = 16
     + 1
     + QUARANTINE_EVIDENCE_BYTES
     + 8
-    + VAR_LEN_PREFIX_BYTES;
+    + ADVISORY_PATH_FIXED_BYTES as u64;
 
-/// `register_file` without its fingerprint and advisory-path bytes.
+/// `register_file` without its fingerprint and advisory-path stored bytes.
+/// `framing_resume` is required to be `Clean` at registration time, so this
+/// uses its one-byte encoding rather than the generic widest variant.
 const REGISTER_FILE_FIXED_BYTES: u64 = OPERATION_HEADER_BYTES
     + 4
     + 8
+    + COMMITTED_FRONTIER_GUARD_BYTES
     + VAR_LEN_PREFIX_BYTES
     + 4
     + LOCATOR_MAX_BYTES
     + 2
     + 32
+    + FRAMING_RESUME_CLEAN_BYTES
+    + 8
+    + ADVISORY_PATH_FIXED_BYTES as u64;
+/// `update_progress`, which carries no variable-length field.
+const UPDATE_PROGRESS_BYTES: u64 = OPERATION_HEADER_BYTES
+    + 8
+    + 4
+    + 8
+    + COMMITTED_FRONTIER_GUARD_BYTES
     + FRAMING_RESUME_MAX_BYTES
     + 8
-    + VAR_LEN_PREFIX_BYTES;
-/// `update_progress`, which carries no variable-length field.
-const UPDATE_PROGRESS_BYTES: u64 =
-    OPERATION_HEADER_BYTES + 8 + 4 + 8 + FRAMING_RESUME_MAX_BYTES + 8 + 1;
-/// `reset_after_truncate`, which carries no variable-length field.
+    + 1;
+/// `reset_after_truncate`, which carries no variable-length field and no
+/// wire-level guard (the resulting guard is always the format-defined
+/// empty guard, so it is not carried redundantly).
 const RESET_AFTER_TRUNCATE_BYTES: u64 =
     OPERATION_HEADER_BYTES + 4 + 8 + 4 + 8 + FRAMING_RESUME_MAX_BYTES + 8 + 2;
 /// `update_fingerprint` without its two fingerprint values.
 const UPDATE_FINGERPRINT_FIXED_BYTES: u64 =
     OPERATION_HEADER_BYTES + 4 + VAR_LEN_PREFIX_BYTES + VAR_LEN_PREFIX_BYTES;
-/// `update_metadata` with both optional values present and the advisory
-/// path at its maximum.
+/// `update_metadata` with the advisory path present at its maximum
+/// (truncated) size. Never carries a locator: the locator is immutable for
+/// a `file_id`.
 const UPDATE_METADATA_BYTES: u64 = OPERATION_HEADER_BYTES
     + 1
-    + LOCATOR_MAX_BYTES
     + 8
-    + VAR_LEN_PREFIX_BYTES
-    + ADVISORY_PATH_MAX_BYTES as u64;
+    + ADVISORY_PATH_FIXED_BYTES as u64
+    + ADVISORY_PATH_STORED_MAX_BYTES as u64;
 /// `quarantine_file`, which carries no variable-length field.
 const QUARANTINE_FILE_BYTES: u64 = OPERATION_HEADER_BYTES + 4 + 2 + LOCATOR_MAX_BYTES + 8 + 4 + 8;
 /// `reset_quarantined_file` with the audit reason at its maximum.
@@ -159,6 +183,7 @@ const RESET_QUARANTINED_FILE_BYTES: u64 = OPERATION_HEADER_BYTES
     + 1
     + 4
     + 8
+    + COMMITTED_FRONTIER_GUARD_BYTES
     + FRAMING_RESUME_MAX_BYTES
     + 8
     + VAR_LEN_PREFIX_BYTES
@@ -347,7 +372,7 @@ pub fn snapshot_record_bytes(fingerprint_bytes: u64) -> Result<u64, LimitsError>
         &[
             SNAPSHOT_RECORD_FIXED_BYTES,
             fingerprint_bytes,
-            ADVISORY_PATH_MAX_BYTES as u64,
+            ADVISORY_PATH_STORED_MAX_BYTES as u64,
             FRAME_OVERHEAD_BYTES,
         ],
     )
@@ -375,8 +400,8 @@ pub fn snapshot_bytes(max_tracked_files: u32, fingerprint_bytes: u64) -> Result<
     )
 }
 
-/// The largest complete WAL operation frame across all eight operations,
-/// including its length prefix and checksum.
+/// The largest complete WAL operation frame across all seven non-progress
+/// operations, including its length prefix and checksum.
 pub fn operation_bytes(fingerprint_bytes: u64) -> Result<u64, LimitsError> {
     // Which operation is widest depends on the configuration: with a small
     // fingerprint window `register_file` wins on its advisory path, and
@@ -388,7 +413,7 @@ pub fn operation_bytes(fingerprint_bytes: u64) -> Result<u64, LimitsError> {
         &[
             REGISTER_FILE_FIXED_BYTES,
             fingerprint_bytes,
-            ADVISORY_PATH_MAX_BYTES as u64,
+            ADVISORY_PATH_STORED_MAX_BYTES as u64,
         ],
     )?;
     let update_fingerprint = sum(
@@ -402,7 +427,6 @@ pub fn operation_bytes(fingerprint_bytes: u64) -> Result<u64, LimitsError> {
     )?;
     let widest = [
         register_file,
-        UPDATE_PROGRESS_BYTES,
         RESET_AFTER_TRUNCATE_BYTES,
         update_fingerprint,
         UPDATE_METADATA_BYTES,
@@ -416,21 +440,46 @@ pub fn operation_bytes(fingerprint_bytes: u64) -> Result<u64, LimitsError> {
     sum(WAL_ARTIFACT, WAL_REMEDY, &[widest, FRAME_OVERHEAD_BYTES])
 }
 
-/// The largest single WAL transaction: the format's maximum number of
-/// worst-case operations plus transaction framing.
-pub fn transaction_bytes(fingerprint_bytes: u64) -> Result<u64, LimitsError> {
-    let operation = operation_bytes(fingerprint_bytes)?;
-    let operations =
-        operation
-            .checked_mul(u64::from(WAL_MAX_OPS_PER_TX))
-            .ok_or(LimitsError::Overflow {
-                artifact: WAL_ARTIFACT,
-                remedy: WAL_REMEDY,
-            })?;
+/// The largest complete `update_progress` operation frame, the only
+/// operation kind a progress-only transaction may contain.
+pub fn progress_operation_bytes() -> Result<u64, LimitsError> {
     sum(
         WAL_ARTIFACT,
         WAL_REMEDY,
-        &[operations, TRANSACTION_OVERHEAD_BYTES],
+        &[UPDATE_PROGRESS_BYTES, FRAME_OVERHEAD_BYTES],
+    )
+}
+
+/// The largest single WAL transaction across both transaction classes: the
+/// non-progress class (up to `WAL_MAX_NON_PROGRESS_OPS_PER_TX` worst-case
+/// non-progress operations) and the progress-only class (up to
+/// `WAL_MAX_OPS_PER_TX` worst-case `update_progress` operations), each
+/// additionally capped at the hard `WAL_MAX_TX_BODY_BYTES` (16 MiB) body
+/// limit every transaction class is subject to before allocation.
+pub fn transaction_bytes(fingerprint_bytes: u64) -> Result<u64, LimitsError> {
+    let non_progress_operation = operation_bytes(fingerprint_bytes)?;
+    let non_progress_body = non_progress_operation
+        .checked_mul(u64::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX))
+        .ok_or(LimitsError::Overflow {
+            artifact: WAL_ARTIFACT,
+            remedy: WAL_REMEDY,
+        })?
+        .min(WAL_MAX_TX_BODY_BYTES);
+
+    let progress_operation = progress_operation_bytes()?;
+    let progress_body = progress_operation
+        .checked_mul(u64::from(WAL_MAX_OPS_PER_TX))
+        .ok_or(LimitsError::Overflow {
+            artifact: WAL_ARTIFACT,
+            remedy: WAL_REMEDY,
+        })?
+        .min(WAL_MAX_TX_BODY_BYTES);
+
+    let widest_body = non_progress_body.max(progress_body);
+    sum(
+        WAL_ARTIFACT,
+        WAL_REMEDY,
+        &[widest_body, TRANSACTION_OVERHEAD_BYTES],
     )
 }
 
@@ -481,7 +530,12 @@ fn within_ceiling(
 mod tests {
     use super::*;
     use crate::receivers::filelog_receiver::checkpoint::primitives::{
-        FileId, FramingResume, LifecycleState, Locator,
+        AdvisoryPath, CommittedFrontierGuard, FileId, FramingResume, LifecycleState, Locator,
+        MAX_OPERATION_FRAME_BYTES, MAX_OPERATION_PAYLOAD_BYTES, MAX_PROGRESS_TX_BODY_BYTES,
+        MAX_PROGRESS_TX_FRAME_BYTES, REGISTER_FILE_MAX_OP_PAYLOAD_BYTES,
+        SNAPSHOT_MAX_RECORD_FRAME_BYTES, SNAPSHOT_MAX_RECORD_PAYLOAD_BYTES, TX_MIN_BODY_BYTES,
+        TX_MIN_FRAME_BYTES, UPDATE_PROGRESS_MAX_OP_FRAME_BYTES,
+        UPDATE_PROGRESS_MAX_OP_PAYLOAD_BYTES, WAL_MAX_TX_FRAME_BYTES,
     };
     use crate::receivers::filelog_receiver::checkpoint::snapshot::{
         QuarantineEvidence, SnapshotRecord, encode_snapshot,
@@ -492,22 +546,38 @@ mod tests {
         UpdateMetadata, UpdateProgress, encode_wal,
     };
 
+    /// The test namespace all fixtures in this module encode under.
+    const TEST_NAMESPACE_ID: &str = "limits-test-namespace";
+
     /// The widest locator, resume state, and evidence the codec can emit,
     /// so a fixture is a genuine worst case rather than a typical value.
+    /// `record_start_offset` is `u64::MAX - 1` (rather than `u64::MAX`) so
+    /// it remains strictly less than a `committed_offset` of `u64::MAX`,
+    /// satisfying the reachable-state invariant `SnapshotRecord::encode`
+    /// enforces.
     const WIDEST_LOCATOR: Locator = Locator::WindowsVolumeFileId {
         volume_serial: u64::MAX,
         file_id: [0xAB; 16],
     };
     const WIDEST_RESUME: FramingResume = FramingResume::Continuation {
-        record_start_offset: u64::MAX,
+        record_start_offset: u64::MAX - 1,
+        record_end_offset: 0,
         next_fragment_index: u32::MAX,
     };
+
+    /// The widest encoded `CommittedFrontierGuard`: 34 bytes regardless of
+    /// the offset value, paired with `committed_offset == u64::MAX` (whose
+    /// required window is the full 64 bytes).
+    fn widest_guard() -> CommittedFrontierGuard {
+        CommittedFrontierGuard::compute(u64::MAX, &[0x5A; 64]).unwrap()
+    }
 
     fn widest_snapshot_record(fingerprint_bytes: u64) -> SnapshotRecord {
         SnapshotRecord {
             file_id: FileId([1; 16]),
             file_epoch: u32::MAX,
             committed_offset: u64::MAX,
+            committed_frontier_guard: widest_guard(),
             fingerprint: vec![0x5A; fingerprint_bytes as usize],
             ignored_header_bytes: u32::MAX,
             locator: WIDEST_LOCATOR,
@@ -522,7 +592,11 @@ mod tests {
                 quarantine_time_unix_nano: u64::MAX,
             }),
             last_seen_time_unix_nano: u64::MAX,
-            advisory_path: vec![b'p'; ADVISORY_PATH_MAX_BYTES],
+            advisory_path: AdvisoryPath::from_unix_bytes(&vec![
+                b'p';
+                ADVISORY_PATH_STORED_MAX_BYTES
+            ])
+            .unwrap(),
         }
     }
 
@@ -534,20 +608,26 @@ mod tests {
                 file_id,
                 file_epoch: 1,
                 committed_offset: 0,
+                committed_frontier_guard: CommittedFrontierGuard::empty(),
                 fingerprint: fingerprint.clone(),
                 ignored_header_bytes: u32::MAX,
                 locator: WIDEST_LOCATOR,
                 framing_profile_version: 1,
                 framing_profile_digest: [0x33; 32],
-                framing_resume: WIDEST_RESUME,
+                framing_resume: FramingResume::Clean,
                 last_seen_time_unix_nano: u64::MAX,
-                advisory_path: vec![b'p'; ADVISORY_PATH_MAX_BYTES],
+                advisory_path: AdvisoryPath::from_unix_bytes(&vec![
+                    b'p';
+                    ADVISORY_PATH_STORED_MAX_BYTES
+                ])
+                .unwrap(),
             }),
             Operation::UpdateProgress(UpdateProgress {
                 file_id,
                 expected_committed_offset: 0,
                 expected_file_epoch: 1,
                 new_committed_offset: u64::MAX,
+                new_committed_frontier_guard: widest_guard(),
                 new_framing_resume: WIDEST_RESUME,
                 new_last_seen_time_unix_nano: u64::MAX,
                 finalize: true,
@@ -570,9 +650,11 @@ mod tests {
             }),
             Operation::UpdateMetadata(UpdateMetadata {
                 file_id,
-                locator: Some(WIDEST_LOCATOR),
                 last_seen_time_unix_nano: u64::MAX,
-                advisory_path: Some(vec![b'p'; ADVISORY_PATH_MAX_BYTES]),
+                advisory_path: Some(
+                    AdvisoryPath::from_unix_bytes(&vec![b'p'; ADVISORY_PATH_STORED_MAX_BYTES])
+                        .unwrap(),
+                ),
             }),
             Operation::QuarantineFile(QuarantineFile {
                 file_id,
@@ -589,6 +671,7 @@ mod tests {
                 action: ResetQuarantineAction::ResetToBeginning,
                 resulting_epoch: 2,
                 resulting_offset: u64::MAX,
+                new_committed_frontier_guard: widest_guard(),
                 new_framing_resume: WIDEST_RESUME,
                 reset_time_unix_nano: u64::MAX,
                 audit_reason: "a".repeat(AUDIT_REASON_MAX_BYTES),
@@ -641,28 +724,31 @@ mod tests {
                 record
             })
             .collect();
-        let encoded = encode_snapshot(7, &records).expect("the snapshot encodes");
+        let encoded =
+            encode_snapshot(7, TEST_NAMESPACE_ID, &records).expect("the snapshot encodes");
         assert_eq!(
             snapshot_bytes(4, fingerprint_bytes).expect("the bound is representable"),
             encoded.len() as u64
         );
     }
 
-    /// Scenario: every one of the eight WAL operations is built at its
-    /// widest legal shape and encoded, for a narrow and for a maximal
-    /// fingerprint window.
-    /// Guarantees: `operation_bytes` equals the widest frame the codec
-    /// actually produces in both regimes -- `register_file` dominates for a
-    /// narrow window and `update_fingerprint` for a wide one -- so the WAL
-    /// cap covers any single operation this store may write.
+    /// Scenario: every one of the seven non-progress WAL operations is
+    /// built at its widest legal shape and encoded, for a narrow and for a
+    /// maximal fingerprint window.
+    /// Guarantees: `operation_bytes` equals the widest non-progress frame
+    /// the codec actually produces in both regimes -- `register_file`
+    /// dominates for a narrow window and `update_fingerprint` for a wide
+    /// one -- so the non-progress transaction cap covers any single
+    /// non-progress operation this store may write.
     #[test]
     fn operation_formula_matches_the_widest_encoded_operation() {
         for fingerprint_bytes in [16u64, 1_000, FINGERPRINT_MAX_BYTES as u64] {
             let widest_encoded = widest_operations(fingerprint_bytes)
                 .iter()
+                .filter(|operation| !matches!(operation, Operation::UpdateProgress(_)))
                 .map(|operation| operation.encode().expect("the operation encodes").len() as u64)
                 .max()
-                .expect("there are eight operations");
+                .expect("there are seven non-progress operations");
             assert_eq!(
                 operation_bytes(fingerprint_bytes).expect("the bound is representable"),
                 widest_encoded,
@@ -671,41 +757,62 @@ mod tests {
         }
     }
 
-    /// Scenario: a maximal transaction -- the format's per-transaction
-    /// operation maximum, every operation at its widest -- is encoded into
-    /// a WAL and compared with the transaction and WAL formulas.
+    /// Scenario: a maximal progress-only transaction (`WAL_MAX_OPS_PER_TX`
+    /// widest `update_progress` operations) and a maximal non-progress
+    /// transaction (`WAL_MAX_NON_PROGRESS_OPS_PER_TX` widest non-progress
+    /// operations of one kind) are each encoded into a WAL and compared
+    /// with the transaction and WAL formulas.
     /// Guarantees: `transaction_bytes` covers transaction framing plus the
-    /// full operation count, and `wal_bytes` leaves room for exactly one
-    /// such transaction on top of the compaction threshold, so honoring the
-    /// threshold keeps every WAL readable.
+    /// wider of the two per-class maxima, and `wal_bytes` leaves room for
+    /// exactly one such transaction on top of the compaction threshold, so
+    /// honoring the threshold keeps every WAL readable.
     #[test]
     fn transaction_and_wal_formulas_bound_a_maximal_transaction() {
         let fingerprint_bytes = 16u64;
-        let widest = widest_operations(fingerprint_bytes)
+        let widest_non_progress = widest_operations(fingerprint_bytes)
             .into_iter()
+            .filter(|operation| !matches!(operation, Operation::UpdateProgress(_)))
             .max_by_key(|operation| operation.encode().expect("the operation encodes").len())
-            .expect("there are eight operations");
-        let operations = vec![widest; WAL_MAX_OPS_PER_TX as usize];
-        let transaction = Transaction {
+            .expect("there are seven non-progress operations");
+        let non_progress_operations =
+            vec![widest_non_progress; WAL_MAX_NON_PROGRESS_OPS_PER_TX as usize];
+        let non_progress_tx = Transaction {
             sequence: 1,
-            operations,
+            operations: non_progress_operations,
         };
-        let encoded = transaction.encode().expect("the transaction encodes");
+        let non_progress_encoded = non_progress_tx
+            .encode()
+            .expect("the non-progress transaction encodes");
+
+        let widest_progress = widest_operations(fingerprint_bytes)
+            .into_iter()
+            .find(|operation| matches!(operation, Operation::UpdateProgress(_)))
+            .expect("widest_operations includes update_progress");
+        let progress_operations = vec![widest_progress; WAL_MAX_OPS_PER_TX as usize];
+        let progress_tx = Transaction {
+            sequence: 2,
+            operations: progress_operations,
+        };
+        let progress_encoded = progress_tx
+            .encode()
+            .expect("the progress transaction encodes");
+
+        let bound = transaction_bytes(fingerprint_bytes).expect("the bound is representable");
         assert_eq!(
-            transaction_bytes(fingerprint_bytes).expect("the bound is representable"),
-            encoded.len() as u64
+            bound,
+            non_progress_encoded.len().max(progress_encoded.len()) as u64
         );
 
         let compact_after_bytes = 4_096u64;
-        let wal = encode_wal(0, &[transaction]).expect("the WAL encodes");
-        let bound =
+        let wal = encode_wal(0, TEST_NAMESPACE_ID, &[non_progress_tx]).expect("the WAL encodes");
+        let wal_bound =
             wal_bytes(compact_after_bytes, fingerprint_bytes).expect("the bound is representable");
         assert_eq!(
-            bound,
-            WAL_HEADER_LEN as u64 + compact_after_bytes + encoded.len() as u64
+            wal_bound,
+            WAL_HEADER_LEN as u64 + compact_after_bytes + bound
         );
         assert!(
-            (wal.len() as u64) < bound,
+            (wal.len() as u64) < wal_bound,
             "a maximal transaction must fit under the WAL bound"
         );
     }
@@ -758,8 +865,14 @@ mod tests {
             "the documented default snapshot estimate changed: {} bytes",
             defaults.max_snapshot_bytes
         );
+        // The WAL bound dropped from the pre-Stage-2A estimate now that a
+        // transaction's worst case is the wider of two bounded classes
+        // (256 non-progress operations, or 4096 progress operations, each
+        // additionally capped by the 16 MiB hard transaction-body limit)
+        // rather than `WAL_MAX_OPS_PER_TX` copies of the single widest
+        // operation across all eight kinds.
         assert!(
-            (84 * 1024 * 1024..=85 * 1024 * 1024).contains(&defaults.max_wal_bytes),
+            (64 * 1024 * 1024..=66 * 1024 * 1024).contains(&defaults.max_wal_bytes),
             "the documented default WAL estimate changed: {} bytes",
             defaults.max_wal_bytes
         );
@@ -791,5 +904,134 @@ mod tests {
             StoreLimits::derive(64 * 1024 * 1024, 10_000, FINGERPRINT_MAX_BYTES as u64),
             Err(LimitsError::RecoveryExceedsCeiling { .. })
         ));
+    }
+
+    /// Scenario: the widest snapshot record (maximum fingerprint,
+    /// maximum/truncated advisory path, `Continuation` resume, Windows
+    /// locator, and quarantine evidence) is independently encoded.
+    /// Guarantees: its encoded frame and payload lengths equal the
+    /// authoritative `SNAPSHOT_MAX_RECORD_FRAME_BYTES` /
+    /// `SNAPSHOT_MAX_RECORD_PAYLOAD_BYTES` constants from
+    /// `docs/filelog-checkpoint-format.md` exactly.
+    #[test]
+    fn snapshot_record_constants_match_the_codec() {
+        let record = widest_snapshot_record(FINGERPRINT_MAX_BYTES as u64);
+        let encoded = record.encode().expect("the widest record encodes");
+        assert_eq!(encoded.len() as u64, SNAPSHOT_MAX_RECORD_FRAME_BYTES);
+        assert_eq!(
+            encoded.len() as u64 - FRAME_OVERHEAD_BYTES,
+            SNAPSHOT_MAX_RECORD_PAYLOAD_BYTES
+        );
+    }
+
+    /// Scenario: every non-progress operation is built at its widest legal
+    /// shape with a maximum fingerprint window and independently encoded.
+    /// Guarantees: the widest one's frame and payload lengths equal the
+    /// authoritative `MAX_OPERATION_FRAME_BYTES` /
+    /// `MAX_OPERATION_PAYLOAD_BYTES` constants (dominated by
+    /// `update_fingerprint` at this fingerprint width), and the
+    /// `register_file` operation alone matches
+    /// `REGISTER_FILE_MAX_OP_PAYLOAD_BYTES`.
+    #[test]
+    fn operation_constants_match_the_widest_encoded_operation() {
+        let operations = widest_operations(FINGERPRINT_MAX_BYTES as u64);
+        let widest_encoded = operations
+            .iter()
+            .filter(|operation| !matches!(operation, Operation::UpdateProgress(_)))
+            .map(|operation| operation.encode().expect("the operation encodes").len() as u64)
+            .max()
+            .expect("there are seven non-progress operations");
+        assert_eq!(widest_encoded, MAX_OPERATION_FRAME_BYTES);
+        assert_eq!(
+            widest_encoded - FRAME_OVERHEAD_BYTES,
+            MAX_OPERATION_PAYLOAD_BYTES
+        );
+
+        let register_file_encoded = operations
+            .iter()
+            .find(|operation| matches!(operation, Operation::RegisterFile(_)))
+            .expect("widest_operations includes register_file")
+            .encode()
+            .expect("register_file encodes");
+        assert_eq!(
+            register_file_encoded.len() as u64 - FRAME_OVERHEAD_BYTES,
+            REGISTER_FILE_MAX_OP_PAYLOAD_BYTES
+        );
+    }
+
+    /// Scenario: the widest `update_progress` operation is independently
+    /// encoded, and `WAL_MAX_OPS_PER_TX` copies of it are assembled into
+    /// one progress-only transaction.
+    /// Guarantees: the operation's frame and payload lengths equal
+    /// `UPDATE_PROGRESS_MAX_OP_FRAME_BYTES` /
+    /// `UPDATE_PROGRESS_MAX_OP_PAYLOAD_BYTES`, and the assembled
+    /// transaction's body and frame lengths equal
+    /// `MAX_PROGRESS_TX_BODY_BYTES` / `MAX_PROGRESS_TX_FRAME_BYTES`
+    /// exactly.
+    #[test]
+    fn update_progress_and_progress_transaction_constants_match_the_codec() {
+        let widest_progress = widest_operations(16)
+            .into_iter()
+            .find(|operation| matches!(operation, Operation::UpdateProgress(_)))
+            .expect("widest_operations includes update_progress");
+        let encoded_operation = widest_progress.encode().expect("update_progress encodes");
+        assert_eq!(
+            encoded_operation.len() as u64,
+            UPDATE_PROGRESS_MAX_OP_FRAME_BYTES
+        );
+        assert_eq!(
+            encoded_operation.len() as u64 - FRAME_OVERHEAD_BYTES,
+            UPDATE_PROGRESS_MAX_OP_PAYLOAD_BYTES
+        );
+
+        let progress_tx = Transaction {
+            sequence: 1,
+            operations: vec![widest_progress; WAL_MAX_OPS_PER_TX as usize],
+        };
+        let encoded_tx = progress_tx
+            .encode()
+            .expect("the progress transaction encodes");
+        assert_eq!(encoded_tx.len() as u64, MAX_PROGRESS_TX_FRAME_BYTES);
+        assert_eq!(
+            encoded_tx.len() as u64 - TRANSACTION_OVERHEAD_BYTES,
+            MAX_PROGRESS_TX_BODY_BYTES
+        );
+    }
+
+    /// Scenario: a minimal `update_metadata` operation (`presence_flags`
+    /// clear, no advisory path) is wrapped in its own transaction and
+    /// independently encoded.
+    /// Guarantees: the operation's frame length equals `TX_MIN_BODY_BYTES`
+    /// and the assembled transaction's frame length equals
+    /// `TX_MIN_FRAME_BYTES` exactly -- the smallest legal transaction this
+    /// format allows.
+    #[test]
+    fn minimal_transaction_matches_tx_min_constants() {
+        let minimal_operation = Operation::UpdateMetadata(UpdateMetadata {
+            file_id: FileId([9; 16]),
+            last_seen_time_unix_nano: 0,
+            advisory_path: None,
+        });
+        let encoded_operation = minimal_operation
+            .encode()
+            .expect("a minimal update_metadata encodes");
+        assert_eq!(encoded_operation.len() as u64, u64::from(TX_MIN_BODY_BYTES));
+
+        let tx = Transaction {
+            sequence: 1,
+            operations: vec![minimal_operation],
+        };
+        let encoded_tx = tx.encode().expect("the minimal transaction encodes");
+        assert_eq!(encoded_tx.len() as u64, u64::from(TX_MIN_FRAME_BYTES));
+    }
+
+    /// Scenario: the format's hard transaction-body ceiling
+    /// (`WAL_MAX_TX_BODY_BYTES`, 16 MiB) plus its fixed envelope overhead.
+    /// Guarantees: `WAL_MAX_TX_FRAME_BYTES` equals `36 + 16,777,216 + 4`
+    /// exactly, matching the published constant.
+    #[test]
+    fn wal_max_tx_frame_bytes_matches_the_hard_cap_arithmetic() {
+        assert_eq!(WAL_MAX_TX_FRAME_BYTES, 36 + 16_777_216 + 4);
+        assert_eq!(WAL_MAX_TX_FRAME_BYTES, 16_777_256);
     }
 }

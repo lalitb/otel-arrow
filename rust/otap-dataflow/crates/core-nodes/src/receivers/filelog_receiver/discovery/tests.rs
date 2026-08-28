@@ -14,7 +14,8 @@ use super::scanner::{DiscoveryPlan, FilesystemScanner, validate_candidate_path_s
 use super::source::{spawn_discovery, spawn_discovery_with_shutdown_signal};
 use super::*;
 use crate::receivers::filelog_receiver::checkpoint::primitives::{
-    FRAMING_PROFILE_VERSION, FileId, FramingResume,
+    AdvisoryPath, CommittedFrontierGuard, CommittedFrontierWindow, FRAMING_PROFILE_VERSION, FileId,
+    FramingResume,
 };
 use crate::receivers::filelog_receiver::checkpoint::store::{CheckpointStore, StoreOptions};
 use crate::receivers::filelog_receiver::checkpoint::wal::{Operation, RegisterFile};
@@ -25,6 +26,22 @@ use crate::receivers::filelog_receiver::identity::matcher::{
 
 fn pattern(root: &Path, suffix: &str) -> String {
     root.join(suffix).to_string_lossy().into_owned()
+}
+
+/// Test-only zero-filled window guard: a deterministic, obviously-fake
+/// `CommittedFrontierGuard` for tests that only need a structurally valid
+/// guard and do not exercise real continuity evidence. Production code
+/// must never do this; see
+/// `crate::receivers::filelog_receiver::checkpoint::primitives::CommittedFrontierWindow`
+/// for the real, non-fabricated runtime window.
+fn zero_guard(committed_offset: u64) -> CommittedFrontierGuard {
+    let window_len = committed_offset.min(64) as usize;
+    CommittedFrontierGuard::compute(committed_offset, &vec![0u8; window_len]).unwrap()
+}
+
+fn zero_window(end_offset: u64) -> CommittedFrontierWindow {
+    let window_len = end_offset.min(64) as usize;
+    CommittedFrontierWindow::new(end_offset, vec![0u8; window_len]).unwrap()
 }
 
 #[cfg(unix)]
@@ -109,7 +126,11 @@ fn fake_candidate(number: u64) -> DiscoveredCandidate {
             },
             size: 16,
             fingerprint: vec![number as u8; 16],
-            advisory_path: format!("candidate-{number}.log").into_bytes(),
+            advisory_path: AdvisoryPath::from_unix_bytes(
+                format!("candidate-{number}.log").as_bytes(),
+            )
+            .unwrap(),
+            committed_frontier_window: zero_window(16),
         },
         modified: None,
     }
@@ -1652,6 +1673,7 @@ fn full_tracked_table_still_recovers_existing_identity() {
             file_id,
             file_epoch: 1,
             committed_offset: 2,
+            committed_frontier_guard: zero_guard(2),
             fingerprint: candidate.fingerprint.clone(),
             ignored_header_bytes: 0,
             locator: candidate.locator,

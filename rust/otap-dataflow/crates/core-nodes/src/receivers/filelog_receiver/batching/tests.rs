@@ -45,6 +45,16 @@ fn batch_with_settings(settings: BatchSettings) -> OpenBatch {
     OpenBatch::from_settings(settings).expect("test settings are valid")
 }
 
+fn test_window(end_offset: u64) -> CommittedFrontierWindow {
+    let window_len = end_offset.min(64) as usize;
+    CommittedFrontierWindow::new(end_offset, vec![0u8; window_len]).unwrap()
+}
+
+fn test_guard(committed_offset: u64) -> CommittedFrontierGuard {
+    let window_len = committed_offset.min(64) as usize;
+    CommittedFrontierGuard::compute(committed_offset, &vec![0u8; window_len]).unwrap()
+}
+
 fn input(seed: u64, start: u64, end: u64, base: u64, ready_at: Instant) -> RecordInput {
     let path = PathBuf::from(format!("/var/log/file-{seed}.log"));
     RecordInput {
@@ -59,6 +69,7 @@ fn input(seed: u64, start: u64, end: u64, base: u64, ready_at: Instant) -> Recor
             fragment: None,
             truncated: false,
             discarded_source_bytes: 0,
+            checkpoint_window: test_window(end),
         },
         file_id: file_id(seed),
         progress_base: ProgressBase {
@@ -66,6 +77,7 @@ fn input(seed: u64, start: u64, end: u64, base: u64, ready_at: Instant) -> Recor
             committed_offset: base,
             framing_resume: FramingResume::Clean,
             last_seen_time_unix_nano: 0,
+            committed_frontier_guard: test_guard(base),
         },
         matched_path: path.clone(),
         resolved_path: path,
@@ -237,6 +249,7 @@ fn projects_all_split_and_decode_attributes_with_exact_types() {
     });
     record.framed.resulting_resume = FramingResume::Continuation {
         record_start_offset: 10,
+        record_end_offset: 0,
         next_fragment_index: 1,
     };
     record.framed.decode_outcome = DecodeOutcome::PreserveRaw { count: 7 };
@@ -435,17 +448,21 @@ fn unix_path_encoding_is_reversible_and_literal_prefix_is_unambiguous() {
 }
 
 #[cfg(unix)]
-/// Scenario: invalid Unix path evidence is exactly at and one byte above the
-/// 4,096-byte native advisory-path cap.
-/// Guarantees: the maximum expands to prefix plus three bytes per native
-/// byte and is accepted; the over-cap path fails before Arrow mutation.
+/// Scenario: live Unix path evidence is exactly at and one byte above the
+/// durable format's 4,096-byte advisory-path stored maximum.
+/// Guarantees: the OTAP provenance attribute always carries the complete
+/// live native path losslessly -- the durable stored-byte cap bounds only
+/// checkpointed `AdvisoryPath` evidence, never a live provenance attribute
+/// -- so both lengths expand to prefix plus three bytes per native byte
+/// and succeed.
 #[test]
-fn unix_path_encoding_enforces_native_cap_and_worst_case_expansion() {
+fn unix_path_encoding_is_unbounded_for_live_full_paths() {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
 
     let now = Instant::now();
-    let maximum_raw = vec![0xff; super::super::checkpoint::primitives::ADVISORY_PATH_MAX_BYTES];
+    let maximum_raw =
+        vec![0xff; super::super::checkpoint::primitives::ADVISORY_PATH_STORED_MAX_BYTES];
     let maximum_path = PathBuf::from(OsString::from_vec(maximum_raw.clone()));
     let mut maximum = empty_input(22, 0, 1, 0, now);
     maximum.matched_path = maximum_path.clone();
@@ -459,28 +476,29 @@ fn unix_path_encoding_enforces_native_cap_and_worst_case_expansion() {
         ENCODED_PATH_PREFIX.len() + 3 * maximum_raw.len()
     );
 
-    let over_path = PathBuf::from(OsString::from_vec(vec![
-        0xff;
-        super::super::checkpoint::primitives::ADVISORY_PATH_MAX_BYTES
-            + 1
-    ]));
+    let over_raw =
+        vec![0xff; super::super::checkpoint::primitives::ADVISORY_PATH_STORED_MAX_BYTES + 1];
+    let over_path = PathBuf::from(OsString::from_vec(over_raw.clone()));
     let mut over = empty_input(23, 0, 1, 0, now);
     over.matched_path = over_path.clone();
     over.resolved_path = over_path;
     let mut batch = batch_with_settings(settings(1, 64 << 20, Duration::from_secs(1)));
-    assert!(matches!(
-        batch.try_append(over),
-        Err(BatchError::Path { .. })
-    ));
-    assert_eq!(batch.record_count(), 0);
+    let _ = append(&mut batch, over);
+    let request = decode(&batch.finish().unwrap());
+    let log = &request.resource_logs[0].scope_logs[0].log_records[0];
+    assert_eq!(
+        string_attr(log, ATTR_KEY_LOG_FILE_PATH).unwrap().len(),
+        ENCODED_PATH_PREFIX.len() + 3 * over_raw.len()
+    );
 }
 
 #[cfg(windows)]
 /// Scenario: a Windows matched path contains an unpaired UTF-16 surrogate.
-/// Guarantees: projection percent-encodes every big-endian UTF-16 code-unit
-/// byte and marks the String with the `percent-v1` discriminator.
+/// Guarantees: projection percent-encodes every little-endian UTF-16
+/// code-unit byte (`AdvisoryPathKind::WindowsUtf16Le`'s native byte order)
+/// and marks the String with the `percent-v1` discriminator.
 #[test]
-fn windows_unpaired_surrogate_uses_utf16be_percent_encoding() {
+fn windows_unpaired_surrogate_uses_utf16le_percent_encoding() {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
 
@@ -489,7 +507,7 @@ fn windows_unpaired_surrogate_uses_utf16be_percent_encoding() {
     let mut record = empty_input(24, 0, 1, 0, Instant::now());
     record.matched_path = path.clone();
     record.resolved_path = path;
-    let expected: Vec<u8> = units.into_iter().flat_map(u16::to_be_bytes).collect();
+    let expected: Vec<u8> = units.into_iter().flat_map(u16::to_le_bytes).collect();
     let mut batch = batch_with_settings(settings(1, 1 << 20, Duration::from_secs(1)));
     let _ = append(&mut batch, record);
     let request = decode(&batch.finish().unwrap());
@@ -503,11 +521,14 @@ fn windows_unpaired_surrogate_uses_utf16be_percent_encoding() {
 
 #[cfg(windows)]
 /// Scenario: unpaired-surrogate Windows path evidence is exactly at and one
-/// code unit above the 4,096-byte native advisory-path cap.
-/// Guarantees: 2,048 UTF-16 units receive the full prefix-plus-`%HH`
-/// expansion, while 2,049 units fail before any record is appended.
+/// code unit above the durable format's 4,096-byte advisory-path stored
+/// maximum.
+/// Guarantees: the OTAP provenance attribute always carries the complete
+/// live native path losslessly regardless of the durable stored-byte cap,
+/// so 2,048 and 2,049 UTF-16 units both receive the full prefix-plus-`%HH`
+/// expansion and succeed.
 #[test]
-fn windows_path_encoding_enforces_utf16be_native_cap() {
+fn windows_path_encoding_is_unbounded_for_live_full_paths() {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
 
@@ -532,11 +553,13 @@ fn windows_path_encoding_enforces_utf16be_native_cap() {
     over.matched_path = over_path.clone();
     over.resolved_path = over_path;
     let mut batch = batch_with_settings(settings(1, 64 << 20, Duration::from_secs(1)));
-    assert!(matches!(
-        batch.try_append(over),
-        Err(BatchError::Path { .. })
-    ));
-    assert_eq!(batch.record_count(), 0);
+    let _ = append(&mut batch, over);
+    let request = decode(&batch.finish().unwrap());
+    let log = &request.resource_logs[0].scope_logs[0].log_records[0];
+    assert_eq!(
+        string_attr(log, ATTR_KEY_LOG_FILE_PATH).unwrap().len(),
+        ENCODED_PATH_PREFIX.len() + 3 * 4_098
+    );
 }
 
 /// Scenario: a fully populated split projection is sized both before Arrow
@@ -566,6 +589,7 @@ fn runtime_attribute_enumeration_matches_shared_logical_size() {
     record.framed.body = FramedBody::Bytes(b"body".to_vec());
     record.progress_base.framing_resume = FramingResume::Continuation {
         record_start_offset: 0,
+        record_end_offset: 0,
         next_fragment_index: u32::MAX,
     };
     record.framed.fragment = Some(FragmentMetadata {
@@ -868,6 +892,7 @@ fn interleaved_files_merge_contiguous_progress_and_preserve_base() {
     });
     a1.framed.resulting_resume = FramingResume::Continuation {
         record_start_offset: 0,
+        record_end_offset: 0,
         next_fragment_index: 1,
     };
     let mut b1 = input(41, 0, 1, 0, now);
@@ -881,6 +906,7 @@ fn interleaved_files_merge_contiguous_progress_and_preserve_base() {
     });
     a2.framed.resulting_resume = FramingResume::Continuation {
         record_start_offset: 0,
+        record_end_offset: 0,
         next_fragment_index: 2,
     };
 
@@ -901,6 +927,7 @@ fn interleaved_files_merge_contiguous_progress_and_preserve_base() {
         a.final_framing_resume(),
         FramingResume::Continuation {
             record_start_offset: 0,
+            record_end_offset: 0,
             next_fragment_index: 2
         }
     );
@@ -911,6 +938,7 @@ fn interleaved_files_merge_contiguous_progress_and_preserve_base() {
             committed_offset: 0,
             framing_resume: FramingResume::Clean,
             last_seen_time_unix_nano: 75,
+            committed_frontier_guard: test_guard(0),
         })
         .unwrap();
     assert_eq!(update.expected_committed_offset, 0);
@@ -968,6 +996,7 @@ fn progress_rejects_epoch_and_durable_base_changes() {
             2 => {
                 later.progress_base.framing_resume = FramingResume::Continuation {
                     record_start_offset: 0,
+                    record_end_offset: 0,
                     next_fragment_index: 1,
                 };
             }
@@ -1032,6 +1061,7 @@ fn fragment_metadata_must_match_durable_resume_transitions() {
     let mut missing_fragment = input(143, 1, 2, 1, now);
     missing_fragment.progress_base.framing_resume = FramingResume::Continuation {
         record_start_offset: 0,
+        record_end_offset: 0,
         next_fragment_index: 1,
     };
     assert!(matches!(
@@ -1058,21 +1088,25 @@ fn progress_conversion_revalidates_current_durable_state() {
             committed_offset: 0,
             framing_resume: FramingResume::Clean,
             last_seen_time_unix_nano: 0,
+            committed_frontier_guard: test_guard(0),
         },
         ProgressBase {
             file_epoch: 1,
             committed_offset: 1,
             framing_resume: FramingResume::Clean,
             last_seen_time_unix_nano: 0,
+            committed_frontier_guard: test_guard(1),
         },
         ProgressBase {
             file_epoch: 1,
             committed_offset: 0,
             framing_resume: FramingResume::Continuation {
                 record_start_offset: 0,
+                record_end_offset: 0,
                 next_fragment_index: 1,
             },
             last_seen_time_unix_nano: 0,
+            committed_frontier_guard: test_guard(0),
         },
     ] {
         assert!(matches!(
@@ -1087,6 +1121,7 @@ fn progress_conversion_revalidates_current_durable_state() {
             committed_offset: 0,
             framing_resume: FramingResume::Clean,
             last_seen_time_unix_nano: 500,
+            committed_frontier_guard: test_guard(0),
         })
         .unwrap();
     assert_eq!(update.new_last_seen_time_unix_nano, 500);
@@ -1120,6 +1155,57 @@ fn exact_wal_delta_cap_seals_without_splitting_transaction() {
             reason: SealReason::DistinctFiles
         }
     );
+}
+
+/// Scenario: one file's batch delta is built from a single record, then a
+/// second same-file record extends it (a "batch retry" reconstructing the
+/// delta from a later, higher-offset frame).
+/// Guarantees: `final_window` always exposes the exact window owned by the
+/// most recently merged record, never a stale or first-record window, so a
+/// caller installing it onto the reader always retains the latest real
+/// evidence.
+#[test]
+fn final_window_tracks_the_most_recently_merged_record() {
+    let now = Instant::now();
+    let mut batch = batch_with_settings(settings(10, 1 << 20, Duration::from_secs(1)));
+    let first = input(60, 0, 1, 0, now);
+    let first_window = first.framed.checkpoint_window.clone();
+    let _ = append(&mut batch, first);
+    assert_eq!(batch.deltas[0].final_window(), Some(&first_window));
+
+    let second = input(60, 1, 2, 0, now);
+    let second_window = second.framed.checkpoint_window.clone();
+    assert_ne!(first_window, second_window);
+    let _ = append(&mut batch, second);
+    assert_eq!(batch.deltas[0].final_window(), Some(&second_window));
+}
+
+/// Scenario: a recordless (zero-delta) finalization is converted through
+/// `to_update_progress`.
+/// Guarantees: `final_window` is `None`, so a caller never replaces the
+/// reader's already-retained committed-frontier window; the resulting
+/// checkpoint operation reuses the durable guard bit-for-bit.
+#[test]
+fn zero_delta_finalize_exposes_no_window_to_install() {
+    let now = Instant::now();
+    let mut batch = batch_with_settings(settings(10, 1 << 20, Duration::from_secs(1)));
+    let _ = append(&mut batch, input(61, 0, 1, 0, now));
+
+    let direct = batch
+        .finalize_file(
+            file_id(62),
+            ProgressFrontier {
+                file_epoch: 1,
+                offset: 5,
+                framing_resume: FramingResume::Clean,
+            },
+            10,
+        )
+        .unwrap();
+    let FinalizationOutcome::Direct(delta) = direct else {
+        panic!("file without a batch record must return direct finalization")
+    };
+    assert_eq!(delta.final_window(), None);
 }
 
 /// Scenario: rotation finalization targets a file with an existing batch
@@ -1161,6 +1247,7 @@ fn recordless_finalization_merges_or_returns_direct_delta() {
                 offset: 99,
                 framing_resume: FramingResume::Continuation {
                     record_start_offset: 90,
+                    record_end_offset: 0,
                     next_fragment_index: 3,
                 },
             },
@@ -1179,9 +1266,11 @@ fn recordless_finalization_merges_or_returns_direct_delta() {
             committed_offset: 99,
             framing_resume: FramingResume::Continuation {
                 record_start_offset: 90,
+                record_end_offset: 0,
                 next_fragment_index: 3,
             },
             last_seen_time_unix_nano: 350,
+            committed_frontier_guard: test_guard(99),
         })
         .unwrap();
     assert_eq!(
@@ -1190,6 +1279,9 @@ fn recordless_finalization_merges_or_returns_direct_delta() {
     );
     assert_eq!(update.new_last_seen_time_unix_nano, 350);
     assert!(update.finalize);
+    // A recordless (zero-delta) finalize reuses the durable guard verbatim
+    // instead of recomputing one, since the offset does not change.
+    assert_eq!(update.new_committed_frontier_guard, test_guard(99));
 
     let empty = batch_with_settings(settings(1, 1 << 20, Duration::from_secs(1)));
     assert!(matches!(empty.finish(), Err(BatchError::EmptyBatch)));

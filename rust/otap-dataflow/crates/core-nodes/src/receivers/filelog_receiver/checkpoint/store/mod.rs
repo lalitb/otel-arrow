@@ -105,15 +105,17 @@ use std::time::{Duration, Instant};
 
 use super::apply::CheckpointTable;
 use super::current_marker::{decode_current_marker, encode_current_marker};
-use super::error::DecodeError;
 use super::primitives::{
-    FileId, LifecycleState, NAMESPACE_ID_MAX_BYTES, REASON_CODE_RESERVED, WAL_MAX_OPS_PER_TX,
+    FileId, LifecycleState, NAMESPACE_ID_MAX_BYTES, REASON_CODE_RESERVED, TX_FRAME_CRC_BYTES,
+    TX_HEADER_BYTES, WAL_MAX_NON_PROGRESS_OPS_PER_TX, WAL_MAX_OPS_PER_TX, WAL_MAX_TX_BODY_BYTES,
+    namespace_digest,
 };
 use super::snapshot::{SnapshotRecord, decode_snapshot, decode_snapshot_header, encode_snapshot};
 use super::wal::{
-    Operation, QuarantineFile, RegisterFile, RemoveFile, ResetAfterTruncate, ResetQuarantineAction,
-    ResetQuarantinedFile, Transaction, TransactionScan, UpdateFingerprint, UpdateMetadata,
-    UpdateProgress, WAL_HEADER_LEN, decode_wal_header, encode_wal, scan_one_transaction,
+    ClassifyOutcome, Operation, QuarantineFile, RegisterFile, RemoveFile, ResetAfterTruncate,
+    ResetQuarantineAction, ResetQuarantinedFile, Transaction, TransactionScan, UpdateFingerprint,
+    UpdateMetadata, UpdateProgress, WAL_HEADER_LEN, classify_operations, decode_wal_header,
+    encode_wal, scan_one_transaction,
 };
 use crate::receivers::filelog_receiver::config::{
     CheckpointConfig, IdentityConfig, LimitsConfig, RuntimeConfig,
@@ -387,8 +389,17 @@ fn pack_atomic_groups(
     if groups.is_empty() {
         return Err(StoreError::EmptyTransaction);
     }
+    for group in &groups {
+        reject_reserved_reason_codes(group)?;
+    }
 
-    let maximum = WAL_MAX_OPS_PER_TX as usize;
+    // Every atomic group passed through this path is non-progress (never
+    // contains `update_progress`; progress commits always go through the
+    // unsplit, class-checked `append` path instead), so packing is bounded
+    // by the non-progress class's operation-count maximum and the format's
+    // hard 16 MiB transaction-body cap. Both bounds are enforced by byte-
+    // and count-aware packing before a single chunk is appended.
+    let max_ops = WAL_MAX_NON_PROGRESS_OPS_PER_TX as usize;
     let operation_count = groups.iter().try_fold(0usize, |count, group| {
         count
             .checked_add(group.len())
@@ -400,27 +411,89 @@ fn pack_atomic_groups(
     let mut operations = Vec::with_capacity(operation_count);
     let mut transaction_lengths = Vec::new();
     let mut current_len = 0usize;
+    let mut current_bytes: u64 = 0;
     for group in groups {
         if group.is_empty() {
             return Err(StoreError::EmptyTransaction);
         }
-        if group.len() > maximum {
+        let group_bytes = encoded_operations_bytes(&group)?;
+        if group.len() > max_ops || group_bytes > WAL_MAX_TX_BODY_BYTES {
             return Err(StoreError::TransactionTooLarge {
                 operations: group.len(),
-                max: WAL_MAX_OPS_PER_TX,
+                max: WAL_MAX_NON_PROGRESS_OPS_PER_TX,
             });
         }
-        if current_len > maximum - group.len() {
+        let exceeds_count = current_len + group.len() > max_ops;
+        let exceeds_bytes = current_bytes
+            .checked_add(group_bytes)
+            .is_none_or(|total| total > WAL_MAX_TX_BODY_BYTES);
+        if current_len > 0 && (exceeds_count || exceeds_bytes) {
             transaction_lengths.push(current_len);
             current_len = 0;
+            current_bytes = 0;
         }
         current_len += group.len();
+        current_bytes += group_bytes;
         operations.extend(group);
     }
     if current_len != 0 {
         transaction_lengths.push(current_len);
     }
     Ok((operations, transaction_lengths))
+}
+
+/// The total encoded operation-frame bytes `operations` would contribute to
+/// a transaction body, computed by actually encoding each operation so a
+/// chunking decision never trusts an estimate the codec itself would
+/// disagree with.
+fn encoded_operations_bytes(operations: &[Operation]) -> Result<u64, StoreError> {
+    let mut total: u64 = 0;
+    for operation in operations {
+        let encoded_len = operation
+            .encode()
+            .map_err(|source| StoreError::Encode {
+                artifact: "WAL operation",
+                generation: 0,
+                source,
+            })?
+            .len() as u64;
+        total = total
+            .checked_add(encoded_len)
+            .ok_or(StoreError::CounterOverflow {
+                counter: "grouped checkpoint operation bytes",
+                value: total,
+            })?;
+    }
+    Ok(total)
+}
+
+/// Splits a flat, always-non-progress operation list into chunk lengths,
+/// each respecting both `WAL_MAX_NON_PROGRESS_OPS_PER_TX` and the hard
+/// `WAL_MAX_TX_BODY_BYTES` cap, computed from each operation's actual
+/// encoded size.
+fn chunk_non_progress_operations(operations: &[Operation]) -> Result<Vec<usize>, StoreError> {
+    let max_ops = WAL_MAX_NON_PROGRESS_OPS_PER_TX as usize;
+    let mut lengths = Vec::new();
+    let mut current_len = 0usize;
+    let mut current_bytes: u64 = 0;
+    for operation in operations {
+        let op_bytes = encoded_operations_bytes(std::slice::from_ref(operation))?;
+        let exceeds_count = current_len + 1 > max_ops;
+        let exceeds_bytes = current_bytes
+            .checked_add(op_bytes)
+            .is_none_or(|total| total > WAL_MAX_TX_BODY_BYTES);
+        if current_len > 0 && (exceeds_count || exceeds_bytes) {
+            lengths.push(current_len);
+            current_len = 0;
+            current_bytes = 0;
+        }
+        current_len += 1;
+        current_bytes += op_bytes;
+    }
+    if current_len > 0 {
+        lengths.push(current_len);
+    }
+    Ok(lengths)
 }
 
 /// Refuses the reserved reason code the format forbids an encoder from
@@ -695,6 +768,7 @@ impl CheckpointStore {
                     (None, None) => {
                         let Some(selection) = Self::select_without_marker(
                             &namespace_dir,
+                            &namespace_id,
                             &mut faults,
                             &limits,
                             max_tracked_files,
@@ -997,6 +1071,7 @@ impl CheckpointStore {
     /// authoritative one.
     fn select_without_marker(
         dir: &Path,
+        namespace_id: &str,
         faults: &mut FaultPlan,
         limits: &StoreLimits,
         max_tracked_files: u32,
@@ -1040,6 +1115,7 @@ impl CheckpointStore {
         // durable progress.
         if !Self::verify_incomplete_initial_pair_is_empty(
             dir,
+            namespace_id,
             limits,
             max_tracked_files,
             &mut *cancelled,
@@ -1048,6 +1124,7 @@ impl CheckpointStore {
         }
         if !Self::create_generation_cancellable(
             dir,
+            namespace_id,
             INITIAL_GENERATION,
             &[],
             limits,
@@ -1077,6 +1154,7 @@ impl CheckpointStore {
     /// recreating the generation would silently discard durable progress.
     fn verify_incomplete_initial_pair_is_empty(
         dir: &Path,
+        namespace_id: &str,
         limits: &StoreLimits,
         max_tracked_files: u32,
         cancelled: &mut impl FnMut() -> bool,
@@ -1119,11 +1197,14 @@ impl CheckpointStore {
                     reason: "its snapshot already holds records",
                 });
             }
-            let snapshot = decode_snapshot(&bytes).map_err(|source| StoreError::Decode {
-                artifact: "snapshot",
-                path: snapshot_path.clone(),
-                source,
-            })?;
+            let snapshot =
+                decode_snapshot(&bytes, &namespace_digest(namespace_id)).map_err(|source| {
+                    StoreError::Decode {
+                        artifact: "snapshot",
+                        path: snapshot_path.clone(),
+                        source,
+                    }
+                })?;
             debug_assert!(snapshot.records.is_empty());
         }
         if cancelled() {
@@ -1140,25 +1221,24 @@ impl CheckpointStore {
             return Ok(false);
         };
         if let Some(bytes) = wal {
-            let wal_generation =
-                decode_wal_header(&bytes).map_err(|source| StoreError::Decode {
-                    artifact: "WAL",
-                    path: wal_path.clone(),
-                    source,
-                })?;
-            if wal_generation != INITIAL_GENERATION {
+            let wal_header = decode_wal_header(&bytes).map_err(|source| StoreError::Decode {
+                artifact: "WAL",
+                path: wal_path.clone(),
+                source,
+            })?;
+            if wal_header.generation != INITIAL_GENERATION {
                 return Err(StoreError::GenerationMismatch {
                     artifact: "WAL",
                     path: wal_path,
                     expected: INITIAL_GENERATION,
-                    found: wal_generation,
+                    found: wal_header.generation,
                 });
             }
             if bytes.len() > WAL_HEADER_LEN {
                 let remaining = &bytes[WAL_HEADER_LEN..];
                 Self::validate_declared_transaction_size(remaining, &wal_path, limits)?;
                 let scan =
-                    scan_one_transaction(remaining).map_err(|source| StoreError::Decode {
+                    scan_one_transaction(remaining, 1).map_err(|source| StoreError::Decode {
                         artifact: "WAL",
                         path: wal_path.clone(),
                         source,
@@ -1177,22 +1257,33 @@ impl CheckpointStore {
         Ok(!cancelled())
     }
 
-    /// Enforces the configured transaction bound from the four-byte length
-    /// prefix before a complete frame can be decoded into operations.
+    /// Enforces the configured transaction bound from the transaction
+    /// header's `body_len` field (offset 20 within the fixed 36-byte
+    /// envelope header) before a complete frame can be decoded into
+    /// operations.
+    ///
+    /// This is a preflight-only check against the configured
+    /// `limits.max_transaction_bytes` bound (which may be smaller than the
+    /// format's own hard `WAL_MAX_TX_BODY_BYTES` cap); full structural
+    /// validation (magic, envelope version, flags, length complement,
+    /// header CRC, and format bounds) happens afterward in
+    /// `scan_one_transaction`. A buffer shorter than the fixed header is
+    /// left to that function to classify as a torn tail or an error.
     fn validate_declared_transaction_size(
         bytes: &[u8],
         wal_path: &Path,
         limits: &StoreLimits,
     ) -> Result<(), StoreError> {
-        if bytes.len() < size_of::<u32>() {
+        if bytes.len() < TX_HEADER_BYTES {
             return Ok(());
         }
         let mut encoded_len = [0u8; size_of::<u32>()];
-        encoded_len.copy_from_slice(&bytes[..size_of::<u32>()]);
-        // The declared body is surrounded by the four-byte length and
-        // four-byte CRC fields.
+        encoded_len.copy_from_slice(&bytes[20..24]);
+        // The declared body is surrounded by the fixed 36-byte header and
+        // the trailing 4-byte frame CRC.
         let transaction_bytes = u64::from(u32::from_be_bytes(encoded_len))
-            .checked_add(8)
+            .checked_add(TX_HEADER_BYTES as u64)
+            .and_then(|value| value.checked_add(TX_FRAME_CRC_BYTES as u64))
             .ok_or(StoreError::AccountingOverflow { bytes: u64::MAX })?;
         if transaction_bytes > limits.max_transaction_bytes {
             return Err(StoreError::FileTooLarge {
@@ -1246,6 +1337,13 @@ impl CheckpointStore {
                 path: snapshot_path.clone(),
                 source,
             })?;
+        let expected_namespace_digest = namespace_digest(namespace_id);
+        if snapshot_header.namespace_digest != expected_namespace_digest {
+            return Err(StoreError::NamespaceMismatch {
+                artifact: "snapshot",
+                path: snapshot_path.clone(),
+            });
+        }
         if snapshot_header.generation != generation {
             return Err(StoreError::GenerationMismatch {
                 artifact: "snapshot",
@@ -1261,11 +1359,14 @@ impl CheckpointStore {
                 max: max_tracked_files,
             });
         }
-        let snapshot = decode_snapshot(&snapshot_bytes).map_err(|source| StoreError::Decode {
-            artifact: "snapshot",
-            path: snapshot_path.clone(),
-            source,
-        })?;
+        let snapshot =
+            decode_snapshot(&snapshot_bytes, &expected_namespace_digest).map_err(|source| {
+                StoreError::Decode {
+                    artifact: "snapshot",
+                    path: snapshot_path.clone(),
+                    source,
+                }
+            })?;
         let snapshot_records = snapshot.records.len();
         let mut table =
             CheckpointTable::from_snapshot_records(snapshot.records).map_err(|source| {
@@ -1298,18 +1399,23 @@ impl CheckpointStore {
                 missing: "the WAL file",
             });
         };
-        let wal_generation =
-            decode_wal_header(&wal_bytes).map_err(|source| StoreError::Decode {
+        let wal_header = decode_wal_header(&wal_bytes).map_err(|source| StoreError::Decode {
+            artifact: "WAL",
+            path: wal_path.clone(),
+            source,
+        })?;
+        if wal_header.namespace_digest != expected_namespace_digest {
+            return Err(StoreError::NamespaceMismatch {
                 artifact: "WAL",
                 path: wal_path.clone(),
-                source,
-            })?;
-        if wal_generation != generation {
+            });
+        }
+        if wal_header.generation != generation {
             return Err(StoreError::GenerationMismatch {
                 artifact: "WAL",
                 path: wal_path.clone(),
                 expected: generation,
-                found: wal_generation,
+                found: wal_header.generation,
             });
         }
 
@@ -1323,26 +1429,18 @@ impl CheckpointStore {
             }
             let remaining = &wal_bytes[cursor..];
             Self::validate_declared_transaction_size(remaining, &wal_path, limits)?;
-            match scan_one_transaction(remaining).map_err(|source| StoreError::Decode {
-                artifact: "WAL",
-                path: wal_path.clone(),
-                source,
+            match scan_one_transaction(remaining, expected_sequence).map_err(|source| {
+                StoreError::Decode {
+                    artifact: "WAL",
+                    path: wal_path.clone(),
+                    source,
+                }
             })? {
                 TransactionScan::TornTail(bytes) => {
                     torn_tail_bytes = bytes;
                     break;
                 }
                 TransactionScan::Complete(transaction, consumed) => {
-                    if transaction.sequence != expected_sequence {
-                        return Err(StoreError::Decode {
-                            artifact: "WAL",
-                            path: wal_path.clone(),
-                            source: DecodeError::SequenceOutOfOrder {
-                                expected: expected_sequence,
-                                found: transaction.sequence,
-                            },
-                        });
-                    }
                     expected_sequence =
                         expected_sequence
                             .checked_add(1)
@@ -1511,6 +1609,7 @@ impl CheckpointStore {
     /// then atomically makes it authoritative.
     fn create_generation_cancellable(
         dir: &Path,
+        namespace_id: &str,
         generation: u64,
         records: &[SnapshotRecord],
         limits: &StoreLimits,
@@ -1519,6 +1618,7 @@ impl CheckpointStore {
     ) -> Result<bool, StoreError> {
         if !Self::stage_generation_cancellable(
             dir,
+            namespace_id,
             generation,
             records,
             limits,
@@ -1545,19 +1645,29 @@ impl CheckpointStore {
     /// to read.
     fn stage_generation(
         dir: &Path,
+        namespace_id: &str,
         generation: u64,
         records: &[SnapshotRecord],
         limits: &StoreLimits,
         faults: &mut FaultPlan,
     ) -> Result<(), StoreError> {
-        Self::stage_generation_cancellable(dir, generation, records, limits, faults, &mut || false)
-            .map(|completed| {
-                debug_assert!(completed, "non-cancellable generation staging completes");
-            })
+        Self::stage_generation_cancellable(
+            dir,
+            namespace_id,
+            generation,
+            records,
+            limits,
+            faults,
+            &mut || false,
+        )
+        .map(|completed| {
+            debug_assert!(completed, "non-cancellable generation staging completes");
+        })
     }
 
     fn stage_generation_cancellable(
         dir: &Path,
+        namespace_id: &str,
         generation: u64,
         records: &[SnapshotRecord],
         limits: &StoreLimits,
@@ -1565,10 +1675,12 @@ impl CheckpointStore {
         cancelled: &mut impl FnMut() -> bool,
     ) -> Result<bool, StoreError> {
         let snapshot_bytes =
-            encode_snapshot(generation, records).map_err(|source| StoreError::Encode {
-                artifact: "snapshot",
-                generation,
-                source,
+            encode_snapshot(generation, namespace_id, records).map_err(|source| {
+                StoreError::Encode {
+                    artifact: "snapshot",
+                    generation,
+                    source,
+                }
             })?;
         let snapshot_len = snapshot_bytes.len() as u64;
         if snapshot_len > limits.max_snapshot_bytes {
@@ -1580,11 +1692,12 @@ impl CheckpointStore {
                 max: limits.max_snapshot_bytes,
             });
         }
-        let wal_bytes = encode_wal(generation, &[]).map_err(|source| StoreError::Encode {
-            artifact: "WAL header",
-            generation,
-            source,
-        })?;
+        let wal_bytes =
+            encode_wal(generation, namespace_id, &[]).map_err(|source| StoreError::Encode {
+                artifact: "WAL header",
+                generation,
+                source,
+            })?;
 
         if cancelled() {
             return Ok(false);
@@ -1770,6 +1883,20 @@ impl CheckpointStore {
                 max: WAL_MAX_OPS_PER_TX,
             });
         }
+        // The coarse check above already rejects anything wider than the
+        // widest class (`WAL_MAX_OPS_PER_TX`, progress-only); this tightens
+        // it to the non-progress class's narrower maximum. A mixed-class
+        // transaction is left to `Transaction::encode`'s own
+        // `MixedTransactionClass` error below, since there is no single
+        // class maximum to report for it here.
+        if let ClassifyOutcome::Class(class) = classify_operations(&operations)
+            && operations.len() > class.max_ops() as usize
+        {
+            return Err(StoreError::TransactionTooLarge {
+                operations: operations.len(),
+                max: class.max_ops(),
+            });
+        }
         reject_reserved_reason_codes(&operations)?;
         let mut reset_beginning = 0u64;
         let mut reset_end = 0u64;
@@ -1850,14 +1977,23 @@ impl CheckpointStore {
         result
     }
 
-    /// Appends `operations` as a series of atomic transactions, each bounded
-    /// by the format's per-transaction operation maximum.
+    /// Appends `operations` (always non-progress; progress commits go
+    /// through the unsplit `append`/`commit_progress` path instead) as a
+    /// series of atomic transactions, each bounded by both the non-progress
+    /// class's operation-count maximum (`WAL_MAX_NON_PROGRESS_OPS_PER_TX`)
+    /// and the format's hard 16 MiB transaction-body cap
+    /// (`WAL_MAX_TX_BODY_BYTES`).
     ///
-    /// Each chunk is atomic on its own. Splitting is safe because every
-    /// operation carries its own expected state: a crash between chunks
-    /// leaves the earlier chunks durable and the later ones absent, which
-    /// widens the duplicate window for the files in the later chunks and
-    /// never loses acknowledged progress.
+    /// `preflight_batched` fully preflights and byte-encodes every chunk
+    /// (business rules, tracked-file/WAL capacity, and a real
+    /// `Transaction::encode`) before the first chunk is appended, so a
+    /// failure in a later chunk (an oversized encoding, or a business-rule
+    /// conflict) is reported before any chunk becomes durable. Each chunk
+    /// remains atomic on its own thereafter: splitting across chunks is
+    /// safe because every operation carries its own expected state, so a
+    /// crash between chunks leaves the earlier chunks durable and the later
+    /// ones absent, which widens the duplicate window for the files in the
+    /// later chunks and never loses acknowledged progress.
     pub fn append_batched(
         &mut self,
         operations: Vec<Operation>,
@@ -1867,11 +2003,11 @@ impl CheckpointStore {
             return Err(StoreError::EmptyTransaction);
         }
         self.preflight_batched(&operations)?;
-        let mut outcomes = Vec::new();
+        let chunk_lengths = chunk_non_progress_operations(&operations)?;
+        let mut outcomes = Vec::with_capacity(chunk_lengths.len());
         let mut remaining = operations;
-        while !remaining.is_empty() {
-            let take = remaining.len().min(WAL_MAX_OPS_PER_TX as usize);
-            let rest = remaining.split_off(take);
+        for length in chunk_lengths {
+            let rest = remaining.split_off(length);
             outcomes.push(self.append(remaining)?);
             remaining = rest;
         }
@@ -2298,6 +2434,7 @@ impl CheckpointStore {
         }
         let staged = Self::stage_generation(
             &self.namespace_dir,
+            &self.namespace_id,
             next,
             &records,
             &self.limits,
@@ -2474,7 +2611,15 @@ impl CheckpointStore {
     /// transition failures must not return an error after an earlier chunk
     /// has already consumed durable tracked-file or WAL capacity.
     fn preflight_batched(&self, operations: &[Operation]) -> Result<(), StoreError> {
-        self.preflight_transactions(operations, operations.chunks(WAL_MAX_OPS_PER_TX as usize))
+        reject_reserved_reason_codes(operations)?;
+        let chunk_lengths = chunk_non_progress_operations(operations)?;
+        let mut offset = 0usize;
+        let chunks = chunk_lengths.iter().map(|&length| {
+            let start = offset;
+            offset += length;
+            &operations[start..offset]
+        });
+        self.preflight_transactions(operations, chunks)
     }
 
     fn preflight_transactions<'a>(

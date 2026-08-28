@@ -25,7 +25,7 @@ use regex::Regex;
 
 use super::checkpoint::framing_profile;
 use super::checkpoint::primitives::{
-    ADVISORY_PATH_MAX_BYTES, FINGERPRINT_MAX_BYTES, FINGERPRINT_PROFILE_VERSION,
+    ADVISORY_PATH_STORED_MAX_BYTES, FINGERPRINT_MAX_BYTES, FINGERPRINT_PROFILE_VERSION,
     FRAMING_PATTERN_MAX_BYTES, NAMESPACE_ID_MAX_BYTES,
 };
 use super::checkpoint::store::limits::StoreLimits;
@@ -197,10 +197,10 @@ pub(crate) const ENCODED_PATH_DISCRIMINATOR: &str = "percent-v1";
 
 /// Worst-case percent-encoded output for one path-shaped attribute value.
 ///
-/// Native path evidence is capped at `ADVISORY_PATH_MAX_BYTES`; every byte
+/// Native path evidence is capped at `ADVISORY_PATH_STORED_MAX_BYTES`; every byte
 /// expands to `%HH`, after the fixed discriminator prefix.
 pub(crate) const MAX_ENCODED_PATH_ATTRIBUTE_VALUE_BYTES: u64 =
-    ENCODED_PATH_PREFIX.len() as u64 + 3 * ADVISORY_PATH_MAX_BYTES as u64;
+    ENCODED_PATH_PREFIX.len() as u64 + 3 * ADVISORY_PATH_STORED_MAX_BYTES as u64;
 /// Conservative reserved bytes for a decimal-encoded `u64` attribute value
 /// (source byte offset / record number), sized for the longest possible
 /// `u64` (20 digits).
@@ -1385,7 +1385,7 @@ fn validate_identity_reconciliation_bounds(
         .fingerprint_bytes
         .checked_mul(DISCOVERY_CANDIDATE_FINGERPRINT_COPIES)
         .and_then(|bytes| {
-            (ADVISORY_PATH_MAX_BYTES as u64)
+            (ADVISORY_PATH_STORED_MAX_BYTES as u64)
                 .checked_mul(DISCOVERY_CANDIDATE_PATH_COPIES)
                 .and_then(|paths| bytes.checked_add(paths))
         })
@@ -1402,7 +1402,7 @@ fn validate_identity_reconciliation_bounds(
         .fingerprint_bytes
         .checked_mul(IDENTITY_OPEN_CANDIDATE_FINGERPRINT_COPIES)
         .and_then(|bytes| {
-            (ADVISORY_PATH_MAX_BYTES as u64)
+            (ADVISORY_PATH_STORED_MAX_BYTES as u64)
                 .checked_mul(IDENTITY_OPEN_CANDIDATE_PATH_COPIES)
                 .and_then(|paths| bytes.checked_add(paths))
         })
@@ -1413,7 +1413,7 @@ fn validate_identity_reconciliation_bounds(
         })?;
     let record_state_bytes = identity
         .fingerprint_bytes
-        .checked_add(ADVISORY_PATH_MAX_BYTES as u64)
+        .checked_add(ADVISORY_PATH_STORED_MAX_BYTES as u64)
         .and_then(|bytes| bytes.checked_add(IDENTITY_RECORD_INDEX_OVERHEAD_BYTES))
         .and_then(|bytes| bytes.checked_mul(u64::from(limits.max_tracked_files)))
         .ok_or_else(|| invalid("identity reconciliation record-state bound overflows u64"))?;

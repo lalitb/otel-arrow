@@ -13,7 +13,10 @@ use super::decoder::{
 };
 use crate::receivers::filelog_receiver::{
     Encoding, MaxLogSizeBehavior, OnDecodeError,
-    checkpoint::{FileId, FramingResume},
+    checkpoint::{
+        CommittedFrontierWindow, FileId, FramingResume,
+        primitives::COMMITTED_FRONTIER_GUARD_WINDOW_BYTES,
+    },
     config::{CompiledMultilinePattern, RuntimeConfig, peak_framer_payload_bytes},
 };
 
@@ -98,6 +101,10 @@ pub(crate) struct FramedRecord {
     pub(crate) truncated: bool,
     /// Exact number of discarded source body bytes.
     pub(crate) discarded_source_bytes: u64,
+    /// The exact raw source bytes ending at `checkpoint_end`, already owned
+    /// by this framer's rolling buffer -- never a post-Ack reread and
+    /// never fabricated.
+    pub(crate) checkpoint_window: CommittedFrontierWindow,
 }
 
 impl FramedRecord {
@@ -148,6 +155,29 @@ pub(crate) enum FramerError {
         /// Current committed offset.
         committed_offset: u64,
     },
+    /// A durable continuation's nonzero known record end must still lie
+    /// strictly beyond the committed offset it resumes at.
+    #[error(
+        "continuation record end {record_end_offset} must be zero or after committed offset {committed_offset}"
+    )]
+    ContinuationRecordEnd {
+        /// Durable known record end (nonzero).
+        record_end_offset: u64,
+        /// Current committed offset.
+        committed_offset: u64,
+    },
+    /// A decoded/raw source unit would cross or overshoot a resumed split's
+    /// exact known record end: the boundary is authoritative and can never
+    /// be reinterpreted under scan-to-next-LF semantics.
+    #[error(
+        "source unit ending at {unit_end} overshoots the exact continuation record end {record_end}"
+    )]
+    ContinuationRecordEndOverrun {
+        /// The exact known record end.
+        record_end: u64,
+        /// The offset the overshooting unit would end at.
+        unit_end: u64,
+    },
     /// Durable continuation state is impossible under truncate policy.
     #[error("continuation framing state requires max_log_size_behavior=split")]
     ContinuationRequiresSplit,
@@ -155,6 +185,12 @@ pub(crate) enum FramerError {
     #[error("new stream start requires committed offset zero, got {committed_offset}")]
     InvalidNewStreamOffset {
         /// Nonzero offset incorrectly marked as a new stream.
+        committed_offset: u64,
+    },
+    /// The caller-supplied seed window did not end at `committed_offset`.
+    #[error("committed frontier seed window must end at committed_offset {committed_offset}")]
+    InvalidSeedWindow {
+        /// The offset the framer is being constructed at.
         committed_offset: u64,
     },
     /// A validated runtime limit did not fit the current platform.
@@ -544,6 +580,13 @@ struct BufferedRecord {
 #[derive(Debug)]
 struct SplitState {
     record_start: u64,
+    /// The record's exact known final source offset, or `None` for the
+    /// scan-to-next-physical-LF termination mode. Once known (only ever
+    /// inherited from a resumed `FramingResume::Continuation`), it is
+    /// propagated unchanged to every subsequently emitted nonfinal fragment
+    /// of the same split -- the deterministic boundary, once established,
+    /// is never rediscarded back to the unknown/scan sentinel.
+    record_end: Option<u64>,
     index: u32,
     current: Payload,
     emit_current_nonfinal: bool,
@@ -600,10 +643,24 @@ pub(crate) struct Framer {
     oversize: Option<OversizeState>,
     pattern_not_matched: u64,
     deadline: Option<Instant>,
+    /// Raw source bytes consumed since `raw_window_start`, retaining at
+    /// least the last [`COMMITTED_FRONTIER_GUARD_WINDOW_BYTES`] bytes
+    /// ending at `next_frame_start` plus any not-yet-checkpointed
+    /// lookahead already consumed by the decoder.
+    ///
+    /// [`COMMITTED_FRONTIER_GUARD_WINDOW_BYTES`]: crate::receivers::filelog_receiver::checkpoint::primitives::COMMITTED_FRONTIER_GUARD_WINDOW_BYTES
+    raw_window_buffer: Vec<u8>,
+    /// Source offset of `raw_window_buffer[0]`.
+    raw_window_start: u64,
 }
 
 impl Framer {
     /// Creates a framer from one already validated runtime configuration.
+    ///
+    /// `seed_window` must be the exact real committed-frontier window
+    /// ending at `committed_offset` (empty for offset `0`); this is never
+    /// fabricated and always either freshly captured at registration or
+    /// read back from the reopened source handle at restart/reopen.
     ///
     /// The runtime's compiled matcher is cloned; its source is never
     /// recompiled or revalidated here.
@@ -615,10 +672,14 @@ impl Framer {
         committed_offset: u64,
         resume: FramingResume,
         new_stream_start: bool,
+        seed_window: CommittedFrontierWindow,
         now: Instant,
     ) -> Result<Self, FramerError> {
         if new_stream_start && committed_offset != 0 {
             return Err(FramerError::InvalidNewStreamOffset { committed_offset });
+        }
+        if seed_window.end_offset() != committed_offset {
+            return Err(FramerError::InvalidSeedWindow { committed_offset });
         }
         if !runtime.framing.force_flush_period.is_zero() {
             let _ = now
@@ -672,6 +733,7 @@ impl Framer {
             FramingResume::Continuation {
                 record_start_offset,
                 next_fragment_index,
+                record_end_offset,
             } => {
                 if runtime.framing.max_log_size_behavior != MaxLogSizeBehavior::Split {
                     return Err(FramerError::ContinuationRequiresSplit);
@@ -685,8 +747,21 @@ impl Framer {
                         committed_offset,
                     });
                 }
+                // `record_end_offset == 0` is the documented
+                // scan-to-next-physical-LF sentinel (the end is not yet
+                // known). A nonzero end must still lie strictly beyond the
+                // committed offset: it is the record's remaining exact
+                // deterministic boundary, so at least one more byte must be
+                // owed before it.
+                if record_end_offset != 0 && record_end_offset <= committed_offset {
+                    return Err(FramerError::ContinuationRecordEnd {
+                        record_end_offset,
+                        committed_offset,
+                    });
+                }
                 oversize = Some(OversizeState::Split(SplitState {
                     record_start: record_start_offset,
+                    record_end: (record_end_offset != 0).then_some(record_end_offset),
                     index: next_fragment_index,
                     current: Payload::new(committed_offset, payload_kind.keeps_source_shadow()),
                     emit_current_nonfinal: false,
@@ -723,6 +798,8 @@ impl Framer {
             oversize,
             pattern_not_matched: 0,
             deadline: None,
+            raw_window_start: committed_offset - seed_window.bytes().len() as u64,
+            raw_window_buffer: seed_window.bytes().to_vec(),
         })
     }
 
@@ -735,6 +812,7 @@ impl Framer {
         committed_offset: u64,
         resume: FramingResume,
         new_stream_start: bool,
+        seed_window: CommittedFrontierWindow,
         now: Instant,
     ) -> Result<Self, FramerError> {
         Self::new(
@@ -744,6 +822,7 @@ impl Framer {
             committed_offset,
             resume,
             new_stream_start,
+            seed_window,
             now,
         )
     }
@@ -893,6 +972,7 @@ impl Framer {
                 .decoder
                 .next(self.decoder.next_expected_input_offset(), remaining)?;
             if decode_step.consumed != 0 {
+                self.extend_raw_window(&remaining[..decode_step.consumed]);
                 consumed = consumed.checked_add(decode_step.consumed).ok_or(
                     FramerError::ArithmeticOverflow {
                         context: "step consumed byte count",
@@ -1110,6 +1190,7 @@ impl Framer {
                 let record_start = prefix.range.start;
                 OversizeState::Split(SplitState {
                     record_start,
+                    record_end: None,
                     index: 0,
                     current: prefix,
                     emit_current_nonfinal: true,
@@ -1129,6 +1210,11 @@ impl Framer {
     }
 
     fn process_oversize_unit(&mut self, unit: Unit) -> Result<Option<FramedRecord>, FramerError> {
+        if let Some(OversizeState::Split(state)) = self.oversize.as_ref()
+            && let Some(end) = state.record_end
+        {
+            return self.process_known_end_split_unit(unit, end);
+        }
         if unit.is_lf() {
             return self.finish_oversize(unit);
         }
@@ -1174,6 +1260,76 @@ impl Framer {
         }
     }
 
+    /// Processes one decoded/raw source unit while resuming (or continuing)
+    /// a split whose deterministic record end is already known: a nonzero
+    /// `FramingResume::Continuation.record_end_offset`, inherited unchanged
+    /// across every fragment of the same split.
+    ///
+    /// Normal newline/multiline/start/end-pattern boundary decisions are
+    /// suppressed here: every unit up to `end` is bounded safe-unit content,
+    /// and only the fragment whose source range ends exactly at `end` is
+    /// `last`. A unit that would cross or overshoot `end` fails closed
+    /// instead of being reinterpreted under scan-to-next-LF semantics.
+    fn process_known_end_split_unit(
+        &mut self,
+        unit: Unit,
+        end: u64,
+    ) -> Result<Option<FramedRecord>, FramerError> {
+        if unit.range.end > end {
+            return Err(FramerError::ContinuationRecordEndOverrun {
+                record_end: end,
+                unit_end: unit.range.end,
+            });
+        }
+        if unit.range.end == end {
+            let mut state = match self.oversize.take() {
+                Some(OversizeState::Split(state)) => state,
+                _ => {
+                    return Err(FramerError::Invariant {
+                        context: "known-end split terminator requires split state",
+                    });
+                }
+            };
+            state.current.append_unit(unit, self.payload_kind)?;
+            self.line = Payload::new(end, self.payload_kind.keeps_source_shadow());
+            self.line_record_fit = None;
+            self.record = None;
+            return self
+                .make_fragment(
+                    state.current,
+                    end,
+                    state.record_start,
+                    state.index,
+                    true,
+                    None,
+                    None,
+                    None,
+                )
+                .map(Some);
+        }
+        let state = match self.oversize.as_mut() {
+            Some(OversizeState::Split(state)) => state,
+            _ => {
+                return Err(FramerError::Invariant {
+                    context: "known-end unit processing requires split state",
+                });
+            }
+        };
+        let prospective = state.current.prospective_measure(unit, self.payload_kind)?;
+        if prospective > self.line_limit {
+            if state.current.is_empty() {
+                return Err(FramerError::Invariant {
+                    context: "one decoded unit exceeds a validated split limit",
+                });
+            }
+            state.emit_current_nonfinal = true;
+            self.pending_unit = Some(unit);
+            return self.emit_current_split_nonfinal();
+        }
+        state.current.append_unit(unit, self.payload_kind)?;
+        Ok(None)
+    }
+
     fn finish_oversize(&mut self, delimiter: Unit) -> Result<Option<FramedRecord>, FramerError> {
         let state = self.oversize.take().ok_or(FramerError::Invariant {
             context: "oversize terminator requires oversize state",
@@ -1189,6 +1345,7 @@ impl Framer {
                     state.record_start,
                     state.index,
                     true,
+                    None,
                     None,
                     None,
                 )
@@ -1210,7 +1367,7 @@ impl Framer {
     }
 
     fn emit_current_split_nonfinal(&mut self) -> Result<Option<FramedRecord>, FramerError> {
-        let (payload, record_start, index, next_index) = {
+        let (payload, record_start, record_end, index, next_index) = {
             let state = match self.oversize.as_mut() {
                 Some(OversizeState::Split(state)) => state,
                 _ => {
@@ -1237,7 +1394,13 @@ impl Framer {
             let index = state.index;
             state.index = next_index;
             state.emit_current_nonfinal = false;
-            (payload, state.record_start, index, next_index)
+            (
+                payload,
+                state.record_start,
+                state.record_end,
+                index,
+                next_index,
+            )
         };
         let frame_end = payload.range.end;
         self.make_fragment(
@@ -1247,6 +1410,7 @@ impl Framer {
             index,
             false,
             Some(next_index),
+            record_end,
             None,
         )
         .map(Some)
@@ -1498,12 +1662,22 @@ impl Framer {
                     self.pending_unit = Some(delimiter);
                     self.oversize = Some(OversizeState::Split(SplitState {
                         record_start,
+                        record_end: None,
                         index: 1,
                         current: content,
                         emit_current_nonfinal: false,
                     }));
-                    self.make_fragment(prefix, trigger_start, record_start, 0, false, Some(1), None)
-                        .map(Some)
+                    self.make_fragment(
+                        prefix,
+                        trigger_start,
+                        record_start,
+                        0,
+                        false,
+                        Some(1),
+                        None,
+                        None,
+                    )
+                    .map(Some)
                 } else {
                     let record_start = content.range.start;
                     self.make_fragment(
@@ -1512,6 +1686,7 @@ impl Framer {
                         record_start,
                         0,
                         true,
+                        None,
                         None,
                         None,
                     )
@@ -1577,8 +1752,14 @@ impl Framer {
         let delivered = self.decoder.highest_delivered_source_boundary();
         if matches!(
             self.oversize.as_ref(),
-            Some(OversizeState::Split(state)) if state.current.is_empty()
+            Some(OversizeState::Split(state))
+                if state.current.is_empty() || state.record_end.is_some()
         ) {
+            // An empty split has nothing to flush. A split with a known
+            // exact end that has not yet been reached is deterministically
+            // incomplete: a temporary EOF/idle timeout can never stand in
+            // for its real terminator, so it remains pending rather than
+            // being flushed as a spurious `last` fragment.
             return Ok(None);
         }
         if let Some(state) = self.oversize.take() {
@@ -1592,6 +1773,7 @@ impl Framer {
                         state.record_start,
                         state.index,
                         true,
+                        None,
                         None,
                         Some(reason),
                     )
@@ -1675,6 +1857,7 @@ impl Framer {
                 let record_start = record.payload.range.start;
                 self.oversize = Some(OversizeState::Split(SplitState {
                     record_start,
+                    record_end: None,
                     index: 1,
                     current: line,
                     emit_current_nonfinal: false,
@@ -1686,6 +1869,7 @@ impl Framer {
                     0,
                     false,
                     Some(1),
+                    None,
                     None,
                 )
                 .map(Some)
@@ -1718,6 +1902,7 @@ impl Framer {
         index: u32,
         last: bool,
         expected_next_index: Option<u32>,
+        record_end: Option<u64>,
         flush_reason: Option<FlushReason>,
     ) -> Result<FramedRecord, FramerError> {
         if !last && index == u32::MAX {
@@ -1731,6 +1916,13 @@ impl Framer {
                 .ok_or(FramerError::FragmentIndexOverflow)?;
             FramingResume::Continuation {
                 record_start_offset: record_start,
+                // `record_end` is the split's exact known final source
+                // offset, honored and carried forward unchanged from a
+                // resumed continuation across every subsequent nonfinal
+                // fragment; `0` is the documented scan-to-next-physical-LF
+                // sentinel, used only while that boundary genuinely is not
+                // yet known.
+                record_end_offset: record_end.unwrap_or(0),
                 next_fragment_index,
             }
         };
@@ -1827,6 +2019,7 @@ impl Framer {
         };
         self.next_frame_start = frame_end;
         self.record = None;
+        let checkpoint_window = self.checkpoint_window_at(frame_end)?;
         Ok(FramedRecord {
             body,
             body_source_range: payload.range,
@@ -1838,6 +2031,52 @@ impl Framer {
             fragment,
             truncated,
             discarded_source_bytes,
+            checkpoint_window,
+        })
+    }
+
+    /// Appends raw source bytes the decoder just consumed to the rolling
+    /// window buffer. Bytes are never dropped from the front here: trimming
+    /// happens only once a checkpoint frontier using them has been
+    /// produced, in [`Self::checkpoint_window_at`], so the buffer always
+    /// retains everything a not-yet-emitted frame might still need.
+    fn extend_raw_window(&mut self, consumed_bytes: &[u8]) {
+        self.raw_window_buffer.extend_from_slice(consumed_bytes);
+    }
+
+    /// Returns the exact real committed-frontier window ending at
+    /// `frame_end`, trimming the rolling buffer's now-unreachable prefix.
+    ///
+    /// `frame_end` can never regress across calls (checkpoint boundaries
+    /// only advance), so trimming to this call's window start can never
+    /// discard bytes a later call still needs.
+    fn checkpoint_window_at(
+        &mut self,
+        frame_end: u64,
+    ) -> Result<CommittedFrontierWindow, FramerError> {
+        let window_len = frame_end.min(u64::from(COMMITTED_FRONTIER_GUARD_WINDOW_BYTES)) as usize;
+        let window_start = frame_end - window_len as u64;
+        if window_start < self.raw_window_start {
+            return Err(FramerError::Invariant {
+                context: "raw window buffer no longer covers the checkpoint frontier",
+            });
+        }
+        let rel_start = (window_start - self.raw_window_start) as usize;
+        let rel_end = (frame_end - self.raw_window_start) as usize;
+        let window_bytes = self
+            .raw_window_buffer
+            .get(rel_start..rel_end)
+            .ok_or(FramerError::Invariant {
+                context: "raw window buffer shorter than the checkpoint frontier requires",
+            })?
+            .to_vec();
+        // Everything before `window_start` can never be needed again: future
+        // frame ends only advance, so their windows never reach further
+        // back than this one.
+        let _ = self.raw_window_buffer.drain(..rel_start);
+        self.raw_window_start = window_start;
+        CommittedFrontierWindow::new(frame_end, window_bytes).map_err(|_| FramerError::Invariant {
+            context: "checkpoint window length does not match its offset",
         })
     }
 

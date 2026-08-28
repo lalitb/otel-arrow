@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use super::error::EncodeError;
 use super::primitives::{ByteWriter, FRAMING_PATTERN_MAX_BYTES};
 
-const DOMAIN_PREFIX: &[u8] = b"otel-arrow-filelog-framing-profile-v3\0";
+const DOMAIN_PREFIX: &[u8] = b"otel-arrow-filelog-framing-profile-v1\0";
 
 /// Configured character encoding (decode-before-framing contract).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,12 +223,12 @@ mod tests {
         assert_eq!(bytes.len(), 82);
         assert_eq!(
             hex::encode(&bytes),
-            "6f74656c2d6172726f772d66696c656c6f672d6672616d696e672d70726f66696c652d763300000103e800000000010100000000000000000000100000000000000010000001000001f400000000000001f4"
+            "6f74656c2d6172726f772d66696c656c6f672d6672616d696e672d70726f66696c652d763100000103e800000000010100000000000000000000100000000000000010000001000001f400000000000001f4"
         );
         let digest = profile.digest().unwrap();
         assert_eq!(
             hex::encode(digest),
-            "84cd122c62b3a4aea428db9f2c41166ed9af1f8087ab3e562f8033a9eedcf513"
+            "b89a44439258d045238a81d1d608cb41abede895ab1e047eef2b83898d3e0b25"
         );
     }
 
@@ -248,12 +248,12 @@ mod tests {
         assert_eq!(bytes.len(), 95);
         assert_eq!(
             hex::encode(&bytes),
-            "6f74656c2d6172726f772d66696c656c6f672d6672616d696e672d70726f66696c652d763300000103e8000000000101020001000d5e454e442072657175657374240000000000100000000000000010000001000001f400000000000001f4"
+            "6f74656c2d6172726f772d66696c656c6f672d6672616d696e672d70726f66696c652d763100000103e8000000000101020001000d5e454e442072657175657374240000000000100000000000000010000001000001f400000000000001f4"
         );
         let digest = profile.digest().unwrap();
         assert_eq!(
             hex::encode(digest),
-            "49834e9d951d6c68f351d1a51f70cca9ed4da0b8eef18670607b71aa15c03637"
+            "1c3159dd242ae99f29b6aace2f40c9d16192db416810456c5975ba8b9a020b54"
         );
         assert_ne!(digest, default_newline_profile().digest().unwrap());
     }

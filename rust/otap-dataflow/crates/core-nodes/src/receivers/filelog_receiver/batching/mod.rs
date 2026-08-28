@@ -26,7 +26,7 @@ use thiserror::Error;
 
 use super::checkpoint::primitives::WAL_MAX_OPS_PER_TX;
 use super::checkpoint::wal::UpdateProgress;
-use super::checkpoint::{FileId, FramingResume};
+use super::checkpoint::{CommittedFrontierGuard, CommittedFrontierWindow, FileId, FramingResume};
 use super::config::{
     ATTR_KEY_DECODE_ERROR_COUNT, ATTR_KEY_DECODE_ERROR_POLICY, ATTR_KEY_FLUSH_REASON,
     ATTR_KEY_FRAGMENT_ID, ATTR_KEY_FRAGMENT_INDEX, ATTR_KEY_FRAGMENT_LAST,
@@ -41,7 +41,7 @@ use super::framing::{
     DecodeOutcome, FlushReason, FragmentMetadata, FramedBody, FramedRecord, fragment_id,
 };
 use super::identity::IdentityError;
-use super::identity::platform::encode_advisory_path;
+use super::identity::platform::native_path_bytes;
 use super::{MaxLogSizeBehavior, OnDecodeError};
 
 #[cfg(test)]
@@ -62,6 +62,10 @@ pub(crate) struct ProgressBase {
     pub(crate) framing_resume: FramingResume,
     /// Latest last-seen metadata already persisted for this identity.
     pub(crate) last_seen_time_unix_nano: u64,
+    /// Durable committed-frontier guard paired atomically with the offset.
+    /// Reused verbatim by a zero-delta or finalize-only update instead of
+    /// being recomputed, since the source offset does not change.
+    pub(crate) committed_frontier_guard: CommittedFrontierGuard,
 }
 
 /// One current source frontier, which may still be provisional.
@@ -103,6 +107,19 @@ pub(crate) struct RecordInput {
     pub(crate) record_number: Option<u64>,
 }
 
+/// The evidence source for one delta's resulting committed-frontier guard.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DeltaGuardSource {
+    /// The source offset does not change (a recordless finalize, or a
+    /// zero-delta update): the durable guard is reused verbatim rather than
+    /// recomputed.
+    Unchanged,
+    /// Real progress happened: the exact real committed-frontier window
+    /// ending at the delta's `final_offset`, already owned by the
+    /// reader/framer pipeline that produced it.
+    Window(CommittedFrontierWindow),
+}
+
 /// One file's complete Ack transaction contribution.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProgressDelta {
@@ -112,6 +129,7 @@ pub(crate) struct ProgressDelta {
     expected_framing_resume: FramingResume,
     final_offset: u64,
     final_framing_resume: FramingResume,
+    final_guard_source: DeltaGuardSource,
     last_seen_time_unix_nano: u64,
     finalize: bool,
 }
@@ -147,6 +165,21 @@ impl ProgressDelta {
         self.final_framing_resume
     }
 
+    /// The exact real committed-frontier window resulting from this delta,
+    /// once its checkpoint operation has been durably applied.
+    ///
+    /// `None` means the source offset did not change (a zero-delta or
+    /// finalize-only update): the reader's already-retained window remains
+    /// correct bit-for-bit and must not be replaced. `Some` carries the
+    /// exact window the framing pipeline already owns for `final_offset`,
+    /// never a fabricated or reread substitute.
+    pub(crate) fn final_window(&self) -> Option<&CommittedFrontierWindow> {
+        match &self.final_guard_source {
+            DeltaGuardSource::Unchanged => None,
+            DeltaGuardSource::Window(window) => Some(window),
+        }
+    }
+
     /// Greatest last-seen timestamp represented by merged records.
     pub(crate) const fn last_seen_time_unix_nano(&self) -> u64 {
         self.last_seen_time_unix_nano
@@ -178,11 +211,32 @@ impl ProgressDelta {
                 reason: "final offset regresses below the durable base",
             });
         }
+        let new_committed_frontier_guard = match &self.final_guard_source {
+            // The offset does not change: the durable guard is reused
+            // verbatim, never recomputed, matching the format's zero-delta
+            // invariant that the guard is repeated bit-for-bit.
+            DeltaGuardSource::Unchanged => current.committed_frontier_guard,
+            // Real progress: the exact real window the reader/framer
+            // pipeline already owns for this new offset.
+            DeltaGuardSource::Window(window) => {
+                if window.end_offset() != self.final_offset {
+                    return Err(BatchError::InvalidProgress {
+                        file_id: self.file_id,
+                        reason: "retained committed-frontier window does not end at final_offset",
+                    });
+                }
+                window.guard().map_err(|_| BatchError::InvalidProgress {
+                    file_id: self.file_id,
+                    reason: "retained committed-frontier window is not a valid guard",
+                })?
+            }
+        };
         Ok(UpdateProgress {
             file_id: self.file_id,
             expected_committed_offset: self.expected_committed_offset,
             expected_file_epoch: self.expected_file_epoch,
             new_committed_offset: self.final_offset,
+            new_committed_frontier_guard,
             new_framing_resume: self.final_framing_resume,
             new_last_seen_time_unix_nano: self
                 .last_seen_time_unix_nano
@@ -455,6 +509,7 @@ enum DeltaPlan {
         index: usize,
         final_offset: u64,
         final_framing_resume: FramingResume,
+        final_window: CommittedFrontierWindow,
         last_seen_time_unix_nano: u64,
     },
 }
@@ -751,6 +806,7 @@ impl OpenBatch {
                 index,
                 final_offset: frame.end,
                 final_framing_resume: record.framed.resulting_resume,
+                final_window: record.framed.checkpoint_window.clone(),
                 last_seen_time_unix_nano: delta
                     .last_seen_time_unix_nano
                     .max(record.progress_base.last_seen_time_unix_nano)
@@ -778,6 +834,7 @@ impl OpenBatch {
             expected_framing_resume: record.progress_base.framing_resume,
             final_offset: frame.end,
             final_framing_resume: record.framed.resulting_resume,
+            final_guard_source: DeltaGuardSource::Window(record.framed.checkpoint_window.clone()),
             last_seen_time_unix_nano: record
                 .progress_base
                 .last_seen_time_unix_nano
@@ -801,6 +858,7 @@ impl OpenBatch {
                 index,
                 final_offset,
                 final_framing_resume,
+                final_window,
                 last_seen_time_unix_nano,
             } => {
                 // `prepare_delta` obtained this index from the same immutable
@@ -812,6 +870,7 @@ impl OpenBatch {
                     .expect("prevalidated delta index must remain valid");
                 delta.final_offset = final_offset;
                 delta.final_framing_resume = final_framing_resume;
+                delta.final_guard_source = DeltaGuardSource::Window(final_window);
                 delta.last_seen_time_unix_nano = last_seen_time_unix_nano;
             }
         }
@@ -848,6 +907,11 @@ impl OpenBatch {
             return Ok(FinalizationOutcome::Merged);
         }
 
+        // No record advanced this identity's offset in this batch: this is
+        // a zero-delta, lifecycle-only finalize. The durable guard is
+        // reused verbatim rather than recomputed (there is no new frame to
+        // provide real evidence for), matching "zero-delta finalization
+        // preserves prior window/guard".
         Ok(FinalizationOutcome::Direct(ProgressDelta {
             file_id,
             expected_file_epoch: frontier.file_epoch,
@@ -855,6 +919,7 @@ impl OpenBatch {
             expected_framing_resume: frontier.framing_resume,
             final_offset: frontier.offset,
             final_framing_resume: frontier.framing_resume,
+            final_guard_source: DeltaGuardSource::Unchanged,
             last_seen_time_unix_nano,
             finalize: true,
         }))
@@ -1067,6 +1132,9 @@ fn validate_resume_transition(
         FramingResume::Continuation {
             record_start_offset,
             next_fragment_index,
+            // Not consulted by this reconstruction check: only the
+            // fragment start/index feed `fragment_id`.
+            record_end_offset: _,
         } => {
             if record_start_offset >= record.framed.frame_source_range.start {
                 return Err(BatchError::InvalidProgress {
@@ -1100,6 +1168,9 @@ fn validate_resume_transition(
     } else {
         FramingResume::Continuation {
             record_start_offset,
+            // Fragments produced by this framer always use the
+            // scan-to-next-physical-LF sentinel; see `framer.rs`.
+            record_end_offset: 0,
             next_fragment_index: fragment.index.checked_add(1).ok_or(
                 BatchError::InvalidProgress {
                     file_id: record.file_id,
@@ -1272,7 +1343,7 @@ fn push_attribute(
 }
 
 fn prepare_path(path: &Path, field: &'static str) -> Result<PreparedPath, BatchError> {
-    let native = encode_advisory_path(path).map_err(|source| BatchError::Path {
+    let native = native_path_bytes(path).map_err(|source| BatchError::Path {
         field,
         path: path.to_path_buf(),
         source: Box::new(source),

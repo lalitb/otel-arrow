@@ -10,12 +10,13 @@
 
 use super::error::{DecodeError, EncodeError};
 use super::primitives::{
-    ADVISORY_PATH_MAX_BYTES, ByteReader, ByteWriter, FINGERPRINT_MAX_BYTES, FileId, FramingResume,
-    LifecycleState, Locator, REASON_CODE_RESERVED, SNAPSHOT_FOOTER_MAGIC, SNAPSHOT_MAGIC, crc32c,
+    AdvisoryPath, ByteReader, ByteWriter, COMMITTED_FRONTIER_GUARD_WINDOW_BYTES,
+    CommittedFrontierGuard, FINGERPRINT_MAX_BYTES, FileId, FramingResume, LifecycleState, Locator,
+    REASON_CODE_RESERVED, SNAPSHOT_FOOTER_MAGIC, SNAPSHOT_MAGIC, crc32c, namespace_digest,
 };
 
 /// Fixed width of the snapshot header, in bytes.
-pub const SNAPSHOT_HEADER_LEN: usize = 28;
+pub const SNAPSHOT_HEADER_LEN: usize = 60;
 /// Fixed width of the snapshot footer, in bytes.
 pub const SNAPSHOT_FOOTER_LEN: usize = 24;
 
@@ -44,6 +45,9 @@ pub struct SnapshotRecord {
     pub file_epoch: u32,
     /// Committed (Ack'd) source-byte offset.
     pub committed_offset: u64,
+    /// Continuity evidence for the raw source bytes preceding
+    /// `committed_offset`.
+    pub committed_frontier_guard: CommittedFrontierGuard,
     /// Current fingerprint matching evidence.
     pub fingerprint: Vec<u8>,
     /// Number of header bytes ignored when computing the fingerprint.
@@ -62,16 +66,78 @@ pub struct SnapshotRecord {
     pub quarantine_evidence: Option<QuarantineEvidence>,
     /// Last-seen timestamp, in Unix nanoseconds.
     pub last_seen_time_unix_nano: u64,
-    /// Advisory path bytes (matching/diagnostic evidence, not identity).
-    pub advisory_path: Vec<u8>,
+    /// Advisory path (bounded matching/diagnostic evidence, not identity).
+    pub advisory_path: AdvisoryPath,
 }
 
 impl SnapshotRecord {
+    /// Validates the reachable-state invariants
+    /// (`docs/filelog-checkpoint-format.md#snapshot-reachable-state-invariants`)
+    /// this record must satisfy regardless of whether it is being encoded
+    /// or was just decoded. A CRC-valid record failing this check is
+    /// `InvalidSnapshotState`, never a candidate for repair.
+    fn validate_reachable_state(&self) -> Result<(), &'static str> {
+        if self.file_epoch < 1 {
+            return Err("file_epoch must be >= 1");
+        }
+        let expected_window = self
+            .committed_offset
+            .min(u64::from(COMMITTED_FRONTIER_GUARD_WINDOW_BYTES));
+        if u64::from(self.committed_frontier_guard.window_len) != expected_window {
+            return Err("committed_frontier_guard.window_len != min(committed_offset, 64)");
+        }
+        if matches!(self.locator, Locator::Unspecified) {
+            return Err("locator must be a recognized non-Unspecified kind");
+        }
+        if self.framing_profile_version == 0 {
+            return Err("framing_profile_version must be nonzero");
+        }
+        if let FramingResume::Continuation {
+            record_start_offset,
+            record_end_offset,
+            next_fragment_index,
+        } = self.framing_resume
+        {
+            if next_fragment_index < 1
+                || record_start_offset >= self.committed_offset
+                || (record_end_offset != 0 && self.committed_offset >= record_end_offset)
+            {
+                return Err("FramingResume::Continuation violates its reachable-state invariant");
+            }
+        }
+        if self.lifecycle_state == LifecycleState::RotatedFinalized {
+            if self.quarantine_evidence.is_some() {
+                return Err("RotatedFinalized record must not carry quarantine_evidence");
+            }
+            if self.framing_resume != FramingResume::Clean {
+                return Err("RotatedFinalized record must have FramingResume::Clean");
+            }
+        }
+        // Quarantine-evidence presence-vs-lifecycle-state agreement is
+        // enforced by the caller (`encode_payload`'s
+        // `MissingQuarantineEvidence`/`UnexpectedQuarantineEvidence`, and
+        // `decode_payload`, which only ever reads evidence when
+        // `lifecycle_state == Quarantined`); this only validates evidence
+        // *content* once it is known to be present.
+        if let Some(evidence) = &self.quarantine_evidence {
+            if evidence.reason_code == REASON_CODE_RESERVED {
+                return Err("quarantine_evidence.reason_code must not be 0x0000");
+            }
+            if self.lifecycle_state == LifecycleState::Quarantined
+                && evidence.quarantine_epoch != self.file_epoch
+            {
+                return Err("Quarantined record requires quarantine_epoch == file_epoch");
+            }
+        }
+        Ok(())
+    }
+
     fn encode_payload(&self) -> Result<Vec<u8>, EncodeError> {
         let mut out = ByteWriter::new();
         out.write_bytes(&self.file_id.0);
         out.write_u32(self.file_epoch);
         out.write_u64(self.committed_offset);
+        self.committed_frontier_guard.write(&mut out);
         out.write_var_bytes(
             "snapshot_record.fingerprint",
             &self.fingerprint,
@@ -112,12 +178,19 @@ impl SnapshotRecord {
                 });
             }
         }
+        // Runs after the presence/reason checks above (which already cover
+        // their own specific error variants) so this shared invariant
+        // check -- also used by `decode_payload`, which has no equivalent
+        // dedicated error for a reserved reason code -- never preempts a
+        // more specific encode-time error with the generic
+        // `InvalidSnapshotState`.
+        self.validate_reachable_state()
+            .map_err(|reason| EncodeError::InvalidSnapshotState {
+                file_id: self.file_id,
+                reason,
+            })?;
         out.write_u64(self.last_seen_time_unix_nano);
-        out.write_var_bytes(
-            "snapshot_record.advisory_path",
-            &self.advisory_path,
-            ADVISORY_PATH_MAX_BYTES,
-        )?;
+        self.advisory_path.write(&mut out);
         Ok(out.into_bytes())
     }
 
@@ -142,6 +215,7 @@ impl SnapshotRecord {
         let file_id = FileId(file_id_bytes);
         let file_epoch = input.read_u32()?;
         let committed_offset = input.read_u64()?;
+        let committed_frontier_guard = CommittedFrontierGuard::read(&mut input)?;
         let fingerprint = input
             .read_var_bytes("snapshot_record.fingerprint", FINGERPRINT_MAX_BYTES)?
             .to_vec();
@@ -168,9 +242,7 @@ impl SnapshotRecord {
             None
         };
         let last_seen_time_unix_nano = input.read_u64()?;
-        let advisory_path = input
-            .read_var_bytes("snapshot_record.advisory_path", ADVISORY_PATH_MAX_BYTES)?
-            .to_vec();
+        let advisory_path = AdvisoryPath::read(&mut input)?;
         if input.remaining() != 0 {
             return Err(DecodeError::UnconsumedBytes {
                 context: "snapshot_record",
@@ -178,10 +250,11 @@ impl SnapshotRecord {
                 consumed: bytes.len() - input.remaining(),
             });
         }
-        Ok(SnapshotRecord {
+        let record = SnapshotRecord {
             file_id,
             file_epoch,
             committed_offset,
+            committed_frontier_guard,
             fingerprint,
             ignored_header_bytes,
             locator,
@@ -192,7 +265,14 @@ impl SnapshotRecord {
             quarantine_evidence,
             last_seen_time_unix_nano,
             advisory_path,
-        })
+        };
+        record
+            .validate_reachable_state()
+            .map_err(|reason| DecodeError::InvalidSnapshotState {
+                file_id: record.file_id,
+                reason,
+            })?;
+        Ok(record)
     }
 
     /// Decodes one self-delimiting record frame from the front of `input`,
@@ -217,9 +297,10 @@ impl SnapshotRecord {
 }
 
 /// Encodes a complete snapshot file (header, records, footer) for the given
-/// `generation`.
+/// `generation` and `checkpoint_id` (namespace).
 pub fn encode_snapshot(
     generation: u64,
+    checkpoint_id: &str,
     records: &[SnapshotRecord],
 ) -> Result<Vec<u8>, EncodeError> {
     // `file_id` is the record key: a snapshot with two records sharing a
@@ -239,12 +320,14 @@ pub fn encode_snapshot(
     out.write_u16(super::primitives::FORMAT_VERSION);
     out.write_u16(0); // flags, reserved
     out.write_u64(generation);
+    out.write_bytes(&namespace_digest(checkpoint_id));
     // Record counts in practice stay well below u32::MAX (bounded by
     // configured max_tracked_files in a later stage); this cast is exact for
     // any input this codec is expected to see.
     out.write_u32(records.len() as u32);
     let header_crc = crc32c(out.as_bytes());
     out.write_u32(header_crc);
+    debug_assert_eq!(out.as_bytes().len(), SNAPSHOT_HEADER_LEN);
 
     let mut total_record_bytes: u64 = 0;
     for record in records {
@@ -280,6 +363,8 @@ pub struct SnapshotContents {
 pub(crate) struct SnapshotHeader {
     /// Generation declared by the snapshot.
     pub(crate) generation: u64,
+    /// Namespace digest declared by the snapshot header.
+    pub(crate) namespace_digest: [u8; 32],
     /// Number of records declared by the snapshot.
     pub(crate) record_count: u32,
 }
@@ -318,9 +403,11 @@ pub(crate) fn decode_snapshot_header(bytes: &[u8]) -> Result<SnapshotHeader, Dec
         });
     }
     let generation = reader.read_u64()?;
+    let mut namespace_digest = [0u8; 32];
+    namespace_digest.copy_from_slice(reader.read_exact(32)?);
     let record_count = reader.read_u32()?;
     let stored_header_crc = reader.read_u32()?;
-    let computed_header_crc = crc32c(&bytes[0..24]);
+    let computed_header_crc = crc32c(&bytes[0..56]);
     if stored_header_crc != computed_header_crc {
         return Err(DecodeError::ChecksumMismatch {
             context: "snapshot_header",
@@ -330,18 +417,28 @@ pub(crate) fn decode_snapshot_header(bytes: &[u8]) -> Result<SnapshotHeader, Dec
     }
     Ok(SnapshotHeader {
         generation,
+        namespace_digest,
         record_count,
     })
 }
 
-/// Decodes and fully validates a complete snapshot file, returning its
-/// generation and records in on-disk order.
+/// Decodes and fully validates a complete snapshot file against
+/// `expected_namespace_digest`, returning its generation and records in
+/// on-disk order.
 ///
 /// Fails closed (with no torn-tail leniency) on any header, record, or
 /// footer inconsistency, including trailing bytes after a structurally
 /// complete footer.
-pub fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotContents, DecodeError> {
+pub fn decode_snapshot(
+    bytes: &[u8],
+    expected_namespace_digest: &[u8; 32],
+) -> Result<SnapshotContents, DecodeError> {
     let header = decode_snapshot_header(bytes)?;
+    if &header.namespace_digest != expected_namespace_digest {
+        return Err(DecodeError::NamespaceMismatch {
+            context: "snapshot",
+        });
+    }
     let generation = header.generation;
     let record_count = header.record_count;
 

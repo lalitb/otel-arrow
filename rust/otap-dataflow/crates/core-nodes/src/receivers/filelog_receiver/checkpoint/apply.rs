@@ -13,9 +13,61 @@
 use std::collections::HashMap;
 
 use super::error::{ApplyError, DecodeError};
-use super::primitives::{FileId, FramingResume, LifecycleState};
+use super::primitives::{CommittedFrontierGuard, FileId, FramingResume, LifecycleState, Locator};
 use super::snapshot::{QuarantineEvidence, SnapshotRecord};
 use super::wal::{Operation, ResetQuarantineAction, Transaction};
+
+/// Validates that `guard.window_len` equals
+/// `min(committed_offset, COMMITTED_FRONTIER_GUARD_WINDOW_BYTES)`, the
+/// reachable-state invariant every stored or incoming guard must satisfy.
+fn validate_guard_window(
+    operation: &'static str,
+    file_id: FileId,
+    committed_offset: u64,
+    guard: &CommittedFrontierGuard,
+) -> Result<(), ApplyError> {
+    let expected = committed_offset.min(u64::from(
+        super::primitives::COMMITTED_FRONTIER_GUARD_WINDOW_BYTES,
+    ));
+    if u64::from(guard.window_len) != expected {
+        return Err(ApplyError::InvalidCommittedFrontierGuard {
+            operation,
+            file_id,
+            reason: "window_len does not equal min(committed_offset, 64)",
+        });
+    }
+    Ok(())
+}
+
+/// Validates a `Continuation` framing-resume value against the offset it is
+/// paired with: `next_fragment_index >= 1`, `record_start_offset <
+/// committed_offset`, and either `record_end_offset == 0` or
+/// `committed_offset < record_end_offset`. `Clean` is always valid.
+fn validate_framing_resume(
+    operation: &'static str,
+    file_id: FileId,
+    committed_offset: u64,
+    resume: &FramingResume,
+) -> Result<(), ApplyError> {
+    if let FramingResume::Continuation {
+        record_start_offset,
+        record_end_offset,
+        next_fragment_index,
+    } = *resume
+    {
+        if next_fragment_index < 1
+            || record_start_offset >= committed_offset
+            || (record_end_offset != 0 && committed_offset >= record_end_offset)
+        {
+            return Err(ApplyError::ImpossibleTransition {
+                operation,
+                file_id,
+                reason: "framing_resume Continuation violates a reachable-state invariant",
+            });
+        }
+    }
+    Ok(())
+}
 
 /// One in-memory checkpoint record. Identical in shape to
 /// [`SnapshotRecord`]: applying every durable operation for a `file_id`
@@ -268,6 +320,33 @@ impl CheckpointTable {
                         reason: "framing_resume must be Clean at registration",
                     });
                 }
+                // Matches the snapshot's reachable-state validation
+                // (`SnapshotRecord::validate_reachable_state`): an
+                // `Unspecified` locator or a zero `framing_profile_version`
+                // is unreachable for an Active record, so replay rejects it
+                // before insertion or an identical-looking replay, rather
+                // than durably persisting a value the snapshot codec would
+                // itself refuse to encode or decode.
+                if matches!(op.locator, Locator::Unspecified) {
+                    return Err(ApplyError::ImpossibleTransition {
+                        operation: "register_file",
+                        file_id: op.file_id,
+                        reason: "locator must be a recognized non-Unspecified kind",
+                    });
+                }
+                if op.framing_profile_version == 0 {
+                    return Err(ApplyError::ImpossibleTransition {
+                        operation: "register_file",
+                        file_id: op.file_id,
+                        reason: "framing_profile_version must be nonzero",
+                    });
+                }
+                validate_guard_window(
+                    "register_file",
+                    op.file_id,
+                    op.committed_offset,
+                    &op.committed_frontier_guard,
+                )?;
                 let slot = Self::slot(table, op.file_id);
                 match slot {
                     None => {
@@ -275,6 +354,7 @@ impl CheckpointTable {
                             file_id: op.file_id,
                             file_epoch: op.file_epoch,
                             committed_offset: op.committed_offset,
+                            committed_frontier_guard: op.committed_frontier_guard,
                             fingerprint: op.fingerprint.clone(),
                             ignored_header_bytes: op.ignored_header_bytes,
                             locator: op.locator,
@@ -290,6 +370,7 @@ impl CheckpointTable {
                     Some(existing) => {
                         let identical = existing.file_epoch == op.file_epoch
                             && existing.committed_offset == op.committed_offset
+                            && existing.committed_frontier_guard == op.committed_frontier_guard
                             && existing.fingerprint == op.fingerprint
                             && existing.ignored_header_bytes == op.ignored_header_bytes
                             && existing.locator == op.locator
@@ -339,7 +420,36 @@ impl CheckpointTable {
                         attempted: op.new_committed_offset,
                     });
                 }
+                validate_guard_window(
+                    "update_progress",
+                    op.file_id,
+                    op.new_committed_offset,
+                    &op.new_committed_frontier_guard,
+                )?;
+                if op.new_committed_offset == op.expected_committed_offset
+                    && op.new_committed_frontier_guard != record.committed_frontier_guard
+                {
+                    return Err(ApplyError::InvalidCommittedFrontierGuard {
+                        operation: "update_progress",
+                        file_id: op.file_id,
+                        reason: "a zero-delta update must repeat the stored guard exactly",
+                    });
+                }
+                if op.finalize && op.new_framing_resume != FramingResume::Clean {
+                    return Err(ApplyError::ImpossibleTransition {
+                        operation: "update_progress",
+                        file_id: op.file_id,
+                        reason: "finalize requires new_framing_resume to be Clean",
+                    });
+                }
+                validate_framing_resume(
+                    "update_progress",
+                    op.file_id,
+                    op.new_committed_offset,
+                    &op.new_framing_resume,
+                )?;
                 record.committed_offset = op.new_committed_offset;
+                record.committed_frontier_guard = op.new_committed_frontier_guard;
                 record.framing_resume = op.new_framing_resume;
                 record.last_seen_time_unix_nano = op.new_last_seen_time_unix_nano;
                 if op.finalize {
@@ -404,6 +514,7 @@ impl CheckpointTable {
                 }
                 record.file_epoch = resulting_epoch;
                 record.committed_offset = 0;
+                record.committed_frontier_guard = CommittedFrontierGuard::empty();
                 record.framing_resume = FramingResume::Clean;
                 record.last_seen_time_unix_nano = op.reset_time_unix_nano;
             }
@@ -447,19 +558,10 @@ impl CheckpointTable {
                     },
                 )?;
                 match record.lifecycle_state {
-                    LifecycleState::Active => {
-                        if let Some(locator) = op.locator {
-                            record.locator = locator;
-                        }
-                        if let Some(path) = &op.advisory_path {
-                            record.advisory_path = path.clone();
-                        }
-                        record.last_seen_time_unix_nano = op.last_seen_time_unix_nano;
-                    }
-                    LifecycleState::Quarantined => {
-                        // The immutable quarantine locator, lifecycle state,
-                        // and failure evidence are never touched here, even
-                        // when `op.locator` is `Some`.
+                    LifecycleState::Active | LifecycleState::Quarantined => {
+                        // The locator is immutable for a `file_id`:
+                        // `update_metadata` never carries one, and the
+                        // quarantine locator additionally stays frozen.
                         if let Some(path) = &op.advisory_path {
                             record.advisory_path = path.clone();
                         }
@@ -501,6 +603,18 @@ impl CheckpointTable {
                                     reason: "quarantine_epoch must equal expected_file_epoch",
                                 });
                             }
+                            // The format requires the operation's locator to
+                            // equal the stored locator for an Active record;
+                            // a divergent locator fails replay closed rather
+                            // than silently rebinding quarantine evidence to
+                            // a different runtime identity.
+                            if op.locator != existing.locator {
+                                return Err(ApplyError::ImpossibleTransition {
+                                    operation: "quarantine_file",
+                                    file_id: op.file_id,
+                                    reason: "locator must equal the stored locator",
+                                });
+                            }
                         }
                         LifecycleState::Quarantined => {
                             let evidence = existing.quarantine_evidence.as_ref().ok_or(
@@ -535,7 +649,9 @@ impl CheckpointTable {
                     .as_mut()
                     .expect("presence already checked above");
                 record.lifecycle_state = LifecycleState::Quarantined;
-                record.locator = op.locator;
+                // `op.locator` is validated equal to `existing.locator`
+                // above; the locator is frozen as the immutable quarantine
+                // locator and is never reassigned to a different value.
                 record.quarantine_evidence = Some(QuarantineEvidence {
                     reason_code: op.reason_code,
                     observed_size: op.observed_size,
@@ -546,6 +662,8 @@ impl CheckpointTable {
             Operation::ResetQuarantinedFile(op) => {
                 let record_slot = Self::slot(table, op.file_id);
                 let committed_offset;
+                let stored_guard;
+                let stored_framing_resume;
                 {
                     let existing =
                         record_slot
@@ -576,6 +694,8 @@ impl CheckpointTable {
                         });
                     }
                     committed_offset = existing.committed_offset;
+                    stored_guard = existing.committed_frontier_guard;
+                    stored_framing_resume = existing.framing_resume;
                 }
                 match op.action {
                     ResetQuarantineAction::KeepFailed => {
@@ -591,6 +711,13 @@ impl CheckpointTable {
                                 operation: "reset_quarantined_file",
                                 file_id: op.file_id,
                                 reason: "keep_failed must not change the committed offset",
+                            });
+                        }
+                        if op.new_committed_frontier_guard != stored_guard
+                            || op.new_framing_resume != stored_framing_resume
+                        {
+                            return Err(ApplyError::KeepFailedStateChange {
+                                file_id: op.file_id,
                             });
                         }
                         return Ok(()); // Stays Quarantined; audit-only.
@@ -616,6 +743,13 @@ impl CheckpointTable {
                                 reason: "reset_to_beginning requires resulting_offset == 0",
                             });
                         }
+                        if op.new_committed_frontier_guard != CommittedFrontierGuard::empty() {
+                            return Err(ApplyError::InvalidCommittedFrontierGuard {
+                                operation: "reset_quarantined_file",
+                                file_id: op.file_id,
+                                reason: "reset_to_beginning requires the empty guard",
+                            });
+                        }
                     }
                     ResetQuarantineAction::ResetToEnd => {
                         let resulting_epoch = op.expected_quarantine_epoch.checked_add(1).ok_or(
@@ -632,6 +766,12 @@ impl CheckpointTable {
                             });
                         }
                         // `resulting_offset` is accepted as given.
+                        validate_guard_window(
+                            "reset_quarantined_file",
+                            op.file_id,
+                            op.resulting_offset,
+                            &op.new_committed_frontier_guard,
+                        )?;
                     }
                 }
                 if op.new_framing_resume != FramingResume::Clean {
@@ -647,11 +787,26 @@ impl CheckpointTable {
                 record.lifecycle_state = LifecycleState::Active;
                 record.file_epoch = op.resulting_epoch;
                 record.committed_offset = op.resulting_offset;
+                record.committed_frontier_guard = op.new_committed_frontier_guard;
                 record.framing_resume = FramingResume::Clean;
                 record.last_seen_time_unix_nano = op.reset_time_unix_nano;
                 record.quarantine_evidence = None;
             }
             Operation::RemoveFile(op) => {
+                // Namespace validation runs before table lookup or
+                // absent-file idempotency: an administrative removal
+                // recorded against the wrong namespace fails closed even
+                // when `file_id` is absent from this table.
+                if op.administrative {
+                    let named_namespace = op.namespace_id.as_deref().unwrap_or_default();
+                    if named_namespace != namespace_id {
+                        return Err(ApplyError::NamespaceMismatch {
+                            file_id: op.file_id,
+                            named: named_namespace.to_owned(),
+                            actual: namespace_id.to_owned(),
+                        });
+                    }
+                }
                 let record_slot = Self::slot(table, op.file_id);
                 let existing = match record_slot.as_ref() {
                     None => return Ok(()), // Idempotent: already absent.
@@ -695,22 +850,6 @@ impl CheckpointTable {
                                 reason: "ordinary retention cannot remove quarantined state",
                             });
                         }
-                    }
-                }
-                // Namespace validation applies whenever this removal is
-                // administrative, regardless of the record's lifecycle
-                // state -- not only when removing a Quarantined record --
-                // so an administrative removal recorded against the wrong
-                // namespace can never silently succeed against an Active or
-                // RotatedFinalized record either.
-                if op.administrative {
-                    let named_namespace = op.namespace_id.as_deref().unwrap_or_default();
-                    if named_namespace != namespace_id {
-                        return Err(ApplyError::NamespaceMismatch {
-                            file_id: op.file_id,
-                            named: named_namespace.to_owned(),
-                            actual: namespace_id.to_owned(),
-                        });
                     }
                 }
                 *record_slot = None;
