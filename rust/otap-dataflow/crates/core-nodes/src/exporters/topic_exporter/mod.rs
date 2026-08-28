@@ -74,6 +74,13 @@ pub struct TopicExporterMetrics {
     /// Number of pending end-to-end messages nacked during shutdown.
     #[metric(unit = "{item}")]
     pub shutdown_nacks: Counter<u64>,
+    /// Number of messages rejected because the topic had no ready required
+    /// subscriber for an all-subscriber-aggregation publish.
+    ///
+    /// This counter has no per-message attributes; it is one bounded series per
+    /// exporter node and topic.
+    #[metric(unit = "{item}")]
+    pub rejected_messages_on_no_route: Counter<u64>,
 }
 
 /// Topic exporter configuration.
@@ -107,7 +114,14 @@ struct BlockedPublish {
 enum BlockedPublishCompletion {
     Untracked,
     Tracked(TrackedPublishReceipt),
+    /// The topic rejected the publish because it requires all-subscriber
+    /// aggregation and had no ready required subscriber.
+    NoRoute,
 }
+
+/// Reason text bridged upstream when a topic rejects a publish for lack of a
+/// ready required subscriber.
+const NO_ROUTE_NACK_REASON: &str = "topic has no ready required broadcast subscriber";
 
 /// Declares the topic exporter as a local exporter factory.
 #[allow(unsafe_code)]
@@ -217,6 +231,33 @@ impl TopicExporter {
         Ok(())
     }
 
+    /// Bridge a topic-level no-route rejection to an explicit upstream
+    /// non-success.
+    ///
+    /// The topic never published, registered, or delivered the message, so the
+    /// exporter still owns it. Reporting Nack (rather than Ack) keeps the
+    /// upstream source responsible for retrying; the local pipeline has already
+    /// accepted the message, so a Nack is the correct explicit failure.
+    async fn reject_no_route(
+        data: OtapPdata,
+        topic: &TopicHandle<OtapPdata>,
+        effect_handler: &EffectHandler<OtapPdata>,
+        metrics: &mut MetricSet<TopicExporterMetrics>,
+    ) -> Result<(), Error> {
+        metrics.rejected_messages_on_no_route.add(1);
+        let exporter_id = effect_handler.exporter_id();
+        otel_warn!(
+            "topic_exporter.no_route",
+            node = exporter_id.name.as_ref(),
+            topic = topic.name().as_ref(),
+            message =
+                "Rejecting message because the topic has no ready required broadcast subscriber"
+        );
+        effect_handler
+            .notify_nack(NackMsg::new(NO_ROUTE_NACK_REASON, data))
+            .await
+    }
+
     /// Start one topic-owned blocked publish future after the immediate fast
     /// path has already reported backpressure.
     fn start_blocked_publish(
@@ -228,10 +269,14 @@ impl TopicExporter {
         let future: Pin<Box<dyn Future<Output = Result<BlockedPublishCompletion, Error>>>> =
             if let Some(tracked_publisher) = tracked_publisher.cloned() {
                 Box::pin(async move {
-                    tracked_publisher
-                        .publish(published)
-                        .await
-                        .map(BlockedPublishCompletion::Tracked)
+                    match tracked_publisher.publish(published).await {
+                        Ok(receipt) => Ok(BlockedPublishCompletion::Tracked(receipt)),
+                        // Typed rejection: the topic had no ready required
+                        // subscriber. Nothing was published, so ownership of the
+                        // upstream message stays with the exporter.
+                        Err(Error::TopicNoRoute { .. }) => Ok(BlockedPublishCompletion::NoRoute),
+                        Err(error) => Err(error),
+                    }
                 })
             } else {
                 let topic = topic.clone();
@@ -285,6 +330,13 @@ impl TopicExporter {
                         | TrackedTryPublishOutcome::MaxInFlightReached => Ok(Some(
                             Self::start_blocked_publish(data, Some(tracked_publisher), topic),
                         )),
+                        // No ready required subscriber: blocking would not create
+                        // one, and the topic must never Ack a publication nobody
+                        // received. Report an explicit upstream non-success.
+                        TrackedTryPublishOutcome::NoRoute => {
+                            Self::reject_no_route(data, topic, effect_handler, metrics).await?;
+                            Ok(None)
+                        }
                     }
                 } else {
                     match topic.try_publish(published)? {
@@ -342,6 +394,9 @@ impl TopicExporter {
                                     data,
                                 ))
                                 .await?;
+                        }
+                        TrackedTryPublishOutcome::NoRoute => {
+                            Self::reject_no_route(data, topic, effect_handler, metrics).await?;
                         }
                     }
                 } else {
@@ -497,6 +552,15 @@ impl Exporter<OtapPdata> for TopicExporter {
                                         &mut pending_messages,
                                         &mut pending_outcomes,
                                     );
+                                }
+                                BlockedPublishCompletion::NoRoute => {
+                                    Self::reject_no_route(
+                                        blocked.data,
+                                        &topic,
+                                        &effect_handler,
+                                        &mut metrics,
+                                    )
+                                    .await?;
                                 }
                             }
                             tokio::task::consume_budget().await;
@@ -785,6 +849,153 @@ mod tests {
             let exporter_result = exporter_task.await.expect("exporter task should join");
             assert!(exporter_result.is_ok(), "exporter should stop cleanly");
         }));
+    }
+
+    /// Scenario: an Ack-interested pdata reaches a topic exporter whose
+    /// broadcast-only topic requires all-subscriber aggregation and currently
+    /// has no ready subscriber, under both `queue_on_full` policies.
+    /// Guarantees: the exporter never synthesizes success; it reports an
+    /// explicit upstream Nack carrying the upstream calldata, and no message is
+    /// published for a later subscriber to observe.
+    #[test]
+    fn no_route_publish_nacks_upstream_instead_of_acking() {
+        for queue_on_full in ["block", "drop_newest"] {
+            let (rt, local_tasks) = setup_test_runtime();
+            rt.block_on(local_tasks.run_until(async move {
+                let broker = TopicBroker::<OtapPdata>::new();
+                let topic_name =
+                    otap_df_config::TopicName::parse("ingress").expect("topic name should parse");
+                let base_handle = broker
+                    .create_in_memory_topic(
+                        topic_name.clone(),
+                        TopicOptions::BroadcastOnly {
+                            capacity: 16,
+                            on_lag: TopicBroadcastOnLagPolicy::DropOldest,
+                            ack_mode: TopicBroadcastAckMode::All,
+                        },
+                    )
+                    .expect("topic should be created");
+                let exporter_handle = PipelineTopicBinding::from(base_handle.clone())
+                    .with_default_ack_propagation_mode(TopicAckPropagationMode::Auto);
+
+                let topic_set = TopicSet::new("exporter-set");
+                _ = topic_set.insert(topic_name.clone(), exporter_handle);
+
+                let mut exporter_ctx = create_test_pipeline_context();
+                exporter_ctx.set_topic_set(topic_set);
+
+                let exporter_node = test_node("topic_exporter");
+                let mut exporter_user_cfg = NodeUserConfig::new_exporter_config(TOPIC_EXPORTER_URN);
+                exporter_user_cfg.config = json!({
+                    "topic": "ingress",
+                    "queue_on_full": queue_on_full
+                });
+
+                let mut exporter = (TOPIC_EXPORTER.create)(
+                    exporter_ctx,
+                    exporter_node.clone(),
+                    Arc::new(exporter_user_cfg),
+                    &ExporterConfig::new("topic_exporter"),
+                    &otap_df_engine::capability::registry::Capabilities::empty(),
+                )
+                .expect("topic exporter should be created");
+
+                let (exporter_input_tx, exporter_input_rx) =
+                    create_not_send_channel::<OtapPdata>(8);
+                exporter
+                    .set_pdata_receiver(
+                        exporter_node.clone(),
+                        PDataReceiver::Local(LocalReceiver::mpsc(exporter_input_rx)),
+                    )
+                    .expect("exporter input channel should be wired");
+
+                let exporter_ctrl = exporter.control_sender();
+                let (runtime_ctrl_tx, _runtime_ctrl_rx) = runtime_ctrl_msg_channel::<OtapPdata>(32);
+                let (pipeline_completion_tx, mut pipeline_completion_rx) =
+                    pipeline_completion_msg_channel::<OtapPdata>(32);
+                let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(64);
+                let exporter_task = tokio::task::spawn_local(async move {
+                    exporter
+                        .start(
+                            runtime_ctrl_tx,
+                            pipeline_completion_tx,
+                            metrics_reporter,
+                            Interests::empty(),
+                        )
+                        .await
+                });
+
+                let upstream_calldata = TestCallData::default();
+                exporter_input_tx
+                    .send(create_test_pdata().test_subscribe_to(
+                        Interests::ACKS | Interests::NACKS,
+                        upstream_calldata.clone().into(),
+                        4242,
+                    ))
+                    .expect("failed to send pdata to topic exporter");
+
+                let delivered = tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        let msg = pipeline_completion_rx
+                            .recv()
+                            .await
+                            .expect("pipeline-completion channel closed unexpectedly");
+                        assert!(
+                            !matches!(msg, PipelineCompletionMsg::DeliverAck { .. }),
+                            "no-route publish must never ack upstream"
+                        );
+                        if matches!(msg, PipelineCompletionMsg::DeliverNack { .. }) {
+                            break msg;
+                        }
+                    }
+                })
+                .await
+                .expect("timed out waiting for upstream nack control");
+                match delivered {
+                    PipelineCompletionMsg::DeliverNack { nack } => {
+                        let (node_id, nack) =
+                            next_nack(nack).expect("nack should route to exporter subscriber");
+                        assert_eq!(node_id, 4242);
+                        let got: TestCallData = nack
+                            .unwind
+                            .route
+                            .calldata
+                            .try_into()
+                            .expect("nack calldata should parse");
+                        assert_eq!(got, upstream_calldata);
+                        assert!(
+                            nack.reason
+                                .contains("no ready required broadcast subscriber"),
+                            "unexpected nack reason: {}",
+                            nack.reason
+                        );
+                    }
+                    other => panic!("expected DeliverNack, got: {other:?}"),
+                }
+
+                // A subscriber that joins afterwards must not observe the
+                // rejected attempt: nothing was published.
+                let mut subscriber = base_handle
+                    .subscribe(SubscriptionMode::Broadcast, SubscriberOptions::default())
+                    .expect("topic subscriber should be created");
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(200), subscriber.recv())
+                        .await
+                        .is_err(),
+                    "late subscriber must not receive a rejected publication"
+                );
+
+                exporter_ctrl
+                    .send(NodeControlMsg::Shutdown {
+                        deadline: Instant::now() + Duration::from_secs(1),
+                        reason: "test shutdown".to_owned(),
+                    })
+                    .await
+                    .expect("exporter shutdown should be sent");
+                let exporter_result = exporter_task.await.expect("exporter task should join");
+                assert!(exporter_result.is_ok(), "exporter should stop cleanly");
+            }));
+        }
     }
 
     /// Scenario: shutdown reaches a topic exporter while one untracked publish

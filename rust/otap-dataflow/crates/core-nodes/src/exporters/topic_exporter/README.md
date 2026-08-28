@@ -60,6 +60,7 @@ runtime metric sets may also be attached by the pipeline telemetry policy.
 | `exporter.topic.tracked_in_flight` | `{item}` | Current number of tracked publishes waiting for a terminal outcome. Future: add a pending-bytes gauge once retained payload size accounting is available for tracked publishes. |
 | `exporter.topic.outcome_timeouts` | `{item}` | Number of tracked publishes that resolved by timeout. Future: add an outcome-latency histogram once histogram instruments are available in the telemetry layer. |
 | `exporter.topic.shutdown_nacks` | `{item}` | Number of pending end-to-end messages nacked during shutdown. |
+| `exporter.topic.rejected_messages_on_no_route` | `{item}` | Number of messages rejected because the topic had no ready required subscriber for an all-subscriber-aggregation publish. |
 
 ### Events
 
@@ -68,6 +69,7 @@ runtime metric sets may also be attached by the pipeline telemetry policy.
 | `topic_exporter.start` | `info` | Exporter startup with topic name and effective publish policy. |
 | `topic_exporter.drop_newest` | `warn` | A publish was dropped because the topic queue was full and policy dropped newest. |
 | `topic_exporter.outcome_capacity_full` | `warn` | A publish requiring end-to-end outcome tracking was rejected because tracking capacity was exhausted. |
+| `topic_exporter.no_route` | `warn` | A publish was rejected because the topic requires all-subscriber aggregation and had no ready broadcast subscriber. |
 
 ## Limits
 

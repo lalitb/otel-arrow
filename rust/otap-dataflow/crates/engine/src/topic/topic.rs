@@ -17,8 +17,8 @@ use crate::error::Error::{
 use crate::topic::backend::{PublishFuture, PublishTrackedFuture, SubscriptionBackend, TopicState};
 use crate::topic::subscription::{Delivery, RecvDelivery};
 use crate::topic::types::{
-    AckFromResult, BroadcastSubscriberId, Envelope, NackFromResult, PublishOutcome,
-    SubscriberOptions, TopicOptions, TrackedPublishOutcome, TrackedPublishPermit,
+    AckFromResult, BroadcastSubscriberId, Envelope, NackFromResult, NonEmptyBroadcastMembership,
+    PublishOutcome, SubscriberOptions, TopicOptions, TrackedPublishOutcome, TrackedPublishPermit,
     TrackedPublishReceipt, TrackedPublishTracker, TrackedTryPublishOutcome,
 };
 use futures_core::Stream;
@@ -294,8 +294,9 @@ impl<T: Send + Sync + 'static> TopicInner<T> {
             } => {
                 TopicInner::BroadcastOnly(BroadcastOnlyTopic::new(name, capacity, on_lag, ack_mode))
             }
-            // `ack_mode` is intentionally ignored for Mixed: PR3 rejects `all` on
-            // any non-broadcast-only topic, so Mixed is always `first`.
+            // `ack_mode` is intentionally ignored for Mixed: the controller
+            // rejects `all` on any non-broadcast-only topic, so Mixed is always
+            // `first`.
             TopicOptions::Mixed {
                 balanced_capacity,
                 broadcast_capacity,
@@ -610,6 +611,14 @@ impl<T: Send + Sync + 'static> BalancedOnlyTopic<T> {
 /// started at or before that message's ring sequence, or excluded AND started
 /// strictly after it. Lock order is always **registry -> tracker**; tracker code
 /// must never call back into the registry.
+///
+/// Registry membership is also the topic's *readiness* set. Insertion in
+/// `subscribe_broadcast` is the ready transition: the subscriber's cursor
+/// (`start_seq`) and its membership are installed together under this lock, and
+/// the ring buffers messages until the subscriber task actually polls. A
+/// tracked `all`-mode publish that finds this set empty therefore has no
+/// required subscriber that could ever ack it and is rejected as
+/// `TopicNoRoute` instead of being published.
 struct BroadcastSubscriberRegistry {
     next_subscriber_id: AtomicU64,
     subscribers: Mutex<Arc<HashSet<BroadcastSubscriberId>>>,
@@ -693,8 +702,6 @@ impl<T: Send + Sync + 'static> BroadcastOnlyTopic<T> {
             return Err(TopicClosed);
         }
 
-        let id = self.next_message_id();
-
         // `all` mode: snapshot the eligible subscriber set and reserve the ring
         // sequence atomically under the registry lock so the consensus
         // membership exactly matches who will receive this message. Membership
@@ -702,15 +709,33 @@ impl<T: Send + Sync + 'static> BroadcastOnlyTopic<T> {
         // refcount bump rather than a deep copy of the whole set. The heavier
         // slot write plus waker fan-out happen after releasing the lock.
         //
+        // A registry entry is installed by `subscribe_broadcast` together with
+        // the subscriber's `start_seq`, so registry membership is exactly the
+        // set of ready subscribers: the ring buffers the message until the
+        // subscriber task polls it. If that snapshot is empty there is no
+        // required subscriber that could ever ack, so the publish is rejected
+        // as `TopicNoRoute` *before* any sequence is reserved, any tracked
+        // outcome is registered, or any slot is committed. The retained payload
+        // and the caller's in-flight permit are released here; the caller still
+        // owns the upstream message and must report an explicit non-success.
+        //
         // Lock order is registry -> tracker (`register_consensus` locks the
         // tracker); the tracker must never call back into the registry.
         if let Some(registry) = &self.registry {
             let subscribers = registry.subscribers.lock();
-            let snapshot = Arc::clone(&subscribers);
+            let Some(members) = NonEmptyBroadcastMembership::new(Arc::clone(&subscribers)) else {
+                drop(subscribers);
+                drop(permit);
+                drop(msg);
+                return Err(Error::TopicNoRoute {
+                    topic: self.name.clone(),
+                });
+            };
+            let id = self.next_message_id();
             let seq = self.broadcast_ring.reserve_seq();
             let receipt = self
                 .outcomes
-                .register_consensus(id, timeout, permit, snapshot, seq);
+                .register_consensus(id, timeout, permit, members, seq);
             drop(subscribers);
             let committed = self.broadcast_ring.commit_slot(
                 seq,
@@ -732,6 +757,7 @@ impl<T: Send + Sync + 'static> BroadcastOnlyTopic<T> {
         }
 
         // `first` mode: unchanged single-call path, no registry involvement.
+        let id = self.next_message_id();
         let receipt = self.outcomes.register(id, timeout, permit);
         self.broadcast_ring.publish(Envelope {
             id,
@@ -752,8 +778,11 @@ impl<T: Send + Sync + 'static> BroadcastOnlyTopic<T> {
         timeout: Duration,
         permit: TrackedPublishPermit,
     ) -> Result<TrackedTryPublishOutcome, Error> {
-        let receipt = self.publish_tracked(msg, timeout, permit)?;
-        Ok(TrackedTryPublishOutcome::Published(receipt))
+        match self.publish_tracked(msg, timeout, permit) {
+            Ok(receipt) => Ok(TrackedTryPublishOutcome::Published(receipt)),
+            Err(Error::TopicNoRoute { .. }) => Ok(TrackedTryPublishOutcome::NoRoute),
+            Err(error) => Err(error),
+        }
     }
 
     fn subscribe_broadcast(&self, _opts: SubscriberOptions) -> BroadcastSub<T> {

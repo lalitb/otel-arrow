@@ -121,6 +121,7 @@ pub mod error;
 /// Available controller extensions.
 pub mod extension;
 
+mod delivery_completion;
 mod listener_group;
 mod live_control;
 mod placement;
@@ -373,17 +374,36 @@ struct DeclaredTopics<PData: 'static + Clone + Send + Sync + std::fmt::Debug> {
     global_names: HashMap<TopicName, TopicName>,
     group_names: HashMap<(PipelineGroupId, TopicName), TopicName>,
     inferred_mode_reports: Vec<InferredTopicModeReport>,
+    /// Resolved per-topic facts needed to prove delivery-completion guarantees
+    /// across a topic hop, keyed by declared (fully qualified) topic name.
+    route_facts: HashMap<TopicName, TopicRouteFacts>,
+}
+
+/// Resolved topology and policy facts for one declared topic.
+///
+/// These are the only inputs the delivery-completion validator needs about a
+/// topic hop. They are captured while topics are declared, so validation reasons
+/// about the same resolved graph and policies the runtime uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TopicRouteFacts {
+    pub(crate) selected_mode: InferredTopicMode,
+    pub(crate) has_broadcast_receivers: bool,
+    pub(crate) has_unknown_receiver_mode: bool,
+    pub(crate) balanced_group_count: usize,
+    pub(crate) receiver_refs: usize,
+    pub(crate) ack_propagation_mode: TopicAckPropagationMode,
+    pub(crate) broadcast_ack_mode: TopicBroadcastAckMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InferredTopicMode {
+pub(crate) enum InferredTopicMode {
     Mixed,
     BalancedOnly,
     BroadcastOnly,
 }
 
 impl InferredTopicMode {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Mixed => "mixed",
             Self::BalancedOnly => "balanced_only",
@@ -566,8 +586,9 @@ impl<
         let balanced_capacity = spec.policies.balanced.queue_capacity.max(1);
         let broadcast_capacity = spec.policies.broadcast.queue_capacity.max(1);
         let broadcast_on_lag = spec.policies.broadcast.on_lag;
-        // TODO(#2252 PR3): pass the configured `ack_mode` through instead of
-        // hardcoding `first`, and reject `all` on non-broadcast-only topics.
+        // `all` aggregation is honored only for broadcast-only topics.
+        // `validate_topic_runtime_support` rejects `all` on any other inferred
+        // mode before this mapping runs, so Mixed stays first-only.
         match inferred_mode {
             InferredTopicMode::Mixed => TopicOptions::Mixed {
                 balanced_capacity,
@@ -581,7 +602,7 @@ impl<
             InferredTopicMode::BroadcastOnly => TopicOptions::BroadcastOnly {
                 capacity: broadcast_capacity,
                 on_lag: broadcast_on_lag,
-                ack_mode: TopicBroadcastAckMode::First,
+                ack_mode: spec.policies.broadcast.ack_mode,
             },
         }
     }
@@ -1074,6 +1095,38 @@ impl<
             });
         }
 
+        // `all` aggregation requires a nonempty required-subscriber membership
+        // per publication, which only the broadcast-only runtime can snapshot.
+        // Mixed and balanced-only topics stay first-wins, so accepting `all`
+        // there would silently downgrade the requested guarantee.
+        if policies.broadcast.ack_mode == TopicBroadcastAckMode::All
+            && selected_mode != InferredTopicMode::BroadcastOnly
+        {
+            return Err(Error::UnsupportedTopicPolicy {
+                topic: topic.clone(),
+                backend,
+                policy: "broadcast.ack_mode",
+                value: format!(
+                    "all (requires a broadcast_only topic; inferred mode is {})",
+                    selected_mode.as_str()
+                ),
+            });
+        }
+
+        // Defense in depth: config validation already rejects this pair, but a
+        // topic reaching the runtime with `all` and no automatic propagation
+        // could never bridge an aggregate completion upstream.
+        if policies.broadcast.ack_mode == TopicBroadcastAckMode::All
+            && policies.ack_propagation.mode != TopicAckPropagationMode::Auto
+        {
+            return Err(Error::UnsupportedTopicPolicy {
+                topic: topic.clone(),
+                backend,
+                policy: "broadcast.ack_mode",
+                value: "all (requires ack_propagation.mode `auto`)".to_owned(),
+            });
+        }
+
         Ok(())
     }
 
@@ -1126,6 +1179,26 @@ impl<
         })
     }
 
+    /// Capture the resolved topology and policy facts for one declared topic.
+    fn build_topic_route_facts(
+        reports: &[InferredTopicModeReport],
+        declared_name: &TopicName,
+        spec: &TopicSpec,
+        selected_mode: InferredTopicMode,
+    ) -> TopicRouteFacts {
+        let report = reports.iter().find(|report| &report.topic == declared_name);
+        TopicRouteFacts {
+            selected_mode,
+            has_broadcast_receivers: report.is_some_and(|report| report.has_broadcast_receivers),
+            has_unknown_receiver_mode: report
+                .is_some_and(|report| report.has_unknown_receiver_mode),
+            balanced_group_count: report.map_or(0, |report| report.balanced_group_count),
+            receiver_refs: report.map_or(0, |report| report.receiver_refs),
+            ack_propagation_mode: spec.policies.ack_propagation.mode,
+            broadcast_ack_mode: spec.policies.broadcast.ack_mode,
+        }
+    }
+
     fn declare_topics(config: &OtelDataflowSpec) -> Result<DeclaredTopics<PData>, Error> {
         let broker = TopicBroker::<PData>::new();
         let (global_names, group_names) = Self::build_declared_topic_name_maps(config)?;
@@ -1133,6 +1206,7 @@ impl<
         let (inferred_modes, mut inferred_mode_reports) =
             Self::infer_topic_modes(config, &global_names, &group_names)?;
         let default_selection_policy = config.engine.topics.impl_selection;
+        let mut route_facts = HashMap::<TopicName, TopicRouteFacts>::new();
 
         for (topic_name, spec) in &config.topics {
             let declared_name = global_names
@@ -1158,6 +1232,15 @@ impl<
                 &declared_name,
                 selection_policy,
                 selected_mode,
+            );
+            _ = route_facts.insert(
+                declared_name.clone(),
+                Self::build_topic_route_facts(
+                    &inferred_mode_reports,
+                    &declared_name,
+                    spec,
+                    selected_mode,
+                ),
             );
             Self::declare_topic(&broker, declared_name, spec, selected_mode)?;
         }
@@ -1189,6 +1272,15 @@ impl<
                     selection_policy,
                     selected_mode,
                 );
+                _ = route_facts.insert(
+                    declared_name.clone(),
+                    Self::build_topic_route_facts(
+                        &inferred_mode_reports,
+                        &declared_name,
+                        spec,
+                        selected_mode,
+                    ),
+                );
                 Self::declare_topic(&broker, declared_name, spec, selected_mode)?;
             }
         }
@@ -1198,6 +1290,7 @@ impl<
             global_names,
             group_names,
             inferred_mode_reports,
+            route_facts,
         })
     }
 
@@ -1461,6 +1554,19 @@ impl<
         }
         // Declare all topics up front before any pipeline thread starts.
         let declared_topics = Self::declare_topics(&engine_config)?;
+
+        // Prove every aggregate-Ack-required route before any worker starts.
+        // This uses factory wiring contracts plus the resolved pipeline and
+        // topic graph, and fails closed on any route it cannot prove.
+        delivery_completion::validate_delivery_completion_requirements(
+            &engine_config,
+            self.pipeline_factory,
+            &delivery_completion::TopicGraphView {
+                global_names: &declared_topics.global_names,
+                group_names: &declared_topics.group_names,
+                route_facts: &declared_topics.route_facts,
+            },
+        )?;
 
         for pipeline_entry in &pipelines {
             let pipeline_key = PipelineKey::new(
@@ -4244,6 +4350,119 @@ groups:
                 assert_eq!(backend, TopicBackendKind::InMemory);
                 assert_eq!(policy, "ack_propagation");
                 assert_eq!(value, "auto");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// Scenario: a broadcast-only topic declares `policies.broadcast.ack_mode:
+    /// all` with automatic Ack propagation.
+    /// Guarantees: the configured aggregation mode reaches the topic runtime
+    /// instead of being silently downgraded to `first`, and the default keeps
+    /// mapping to `first`.
+    #[test]
+    fn map_topic_spec_to_options_passes_broadcast_ack_mode_through() {
+        let mut spec = TopicSpec::default();
+        spec.policies.ack_propagation.mode = TopicAckPropagationMode::Auto;
+        spec.policies.broadcast.ack_mode = TopicBroadcastAckMode::All;
+
+        match Controller::<()>::map_topic_spec_to_options(&spec, InferredTopicMode::BroadcastOnly) {
+            TopicOptions::BroadcastOnly { ack_mode, .. } => {
+                assert_eq!(ack_mode, TopicBroadcastAckMode::All);
+            }
+            other => panic!("unexpected topic options: {other:?}"),
+        }
+
+        match Controller::<()>::map_topic_spec_to_options(
+            &TopicSpec::default(),
+            InferredTopicMode::BroadcastOnly,
+        ) {
+            TopicOptions::BroadcastOnly { ack_mode, .. } => {
+                assert_eq!(ack_mode, TopicBroadcastAckMode::First);
+            }
+            other => panic!("unexpected topic options: {other:?}"),
+        }
+    }
+
+    /// Scenario: a topic declares `broadcast.ack_mode: all` but its inferred
+    /// runtime mode is mixed or balanced-only.
+    /// Guarantees: the controller rejects the declaration instead of running a
+    /// first-wins topic that a caller believes aggregates all subscribers.
+    #[test]
+    fn validate_topic_runtime_support_rejects_all_ack_mode_outside_broadcast_only() {
+        let topic = TopicName::parse("test_topic").expect("topic name should parse");
+        let capabilities = TopicBackendCapabilities {
+            supports_balanced_only: true,
+            supports_broadcast_only: true,
+            supports_mixed: true,
+            supports_broadcast_on_lag_drop_oldest: true,
+            supports_broadcast_on_lag_disconnect: true,
+            supports_ack_propagation_disabled: true,
+            supports_ack_propagation_auto: true,
+        };
+        let mut spec = TopicSpec::default();
+        spec.policies.ack_propagation.mode = TopicAckPropagationMode::Auto;
+        spec.policies.broadcast.ack_mode = TopicBroadcastAckMode::All;
+
+        for mode in [InferredTopicMode::Mixed, InferredTopicMode::BalancedOnly] {
+            let err = Controller::<()>::validate_topic_runtime_support_with_capabilities(
+                &topic,
+                TopicBackendKind::InMemory,
+                &spec.policies,
+                mode,
+                capabilities,
+            )
+            .expect_err("all ack mode should be rejected outside broadcast_only");
+            match err {
+                Error::UnsupportedTopicPolicy { policy, value, .. } => {
+                    assert_eq!(policy, "broadcast.ack_mode");
+                    assert!(value.contains("broadcast_only"), "{value}");
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+        }
+
+        Controller::<()>::validate_topic_runtime_support_with_capabilities(
+            &topic,
+            TopicBackendKind::InMemory,
+            &spec.policies,
+            InferredTopicMode::BroadcastOnly,
+            capabilities,
+        )
+        .expect("all ack mode is supported on broadcast_only topics");
+    }
+
+    /// Scenario: a topic reaches runtime validation with `broadcast.ack_mode:
+    /// all` while Ack propagation is disabled.
+    /// Guarantees: the controller fails closed even if the combination bypassed
+    /// config-level validation.
+    #[test]
+    fn validate_topic_runtime_support_rejects_all_ack_mode_without_auto_propagation() {
+        let topic = TopicName::parse("test_topic").expect("topic name should parse");
+        let capabilities = TopicBackendCapabilities {
+            supports_balanced_only: true,
+            supports_broadcast_only: true,
+            supports_mixed: true,
+            supports_broadcast_on_lag_drop_oldest: true,
+            supports_broadcast_on_lag_disconnect: true,
+            supports_ack_propagation_disabled: true,
+            supports_ack_propagation_auto: true,
+        };
+        let mut spec = TopicSpec::default();
+        spec.policies.broadcast.ack_mode = TopicBroadcastAckMode::All;
+
+        let err = Controller::<()>::validate_topic_runtime_support_with_capabilities(
+            &topic,
+            TopicBackendKind::InMemory,
+            &spec.policies,
+            InferredTopicMode::BroadcastOnly,
+            capabilities,
+        )
+        .expect_err("all ack mode without auto propagation should be rejected");
+        match err {
+            Error::UnsupportedTopicPolicy { policy, value, .. } => {
+                assert_eq!(policy, "broadcast.ack_mode");
+                assert!(value.contains("auto"), "{value}");
             }
             other => panic!("unexpected error: {other:?}"),
         }

@@ -28,9 +28,10 @@ use crate::topic::backend::{InMemoryBackend, SubscriptionBackend};
 use crate::topic::subscription::{DeliveryBackend, DeliveryStorageKind};
 use crate::topic::topic::{BroadcastReadResult, FastBroadcastRing};
 use crate::topic::types::{
-    AckFromResult, BroadcastSubscriberId, Envelope, NackFromResult, PublishOutcome, RecvItem,
-    SubscriberOptions, SubscriptionMode, TopicOptions, TopicPublishOutcomeConfig,
-    TrackedPublishOutcome, TrackedPublishPermit, TrackedPublishTracker, TrackedTryPublishOutcome,
+    AckFromResult, BroadcastSubscriberId, Envelope, NackFromResult, NonEmptyBroadcastMembership,
+    PublishOutcome, RecvItem, SubscriberOptions, SubscriptionMode, TopicOptions,
+    TopicPublishOutcomeConfig, TrackedPublishOutcome, TrackedPublishPermit, TrackedPublishTracker,
+    TrackedTryPublishOutcome,
 };
 use crate::topic::{Delivery, RecvDelivery, Subscription, TopicBroker, TopicSet};
 use otap_df_config::topic::{TopicBroadcastAckMode, TopicBroadcastOnLagPolicy};
@@ -1974,6 +1975,49 @@ async fn broadcast_all_mode_single_nack_resolves_nack() {
     }
 }
 
+/// Scenario: An `all`-mode publication is nacked by one of two required
+/// subscribers, that subscriber then disappears, and the publisher retries the
+/// same payload.
+/// Guarantees: The retry snapshots required membership afresh, so it requires
+/// only the subscribers registered at retry time and can resolve as Ack even
+/// though the previous attempt's membership included a subscriber that is gone.
+#[tokio::test]
+async fn broadcast_all_mode_retry_uses_fresh_membership_snapshot() {
+    let broker = TopicBroker::<u64>::new();
+    let topic = all_mode_topic(
+        &broker,
+        "all-retry",
+        1024,
+        TopicBroadcastOnLagPolicy::DropOldest,
+    );
+    let handle = topic.tracked_publisher();
+
+    let mut sub1 = topic
+        .subscribe(SubscriptionMode::Broadcast, SubscriberOptions::default())
+        .unwrap();
+    let mut sub2 = topic
+        .subscribe(SubscriptionMode::Broadcast, SubscriberOptions::default())
+        .unwrap();
+
+    let first = handle.publish(Arc::new(1)).await.unwrap();
+    let id1 = recv_message_id(sub1.recv().await);
+    let id2 = recv_message_id(sub2.recv().await);
+    sub1.ack(id1).unwrap();
+    sub2.nack(id2, Arc::from("downstream rejected")).unwrap();
+    assert!(matches!(
+        first.wait_for_outcome().await,
+        TrackedPublishOutcome::Nack { .. }
+    ));
+
+    drop(sub2);
+
+    let retry = handle.publish(Arc::new(1)).await.unwrap();
+    let retry_id = recv_message_id(sub1.recv().await);
+    assert_eq!(retry_id, retry.message_id());
+    sub1.ack(retry_id).unwrap();
+    assert_eq!(retry.wait_for_outcome().await, TrackedPublishOutcome::Ack);
+}
+
 /// Scenario: A required subscriber lag-disconnects before acknowledging a tracked message.
 /// Guarantees: The outstanding upstream receipt resolves as Nack.
 #[tokio::test]
@@ -2077,10 +2121,15 @@ async fn broadcast_all_mode_drop_before_ack_nacks() {
     ));
 }
 
-/// Scenario: An `all`-mode tracked message is published with no eligible subscribers.
-/// Guarantees: The upstream receipt resolves immediately as Ack.
+/// Scenario: An `all`-mode tracked message is published while the topic has no
+/// registered broadcast subscriber, through both the awaiting and the
+/// non-awaiting tracked publish APIs.
+/// Guarantees: Both APIs report a typed no-route rejection instead of Ack, the
+/// publication is never accepted (no ring sequence is consumed and no tracked
+/// outcome is registered), and a subscriber that joins afterwards never receives
+/// the rejected attempt.
 #[tokio::test]
-async fn broadcast_all_mode_zero_subscribers_acks_immediately() {
+async fn broadcast_all_mode_zero_subscribers_rejects_with_no_route() {
     let broker = TopicBroker::<u64>::new();
     let topic = all_mode_topic(
         &broker,
@@ -2090,9 +2139,73 @@ async fn broadcast_all_mode_zero_subscribers_acks_immediately() {
     );
     let handle = topic.tracked_publisher();
 
-    let receipt = handle.publish(Arc::new(1)).await.unwrap();
+    let error = handle
+        .publish(Arc::new(1))
+        .await
+        .expect_err("publishing without a ready subscriber must not be accepted");
+    assert!(matches!(error, Error::TopicNoRoute { .. }));
 
+    assert!(matches!(
+        handle
+            .try_publish(Arc::new(2))
+            .expect("try publish must not fail the node"),
+        TrackedTryPublishOutcome::NoRoute
+    ));
+
+    // The in-flight permits taken for both rejected attempts were released, so
+    // the publisher still has its full budget.
+    assert_eq!(
+        handle.max_in_flight(),
+        topic.default_publish_outcome_config().max_in_flight
+    );
+
+    // A subscriber that becomes ready afterwards starts strictly after the
+    // rejected attempts and only sees a subsequently accepted publication.
+    let mut sub = topic
+        .subscribe(SubscriptionMode::Broadcast, SubscriberOptions::default())
+        .unwrap();
+    let receipt = handle
+        .publish(Arc::new(3))
+        .await
+        .expect("publish with a ready subscriber is accepted");
+    let delivered = recv_message_id(sub.recv().await);
+    assert_eq!(delivered, receipt.message_id());
+    sub.ack(delivered).unwrap();
     assert_eq!(receipt.wait_for_outcome().await, TrackedPublishOutcome::Ack);
+}
+
+/// Scenario: An `all`-mode topic loses its only broadcast subscriber and a new
+/// tracked publish is attempted.
+/// Guarantees: The topic stops accepting tracked publishes as soon as required
+/// membership is empty, so a retry after a drop-induced Nack never resolves as a
+/// vacuous Ack.
+#[tokio::test]
+async fn broadcast_all_mode_rejects_after_last_subscriber_disappears() {
+    let broker = TopicBroker::<u64>::new();
+    let topic = all_mode_topic(
+        &broker,
+        "all-empty-after-drop",
+        1024,
+        TopicBroadcastOnLagPolicy::DropOldest,
+    );
+    let handle = topic.tracked_publisher();
+
+    let mut sub = topic
+        .subscribe(SubscriptionMode::Broadcast, SubscriberOptions::default())
+        .unwrap();
+    let receipt = handle.publish(Arc::new(1)).await.unwrap();
+    let _id = recv_message_id(sub.recv().await);
+    drop(sub);
+    assert!(matches!(
+        receipt.wait_for_outcome().await,
+        TrackedPublishOutcome::Nack { .. }
+    ));
+
+    let error = handle
+        .publish(Arc::new(1))
+        .await
+        .expect_err("retry without a ready subscriber must not be accepted");
+    assert!(matches!(error, Error::TopicNoRoute { .. }));
 }
 
 /// Scenario: A subscriber joins after an `all`-mode tracked message is published.
@@ -2719,8 +2832,11 @@ fn consensus_permit() -> TrackedPublishPermit {
     consensus_permit_from(&Arc::new(Semaphore::new(1)))
 }
 
-fn subscriber_set(ids: impl IntoIterator<Item = u64>) -> HashSet<BroadcastSubscriberId> {
-    ids.into_iter().map(BroadcastSubscriberId).collect()
+fn subscriber_set(ids: impl IntoIterator<Item = u64>) -> NonEmptyBroadcastMembership {
+    let members: HashSet<BroadcastSubscriberId> =
+        ids.into_iter().map(BroadcastSubscriberId).collect();
+    NonEmptyBroadcastMembership::new(Arc::new(members))
+        .expect("test membership sets are never empty")
 }
 
 // A consensus entry resolves as Ack only once every required subscriber has acked,
@@ -2861,23 +2977,20 @@ async fn consensus_nack_from_respects_pending_membership() {
     );
 }
 
-// Zero eligible subscribers resolves immediately as Ack without registering.
-#[tokio::test]
-async fn consensus_empty_set_resolves_ack_immediately() {
-    let tracker = TrackedPublishTracker::new();
-    let receipt = tracker.register_consensus(
-        1,
-        Duration::from_secs(30),
-        consensus_permit(),
-        HashSet::new(),
-        1,
-    );
+/// Scenario: an empty required-membership snapshot is offered to the consensus
+/// membership constructor used by `register_consensus`.
+/// Guarantees: the empty case is unrepresentable, so the tracker has no API that
+/// could vacuously resolve a zero-subscriber publication as Ack.
+#[test]
+fn consensus_membership_cannot_be_empty() {
+    assert!(NonEmptyBroadcastMembership::new(Arc::new(HashSet::new())).is_none());
 
-    assert_eq!(receipt.wait_for_outcome().await, TrackedPublishOutcome::Ack);
-    assert_eq!(
-        tracker.resolve_ack_from(1, BroadcastSubscriberId(1)),
-        AckFromResult::NotTracked
-    );
+    let members = NonEmptyBroadcastMembership::new(Arc::new(
+        [BroadcastSubscriberId(1)].into_iter().collect(),
+    ))
+    .expect("non-empty membership should be accepted");
+    assert_eq!(members.len(), 1);
+    assert!(!members.is_empty());
 }
 
 // Acking an unknown message id is reported as not-tracked.

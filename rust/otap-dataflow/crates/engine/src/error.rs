@@ -528,6 +528,19 @@ pub enum Error {
     #[error("topic closed")]
     TopicClosed,
 
+    /// A tracked broadcast publish that requires all-subscriber aggregation was
+    /// rejected because the topic had no ready broadcast subscriber.
+    ///
+    /// The publish never reserved a ring sequence, never registered a tracked
+    /// outcome, and was never delivered. It is an explicit, non-vacuous
+    /// non-success: an `all`-mode topic must never Ack a publication that no
+    /// required subscriber received.
+    #[error("topic `{topic}` has no ready broadcast subscriber for an all-mode tracked publish")]
+    TopicNoRoute {
+        /// The topic that rejected the tracked publish.
+        topic: TopicName,
+    },
+
     /// Balanced (consumer-group) subscriptions are not supported on this topic.
     #[error("balanced subscriptions are not supported on this topic")]
     SubscribeBalancedNotSupported,
@@ -626,6 +639,7 @@ impl Error {
             Error::UnknownTopic { .. } => "UnknownTopic",
             Error::MessageNotTracked => "MessageNotTracked",
             Error::TopicClosed => "TopicClosed",
+            Error::TopicNoRoute { .. } => "TopicNoRoute",
             Error::SubscribeBalancedNotSupported => "SubscribeBalancedNotSupported",
             Error::SubscribeBroadcastNotSupported => "SubscribeBroadcastNotSupported",
             Error::SubscribeSingleGroupViolation => "SubscribeSingleGroupViolation",

@@ -85,6 +85,48 @@ pub enum TrackedTryPublishOutcome {
     DroppedOnFull,
     /// No tracked-outcome slot was available for this publisher.
     MaxInFlightReached,
+    /// The topic requires all-subscriber aggregation but had no ready broadcast
+    /// subscriber, so the message was rejected before publication.
+    ///
+    /// Nothing was reserved, registered, or delivered; the caller still owns the
+    /// message and must surface an explicit upstream non-success. This is the
+    /// non-awaiting counterpart of
+    /// [`Error::TopicNoRoute`](crate::error::Error::TopicNoRoute).
+    NoRoute,
+}
+
+/// A required broadcast-subscriber membership snapshot that is known to be
+/// non-empty.
+///
+/// `all`-mode broadcast aggregation must never resolve an empty required
+/// membership as Ack. Making the empty case unrepresentable in the tracker API
+/// removes the vacuous-Ack path entirely: the only way to obtain this type is
+/// [`NonEmptyBroadcastMembership::new`], which returns `None` for an empty set.
+#[derive(Debug, Clone)]
+pub struct NonEmptyBroadcastMembership(Arc<HashSet<BroadcastSubscriberId>>);
+
+impl NonEmptyBroadcastMembership {
+    /// Wraps a membership snapshot, returning `None` when it is empty.
+    #[must_use]
+    pub fn new(members: Arc<HashSet<BroadcastSubscriberId>>) -> Option<Self> {
+        (!members.is_empty()).then_some(Self(members))
+    }
+
+    /// Number of required subscribers in this snapshot (always >= 1).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Always `false`; provided for clippy's `len`-without-`is_empty` lint.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        false
+    }
+
+    fn into_inner(self) -> Arc<HashSet<BroadcastSubscriberId>> {
+        self.0
+    }
 }
 
 /// Opaque capacity token for one tracked publish.
@@ -199,15 +241,17 @@ impl TrackedPublishTracker {
 
     /// Register one tracked publish that resolves via `all`-mode consensus.
     ///
-    /// The entry resolves as Ack only once every subscriber in `pending` has
+    /// The entry resolves as Ack only once every subscriber in `members` has
     /// acked (via [`TrackedPublishTracker::resolve_ack_from`]); a Nack or a
     /// required subscriber disappearing (via
     /// [`TrackedPublishTracker::nack_pending_for_subscriber`]) resolves it as
-    /// Nack. `pending` must be non-empty; callers resolve the zero-subscriber
-    /// case as an immediate Ack without registering.
+    /// Nack.
     ///
-    /// As a defensive measure the primitive also resolves an empty `pending` set
-    /// immediately as Ack (without registering or arming a timeout).
+    /// `members` is a [`NonEmptyBroadcastMembership`], so an empty required
+    /// membership cannot be registered at all. A publication with zero ready
+    /// required subscribers must be rejected by the caller before it reaches the
+    /// tracker (see [`Error::TopicNoRoute`](crate::error::Error::TopicNoRoute));
+    /// this API has no vacuous-Ack path.
     ///
     /// As with [`TrackedPublishTracker::register`], a closed tracker resolves the
     /// returned receipt immediately as [`TrackedPublishOutcome::TopicClosed`].
@@ -216,10 +260,10 @@ impl TrackedPublishTracker {
         message_id: u64,
         timeout: Duration,
         permit: TrackedPublishPermit,
-        members: impl Into<Arc<HashSet<BroadcastSubscriberId>>>,
+        members: NonEmptyBroadcastMembership,
         seq: u64,
     ) -> TrackedPublishReceipt {
-        let members = members.into();
+        let members = members.into_inner();
         if self.inner.closed.load(Ordering::Acquire) {
             let entry = Arc::new(TrackedPublishEntry::new_consensus(
                 Instant::now(),
@@ -228,17 +272,6 @@ impl TrackedPublishTracker {
                 seq,
             ));
             let _resolved = entry.resolve(TrackedPublishOutcome::TopicClosed);
-            return TrackedPublishReceipt::new(message_id, entry);
-        }
-
-        if members.is_empty() {
-            let entry = Arc::new(TrackedPublishEntry::new_consensus(
-                Instant::now(),
-                permit,
-                members,
-                seq,
-            ));
-            let _resolved = entry.resolve(TrackedPublishOutcome::Ack);
             return TrackedPublishReceipt::new(message_id, entry);
         }
 

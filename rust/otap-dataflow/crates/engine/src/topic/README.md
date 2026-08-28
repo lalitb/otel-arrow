@@ -102,13 +102,25 @@ Mapping from YAML to runtime behavior:
   startup, including same-pipeline feedback through a topic and
   multi-pipeline topic loops.
 
-Current limitation: in broadcast mode, `ack_propagation.mode: auto` does not
-aggregate acknowledgements across all subscribers. The first broadcast
-subscriber Ack/Nack resolves the upstream message, so upstream completion does
-not mean all broadcast subscribers processed the message. This matters
-especially with `broadcast.on_lag: drop_oldest`, where one subscriber may miss
-a message that another subscriber still Acks upstream. Future enhancements are
-tracked in [GH-2252](https://github.com/open-telemetry/otel-arrow/issues/2252).
+`broadcast.ack_mode` selects how a tracked broadcast publish resolves
+upstream:
+
+- `first` (default): the first broadcast subscriber Ack/Nack resolves the
+  upstream message, so upstream completion does not mean all broadcast
+  subscribers processed it. This matters especially with
+  `broadcast.on_lag: drop_oldest`, where one subscriber may miss a message
+  that another subscriber still Acks upstream.
+- `all`: membership is snapshotted under the subscriber-registry lock at
+  publish time and the message Acks only after every member Acks. A member
+  Nack, lag loss, or disappearance before its Ack resolves it as Nack;
+  subscribers that become ready later are not added to that attempt. A
+  publish that finds no ready subscriber is rejected before publication as
+  `Error::TopicNoRoute` (or `TrackedTryPublishOutcome::NoRoute`) and never
+  Acks. `all` requires `ack_propagation.mode: auto` and a broadcast-only
+  topic.
+
+Remaining work is tracked in
+[GH-2252](https://github.com/open-telemetry/otel-arrow/issues/2252).
 
 ## Observability Notes
 

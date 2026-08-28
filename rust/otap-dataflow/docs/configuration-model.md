@@ -773,6 +773,7 @@ topics:
       broadcast:
         queue_capacity: 1000
         on_lag: drop_oldest
+        ack_mode: first
       ack_propagation:
         mode: auto
         max_in_flight: 1024
@@ -802,6 +803,23 @@ Supported `broadcast.on_lag` values:
 - `drop_oldest`
 - `disconnect`
 
+Supported `broadcast.ack_mode` values:
+
+- `first` (default): the first broadcast subscriber to Ack/Nack resolves the
+  upstream message.
+- `all`: the upstream message Acks only after every subscriber that was ready
+  when the message was published Acks. Any subscriber Nack, lag loss, or
+  disappearance before its Ack resolves the upstream message as Nack.
+
+`ack_mode: all` requires `ack_propagation.mode: auto` and a topic whose
+inferred topology is broadcast-only (topic receivers all subscribe in
+`broadcast` mode). Both requirements are enforced at startup.
+
+With `ack_mode: all`, a tracked publish that finds no ready broadcast
+subscriber is rejected before publication and reported to the publisher as an
+explicit non-success; `exporter:topic` bridges that rejection upstream as a
+Nack. A topic with zero ready required subscribers never Acks.
+
 Supported `ack_propagation` fields:
 
 - `mode`:
@@ -827,13 +845,23 @@ and
 [`signal_type_router`](../crates/core-nodes/src/processors/signal_type_router/README.md)
 processor docs.
 
-Current limitation: in broadcast mode, `ack_propagation.mode: auto` does not
-aggregate acknowledgements across all subscribers. The first broadcast
+With the default `broadcast.ack_mode: first`, `ack_propagation.mode: auto`
+does not aggregate acknowledgements across subscribers: the first broadcast
 subscriber Ack/Nack resolves the upstream message, so upstream completion does
 not mean all broadcast subscribers processed the message. This matters
 especially with `broadcast.on_lag: drop_oldest`, where one subscriber may miss
-a message that another subscriber still Acks upstream. Future enhancements are
-tracked in [GH-2252](https://github.com/open-telemetry/otel-arrow/issues/2252).
+a message that another subscriber still Acks upstream. Set
+`broadcast.ack_mode: all` when upstream completion must mean that every ready
+subscriber processed the message. Remaining work is tracked in
+[GH-2252](https://github.com/open-telemetry/otel-arrow/issues/2252).
+
+Some receivers only make durable progress on such an aggregate completion (for
+example the filelog receiver, which advances its checkpoint only after an
+aggregate Ack). Startup validation rejects a configuration in which any route
+from such a receiver cannot provide it: the route must reach a proven
+completion point, and any topic hop on it must be a declared, broadcast-only
+topic with at least one configured broadcast topic receiver,
+`ack_propagation.mode: auto`, and `broadcast.ack_mode: all`.
 
 Topic defaults:
 
@@ -843,6 +871,7 @@ Topic defaults:
 - `policies.balanced.on_full = block`
 - `policies.broadcast.queue_capacity = 128`
 - `policies.broadcast.on_lag = drop_oldest`
+- `policies.broadcast.ack_mode = first`
 - `policies.ack_propagation.mode = disabled`
 - `policies.ack_propagation.max_in_flight = 1024`
 - `policies.ack_propagation.timeout = 30s`
@@ -864,8 +893,8 @@ Exporter-local `queue_on_full` behavior:
 - precedence: exporter `config.queue_on_full` ->
   topic `policies.balanced.on_full` -> default `block`
 - queue capacities remain topic-declaration-only (no exporter-local override)
-- broadcast lag handling remains topic-declaration-only via
-  `policies.broadcast.on_lag`
+- broadcast lag handling and Ack aggregation remain topic-declaration-only via
+  `policies.broadcast.on_lag` and `policies.broadcast.ack_mode`
 - Ack/Nack tracking limits remain topic-declaration-only via
   `policies.ack_propagation`
 

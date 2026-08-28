@@ -107,7 +107,12 @@ pub static FILELOG_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFactory {
              _capabilities: &otap_df_engine::capability::registry::Capabilities| {
         create_filelog_receiver(pipeline, node, node_config, receiver_config)
     },
-    wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
+    // Phase 1 filelog advances durable checkpoints only after an aggregate
+    // delivery completion whose Ack means a nonempty required destination set
+    // all acked. Direct fanout stays unrestricted; the requirement is on
+    // completion semantics, not on destination count.
+    wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED
+        .requiring_aggregate_ack(),
     validate_config: validate_filelog_config,
 };
 

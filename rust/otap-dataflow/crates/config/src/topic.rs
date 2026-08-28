@@ -259,6 +259,13 @@ impl TopicPolicies {
                 "{path_prefix}.ack_propagation.max_in_flight must be greater than 0"
             ));
         }
+        if self.broadcast.ack_mode == TopicBroadcastAckMode::All
+            && self.ack_propagation.mode != TopicAckPropagationMode::Auto
+        {
+            errors.push(format!(
+                "{path_prefix}.broadcast.ack_mode `all` requires {path_prefix}.ack_propagation.mode `auto`"
+            ));
+        }
         errors
     }
 }
@@ -294,8 +301,13 @@ pub struct TopicBroadcastPolicies {
     /// Behavior when a broadcast subscriber falls behind the retained ring window.
     #[serde(default)]
     pub on_lag: TopicBroadcastOnLagPolicy,
-    // TODO(#2252 PR3): add a user-facing `ack_mode` field here and reject the
-    // config combinations that aren't safe (e.g. `all` with a lossy lag policy).
+    /// Aggregation mode used to resolve a tracked broadcast publish upstream.
+    ///
+    /// Defaults to [`TopicBroadcastAckMode::First`], which preserves the
+    /// historical first-subscriber-wins behavior. [`TopicBroadcastAckMode::All`]
+    /// requires `ack_propagation.mode: auto` and a broadcast-only topology.
+    #[serde(default)]
+    pub ack_mode: TopicBroadcastAckMode,
 }
 
 impl Default for TopicBroadcastPolicies {
@@ -303,6 +315,7 @@ impl Default for TopicBroadcastPolicies {
         Self {
             queue_capacity: default_topic_broadcast_queue_capacity(),
             on_lag: TopicBroadcastOnLagPolicy::default(),
+            ack_mode: TopicBroadcastAckMode::default(),
         }
     }
 }
@@ -582,6 +595,79 @@ impl_selection: force_mixed
         let parsed: TopicBroadcastAckMode =
             serde_yaml::from_str("first").expect("ack mode should parse");
         assert_eq!(parsed, TopicBroadcastAckMode::First);
+    }
+
+    /// Scenario: a topic omits `policies.broadcast.ack_mode`.
+    /// Guarantees: the broadcast Ack aggregation mode stays `first`, so existing
+    /// configurations keep first-subscriber-wins upstream resolution.
+    #[test]
+    fn broadcast_ack_mode_defaults_to_first() {
+        let topic = TopicSpec::default();
+        assert_eq!(
+            topic.policies.broadcast.ack_mode,
+            TopicBroadcastAckMode::First
+        );
+
+        let topic: TopicSpec = serde_yaml::from_str(
+            r#"
+policies:
+  broadcast:
+    queue_capacity: 8
+"#,
+        )
+        .expect("topic should parse");
+        assert_eq!(
+            topic.policies.broadcast.ack_mode,
+            TopicBroadcastAckMode::First
+        );
+    }
+
+    /// Scenario: a topic declares `broadcast.ack_mode: all` together with
+    /// `ack_propagation.mode: auto`, and is serialized back to YAML.
+    /// Guarantees: `all` round-trips through the user-facing topic schema and
+    /// validates without errors.
+    #[test]
+    fn parses_and_serializes_broadcast_ack_mode_all() {
+        let yaml = r#"
+policies:
+  broadcast:
+    ack_mode: all
+  ack_propagation:
+    mode: auto
+"#;
+
+        let topic: TopicSpec = serde_yaml::from_str(yaml).expect("topic should parse");
+        assert_eq!(
+            topic.policies.broadcast.ack_mode,
+            TopicBroadcastAckMode::All
+        );
+        assert!(topic.validation_errors("topics.raw").is_empty());
+
+        let rendered = serde_yaml::to_string(&topic).expect("topic should serialize");
+        assert!(rendered.contains("ack_mode: all"));
+        let round_tripped: TopicSpec =
+            serde_yaml::from_str(&rendered).expect("serialized topic should parse");
+        assert_eq!(round_tripped, topic);
+    }
+
+    /// Scenario: a topic declares `broadcast.ack_mode: all` while leaving
+    /// `ack_propagation.mode` at its default (`disabled`).
+    /// Guarantees: config validation rejects the combination, so an
+    /// all-required-subscriber topic can never run without automatic Ack
+    /// propagation.
+    #[test]
+    fn rejects_broadcast_ack_mode_all_without_auto_ack_propagation() {
+        let yaml = r#"
+policies:
+  broadcast:
+    ack_mode: all
+"#;
+
+        let topic: TopicSpec = serde_yaml::from_str(yaml).expect("topic should parse");
+        let errors = topic.validation_errors("topics.raw");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("broadcast.ack_mode"));
+        assert!(errors[0].contains("ack_propagation.mode"));
     }
 
     #[test]

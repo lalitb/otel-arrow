@@ -119,6 +119,23 @@ pub enum Error {
         cycle: Vec<String>,
     },
 
+    /// A node whose wiring contract requires aggregate-Ack delivery completion
+    /// is wired to a route that cannot provide it.
+    #[error(
+        "Node `{node}` in pipeline_group={pipeline_group} pipeline={pipeline} requires aggregate-Ack delivery completion, but {reason}"
+    )]
+    #[diagnostic(code(data_plane::aggregate_ack_route_unsupported), url(docsrs))]
+    AggregateAckRouteUnsupported {
+        /// The pipeline group holding the requiring node.
+        pipeline_group: String,
+        /// The pipeline holding the requiring node.
+        pipeline: String,
+        /// The node that declared the requirement.
+        node: String,
+        /// Why the route cannot provide the guarantee.
+        reason: String,
+    },
+
     /// Failed to spawn an OS thread.
     #[error("Failed to spawn thread '{thread_name}': {source}")]
     ThreadSpawnError {
