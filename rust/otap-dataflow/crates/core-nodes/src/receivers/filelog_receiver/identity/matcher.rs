@@ -9,14 +9,14 @@ use super::{CandidateEvidence, IdentityError};
 use crate::receivers::filelog_receiver::checkpoint::CommittedFrontierGuard;
 use crate::receivers::filelog_receiver::checkpoint::primitives::{
     AdvisoryPath, FRAMING_PROFILE_VERSION, FileId, FramingResume, LifecycleState, Locator,
-    QUARANTINE_REASON_RECOVERY_MISMATCH,
+    QUARANTINE_REASON_RECOVERY_MISMATCH, REMOVAL_REASON_LOCATOR_SUPERSEDED,
 };
 use crate::receivers::filelog_receiver::checkpoint::snapshot::SnapshotRecord;
 use crate::receivers::filelog_receiver::checkpoint::store::{
     AtomicGroupAppendOutcome, CheckpointStore,
 };
 use crate::receivers::filelog_receiver::checkpoint::wal::{
-    Operation, QuarantineFile, RegisterFile, UpdateFingerprint, UpdateMetadata,
+    Operation, QuarantineFile, RegisterFile, RemoveFile, UpdateFingerprint, UpdateMetadata,
 };
 use crate::receivers::filelog_receiver::config::{OnRecoveryMismatch, RuntimeConfig, StartAt};
 
@@ -39,9 +39,12 @@ pub(crate) struct IdentitySettings {
 /// Resolver-wide view of all live and pending candidates participating in
 /// one reconciliation pass.
 ///
-/// Fingerprint-only recovery is enabled only when
-/// `fingerprint_counts_complete` is true. Callers that cannot inventory
-/// every bounded pending/in-flight candidate must set it false.
+/// Fingerprint multiplicity is retained only for diagnostics and batch
+/// consistency validation; it never selects an existing durable `file_id`.
+/// The only durable recovery match is an exact runtime locator (see
+/// [`IdentityMatch::ExactLocator`]). Callers that cannot inventory every
+/// bounded pending/in-flight candidate must set `fingerprint_counts_complete`
+/// false so batch validation stays conservative.
 #[derive(Debug, Clone)]
 pub(crate) struct CandidateInventory {
     live_locators: HashSet<Locator>,
@@ -115,7 +118,8 @@ impl CandidateInventory {
     }
 
     /// Builds a fail-safe inventory for an incomplete/overflowed
-    /// reconciliation. Fingerprint-only matching is disabled.
+    /// reconciliation. Batch fingerprint-multiplicity validation stays
+    /// conservative; no durable recovery match depends on this flag.
     pub(crate) fn from_incomplete_reconciliation(
         retained_candidates: &[CandidateEvidence],
         other_live_locators: &HashSet<Locator>,
@@ -181,10 +185,9 @@ impl IdentitySettings {
 /// Why one candidate received its resolved durable identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IdentityMatch {
-    /// Strongest match: handle locator plus compatible fingerprint prefix.
+    /// The only supported durable recovery match: handle locator plus
+    /// compatible fingerprint prefix.
     ExactLocator,
-    /// Restart-only reconnect by a unique complete fingerprint.
-    UniqueFingerprint,
     /// A genuinely new discovery governed by `start_at`.
     NewDiscovery,
     /// Recovery evidence existed but was unsafe to inherit; a new identity
@@ -206,8 +209,8 @@ pub(crate) struct ResolvedIdentity {
     /// For [`IdentityMatch::NewDiscovery`] or [`IdentityMatch::RecoveryMismatch`],
     /// this is real evidence already validated against the candidate's own
     /// handle (empty at offset `0`, or the candidate's exact EOF window).
-    /// For [`IdentityMatch::ExactLocator`] or [`IdentityMatch::UniqueFingerprint`],
-    /// this is the guard already durably recorded for the resumed identity;
+    /// For [`IdentityMatch::ExactLocator`], this is the guard already
+    /// durably recorded for the resumed identity;
     /// the reader must independently re-validate it against a freshly read
     /// window once its own descriptor is opened, never trusting the
     /// candidate's own (differently offset) evidence.
@@ -383,10 +386,20 @@ fn resolve_with_source_mode(
         .take(candidates.len())
         .collect();
     let mut recovery_evidence = vec![false; candidates.len()];
-    let mut reserved_file_ids = HashSet::new();
+    // Non-quarantined records (`Active` or `RotatedFinalized`) found at a
+    // candidate's own exact locator that cannot be resumed: a locator is
+    // reused by exactly one real object at a time, so at most one of these
+    // may ever legitimately remain once the new identity below is durable.
+    // Retiring them in the same atomic group is what keeps INV-ID1 -- one
+    // `file_id` per concurrently claimed locator -- true going forward,
+    // rather than leaving a stale record that makes every later exact-locator
+    // lookup for this locator ambiguous.
+    let mut stale_locator_records: Vec<Vec<(FileId, u32, LifecycleState)>> =
+        vec![Vec::new(); candidates.len()];
 
-    // Exact-locator matches reserve their records before weaker fingerprint
-    // matching, making the result independent of candidate iteration order.
+    // Exact locator is the only durable recovery match; each candidate has a
+    // distinct locator (checked above) and each locator maps to at most one
+    // non-ambiguous record, so no cross-candidate reservation is needed.
     for (index, candidate) in candidates.iter().enumerate() {
         let Some(group) = records_by_locator.get(&candidate.locator) else {
             continue;
@@ -401,11 +414,14 @@ fn resolve_with_source_mode(
                 });
             }
             recovery_evidence[index] = true;
+            stale_locator_records[index] = group
+                .iter()
+                .map(|record| (record.file_id, record.file_epoch, record.lifecycle_state))
+                .collect();
             continue;
         }
         let record = group[0];
         if record.lifecycle_state == LifecycleState::Quarantined {
-            let _ = reserved_file_ids.insert(record.file_id);
             plans[index] = Some(plan_existing(
                 candidate,
                 record,
@@ -415,55 +431,22 @@ fn resolve_with_source_mode(
             continue;
         }
         recovery_evidence[index] = true;
+        if record.lifecycle_state == LifecycleState::RotatedFinalized {
+            stale_locator_records[index] =
+                vec![(record.file_id, record.file_epoch, record.lifecycle_state)];
+            continue;
+        }
         if !candidate.fingerprint.starts_with(&record.fingerprint)
             || record.committed_offset > candidate.size
         {
+            stale_locator_records[index] =
+                vec![(record.file_id, record.file_epoch, record.lifecycle_state)];
             continue;
         }
-        let _ = reserved_file_ids.insert(record.file_id);
         plans[index] = Some(plan_existing(
             candidate,
             record,
             IdentityMatch::ExactLocator,
-            now_unix_nano,
-        ));
-    }
-
-    for (index, candidate) in candidates.iter().enumerate() {
-        if plans[index].is_some()
-            || !inventory.fingerprint_counts_complete
-            || candidate.fingerprint.len() != usize::from(settings.fingerprint_bytes)
-            || inventory
-                .full_fingerprint_counts
-                .get(candidate.fingerprint.as_slice())
-                .copied()
-                != Some(1)
-        {
-            continue;
-        }
-
-        let Some(group) = records_by_fingerprint.get(candidate.fingerprint.as_slice()) else {
-            continue;
-        };
-        recovery_evidence[index] = group
-            .iter()
-            .any(|record| record.lifecycle_state == LifecycleState::Active);
-        let [record] = group.as_slice() else {
-            continue;
-        };
-        if record.lifecycle_state != LifecycleState::Active
-            || record.fingerprint.len() != usize::from(settings.fingerprint_bytes)
-            || inventory.live_locators.contains(&record.locator)
-            || record.committed_offset > candidate.size
-            || reserved_file_ids.contains(&record.file_id)
-        {
-            continue;
-        }
-        let _ = reserved_file_ids.insert(record.file_id);
-        plans[index] = Some(plan_existing(
-            candidate,
-            record,
-            IdentityMatch::UniqueFingerprint,
             now_unix_nano,
         ));
     }
@@ -496,6 +479,7 @@ fn resolve_with_source_mode(
             quarantine,
             settings,
             now_unix_nano,
+            &stale_locator_records[index],
         ));
     }
 
@@ -778,6 +762,7 @@ fn plan_new(
     quarantine: bool,
     settings: &IdentitySettings,
     now_unix_nano: u64,
+    stale_locator_records: &[(FileId, u32, LifecycleState)],
 ) -> PlannedIdentity {
     // `committed_offset` is always `0` (`start_at: beginning`, or a
     // recovery mismatch under `on_recovery_mismatch: beginning`/`fail`) or
@@ -814,6 +799,26 @@ fn plan_new(
         advisory_path: candidate.advisory_path.clone(),
     };
     let mut operations = vec![Operation::RegisterFile(register)];
+    // Retire every stale non-quarantined record this candidate's exact
+    // locator can no longer resume, atomically with its own new
+    // registration: a locator is claimed by exactly one real object at a
+    // time, so once this new identity is durable, the old record's
+    // `locator` value must never again match a live object. Removing it
+    // here (rather than leaving it for time-based retention, which is not
+    // itself locator-aware) is what keeps a later exact-locator lookup for
+    // this same locator unambiguous.
+    for &(stale_file_id, stale_file_epoch, stale_prior_state) in stale_locator_records {
+        operations.push(Operation::RemoveFile(RemoveFile {
+            file_id: stale_file_id,
+            expected_file_epoch: stale_file_epoch,
+            expected_prior_state: stale_prior_state,
+            removal_reason: REMOVAL_REASON_LOCATOR_SUPERSEDED,
+            removal_time_unix_nano: now_unix_nano,
+            administrative: false,
+            namespace_id: None,
+            audit_reason: None,
+        }));
+    }
     if quarantine {
         operations.push(Operation::QuarantineFile(QuarantineFile {
             file_id,

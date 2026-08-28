@@ -20,7 +20,7 @@ use crate::receivers::filelog_receiver::checkpoint::primitives::{
 use crate::receivers::filelog_receiver::checkpoint::store::fault::FaultPoint;
 use crate::receivers::filelog_receiver::checkpoint::store::{CheckpointStore, StoreOptions};
 use crate::receivers::filelog_receiver::checkpoint::wal::{
-    Operation, QuarantineFile, RegisterFile,
+    Operation, QuarantineFile, RegisterFile, UpdateProgress,
 };
 use crate::receivers::filelog_receiver::config::{OnRecoveryMismatch, StartAt};
 
@@ -362,17 +362,17 @@ fn exact_locator_accepts_empty_and_short_fingerprints() {
     assert_eq!(store.table().get(&short_id).unwrap().fingerprint, b"ab");
 }
 
-/// Scenario: one complete fingerprint maps to one active checkpoint whose
-/// old locator is absent, then the same setup is repeated while that old
-/// locator is reported live.
-/// Guarantees: fingerprint reconnect matches the identity and updates its
-/// advisory path, but the locator is immutable for a `file_id` in this
-/// version (`update_metadata` never carries one), so it is left exactly as
-/// registered even though the candidate presents a different locator; a
-/// live prior locator still prevents a second reader inheriting the
-/// identity at all.
+/// Scenario: a candidate presents a locator different from an existing
+/// Active checkpoint but shares that checkpoint's complete fingerprint
+/// bytes, both while the old locator is absent and while it is reported
+/// live.
+/// Guarantees: a changed locator is never a durable recovery match --
+/// fingerprint identity alone never inherits an existing `file_id` or its
+/// committed offset. Every case creates a genuinely new identity under
+/// `on_recovery_mismatch`, regardless of whether the old locator is still
+/// live.
 #[test]
-fn fingerprint_reconnect_requires_previous_locator_to_be_absent() {
+fn same_fingerprint_on_different_locator_never_inherits_active_progress() {
     let (_directory, mut store, _options) = test_store(8);
     let file_id = FileId::from_bytes([4; 16]);
     let old_locator = locator(4);
@@ -386,11 +386,12 @@ fn fingerprint_reconnect_requires_previous_locator_to_be_absent() {
         3,
     )
     .unwrap();
-    assert_eq!(resolved[0].file_id, file_id);
-    assert_eq!(resolved[0].matched_by, IdentityMatch::UniqueFingerprint);
-    // The locator is immutable for this `file_id`: it stays exactly as
-    // registered, never adopting the reconnecting candidate's locator.
+    assert_ne!(resolved[0].file_id, file_id);
+    assert_eq!(resolved[0].matched_by, IdentityMatch::RecoveryMismatch);
+    assert_eq!(resolved[0].committed_offset, 0);
+    // The original identity's own record is untouched by the mismatch.
     assert_eq!(store.table().get(&file_id).unwrap().locator, old_locator);
+    assert_eq!(store.table().get(&file_id).unwrap().committed_offset, 2);
 
     let (_directory, mut store, _options) = test_store(8);
     register(&mut store, file_id, old_locator, 2, b"same", b"old");
@@ -509,7 +510,10 @@ fn duplicate_checkpoint_fingerprint_is_ambiguous() {
 /// Scenario: an exact locator reappears with changed fingerprint bytes or a
 /// size below its committed offset.
 /// Guarantees: neither invalid candidate inherits acknowledged progress;
-/// each is handled as a fresh recovery-mismatch identity.
+/// each is handled as a fresh recovery-mismatch identity, and the stale old
+/// record at that same locator is durably retired in the same atomic group
+/// so it never again coexists with the new identity's claim on that
+/// locator.
 #[test]
 fn exact_locator_mismatch_and_offset_beyond_size_never_resume() {
     let (_directory, mut store, _options) = test_store(8);
@@ -543,6 +547,102 @@ fn exact_locator_mismatch_and_offset_beyond_size_never_resume() {
         resolved
             .iter()
             .all(|identity| identity.matched_by == IdentityMatch::RecoveryMismatch)
+    );
+    // The stale old records are gone: only the two new identities remain,
+    // so this locator is never simultaneously claimed by two records.
+    assert!(store.table().get(&fingerprint_id).is_none());
+    assert!(store.table().get(&offset_id).is_none());
+    assert_eq!(store.table().len(), 2);
+}
+
+/// Scenario: a same-locator recovery mismatch under `on_recovery_mismatch:
+/// beginning` durably retires the stale old record, then a later
+/// reconciliation observes that same locator again with content matching
+/// the new identity exactly.
+/// Guarantees: the retirement in the mismatch's own atomic group prevents
+/// the stale record from making every subsequent reconciliation ambiguous:
+/// the later candidate resumes the new identity by `ExactLocator`, never
+/// repeatedly manufacturing a further new identity on each pass.
+#[test]
+fn same_locator_mismatch_retirement_keeps_later_exact_locator_lookups_unambiguous() {
+    let (_directory, mut store, _options) = test_store(8);
+    let old_id = FileId::from_bytes([50; 16]);
+    register(&mut store, old_id, locator(90), 4, b"old!", b"reused");
+
+    let first_pass = resolve_and_persist(
+        &mut store,
+        &[evidence(locator(90), 8, b"new!", b"reused")],
+        &no_live_locators(),
+        &settings(),
+        10,
+    )
+    .unwrap();
+    assert_ne!(first_pass[0].file_id, old_id);
+    assert_eq!(first_pass[0].matched_by, IdentityMatch::RecoveryMismatch);
+    assert!(store.table().get(&old_id).is_none());
+    let new_id = first_pass[0].file_id;
+
+    // The very same real object is observed again, now with content that
+    // exactly matches the new identity's committed evidence.
+    let second_pass = resolve_and_persist(
+        &mut store,
+        &[evidence(locator(90), 8, b"new!", b"reused")],
+        &no_live_locators(),
+        &settings(),
+        11,
+    )
+    .unwrap();
+    assert_eq!(second_pass[0].file_id, new_id);
+    assert_eq!(second_pass[0].matched_by, IdentityMatch::ExactLocator);
+    assert_eq!(store.table().len(), 1);
+}
+
+/// Scenario: an empty finalized identity's locator is later reused by a new
+/// nonempty file whose fingerprint necessarily extends the empty prefix.
+/// Guarantees: finalized state is never resumed; the old record is retired
+/// atomically and the reused locator receives a new mismatch identity.
+#[test]
+fn finalized_locator_reuse_never_resumes_the_old_identity() {
+    let (_directory, mut store, _options) = test_store(8);
+    let old_id = FileId::from_bytes([51; 16]);
+    register(&mut store, old_id, locator(91), 0, b"", b"finalized");
+    let _outcomes = store
+        .commit_progress(vec![UpdateProgress {
+            file_id: old_id,
+            expected_committed_offset: 0,
+            expected_file_epoch: 1,
+            new_committed_offset: 0,
+            new_committed_frontier_guard: CommittedFrontierGuard::empty(),
+            new_framing_resume: FramingResume::Clean,
+            new_last_seen_time_unix_nano: 2,
+            finalize: true,
+        }])
+        .unwrap();
+    assert_eq!(
+        store.table().get(&old_id).unwrap().lifecycle_state,
+        LifecycleState::RotatedFinalized
+    );
+
+    let resolved = resolve_and_persist(
+        &mut store,
+        &[evidence(locator(91), 4, b"new!", b"replacement")],
+        &no_live_locators(),
+        &settings(),
+        3,
+    )
+    .unwrap();
+
+    assert_ne!(resolved[0].file_id, old_id);
+    assert_eq!(resolved[0].matched_by, IdentityMatch::RecoveryMismatch);
+    assert_eq!(resolved[0].committed_offset, 0);
+    assert!(store.table().get(&old_id).is_none());
+    assert_eq!(
+        store
+            .table()
+            .get(&resolved[0].file_id)
+            .unwrap()
+            .lifecycle_state,
+        LifecycleState::Active
     );
 }
 
@@ -699,51 +799,103 @@ fn quarantine_reconnects_only_by_the_same_locator() {
     assert_eq!(replacement[0].lifecycle_state, LifecycleState::Active);
 }
 
-/// Scenario: two discovered files with one complete fingerprint are split
-/// across resolver batches, while the resolver receives a complete
-/// reconciliation-wide multiplicity count.
-/// Guarantees: the first batch cannot appear uniquely matchable merely
-/// because the second candidate is processed later, so neither ordering can
-/// assign an unrelated file the checkpoint's offset.
+/// Scenario: a durably quarantined record's locator is absent, and a
+/// different candidate locator presents that record's exact fingerprint
+/// bytes.
+/// Guarantees: fingerprint identity never reconnects a quarantined record;
+/// only the exact same locator does (see
+/// `quarantine_reconnects_only_by_the_same_locator`), so a different
+/// locator is always a genuinely new, non-quarantined discovery.
 #[test]
-fn fingerprint_uniqueness_is_reconciliation_wide_not_batch_local() {
+fn same_fingerprint_on_different_locator_never_inherits_quarantined_progress() {
+    let (_directory, mut store, _options) = test_store(8);
+    let quarantined_id = FileId::from_bytes([44; 16]);
+    register(
+        &mut store,
+        quarantined_id,
+        locator(45),
+        2,
+        b"qqqq",
+        b"quarantined",
+    );
+    let _outcome = store
+        .append(vec![Operation::QuarantineFile(QuarantineFile {
+            file_id: quarantined_id,
+            expected_file_epoch: 1,
+            reason_code: QUARANTINE_REASON_RECOVERY_MISMATCH,
+            locator: locator(45),
+            observed_size: 2,
+            quarantine_epoch: 1,
+            quarantine_time_unix_nano: 2,
+        })])
+        .unwrap();
+
+    let resolved = resolve_and_persist(
+        &mut store,
+        &[evidence(locator(46), 10, b"qqqq", b"different-path")],
+        &no_live_locators(),
+        &settings(),
+        8,
+    )
+    .unwrap();
+
+    assert_ne!(resolved[0].file_id, quarantined_id);
+    assert_eq!(resolved[0].matched_by, IdentityMatch::NewDiscovery);
+    assert_eq!(resolved[0].lifecycle_state, LifecycleState::Active);
+    assert_eq!(resolved[0].committed_offset, 0);
+}
+
+/// Scenario: a reconciliation-wide-complete inventory reports a candidate's
+/// fingerprint as globally unique, and a separate incomplete-inventory
+/// reconciliation observes only one of two same-fingerprint candidates.
+/// Guarantees: neither inventory completeness ever changes the outcome --
+/// fingerprint identity is not a durable recovery match under any
+/// `CandidateInventory` state, so both cases create a fresh
+/// `RecoveryMismatch` identity rather than inheriting the other record's
+/// checkpoint offset.
+#[test]
+fn fingerprint_multiplicity_never_affects_recovery_regardless_of_completeness() {
     let (_directory, mut store, _options) = test_store(8);
     let file_id = FileId::from_bytes([18; 16]);
     register(&mut store, file_id, locator(29), 3, b"same", b"old");
     let candidate = evidence(locator(30), 10, b"same", b"first");
     let hidden_candidate = evidence(locator(31), 10, b"same", b"second");
-    let inventory = CandidateInventory::from_complete_reconciliation(
+    let complete_inventory = CandidateInventory::from_complete_reconciliation(
         &[candidate.clone(), hidden_candidate],
         &no_live_locators(),
         settings().fingerprint_bytes,
     );
 
-    let resolved =
-        resolve_with_inventory(&mut store, &[candidate], &inventory, &settings(), 7).unwrap();
+    let resolved = resolve_with_inventory(
+        &mut store,
+        &[candidate],
+        &complete_inventory,
+        &settings(),
+        7,
+    )
+    .unwrap();
 
     assert_ne!(resolved[0].file_id, file_id);
     assert_eq!(resolved[0].matched_by, IdentityMatch::RecoveryMismatch);
     assert_eq!(resolved[0].committed_offset, 0);
-}
 
-/// Scenario: a reconciliation pass cannot prove that its fingerprint
-/// inventory includes every pending candidate.
-/// Guarantees: incomplete evidence disables fingerprint-only inheritance
-/// rather than treating absence from the current batch as uniqueness.
-#[test]
-fn incomplete_candidate_inventory_disables_fingerprint_reconnect() {
     let (_directory, mut store, _options) = test_store(8);
-    let file_id = FileId::from_bytes([19; 16]);
     register(&mut store, file_id, locator(32), 3, b"same", b"old");
     let candidate = evidence(locator(33), 10, b"same", b"first");
-    let inventory = CandidateInventory::from_incomplete_reconciliation(
+    let incomplete_inventory = CandidateInventory::from_incomplete_reconciliation(
         std::slice::from_ref(&candidate),
         &no_live_locators(),
         settings().fingerprint_bytes,
     );
 
-    let resolved =
-        resolve_with_inventory(&mut store, &[candidate], &inventory, &settings(), 7).unwrap();
+    let resolved = resolve_with_inventory(
+        &mut store,
+        &[candidate],
+        &incomplete_inventory,
+        &settings(),
+        7,
+    )
+    .unwrap();
 
     assert_ne!(resolved[0].file_id, file_id);
     assert_eq!(resolved[0].matched_by, IdentityMatch::RecoveryMismatch);
@@ -1009,6 +1161,56 @@ fn fail_policy_registration_is_atomic_across_wal_faults() {
                 || (candidate_records.len() == 1
                     && candidate_records[0].lifecycle_state == LifecycleState::Quarantined),
             "{point:?} recovered a register-only identity"
+        );
+    }
+}
+
+/// Scenario: the same locator's old, now-mismatched record must be
+/// atomically retired alongside a `fail`-policy quarantine of the new
+/// identity, and every injected WAL write/sync failure interrupts that
+/// three-operation atomic group (`remove_file` + `register_file` +
+/// `quarantine_file`).
+/// Guarantees: reopening after a fault observes either the complete
+/// original state (old record intact, no new record) or the complete new
+/// state (old record gone, exactly one quarantined new record) -- never a
+/// partial state that would leave the locator claimed by two records or by
+/// none.
+#[test]
+fn fail_policy_same_locator_retirement_is_atomic_across_wal_faults() {
+    for point in FaultPoint::WAL_DURABILITY {
+        let (_directory, mut initial, options) = test_store(8);
+        let old_id = FileId::from_bytes([22; 16]);
+        register(&mut initial, old_id, locator(60), 0, b"old!", b"reused");
+        drop(initial);
+
+        let mut faulted = CheckpointStore::open_with_fault(options.clone(), point).unwrap();
+        let candidate = evidence(locator(60), 4, b"new!", b"reused");
+        let mut config = settings();
+        config.on_recovery_mismatch = OnRecoveryMismatch::Fail;
+        assert!(
+            resolve_and_persist(&mut faulted, &[candidate], &no_live_locators(), &config, 11,)
+                .is_err(),
+            "{point:?} must interrupt the append"
+        );
+        drop(faulted);
+
+        let recovered = CheckpointStore::open(options).unwrap();
+        let locator_records: Vec<_> = recovered
+            .table()
+            .iter()
+            .filter_map(|(file_id, record)| {
+                (record.locator == locator(60)).then_some((*file_id, record))
+            })
+            .collect();
+        let is_original_state = locator_records.len() == 1
+            && locator_records[0].0 == old_id
+            && locator_records[0].1.lifecycle_state == LifecycleState::Active;
+        let is_new_state = locator_records.len() == 1
+            && locator_records[0].0 != old_id
+            && locator_records[0].1.lifecycle_state == LifecycleState::Quarantined;
+        assert!(
+            is_original_state || is_new_state,
+            "{point:?} left a partial state: {locator_records:?}"
         );
     }
 }

@@ -866,10 +866,10 @@ impl ReaderTable {
         // cases the candidate's own evidence, already read from this same
         // validated handle, is real committed-frontier evidence and never
         // needs to be reread once a descriptor is opened. An existing
-        // durable identity resumed mid-file (`ExactLocator` /
-        // `UniqueFingerprint`) has no such evidence at `committed_offset`;
-        // its real window is read and validated once this reader's own
-        // descriptor is (re)opened, in `open_reader`.
+        // durable identity resumed mid-file (`ExactLocator`) has no such
+        // evidence at `committed_offset`; its real window is read and
+        // validated once this reader's own descriptor is (re)opened, in
+        // `open_reader`.
         let committed_frontier_window = if resolved.committed_offset == 0 {
             Some(CommittedFrontierWindow::empty())
         } else if matches!(

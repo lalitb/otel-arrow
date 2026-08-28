@@ -1225,9 +1225,10 @@ fn incomplete_scan_preserves_unseen_tracked_and_pending_state() {
 
 /// Scenario: a complete traversal proves one durable locator absent while
 /// enough new candidates overflow the bounded event selection.
-/// Guarantees: candidate overflow disables fingerprint-only recovery but
-/// does not suppress proven removal, and removals remain ordered after all
-/// observed or updated transitions in the batch.
+/// Guarantees: candidate overflow marks the inventory incomplete (batch
+/// fingerprint-multiplicity validation stays conservative) but does not
+/// suppress proven removal, and removals remain ordered after all observed
+/// or updated transitions in the batch.
 #[test]
 fn candidate_overflow_still_emits_proven_removals_last() {
     let mut admission = AdmissionController::new(0, 2, 1, 16).unwrap();

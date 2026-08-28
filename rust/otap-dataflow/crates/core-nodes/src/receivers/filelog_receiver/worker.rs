@@ -1258,10 +1258,6 @@ impl WorkerRuntime {
                     IdentityMatch::ExactLocator => {
                         self.telemetry.add(WorkerCounter::IdentityExactMatches, 1);
                     }
-                    IdentityMatch::UniqueFingerprint => {
-                        self.telemetry
-                            .add(WorkerCounter::IdentityFingerprintMatches, 1);
-                    }
                     IdentityMatch::NewDiscovery => {
                         self.telemetry.add(WorkerCounter::IdentityRegistrations, 1);
                     }

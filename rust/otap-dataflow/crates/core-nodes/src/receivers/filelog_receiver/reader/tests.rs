@@ -2135,9 +2135,97 @@ fn restart_admission_fails_closed_on_wrong_committed_frontier_guard() {
     table.shutdown().unwrap();
 }
 
-/// Scenario: discovery captures a new identity at EOF, then the same locator
-/// is rewritten behind an unchanged fingerprint prefix before the reader's
-/// separate first open.
+/// Scenario: a durably recorded fingerprint prefix no longer matches the
+/// candidate's current bytes, even though the exact committed-frontier
+/// window bytes at the stored committed offset (a separate, tail-only
+/// region of a larger file) are byte-for-byte unchanged and would pass
+/// guard validation on their own.
+/// Guarantees: prefix evidence is checked -- and fails closed -- before the
+/// committed-frontier window is ever read; a matching tail window never
+/// overrides a mismatched configured-prefix evidence.
+#[test]
+fn reopen_reports_fingerprint_mismatch_even_when_frontier_window_matches() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("prefix-mismatch-matching-window.log");
+    let original: Vec<u8> = (0..100u32).map(|i| b'a' + (i % 26) as u8).collect();
+    std::fs::write(&path, &original).unwrap();
+    // The durable fingerprint is captured from the original prefix before
+    // the file is rewritten below.
+    let candidate = candidate_with_fingerprint(&path, 4);
+    assert_eq!(candidate.evidence.fingerprint, original[..4]);
+    // The real committed-frontier window ending at offset 90 is the tail
+    // region [26, 90), entirely disjoint from the rewritten prefix [0, 4).
+    let committed_offset = 90u64;
+    let window_start = (committed_offset - 64) as usize;
+    let guard =
+        CommittedFrontierGuard::compute(committed_offset, &original[window_start..90]).unwrap();
+    // Only the prefix changes; the tail window bytes are left identical.
+    let mut rewritten = original.clone();
+    rewritten[..4].copy_from_slice(b"ZZZZ");
+    std::fs::write(&path, &rewritten).unwrap();
+
+    let mut table = ReaderTable::new(settings_with_fingerprint(1, 1, 100, 4)).unwrap();
+    table
+        .insert(candidate, resolved_with_guard(77, committed_offset, guard))
+        .unwrap();
+
+    assert!(matches!(
+        table.poll(Instant::now()).unwrap(),
+        ReaderPoll::Truncated {
+            file_id: mismatched,
+            observed_fingerprint,
+            ..
+        } if mismatched == file_id(77) && observed_fingerprint == b"ZZZZ"
+    ));
+    table.shutdown().unwrap();
+}
+
+/// Scenario: a byte strictly between the sampled fingerprint prefix and the
+/// sampled committed-frontier window -- a region this design never reads
+/// for matching -- changes on disk while the prefix and the tail window
+/// are both byte-for-byte unchanged.
+/// Guarantees: this is the design's explicit, accepted residual ambiguity,
+/// not a detection gap to close: bounded-evidence identity matching
+/// resumes normally (no truncation, no error) because the unchanged
+/// sampled evidence is, by construction, the only evidence this design
+/// ever checks. It never claims to detect an in-place rewrite confined to
+/// unsampled middle bytes.
+#[test]
+fn unchecked_middle_byte_rewrite_is_the_accepted_residual_ambiguity() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("middle-byte-residual-ambiguity.log");
+    let original: Vec<u8> = (0..200u32).map(|i| b'a' + (i % 26) as u8).collect();
+    std::fs::write(&path, &original).unwrap();
+    let candidate = candidate_with_fingerprint(&path, 4);
+    assert_eq!(candidate.evidence.fingerprint, original[..4]);
+    let committed_offset = 180u64;
+    let window_start = (committed_offset - 64) as usize; // 116
+    let guard =
+        CommittedFrontierGuard::compute(committed_offset, &original[window_start..180]).unwrap();
+
+    // A middle byte, strictly outside both the 4-byte prefix [0, 4) and the
+    // 64-byte tail window [116, 180), changes on disk.
+    let middle_index = 50usize;
+    assert!(middle_index >= 4 && middle_index < window_start);
+    let mut rewritten = original.clone();
+    rewritten[middle_index] = rewritten[middle_index].wrapping_add(1);
+    std::fs::write(&path, &rewritten).unwrap();
+
+    let mut table = ReaderTable::new(settings_with_fingerprint(1, 1, 200, 4)).unwrap();
+    table
+        .insert(candidate, resolved_with_guard(78, committed_offset, guard))
+        .unwrap();
+
+    // The mismatch is invisible to bounded-evidence matching: the reader
+    // resumes normally rather than reporting truncation or an error.
+    let turn = data(table.poll(Instant::now()).unwrap());
+    assert_eq!(turn.source_offset(), committed_offset);
+    table.shutdown().unwrap();
+}
+
+/// Scenario: discovery captures a new identity at EOF, then the same
+/// locator is rewritten behind an unchanged fingerprint prefix before the
+/// reader's separate first open.
 /// Guarantees: the first nonzero open revalidates the durable frontier guard
 /// against its own handle and cannot trust stale discovery-window bytes.
 #[test]

@@ -167,6 +167,12 @@ pub const QUARANTINE_REASON_TRUNCATE: u16 = 0x0002;
 /// Quarantine reason: rotation removed a file after its native descriptor
 /// had already been evicted, so late writes could not be captured safely.
 pub const QUARANTINE_REASON_ROTATION_DESCRIPTOR_UNAVAILABLE: u16 = 0x0004;
+/// Removal reason: a stale non-quarantined record (`Active` or
+/// `RotatedFinalized`) was superseded by a new identity created for the
+/// same runtime locator under recovery-mismatch handling. `removal_reason`
+/// is opaque per the format; this named value only aids diagnostics and
+/// never gates apply-time validation.
+pub const REMOVAL_REASON_LOCATOR_SUPERSEDED: u16 = 0x0001;
 
 /// `update_metadata` presence bit: an advisory path value is present.
 ///

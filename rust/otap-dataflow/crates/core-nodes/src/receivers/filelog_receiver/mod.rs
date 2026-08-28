@@ -25,8 +25,8 @@
 //!   two filelog readers in one engine process from controlling the same live
 //!   file.
 //! - Secure handle-based identity evidence plus durable recovery matching
-//!   ([`identity`]), including exact-locator and guarded unique-fingerprint
-//!   reconnect, start/mismatch policy, and atomic registration.
+//!   ([`identity`]), including exact-locator-only reconnect, start/mismatch
+//!   policy, and atomic registration.
 //! - Bounded periodic filesystem discovery and admission ([`discovery`]),
 //!   including compiled include/exclude globs, resolved-target safety,
 //!   incomplete-inventory fail-closed behavior, overflow fairness, and a
@@ -124,7 +124,6 @@ fn create_filelog_receiver(
         pipeline_group_id.as_ref(),
         pipeline_id.as_ref(),
         node.name.as_ref(),
-        receiver_config.name.as_ref(),
     )?;
     let parsed: Config = serde_json::from_value(node_config.config.clone()).map_err(|error| {
         otap_df_config::error::Error::InvalidUserConfig {
@@ -162,23 +161,38 @@ fn validate_pipeline_cores(num_cores: usize) -> Result<(), otap_df_config::error
     Ok(())
 }
 
+/// Derives the default `checkpoint.id` per the exact domain-separated
+/// derivation:
+///
+/// ```text
+/// "auto-" + lowercase_hex(
+///   SHA-256(
+///     UTF-8("otel-arrow-filelog-checkpoint-id-v1\0") ||
+///     u32_be(len(UTF-8(pipeline_group_id))) || UTF-8(pipeline_group_id) ||
+///     u32_be(len(UTF-8(pipeline_id)))       || UTF-8(pipeline_id)       ||
+///     u32_be(len(UTF-8(node_id)))           || UTF-8(node_id)
+///   )
+/// )
+/// ```
+///
+/// The three configured IDs are the complete input set. A receiver
+/// component name, component URN, deployment generation, CPU count, core
+/// ID, and runtime instance ID never affect this value.
 fn derive_default_checkpoint_id(
     pipeline_group_id: &str,
     pipeline_id: &str,
-    node_name: &str,
-    receiver_name: &str,
+    node_id: &str,
 ) -> Result<String, otap_df_config::error::Error> {
     let mut digest = Sha256::new();
-    digest.update(b"otap-filelog-checkpoint-default-v1");
+    digest.update(b"otel-arrow-filelog-checkpoint-id-v1\0");
     for field in [
         pipeline_group_id.as_bytes(),
         pipeline_id.as_bytes(),
-        node_name.as_bytes(),
-        receiver_name.as_bytes(),
+        node_id.as_bytes(),
     ] {
-        let length = u64::try_from(field.len()).map_err(|_| {
+        let length = u32::try_from(field.len()).map_err(|_| {
             otap_df_config::error::Error::InvalidUserConfig {
-                error: "filelog checkpoint identity input length does not fit u64".to_owned(),
+                error: "filelog checkpoint identity input length does not fit u32".to_owned(),
             }
         })?;
         digest.update(length.to_be_bytes());
@@ -207,28 +221,61 @@ mod runtime_factory_tests {
         assert!(error.to_string().contains("unknown field"));
     }
 
-    /// Scenario: two receiver placements differ in each namespace identity
-    /// input one at a time.
+    /// Scenario: three placements differ in exactly one of
+    /// `pipeline_group_id`, `pipeline_id`, or `node_id`.
     /// Guarantees: the default checkpoint ID is deterministic for one
-    /// placement and collision-resistant across group, pipeline, node, and
-    /// receiver names.
+    /// placement and changes when, and only when, one of these three exact
+    /// inputs changes; a receiver name is not part of the input set.
     #[test]
-    fn default_checkpoint_id_binds_complete_receiver_placement() {
-        let base = derive_default_checkpoint_id("group", "pipeline", "node", "receiver").unwrap();
+    fn default_checkpoint_id_binds_exactly_three_namespace_inputs() {
+        let base = derive_default_checkpoint_id("group", "pipeline", "node").unwrap();
         assert_eq!(
             base,
-            derive_default_checkpoint_id("group", "pipeline", "node", "receiver").unwrap()
+            derive_default_checkpoint_id("group", "pipeline", "node").unwrap()
         );
         for changed in [
-            derive_default_checkpoint_id("other", "pipeline", "node", "receiver").unwrap(),
-            derive_default_checkpoint_id("group", "other", "node", "receiver").unwrap(),
-            derive_default_checkpoint_id("group", "pipeline", "other", "receiver").unwrap(),
-            derive_default_checkpoint_id("group", "pipeline", "node", "other").unwrap(),
+            derive_default_checkpoint_id("other", "pipeline", "node").unwrap(),
+            derive_default_checkpoint_id("group", "other", "node").unwrap(),
+            derive_default_checkpoint_id("group", "pipeline", "other").unwrap(),
         ] {
             assert_ne!(base, changed);
         }
         assert!(base.starts_with("auto-"));
         assert_eq!(base.len(), 69);
+    }
+
+    /// Scenario: the exact domain-separated SHA-256 derivation is evaluated
+    /// against fixed, independently computed normative vectors covering
+    /// distinct and empty inputs.
+    /// Guarantees: the byte-level encoding -- domain string with its
+    /// trailing NUL, u32 BE length prefixes, and UTF-8 field bytes -- matches
+    /// the specification exactly rather than merely being self-consistent.
+    #[test]
+    fn default_checkpoint_id_matches_normative_vectors() {
+        assert_eq!(
+            derive_default_checkpoint_id("group", "pipeline", "node").unwrap(),
+            "auto-dcc7339c465c91720794cc31db2063c94151bf86370d33e74faa20d7c5b6dd30"
+        );
+        assert_eq!(
+            derive_default_checkpoint_id("othergroup", "pipeline", "node").unwrap(),
+            "auto-d85e302bc3543d175979f2493603be27fffb6540f602d4f20230d66b2a401241"
+        );
+        assert_eq!(
+            derive_default_checkpoint_id("group", "otherpipeline", "node").unwrap(),
+            "auto-afc0e6fe58c061e8985b97a9890a90745dcd0f2f2821f244c658b325cfc03d9f"
+        );
+        assert_eq!(
+            derive_default_checkpoint_id("group", "pipeline", "othernode").unwrap(),
+            "auto-fab2d254b1253ea086e2ebde48f7dcceff97a747fd975ed1db59868ae555a2d3"
+        );
+        assert_eq!(
+            derive_default_checkpoint_id("", "", "").unwrap(),
+            "auto-2bd995b2549505e07220558cefe21377f51d3b2bb0016423fd99166021ad5e4b"
+        );
+        assert_eq!(
+            derive_default_checkpoint_id("logs-group", "logs-pipeline", "node-1").unwrap(),
+            "auto-37f6abd27c960cb89c4d8f5006adbfdb77d2e02bf2de940dfae36982723ddf8b"
+        );
     }
 
     /// Scenario: factory construction is requested for single-core and

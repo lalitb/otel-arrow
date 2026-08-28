@@ -210,9 +210,6 @@ pub struct FilelogReceiverMetrics {
     /// Exact-locator recovery matches.
     #[metric(name = "identity.matches.exact_locator", unit = "{file}")]
     pub identity_exact_matches: Counter<u64>,
-    /// Guarded unique-fingerprint recovery matches.
-    #[metric(name = "identity.matches.unique_fingerprint", unit = "{file}")]
-    pub identity_fingerprint_matches: Counter<u64>,
 
     /// Same-locator path changes associated with move/create rotation.
     #[metric(name = "rotation.move_create", unit = "{rotation}")]
@@ -380,7 +377,6 @@ pub(super) enum WorkerCounter {
     IdentityResets,
     IdentityRecoveryMismatches,
     IdentityExactMatches,
-    IdentityFingerprintMatches,
     RotationMoveCreate,
     RotationFinalizations,
     RotationLateWrites,
@@ -537,7 +533,6 @@ impl WorkerTelemetryBridge {
         drain!(IdentityResets, identity_resets);
         drain!(IdentityRecoveryMismatches, identity_recovery_mismatches);
         drain!(IdentityExactMatches, identity_exact_matches);
-        drain!(IdentityFingerprintMatches, identity_fingerprint_matches);
         drain!(RotationMoveCreate, rotation_move_create);
         drain!(RotationFinalizations, rotation_finalizations);
         drain!(RotationLateWrites, rotation_late_writes);

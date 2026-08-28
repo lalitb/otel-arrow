@@ -728,6 +728,98 @@ async fn second_ack_below_64_bytes_combines_prior_and_new_committed_frontier_win
     assert_eq!(record.committed_frontier_guard, expected_guard);
 }
 
+/// Scenario: under `max_open_files: 1`, a second file's admission evicts the
+/// first file's resident descriptor and in-memory framer, then the first
+/// file receives a new advance well below 64 bytes before it is reopened.
+/// Guarantees: reopen independently rereads and revalidates the real
+/// committed-frontier window from disk (never trusting stale in-memory
+/// bytes across the evicted descriptor), and the reconstructed framer
+/// correctly combines that freshly reread tail with the short new advance
+/// into the exact real trailing window, never a partial or fabricated one.
+#[tokio::test]
+async fn descriptor_eviction_then_short_advance_combines_reread_committed_frontier_window() {
+    let directory = tempdir().unwrap();
+    let first = directory.path().join("first.log");
+    let second = directory.path().join("second.log");
+    let line1 = vec![b'a'; 70];
+    let mut content = Vec::new();
+    content.extend_from_slice(&line1);
+    content.push(b'\n');
+    std::fs::write(&first, &content).unwrap();
+    let include = directory.path().join("*.log");
+    let namespace = directory.path().join("checkpoint");
+    let mut runtime = runtime_config(include.to_str().unwrap(), &namespace, 1);
+    runtime.limits.max_open_files = 1;
+    let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+    let worker = spawn_worker(runtime.clone(), event_tx).unwrap();
+
+    // First Ack establishes a real, nonzero committed-frontier window for
+    // `first.log` strictly larger than the 64-byte guard bound.
+    let first_batch = receive_batch(&mut events).await;
+    worker
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: first_batch.batch_id,
+            attempt: first_batch.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    receive_commit(&mut events).await.3.unwrap();
+
+    // Admitting and reading `second.log` under `max_open_files: 1` evicts
+    // `first.log`'s resident descriptor and discards its in-memory framer
+    // (see `Worker::seal_open_batch`'s `clear_framers`, plus the eviction
+    // path's own `discard_framer`).
+    std::fs::write(&second, b"one\n").unwrap();
+    let second_batch = receive_batch(&mut events).await;
+    worker
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: second_batch.batch_id,
+            attempt: second_batch.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    receive_commit(&mut events).await.3.unwrap();
+
+    // A short new advance, well below 64 bytes, arrives on the now-evicted
+    // `first.log`. Serving it requires reopening the file (evicting
+    // `second.log`'s descriptor in turn under the same `max_open_files: 1`
+    // bound) and independently rereading and revalidating the real
+    // committed-frontier window from disk before any new byte is combined.
+    let short_line = b"shortline\n".to_vec();
+    content.extend_from_slice(&short_line);
+    let mut handle = OpenOptions::new().append(true).open(&first).unwrap();
+    handle.write_all(&short_line).unwrap();
+    drop(handle);
+
+    let third_batch = receive_batch(&mut events).await;
+    worker
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: third_batch.batch_id,
+            attempt: third_batch.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    receive_commit(&mut events).await.3.unwrap();
+    stop_worker(worker, &mut events).await.unwrap();
+
+    let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
+    let record = store
+        .table()
+        .iter()
+        .map(|(_, record)| record)
+        .find(|record| record.committed_offset > 10)
+        .expect("first.log's record has the larger committed offset");
+    assert_eq!(record.committed_offset, content.len() as u64);
+    let expected_bytes = content[content.len() - 64..].to_vec();
+    assert_eq!(expected_bytes.len(), 64);
+    let expected_guard =
+        CommittedFrontierGuard::compute(content.len() as u64, &expected_bytes).unwrap();
+    assert_eq!(record.committed_frontier_guard, expected_guard);
+}
+
 /// Scenario: two readable files share a receiver whose first record exactly
 /// seals a one-record batch, and no completion is sent.
 /// Guarantees: the sole retained batch blocks every further filelog batch and
