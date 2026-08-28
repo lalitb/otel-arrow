@@ -11,8 +11,10 @@
 pub mod common;
 pub(crate) mod logs;
 pub(crate) mod metrics;
+pub mod profiles;
 pub(crate) mod traces;
 
 pub use logs::OtapLogsView;
 pub use metrics::OtapMetricsView;
+pub use profiles::{ProfilesBatchView, ProfilesValidationError};
 pub use traces::OtapTracesView;
