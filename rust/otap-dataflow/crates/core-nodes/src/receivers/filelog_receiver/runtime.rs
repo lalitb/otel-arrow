@@ -621,6 +621,22 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                             }
                             match result {
                                 Ok(()) => {
+                                    if explicit_loss {
+                                        counters
+                                            .record_explicit_loss()
+                                            .map_err(|error| terminal_error(&effect_handler, error))?;
+                                        if let Some(suppressed) = admit_health_event(
+                                            &mut health_events,
+                                            &mut metrics,
+                                            HealthEventCategory::ExplicitLoss,
+                                        ) {
+                                            otel_warn!(
+                                                "filelog_receiver.batch_explicit_loss",
+                                                reason = "drop_and_continue",
+                                                suppressed_events = suppressed
+                                            );
+                                        }
+                                    }
                                     record_commit_success(&mut metrics, explicit_loss);
                                     pending_batch = None;
                                     retry_deadline = None;
@@ -835,20 +851,6 @@ async fn apply_decision(
             explicit_loss,
             exhausted: _,
         } => {
-            if explicit_loss {
-                counters
-                    .record_explicit_loss()
-                    .map_err(|error| terminal_error(effect_handler, error))?;
-                if let Some(suppressed) =
-                    admit_health_event(health_events, metrics, HealthEventCategory::ExplicitLoss)
-                {
-                    otel_warn!(
-                        "filelog_receiver.batch_explicit_loss",
-                        reason = "drop_and_continue",
-                        suppressed_events = suppressed
-                    );
-                }
-            }
             send_worker_command(
                 worker_tx,
                 WorkerCommand::Commit {
