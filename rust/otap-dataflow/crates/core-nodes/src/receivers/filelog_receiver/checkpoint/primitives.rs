@@ -573,6 +573,32 @@ impl AdvisoryPath {
         ADVISORY_PATH_FIXED_BYTES + self.stored_path_bytes.len()
     }
 
+    /// Deterministic total order used to select one distinguished
+    /// matched-path binding among simultaneously eligible aliases for the
+    /// same runtime locator (see `docs/filelog-receiver-phase1-spec.md`,
+    /// "Discovery and matching").
+    ///
+    /// `path_kind` orders first. When neither side is truncated, the
+    /// complete native path bytes are both available, so the remaining
+    /// comparison is a literal lexicographic order over those bytes --
+    /// exactly `(path_kind, complete native path bytes)`. When either side
+    /// is truncated, the complete bytes are not both available, so the
+    /// comparison instead uses the full length, digest, and stored suffix
+    /// together, in that order -- never the stored suffix alone.
+    #[must_use]
+    pub(crate) fn distinguished_binding_order(&self, other: &Self) -> std::cmp::Ordering {
+        self.kind.cmp(&other.kind).then_with(|| {
+            if !self.truncated && !other.truncated {
+                self.stored_path_bytes.cmp(&other.stored_path_bytes)
+            } else {
+                self.full_path_len
+                    .cmp(&other.full_path_len)
+                    .then_with(|| self.full_path_digest.cmp(&other.full_path_digest))
+                    .then_with(|| self.stored_path_bytes.cmp(&other.stored_path_bytes))
+            }
+        })
+    }
+
     pub(super) fn write(&self, out: &mut ByteWriter) {
         out.write_u8(self.kind.to_wire());
         out.write_u8(if self.truncated {
@@ -1458,5 +1484,71 @@ mod tests {
             AdvisoryPath::from_windows_utf16_units(&[]),
             Err(EncodeError::InvalidAdvisoryPath { .. })
         ));
+    }
+
+    /// Scenario: two complete (untruncated) advisory paths of different
+    /// native byte content are compared for the distinguished-binding
+    /// selection order.
+    /// Guarantees: the order is a literal lexicographic comparison of the
+    /// complete native path bytes -- `b"aa"` sorts before `b"b"` even though
+    /// it is longer, so the order never degenerates into a length-first
+    /// comparison.
+    #[test]
+    fn distinguished_binding_order_is_lexicographic_not_length_first() {
+        let shorter = AdvisoryPath::from_unix_bytes(b"b").unwrap();
+        let longer_but_lexicographically_smaller = AdvisoryPath::from_unix_bytes(b"aa").unwrap();
+        assert_eq!(
+            longer_but_lexicographically_smaller.distinguished_binding_order(&shorter),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            shorter.distinguished_binding_order(&longer_but_lexicographically_smaller),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    /// Scenario: two structurally equal advisory paths (same kind,
+    /// truncation, length, digest, and stored suffix) are compared.
+    /// Guarantees: the order is reflexively `Equal`, matching `AdvisoryPath`
+    /// equality.
+    #[test]
+    fn distinguished_binding_order_is_equal_for_equal_paths() {
+        let a = AdvisoryPath::from_unix_bytes(b"same.log").unwrap();
+        let b = AdvisoryPath::from_unix_bytes(b"same.log").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.distinguished_binding_order(&b), std::cmp::Ordering::Equal);
+    }
+
+    /// Scenario: two paths exceed the stored bound and are both truncated,
+    /// with different complete lengths but suffixes that happen to collide
+    /// in their trailing bytes.
+    /// Guarantees: comparison never uses the stored suffix alone -- the
+    /// differing complete lengths (part of the order key) still produce a
+    /// deterministic, non-`Equal` order.
+    #[test]
+    fn distinguished_binding_order_for_truncated_paths_never_uses_suffix_alone() {
+        let common_suffix = vec![b'x'; ADVISORY_PATH_STORED_MAX_BYTES];
+        let mut shorter_prefixed = b"a/".to_vec();
+        shorter_prefixed.extend_from_slice(&common_suffix);
+        let mut longer_prefixed = b"aaaaaa/".to_vec();
+        longer_prefixed.extend_from_slice(&common_suffix);
+
+        let shorter = AdvisoryPath::from_unix_bytes(&shorter_prefixed).unwrap();
+        let longer = AdvisoryPath::from_unix_bytes(&longer_prefixed).unwrap();
+        assert!(shorter.is_truncated());
+        assert!(longer.is_truncated());
+        // Both encodings retain only the shared trailing suffix; the stored
+        // bytes alone cannot distinguish them.
+        assert_eq!(shorter.stored_path_bytes(), longer.stored_path_bytes());
+        assert_ne!(shorter.full_path_len(), longer.full_path_len());
+        assert_ne!(
+            shorter.distinguished_binding_order(&longer),
+            std::cmp::Ordering::Equal
+        );
+        // The order is a strict total order: swapping operands reverses it.
+        assert_eq!(
+            shorter.distinguished_binding_order(&longer),
+            longer.distinguished_binding_order(&shorter).reverse()
+        );
     }
 }

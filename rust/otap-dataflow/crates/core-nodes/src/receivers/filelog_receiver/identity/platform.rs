@@ -173,22 +173,45 @@ fn open_candidate_at_expected_cancellable(
     }))
 }
 
-/// Opens one already-authorized path and returns only its handle-derived
-/// locator. No fingerprint or source-content bytes are read.
-pub(crate) fn open_locator_at_cancellable(
+/// Opens one path and returns only its handle-derived locator for a caller
+/// that validates stability with another open. No fingerprint or
+/// source-content bytes are read.
+///
+/// This intentionally does not compare a handle-derived path: some platforms
+/// report another hard-link name for the same object. Callers must bracket
+/// path-policy revalidation with two calls and require equal locators.
+pub(crate) fn open_locator_for_stability_check_cancellable(
     open_path: &Path,
-    advisory_path: &Path,
     follow_symlinks: bool,
     mut cancelled: impl FnMut() -> bool,
 ) -> Result<Option<Locator>, IdentityError> {
-    open_verified_locator_at_expected_cancellable(
-        open_path,
-        open_path,
-        advisory_path,
-        follow_symlinks,
-        &mut cancelled,
-    )
-    .map(|opened| opened.map(|opened| opened.locator))
+    if cancelled() {
+        return Ok(None);
+    }
+    let file = open_read_only(open_path, follow_symlinks);
+    if cancelled() {
+        return Ok(None);
+    }
+    let file = file.map_err(|source| IdentityError::Io {
+        operation: "open candidate for locator stability",
+        path: open_path.to_path_buf(),
+        source,
+    })?;
+    let metadata = file.metadata();
+    if cancelled() {
+        return Ok(None);
+    }
+    let metadata = metadata.map_err(|source| IdentityError::Io {
+        operation: "read locator-stability candidate metadata",
+        path: open_path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(IdentityError::NotRegularFile {
+            path: open_path.to_path_buf(),
+        });
+    }
+    locator_from_handle_cancellable(&file, open_path, follow_symlinks, &mut cancelled)
 }
 
 fn open_verified_locator_at_expected_cancellable(
@@ -1246,6 +1269,29 @@ mod tests {
         assert_eq!(first.evidence.fingerprint, b"ab");
         assert_eq!(second.evidence.fingerprint, b"abcd");
         assert_eq!(second.file.stream_position().unwrap(), 0);
+    }
+
+    /// Scenario: two hard-link names are opened only to compare native
+    /// locator stability during exclusion-policy revalidation.
+    /// Guarantees: locator-only opens accept either path name and return the
+    /// same object identity without depending on a platform's chosen
+    /// handle-derived path alias.
+    #[test]
+    fn locator_stability_open_accepts_hard_link_aliases() {
+        let directory = tempdir().unwrap();
+        let first = directory.path().join("first.log");
+        let second = directory.path().join("second.log");
+        std::fs::write(&first, b"same").unwrap();
+        std::fs::hard_link(&first, &second).unwrap();
+
+        let first_locator = open_locator_for_stability_check_cancellable(&first, false, || false)
+            .unwrap()
+            .unwrap();
+        let second_locator = open_locator_for_stability_check_cancellable(&second, false, || false)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first_locator, second_locator);
     }
 
     #[cfg(unix)]

@@ -124,9 +124,18 @@ fn admission_resolution_defers_new_identity_at_durable_capacity() {
     let mut settings = settings();
     settings.max_tracked_files = 1;
 
-    let resolutions =
-        resolve_and_persist_with_admission(&mut store, &candidates, &inventory, &settings, 10)
-            .unwrap();
+    let no_replacements = HashSet::new();
+    let no_confirmed = HashSet::new();
+    let resolutions = resolve_and_persist_with_admission(
+        &mut store,
+        &candidates,
+        &inventory,
+        &settings,
+        10,
+        &no_replacements,
+        &no_confirmed,
+    )
+    .unwrap();
     assert!(matches!(resolutions[0], IdentityResolution::Resolved(_)));
     assert_eq!(resolutions[1], IdentityResolution::Deferred);
     assert_eq!(store.table().len(), 1);
@@ -146,12 +155,16 @@ fn admission_resolution_cancellation_preempts_persistence() {
     let mut settings = settings();
     settings.max_tracked_files = 1;
 
+    let no_replacements = HashSet::new();
+    let no_confirmed = HashSet::new();
     let resolutions = resolve_and_persist_with_admission_cancellable(
         &mut store,
         &candidates,
         &inventory,
         &settings,
         10,
+        &no_replacements,
+        &no_confirmed,
         || true,
     )
     .unwrap();
@@ -187,12 +200,16 @@ fn admission_resolution_cancellation_hides_durable_transaction_prefix() {
     settings.max_tracked_files = candidate_count;
     let mut cancellation_checks = 0usize;
 
+    let no_replacements = HashSet::new();
+    let no_confirmed = HashSet::new();
     let resolutions = resolve_and_persist_with_admission_cancellable(
         &mut store,
         &candidates,
         &inventory,
         &settings,
         10,
+        &no_replacements,
+        &no_confirmed,
         || {
             let cancelled = cancellation_checks >= 2;
             cancellation_checks += 1;
@@ -1254,4 +1271,372 @@ fn windows_handle_identity_reconnects_after_checkpoint_reopen() {
 
     assert_eq!(reopened[0].file_id, file_id);
     assert_eq!(reopened[0].matched_by, IdentityMatch::ExactLocator);
+}
+
+/// Scenario: discovery recognizes a candidate as a move/create replacement
+/// for a rebounding distinguished path binding, and the candidate has no
+/// eligible durable state of its own, under `start_at: end`.
+/// Guarantees: the replacement registers a new identity at offset zero with
+/// the empty guard and clean framing, never applying `start_at`, and is
+/// reported as `IdentityMatch::RecognizedReplacement`.
+#[test]
+fn recognized_replacement_with_no_durable_state_starts_clean_at_zero_ignoring_start_at_end() {
+    let (_directory, mut store, _options) = test_store(8);
+    let mut config = settings();
+    config.start_at = StartAt::End;
+    let candidate = evidence(locator(100), 100, b"abcd", b"app.log");
+    let inventory = CandidateInventory::from_complete_reconciliation(
+        std::slice::from_ref(&candidate),
+        &HashSet::new(),
+        4,
+    );
+    let mut recognized_replacements = HashSet::new();
+    let _ = recognized_replacements.insert(locator(100));
+    let confirmed_path_bindings = HashSet::new();
+
+    let resolved = resolve_and_persist_with_admission(
+        &mut store,
+        &[candidate],
+        &inventory,
+        &config,
+        7,
+        &recognized_replacements,
+        &confirmed_path_bindings,
+    )
+    .unwrap();
+
+    let IdentityResolution::Resolved(identity) = &resolved[0] else {
+        panic!("recognized replacement must not defer");
+    };
+    assert_eq!(identity.matched_by, IdentityMatch::RecognizedReplacement);
+    assert_eq!(identity.committed_offset, 0);
+    assert_eq!(identity.lifecycle_state, LifecycleState::Active);
+    assert_eq!(
+        identity.committed_frontier_guard,
+        CommittedFrontierGuard::empty()
+    );
+    let record = store.table().get(&identity.file_id).unwrap();
+    assert_eq!(record.committed_offset, 0);
+    assert_eq!(record.framing_resume, FramingResume::Clean);
+}
+
+/// Scenario: discovery recognizes a candidate locator as a rebound
+/// replacement, but that exact locator already reconnects its own durable
+/// `Active` record.
+/// Guarantees: the existing `Active` state resumes through ordinary
+/// exact-locator matching; the replacement context never resets it to
+/// offset zero or otherwise overrides its own progress.
+#[test]
+fn recognized_replacement_target_with_existing_active_state_resumes_itself() {
+    let (_directory, mut store, _options) = test_store(8);
+    let file_id = FileId::from_bytes([61; 16]);
+    register(&mut store, file_id, locator(101), 5, b"abcd", b"b.log");
+    let candidate = evidence(locator(101), 20, b"abcd", b"b.log");
+    let inventory = CandidateInventory::from_complete_reconciliation(
+        std::slice::from_ref(&candidate),
+        &HashSet::new(),
+        4,
+    );
+    let mut recognized_replacements = HashSet::new();
+    let _ = recognized_replacements.insert(locator(101));
+    let confirmed_path_bindings = HashSet::new();
+
+    let resolved = resolve_and_persist_with_admission(
+        &mut store,
+        &[candidate],
+        &inventory,
+        &settings(),
+        8,
+        &recognized_replacements,
+        &confirmed_path_bindings,
+    )
+    .unwrap();
+
+    let IdentityResolution::Resolved(identity) = &resolved[0] else {
+        panic!("exact-locator reconnection must not defer");
+    };
+    assert_eq!(identity.file_id, file_id);
+    assert_eq!(identity.matched_by, IdentityMatch::ExactLocator);
+    assert_eq!(identity.committed_offset, 5);
+    assert_eq!(identity.lifecycle_state, LifecycleState::Active);
+}
+
+/// Scenario: discovery recognizes a candidate locator as a rebound
+/// replacement, but that exact locator already reconnects its own durable
+/// `Quarantined` record.
+/// Guarantees: the record remains quarantined; the replacement context
+/// never lifts quarantine or resets progress.
+#[test]
+fn recognized_replacement_target_with_existing_quarantined_state_stays_quarantined() {
+    let (_directory, mut store, _options) = test_store(8);
+    let file_id = FileId::from_bytes([62; 16]);
+    register(&mut store, file_id, locator(102), 2, b"abcd", b"b.log");
+    let _outcome = store
+        .append(vec![Operation::QuarantineFile(QuarantineFile {
+            file_id,
+            expected_file_epoch: 1,
+            reason_code: QUARANTINE_REASON_RECOVERY_MISMATCH,
+            locator: locator(102),
+            observed_size: 2,
+            quarantine_epoch: 1,
+            quarantine_time_unix_nano: 2,
+        })])
+        .unwrap();
+    let candidate = evidence(locator(102), 2, b"ab", b"b.log");
+    let inventory = CandidateInventory::from_complete_reconciliation(
+        std::slice::from_ref(&candidate),
+        &HashSet::new(),
+        4,
+    );
+    let mut recognized_replacements = HashSet::new();
+    let _ = recognized_replacements.insert(locator(102));
+    let confirmed_path_bindings = HashSet::new();
+
+    let resolved = resolve_and_persist_with_admission(
+        &mut store,
+        &[candidate],
+        &inventory,
+        &settings(),
+        9,
+        &recognized_replacements,
+        &confirmed_path_bindings,
+    )
+    .unwrap();
+
+    let IdentityResolution::Resolved(identity) = &resolved[0] else {
+        panic!("exact-locator quarantine reconnection must not defer");
+    };
+    assert_eq!(identity.file_id, file_id);
+    assert_eq!(identity.matched_by, IdentityMatch::ExactLocator);
+    assert_eq!(identity.lifecycle_state, LifecycleState::Quarantined);
+    assert_eq!(identity.committed_offset, 2);
+}
+
+/// Scenario: a recognized replacement's fingerprint happens to equal an
+/// unrelated live `Active` record's fingerprint, under
+/// `on_recovery_mismatch: fail`.
+/// Guarantees: the replacement never routes through fingerprint-based
+/// mismatch inheritance -- it registers cleanly at offset zero as `Active`,
+/// proving it never receives another identity's progress and never applies
+/// the mismatch policy merely from an incidental fingerprint match.
+#[test]
+fn recognized_replacement_never_inherits_progress_through_fingerprint_association() {
+    let (_directory, mut store, _options) = test_store(8);
+    let unrelated_id = FileId::from_bytes([63; 16]);
+    register(&mut store, unrelated_id, locator(103), 4, b"abcd", b"a.log");
+    let mut config = settings();
+    config.on_recovery_mismatch = OnRecoveryMismatch::Fail;
+    // Locator 104 is a genuinely different, live object; only its
+    // fingerprint bytes coincide with the unrelated record above.
+    let mut live_locators = HashSet::new();
+    let _ = live_locators.insert(locator(103));
+    let candidate = evidence(locator(104), 8, b"abcd", b"b.log");
+    let inventory = CandidateInventory::from_complete_reconciliation(
+        std::slice::from_ref(&candidate),
+        &live_locators,
+        4,
+    );
+    let mut recognized_replacements = HashSet::new();
+    let _ = recognized_replacements.insert(locator(104));
+    let confirmed_path_bindings = HashSet::new();
+
+    let resolved = resolve_and_persist_with_admission(
+        &mut store,
+        &[candidate],
+        &inventory,
+        &config,
+        10,
+        &recognized_replacements,
+        &confirmed_path_bindings,
+    )
+    .unwrap();
+
+    let IdentityResolution::Resolved(identity) = &resolved[0] else {
+        panic!("recognized replacement must not defer");
+    };
+    assert_ne!(identity.file_id, unrelated_id);
+    assert_eq!(identity.matched_by, IdentityMatch::RecognizedReplacement);
+    assert_eq!(identity.committed_offset, 0);
+    assert_eq!(identity.lifecycle_state, LifecycleState::Active);
+}
+
+/// Scenario: a locator's durable `Active` record already has an
+/// authoritative `advisory_path`, but discovery has no continuity memory
+/// for it yet (its very first post-restart `Observed` sighting), and the
+/// candidate it forwards carries a different, merely provisional alias.
+/// Guarantees: the unconfirmed candidate path never overwrites the durable
+/// binding; only a later, admission-confirmed candidate (an `Updated`-style
+/// resolution) may replace it (`docs/filelog-receiver-phase1-spec.md`,
+/// "Discovery and matching").
+#[test]
+fn unconfirmed_first_sighting_never_overwrites_durable_binding_after_restart() {
+    let (_directory, mut store, _options) = test_store(8);
+    let file_id = FileId::from_bytes([70; 16]);
+    register(
+        &mut store,
+        file_id,
+        locator(110),
+        3,
+        b"ab",
+        b"authoritative.log",
+    );
+    let provisional = evidence(locator(110), 20, b"abcd", b"provisional-alias.log");
+    let inventory = CandidateInventory::from_complete_reconciliation(
+        std::slice::from_ref(&provisional),
+        &HashSet::new(),
+        4,
+    );
+    let no_replacements = HashSet::new();
+    let not_confirmed = HashSet::new();
+
+    let resolved = resolve_and_persist_with_admission(
+        &mut store,
+        std::slice::from_ref(&provisional),
+        &inventory,
+        &settings(),
+        11,
+        &no_replacements,
+        &not_confirmed,
+    )
+    .unwrap();
+    let IdentityResolution::Resolved(identity) = &resolved[0] else {
+        panic!("exact-locator reconnection must not defer");
+    };
+    assert_eq!(identity.file_id, file_id);
+    assert_eq!(
+        identity.advisory_path,
+        AdvisoryPath::from_unix_bytes(b"authoritative.log").unwrap()
+    );
+    let record = store.table().get(&file_id).unwrap();
+    assert_eq!(
+        record.advisory_path,
+        AdvisoryPath::from_unix_bytes(b"authoritative.log").unwrap()
+    );
+
+    // A later pass for which discovery *does* have continuity memory (an
+    // `Updated`-style, confirmed resolution) may legitimately reselect the
+    // binding.
+    let mut confirmed = HashSet::new();
+    let _ = confirmed.insert(locator(110));
+    let inventory = CandidateInventory::from_complete_reconciliation(
+        std::slice::from_ref(&provisional),
+        &HashSet::new(),
+        4,
+    );
+    let resolved = resolve_and_persist_with_admission(
+        &mut store,
+        &[provisional],
+        &inventory,
+        &settings(),
+        12,
+        &no_replacements,
+        &confirmed,
+    )
+    .unwrap();
+    let IdentityResolution::Resolved(identity) = &resolved[0] else {
+        panic!("exact-locator reconnection must not defer");
+    };
+    assert_eq!(
+        identity.advisory_path,
+        AdvisoryPath::from_unix_bytes(b"provisional-alias.log").unwrap()
+    );
+    let record = store.table().get(&file_id).unwrap();
+    assert_eq!(
+        record.advisory_path,
+        AdvisoryPath::from_unix_bytes(b"provisional-alias.log").unwrap()
+    );
+}
+
+/// Scenario: durable tracked-file capacity is already fully consumed by an
+/// unrelated existing record, and the only candidate this pass is
+/// recognized as a move/create replacement.
+/// Guarantees: `IdentityMatch::RecognizedReplacement` is included in the
+/// same capacity accounting as `NewDiscovery`/`RecoveryMismatch`: the
+/// replacement is deferred rather than registered over capacity, and no
+/// registration operation reaches the WAL.
+#[test]
+fn recognized_replacement_defers_at_full_tracked_capacity() {
+    let (_directory, mut store, _options) = test_store(1);
+    let existing_id = FileId::from_bytes([80; 16]);
+    register(&mut store, existing_id, locator(120), 4, b"abcd", b"a.log");
+    let mut config = settings();
+    config.max_tracked_files = 1;
+    let candidate = evidence(locator(121), 6, b"efgh", b"b.log");
+    let inventory = CandidateInventory::from_complete_reconciliation(
+        std::slice::from_ref(&candidate),
+        &HashSet::new(),
+        4,
+    );
+    let mut recognized_replacements = HashSet::new();
+    let _ = recognized_replacements.insert(locator(121));
+    let confirmed_path_bindings = HashSet::new();
+
+    let resolved = resolve_and_persist_with_admission(
+        &mut store,
+        &[candidate],
+        &inventory,
+        &config,
+        13,
+        &recognized_replacements,
+        &confirmed_path_bindings,
+    )
+    .unwrap();
+
+    assert_eq!(resolved[0], IdentityResolution::Deferred);
+    // Only the pre-existing registration is durable; the deferred
+    // replacement never reached the WAL.
+    assert_eq!(store.table().len(), 1);
+    assert!(store.table().get(&existing_id).is_some());
+}
+
+/// Scenario: one reconciliation pass contains both a recognized-replacement
+/// candidate and a genuinely new candidate, with durable tracked-file
+/// capacity for exactly one more registration.
+/// Guarantees: the recognized replacement consumes exactly one unit of
+/// capacity like any other newly created identity, so the later new
+/// candidate correctly observes the remaining capacity as exhausted and is
+/// deferred; capacity accounting is never double-counted or skipped for
+/// either match kind.
+#[test]
+fn mixed_batch_counts_recognized_replacement_and_new_registration_correctly() {
+    let (_directory, mut store, _options) = test_store(2);
+    let mut config = settings();
+    config.max_tracked_files = 1;
+    let replacement = evidence(locator(122), 5, b"iiii", b"c.log");
+    let new_candidate = evidence(locator(123), 5, b"jjjj", b"d.log");
+    let candidates = vec![replacement, new_candidate];
+    let inventory =
+        CandidateInventory::from_complete_reconciliation(&candidates, &HashSet::new(), 4);
+    let mut recognized_replacements = HashSet::new();
+    let _ = recognized_replacements.insert(locator(122));
+    let confirmed_path_bindings = HashSet::new();
+
+    let resolved = resolve_and_persist_with_admission(
+        &mut store,
+        &candidates,
+        &inventory,
+        &config,
+        14,
+        &recognized_replacements,
+        &confirmed_path_bindings,
+    )
+    .unwrap();
+
+    let IdentityResolution::Resolved(replacement_identity) = &resolved[0] else {
+        panic!("the recognized replacement had free capacity and must not defer");
+    };
+    assert_eq!(
+        replacement_identity.matched_by,
+        IdentityMatch::RecognizedReplacement
+    );
+    assert_eq!(resolved[1], IdentityResolution::Deferred);
+    assert_eq!(store.table().len(), 1);
+    assert_eq!(
+        store
+            .table()
+            .get(&replacement_identity.file_id)
+            .unwrap()
+            .locator,
+        locator(122)
+    );
 }

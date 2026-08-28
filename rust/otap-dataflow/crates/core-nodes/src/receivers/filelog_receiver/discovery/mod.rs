@@ -12,12 +12,13 @@ pub(crate) mod admission;
 pub(crate) mod scanner;
 pub(crate) mod source;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use thiserror::Error;
 
-use super::checkpoint::Locator;
+use super::checkpoint::{AdvisoryPath, Locator};
 use super::identity::matcher::CandidateInventory;
 use super::identity::{CandidateEvidence, IdentityError};
 
@@ -65,7 +66,9 @@ pub(crate) enum CandidateEvent {
 }
 
 impl CandidateEvent {
-    fn candidate(&self) -> Option<&DiscoveredCandidate> {
+    /// The retained candidate evidence, if this transition carries one.
+    #[cfg(test)]
+    pub(crate) fn candidate(&self) -> Option<&DiscoveredCandidate> {
         match self {
             CandidateEvent::Observed(candidate) | CandidateEvent::Updated(candidate) => {
                 Some(candidate)
@@ -154,13 +157,38 @@ pub(crate) struct ReconciliationBatch {
     pub(crate) inventory: CandidateInventory,
     /// Bounded scan and admission evidence.
     pub(crate) stats: DiscoveryStats,
+    /// Locators this pass actually emitted a `CandidateEvent` for while
+    /// recognized as a validated move/create replacement for a
+    /// distinguished matched-path binding that rebounded away from its
+    /// prior owner. A candidate recognized this generation but only
+    /// deferred to the bounded pending queue (not yet emitted) is never
+    /// named here; it reappears once a later pass actually emits it.
+    /// Identity resolution bypasses `start_at` and mismatch-based anchor
+    /// selection only for these locators (see
+    /// `docs/filelog-receiver-phase1-spec.md`, "Discovery and matching").
+    pub(crate) recognized_replacements: HashSet<Locator>,
+}
+
+/// A locator's registration or metadata update becoming durable, paired
+/// with the exact `AdvisoryPath` now authoritative for its checkpoint
+/// record. Discovery reconstructs its own distinguished-binding memory from
+/// this value rather than the (possibly provisional) candidate path it
+/// originally forwarded, so a restart's first traversal-order alias can
+/// never silently replace an already-durable binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DurableAck {
+    /// Locator whose durable state advanced.
+    pub(crate) locator: Locator,
+    /// The advisory path now authoritative for this locator's checkpoint
+    /// record.
+    pub(crate) advisory_path: AdvisoryPath,
 }
 
 /// Read-worker feedback applied before a later reconciliation pass.
 #[derive(Debug, Default)]
 pub(crate) struct DiscoveryFeedback {
     /// Locators whose registration or metadata update is now durable.
-    pub(crate) durable: Vec<Locator>,
+    pub(crate) durable: Vec<DurableAck>,
     /// Locators whose candidate transition failed and must be rediscovered.
     pub(crate) rejected: Vec<Locator>,
     /// New locators that could not consume durable tracked-file capacity and
@@ -210,6 +238,18 @@ pub(crate) enum DiscoveryIssue {
     /// Handle-based identity collection rejected one candidate.
     #[error(transparent)]
     Identity(#[from] IdentityError),
+    /// A distinguished matched-path binding's prior owner rebound to more
+    /// than one live locator within one pass, or two different prior
+    /// owners both rebound to the same newly observed locator. Either
+    /// makes the affected binding transitions unsafe to apply.
+    #[error(
+        "filelog discovery observed a conflicting or unstable prior path binding for locator {locator:?}"
+    )]
+    ConflictingPathRebind {
+        /// The tracked locator whose prior distinguished binding could not
+        /// be safely resolved this pass.
+        locator: Locator,
+    },
 }
 
 /// Terminal discovery setup, accounting, channel, or thread failure.

@@ -8,7 +8,7 @@
 //! receiver owns only control, completion correlation, retry timing, and
 //! downstream sends.
 
-use std::collections::{HashMap, TryReserveError};
+use std::collections::{HashMap, HashSet, TryReserveError};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, sync_channel};
@@ -38,7 +38,8 @@ use super::discovery::source::{
     DiscoveryHandle, FeedbackSendError, spawn_discovery_with_shutdown_signal,
 };
 use super::discovery::{
-    CandidateEvent, DiscoveryError, DiscoveryFeedback, DiscoveryMessage, ReconciliationBatch,
+    CandidateEvent, DiscoveryError, DiscoveryFeedback, DiscoveryMessage, DurableAck,
+    ReconciliationBatch,
 };
 use super::framing::{DecodeError, DecodeOutcome, FlushReason, FramedRecord, Framer, FramerError};
 use super::identity::CandidateEvidence;
@@ -1120,6 +1121,9 @@ impl WorkerRuntime {
                     super::discovery::DiscoveryIssue::Io { .. } => "io",
                     super::discovery::DiscoveryIssue::Walk { .. } => "walk",
                     super::discovery::DiscoveryIssue::Identity(_) => "identity",
+                    super::discovery::DiscoveryIssue::ConflictingPathRebind { .. } => {
+                        "conflicting_path_rebind"
+                    }
                 });
             otel_warn!(
                 "filelog_receiver.discovery_scan_failed",
@@ -1205,10 +1209,22 @@ impl WorkerRuntime {
                 reason: "discovery candidate batch exceeds its preallocated bound",
             });
         }
+        // A locator's candidate path is a confirmed distinguished-binding
+        // decision only when discovery already had continuity memory for
+        // it (an `Updated` event); a locator discovery is observing for the
+        // first time since process start (an `Observed` event) must not
+        // silently overwrite an already-durable `advisory_path` (see
+        // `docs/filelog-receiver-phase1-spec.md`, "Discovery and
+        // matching").
+        let mut confirmed_path_bindings = HashSet::with_capacity(candidate_count);
         for event in &batch.events {
             match event {
-                CandidateEvent::Observed(candidate) | CandidateEvent::Updated(candidate) => {
+                CandidateEvent::Observed(candidate) => {
                     self.candidate_evidence.push(candidate.evidence.clone());
+                }
+                CandidateEvent::Updated(candidate) => {
+                    self.candidate_evidence.push(candidate.evidence.clone());
+                    let _ = confirmed_path_bindings.insert(candidate.evidence.locator);
                 }
                 CandidateEvent::Removed { .. } | CandidateEvent::Revoked { .. } => {}
             }
@@ -1224,6 +1240,8 @@ impl WorkerRuntime {
             &batch.inventory,
             &self.identity_settings,
             now_unix_nano,
+            &batch.recognized_replacements,
+            &confirmed_path_bindings,
             || shutdown_requested.load(Ordering::Acquire),
         )
         .map_err(WorkerError::Identity);
@@ -1271,6 +1289,11 @@ impl WorkerRuntime {
                                 .add(WorkerCounter::QuarantineRecoveryMismatch, 1);
                         }
                     }
+                    IdentityMatch::RecognizedReplacement => {
+                        self.telemetry.add(WorkerCounter::IdentityRegistrations, 1);
+                        self.telemetry
+                            .add(WorkerCounter::RotationRecognizedReplacement, 1);
+                    }
                 },
             }
         }
@@ -1297,6 +1320,7 @@ impl WorkerRuntime {
                         continue;
                     };
                     let locator = candidate.evidence.locator;
+                    let advisory_path = identity.advisory_path.clone();
                     if identity.lifecycle_state != LifecycleState::Active {
                         if let Some(existing) =
                             self.inactive_locators.insert(locator, identity.file_id)
@@ -1306,7 +1330,10 @@ impl WorkerRuntime {
                                 reason: "inactive locator changed durable identity",
                             });
                         }
-                        feedback.durable.push(locator);
+                        feedback.durable.push(DurableAck {
+                            locator,
+                            advisory_path,
+                        });
                         continue;
                     }
                     if let Some(detached_file_id) = self.inactive_locators.get(&locator)
@@ -1322,7 +1349,10 @@ impl WorkerRuntime {
                     match insert_result {
                         Ok(()) => {
                             let _detached = self.inactive_locators.remove(&locator);
-                            feedback.durable.push(locator);
+                            feedback.durable.push(DurableAck {
+                                locator,
+                                advisory_path,
+                            });
                         }
                         Err(ReaderError::ReaderCapacityExhausted { .. }) => {
                             self.remember_inactive_locator(locator, file_id)?;
@@ -1344,6 +1374,7 @@ impl WorkerRuntime {
                         }
                     };
                     let locator = candidate.evidence.locator;
+                    let advisory_path = identity.advisory_path.clone();
                     if identity.lifecycle_state == LifecycleState::Active {
                         match self.readers_ref()?.file_id_for_locator(locator) {
                             Ok(file_id) => {
@@ -1393,7 +1424,10 @@ impl WorkerRuntime {
                             reason: "inactive locator update changed durable identity",
                         });
                     }
-                    feedback.durable.push(locator);
+                    feedback.durable.push(DurableAck {
+                        locator,
+                        advisory_path,
+                    });
                 }
                 CandidateEvent::Removed { locator } => {
                     match self.readers_ref()?.file_id_for_locator(locator) {

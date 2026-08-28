@@ -214,6 +214,10 @@ pub struct FilelogReceiverMetrics {
     /// Same-locator path changes associated with move/create rotation.
     #[metric(name = "rotation.move_create", unit = "{rotation}")]
     pub rotation_move_create: Counter<u64>,
+    /// New identities registered as a recognized move/create replacement
+    /// for a rebounding distinguished matched-path binding.
+    #[metric(name = "rotation.recognized_replacement", unit = "{rotation}")]
+    pub rotation_recognized_replacement: Counter<u64>,
     /// Removed-file lifecycle finalizations.
     #[metric(name = "rotation.finalizations", unit = "{file}")]
     pub rotation_finalizations: Counter<u64>,
@@ -378,6 +382,7 @@ pub(super) enum WorkerCounter {
     IdentityRecoveryMismatches,
     IdentityExactMatches,
     RotationMoveCreate,
+    RotationRecognizedReplacement,
     RotationFinalizations,
     RotationLateWrites,
     RotationDescriptorUnavailable,
@@ -534,6 +539,10 @@ impl WorkerTelemetryBridge {
         drain!(IdentityRecoveryMismatches, identity_recovery_mismatches);
         drain!(IdentityExactMatches, identity_exact_matches);
         drain!(RotationMoveCreate, rotation_move_create);
+        drain!(
+            RotationRecognizedReplacement,
+            rotation_recognized_replacement
+        );
         drain!(RotationFinalizations, rotation_finalizations);
         drain!(RotationLateWrites, rotation_late_writes);
         drain!(

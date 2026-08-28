@@ -8,6 +8,7 @@ use std::path::Path;
 use tempfile::tempdir;
 
 use super::*;
+use crate::receivers::filelog_receiver::checkpoint::AdvisoryPath;
 use crate::receivers::filelog_receiver::identity::matcher::IdentityMatch;
 use crate::receivers::filelog_receiver::identity::platform::open_candidate;
 
@@ -72,6 +73,7 @@ fn resolved_with_guard(
         lifecycle_state: LifecycleState::Active,
         matched_by: IdentityMatch::NewDiscovery,
         committed_frontier_guard,
+        advisory_path: AdvisoryPath::unavailable(),
     }
 }
 

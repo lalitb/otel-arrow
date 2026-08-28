@@ -22,7 +22,8 @@ use super::{
 use crate::receivers::filelog_receiver::config::{RuntimeConfig, glob_literal_prefix};
 use crate::receivers::filelog_receiver::identity::IdentityError;
 use crate::receivers::filelog_receiver::identity::platform::{
-    encode_advisory_path, open_candidate_at_cancellable, open_locator_at_cancellable,
+    encode_advisory_path, open_candidate_at_cancellable,
+    open_locator_for_stability_check_cancellable,
 };
 
 #[derive(Debug, Clone)]
@@ -769,7 +770,7 @@ impl FilesystemScanner {
         if self.cancellation_requested() {
             return Ok(None);
         }
-        let first = open_locator_at_cancellable(resolved_path, matched_path, false, || {
+        let first = open_locator_for_stability_check_cancellable(resolved_path, false, || {
             self.cancellation_requested()
         });
         if self.cancellation_requested() {
@@ -804,7 +805,7 @@ impl FilesystemScanner {
                 },
             ));
         }
-        let second = open_locator_at_cancellable(&resolved_again, matched_path, false, || {
+        let second = open_locator_for_stability_check_cancellable(&resolved_again, false, || {
             self.cancellation_requested()
         });
         if self.cancellation_requested() {
@@ -901,9 +902,10 @@ impl FilesystemScanner {
             ));
         }
         if self.path_matches_user_exclude(matched_path, &resolved_again, resolved_excludes) {
-            let second = open_locator_at_cancellable(&resolved_again, matched_path, false, || {
-                self.cancellation_requested()
-            });
+            let second =
+                open_locator_for_stability_check_cancellable(&resolved_again, false, || {
+                    self.cancellation_requested()
+                });
             if self.cancellation_requested() {
                 return Ok(None);
             }

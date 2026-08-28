@@ -193,6 +193,12 @@ pub(crate) enum IdentityMatch {
     /// Recovery evidence existed but was unsafe to inherit; a new identity
     /// was created under `on_recovery_mismatch`.
     RecoveryMismatch,
+    /// A validated move/create replacement recognized through another
+    /// identity's rebounding distinguished matched-path binding. Registered
+    /// at offset zero with clean framing regardless of `start_at`, and
+    /// never through fingerprint- or path-based mismatch inheritance (see
+    /// `docs/filelog-receiver-phase1-spec.md`, "Discovery and matching").
+    RecognizedReplacement,
 }
 
 /// Durable state selected for one candidate after persistence succeeds.
@@ -215,6 +221,14 @@ pub(crate) struct ResolvedIdentity {
     /// window once its own descriptor is opened, never trusting the
     /// candidate's own (differently offset) evidence.
     pub(crate) committed_frontier_guard: CommittedFrontierGuard,
+    /// The `AdvisoryPath` now authoritative for this identity's checkpoint
+    /// record. For [`IdentityMatch::ExactLocator`] this is the candidate's
+    /// path only when discovery supplied a confirmed, validated
+    /// distinguished-binding reselection; otherwise it is the durable
+    /// record's existing value, unchanged. This is what discovery
+    /// reconstructs its own binding memory from (see
+    /// `docs/filelog-receiver-phase1-spec.md`, "Discovery and matching").
+    pub(crate) advisory_path: AdvisoryPath,
 }
 
 /// Capacity-aware result for one candidate in reconciliation order.
@@ -246,6 +260,33 @@ impl FileIdSource for RandomFileIdSource {
     }
 }
 
+/// Which candidates' forwarded `AdvisoryPath` is safe to persist as the new
+/// authoritative distinguished binding for an `IdentityMatch::ExactLocator`
+/// reconnection.
+///
+/// Discovery only has continuity memory for a locator it has already been
+/// tracking across scans; a locator it is observing for the first time
+/// since process start (including immediately after a restart) forwards
+/// whatever alias happened to be visited, which must not silently replace
+/// an already-durable binding. Direct, non-admission resolution (used
+/// throughout this module's own tests) has no such distinction and treats
+/// every candidate's path as confirmed, matching this module's prior
+/// behavior (`docs/filelog-receiver-phase1-spec.md`, "Discovery and
+/// matching").
+enum ConfirmedPathBindings<'a> {
+    All,
+    Only(&'a HashSet<Locator>),
+}
+
+impl ConfirmedPathBindings<'_> {
+    fn contains(&self, locator: Locator) -> bool {
+        match self {
+            ConfirmedPathBindings::All => true,
+            ConfirmedPathBindings::Only(set) => set.contains(&locator),
+        }
+    }
+}
+
 /// Resolves a bounded candidate batch and persists every registration or
 /// matching-evidence update before returning it to a reader.
 pub(crate) fn resolve_and_persist(
@@ -267,12 +308,21 @@ pub(crate) fn resolve_and_persist(
 
 /// Resolves one complete reconciliation while deferring only new identities
 /// that cannot consume durable tracked-file capacity.
+///
+/// `recognized_replacements` names locators discovery has recognized this
+/// pass as a validated move/create replacement for a rebounding
+/// distinguished matched-path binding (see [`IdentityMatch::RecognizedReplacement`]).
+/// `confirmed_path_bindings` names locators for which discovery's forwarded
+/// candidate path is a validated distinguished-binding decision, safe to
+/// persist over an existing durable record's `advisory_path`.
 pub(crate) fn resolve_and_persist_with_admission(
     store: &mut CheckpointStore,
     candidates: &[CandidateEvidence],
     inventory: &CandidateInventory,
     settings: &IdentitySettings,
     now_unix_nano: u64,
+    recognized_replacements: &HashSet<Locator>,
+    confirmed_path_bindings: &HashSet<Locator>,
 ) -> Result<Vec<IdentityResolution>, IdentityError> {
     resolve_with_source_mode(
         store,
@@ -283,18 +333,25 @@ pub(crate) fn resolve_and_persist_with_admission(
         &mut RandomFileIdSource,
         true,
         &mut || false,
+        recognized_replacements,
+        ConfirmedPathBindings::Only(confirmed_path_bindings),
     )
     .map(|resolved| resolved.expect("non-cancellable identity resolution cannot be cancelled"))
 }
 
 /// Resolves one complete reconciliation but abandons all planned operations
-/// when cancellation becomes visible immediately before persistence.
+/// when cancellation becomes visible immediately before persistence. See
+/// [`resolve_and_persist_with_admission`] for `recognized_replacements` and
+/// `confirmed_path_bindings`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_and_persist_with_admission_cancellable(
     store: &mut CheckpointStore,
     candidates: &[CandidateEvidence],
     inventory: &CandidateInventory,
     settings: &IdentitySettings,
     now_unix_nano: u64,
+    recognized_replacements: &HashSet<Locator>,
+    confirmed_path_bindings: &HashSet<Locator>,
     mut cancelled: impl FnMut() -> bool,
 ) -> Result<Option<Vec<IdentityResolution>>, IdentityError> {
     resolve_with_source_mode(
@@ -306,6 +363,8 @@ pub(crate) fn resolve_and_persist_with_admission_cancellable(
         &mut RandomFileIdSource,
         true,
         &mut cancelled,
+        recognized_replacements,
+        ConfirmedPathBindings::Only(confirmed_path_bindings),
     )
 }
 
@@ -317,6 +376,7 @@ pub(super) fn resolve_and_persist_with_source(
     now_unix_nano: u64,
     file_ids: &mut impl FileIdSource,
 ) -> Result<Vec<ResolvedIdentity>, IdentityError> {
+    let empty_replacements = HashSet::new();
     let resolutions = resolve_with_source_mode(
         store,
         candidates,
@@ -326,6 +386,8 @@ pub(super) fn resolve_and_persist_with_source(
         file_ids,
         false,
         &mut || false,
+        &empty_replacements,
+        ConfirmedPathBindings::All,
     )?;
     let resolutions = resolutions.expect("non-cancellable identity resolution cannot be cancelled");
     resolutions
@@ -349,6 +411,8 @@ fn resolve_with_source_mode(
     file_ids: &mut impl FileIdSource,
     defer_new_at_capacity: bool,
     cancelled: &mut impl FnMut() -> bool,
+    recognized_replacements: &HashSet<Locator>,
+    confirmed_path_bindings: ConfirmedPathBindings<'_>,
 ) -> Result<Option<Vec<IdentityResolution>>, IdentityError> {
     validate_resumption_profiles(store, settings)?;
     validate_candidates(candidates, inventory, settings)?;
@@ -427,6 +491,7 @@ fn resolve_with_source_mode(
                 record,
                 IdentityMatch::ExactLocator,
                 now_unix_nano,
+                confirmed_path_bindings.contains(candidate.locator),
             ));
             continue;
         }
@@ -448,6 +513,7 @@ fn resolve_with_source_mode(
             record,
             IdentityMatch::ExactLocator,
             now_unix_nano,
+            confirmed_path_bindings.contains(candidate.locator),
         ));
     }
 
@@ -456,7 +522,12 @@ fn resolve_with_source_mode(
             continue;
         }
 
-        if !recovery_evidence[index] {
+        let is_recognized_replacement = recognized_replacements.contains(&candidate.locator);
+        if !recovery_evidence[index] && !is_recognized_replacement {
+            // A recognized move/create replacement never inherits progress
+            // through fingerprint- or path-based association: only a
+            // same-locator conflict detected above (genuine locator reuse)
+            // still forces `on_recovery_mismatch` for a replacement.
             recovery_evidence[index] = has_unavailable_recovery_evidence(
                 candidate,
                 &records_by_fingerprint,
@@ -465,13 +536,20 @@ fn resolve_with_source_mode(
             );
         }
         let mismatch = recovery_evidence[index];
-        let (committed_offset, quarantine) = initial_state(candidate.size, mismatch, settings);
+        let is_clean_replacement = is_recognized_replacement && !mismatch;
+        let (committed_offset, quarantine) = if is_clean_replacement {
+            (0, false)
+        } else {
+            initial_state(candidate.size, mismatch, settings)
+        };
         let file_id = generate_unique_file_id(&mut known_file_ids, file_ids)?;
         plans[index] = Some(plan_new(
             candidate,
             file_id,
             committed_offset,
-            if mismatch {
+            if is_clean_replacement {
+                IdentityMatch::RecognizedReplacement
+            } else if mismatch {
                 IdentityMatch::RecoveryMismatch
             } else {
                 IdentityMatch::NewDiscovery
@@ -498,7 +576,9 @@ fn resolve_with_source_mode(
     for plan in plans {
         let creates_identity = matches!(
             plan.resolved.matched_by,
-            IdentityMatch::NewDiscovery | IdentityMatch::RecoveryMismatch
+            IdentityMatch::NewDiscovery
+                | IdentityMatch::RecoveryMismatch
+                | IdentityMatch::RecognizedReplacement
         );
         if defer_new_at_capacity && creates_identity && remaining_capacity == 0 {
             resolutions.push(IdentityResolution::Deferred);
@@ -717,6 +797,7 @@ fn plan_existing(
     record: &SnapshotRecord,
     matched_by: IdentityMatch,
     now_unix_nano: u64,
+    path_binding_confirmed: bool,
 ) -> PlannedIdentity {
     let mut operations = Vec::with_capacity(2);
     if record.lifecycle_state == LifecycleState::Active
@@ -729,17 +810,29 @@ fn plan_existing(
             new_fingerprint: candidate.fingerprint.clone(),
         }));
     }
+    // Only a confirmed, validated distinguished-binding reselection may
+    // replace the durable `advisory_path`: an unconfirmed candidate (a
+    // locator discovery has no continuity memory for yet, including
+    // immediately after a restart) forwards whatever alias it happened to
+    // observe first, which must never silently overwrite an
+    // already-durable binding (`docs/filelog-receiver-phase1-spec.md`,
+    // "Discovery and matching").
+    let apply_path_update =
+        path_binding_confirmed && record.advisory_path != candidate.advisory_path;
     if record.lifecycle_state != LifecycleState::RotatedFinalized
-        && (record.last_seen_time_unix_nano != now_unix_nano
-            || record.advisory_path != candidate.advisory_path)
+        && (record.last_seen_time_unix_nano != now_unix_nano || apply_path_update)
     {
         operations.push(Operation::UpdateMetadata(UpdateMetadata {
             file_id: record.file_id,
             last_seen_time_unix_nano: now_unix_nano,
-            advisory_path: (record.advisory_path != candidate.advisory_path)
-                .then(|| candidate.advisory_path.clone()),
+            advisory_path: apply_path_update.then(|| candidate.advisory_path.clone()),
         }));
     }
+    let advisory_path = if apply_path_update {
+        candidate.advisory_path.clone()
+    } else {
+        record.advisory_path.clone()
+    };
     PlannedIdentity {
         resolved: ResolvedIdentity {
             file_id: record.file_id,
@@ -749,6 +842,7 @@ fn plan_existing(
             lifecycle_state: record.lifecycle_state,
             matched_by,
             committed_frontier_guard: record.committed_frontier_guard,
+            advisory_path,
         },
         operations,
     }
@@ -843,6 +937,7 @@ fn plan_new(
             },
             matched_by,
             committed_frontier_guard,
+            advisory_path: candidate.advisory_path.clone(),
         },
         operations,
     }

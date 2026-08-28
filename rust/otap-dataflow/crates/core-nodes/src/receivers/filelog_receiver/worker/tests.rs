@@ -240,8 +240,15 @@ fn framed_record_telemetry_uses_exact_bounded_categories() {
 }
 
 async fn receive_batch(events: &mut tokio::sync::mpsc::Receiver<WorkerEvent>) -> WorkerBatch {
+    receive_batch_with_timeout(events, Duration::from_secs(5)).await
+}
+
+async fn receive_batch_with_timeout(
+    events: &mut tokio::sync::mpsc::Receiver<WorkerEvent>,
+    timeout: Duration,
+) -> WorkerBatch {
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        let event = tokio::time::timeout(timeout, events.recv())
             .await
             .expect("worker event timeout")
             .expect("worker event channel closed");
@@ -1623,6 +1630,7 @@ fn durable_truncate_quarantine_is_reported_before_reader_cleanup() {
                 lifecycle_state: LifecycleState::Active,
                 matched_by: IdentityMatch::NewDiscovery,
                 committed_frontier_guard: zero_guard(4),
+                advisory_path: evidence.advisory_path.clone(),
             },
         )
         .unwrap();
@@ -2693,6 +2701,74 @@ async fn rotate_wait_is_not_rounded_up_to_discovery_poll_interval() {
 }
 
 #[cfg(unix)]
+/// Scenario: a broad glob (`app.log*`) matches both a locator being renamed
+/// away and the brand-new locator that appears at the vacated distinguished
+/// path, under `start_at: end`.
+/// Guarantees: the ordered path rebound recognizes the new locator as A's
+/// move/create replacement and registers it clean at offset zero -- proving
+/// B never inherits A's offset and never applies `start_at: end` -- while A
+/// keeps reading its own pre-rotation content through its retained
+/// descriptor.
+#[tokio::test]
+async fn broad_glob_move_create_gives_new_locator_zero_offset_under_start_at_end() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("app.log");
+    let rotated = directory.path().join("app.log.1");
+    std::fs::write(&source, b"before-rotation\n").unwrap();
+    let namespace = directory.path().join("checkpoint");
+    let include = directory
+        .path()
+        .join("app.log*")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let runtime = runtime_config_with(&include, &namespace, 1, |config| {
+        config.start_at = crate::receivers::filelog_receiver::StartAt::End;
+    });
+    let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+    let worker = spawn_worker(runtime.clone(), event_tx).unwrap();
+    let telemetry = Arc::clone(&worker.telemetry);
+
+    // `start_at: end` anchors A past its pre-existing bytes, so no batch is
+    // emitted yet; wait for the reader to actually open before rotating.
+    wait_for_worker_gauge(&telemetry, WorkerGauge::FilesOpen, 1).await;
+
+    std::fs::rename(&source, &rotated).unwrap();
+    std::fs::write(&source, b"after-rotation\n").unwrap();
+
+    let mut replacement = receive_batch_with_timeout(&mut events, Duration::from_secs(15)).await;
+    let request = decode_worker_records(&mut replacement.records);
+    assert_eq!(log_body_bytes(only_log(&request)), b"after-rotation");
+    wait_for_worker_counter(&telemetry, WorkerCounter::RotationRecognizedReplacement, 1).await;
+
+    worker
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: replacement.batch_id,
+            attempt: replacement.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    receive_commit(&mut events).await.3.unwrap();
+    stop_worker(worker, &mut events).await.unwrap();
+
+    let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
+    let records: Vec<_> = store.table().iter().collect();
+    assert_eq!(records.len(), 2);
+    let a_record = records
+        .iter()
+        .find(|(_, record)| record.committed_offset == 16)
+        .expect("A keeps its own pre-rotation committed offset");
+    assert_eq!(a_record.1.lifecycle_state, LifecycleState::Active);
+    let b_record = records
+        .iter()
+        .find(|(_, record)| record.locator != a_record.1.locator)
+        .expect("B is a distinct identity");
+    assert_eq!(b_record.1.committed_offset, 15);
+    assert_eq!(b_record.1.lifecycle_state, LifecycleState::Active);
+}
+
+#[cfg(unix)]
 /// Scenario: Drain arrives after removal starts a long rotation wait but
 /// before the EOF stability interval can expire.
 /// Guarantees: drain stays command-responsive, does not invent finalization,
@@ -2901,7 +2977,7 @@ fn pre_discovery_path_replacement_uses_per_file_containment() {
             DiscoveredCandidate {
                 matched_path: source.clone(),
                 resolved_path,
-                evidence,
+                evidence: evidence.clone(),
                 modified: None,
             },
             ResolvedIdentity {
@@ -2912,6 +2988,7 @@ fn pre_discovery_path_replacement_uses_per_file_containment() {
                 lifecycle_state: LifecycleState::Active,
                 matched_by: IdentityMatch::NewDiscovery,
                 committed_frontier_guard: zero_guard(0),
+                advisory_path: evidence.advisory_path.clone(),
             },
         )
         .unwrap();

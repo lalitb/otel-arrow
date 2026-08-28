@@ -12,7 +12,7 @@ use super::{
     CandidateEvent, DiscoveredCandidate, DiscoveryError, DiscoveryFeedback, DiscoveryIssue,
     DiscoveryStats, ReconciliationBatch, RevocationReason,
 };
-use crate::receivers::filelog_receiver::checkpoint::Locator;
+use crate::receivers::filelog_receiver::checkpoint::{AdvisoryPath, Locator};
 
 use crate::receivers::filelog_receiver::identity::matcher::CandidateInventory;
 
@@ -22,6 +22,13 @@ struct PendingEntry {
     first_seen_generation: u64,
     first_seen_at: Instant,
     seen_generation: u64,
+    /// Whether `candidate` was recognized as a validated move/create
+    /// replacement for a rebounding distinguished matched-path binding.
+    /// Carried while the candidate waits in the bounded pending queue so
+    /// admission capacity pressure emitting it in a later pass cannot
+    /// silently lose the recognition (`docs/filelog-receiver-phase1-spec.md`,
+    /// "Discovery and matching").
+    recognized_replacement: bool,
 }
 
 #[derive(Debug)]
@@ -35,6 +42,42 @@ struct TrackedEntry {
     inflight_candidate: Option<DiscoveredCandidate>,
     first_seen_generation: Option<u64>,
     first_seen_at: Option<Instant>,
+    /// The single durable distinguished `AdvisoryPath` binding this locator
+    /// currently owns. Seeded when the locator is first tracked and
+    /// corrected from durable feedback (see [`DurableAck`]) so a restart's
+    /// first traversal-order alias can never silently replace an
+    /// already-durable binding (`docs/filelog-receiver-phase1-spec.md`,
+    /// "Discovery and matching").
+    distinguished_path: AdvisoryPath,
+    /// Whether `distinguished_path` was itself observed, still naming this
+    /// same locator, during the scan generation named by `seen_generation`.
+    /// Scratch state, reset whenever a new generation's first alias for
+    /// this locator is observed.
+    binding_seen_this_generation: bool,
+    /// The candidate observed at `distinguished_path` this generation, if
+    /// `binding_seen_this_generation` is true. Used only to refresh
+    /// non-path evidence; the binding itself does not change.
+    binding_candidate: Option<DiscoveredCandidate>,
+    /// The deterministic-minimum candidate observed this generation whose
+    /// path differs from `distinguished_path`, retained only in case
+    /// `distinguished_path` turns out not to be observed at all this
+    /// generation. Bounded to one retained candidate; never an
+    /// accumulated alias list.
+    rebind_candidate: Option<DiscoveredCandidate>,
+    /// Whether any alias for this locator was observed during the
+    /// generation named by `seen_generation`. Scratch state.
+    observed_this_generation: bool,
+    /// `present` captured before this generation's first observation, used
+    /// to detect an unsafe reappearance before an earlier removal
+    /// transition finalized. Scratch state.
+    was_present_before_generation: bool,
+    /// Whether `inflight_candidate` (when present) was admitted as a
+    /// validated move/create replacement recognition. Carried so
+    /// identity-capacity feedback returning this candidate to the bounded
+    /// pending queue (see `feedback.deferred`) does not silently lose the
+    /// recognition (`docs/filelog-receiver-phase1-spec.md`, "Discovery and
+    /// matching").
+    recognized_replacement: bool,
 }
 
 #[derive(Debug)]
@@ -81,6 +124,12 @@ pub(crate) struct AdmissionController {
     pending_order: VecDeque<Locator>,
     selected: BinaryHeap<SelectedCandidate>,
     selected_locators: HashSet<Locator>,
+    /// Deterministic-minimum candidate retained per not-yet-tracked locator
+    /// already selected this scan. The heap above only orders bounded fair
+    /// overflow eviction by `(generation, locator)`; it never compares
+    /// paths, so the reported candidate for one selected locator is kept
+    /// here instead and swapped in when the heap is drained.
+    selected_min_candidates: HashMap<Locator, DiscoveredCandidate>,
     denied_locators: HashSet<Locator>,
     denial_overflowed: bool,
     events: Vec<CandidateEvent>,
@@ -90,6 +139,30 @@ pub(crate) struct AdmissionController {
     removal_evidence_complete: bool,
     deferred_overflow: u64,
     overflow_since: Option<Instant>,
+    /// Bounded path -> locator index frozen from tracked distinguished
+    /// bindings at scan start (`docs/filelog-receiver-phase1-spec.md`,
+    /// "Discovery and matching").
+    frozen_path_index: HashMap<AdvisoryPath, Locator>,
+    /// Prior-binding owner -> newly observed claimant locator, recorded
+    /// when an observation's path matches another locator's frozen
+    /// distinguished binding.
+    rebind_claims: HashMap<Locator, Locator>,
+    /// Owners whose rebind evidence was unstable or conflicting this scan;
+    /// their old binding is preserved and no rebind is recognized.
+    rebind_conflicts: HashSet<Locator>,
+    /// Bounded, per-scan candidate set freshly recognized by
+    /// [`finalize_tracked_bindings`] as a validated move/create
+    /// replacement. Consulted only while admitting or deferring a
+    /// candidate this same pass; recognition that survives across passes
+    /// is instead carried on the bounded [`PendingEntry`] and
+    /// [`TrackedEntry`] the candidate itself occupies (see
+    /// `docs/filelog-receiver-phase1-spec.md`, "Discovery and matching").
+    recognized_replacement_candidates: HashSet<Locator>,
+    /// Locators this pass actually emitted a `CandidateEvent` for while
+    /// carrying a recognized-replacement flag. This is the exact set
+    /// returned to the reader; a candidate merely deferred to the pending
+    /// queue this pass is never named here.
+    recognized_replacements: HashSet<Locator>,
 }
 
 impl AdmissionController {
@@ -123,6 +196,7 @@ impl AdmissionController {
             pending_order: VecDeque::with_capacity(max_pending_candidates),
             selected: BinaryHeap::new(),
             selected_locators: HashSet::new(),
+            selected_min_candidates: HashMap::new(),
             denied_locators: HashSet::with_capacity(max_denied_locators),
             denial_overflowed: false,
             events: Vec::new(),
@@ -132,6 +206,11 @@ impl AdmissionController {
             removal_evidence_complete: false,
             deferred_overflow: 0,
             overflow_since: None,
+            frozen_path_index: HashMap::with_capacity(max_tracked_files),
+            rebind_claims: HashMap::with_capacity(max_tracked_files),
+            rebind_conflicts: HashSet::with_capacity(max_tracked_files),
+            recognized_replacement_candidates: HashSet::new(),
+            recognized_replacements: HashSet::new(),
         })
     }
 
@@ -159,8 +238,34 @@ impl AdmissionController {
         self.events.clear();
         self.selected.clear();
         self.selected_locators.clear();
+        self.selected_min_candidates.clear();
         self.denied_locators.clear();
         self.denial_overflowed = false;
+        self.rebind_claims.clear();
+        self.rebind_conflicts.clear();
+        self.recognized_replacement_candidates.clear();
+        self.recognized_replacements.clear();
+        self.frozen_path_index.clear();
+        let mut ambiguous_paths = HashSet::with_capacity(self.tracked.len());
+        for (&locator, entry) in &self.tracked {
+            if !entry.durable {
+                continue;
+            }
+            if ambiguous_paths.contains(&entry.distinguished_path) {
+                let _ = self.rebind_conflicts.insert(locator);
+                continue;
+            }
+            if let Some(previous) = self
+                .frozen_path_index
+                .insert(entry.distinguished_path.clone(), locator)
+                && previous != locator
+            {
+                let _ = self.frozen_path_index.remove(&entry.distinguished_path);
+                let _ = ambiguous_paths.insert(entry.distinguished_path.clone());
+                let _ = self.rebind_conflicts.insert(previous);
+                let _ = self.rebind_conflicts.insert(locator);
+            }
+        }
         let mut stats = DiscoveryStats::new(self.generation);
         stats.overflowed_candidates = std::mem::take(&mut self.deferred_overflow);
         if stats.overflowed_candidates != 0 {
@@ -170,6 +275,9 @@ impl AdmissionController {
         self.scan_now = Some(now);
         self.scan_started = Some(started);
         self.removal_evidence_complete = true;
+        for locator in self.rebind_conflicts.iter().copied().collect::<Vec<_>>() {
+            self.record_issue(DiscoveryIssue::ConflictingPathRebind { locator })?;
+        }
         Ok(self.generation)
     }
 
@@ -214,55 +322,48 @@ impl AdmissionController {
         if self.denied_locators.contains(&locator) {
             return Ok(());
         }
+        // A distinguished binding's prior owner is frozen at scan start
+        // (`begin_scan_at`); an observation naming a *different* live
+        // locator at that same path is evidence the binding rebounded away
+        // from its owner. This is detected uniformly here, before any
+        // tracked/pending/new branching, so a genuinely new replacement
+        // candidate is recognized exactly the same way as one that is
+        // already tracked or pending.
+        if let Some(&owner) = self
+            .frozen_path_index
+            .get(&candidate.evidence.advisory_path)
+            && owner != locator
+        {
+            self.record_rebind_claim(owner, locator)?;
+        }
         if self.tracked.contains_key(&locator) {
-            let mut emit_update = false;
-            let mut evidence_blocked = false;
-            {
-                let entry = self
-                    .tracked
-                    .get_mut(&locator)
-                    .expect("contains_key established tracked entry");
-                if entry.seen_generation == generation {
-                    return Ok(());
-                }
+            let entry = self
+                .tracked
+                .get_mut(&locator)
+                .expect("contains_key established tracked entry");
+            if entry.seen_generation != generation {
                 entry.seen_generation = generation;
-                let was_present = entry.present;
-                let signature = candidate_signature(&candidate);
-                if entry.revoked {
-                    if entry.revocation_inflight
-                        || entry.inflight_candidate.is_some()
-                        || self.inflight_count >= self.max_candidate_events
-                    {
-                        evidence_blocked = true;
-                    } else {
-                        entry.signature = signature;
-                        entry.inflight_candidate = Some(candidate.clone());
-                        entry.present = true;
-                        entry.revoked = false;
-                        emit_update = true;
-                    }
-                } else if !was_present {
-                    evidence_blocked = true;
-                } else if entry.signature != signature {
-                    if entry.inflight_candidate.is_some()
-                        || self.inflight_count >= self.max_candidate_events
-                    {
-                        evidence_blocked = true;
-                    } else {
-                        entry.signature = signature;
-                        entry.inflight_candidate = Some(candidate.clone());
-                        entry.present = true;
-                        emit_update = true;
-                    }
-                } else {
-                    entry.present = true;
-                }
+                entry.binding_seen_this_generation = false;
+                entry.binding_candidate = None;
+                entry.rebind_candidate = None;
+                entry.observed_this_generation = false;
+                entry.was_present_before_generation = entry.present;
             }
-            if emit_update {
-                self.inflight_count += 1;
-                self.events.push(CandidateEvent::Updated(candidate));
-            } else if evidence_blocked {
-                self.mark_incomplete_overflow()?;
+            entry.observed_this_generation = true;
+            if candidate.evidence.advisory_path == entry.distinguished_path {
+                entry.binding_seen_this_generation = true;
+                entry.binding_candidate = Some(candidate);
+            } else {
+                let replace = entry.rebind_candidate.as_ref().is_none_or(|existing| {
+                    candidate
+                        .evidence
+                        .advisory_path
+                        .distinguished_binding_order(&existing.evidence.advisory_path)
+                        == Ordering::Less
+                });
+                if replace {
+                    entry.rebind_candidate = Some(candidate);
+                }
             }
             self.increment_eligible_candidates()?;
             return Ok(());
@@ -274,6 +375,14 @@ impl AdmissionController {
             if entry.seen_generation != generation {
                 entry.candidate = candidate;
                 entry.seen_generation = generation;
+                self.increment_eligible_candidates()?;
+            } else if candidate
+                .evidence
+                .advisory_path
+                .distinguished_binding_order(&entry.candidate.evidence.advisory_path)
+                == Ordering::Less
+            {
+                entry.candidate = candidate;
                 self.increment_eligible_candidates()?;
             }
             return Ok(());
@@ -287,6 +396,36 @@ impl AdmissionController {
         }
         self.increment_eligible_candidates()?;
         self.consider_new_candidate(candidate)
+    }
+
+    /// Records that `owner`'s frozen distinguished path was observed this
+    /// scan naming a different live locator, `claimant`. Two different
+    /// claimants observed for the same owner within one pass is unstable
+    /// evidence; the owner's rebind is then refused and its old binding is
+    /// preserved (`docs/filelog-receiver-phase1-spec.md`, "Discovery and
+    /// matching"). Once poisoned this way, `owner` is removed from
+    /// `rebind_claims` (so neither claimant can later be recognized as its
+    /// replacement) and every later claim for the same `owner` this
+    /// generation is silently ignored.
+    fn record_rebind_claim(
+        &mut self,
+        owner: Locator,
+        claimant: Locator,
+    ) -> Result<(), DiscoveryError> {
+        if self.rebind_conflicts.contains(&owner) {
+            return Ok(());
+        }
+        match self.rebind_claims.get(&owner) {
+            Some(&existing) if existing != claimant => {
+                let _ = self.rebind_claims.remove(&owner);
+                let _ = self.rebind_conflicts.insert(owner);
+                self.record_issue(DiscoveryIssue::ConflictingPathRebind { locator: owner })?;
+            }
+            _ => {
+                let _ = self.rebind_claims.insert(owner, claimant);
+            }
+        }
+        Ok(())
     }
 
     /// Records positive path-policy evidence. Unknown excluded locators use
@@ -325,31 +464,6 @@ impl AdmissionController {
                 .expect("tracked revocation entry disappeared")
                 .seen_generation = generation;
             return Ok(());
-        }
-
-        let current_candidate_event = self.events.iter().position(|event| {
-            event
-                .candidate()
-                .is_some_and(|candidate| candidate.evidence.locator == locator)
-        });
-        if let Some(index) = current_candidate_event {
-            let _cancelled = self.events.remove(index);
-            let entry = self
-                .tracked
-                .get_mut(&locator)
-                .expect("tracked revocation entry disappeared");
-            if entry.inflight_candidate.take().is_none() {
-                return Err(DiscoveryError::InvalidFeedback {
-                    locator,
-                    reason: "current candidate event has no retained in-flight evidence",
-                });
-            }
-            self.inflight_count =
-                self.inflight_count
-                    .checked_sub(1)
-                    .ok_or(DiscoveryError::CounterOverflow {
-                        counter: "in-flight candidate evidence",
-                    })?;
         }
 
         let entry = self
@@ -419,9 +533,12 @@ impl AdmissionController {
                 .retain(|locator| self.pending.contains_key(locator));
         }
 
+        self.finalize_tracked_bindings()?;
+
         if self.denial_overflowed {
             self.selected.clear();
             self.selected_locators.clear();
+            self.selected_min_candidates.clear();
         } else {
             self.admit_pending(finished_at)?;
             self.retain_selected(finished_at)?;
@@ -497,6 +614,7 @@ impl AdmissionController {
             events: std::mem::take(&mut self.events),
             inventory,
             stats,
+            recognized_replacements: std::mem::take(&mut self.recognized_replacements),
         })
     }
 
@@ -508,7 +626,7 @@ impl AdmissionController {
         for (locator, requires_inflight, requires_absence, requires_revocation) in feedback
             .durable
             .iter()
-            .map(|locator| (locator, true, false, false))
+            .map(|ack| (&ack.locator, true, false, false))
             .chain(
                 feedback
                     .rejected
@@ -592,15 +710,20 @@ impl AdmissionController {
                 counter: "deferred candidate overflow",
             })?;
 
-        for locator in feedback.durable {
+        for ack in feedback.durable {
             let entry = self
                 .tracked
-                .get_mut(&locator)
+                .get_mut(&ack.locator)
                 .expect("feedback was preflighted");
             entry.inflight_candidate = None;
             entry.first_seen_generation = None;
             entry.first_seen_at = None;
             entry.durable = true;
+            entry.distinguished_path = ack.advisory_path;
+            // The recognized-replacement identity is now durable; it must
+            // never be carried forward onto a later, unrelated in-flight
+            // candidate for the same locator.
+            entry.recognized_replacement = false;
             self.inflight_count =
                 self.inflight_count
                     .checked_sub(1)
@@ -621,6 +744,9 @@ impl AdmissionController {
                             counter: "in-flight candidate evidence",
                         })?;
             }
+            // The rejected candidate's recognition must not survive onto
+            // whatever this locator is later reobserved as.
+            entry.recognized_replacement = false;
             if !entry.present {
                 entry.first_seen_generation = None;
                 entry.first_seen_at = None;
@@ -658,6 +784,12 @@ impl AdmissionController {
                         first_seen_generation,
                         first_seen_at,
                         seen_generation: self.generation,
+                        // Identity capacity, not recognition, deferred
+                        // this candidate: the recognized-replacement
+                        // decision survives the round trip through the
+                        // pending queue so a later pass emits it again as
+                        // a replacement rather than an ordinary discovery.
+                        recognized_replacement: entry.recognized_replacement,
                     },
                 );
                 debug_assert!(previous.is_none());
@@ -689,6 +821,10 @@ impl AdmissionController {
                     .expect("feedback was preflighted")
                     .revocation_inflight = false;
             } else {
+                // A non-durable revoked locator's tracked entry is removed
+                // entirely, which also clears any recognized-replacement
+                // flag it carried rather than letting it survive onto a
+                // later, unrelated observation of the same locator.
                 let entry = self
                     .tracked
                     .remove(&locator)
@@ -719,6 +855,25 @@ impl AdmissionController {
         &mut self,
         candidate: DiscoveredCandidate,
     ) -> Result<(), DiscoveryError> {
+        let locator = candidate.evidence.locator;
+        if self.selected_locators.contains(&locator) {
+            // Another alias for this not-yet-tracked locator was already
+            // selected this scan. Retain only the deterministic-minimum
+            // observation rather than every alias; the fair-overflow heap
+            // orders purely by `(generation, locator)` and never inspects
+            // the retained candidate, so replacing it here cannot disturb
+            // eviction fairness.
+            if let Some(existing) = self.selected_min_candidates.get(&locator)
+                && candidate
+                    .evidence
+                    .advisory_path
+                    .distinguished_binding_order(&existing.evidence.advisory_path)
+                    == Ordering::Less
+            {
+                let _ = self.selected_min_candidates.insert(locator, candidate);
+            }
+            return Ok(());
+        }
         let remaining_events = self
             .max_candidate_events
             .saturating_sub(self.inflight_count);
@@ -734,10 +889,10 @@ impl AdmissionController {
         if selection_capacity == 0 {
             return self.mark_incomplete_overflow();
         }
-        let locator = candidate.evidence.locator;
-        if !self.selected_locators.insert(locator) {
-            return Ok(());
-        }
+        let _ = self.selected_locators.insert(locator);
+        let _ = self
+            .selected_min_candidates
+            .insert(locator, candidate.clone());
         let selected = SelectedCandidate {
             priority: candidate_priority(self.generation, locator),
             locator_key: locator_key(locator),
@@ -756,10 +911,14 @@ impl AdmissionController {
             let _ = self
                 .selected_locators
                 .remove(&displaced.candidate.evidence.locator);
+            let _ = self
+                .selected_min_candidates
+                .remove(&displaced.candidate.evidence.locator);
             self.selected.push(selected);
             self.mark_incomplete_overflow()
         } else {
             let _ = self.selected_locators.remove(&locator);
+            let _ = self.selected_min_candidates.remove(&locator);
             self.mark_incomplete_overflow()
         }
     }
@@ -789,6 +948,7 @@ impl AdmissionController {
                 entry.first_seen_generation,
                 entry.first_seen_at,
                 finished_at,
+                entry.recognized_replacement,
             )?;
         }
         Ok(())
@@ -798,34 +958,38 @@ impl AdmissionController {
         let selected = std::mem::take(&mut self.selected).into_sorted_vec();
         self.selected_locators.clear();
         for selected in selected {
-            if self
-                .denied_locators
-                .contains(&selected.candidate.evidence.locator)
-            {
+            let locator = selected.candidate.evidence.locator;
+            let candidate = self
+                .selected_min_candidates
+                .remove(&locator)
+                .unwrap_or(selected.candidate);
+            if self.denied_locators.contains(&locator) {
                 continue;
             }
+            let recognized_replacement = self.recognized_replacement_candidates.contains(&locator);
             if self.inflight_count < self.max_candidate_events {
                 let first_seen_at = self
                     .scan_started
                     .expect("active scan always has a monotonic clock");
                 self.track_observed(
-                    selected.candidate,
+                    candidate,
                     self.generation,
                     first_seen_at,
                     finished_at,
+                    recognized_replacement,
                 )?;
             } else if self.pending.len() < self.max_pending_candidates {
-                let locator = selected.candidate.evidence.locator;
                 self.pending_order.push_back(locator);
                 let previous = self.pending.insert(
                     locator,
                     PendingEntry {
-                        candidate: selected.candidate,
+                        candidate,
                         first_seen_generation: self.generation,
                         first_seen_at: self
                             .scan_started
                             .expect("active scan always has a monotonic clock"),
                         seen_generation: self.generation,
+                        recognized_replacement,
                     },
                 );
                 debug_assert!(previous.is_none());
@@ -842,6 +1006,7 @@ impl AdmissionController {
         first_seen_generation: u64,
         first_seen_at: Instant,
         admitted_at: Instant,
+        recognized_replacement: bool,
     ) -> Result<(), DiscoveryError> {
         if self.tracked.len() >= self.max_live_entries {
             return self.mark_incomplete_overflow();
@@ -868,12 +1033,22 @@ impl AdmissionController {
                 durable: false,
                 revoked: false,
                 revocation_inflight: false,
+                distinguished_path: candidate.evidence.advisory_path.clone(),
+                binding_seen_this_generation: true,
+                binding_candidate: None,
+                rebind_candidate: None,
+                observed_this_generation: true,
+                was_present_before_generation: true,
                 inflight_candidate: Some(candidate.clone()),
                 first_seen_generation: Some(first_seen_generation),
                 first_seen_at: Some(first_seen_at),
+                recognized_replacement,
             },
         );
         debug_assert!(previous.is_none());
+        if recognized_replacement {
+            let _ = self.recognized_replacements.insert(locator);
+        }
         self.inflight_count =
             self.inflight_count
                 .checked_add(1)
@@ -881,6 +1056,165 @@ impl AdmissionController {
                     counter: "in-flight candidate evidence",
                 })?;
         self.events.push(CandidateEvent::Observed(candidate));
+        Ok(())
+    }
+
+    /// Resolves every tracked locator's distinguished matched-path binding
+    /// for the just-completed scan, in the order required by
+    /// `docs/filelog-receiver-phase1-spec.md`, "Discovery and matching":
+    /// prior bindings are frozen (`begin_scan_at`), rebind claims are
+    /// grouped to detect conflicts, and only then does each affected
+    /// locator's binding change.
+    fn finalize_tracked_bindings(&mut self) -> Result<(), DiscoveryError> {
+        let mut claimant_owners: HashMap<Locator, Vec<Locator>> = HashMap::new();
+        for (&owner, &claimant) in &self.rebind_claims {
+            claimant_owners.entry(claimant).or_default().push(owner);
+        }
+        let mut recognized_replacements = HashSet::new();
+        for (&claimant, owners) in &claimant_owners {
+            if owners.len() > 1 {
+                for &owner in owners {
+                    let _ = self.rebind_conflicts.insert(owner);
+                }
+            } else {
+                let _ = recognized_replacements.insert(claimant);
+            }
+        }
+        // A claimant already tracked (rather than still pending or
+        // newly selected) picks up the flag directly on its own entry;
+        // `admit_pending`/`retain_selected` handle every other case when
+        // the candidate is actually admitted or deferred below.
+        for &claimant in &recognized_replacements {
+            if let Some(entry) = self.tracked.get_mut(&claimant) {
+                entry.recognized_replacement = true;
+            }
+        }
+        self.recognized_replacement_candidates = recognized_replacements;
+        for issue_owner in claimant_owners
+            .values()
+            .filter(|owners| owners.len() > 1)
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>()
+        {
+            self.record_issue(DiscoveryIssue::ConflictingPathRebind {
+                locator: issue_owner,
+            })?;
+        }
+        let locators: Vec<Locator> = self.tracked.keys().copied().collect();
+        for locator in locators {
+            self.finalize_one_tracked_binding(locator)?;
+        }
+        Ok(())
+    }
+
+    fn finalize_one_tracked_binding(&mut self, locator: Locator) -> Result<(), DiscoveryError> {
+        let generation = self.generation;
+        let (candidate, path_changing, revoked, was_present_before, recognized_replacement) = {
+            let entry = self
+                .tracked
+                .get(&locator)
+                .expect("finalize iterates tracked keys");
+            if entry.seen_generation != generation || !entry.observed_this_generation {
+                return Ok(());
+            }
+            if entry.binding_seen_this_generation {
+                (
+                    entry.binding_candidate.clone(),
+                    false,
+                    entry.revoked,
+                    entry.was_present_before_generation,
+                    entry.recognized_replacement,
+                )
+            } else {
+                (
+                    entry.rebind_candidate.clone(),
+                    true,
+                    entry.revoked,
+                    entry.was_present_before_generation,
+                    entry.recognized_replacement,
+                )
+            }
+        };
+        let Some(candidate) = candidate else {
+            return Ok(());
+        };
+        if path_changing
+            && (!self.removal_evidence_complete || self.rebind_conflicts.contains(&locator))
+        {
+            // Fail closed: an unstable or conflicting rebind, or an
+            // otherwise incomplete pass, must preserve the old durable
+            // binding rather than reselect from partial evidence.
+            return self.mark_incomplete_overflow();
+        }
+        let new_signature = candidate_signature(&candidate);
+        if revoked {
+            let entry = self
+                .tracked
+                .get(&locator)
+                .expect("finalize iterates tracked keys");
+            if entry.revocation_inflight
+                || entry.inflight_candidate.is_some()
+                || self.inflight_count >= self.max_candidate_events
+            {
+                return self.mark_incomplete_overflow();
+            }
+            let entry = self
+                .tracked
+                .get_mut(&locator)
+                .expect("finalize iterates tracked keys");
+            entry.signature = new_signature;
+            entry.inflight_candidate = Some(candidate.clone());
+            entry.present = true;
+            entry.revoked = false;
+            if path_changing {
+                entry.distinguished_path = candidate.evidence.advisory_path.clone();
+            }
+            self.inflight_count += 1;
+            self.events.push(CandidateEvent::Updated(candidate));
+            if recognized_replacement {
+                let _ = self.recognized_replacements.insert(locator);
+            }
+            return Ok(());
+        }
+        if !was_present_before {
+            return self.mark_incomplete_overflow();
+        }
+        let entry = self
+            .tracked
+            .get(&locator)
+            .expect("finalize iterates tracked keys");
+        let evidence_changed = path_changing || entry.signature != new_signature;
+        if !evidence_changed {
+            let entry = self
+                .tracked
+                .get_mut(&locator)
+                .expect("finalize iterates tracked keys");
+            entry.present = true;
+            return Ok(());
+        }
+        let entry = self
+            .tracked
+            .get(&locator)
+            .expect("finalize iterates tracked keys");
+        if entry.inflight_candidate.is_some() || self.inflight_count >= self.max_candidate_events {
+            return self.mark_incomplete_overflow();
+        }
+        let entry = self
+            .tracked
+            .get_mut(&locator)
+            .expect("finalize iterates tracked keys");
+        entry.signature = new_signature;
+        entry.inflight_candidate = Some(candidate.clone());
+        entry.present = true;
+        if path_changing {
+            entry.distinguished_path = candidate.evidence.advisory_path.clone();
+        }
+        self.inflight_count += 1;
+        self.events.push(CandidateEvent::Updated(candidate));
+        if recognized_replacement {
+            let _ = self.recognized_replacements.insert(locator);
+        }
         Ok(())
     }
 

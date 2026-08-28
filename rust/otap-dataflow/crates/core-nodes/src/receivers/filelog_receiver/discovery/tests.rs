@@ -114,6 +114,18 @@ fn event_locators(batch: &ReconciliationBatch) -> Vec<Locator> {
         .collect()
 }
 
+fn event_durable_acks(batch: &ReconciliationBatch) -> Vec<DurableAck> {
+    batch
+        .events
+        .iter()
+        .filter_map(CandidateEvent::candidate)
+        .map(|candidate| DurableAck {
+            locator: candidate.evidence.locator,
+            advisory_path: candidate.evidence.advisory_path.clone(),
+        })
+        .collect()
+}
+
 fn fake_candidate(number: u64) -> DiscoveredCandidate {
     let path = PathBuf::from(format!("candidate-{number}.log"));
     DiscoveredCandidate {
@@ -134,6 +146,18 @@ fn fake_candidate(number: u64) -> DiscoveredCandidate {
         },
         modified: None,
     }
+}
+
+/// Builds an alias observation for the same locator as `fake_candidate`,
+/// naming it through a different literal path. Real overlapping globs and
+/// hardlinks produce exactly this shape: one locator, several distinct
+/// matched-path strings.
+fn fake_candidate_alias(number: u64, alias: &str) -> DiscoveredCandidate {
+    let mut candidate = fake_candidate(number);
+    candidate.matched_path = PathBuf::from(alias);
+    candidate.resolved_path = PathBuf::from(alias);
+    candidate.evidence.advisory_path = AdvisoryPath::from_unix_bytes(alias.as_bytes()).unwrap();
+    candidate
 }
 
 /// Scenario: a tracked locator, fingerprint, and advisory matched path stay
@@ -172,7 +196,7 @@ fn resolved_path_change_emits_tracked_update() {
 
 fn durable_feedback(batch: &ReconciliationBatch) -> DiscoveryFeedback {
     DiscoveryFeedback {
-        durable: event_locators(batch),
+        durable: event_durable_acks(batch),
         ..DiscoveryFeedback::default()
     }
 }
@@ -604,7 +628,7 @@ fn retained_candidate_age_is_measured_deterministically() {
     assert_eq!(first.stats.oldest_pending_age, Duration::ZERO);
     admission
         .apply_feedback(DiscoveryFeedback {
-            durable: vec![event_locators(&first)[0]],
+            durable: vec![event_durable_acks(&first)[0].clone()],
             ..DiscoveryFeedback::default()
         })
         .unwrap();
@@ -688,7 +712,7 @@ fn overflow_persistence_includes_scan_time_and_resets() {
     assert_eq!(first.stats.overflow_persistence, Duration::from_secs(7));
     admission
         .apply_feedback(DiscoveryFeedback {
-            durable: event_locators(&first),
+            durable: event_durable_acks(&first),
             ..DiscoveryFeedback::default()
         })
         .unwrap();
@@ -711,7 +735,7 @@ fn overflow_persistence_includes_scan_time_and_resets() {
     );
     admission
         .apply_feedback(DiscoveryFeedback {
-            durable: event_locators(&continuous),
+            durable: event_durable_acks(&continuous),
             ..DiscoveryFeedback::default()
         })
         .unwrap();
@@ -1301,7 +1325,10 @@ fn reappearance_waits_for_reader_finalization_then_emits_observed() {
     assert!(!blocked.stats.complete);
     admission
         .apply_feedback(DiscoveryFeedback {
-            durable: vec![locator],
+            durable: vec![DurableAck {
+                locator,
+                advisory_path: candidate.evidence.advisory_path.clone(),
+            }],
             ..DiscoveryFeedback::default()
         })
         .unwrap();
@@ -1693,4 +1720,408 @@ fn full_tracked_table_still_recovers_existing_identity() {
     assert_eq!(resolved[0].file_id, file_id);
     assert_eq!(resolved[0].matched_by, IdentityMatch::ExactLocator);
     assert_eq!(store.table().len(), 1);
+}
+
+/// Scenario: one previously untracked locator has two simultaneously
+/// eligible aliases, observed in each possible order across two otherwise
+/// identical reconciliation passes.
+/// Guarantees: both passes select the same deterministic-minimum
+/// `(path_kind, complete native path bytes)` alias as the distinguished
+/// binding, independent of traversal order, and neither retains the other
+/// alias.
+#[test]
+fn deterministic_min_selection_independent_of_traversal_order() {
+    let smaller = fake_candidate_alias(200, "aaa.log");
+    let larger = fake_candidate_alias(200, "zzz.log");
+
+    let mut forward = AdmissionController::new(4, 4, 4, 16).unwrap();
+    let generation = forward.begin_scan(SystemTime::now()).unwrap();
+    forward
+        .observe(generation, larger.clone(), Duration::ZERO)
+        .unwrap();
+    forward
+        .observe(generation, smaller.clone(), Duration::ZERO)
+        .unwrap();
+    let forward_batch = forward.finish_scan().unwrap();
+
+    let mut reverse = AdmissionController::new(4, 4, 4, 16).unwrap();
+    let generation = reverse.begin_scan(SystemTime::now()).unwrap();
+    reverse
+        .observe(generation, smaller.clone(), Duration::ZERO)
+        .unwrap();
+    reverse.observe(generation, larger, Duration::ZERO).unwrap();
+    let reverse_batch = reverse.finish_scan().unwrap();
+
+    let forward_candidates = observed_candidates(&forward_batch);
+    let reverse_candidates = observed_candidates(&reverse_batch);
+    assert_eq!(forward_candidates.len(), 1);
+    assert_eq!(reverse_candidates.len(), 1);
+    assert_eq!(forward_candidates[0].matched_path, PathBuf::from("aaa.log"));
+    assert_eq!(reverse_candidates[0].matched_path, PathBuf::from("aaa.log"));
+}
+
+/// Scenario: a locator's distinguished binding is already stable, and a
+/// later pass simultaneously observes that same path plus a newly
+/// appearing, lexically smaller alias for the same locator.
+/// Guarantees: the existing binding remains stable -- no false rebind --
+/// even though a smaller alias is now present.
+#[test]
+fn lexically_smaller_alias_does_not_replace_stable_binding() {
+    let mut admission = AdmissionController::new(4, 4, 4, 16).unwrap();
+    let initial = fake_candidate_alias(201, "zzz.log");
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe(generation, initial.clone(), Duration::ZERO)
+        .unwrap();
+    let first = admission.finish_scan().unwrap();
+    admission.apply_feedback(durable_feedback(&first)).unwrap();
+
+    let smaller_alias = fake_candidate_alias(201, "aaa.log");
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe(generation, initial, Duration::ZERO)
+        .unwrap();
+    admission
+        .observe(generation, smaller_alias, Duration::ZERO)
+        .unwrap();
+    let second = admission.finish_scan().unwrap();
+
+    assert!(second.stats.complete);
+    for event in &second.events {
+        if let CandidateEvent::Updated(candidate) = event {
+            assert_eq!(candidate.matched_path, PathBuf::from("zzz.log"));
+        }
+    }
+}
+
+/// Scenario: a locator's distinguished path is no longer observed, a
+/// different alias for the same locator would otherwise become its new
+/// minimum, but the pass is separately proven incomplete.
+/// Guarantees: an incomplete pass never reselects a distinguished binding
+/// from partial evidence; the old binding is preserved and no `Updated` or
+/// `Removed` transition is emitted for it.
+#[test]
+fn incomplete_pass_preserves_binding_instead_of_reselecting() {
+    let mut admission = AdmissionController::new(4, 4, 4, 16).unwrap();
+    let initial = fake_candidate_alias(202, "old.log");
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe(generation, initial, Duration::ZERO)
+        .unwrap();
+    let first = admission.finish_scan().unwrap();
+    admission.apply_feedback(durable_feedback(&first)).unwrap();
+
+    let replacement_alias = fake_candidate_alias(202, "new.log");
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe(generation, replacement_alias, Duration::ZERO)
+        .unwrap();
+    admission
+        .record_issue(DiscoveryIssue::Io {
+            operation: "test forced incompleteness",
+            path: PathBuf::from("unrelated"),
+            source: std::io::Error::other("boom"),
+        })
+        .unwrap();
+    let second = admission.finish_scan().unwrap();
+
+    assert!(!second.stats.complete);
+    assert!(second.events.is_empty());
+}
+
+/// Scenario: two different tracked locators' frozen distinguished paths are
+/// both observed this pass naming the same new locator (for example, two
+/// hardlinks of one new file each landing on a different owner's prior
+/// path).
+/// Guarantees: the conflicting claim is refused for both owners, their old
+/// bindings are preserved, no `Updated` transition reassigns either path,
+/// and the claimant is not recognized as anyone's replacement.
+#[test]
+fn conflicting_prior_bindings_fail_closed_and_preserve_old_bindings() {
+    let mut admission = AdmissionController::new(8, 8, 8, 16).unwrap();
+    let owner_a = fake_candidate_alias(203, "shared.log");
+    let owner_b = fake_candidate_alias(204, "other.log");
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe(generation, owner_a, Duration::ZERO)
+        .unwrap();
+    admission
+        .observe(generation, owner_b, Duration::ZERO)
+        .unwrap();
+    let first = admission.finish_scan().unwrap();
+    admission.apply_feedback(durable_feedback(&first)).unwrap();
+
+    let claimant_at_a = fake_candidate_alias(205, "shared.log");
+    let claimant_at_b = fake_candidate_alias(205, "other.log");
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe(generation, claimant_at_a, Duration::ZERO)
+        .unwrap();
+    admission
+        .observe(generation, claimant_at_b, Duration::ZERO)
+        .unwrap();
+    let second = admission.finish_scan().unwrap();
+
+    assert!(!second.stats.complete);
+    assert!(second.recognized_replacements.is_empty());
+    for event in &second.events {
+        assert!(!matches!(event, CandidateEvent::Updated(_)));
+    }
+}
+
+/// Scenario: two durable records enter a scan with the same distinguished
+/// binding, as can occur when reopening checkpoint state written before
+/// binding uniqueness was enforced.
+/// Guarantees: the duplicate frozen path has no arbitrary owner, the scan is
+/// incomplete, and a locator observed at that path is not recognized as
+/// either record's replacement.
+#[test]
+fn duplicate_durable_bindings_are_ambiguous_and_cannot_recognize_replacement() {
+    let mut admission = AdmissionController::new(8, 8, 8, 16).unwrap();
+    let owner_a = fake_candidate_alias(220, "a.log");
+    let owner_b = fake_candidate_alias(221, "b.log");
+    let locator_a = owner_a.evidence.locator;
+    let locator_b = owner_b.evidence.locator;
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe(generation, owner_a, Duration::ZERO)
+        .unwrap();
+    admission
+        .observe(generation, owner_b, Duration::ZERO)
+        .unwrap();
+    let first = admission.finish_scan().unwrap();
+    let duplicate_path = AdvisoryPath::from_unix_bytes(b"shared.log").unwrap();
+    admission
+        .apply_feedback(DiscoveryFeedback {
+            durable: vec![
+                DurableAck {
+                    locator: locator_a,
+                    advisory_path: duplicate_path.clone(),
+                },
+                DurableAck {
+                    locator: locator_b,
+                    advisory_path: duplicate_path,
+                },
+            ],
+            ..DiscoveryFeedback::default()
+        })
+        .unwrap();
+    assert_eq!(first.events.len(), 2);
+
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe(
+            generation,
+            fake_candidate_alias(222, "shared.log"),
+            Duration::ZERO,
+        )
+        .unwrap();
+    let second = admission.finish_scan().unwrap();
+
+    assert!(!second.stats.complete);
+    assert!(second.recognized_replacements.is_empty());
+    assert!(second.events.iter().all(|event| !matches!(
+        event,
+        CandidateEvent::Updated(candidate)
+            if candidate.evidence.locator == locator_a
+                || candidate.evidence.locator == locator_b
+    )));
+}
+
+/// Scenario: an `Active` locator's distinguished binding is excluded
+/// (revoked) and later becomes included again through its same exact path,
+/// simultaneously with a newly appearing, lexically smaller alias.
+/// Guarantees: revocation preserves the durable binding bit-for-bit, and
+/// re-eligibility resumes it unchanged rather than reselecting merely
+/// because a smaller alias is now also present.
+#[test]
+fn revocation_preserves_binding_and_reinclusion_does_not_reselect() {
+    let mut admission = AdmissionController::new(4, 4, 4, 16).unwrap();
+    let candidate = fake_candidate_alias(206, "kept.log");
+    let locator = candidate.evidence.locator;
+
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe(generation, candidate.clone(), Duration::ZERO)
+        .unwrap();
+    let first = admission.finish_scan().unwrap();
+    admission.apply_feedback(durable_feedback(&first)).unwrap();
+
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe_revoked(generation, locator, RevocationReason::ExcludedByPolicy)
+        .unwrap();
+    let revoked = admission.finish_scan().unwrap();
+    assert!(matches!(
+        revoked.events.as_slice(),
+        [CandidateEvent::Revoked { locator: revoked_locator, .. }] if *revoked_locator == locator
+    ));
+    admission
+        .apply_feedback(DiscoveryFeedback {
+            revoked: vec![locator],
+            ..DiscoveryFeedback::default()
+        })
+        .unwrap();
+
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe(generation, candidate, Duration::ZERO)
+        .unwrap();
+    admission
+        .observe(
+            generation,
+            fake_candidate_alias(206, "aaa-smaller.log"),
+            Duration::ZERO,
+        )
+        .unwrap();
+    let reincluded = admission.finish_scan().unwrap();
+
+    let updated: Vec<_> = reincluded
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            CandidateEvent::Updated(candidate) => Some(candidate),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(updated.len(), 1);
+    assert_eq!(updated[0].matched_path, PathBuf::from("kept.log"));
+}
+
+/// Scenario: one tracked locator's frozen distinguished path is observed
+/// this pass naming two different newly appearing locators at once (an
+/// unstable replacement -- for example, two racing observations of the
+/// same path before either supersedes the other).
+/// Guarantees: the second differing claimant poisons the claim for this
+/// owner: neither claimant is recognized as its replacement, the owner's
+/// old binding is preserved (no `Updated` transition reassigns it, and a
+/// later pass observing the owner unchanged at its own path still finds it
+/// unmodified), and the pass is reported incomplete.
+#[test]
+fn unstable_replacement_with_two_claimants_for_one_owner_poisons_the_claim() {
+    let mut admission = AdmissionController::new(8, 8, 8, 16).unwrap();
+    let owner = fake_candidate_alias(207, "owned.log");
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe(generation, owner, Duration::ZERO)
+        .unwrap();
+    let first = admission.finish_scan().unwrap();
+    admission.apply_feedback(durable_feedback(&first)).unwrap();
+
+    let claimant_one = fake_candidate_alias(208, "owned.log");
+    let claimant_two = fake_candidate_alias(209, "owned.log");
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe(generation, claimant_one, Duration::ZERO)
+        .unwrap();
+    admission
+        .observe(generation, claimant_two, Duration::ZERO)
+        .unwrap();
+    let second = admission.finish_scan().unwrap();
+
+    assert!(!second.stats.complete);
+    assert!(second.recognized_replacements.is_empty());
+    for event in &second.events {
+        assert!(!matches!(event, CandidateEvent::Updated(_)));
+    }
+
+    // The owner's binding survived the conflicting pass unmodified: a
+    // later pass observing it, still unchanged, at its own original path
+    // reports a complete scan with no reassignment.
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe(
+            generation,
+            fake_candidate_alias(207, "owned.log"),
+            Duration::ZERO,
+        )
+        .unwrap();
+    let third = admission.finish_scan().unwrap();
+    assert!(third.stats.complete);
+    assert!(
+        !third
+            .events
+            .iter()
+            .any(|event| matches!(event, CandidateEvent::Updated(_)))
+    );
+}
+
+/// Scenario: identity-event capacity for one reconciliation pass is fully
+/// consumed by an already-tracked owner's own binding update (a rename),
+/// while a validated move/create replacement claimant for that owner's old
+/// path is simultaneously selected but cannot be admitted this same pass.
+/// Guarantees: the claimant is pushed to the bounded pending queue rather
+/// than dropped, this pass's `recognized_replacements` names only what it
+/// actually emitted (the owner's rename, not the still-pending claimant),
+/// and a later complete pass that re-observes the claimant emits it and
+/// still reports it in `recognized_replacements`, so identity resolution
+/// later bypasses `start_at` for it.
+#[test]
+fn claimant_deferred_by_owner_binding_update_is_recognized_when_later_emitted() {
+    // `max_candidate_events == 1` forces the owner's own rename to consume
+    // the pass's only event slot before the claimant can be admitted.
+    let mut admission = AdmissionController::new(4, 4, 1, 16).unwrap();
+    let owner_initial = fake_candidate_alias(300, "rotate.log");
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe(generation, owner_initial, Duration::ZERO)
+        .unwrap();
+    let first = admission.finish_scan().unwrap();
+    assert_eq!(observed_candidates(&first).len(), 1);
+    admission.apply_feedback(durable_feedback(&first)).unwrap();
+
+    // The owner renames away from its old path, and a new object appears
+    // at that same now-frozen path: a validated move/create replacement.
+    let owner_moved = fake_candidate_alias(300, "moved-away.log");
+    let claimant = fake_candidate_alias(301, "rotate.log");
+    let claimant_locator = claimant.evidence.locator;
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe(generation, owner_moved, Duration::ZERO)
+        .unwrap();
+    admission
+        .observe(generation, claimant, Duration::ZERO)
+        .unwrap();
+    let second = admission.finish_scan().unwrap();
+
+    // Only the owner's own rename emitted this pass; the claimant is
+    // pending, not yet admitted, so it must not be named as a recognized
+    // replacement until it actually emits.
+    assert_eq!(observed_candidates(&second).len(), 0);
+    let updated_locators: Vec<Locator> = second
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            CandidateEvent::Updated(candidate) => Some(candidate.evidence.locator),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        updated_locators,
+        vec![Locator::PosixDevIno { dev: 1, ino: 300 }]
+    );
+    assert!(second.recognized_replacements.is_empty());
+    assert_eq!(second.stats.pending_candidates, 1);
+    admission.apply_feedback(durable_feedback(&second)).unwrap();
+
+    // A later pass re-observes the still-pending claimant (unchanged) so
+    // its pending entry is refreshed for this generation and can finally
+    // be admitted.
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe(
+            generation,
+            fake_candidate_alias(301, "rotate.log"),
+            Duration::ZERO,
+        )
+        .unwrap();
+    let third = admission.finish_scan().unwrap();
+
+    let observed_this_pass = observed_candidates(&third);
+    assert_eq!(observed_this_pass.len(), 1);
+    assert_eq!(observed_this_pass[0].evidence.locator, claimant_locator);
+    assert_eq!(
+        third.recognized_replacements,
+        HashSet::from([claimant_locator])
+    );
 }
