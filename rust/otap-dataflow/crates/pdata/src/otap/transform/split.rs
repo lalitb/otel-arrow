@@ -10,7 +10,7 @@ use arrow::array::{
 use arrow::datatypes::{ArrowDictionaryKeyType, DataType, UInt8Type, UInt16Type, UInt32Type};
 
 use crate::error::{Error, Result};
-use crate::otap::raw_batch_store::POSITION_LOOKUP;
+use crate::otap::raw_batch_store::payload_position;
 use crate::otap::transform::util::{id_column_dispatch, sort_otap_batch_by_parent_then_id};
 use crate::otap::{Logs, Metrics, OtapBatchStore, Traces, num_items};
 use crate::otlp::metrics::MetricType;
@@ -391,7 +391,7 @@ fn execute_split<const N: usize>(
         return Ok(());
     }
 
-    let root_idx = POSITION_LOOKUP[root_type as usize];
+    let root_idx = payload_position(root_type).expect("root payload position");
     let root = batch[root_idx].take().expect("root must be present");
 
     // Range preconditions
@@ -433,7 +433,7 @@ fn slice_children<const N: usize>(
 
         let key_ranges = get_contiguous_id_ranges(parent_slice, key_col)?;
         for &child_type in relation.child_types {
-            let child_idx = POSITION_LOOKUP[child_type as usize];
+            let child_idx = payload_position(child_type).expect("child payload position");
 
             let Some(child_rb) = &source_batch[child_idx] else {
                 continue;
@@ -1288,7 +1288,7 @@ mod tests {
         batches: &[[Option<RecordBatch>; N]],
     ) {
         let root_type = root_type_for::<N>();
-        let root_idx = POSITION_LOOKUP[root_type as usize];
+        let root_idx = payload_position(root_type).expect("root payload position");
 
         // Reindex + concatenate input into a single OTLP message for equivalence.
         let input_otlp = {
@@ -1331,7 +1331,7 @@ mod tests {
                     ArrowPayloadType::HistogramDataPoints,
                     ArrowPayloadType::ExpHistogramDataPoints,
                 ] {
-                    let idx = POSITION_LOOKUP[dp_type as usize];
+                    let idx = payload_position(dp_type).expect("data-point payload position");
                     let input_rows: usize = batches
                         .iter()
                         .map(|b| b[idx].as_ref().map_or(0, |rb| rb.num_rows()))

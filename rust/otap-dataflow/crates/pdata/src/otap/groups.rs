@@ -9,7 +9,7 @@ use crate::{
         Logs, Metrics, OtapArrowRecords, OtapBatchStore, Traces,
         error::{Error, Result},
         num_items, raw_batch_store,
-        raw_batch_store::POSITION_LOOKUP,
+        raw_batch_store::payload_position,
     },
     proto::opentelemetry::arrow::v1::ArrowPayloadType,
 };
@@ -212,11 +212,15 @@ fn signal_count(records: &[OtapArrowRecords], signal: SignalType) -> usize {
 #[must_use]
 fn primary_table<const N: usize>(batches: &[Option<RecordBatch>; N]) -> Option<&RecordBatch> {
     match N {
-        Logs::COUNT => batches[POSITION_LOOKUP[ArrowPayloadType::Logs as usize]].as_ref(),
-        Metrics::COUNT => {
-            batches[POSITION_LOOKUP[ArrowPayloadType::UnivariateMetrics as usize]].as_ref()
+        Logs::COUNT => {
+            batches[payload_position(ArrowPayloadType::Logs).expect("logs position")].as_ref()
         }
-        Traces::COUNT => batches[POSITION_LOOKUP[ArrowPayloadType::Spans as usize]].as_ref(),
+        Metrics::COUNT => batches
+            [payload_position(ArrowPayloadType::UnivariateMetrics).expect("metrics position")]
+        .as_ref(),
+        Traces::COUNT => {
+            batches[payload_position(ArrowPayloadType::Spans).expect("spans position")].as_ref()
+        }
         _ => {
             unreachable!()
         }

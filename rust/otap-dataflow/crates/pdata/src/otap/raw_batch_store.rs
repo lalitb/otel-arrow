@@ -15,133 +15,94 @@ use arrow::array::RecordBatch;
 use crate::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 
 // ---------------------------------------------------------------------------
-// Position lookup -- maps ArrowPayloadType discriminants to array indices
+// Payload layouts
 // ---------------------------------------------------------------------------
 
-/// Sentinel value for unused slots in [`POSITION_LOOKUP`].
-pub const UNUSED_INDEX: usize = 99;
-
-/// Maps [`ArrowPayloadType`] enum discriminants to positions in the
-/// per-signal batch arrays. Shared across Logs, Metrics, and Traces
-/// (each signal only uses a subset of the indices).
-pub const POSITION_LOOKUP: &[usize] = &[
-    UNUSED_INDEX, // Unknown = 0,
-    // common:
-    0,            // ResourceAttrs = 1,
-    1,            // ScopeAttrs = 2,
-    UNUSED_INDEX, // 3
-    UNUSED_INDEX, // 4
-    UNUSED_INDEX, // 5
-    UNUSED_INDEX, // 6
-    UNUSED_INDEX, // 7
-    UNUSED_INDEX, // 8
-    UNUSED_INDEX, // 9
-    // metrics:
-    2,            // UnivariateMetrics = 10,
-    3,            // NumberDataPoints = 11,
-    4,            // SummaryDataPoints = 12,
-    5,            // HistogramDataPoints = 13,
-    6,            // ExpHistogramDataPoints = 14,
-    7,            // NumberDpAttrs = 15,
-    8,            // SummaryDpAttrs = 16,
-    9,            // HistogramDpAttrs = 17,
-    10,           // ExpHistogramDpAttrs = 18,
-    11,           // NumberDpExemplars = 19,
-    12,           // HistogramDpExemplars = 20,
-    13,           // ExpHistogramDpExemplars = 21,
-    14,           // NumberDpExemplarAttrs = 22,
-    15,           // HistogramDpExemplarAttrs = 23,
-    16,           // ExpHistogramDpExemplarAttrs = 24,
-    17,           // MultivariateMetrics = 25,
-    18,           // MetricAttrs = 26,
-    UNUSED_INDEX, // 27
-    UNUSED_INDEX, // 28
-    UNUSED_INDEX, // 29
-    // logs:
-    2,            // Logs = 30,
-    3,            // LogAttrs = 31,
-    UNUSED_INDEX, // 32
-    UNUSED_INDEX, // 33
-    UNUSED_INDEX, // 34
-    UNUSED_INDEX, // 35
-    UNUSED_INDEX, // 36
-    UNUSED_INDEX, // 37
-    UNUSED_INDEX, // 38
-    UNUSED_INDEX, // 39
-    // traces:
-    2, // Spans = 40,
-    3, // SpanAttrs = 41,
-    4, // SpanEvents = 42,
-    5, // SpanLinks = 43,
-    6, // SpanEventAttrs = 44,
-    7, // SpanLinkAttrs = 45,
-];
+/// Compact per-signal position for a payload, independent of its protobuf value.
+#[must_use]
+pub const fn payload_position(payload_type: ArrowPayloadType) -> Option<usize> {
+    match payload_type {
+        ArrowPayloadType::Unknown => None,
+        ArrowPayloadType::ResourceAttrs => Some(0),
+        ArrowPayloadType::ScopeAttrs => Some(1),
+        ArrowPayloadType::UnivariateMetrics
+        | ArrowPayloadType::Logs
+        | ArrowPayloadType::Spans
+        | ArrowPayloadType::Profiles => Some(2),
+        ArrowPayloadType::NumberDataPoints
+        | ArrowPayloadType::LogAttrs
+        | ArrowPayloadType::SpanAttrs
+        | ArrowPayloadType::ProfileValueTypes => Some(3),
+        ArrowPayloadType::SummaryDataPoints
+        | ArrowPayloadType::SpanEvents
+        | ArrowPayloadType::Samples => Some(4),
+        ArrowPayloadType::HistogramDataPoints
+        | ArrowPayloadType::SpanLinks
+        | ArrowPayloadType::Stacks => Some(5),
+        ArrowPayloadType::ExpHistogramDataPoints
+        | ArrowPayloadType::SpanEventAttrs
+        | ArrowPayloadType::StackLocations => Some(6),
+        ArrowPayloadType::NumberDpAttrs
+        | ArrowPayloadType::SpanLinkAttrs
+        | ArrowPayloadType::ProfileLocations => Some(7),
+        ArrowPayloadType::SummaryDpAttrs | ArrowPayloadType::ProfileLocationLines => Some(8),
+        ArrowPayloadType::HistogramDpAttrs | ArrowPayloadType::ProfileFunctions => Some(9),
+        ArrowPayloadType::ExpHistogramDpAttrs | ArrowPayloadType::ProfileMappings => Some(10),
+        ArrowPayloadType::NumberDpExemplars | ArrowPayloadType::ProfileLinks => Some(11),
+        ArrowPayloadType::HistogramDpExemplars | ArrowPayloadType::ProfileAttrs => Some(12),
+        ArrowPayloadType::ExpHistogramDpExemplars | ArrowPayloadType::ProfileSampleAttrs => {
+            Some(13)
+        }
+        ArrowPayloadType::NumberDpExemplarAttrs | ArrowPayloadType::ProfileMappingAttrs => Some(14),
+        ArrowPayloadType::HistogramDpExemplarAttrs | ArrowPayloadType::ProfileLocationAttrs => {
+            Some(15)
+        }
+        ArrowPayloadType::ExpHistogramDpExemplarAttrs => Some(16),
+        ArrowPayloadType::MultivariateMetrics => Some(17),
+        ArrowPayloadType::MetricAttrs => Some(18),
+    }
+}
 
 // ---------------------------------------------------------------------------
-// Constants -- type masks and counts for each signal type
+// Constants -- layout identifiers and counts for each signal type
 // ---------------------------------------------------------------------------
 
-// Payload-type masks use one bit per protobuf enum value. Values above 63
-// require replacing this u64 representation before they can be declared.
-
-/// Bitmask of valid [`ArrowPayloadType`] values for the Logs signal.
-pub const LOGS_TYPE_MASK: u64 = (1 << ArrowPayloadType::ResourceAttrs as u64)
-    + (1 << ArrowPayloadType::ScopeAttrs as u64)
-    + (1 << ArrowPayloadType::Logs as u64)
-    + (1 << ArrowPayloadType::LogAttrs as u64);
+/// Logs payload layout identifier.
+pub const LOGS_LAYOUT: u8 = 1;
+/// Metrics payload layout identifier.
+pub const METRICS_LAYOUT: u8 = 2;
+/// Traces payload layout identifier.
+pub const TRACES_LAYOUT: u8 = 3;
+/// Profiles payload layout identifier.
+pub const PROFILES_LAYOUT: u8 = 4;
 
 /// Number of payload slots for the Logs signal.
 pub const LOGS_COUNT: usize = 4;
 
-/// Bitmask of valid [`ArrowPayloadType`] values for the Metrics signal.
-pub const METRICS_TYPE_MASK: u64 = (1 << ArrowPayloadType::ResourceAttrs as u64)
-    + (1 << ArrowPayloadType::ScopeAttrs as u64)
-    + (1 << ArrowPayloadType::UnivariateMetrics as u64)
-    + (1 << ArrowPayloadType::MultivariateMetrics as u64)
-    + (1 << ArrowPayloadType::NumberDataPoints as u64)
-    + (1 << ArrowPayloadType::SummaryDataPoints as u64)
-    + (1 << ArrowPayloadType::HistogramDataPoints as u64)
-    + (1 << ArrowPayloadType::ExpHistogramDataPoints as u64)
-    + (1 << ArrowPayloadType::NumberDpAttrs as u64)
-    + (1 << ArrowPayloadType::SummaryDpAttrs as u64)
-    + (1 << ArrowPayloadType::HistogramDpAttrs as u64)
-    + (1 << ArrowPayloadType::ExpHistogramDpAttrs as u64)
-    + (1 << ArrowPayloadType::NumberDpExemplars as u64)
-    + (1 << ArrowPayloadType::HistogramDpExemplars as u64)
-    + (1 << ArrowPayloadType::ExpHistogramDpExemplars as u64)
-    + (1 << ArrowPayloadType::NumberDpExemplarAttrs as u64)
-    + (1 << ArrowPayloadType::HistogramDpExemplarAttrs as u64)
-    + (1 << ArrowPayloadType::ExpHistogramDpExemplarAttrs as u64)
-    + (1 << ArrowPayloadType::MetricAttrs as u64);
-
 /// Number of payload slots for the Metrics signal.
 pub const METRICS_COUNT: usize = 19;
 
-/// Bitmask of valid [`ArrowPayloadType`] values for the Traces signal.
-pub const TRACES_TYPE_MASK: u64 = (1 << ArrowPayloadType::ResourceAttrs as u64)
-    + (1 << ArrowPayloadType::ScopeAttrs as u64)
-    + (1 << ArrowPayloadType::Spans as u64)
-    + (1 << ArrowPayloadType::SpanAttrs as u64)
-    + (1 << ArrowPayloadType::SpanEvents as u64)
-    + (1 << ArrowPayloadType::SpanLinks as u64)
-    + (1 << ArrowPayloadType::SpanEventAttrs as u64)
-    + (1 << ArrowPayloadType::SpanLinkAttrs as u64);
-
 /// Number of payload slots for the Traces signal.
 pub const TRACES_COUNT: usize = 8;
+
+/// Number of payload slots for the Profiles signal, including shared payloads.
+pub const PROFILES_COUNT: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Type aliases
 // ---------------------------------------------------------------------------
 
 /// Raw (unvalidated) batch store for the Logs signal.
-pub type RawLogsStore = RawBatchStore<LOGS_TYPE_MASK, LOGS_COUNT>;
+pub type RawLogsStore = RawBatchStore<LOGS_LAYOUT, LOGS_COUNT>;
 
 /// Raw (unvalidated) batch store for the Metrics signal.
-pub type RawMetricsStore = RawBatchStore<METRICS_TYPE_MASK, METRICS_COUNT>;
+pub type RawMetricsStore = RawBatchStore<METRICS_LAYOUT, METRICS_COUNT>;
 
 /// Raw (unvalidated) batch store for the Traces signal.
-pub type RawTracesStore = RawBatchStore<TRACES_TYPE_MASK, TRACES_COUNT>;
+pub type RawTracesStore = RawBatchStore<TRACES_LAYOUT, TRACES_COUNT>;
+
+/// Raw (unvalidated) batch store for the Profiles signal.
+pub type RawProfilesStore = RawBatchStore<PROFILES_LAYOUT, PROFILES_COUNT>;
 
 // ---------------------------------------------------------------------------
 // RawBatchStore
@@ -149,19 +110,18 @@ pub type RawTracesStore = RawBatchStore<TRACES_TYPE_MASK, TRACES_COUNT>;
 
 /// A fixed-size, payload-type-indexed store of optional [`RecordBatch`]es.
 ///
-/// The `TYPE_MASK` const generic is a bitmask indicating which
-/// [`ArrowPayloadType`] values are valid for this store. The `COUNT` const
-/// generic is the number of slots in the backing array.
+/// The `LAYOUT` const generic selects the signal-local payload layout. The
+/// `COUNT` const generic is the number of slots in the backing array.
 ///
 /// This type provides **no** OTAP schema validation. Callers that need
 /// validation should use the [`OtapBatchStore`](super::OtapBatchStore) trait
 /// implementations which wrap this type.
 #[derive(Clone, Debug, PartialEq)]
-pub struct RawBatchStore<const TYPE_MASK: u64, const COUNT: usize> {
+pub struct RawBatchStore<const LAYOUT: u8, const COUNT: usize> {
     batches: Box<[Option<RecordBatch>; COUNT]>,
 }
 
-impl<const TYPE_MASK: u64, const COUNT: usize> Default for RawBatchStore<TYPE_MASK, COUNT> {
+impl<const LAYOUT: u8, const COUNT: usize> Default for RawBatchStore<LAYOUT, COUNT> {
     fn default() -> Self {
         Self {
             batches: Box::new(std::array::from_fn(|_| None)),
@@ -169,7 +129,7 @@ impl<const TYPE_MASK: u64, const COUNT: usize> Default for RawBatchStore<TYPE_MA
     }
 }
 
-impl<const TYPE_MASK: u64, const COUNT: usize> RawBatchStore<TYPE_MASK, COUNT> {
+impl<const LAYOUT: u8, const COUNT: usize> RawBatchStore<LAYOUT, COUNT> {
     /// Create a new empty store with all slots set to `None`.
     #[must_use]
     pub fn new() -> Self {
@@ -187,7 +147,68 @@ impl<const TYPE_MASK: u64, const COUNT: usize> RawBatchStore<TYPE_MASK, COUNT> {
     /// Check whether the given payload type is valid for this store.
     #[must_use]
     pub fn is_valid_type(payload_type: ArrowPayloadType) -> bool {
-        TYPE_MASK & (1 << payload_type as u64) != 0
+        match LAYOUT {
+            LOGS_LAYOUT => matches!(
+                payload_type,
+                ArrowPayloadType::ResourceAttrs
+                    | ArrowPayloadType::ScopeAttrs
+                    | ArrowPayloadType::Logs
+                    | ArrowPayloadType::LogAttrs
+            ),
+            METRICS_LAYOUT => matches!(
+                payload_type,
+                ArrowPayloadType::ResourceAttrs
+                    | ArrowPayloadType::ScopeAttrs
+                    | ArrowPayloadType::UnivariateMetrics
+                    | ArrowPayloadType::NumberDataPoints
+                    | ArrowPayloadType::SummaryDataPoints
+                    | ArrowPayloadType::HistogramDataPoints
+                    | ArrowPayloadType::ExpHistogramDataPoints
+                    | ArrowPayloadType::NumberDpAttrs
+                    | ArrowPayloadType::SummaryDpAttrs
+                    | ArrowPayloadType::HistogramDpAttrs
+                    | ArrowPayloadType::ExpHistogramDpAttrs
+                    | ArrowPayloadType::NumberDpExemplars
+                    | ArrowPayloadType::HistogramDpExemplars
+                    | ArrowPayloadType::ExpHistogramDpExemplars
+                    | ArrowPayloadType::NumberDpExemplarAttrs
+                    | ArrowPayloadType::HistogramDpExemplarAttrs
+                    | ArrowPayloadType::ExpHistogramDpExemplarAttrs
+                    | ArrowPayloadType::MultivariateMetrics
+                    | ArrowPayloadType::MetricAttrs
+            ),
+            TRACES_LAYOUT => matches!(
+                payload_type,
+                ArrowPayloadType::ResourceAttrs
+                    | ArrowPayloadType::ScopeAttrs
+                    | ArrowPayloadType::Spans
+                    | ArrowPayloadType::SpanAttrs
+                    | ArrowPayloadType::SpanEvents
+                    | ArrowPayloadType::SpanLinks
+                    | ArrowPayloadType::SpanEventAttrs
+                    | ArrowPayloadType::SpanLinkAttrs
+            ),
+            PROFILES_LAYOUT => matches!(
+                payload_type,
+                ArrowPayloadType::ResourceAttrs
+                    | ArrowPayloadType::ScopeAttrs
+                    | ArrowPayloadType::Profiles
+                    | ArrowPayloadType::ProfileValueTypes
+                    | ArrowPayloadType::Samples
+                    | ArrowPayloadType::Stacks
+                    | ArrowPayloadType::StackLocations
+                    | ArrowPayloadType::ProfileLocations
+                    | ArrowPayloadType::ProfileLocationLines
+                    | ArrowPayloadType::ProfileFunctions
+                    | ArrowPayloadType::ProfileMappings
+                    | ArrowPayloadType::ProfileLinks
+                    | ArrowPayloadType::ProfileAttrs
+                    | ArrowPayloadType::ProfileSampleAttrs
+                    | ArrowPayloadType::ProfileMappingAttrs
+                    | ArrowPayloadType::ProfileLocationAttrs
+            ),
+            _ => false,
+        }
     }
 
     /// Read-only access to the underlying batch array as a slice.
@@ -216,8 +237,7 @@ impl<const TYPE_MASK: u64, const COUNT: usize> RawBatchStore<TYPE_MASK, COUNT> {
         if !Self::is_valid_type(payload_type) {
             return None;
         }
-        let idx = POSITION_LOOKUP[payload_type as usize];
-        debug_assert!(idx != UNUSED_INDEX);
+        let idx = payload_position(payload_type).expect("valid payload has compact position");
         self.batches[idx].as_ref()
     }
 
@@ -232,8 +252,7 @@ impl<const TYPE_MASK: u64, const COUNT: usize> RawBatchStore<TYPE_MASK, COUNT> {
             Self::is_valid_type(payload_type),
             "payload type {payload_type:?} is not valid for this store"
         );
-        let idx = POSITION_LOOKUP[payload_type as usize];
-        debug_assert!(idx != UNUSED_INDEX);
+        let idx = payload_position(payload_type).expect("valid payload has compact position");
         self.batches[idx] = Some(record_batch);
     }
 
@@ -248,8 +267,7 @@ impl<const TYPE_MASK: u64, const COUNT: usize> RawBatchStore<TYPE_MASK, COUNT> {
             Self::is_valid_type(payload_type),
             "payload type {payload_type:?} is not valid for this store"
         );
-        let idx = POSITION_LOOKUP[payload_type as usize];
-        debug_assert!(idx != UNUSED_INDEX);
+        let idx = payload_position(payload_type).expect("valid payload has compact position");
         self.batches[idx] = None;
     }
 }

@@ -12,7 +12,7 @@ use arrow::datatypes::{ArrowNativeType, UInt16Type, UInt32Type};
 use arrow_schema::{DataType, FieldRef, Schema, SortOptions};
 
 use crate::error::{Error, Result};
-use crate::otap::raw_batch_store::{POSITION_LOOKUP, UNUSED_INDEX};
+use crate::otap::raw_batch_store::payload_position;
 use crate::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 use crate::schema::consts::{ID, PARENT_ID};
 use crate::schema::{FieldExt, consts};
@@ -691,9 +691,7 @@ pub(crate) fn payload_relations(parent_type: ArrowPayloadType) -> PayloadRelatio
 }
 
 pub(crate) fn payload_to_idx(payload_type: ArrowPayloadType) -> usize {
-    let pos = POSITION_LOOKUP[payload_type as usize];
-    assert_ne!(pos, UNUSED_INDEX);
-    pos
+    payload_position(payload_type).expect("known payload type has compact position")
 }
 
 #[cfg(test)]

@@ -6,6 +6,19 @@
 The implementation is intentionally split into small dependent pull requests.
 Each branch is stacked on the preceding branch.
 
+## Current Status
+
+- Steps 1 through 4 are implemented and committed on their corresponding local
+  stack branches.
+- All stack branches are rebased onto upstream commit `80d38834` from August
+  28, 2026.
+- Step 5 is in progress. Its first change replaces protobuf-number-indexed
+  payload storage and the exhausted `u64` membership bitmap with explicit,
+  compact per-signal layouts.
+- Architecture findings and decisions are tracked in
+  [Profiles Upstream Architecture Notes](profiles-upstream-architecture-notes.md).
+- Steps 6 through 11 have not started.
+
 1. `profiles/01-otap-data-model-design`
    - Define the Profiles OTAP data model, processing semantics, validation
      requirements, and implementation boundaries.
@@ -17,9 +30,12 @@ Each branch is stacked on the preceding branch.
      Profiles slot 63.
 4. `profiles/04-profile-arrow-schemas`
    - Implement Profiles Arrow schemas, typed views, and graph validation.
+   - Status: implemented; pdata checks, Clippy, and all pdata library tests pass.
 5. `profiles/05-profile-engine-integration`
    - Add the Profiles signal and payload variants, memory accounting, batching
      primitives, and usable durable-buffer persistence and reconstruction.
+   - Status: in progress; compact signal-local payload storage is implemented,
+     while the Profiles signal and engine-wide variants remain to be added.
 6. `profiles/06-otlp-to-otap-profiles`
    - Encode OTLP Profiles into the OTAP Profiles representation.
 7. `profiles/07-otap-to-otlp-profiles`

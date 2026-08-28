@@ -376,7 +376,7 @@ pub fn from_record_messages<T: OtapBatchStore>(record_messages: Vec<RecordMessag
     Ok(batch_store)
 }
 
-use raw_batch_store::POSITION_LOOKUP;
+use raw_batch_store::payload_position;
 
 /// Store of record batches for a batch of OTAP logs data.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -506,8 +506,8 @@ impl OtapBatchStore for Logs {
 
 /// Validate all present batches in a [`RawBatchStore`](raw_batch_store::RawBatchStore) against the
 /// OTAP schema spec.
-fn validate_raw_batches<const TYPE_MASK: u64, const COUNT: usize>(
-    raw: &raw_batch_store::RawBatchStore<TYPE_MASK, COUNT>,
+fn validate_raw_batches<const LAYOUT: u8, const COUNT: usize>(
+    raw: &raw_batch_store::RawBatchStore<LAYOUT, COUNT>,
     allowed_payload_types: &[ArrowPayloadType],
 ) -> Result<()> {
     for &payload_type in allowed_payload_types {
@@ -525,13 +525,13 @@ fn validate_raw_batches<const TYPE_MASK: u64, const COUNT: usize>(
 
 /// Validate the payload type and schema, then store the record batch.
 /// Shared implementation used by all [`OtapBatchStore::set`] impls.
-fn validated_set<const TYPE_MASK: u64, const COUNT: usize>(
-    inner: &mut raw_batch_store::RawBatchStore<TYPE_MASK, COUNT>,
+fn validated_set<const LAYOUT: u8, const COUNT: usize>(
+    inner: &mut raw_batch_store::RawBatchStore<LAYOUT, COUNT>,
     signal_type: SignalType,
     payload_type: ArrowPayloadType,
     record_batch: RecordBatch,
 ) -> Result<()> {
-    if !raw_batch_store::RawBatchStore::<TYPE_MASK, COUNT>::is_valid_type(payload_type) {
+    if !raw_batch_store::RawBatchStore::<LAYOUT, COUNT>::is_valid_type(payload_type) {
         return Err(error::Error::InvalidPayloadTypeForSignal {
             signal: signal_type,
             payload_type,
@@ -549,11 +549,11 @@ fn validated_set<const TYPE_MASK: u64, const COUNT: usize>(
 
 /// Remove a batch for the given payload type if it is valid for this store.
 /// Shared implementation used by all [`OtapBatchStore::remove`] impls.
-fn validated_remove<const TYPE_MASK: u64, const COUNT: usize>(
-    inner: &mut raw_batch_store::RawBatchStore<TYPE_MASK, COUNT>,
+fn validated_remove<const LAYOUT: u8, const COUNT: usize>(
+    inner: &mut raw_batch_store::RawBatchStore<LAYOUT, COUNT>,
     payload_type: ArrowPayloadType,
 ) {
-    if raw_batch_store::RawBatchStore::<TYPE_MASK, COUNT>::is_valid_type(payload_type) {
+    if raw_batch_store::RawBatchStore::<LAYOUT, COUNT>::is_valid_type(payload_type) {
         inner.remove(payload_type);
     }
 }
@@ -572,20 +572,22 @@ const DATA_POINTS_TYPES: [ArrowPayloadType; 4] = [
 #[must_use]
 fn num_items(batches: &[Option<RecordBatch>]) -> usize {
     match batches.len() {
-        raw_batch_store::LOGS_COUNT => batches[POSITION_LOOKUP[ArrowPayloadType::Logs as usize]]
-            .as_ref()
-            .map_or(0, |batch| batch.num_rows()),
+        raw_batch_store::LOGS_COUNT => batches
+            [payload_position(ArrowPayloadType::Logs).expect("logs position")]
+        .as_ref()
+        .map_or(0, |batch| batch.num_rows()),
         raw_batch_store::METRICS_COUNT => DATA_POINTS_TYPES
             .iter()
             .map(|&dpt| {
-                batches[POSITION_LOOKUP[dpt as usize]]
+                batches[payload_position(dpt).expect("data-point position")]
                     .as_ref()
                     .map_or(0, |batch| batch.num_rows())
             })
             .sum(),
-        raw_batch_store::TRACES_COUNT => batches[POSITION_LOOKUP[ArrowPayloadType::Spans as usize]]
-            .as_ref()
-            .map_or(0, |batch| batch.num_rows()),
+        raw_batch_store::TRACES_COUNT => batches
+            [payload_position(ArrowPayloadType::Spans).expect("spans position")]
+        .as_ref()
+        .map_or(0, |batch| batch.num_rows()),
         _ => {
             unreachable!()
         }
