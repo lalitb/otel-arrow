@@ -17,6 +17,7 @@ use otap_df_engine::local::receiver as local;
 use otap_df_engine::terminal_state::TerminalState;
 use otap_df_engine::{
     Interests, MessageSourceLocalEffectHandlerExtension, ProducerEffectHandlerExtension,
+    RouteAdmission,
 };
 use otap_df_otap::pdata::{Context, OtapPdata};
 use otap_df_pdata::OtapPayload;
@@ -70,6 +71,7 @@ struct DeliveryCounters {
     duplicate_completions: u64,
     acks: u64,
     nacks: u64,
+    no_routes: u64,
     retries: u64,
     explicit_loss_commits: u64,
     checkpoint_failures: u64,
@@ -101,6 +103,16 @@ impl DeliveryCounters {
             .nacks
             .checked_add(1)
             .ok_or("filelog Nack counter overflowed")?;
+        Ok(())
+    }
+
+    /// A `NoRoute` failure is a distinct pre-publication outcome, not a
+    /// downstream Nack; it is counted separately from `record_nack`.
+    fn record_no_route(&mut self) -> Result<(), &'static str> {
+        self.no_routes = self
+            .no_routes
+            .checked_add(1)
+            .ok_or("filelog NoRoute counter overflowed")?;
         Ok(())
     }
 
@@ -138,6 +150,10 @@ enum DecisionOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SendOutcome {
     Sent,
+    /// The current attempt found no accepted route before publication:
+    /// `NoDefaultOutputPort`, or a route that was (or became) `Closed`,
+    /// including `Closed` observed after an initially `Full` awaited send.
+    NoRoute,
     DrainDeadline(StdInstant),
     Shutdown(StdInstant),
 }
@@ -401,6 +417,9 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                             let key = BatchKey::new(batch.batch_id, batch.attempt).ok_or_else(|| {
                                 terminal_error(&effect_handler, "filelog worker emitted a zero batch ID or attempt")
                             })?;
+                            // `PendingBatch` always enters `Sending` before this
+                            // downstream send is attempted, whether this is the
+                            // initial send or a worker resend.
                             let resend = pending_batch.is_some();
                             if resend {
                                 let accepted = pending_batch
@@ -425,7 +444,9 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                                         ),
                                     ));
                                 }
-                            } else if key.attempt != 1 {
+                            } else if key.attempt == 1 {
+                                pending_batch = Some(PendingBatch::sending(key));
+                            } else {
                                 shutdown_worker(
                                     &mut worker,
                                     &mut event_rx,
@@ -459,11 +480,63 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                                 &mut blocked_send_started,
                             ).await? {
                                 SendOutcome::Sent => {
-                                    if resend {
-                                        if !pending_batch
-                                            .as_mut()
-                                            .is_some_and(|pending| pending.send_succeeded(key))
-                                        {
+                                    if !pending_batch
+                                        .as_mut()
+                                        .is_some_and(|pending| pending.send_succeeded(key))
+                                    {
+                                        shutdown_worker(
+                                            &mut worker,
+                                            &mut event_rx,
+                                            &effect_handler,
+                                            worker_cleanup_deadline(
+                                                drain_deadline,
+                                                config.drain_timeout,
+                                            ),
+                                        )
+                                        .await?;
+                                        return Err(terminal_error(
+                                            &effect_handler,
+                                            "filelog send completed outside the expected sending state",
+                                        ));
+                                    }
+                                }
+                                SendOutcome::NoRoute => {
+                                    counters
+                                        .record_no_route()
+                                        .map_err(|error| terminal_error(&effect_handler, error))?;
+                                    let decision = pending_batch
+                                        .as_mut()
+                                        .and_then(|pending| pending.on_no_route(key, &config.retry, config.on_nack));
+                                    let Some(decision) = decision else {
+                                        shutdown_worker(
+                                            &mut worker,
+                                            &mut event_rx,
+                                            &effect_handler,
+                                            worker_cleanup_deadline(
+                                                drain_deadline,
+                                                config.drain_timeout,
+                                            ),
+                                        )
+                                        .await?;
+                                        return Err(terminal_error(
+                                            &effect_handler,
+                                            "filelog NoRoute did not match the current sending pending state",
+                                        ));
+                                    };
+                                    record_no_route_metrics(decision, &mut metrics, &mut health_events);
+                                    match apply_decision(
+                                        decision,
+                                        &config,
+                                        drain_deadline.is_some(),
+                                        &mut retry_deadline,
+                                        worker_sender(&worker)?,
+                                        &effect_handler,
+                                        &mut counters,
+                                        &mut metrics,
+                                        &mut health_events,
+                                    ).await? {
+                                        DecisionOutcome::Continue => {}
+                                        DecisionOutcome::Fail(key) => {
                                             shutdown_worker(
                                                 &mut worker,
                                                 &mut event_rx,
@@ -476,11 +549,12 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                                             .await?;
                                             return Err(terminal_error(
                                                 &effect_handler,
-                                                "filelog resend completed outside the expected sending state",
+                                                format!(
+                                                    "filelog batch {} attempt {} exhausted retries after NoRoute under on_nack=fail",
+                                                    key.batch_id, key.attempt
+                                                ),
                                             ));
                                         }
-                                    } else {
-                                        pending_batch = Some(PendingBatch::after_send(key));
                                     }
                                 }
                                 SendOutcome::DrainDeadline(deadline) => {
@@ -855,8 +929,8 @@ async fn send_batch(
         call_data(key),
         &mut pdata,
     );
-    match effect_handler.try_send_message_with_source_node(pdata) {
-        Ok(()) => {
+    match effect_handler.try_admit_message_with_source_node(pdata) {
+        Ok(RouteAdmission::Accepted) => {
             record_emitted_batch(metrics, key, record_count, source_bytes, logical_bytes);
             otel_debug!(
                 "filelog_receiver.batch_sent",
@@ -867,7 +941,14 @@ async fn send_batch(
             );
             Ok(SendOutcome::Sent)
         }
-        Err(TypedError::ChannelSendError(SendError::Full(pdata))) => {
+        // No accepted route before publication: a closed route is exactly as
+        // typed as a full one, and an unconfigured default port is a typed
+        // engine outcome, not a string match. Both consume this attempt via
+        // the same bounded backoff/exhaustion/on_nack state machine as an
+        // aggregate Nack, and never fabricate an Ack or a Nack.
+        Ok(RouteAdmission::RejectedClosed(_)) => Ok(SendOutcome::NoRoute),
+        Err(TypedError::Error(Error::NoDefaultOutputPort { .. })) => Ok(SendOutcome::NoRoute),
+        Ok(RouteAdmission::RejectedFull(pdata)) => {
             let backpressure_started = StdInstant::now();
             #[cfg(test)]
             if let Some(started) = blocked_send_started.take() {
@@ -971,20 +1052,30 @@ async fn send_batch(
                     }
 
                     result = send.as_mut() => {
-                        result.map_err(|error| {
-                            terminal_error(
-                                effect_handler,
-                                format!("failed to send filelog batch downstream: {error}"),
-                            )
-                        })?;
-                        record_emitted_batch(
-                            metrics,
-                            key,
-                            record_count,
-                            source_bytes,
-                            logical_bytes,
-                        );
-                        SendOutcome::Sent
+                        match result {
+                            Ok(()) => {
+                                record_emitted_batch(
+                                    metrics,
+                                    key,
+                                    record_count,
+                                    source_bytes,
+                                    logical_bytes,
+                                );
+                                SendOutcome::Sent
+                            }
+                            // Closed after an initially Full awaited send is
+                            // still a typed pre-publication NoRoute outcome,
+                            // never a fabricated Ack or Nack.
+                            Err(TypedError::ChannelSendError(SendError::Closed(_))) => {
+                                SendOutcome::NoRoute
+                            }
+                            Err(error) => {
+                                return Err(terminal_error(
+                                    effect_handler,
+                                    format!("failed to send filelog batch downstream: {error}"),
+                                ));
+                            }
+                        }
                     }
                 };
                 if let Some(metrics) = metrics.as_mut() {
@@ -1241,6 +1332,49 @@ fn record_completion_metrics(
     }
 }
 
+/// Records telemetry for a pre-publication `NoRoute` failure, distinct from
+/// downstream Nack: `batches_no_route` counts every occurrence, while retry
+/// attempt/backoff/exhaustion metrics remain shared with aggregate Nack via
+/// `apply_decision`/`record_retry_metrics`.
+fn record_no_route_metrics(
+    decision: DeliveryDecision,
+    metrics: &mut Option<MetricSet<FilelogReceiverMetrics>>,
+    health_events: &mut HealthEventLimiter,
+) {
+    if let Some(metrics) = metrics.as_mut() {
+        add_counter_saturating(&mut metrics.batches_no_route, 1);
+    }
+    match decision {
+        DeliveryDecision::Commit { exhausted, .. } | DeliveryDecision::Fail { exhausted, .. } => {
+            if exhausted && let Some(metrics) = metrics.as_mut() {
+                add_counter_saturating(&mut metrics.retry_exhausted, 1);
+            }
+            if let Some(suppressed) =
+                admit_health_event(health_events, metrics, HealthEventCategory::NoRoute)
+            {
+                otel_warn!(
+                    "filelog_receiver.no_route_terminal",
+                    exhausted = exhausted,
+                    suppressed_events = suppressed
+                );
+            }
+        }
+        DeliveryDecision::Retry { .. } => {
+            if let Some(suppressed) =
+                admit_health_event(health_events, metrics, HealthEventCategory::NoRoute)
+            {
+                otel_info!(
+                    "filelog_receiver.no_route_retry",
+                    suppressed_events = suppressed
+                );
+            }
+        }
+        // `PendingBatch::on_no_route` only ever returns `Commit`, `Retry`, or
+        // `Fail`; kept exhaustive because it shares `DeliveryDecision`.
+        DeliveryDecision::Ignored(_) => {}
+    }
+}
+
 fn admit_health_event(
     limiter: &mut HealthEventLimiter,
     metrics: &mut Option<MetricSet<FilelogReceiverMetrics>>,
@@ -1350,6 +1484,7 @@ fn log_delivery_counters(config: &RuntimeConfig, counters: &DeliveryCounters) {
         "filelog_receiver.delivery_summary",
         acks = counters.acks,
         nacks = counters.nacks,
+        no_routes = counters.no_routes,
         retries = counters.retries,
         malformed_completions = counters.malformed_completions,
         stale_completions = counters.stale_completions,
@@ -1492,7 +1627,7 @@ mod tests {
             .expect("detached worker eventually exits");
     }
 
-    /// Scenario: initial send, resend, Ack, retryable Nack, exhausted Nack,
+    /// Scenario: initial send, resend, Ack, aggregate Nack, exhausted Nack,
     /// explicit loss, and every ignored completion category are observed.
     /// Guarantees: delivery telemetry increments each authoritative outcome
     /// exactly once and keeps resend, retry, exhaustion, and completion
@@ -2341,7 +2476,10 @@ mod tests {
     }
 
     /// Scenario: four active files are durably registered and one emitted
-    /// batch receives a permanent Nack under the default fail policy.
+    /// batch receives a permanent Nack at the exact `max_attempts` retry
+    /// budget under the default fail policy. `permanent` is diagnostic only:
+    /// this Nack terminates because the budget is exhausted, not because it
+    /// is permanent.
     /// Guarantees: the complete receiver terminates, records the Nack, and
     /// advances neither the refused file nor any unrelated active file.
     #[test]
@@ -2358,6 +2496,7 @@ mod tests {
                     config.limits.max_tracked_files = 4;
                     config.limits.max_pending_candidates = 4;
                     config.limits.max_open_files = 4;
+                    config.retry.max_attempts = 1;
                 });
             let reopened_runtime = runtime.clone();
 
@@ -2662,7 +2801,7 @@ mod tests {
         }));
     }
 
-    /// Scenario: DrainIngress arrives after a retryable Nack has armed the
+    /// Scenario: DrainIngress arrives after an aggregate Nack has armed the
     /// retained batch's retry backoff.
     /// Guarantees: Drain cancels the backoff, emits no resend, and leaves the
     /// durable checkpoint unchanged when its deadline expires.
@@ -2672,11 +2811,254 @@ mod tests {
     }
 
     /// Scenario: DrainIngress arrives while a batch awaits completion, then
-    /// its matching retryable Nack arrives during the drain window.
+    /// its matching aggregate Nack arrives during the drain window.
     /// Guarantees: the Nack cannot arm a new retry, no resend occurs, and the
     /// drain deadline leaves durable progress unchanged.
     #[test]
-    fn retryable_nack_during_drain_does_not_arm_retry() {
+    fn nack_during_drain_does_not_arm_retry() {
         assert_drain_suppresses_retry(true);
+    }
+
+    /// Scenario: the receiver has no configured default output port -- the
+    /// exact typed `NoDefaultOutputPort` engine outcome, not a string match --
+    /// and `retry.max_attempts` is exactly two.
+    /// Guarantees: the initial `NoRoute` retries once with the configured
+    /// checked backoff and the exact retained batch key, the worker resend
+    /// also finds no route, and the receiver terminates under the default
+    /// `on_nack: fail` policy without ever fabricating an Ack or a Nack.
+    /// `batches.no_route` counts both attempts, distinct from
+    /// `batches.nacked`, which stays at zero.
+    #[test]
+    fn no_default_route_retries_then_fails_without_fabricating_progress() {
+        let (tokio_runtime, local_tasks) = setup_test_runtime();
+        tokio_runtime.block_on(local_tasks.run_until(async {
+            let directory = tempdir().unwrap();
+            let source = directory.path().join("no_route.log");
+            std::fs::write(&source, b"line\n").unwrap();
+            let runtime =
+                source_runtime_with(&source, &directory.path().join("checkpoint"), |config| {
+                    config.retry.max_attempts = 2;
+                    config.retry.initial_backoff = Duration::from_millis(50);
+                    config.retry.max_backoff = Duration::from_millis(50);
+                });
+            let reopened_runtime = runtime.clone();
+
+            let (control_tx, control_rx) = mpsc::Channel::new(8);
+            let control_rx =
+                local::ControlChannel::new(EngineReceiver::Local(LocalReceiver::mpsc(control_rx)));
+            let (runtime_tx, _runtime_rx) = runtime_ctrl_msg_channel(4);
+            let (metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(2);
+            // No outputs and no default port configured: every send attempt
+            // returns the typed `NoDefaultOutputPort` engine error.
+            let effect_handler = local::EffectHandler::new(
+                test_node("filelog"),
+                HashMap::new(),
+                None,
+                runtime_tx,
+                metrics_reporter,
+            );
+
+            let mut filelog = FilelogReceiver::new(runtime);
+            filelog.metrics = registered_metrics();
+            let receiver = tokio::task::spawn_local(async move {
+                Box::new(filelog).start(control_rx, effect_handler).await
+            });
+
+            // Real time: discovery, the initial NoRoute, its checked 50ms
+            // backoff, and the resend's NoRoute all happen well within this
+            // bound.
+            let result = tokio::time::timeout(Duration::from_secs(5), receiver)
+                .await
+                .expect("NoRoute exhaustion terminates the receiver")
+                .unwrap();
+            let error = match result {
+                Ok(_) => {
+                    panic!("on_nack=fail must return a terminal error after NoRoute exhaustion")
+                }
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("NoRoute"));
+
+            let snapshot = metrics_rx.recv_async().await.unwrap();
+            assert_eq!(
+                terminal_metric_value(&snapshot, "batches.no_route"),
+                otap_df_telemetry::metrics::MetricValue::U64(2)
+            );
+            assert_eq!(
+                terminal_metric_value(&snapshot, "batches.nacked"),
+                otap_df_telemetry::metrics::MetricValue::U64(0)
+            );
+            assert_eq!(
+                terminal_metric_value(&snapshot, "batches.emitted"),
+                otap_df_telemetry::metrics::MetricValue::U64(0)
+            );
+            assert_eq!(
+                terminal_metric_value(&snapshot, "retries.exhausted"),
+                otap_df_telemetry::metrics::MetricValue::U64(1)
+            );
+
+            let store = CheckpointStore::open(StoreOptions::from_runtime_config(&reopened_runtime))
+                .unwrap();
+            assert_eq!(store.table().iter().next().unwrap().1.committed_offset, 0);
+            drop(control_tx);
+        }));
+    }
+
+    /// Scenario: the receiver's single connected output route is closed --
+    /// its receiving end was dropped before the first batch is ready to send
+    /// -- and `retry.max_attempts` is exactly one.
+    /// Guarantees: the typed `Closed` route admission is `NoRoute`, never a
+    /// fabricated Ack or Nack; the receiver terminates under the default
+    /// `on_nack: fail` policy at exactly the first attempt, and durable
+    /// checkpoint progress remains unchanged.
+    #[test]
+    fn closed_output_route_is_no_route_and_terminates_without_progress() {
+        let (tokio_runtime, local_tasks) = setup_test_runtime();
+        tokio_runtime.block_on(local_tasks.run_until(async {
+            let directory = tempdir().unwrap();
+            let source = directory.path().join("closed_route.log");
+            std::fs::write(&source, b"line\n").unwrap();
+            let runtime =
+                source_runtime_with(&source, &directory.path().join("checkpoint"), |config| {
+                    config.retry.max_attempts = 1;
+                });
+            let reopened_runtime = runtime.clone();
+
+            let (control_tx, control_rx) = mpsc::Channel::new(8);
+            let control_rx =
+                local::ControlChannel::new(EngineReceiver::Local(LocalReceiver::mpsc(control_rx)));
+            let (output_tx, output_rx) = mpsc::Channel::new(1);
+            // Close the route before the receiver ever sends: its receiving
+            // end is dropped immediately, not merely full.
+            drop(output_rx);
+            let mut outputs = HashMap::new();
+            let _ = outputs.insert(
+                Cow::Borrowed("out"),
+                EngineSender::Local(LocalSender::mpsc(output_tx)),
+            );
+            let (runtime_tx, _runtime_rx) = runtime_ctrl_msg_channel(4);
+            let (metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(2);
+            let effect_handler = local::EffectHandler::new(
+                test_node("filelog"),
+                outputs,
+                Some(Cow::Borrowed("out")),
+                runtime_tx,
+                metrics_reporter,
+            );
+            let mut filelog = FilelogReceiver::new(runtime);
+            filelog.metrics = registered_metrics();
+            let receiver = tokio::task::spawn_local(async move {
+                Box::new(filelog).start(control_rx, effect_handler).await
+            });
+
+            let result = tokio::time::timeout(Duration::from_secs(5), receiver)
+                .await
+                .expect("NoRoute exhaustion terminates the receiver")
+                .unwrap();
+            let error = match result {
+                Ok(_) => {
+                    panic!("on_nack=fail must return a terminal error after NoRoute exhaustion")
+                }
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("NoRoute"));
+
+            let snapshot = metrics_rx.recv_async().await.unwrap();
+            assert_eq!(
+                terminal_metric_value(&snapshot, "batches.no_route"),
+                otap_df_telemetry::metrics::MetricValue::U64(1)
+            );
+            assert_eq!(
+                terminal_metric_value(&snapshot, "batches.nacked"),
+                otap_df_telemetry::metrics::MetricValue::U64(0)
+            );
+
+            let store = CheckpointStore::open(StoreOptions::from_runtime_config(&reopened_runtime))
+                .unwrap();
+            assert_eq!(store.table().iter().next().unwrap().1.committed_offset, 0);
+            drop(control_tx);
+        }));
+    }
+
+    /// Scenario: the output route is initially full, then its receiver closes
+    /// while filelog awaits admission for the current attempt.
+    /// Guarantees: the awaited send returns typed `Closed`, which consumes one
+    /// `NoRoute` attempt without publication, Nack fabrication, or checkpoint
+    /// progress.
+    #[test]
+    fn full_output_that_closes_is_no_route_without_progress() {
+        let (tokio_runtime, local_tasks) = setup_test_runtime();
+        tokio_runtime.block_on(local_tasks.run_until(async {
+            let directory = tempdir().unwrap();
+            let source = directory.path().join("full_then_closed.log");
+            std::fs::write(&source, b"line\n").unwrap();
+            let runtime =
+                source_runtime_with(&source, &directory.path().join("checkpoint"), |config| {
+                    config.retry.max_attempts = 1;
+                });
+            let reopened_runtime = runtime.clone();
+
+            let (control_tx, control_rx) = mpsc::Channel::new(8);
+            let control_rx =
+                local::ControlChannel::new(EngineReceiver::Local(LocalReceiver::mpsc(control_rx)));
+            let (output_tx, output_rx) = mpsc::Channel::new(1);
+            output_tx.send(dummy_pdata()).unwrap();
+            let mut outputs = HashMap::new();
+            let _ = outputs.insert(
+                Cow::Borrowed("out"),
+                EngineSender::Local(LocalSender::mpsc(output_tx)),
+            );
+            let (runtime_tx, _runtime_rx) = runtime_ctrl_msg_channel(4);
+            let (metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(2);
+            let effect_handler = local::EffectHandler::new(
+                test_node("filelog"),
+                outputs,
+                Some(Cow::Borrowed("out")),
+                runtime_tx,
+                metrics_reporter,
+            );
+            let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+            let receiver = tokio::task::spawn_local(async move {
+                let mut filelog = FilelogReceiver::new(runtime);
+                filelog.metrics = registered_metrics();
+                filelog.blocked_send_started = Some(blocked_tx);
+                Box::new(filelog).start(control_rx, effect_handler).await
+            });
+
+            let _blocked_at = tokio::time::timeout(Duration::from_secs(5), blocked_rx)
+                .await
+                .expect("receiver reaches the full route")
+                .expect("blocked-send observation remains live");
+            drop(output_rx);
+
+            let result = tokio::time::timeout(Duration::from_secs(5), receiver)
+                .await
+                .expect("closed blocked route terminates the receiver")
+                .unwrap();
+            let error = match result {
+                Ok(_) => panic!("NoRoute exhaustion must terminate under on_nack=fail"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("NoRoute"));
+
+            let snapshot = metrics_rx.recv_async().await.unwrap();
+            assert_eq!(
+                terminal_metric_value(&snapshot, "batches.no_route"),
+                otap_df_telemetry::metrics::MetricValue::U64(1)
+            );
+            assert_eq!(
+                terminal_metric_value(&snapshot, "batches.nacked"),
+                otap_df_telemetry::metrics::MetricValue::U64(0)
+            );
+            assert_eq!(
+                terminal_metric_value(&snapshot, "batches.emitted"),
+                otap_df_telemetry::metrics::MetricValue::U64(0)
+            );
+
+            let store = CheckpointStore::open(StoreOptions::from_runtime_config(&reopened_runtime))
+                .unwrap();
+            assert_eq!(store.table().iter().next().unwrap().1.committed_offset, 0);
+            drop(control_tx);
+        }));
     }
 }

@@ -57,10 +57,15 @@ pub struct FilelogReceiverMetrics {
     /// Matching downstream Nacks.
     #[metric(name = "batches.nacked", unit = "{batch}")]
     pub batches_nacked: Counter<u64>,
+    /// Pre-publication attempts that found no accepted downstream route
+    /// (no default output port, or a route that was or became closed).
+    /// Distinct from `batches.nacked`.
+    #[metric(name = "batches.no_route", unit = "{batch}")]
+    pub batches_no_route: Counter<u64>,
     /// Successful resend handoffs.
     #[metric(name = "batches.resent", unit = "{batch}")]
     pub batches_resent: Counter<u64>,
-    /// Retry attempts scheduled after a retryable Nack.
+    /// Retry attempts scheduled after an aggregate Nack or `NoRoute`.
     #[metric(name = "retries.attempted", unit = "{retry}")]
     pub retry_attempts: Counter<u64>,
     /// Retained batches that exhausted their send-attempt budget.
@@ -666,6 +671,7 @@ pub(super) fn terminal_snapshots(
 pub(super) enum HealthEventCategory {
     Backpressure,
     Retry,
+    NoRoute,
     ExplicitLoss,
     Completion,
     DrainTimeout,
@@ -693,6 +699,7 @@ impl HealthEventCategory {
         match self {
             Self::Backpressure => "backpressure",
             Self::Retry => "retry",
+            Self::NoRoute => "no_route",
             Self::ExplicitLoss => "explicit_loss",
             Self::Completion => "completion",
             Self::DrainTimeout => "drain_timeout",

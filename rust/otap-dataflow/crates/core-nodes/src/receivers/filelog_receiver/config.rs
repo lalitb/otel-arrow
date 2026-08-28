@@ -351,9 +351,10 @@ pub enum OnTruncate {
     ReadNew,
 }
 
-/// Behavior when the downstream Nacks a batch and no further resend is
-/// attempted (a permanent Nack, `RouteClosed`, `NodeShutdown`, or retry
-/// exhaustion).
+/// Behavior applied once the bounded retry budget is exhausted (Phase 1
+/// treats every aggregate downstream Nack and pre-publication `NoRoute`
+/// uniformly: `permanent`, `cause`, and free-form reason text never bypass
+/// retry, so this policy applies only at exhaustion, never earlier).
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OnNack {
@@ -728,7 +729,7 @@ impl Default for CheckpointConfig {
     }
 }
 
-/// Retry budget for a Nacked or resent batch.
+/// Retry budget for a Nacked, `NoRoute`, or resent batch.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetryConfig {
@@ -828,10 +829,10 @@ pub struct Config {
     /// Durable checkpoint store configuration.
     #[serde(default)]
     pub checkpoint: CheckpointConfig,
-    /// Retry budget for a Nacked or resent batch.
+    /// Retry budget for a Nacked, `NoRoute`, or resent batch.
     #[serde(default)]
     pub retry: RetryConfig,
-    /// Behavior on a non-retryable Nack or retry exhaustion.
+    /// Behavior applied once the retry budget is exhausted.
     #[serde(default)]
     pub on_nack: OnNack,
     /// Drain deadline budget.
@@ -1108,9 +1109,9 @@ pub(crate) struct RuntimeConfig {
     /// Resolved checkpoint namespace directory:
     /// `${engine.state_dir}/filelog/@v1/<lowercase-hex checkpoint_id>/`.
     pub(crate) checkpoint_namespace_dir: PathBuf,
-    /// Retry budget for a Nacked or resent batch.
+    /// Retry budget for a Nacked, `NoRoute`, or resent batch.
     pub(crate) retry: RetryConfig,
-    /// Behavior on a non-retryable Nack or retry exhaustion.
+    /// Behavior applied once the retry budget is exhausted.
     pub(crate) on_nack: OnNack,
     /// Drain deadline budget.
     pub(crate) drain_timeout: Duration,
