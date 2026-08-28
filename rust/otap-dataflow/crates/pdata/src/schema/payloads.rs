@@ -14,21 +14,23 @@ use crate::schema::consts::*;
 #[must_use]
 pub fn get(typ: ArrowPayloadType) -> &'static Schema {
     match typ {
-        ArrowPayloadType::Unknown
-        | ArrowPayloadType::Profiles
-        | ArrowPayloadType::ProfileValueTypes
-        | ArrowPayloadType::Samples
-        | ArrowPayloadType::Stacks
-        | ArrowPayloadType::StackLocations
-        | ArrowPayloadType::ProfileLocations
-        | ArrowPayloadType::ProfileLocationLines
-        | ArrowPayloadType::ProfileFunctions
-        | ArrowPayloadType::ProfileMappings
-        | ArrowPayloadType::ProfileLinks
-        | ArrowPayloadType::ProfileAttrs
+        ArrowPayloadType::Unknown => &Schema::EMPTY,
+
+        // Profiles
+        ArrowPayloadType::Profiles => &profiles::SCHEMA,
+        ArrowPayloadType::ProfileValueTypes => &profile_value_types::SCHEMA,
+        ArrowPayloadType::Samples => &samples::SCHEMA,
+        ArrowPayloadType::Stacks => &stacks::SCHEMA,
+        ArrowPayloadType::StackLocations => &stack_locations::SCHEMA,
+        ArrowPayloadType::ProfileLocations => &profile_locations::SCHEMA,
+        ArrowPayloadType::ProfileLocationLines => &profile_location_lines::SCHEMA,
+        ArrowPayloadType::ProfileFunctions => &profile_functions::SCHEMA,
+        ArrowPayloadType::ProfileMappings => &profile_mappings::SCHEMA,
+        ArrowPayloadType::ProfileLinks => &profile_links::SCHEMA,
+        ArrowPayloadType::ProfileAttrs
         | ArrowPayloadType::ProfileSampleAttrs
         | ArrowPayloadType::ProfileMappingAttrs
-        | ArrowPayloadType::ProfileLocationAttrs => &Schema::EMPTY,
+        | ArrowPayloadType::ProfileLocationAttrs => &profile_attrs::SCHEMA,
 
         // Logs
         ArrowPayloadType::Logs => &logs::SCHEMA,
@@ -149,6 +151,423 @@ fn scope_idx(name: &str) -> Option<usize> {
 // ---------------------------------------------------------------------------
 // Payload definitions
 // ---------------------------------------------------------------------------
+
+macro_rules! profile_schema {
+    ($module:ident, [$($field:expr),+ $(,)?]) => {
+        mod $module {
+            use super::*;
+
+            pub(super) static SCHEMA: Schema = Schema {
+                fields: &[$($field),+],
+                idx,
+            };
+
+            fn idx(name: &str) -> Option<usize> {
+                SCHEMA.fields.iter().position(|field| field.name == name)
+            }
+        }
+    };
+}
+
+const I64_LARGE_LIST_ITEM: DataType = DataType::Simple(Int64);
+const U64_LARGE_LIST_ITEM: DataType = DataType::Simple(UInt64);
+
+profile_schema!(
+    profiles,
+    [
+        Field {
+            name: ID,
+            data_type: DataType::Simple(UInt32),
+            required: true
+        },
+        Field {
+            name: RESOURCE,
+            data_type: DataType::Struct(&RESOURCE_SCHEMA),
+            required: false
+        },
+        Field {
+            name: SCOPE,
+            data_type: DataType::Struct(&SCOPE_SCHEMA),
+            required: false
+        },
+        Field {
+            name: SCHEMA_URL,
+            data_type: DataType::Dictionary {
+                min_key_size: DictKeySize::U8,
+                value_type: Utf8
+            },
+            required: false
+        },
+        Field {
+            name: TIME_UNIX_NANO,
+            data_type: DataType::Simple(UInt64),
+            required: true
+        },
+        Field {
+            name: DURATION_NANO,
+            data_type: DataType::Simple(UInt64),
+            required: true
+        },
+        Field {
+            name: PERIOD,
+            data_type: DataType::Simple(Int64),
+            required: false
+        },
+        Field {
+            name: PROFILE_ID,
+            data_type: DataType::Simple(FixedSizeBinary(16)),
+            required: false
+        },
+        Field {
+            name: DROPPED_ATTRIBUTES_COUNT,
+            data_type: DataType::Simple(UInt32),
+            required: false
+        },
+        Field {
+            name: ORIGINAL_PAYLOAD_FORMAT,
+            data_type: DataType::Dictionary {
+                min_key_size: DictKeySize::U8,
+                value_type: Utf8
+            },
+            required: false
+        },
+        Field {
+            name: ORIGINAL_PAYLOAD,
+            data_type: DataType::Simple(LargeBinary),
+            required: false
+        },
+    ]
+);
+
+profile_schema!(
+    profile_value_types,
+    [
+        Field {
+            name: PARENT_ID,
+            data_type: DataType::Dictionary {
+                min_key_size: DictKeySize::U8,
+                value_type: UInt32
+            },
+            required: true
+        },
+        Field {
+            name: ROLE,
+            data_type: DataType::Simple(UInt8),
+            required: true
+        },
+        Field {
+            name: ATTRIBUTE_TYPE,
+            data_type: DataType::Dictionary {
+                min_key_size: DictKeySize::U8,
+                value_type: Utf8
+            },
+            required: true
+        },
+        Field {
+            name: UNIT,
+            data_type: DataType::Dictionary {
+                min_key_size: DictKeySize::U8,
+                value_type: Utf8
+            },
+            required: true
+        },
+    ]
+);
+
+profile_schema!(
+    samples,
+    [
+        Field {
+            name: ID,
+            data_type: DataType::Simple(UInt32),
+            required: true
+        },
+        Field {
+            name: PARENT_ID,
+            data_type: DataType::Dictionary {
+                min_key_size: DictKeySize::U8,
+                value_type: UInt32
+            },
+            required: true
+        },
+        Field {
+            name: STACK_ID,
+            data_type: DataType::Simple(UInt32),
+            required: false
+        },
+        Field {
+            name: LINK_ID,
+            data_type: DataType::Simple(UInt32),
+            required: false
+        },
+        Field {
+            name: VALUES,
+            data_type: DataType::LargeList(&I64_LARGE_LIST_ITEM),
+            required: true
+        },
+        Field {
+            name: TIMESTAMPS_UNIX_NANO,
+            data_type: DataType::LargeList(&U64_LARGE_LIST_ITEM),
+            required: true
+        },
+    ]
+);
+
+profile_schema!(
+    stacks,
+    [Field {
+        name: ID,
+        data_type: DataType::Simple(UInt32),
+        required: true
+    },]
+);
+
+profile_schema!(
+    stack_locations,
+    [
+        Field {
+            name: PARENT_ID,
+            data_type: DataType::Dictionary {
+                min_key_size: DictKeySize::U8,
+                value_type: UInt32
+            },
+            required: true
+        },
+        Field {
+            name: ORDINAL,
+            data_type: DataType::Simple(UInt32),
+            required: true
+        },
+        Field {
+            name: LOCATION_ID,
+            data_type: DataType::Simple(UInt32),
+            required: false
+        },
+    ]
+);
+
+profile_schema!(
+    profile_locations,
+    [
+        Field {
+            name: ID,
+            data_type: DataType::Simple(UInt32),
+            required: true
+        },
+        Field {
+            name: MAPPING_ID,
+            data_type: DataType::Simple(UInt32),
+            required: false
+        },
+        Field {
+            name: ADDRESS,
+            data_type: DataType::Simple(UInt64),
+            required: true
+        },
+    ]
+);
+
+profile_schema!(
+    profile_location_lines,
+    [
+        Field {
+            name: PARENT_ID,
+            data_type: DataType::Dictionary {
+                min_key_size: DictKeySize::U8,
+                value_type: UInt32
+            },
+            required: true
+        },
+        Field {
+            name: ORDINAL,
+            data_type: DataType::Simple(UInt32),
+            required: true
+        },
+        Field {
+            name: FUNCTION_ID,
+            data_type: DataType::Simple(UInt32),
+            required: false
+        },
+        Field {
+            name: LINE,
+            data_type: DataType::Simple(Int64),
+            required: true
+        },
+        Field {
+            name: COLUMN,
+            data_type: DataType::Simple(Int64),
+            required: true
+        },
+    ]
+);
+
+profile_schema!(
+    profile_functions,
+    [
+        Field {
+            name: ID,
+            data_type: DataType::Simple(UInt32),
+            required: true
+        },
+        Field {
+            name: NAME,
+            data_type: DataType::Dictionary {
+                min_key_size: DictKeySize::U8,
+                value_type: Utf8
+            },
+            required: false
+        },
+        Field {
+            name: SYSTEM_NAME,
+            data_type: DataType::Dictionary {
+                min_key_size: DictKeySize::U8,
+                value_type: Utf8
+            },
+            required: false
+        },
+        Field {
+            name: FILENAME,
+            data_type: DataType::Dictionary {
+                min_key_size: DictKeySize::U8,
+                value_type: Utf8
+            },
+            required: false
+        },
+        Field {
+            name: START_LINE,
+            data_type: DataType::Simple(Int64),
+            required: false
+        },
+    ]
+);
+
+profile_schema!(
+    profile_mappings,
+    [
+        Field {
+            name: ID,
+            data_type: DataType::Simple(UInt32),
+            required: true
+        },
+        Field {
+            name: MEMORY_START,
+            data_type: DataType::Simple(UInt64),
+            required: true
+        },
+        Field {
+            name: MEMORY_LIMIT,
+            data_type: DataType::Simple(UInt64),
+            required: true
+        },
+        Field {
+            name: FILE_OFFSET,
+            data_type: DataType::Simple(UInt64),
+            required: true
+        },
+        Field {
+            name: FILENAME,
+            data_type: DataType::Dictionary {
+                min_key_size: DictKeySize::U8,
+                value_type: Utf8
+            },
+            required: false
+        },
+    ]
+);
+
+profile_schema!(
+    profile_links,
+    [
+        Field {
+            name: ID,
+            data_type: DataType::Simple(UInt32),
+            required: true
+        },
+        Field {
+            name: TRACE_ID,
+            data_type: DataType::Simple(FixedSizeBinary(16)),
+            required: true
+        },
+        Field {
+            name: SPAN_ID,
+            data_type: DataType::Simple(FixedSizeBinary(8)),
+            required: true
+        },
+    ]
+);
+
+profile_schema!(
+    profile_attrs,
+    [
+        Field {
+            name: PARENT_ID,
+            data_type: DataType::Dictionary {
+                min_key_size: DictKeySize::U8,
+                value_type: UInt32
+            },
+            required: true
+        },
+        Field {
+            name: ORDINAL,
+            data_type: DataType::Simple(UInt32),
+            required: true
+        },
+        Field {
+            name: ATTRIBUTE_KEY,
+            data_type: DataType::Dictionary {
+                min_key_size: DictKeySize::U8,
+                value_type: Utf8
+            },
+            required: true
+        },
+        Field {
+            name: ATTRIBUTE_TYPE,
+            data_type: DataType::Simple(UInt8),
+            required: true
+        },
+        Field {
+            name: ATTRIBUTE_STR,
+            data_type: DataType::Dictionary {
+                min_key_size: DictKeySize::U8,
+                value_type: Utf8
+            },
+            required: false
+        },
+        Field {
+            name: ATTRIBUTE_INT,
+            data_type: DataType::Simple(Int64),
+            required: false
+        },
+        Field {
+            name: ATTRIBUTE_DOUBLE,
+            data_type: DataType::Simple(Float64),
+            required: false
+        },
+        Field {
+            name: ATTRIBUTE_BOOL,
+            data_type: DataType::Simple(Boolean),
+            required: false
+        },
+        Field {
+            name: ATTRIBUTE_BYTES,
+            data_type: DataType::Simple(Binary),
+            required: false
+        },
+        Field {
+            name: ATTRIBUTE_SER,
+            data_type: DataType::Simple(Binary),
+            required: false
+        },
+        Field {
+            name: UNIT,
+            data_type: DataType::Dictionary {
+                min_key_size: DictKeySize::U8,
+                value_type: Utf8
+            },
+            required: false
+        },
+    ]
+);
 
 mod attributes_16 {
     use super::*;
@@ -1333,12 +1752,31 @@ mod tests {
     };
     use std::sync::Arc;
 
-    /// Return the union of all payload types across Logs, Traces, and Metrics.
+    /// Return the union of all defined payload types.
     fn all_payload_types() -> Vec<ArrowPayloadType> {
         Logs::allowed_payload_types()
             .iter()
             .chain(Traces::allowed_payload_types())
             .chain(Metrics::allowed_payload_types())
+            .chain(
+                [
+                    ArrowPayloadType::Profiles,
+                    ArrowPayloadType::ProfileValueTypes,
+                    ArrowPayloadType::Samples,
+                    ArrowPayloadType::Stacks,
+                    ArrowPayloadType::StackLocations,
+                    ArrowPayloadType::ProfileLocations,
+                    ArrowPayloadType::ProfileLocationLines,
+                    ArrowPayloadType::ProfileFunctions,
+                    ArrowPayloadType::ProfileMappings,
+                    ArrowPayloadType::ProfileLinks,
+                    ArrowPayloadType::ProfileAttrs,
+                    ArrowPayloadType::ProfileSampleAttrs,
+                    ArrowPayloadType::ProfileMappingAttrs,
+                    ArrowPayloadType::ProfileLocationAttrs,
+                ]
+                .iter(),
+            )
             .copied()
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
@@ -1364,6 +1802,10 @@ mod tests {
                 Binary => (
                     ArrowDT::Binary,
                     Arc::new(BinaryArray::from(vec![b"" as &[u8]])),
+                ),
+                LargeBinary => (
+                    ArrowDT::LargeBinary,
+                    Arc::new(LargeBinaryArray::from(vec![b"" as &[u8]])),
                 ),
                 FixedSizeBinary(n) => {
                     let val = vec![0u8; *n as usize];
@@ -1410,6 +1852,17 @@ mod tests {
                 }
                 _ => panic!("unsupported List inner type: {inner:?}"),
             },
+            DataType::LargeList(inner) => match inner {
+                DataType::Simple(s) => {
+                    let arrow_dt = s.to_arrow();
+                    let item_field = Arc::new(ArrowField::new("item", arrow_dt.clone(), true));
+                    let values = new_null_array(&arrow_dt, 0);
+                    let offsets = OffsetBuffer::from_lengths([0usize]);
+                    let list = LargeListArray::new(item_field.clone(), offsets, values, None);
+                    (ArrowDT::LargeList(item_field), Arc::new(list))
+                }
+                _ => panic!("unsupported LargeList inner type: {inner:?}"),
+            },
         }
     }
 
@@ -1450,7 +1903,12 @@ mod tests {
         }
 
         let arrow_schema = Arc::new(ArrowSchema::new(fields));
-        RecordBatch::try_new(arrow_schema, arrays).unwrap()
+        RecordBatch::try_new_with_options(
+            arrow_schema,
+            arrays,
+            &RecordBatchOptions::new().with_row_count(Some(1)),
+        )
+        .unwrap()
     }
 
     /// Build a 1-element dictionary-encoded array.
@@ -1515,6 +1973,10 @@ mod tests {
                         Binary => (
                             ArrowDT::Binary,
                             Arc::new(BinaryArray::from(vec![None as Option<&[u8]>])),
+                        ),
+                        LargeBinary => (
+                            ArrowDT::LargeBinary,
+                            Arc::new(LargeBinaryArray::from(vec![None as Option<&[u8]>])),
                         ),
                         FixedSizeBinary(n) => {
                             let mut builder = FixedSizeBinaryBuilder::with_capacity(1, *n);

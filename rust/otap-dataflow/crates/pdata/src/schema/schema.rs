@@ -25,6 +25,7 @@ pub enum SimpleType {
     Float64,
     Utf8,
     Binary,
+    LargeBinary,
     FixedSizeBinary(i32),
     TimestampNanosecond,
     DurationNanosecond,
@@ -46,6 +47,7 @@ impl SimpleType {
             Self::Float64 => ArrowDT::Float64,
             Self::Utf8 => ArrowDT::Utf8,
             Self::Binary => ArrowDT::Binary,
+            Self::LargeBinary => ArrowDT::LargeBinary,
             Self::FixedSizeBinary(n) => ArrowDT::FixedSizeBinary(*n),
             Self::TimestampNanosecond => ArrowDT::Timestamp(TimeUnit::Nanosecond, None),
             Self::DurationNanosecond => ArrowDT::Duration(TimeUnit::Nanosecond),
@@ -92,6 +94,8 @@ pub enum DataType {
     Struct(&'static Schema),
     /// List whose items have the given OTAP data type.
     List(&'static DataType),
+    /// LargeList whose items have the given OTAP data type.
+    LargeList(&'static DataType),
 }
 
 impl DataType {
@@ -160,6 +164,14 @@ impl DataType {
                 let list_array = array.as_list::<i32>();
                 inner_dt.matches(list_array.values())
             }
+            DataType::LargeList(inner_dt) => {
+                let ArrowDT::LargeList(_) = arrow_dt else {
+                    return false;
+                };
+                // safety: We verified this is a large-list type.
+                let list_array = array.as_list::<i64>();
+                inner_dt.matches(list_array.values())
+            }
         }
     }
 
@@ -185,7 +197,7 @@ impl DataType {
     /// Returns true for `Struct` or `List` variants.
     #[must_use]
     pub fn is_complex(&self) -> bool {
-        matches!(self, Self::Struct(_) | Self::List(_))
+        matches!(self, Self::Struct(_) | Self::List(_) | Self::LargeList(_))
     }
 }
 

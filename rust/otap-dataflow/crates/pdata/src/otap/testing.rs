@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use arrow::array::{
     ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, Float64Array, Int32Array,
-    Int64Array, ListArray, RecordBatch, StringArray, StructArray, UInt8Array, UInt16Array,
-    UInt32Array, UInt64Array,
+    Int64Array, LargeBinaryArray, LargeListArray, ListArray, RecordBatch, StringArray, StructArray,
+    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -302,6 +302,14 @@ fn default_array(data_type: &OtapDataType, num_rows: usize) -> (DataType, ArrayR
             let list_array = ListArray::new(item_field.clone(), offsets, values, None);
             (DataType::List(item_field), Arc::new(list_array))
         }
+        OtapDataType::LargeList(inner) => {
+            let (item_dt, _) = default_array(inner, 0);
+            let item_field = Arc::new(Field::new("item", item_dt.clone(), true));
+            let offsets = OffsetBuffer::from_lengths(vec![0; num_rows]);
+            let values = arrow::array::new_null_array(&item_dt, 0);
+            let list_array = LargeListArray::new(item_field.clone(), offsets, values, None);
+            (DataType::LargeList(item_field), Arc::new(list_array))
+        }
     }
 }
 
@@ -347,6 +355,10 @@ fn simple_type_array(simple_type: &SimpleType, num_rows: usize) -> (DataType, Ar
         SimpleType::Binary => (
             DataType::Binary,
             Arc::new(BinaryArray::from(vec![b"" as &[u8]; num_rows])),
+        ),
+        SimpleType::LargeBinary => (
+            DataType::LargeBinary,
+            Arc::new(LargeBinaryArray::from(vec![b"" as &[u8]; num_rows])),
         ),
         SimpleType::FixedSizeBinary(size) => {
             let byte_width = *size as usize;
