@@ -36,9 +36,10 @@ use super::store::fault::FaultPlan;
 use super::store::fault::FaultPoint;
 use super::store::fsio;
 use super::store::layout::{
-    self, ArtifactForm, CURRENT_FILE_NAME, MAX_GENERATIONS_ON_DISK, MAX_TEMP_FILES,
-    NamespaceArtifactKind, canonical_artifact_name_ignoring_ascii_case,
-    classify_namespace_artifact, snapshot_file_name, wal_file_name,
+    self, ArtifactForm, CURRENT_COMPACT_TEMP_FILE_NAME, CURRENT_FILE_NAME, MAX_GENERATIONS_ON_DISK,
+    MAX_TEMP_FILES, NamespaceArtifactKind, PublicationRole,
+    canonical_artifact_name_ignoring_ascii_case, classify_namespace_artifact, snapshot_file_name,
+    temp_file_name, wal_file_name,
 };
 use super::store::limits::StoreLimits;
 use super::store::lock::NamespaceLock;
@@ -520,22 +521,16 @@ pub struct CheckpointInspectionReport {
 pub enum EvidenceArtifactRole {
     /// Published `CURRENT`.
     Current,
-    /// `CURRENT.tmp`.
+    /// `CURRENT.create.tmp` or `CURRENT.compact.tmp`.
     CurrentTemporary,
-    /// `CURRENT.bak`.
-    CurrentBackup,
     /// Published generation snapshot.
     Snapshot,
-    /// Snapshot temporary.
+    /// Snapshot `.create.tmp` or `.compact.tmp` artifact.
     SnapshotTemporary,
-    /// Snapshot replacement backup.
-    SnapshotBackup,
     /// Published generation WAL.
     Wal,
-    /// WAL temporary.
+    /// WAL `.create.tmp` or `.compact.tmp` artifact.
     WalTemporary,
-    /// WAL replacement backup.
-    WalBackup,
 }
 
 /// Manifest entry for one copied checkpoint artifact.
@@ -1030,6 +1025,14 @@ impl CheckpointNamespaceResetSession {
             });
         }
 
+        if initial_plan.reuse_existing_generation {
+            remove_resumable_empty_generation(
+                &self.options.namespace_dir,
+                &self.namespace,
+                self.active_lock(),
+                initial_plan.new_generation,
+            )?;
+        }
         CheckpointStore::stage_generation(
             &self.options.namespace_dir,
             &self.options.namespace_id,
@@ -1041,6 +1044,7 @@ impl CheckpointNamespaceResetSession {
         if let Err(failure) = CheckpointStore::publish_marker(
             &self.options.namespace_dir,
             initial_plan.new_generation,
+            PublicationRole::Compact,
             &mut self.faults,
         ) {
             if failure.destination_may_have_changed {
@@ -1563,6 +1567,7 @@ impl CheckpointAdminSession {
             if let Err(failure) = CheckpointStore::publish_marker(
                 &self.options.namespace_dir,
                 new_generation,
+                PublicationRole::Compact,
                 &mut self.faults,
             ) {
                 if failure.destination_may_have_changed {
@@ -2442,6 +2447,7 @@ fn verify_source_matches_backup(
 struct NamespaceResetPlan {
     new_generation: u64,
     retained_evidence_generations: Vec<u64>,
+    reuse_existing_generation: bool,
 }
 
 fn namespace_reset_plan(
@@ -2489,6 +2495,7 @@ fn namespace_reset_plan(
         return Ok(NamespaceResetPlan {
             new_generation,
             retained_evidence_generations,
+            reuse_existing_generation: true,
         });
     }
     if final_generation_count >= MAX_GENERATIONS_ON_DISK {
@@ -2515,6 +2522,7 @@ fn namespace_reset_plan(
     Ok(NamespaceResetPlan {
         new_generation,
         retained_evidence_generations,
+        reuse_existing_generation: false,
     })
 }
 
@@ -2563,13 +2571,12 @@ fn resumable_empty_generation(
         let expected = match source.role {
             EvidenceArtifactRole::Snapshot => expected_snapshot.as_slice(),
             EvidenceArtifactRole::Wal => expected_wal.as_slice(),
-            EvidenceArtifactRole::SnapshotTemporary
-            | EvidenceArtifactRole::SnapshotBackup
-            | EvidenceArtifactRole::WalTemporary
-            | EvidenceArtifactRole::WalBackup => continue,
-            EvidenceArtifactRole::Current
-            | EvidenceArtifactRole::CurrentTemporary
-            | EvidenceArtifactRole::CurrentBackup => return Ok(None),
+            EvidenceArtifactRole::SnapshotTemporary | EvidenceArtifactRole::WalTemporary => {
+                continue;
+            }
+            EvidenceArtifactRole::Current | EvidenceArtifactRole::CurrentTemporary => {
+                return Ok(None);
+            }
         };
         let source_path = options.namespace_dir.join(&source.name);
         let bytes = with_verified_source(namespace, lock, || {
@@ -2588,6 +2595,46 @@ fn resumable_empty_generation(
         return Ok(None);
     }
     Ok(Some(candidate))
+}
+
+fn remove_resumable_empty_generation(
+    namespace_dir: &Path,
+    namespace: &fsio::DirectoryPathBinding,
+    lock: &NamespaceLock,
+    generation: u64,
+) -> Result<(), CheckpointAdminError> {
+    with_verified_source(namespace, lock, || {
+        let mut artifacts = Vec::new();
+        for name in [
+            snapshot_file_name(generation),
+            wal_file_name(generation),
+            temp_file_name(&snapshot_file_name(generation), PublicationRole::Compact),
+            temp_file_name(&wal_file_name(generation), PublicationRole::Compact),
+            CURRENT_COMPACT_TEMP_FILE_NAME.to_owned(),
+        ] {
+            let path = namespace_dir.join(name);
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => artifacts.push(fsio::CheckpointFilePathBinding::open(
+                    &path,
+                    "bind a resumable namespace-reset artifact",
+                )?),
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(StoreError::Io {
+                        operation: "inspect a resumable namespace-reset artifact",
+                        path,
+                        source,
+                    }
+                    .into());
+                }
+            }
+        }
+        for artifact in artifacts {
+            artifact.remove("remove a resumable namespace-reset artifact")?;
+        }
+        fsio::sync_directory(namespace_dir)?;
+        Ok(())
+    })
 }
 
 fn native_path_report(path: &Path) -> Result<NativePathReport, CheckpointAdminError> {
@@ -3008,14 +3055,12 @@ fn inventory_recognized_artifacts(
                 "CURRENT marker",
                 MARKER_READ_MAX_BYTES,
             ),
-            (NamespaceArtifactKind::Current, ArtifactForm::Temporary) => (
+            (
+                NamespaceArtifactKind::Current,
+                ArtifactForm::CreateTemporary | ArtifactForm::CompactTemporary,
+            ) => (
                 EvidenceArtifactRole::CurrentTemporary,
                 "CURRENT temporary marker",
-                MARKER_READ_MAX_BYTES,
-            ),
-            (NamespaceArtifactKind::Current, ArtifactForm::Backup) => (
-                EvidenceArtifactRole::CurrentBackup,
-                "CURRENT backup marker",
                 MARKER_READ_MAX_BYTES,
             ),
             (NamespaceArtifactKind::Snapshot, ArtifactForm::Final) => (
@@ -3023,27 +3068,23 @@ fn inventory_recognized_artifacts(
                 "snapshot",
                 limits.max_snapshot_bytes,
             ),
-            (NamespaceArtifactKind::Snapshot, ArtifactForm::Temporary) => (
+            (
+                NamespaceArtifactKind::Snapshot,
+                ArtifactForm::CreateTemporary | ArtifactForm::CompactTemporary,
+            ) => (
                 EvidenceArtifactRole::SnapshotTemporary,
                 "snapshot temporary",
-                limits.max_snapshot_bytes,
-            ),
-            (NamespaceArtifactKind::Snapshot, ArtifactForm::Backup) => (
-                EvidenceArtifactRole::SnapshotBackup,
-                "snapshot backup",
                 limits.max_snapshot_bytes,
             ),
             (NamespaceArtifactKind::Wal, ArtifactForm::Final) => {
                 (EvidenceArtifactRole::Wal, "WAL", limits.max_wal_bytes)
             }
-            (NamespaceArtifactKind::Wal, ArtifactForm::Temporary) => (
+            (
+                NamespaceArtifactKind::Wal,
+                ArtifactForm::CreateTemporary | ArtifactForm::CompactTemporary,
+            ) => (
                 EvidenceArtifactRole::WalTemporary,
                 "WAL temporary",
-                limits.max_wal_bytes,
-            ),
-            (NamespaceArtifactKind::Wal, ArtifactForm::Backup) => (
-                EvidenceArtifactRole::WalBackup,
-                "WAL backup",
                 limits.max_wal_bytes,
             ),
             (NamespaceArtifactKind::OwnershipLock, _) => continue,

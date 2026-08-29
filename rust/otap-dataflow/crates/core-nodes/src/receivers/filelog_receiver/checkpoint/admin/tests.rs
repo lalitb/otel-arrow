@@ -20,7 +20,8 @@ use crate::receivers::filelog_receiver::checkpoint::snapshot::{
 };
 use crate::receivers::filelog_receiver::checkpoint::store::fault::FaultPoint;
 use crate::receivers::filelog_receiver::checkpoint::store::layout::{
-    OWNERSHIP_LOCK_FILE_NAME, backup_file_name, snapshot_file_name, temp_file_name, wal_file_name,
+    CURRENT_COMPACT_TEMP_FILE_NAME, CURRENT_CREATE_TEMP_FILE_NAME, OWNERSHIP_LOCK_FILE_NAME,
+    PublicationRole, snapshot_file_name, temp_file_name, wal_file_name,
 };
 use crate::receivers::filelog_receiver::checkpoint::wal::{
     QuarantineFile, RegisterFile, UpdateProgress, decode_wal, encode_wal,
@@ -28,6 +29,7 @@ use crate::receivers::filelog_receiver::checkpoint::wal::{
 use crate::receivers::filelog_receiver::identity::platform::open_locator_for_stability_check_cancellable;
 
 fn options(state_dir: &Path, namespace_id: &str) -> StoreOptions {
+    fs::create_dir_all(state_dir).unwrap();
     let mut options = StoreOptions::from_state_dir(state_dir, namespace_id).unwrap();
     options.ownership_timeout = Duration::from_millis(200);
     options.ownership_retry_interval = Duration::from_millis(10);
@@ -447,7 +449,7 @@ fn missing_namespace_lock_and_current_are_not_repaired() {
     let current = missing_current.namespace_dir.join(CURRENT_FILE_NAME);
     let current_temp = missing_current
         .namespace_dir
-        .join(temp_file_name(CURRENT_FILE_NAME));
+        .join(CURRENT_CREATE_TEMP_FILE_NAME);
     let _ = fs::copy(&current, &current_temp).unwrap();
     fs::remove_file(&current).unwrap();
     let before = filesystem_state(&missing_current.namespace_dir);
@@ -635,7 +637,7 @@ fn manifests_encode_non_utf8_unix_source_paths() {
 }
 
 /// Scenario: a compacted namespace contains active and retired generations,
-/// marker recovery forms, generation temporary/backup forms, and unrelated
+/// marker and generation temporary forms, and unrelated
 /// directory entries.
 /// Guarantees: backup copies only recognized bounded artifacts, records exact
 /// hashes and validation in its manifest, preserves the source, and refuses
@@ -654,30 +656,18 @@ fn backup_copies_only_recognized_artifacts_with_manifest_hashes() {
     drop(store);
 
     let current = namespace.join(CURRENT_FILE_NAME);
-    let _ = fs::copy(&current, namespace.join(temp_file_name(CURRENT_FILE_NAME))).unwrap();
-    let _ = fs::copy(
-        &current,
-        namespace.join(backup_file_name(CURRENT_FILE_NAME)),
-    )
-    .unwrap();
+    let _ = fs::copy(&current, namespace.join(CURRENT_COMPACT_TEMP_FILE_NAME)).unwrap();
     fs::write(
-        namespace.join(temp_file_name(&snapshot_file_name(2))),
+        namespace.join(temp_file_name(
+            &snapshot_file_name(2),
+            PublicationRole::Compact,
+        )),
         b"partial-snapshot",
     )
     .unwrap();
     fs::write(
-        namespace.join(backup_file_name(&snapshot_file_name(2))),
-        b"replacement-snapshot-backup",
-    )
-    .unwrap();
-    fs::write(
-        namespace.join(temp_file_name(&wal_file_name(2))),
+        namespace.join(temp_file_name(&wal_file_name(2), PublicationRole::Compact)),
         b"partial-wal",
-    )
-    .unwrap();
-    fs::write(
-        namespace.join(backup_file_name(&wal_file_name(2))),
-        b"replacement-wal-backup",
     )
     .unwrap();
     fs::write(namespace.join("notes.txt"), b"unrelated").unwrap();
@@ -714,16 +704,13 @@ fn backup_copies_only_recognized_artifacts_with_manifest_hashes() {
 
     let expected_artifacts: BTreeSet<String> = [
         CURRENT_FILE_NAME.to_owned(),
-        temp_file_name(CURRENT_FILE_NAME),
-        backup_file_name(CURRENT_FILE_NAME),
+        CURRENT_COMPACT_TEMP_FILE_NAME.to_owned(),
         snapshot_file_name(0),
         wal_file_name(0),
         snapshot_file_name(1),
         wal_file_name(1),
-        temp_file_name(&snapshot_file_name(2)),
-        backup_file_name(&snapshot_file_name(2)),
-        temp_file_name(&wal_file_name(2)),
-        backup_file_name(&wal_file_name(2)),
+        temp_file_name(&snapshot_file_name(2), PublicationRole::Compact),
+        temp_file_name(&wal_file_name(2), PublicationRole::Compact),
     ]
     .into_iter()
     .collect();
@@ -763,36 +750,27 @@ fn backup_copies_only_recognized_artifacts_with_manifest_hashes() {
         (EvidenceArtifactRole::Current, None)
     );
     assert_eq!(
-        role_for(&temp_file_name(CURRENT_FILE_NAME)),
+        role_for(CURRENT_COMPACT_TEMP_FILE_NAME),
         (EvidenceArtifactRole::CurrentTemporary, None)
-    );
-    assert_eq!(
-        role_for(&backup_file_name(CURRENT_FILE_NAME)),
-        (EvidenceArtifactRole::CurrentBackup, None)
     );
     assert_eq!(
         role_for(&snapshot_file_name(1)),
         (EvidenceArtifactRole::Snapshot, Some(1))
     );
     assert_eq!(
-        role_for(&temp_file_name(&snapshot_file_name(2))),
+        role_for(&temp_file_name(
+            &snapshot_file_name(2),
+            PublicationRole::Compact
+        )),
         (EvidenceArtifactRole::SnapshotTemporary, Some(2))
-    );
-    assert_eq!(
-        role_for(&backup_file_name(&snapshot_file_name(2))),
-        (EvidenceArtifactRole::SnapshotBackup, Some(2))
     );
     assert_eq!(
         role_for(&wal_file_name(1)),
         (EvidenceArtifactRole::Wal, Some(1))
     );
     assert_eq!(
-        role_for(&temp_file_name(&wal_file_name(2))),
+        role_for(&temp_file_name(&wal_file_name(2), PublicationRole::Compact)),
         (EvidenceArtifactRole::WalTemporary, Some(2))
-    );
-    assert_eq!(
-        role_for(&backup_file_name(&wal_file_name(2))),
-        (EvidenceArtifactRole::WalBackup, Some(2))
     );
     assert_eq!(manifest.namespace_id, "backup-report");
     assert_eq!(
@@ -979,9 +957,12 @@ fn backup_rejects_symlink_fifo_and_oversized_artifacts_without_source_changes() 
         drop(CheckpointStore::open(store_options.clone()).unwrap());
 
         let hostile_path = if case == "oversized" {
-            namespace.join(temp_file_name(CURRENT_FILE_NAME))
+            namespace.join(CURRENT_COMPACT_TEMP_FILE_NAME)
         } else {
-            namespace.join(temp_file_name(&snapshot_file_name(9)))
+            namespace.join(temp_file_name(
+                &snapshot_file_name(9),
+                PublicationRole::Compact,
+            ))
         };
         let victim = root.path().join("victim");
         match case {
@@ -1897,7 +1878,7 @@ fn namespace_reset_backs_up_and_publishes_above_every_recognized_generation() {
     drop(store);
     let future_temp = store_options
         .namespace_dir
-        .join(temp_file_name(&wal_file_name(9)));
+        .join(temp_file_name(&wal_file_name(9), PublicationRole::Compact));
     fs::write(&future_temp, b"recognized future evidence").unwrap();
     let old_names = directory_names(&store_options.namespace_dir);
 
@@ -2035,9 +2016,10 @@ fn namespace_reset_requires_new_backup_audit_and_nonoverflowing_generation() {
         }),
         Err(CheckpointAdminError::AuditReasonRequired { .. })
     ));
-    let max_artifact = store_options
-        .namespace_dir
-        .join(temp_file_name(&wal_file_name(u64::MAX)));
+    let max_artifact = store_options.namespace_dir.join(temp_file_name(
+        &wal_file_name(u64::MAX),
+        PublicationRole::Compact,
+    ));
     fs::write(&max_artifact, b"max generation evidence").unwrap();
     let overflow_backup = root.path().join("overflow-backup");
     assert!(matches!(
@@ -2470,4 +2452,66 @@ fn corrupt_namespace_reset_resumes_empty_staging_at_generation_capacity() {
     let reopened = CheckpointStore::open(store_options).unwrap();
     assert_eq!(reopened.generation(), 2);
     assert!(reopened.table().is_empty());
+}
+
+/// Scenario: corrupt-namespace reset reaches a complete empty staging
+/// generation, then fails after writing or syncing `CURRENT.compact.tmp`.
+/// Guarantees: a fresh backup-gated reset validates and removes that exact
+/// marker temporary, syncs cleanup, and publishes the same generation.
+#[test]
+fn corrupt_namespace_reset_resumes_after_marker_temporary_faults() {
+    for point in [FaultPoint::AfterMarkerWrite, FaultPoint::AfterMarkerSync] {
+        let root = tempfile::tempdir().unwrap();
+        let store_options = options(&root.path().join("state"), "resume-reset-marker");
+        let mut store = CheckpointStore::open(store_options.clone()).unwrap();
+        let _ = store
+            .register_files(vec![registration(52, AdvisoryPath::unavailable())])
+            .unwrap();
+        store.compact().unwrap();
+        drop(store);
+        let wal_path = store_options.namespace_dir.join(wal_file_name(1));
+        let mut bytes = fs::read(&wal_path).unwrap();
+        *bytes.last_mut().unwrap() ^= 0x40;
+        fs::write(&wal_path, bytes).unwrap();
+
+        let mut interrupted =
+            CheckpointNamespaceResetSession::open_with_fault(store_options.clone(), point).unwrap();
+        assert!(
+            interrupted
+                .reset_namespace(NamespaceResetRequest {
+                    backup_destination: root.path().join("first-reset-evidence"),
+                    consequence: NamespaceResetConsequence::AcknowledgeDuplicatePossible,
+                    audit: mutation_audit("first marker attempt", 15_000),
+                })
+                .is_err()
+        );
+        interrupted.release().unwrap();
+        assert!(
+            store_options
+                .namespace_dir
+                .join(CURRENT_COMPACT_TEMP_FILE_NAME)
+                .is_file()
+        );
+
+        let mut resumed = CheckpointNamespaceResetSession::open(store_options.clone()).unwrap();
+        let result = resumed
+            .reset_namespace(NamespaceResetRequest {
+                backup_destination: root.path().join("resumed-reset-evidence"),
+                consequence: NamespaceResetConsequence::AcknowledgeDuplicatePossible,
+                audit: mutation_audit("resume marker staging", 16_000),
+            })
+            .unwrap();
+        assert_eq!(result.reset_report.new_generation, 2);
+        resumed.release().unwrap();
+        assert!(
+            !store_options
+                .namespace_dir
+                .join(CURRENT_COMPACT_TEMP_FILE_NAME)
+                .exists()
+        );
+
+        let reopened = CheckpointStore::open(store_options).unwrap();
+        assert_eq!(reopened.generation(), 2);
+        assert!(reopened.table().is_empty());
+    }
 }

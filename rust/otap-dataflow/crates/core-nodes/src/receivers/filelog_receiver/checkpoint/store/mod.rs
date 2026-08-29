@@ -129,10 +129,11 @@ use crate::receivers::filelog_receiver::config::{
 
 use error::StoreError;
 use fault::{FaultPlan, FaultPoint};
-use fsio::{AtomicWriteError, AtomicWriteFaults};
+use fsio::{AtomicInstallMode, AtomicWriteError, AtomicWriteFaults};
 use layout::{
-    CURRENT_BACKUP_FILE_NAME, CURRENT_FILE_NAME, CURRENT_TEMP_FILE_NAME, INITIAL_GENERATION,
-    snapshot_file_name, wal_file_name,
+    CURRENT_COMPACT_TEMP_FILE_NAME, CURRENT_CREATE_TEMP_FILE_NAME, CURRENT_FILE_NAME,
+    INITIAL_GENERATION, OWNERSHIP_LOCK_FILE_NAME, PublicationRole, snapshot_file_name,
+    temp_file_name, wal_file_name,
 };
 use limits::StoreLimits;
 use lock::NamespaceLock;
@@ -207,7 +208,9 @@ impl StoreOptions {
     }
 
     /// Default store options for a namespace derived below an engine state
-    /// directory by the shared version-1 namespace contract.
+    /// directory by the shared version-1 namespace contract. The engine state
+    /// directory itself must already exist; the store creates and
+    /// parent-syncs only its `filelog/@v1/<id>` descendants.
     pub fn from_state_dir(
         engine_state_dir: impl AsRef<Path>,
         namespace_id: &str,
@@ -269,10 +272,6 @@ pub struct RecoveryReport {
     pub generation: u64,
     /// Whether this open created the namespace's initial generation.
     pub created: bool,
-    /// Whether this open adopted a complete generation that had no
-    /// `CURRENT` marker, either from interrupted first creation or from a
-    /// validated `CURRENT.tmp` publication postcondition.
-    pub adopted_without_marker: bool,
     /// Records recovered from the snapshot before WAL replay.
     pub snapshot_records: usize,
     /// WAL transactions replayed on top of the snapshot.
@@ -280,7 +279,8 @@ pub struct RecoveryReport {
     /// Bytes discarded from a structurally incomplete final WAL
     /// transaction. Any other WAL damage fails recovery closed instead.
     pub torn_tail_bytes: usize,
-    /// Abandoned same-directory temporary files removed during recovery.
+    /// Abandoned first-publication or proposed-generation artifacts removed
+    /// during recovery.
     pub removed_temp_files: usize,
     /// Generations still on disk that are no longer authoritative. They stay
     /// recoverable until [`CheckpointStore::cleanup_retired_generations`]
@@ -690,6 +690,8 @@ pub struct CheckpointStore {
     limits: StoreLimits,
     /// Held for the store's lifetime; dropping it releases the namespace.
     _lock: NamespaceLock,
+    /// Stable namespace-directory identity retained for every later mutation.
+    _namespace: fsio::DirectoryPathBinding,
     table: CheckpointTable,
     generation: u64,
     retired_generations: Vec<u64>,
@@ -777,6 +779,10 @@ impl CheckpointStore {
         retired_generations: Vec<u64>,
         faults: FaultPlan,
     ) -> Result<Self, StoreError> {
+        let namespace_binding = fsio::DirectoryPathBinding::open_canonical(
+            &options.namespace_dir,
+            "bind an append-capable administration namespace",
+        )?;
         let wal_path = options.namespace_dir.join(wal_file_name(generation));
         let loaded_ref = loaded
             .as_mut()
@@ -818,7 +824,6 @@ impl CheckpointStore {
         let recovery = RecoveryReport {
             generation,
             created: false,
-            adopted_without_marker: false,
             snapshot_records: loaded.snapshot_records,
             transactions_replayed: loaded.transactions_replayed,
             torn_tail_bytes: repaired_torn_tail_bytes,
@@ -836,6 +841,7 @@ impl CheckpointStore {
             fingerprint_bytes,
             limits,
             _lock: lock,
+            _namespace: namespace_binding,
             table: loaded.table,
             generation,
             retired_generations,
@@ -874,7 +880,7 @@ impl CheckpointStore {
         // take ownership of a namespace at all.
         let limits = options.limits()?;
         let StoreOptions {
-            namespace_dir,
+            mut namespace_dir,
             namespace_id,
             sync_interval,
             compact_after_bytes,
@@ -905,10 +911,12 @@ impl CheckpointStore {
         if cancelled() {
             return Ok(None);
         }
-        let Some(()) = fsio::create_namespace_dir_cancellable(&namespace_dir, &mut *cancelled)?
+        let Some(prepared_namespace) =
+            fsio::create_namespace_dir_cancellable(&namespace_dir, &mut faults, &mut *cancelled)?
         else {
             return Ok(None);
         };
+        namespace_dir = prepared_namespace.namespace_path().to_path_buf();
         let Some(lock) = NamespaceLock::acquire_cancellable(
             &namespace_dir,
             ownership_timeout,
@@ -918,15 +926,9 @@ impl CheckpointStore {
         else {
             return Ok(None);
         };
-        // Only safe once this writer owns the namespace: a temporary file
-        // could otherwise belong to a live writer's in-flight publication.
-        let Some(mut removed_temp_files) =
-            layout::remove_stale_temp_files(&namespace_dir, &mut *cancelled)?
-        else {
-            return Ok(None);
-        };
-
+        prepared_namespace.verify("revalidate the namespace chain after lock acquisition")?;
         let marker_path = namespace_dir.join(CURRENT_FILE_NAME);
+        prepared_namespace.verify("revalidate the namespace chain before reading authority")?;
         let Some(marker_bytes) = fsio::read_file_bounded_cancellable(
             &marker_path,
             "CURRENT marker",
@@ -937,6 +939,7 @@ impl CheckpointStore {
             return Ok(None);
         };
         let marker_present = marker_bytes.is_some();
+        let mut removed_temp_files = 0usize;
         let selection = match marker_bytes {
             Some(bytes) => {
                 let generation =
@@ -948,82 +951,27 @@ impl CheckpointStore {
                 Selection {
                     generation,
                     created: false,
-                    adopted_without_marker: false,
-                    marker_temp_authoritative: false,
                 }
             }
             None => {
-                let marker_temp_path = namespace_dir.join(CURRENT_TEMP_FILE_NAME);
-                let marker_backup_path = namespace_dir.join(CURRENT_BACKUP_FILE_NAME);
-                let Some(marker_temp_bytes) = fsio::read_file_bounded_cancellable(
-                    &marker_temp_path,
-                    "CURRENT temporary marker",
-                    MARKER_READ_MAX_BYTES,
+                let Some((selection, removed)) = Self::select_without_marker(
+                    &namespace_dir,
+                    &namespace_id,
+                    &mut faults,
+                    &limits,
                     &mut *cancelled,
                 )?
                 else {
                     return Ok(None);
                 };
-                let Some(marker_backup_bytes) = fsio::read_file_bounded_cancellable(
-                    &marker_backup_path,
-                    "CURRENT backup marker",
-                    MARKER_READ_MAX_BYTES,
-                    &mut *cancelled,
-                )?
-                else {
-                    return Ok(None);
-                };
-                match (marker_temp_bytes, marker_backup_bytes) {
-                    (Some(bytes), marker_backup_bytes) => {
-                        let Some(selection) = Self::select_from_temporary_marker(
-                            &namespace_dir,
-                            &marker_temp_path,
-                            &bytes,
-                            &marker_backup_path,
-                            marker_backup_bytes.as_deref(),
-                            &mut *cancelled,
-                        )?
-                        else {
-                            return Ok(None);
-                        };
-                        selection
-                    }
-                    (None, Some(_)) => {
-                        let Some(generations) =
-                            layout::scan_generations(&namespace_dir, &mut *cancelled)?
-                        else {
-                            return Ok(None);
-                        };
-                        return Err(StoreError::MissingMarker {
-                            dir: namespace_dir,
-                            marker: CURRENT_FILE_NAME,
-                            highest_generation: generations
-                                .keys()
-                                .next_back()
-                                .copied()
-                                .unwrap_or(INITIAL_GENERATION),
-                        });
-                    }
-                    (None, None) => {
-                        let Some(selection) = Self::select_without_marker(
-                            &namespace_dir,
-                            &namespace_id,
-                            &mut faults,
-                            &limits,
-                            max_tracked_files,
-                            &mut *cancelled,
-                        )?
-                        else {
-                            return Ok(None);
-                        };
-                        selection
-                    }
-                }
+                removed_temp_files = removed;
+                selection
             }
         };
         if cancelled() {
             return Ok(None);
         }
+        prepared_namespace.verify("revalidate the namespace chain after authority selection")?;
 
         let generation = selection.generation;
         let wal_path = namespace_dir.join(wal_file_name(generation));
@@ -1053,42 +1001,20 @@ impl CheckpointStore {
             faults.check(FaultPoint::AfterTornTailTruncate)?;
         }
         if marker_present {
-            // A checksum-valid CURRENT is not enough to discard other
-            // marker evidence: retain CURRENT.tmp and CURRENT.bak until the
-            // selected generation passes complete bounded validation.
-            let Some(removed) =
-                Self::remove_marker_recovery_files(&namespace_dir, &mut *cancelled)?
+            let Some(removed) = Self::cleanup_abandoned_publication_artifacts(
+                &namespace_dir,
+                generation,
+                &mut *cancelled,
+            )?
             else {
                 return Ok(None);
             };
             removed_temp_files += removed;
-        } else if selection.marker_temp_authoritative {
-            // Windows ReplaceFileW failures 1176 and 1177 can remove
-            // CURRENT while leaving the synced replacement under
-            // CURRENT.tmp. The candidate marker and its exact generation
-            // layout were checked before load, and the selected pair has
-            // now passed full bounded validation, so finish that interrupted
-            // publication without first deleting the only marker evidence.
-            if cancelled() {
-                return Ok(None);
-            }
-            Self::publish_existing_marker_temp(&namespace_dir).map_err(|failure| failure.error)?;
-            removed_temp_files += 1;
-        } else if selection.adopted_without_marker {
-            // Finish the interrupted creation now that the adopted pair has
-            // been validated in full: naming it in `CURRENT` restores the
-            // namespace invariant that a marker always selects the
-            // authoritative generation, so the next open takes the ordinary
-            // path instead of relying on the first-store fallback again.
-            if cancelled() {
-                return Ok(None);
-            }
-            Self::publish_marker(&namespace_dir, generation, &mut faults)
-                .map_err(|failure| failure.error)?;
         }
         if cancelled() {
             return Ok(None);
         }
+        prepared_namespace.verify("revalidate the namespace chain after recovery cleanup")?;
         let Some(wal) = fsio::open_for_append_cancellable(&wal_path, &mut *cancelled)? else {
             return Ok(None);
         };
@@ -1096,9 +1022,15 @@ impl CheckpointStore {
         let Some(generations) = layout::scan_generations(&namespace_dir, &mut *cancelled)? else {
             return Ok(None);
         };
+        if generations.keys().any(|found| *found > generation) {
+            return Err(StoreError::AuthorityMissingOrAmbiguous {
+                dir: namespace_dir,
+                reason: "generation artifacts newer than CURRENT remain outside the one cleaned proposal",
+            });
+        }
         let retired_generations: Vec<u64> = generations
             .into_keys()
-            .filter(|found| *found != generation)
+            .filter(|found| *found < generation)
             .collect();
         if cancelled() {
             return Ok(None);
@@ -1107,7 +1039,6 @@ impl CheckpointStore {
         let recovery = RecoveryReport {
             generation,
             created: selection.created,
-            adopted_without_marker: selection.adopted_without_marker,
             snapshot_records: loaded.snapshot_records,
             transactions_replayed: loaded.transactions_replayed,
             torn_tail_bytes: loaded.torn_tail_bytes,
@@ -1125,6 +1056,7 @@ impl CheckpointStore {
             fingerprint_bytes,
             limits,
             _lock: lock,
+            _namespace: prepared_namespace.into_namespace(),
             table: loaded.table,
             generation,
             retired_generations,
@@ -1186,177 +1118,44 @@ impl CheckpointStore {
         Ok(())
     }
 
-    fn remove_marker_recovery_files(
-        dir: &Path,
-        cancelled: &mut impl FnMut() -> bool,
-    ) -> Result<Option<usize>, StoreError> {
-        if cancelled() {
-            return Ok(None);
-        }
-        let mut removed = 0usize;
-        for name in [CURRENT_TEMP_FILE_NAME, CURRENT_BACKUP_FILE_NAME] {
-            removed += usize::from(fsio::remove_file_if_present(&dir.join(name))?);
-            if cancelled() {
-                return Ok(None);
-            }
-        }
-        Ok(Some(removed))
-    }
-
-    /// Selects the generation named by `CURRENT.tmp` only when the missing
-    /// `CURRENT`, optional `CURRENT.bak`, and generation population exactly
-    /// match a publication postcondition this store can produce.
-    ///
-    /// Generation 0 may be the sole pair after interrupted first
-    /// publication. A later candidate must be complete, strictly newer than
-    /// the complete generation named by `CURRENT.bak`, and no recognized
-    /// generation may be newer than it. This also covers an audited
-    /// namespace reset that deliberately jumps above retained evidence.
-    /// Any other layout is ambiguous and retains both recovery names for
-    /// operator diagnosis.
-    fn select_from_temporary_marker(
-        dir: &Path,
-        marker_temp_path: &Path,
-        marker_temp_bytes: &[u8],
-        marker_backup_path: &Path,
-        marker_backup_bytes: Option<&[u8]>,
-        cancelled: &mut impl FnMut() -> bool,
-    ) -> Result<Option<Selection>, StoreError> {
-        let generation =
-            decode_current_marker(marker_temp_bytes).map_err(|source| StoreError::Decode {
-                artifact: "CURRENT temporary marker",
-                path: marker_temp_path.to_path_buf(),
-                source,
-            })?;
-        let Some(generations) = layout::scan_generations(dir, &mut *cancelled)? else {
-            return Ok(None);
-        };
-        let candidate = generations.get(&generation).copied().unwrap_or_default();
-        if !candidate.is_complete() {
-            return Err(StoreError::IncompleteGeneration {
-                dir: dir.to_path_buf(),
-                generation,
-                missing: candidate.missing(),
-            });
-        }
-
-        let backup_generation = marker_backup_bytes
-            .map(|bytes| {
-                decode_current_marker(bytes).map_err(|source| StoreError::Decode {
-                    artifact: "CURRENT backup marker",
-                    path: marker_backup_path.to_path_buf(),
-                    source,
-                })
-            })
-            .transpose()?;
-        let exact_publication_layout = if generation == INITIAL_GENERATION {
-            generations.len() == 1 && backup_generation.is_none()
-        } else {
-            let Some(found) = backup_generation else {
-                return Err(StoreError::MissingMarker {
-                    dir: dir.to_path_buf(),
-                    marker: CURRENT_FILE_NAME,
-                    highest_generation: generations
-                        .keys()
-                        .next_back()
-                        .copied()
-                        .unwrap_or(generation),
-                });
-            };
-            found < generation
-                && generations
-                    .get(&found)
-                    .is_some_and(|files| files.is_complete())
-                && generations
-                    .keys()
-                    .all(|recognized| *recognized <= generation)
-        };
-        if !exact_publication_layout {
-            return Err(StoreError::MissingMarker {
-                dir: dir.to_path_buf(),
-                marker: CURRENT_FILE_NAME,
-                highest_generation: generations
-                    .keys()
-                    .next_back()
-                    .copied()
-                    .unwrap_or(generation),
-            });
-        }
-
-        Ok(Some(Selection {
-            generation,
-            created: false,
-            adopted_without_marker: true,
-            marker_temp_authoritative: true,
-        }))
-    }
-
-    /// Chooses a generation for a namespace whose `CURRENT` marker is
-    /// absent, creating the initial generation when the namespace is new.
-    ///
-    /// `CURRENT` is written last when a namespace is created and is only
-    /// ever replaced atomically afterwards, so the sole state in which it
-    /// can legitimately be missing is an interrupted *first* creation. The
-    /// fallback to "the highest complete snapshot/WAL pair" is therefore
-    /// deliberately restricted to that case: a namespace that already holds
-    /// *any* trace of a generation beyond the initial one has been compacted
-    /// at least once, so a missing marker there means something outside this
-    /// store removed it, and guessing which generation was authoritative
-    /// could silently discard durable progress. That case fails closed --
-    /// including when the newer generation is itself incomplete, because an
-    /// older complete pair is then a *stale* recovery base, not an
-    /// authoritative one.
+    /// Repairs only the exact bounded interrupted-first-publication layout,
+    /// then restarts generation-zero creation from an empty locked namespace.
     fn select_without_marker(
         dir: &Path,
         namespace_id: &str,
         faults: &mut FaultPlan,
         limits: &StoreLimits,
-        max_tracked_files: u32,
         cancelled: &mut impl FnMut() -> bool,
-    ) -> Result<Option<Selection>, StoreError> {
-        let Some(scan) = layout::scan_generations(dir, &mut *cancelled)? else {
+    ) -> Result<Option<(Selection, usize)>, StoreError> {
+        let Some(stale) = Self::interrupted_initial_publication_artifacts(dir, &mut *cancelled)?
+        else {
             return Ok(None);
         };
-        // Any file belonging to a later generation, complete or not, proves
-        // the namespace has been compacted, which in turn proves a marker
-        // once existed. Its absence is then unexplained, so nothing here is
-        // adopted or recreated.
-        match scan.keys().next_back().copied() {
-            Some(highest_present) if highest_present > INITIAL_GENERATION => {
-                return Err(StoreError::MissingMarker {
-                    dir: dir.to_path_buf(),
-                    marker: CURRENT_FILE_NAME,
-                    highest_generation: highest_present,
-                });
+        let removed = stale.len();
+        let mut artifacts = Vec::with_capacity(removed);
+        for path in stale {
+            if cancelled() {
+                return Ok(None);
             }
-            _ => {}
+            artifacts.push(fsio::CheckpointFilePathBinding::open(
+                &path,
+                "bind an interrupted first-publication artifact",
+            )?);
         }
-
-        // Only the initial generation can be present from here on: this is a
-        // first-store namespace, so the highest complete pair is the initial
-        // pair, and an interrupted first creation is the only way the marker
-        // can be missing.
-        let initial_pair = scan.get(&INITIAL_GENERATION).copied().unwrap_or_default();
-        if initial_pair.is_complete() {
-            return Ok(Some(Selection {
-                generation: INITIAL_GENERATION,
-                created: false,
-                adopted_without_marker: true,
-                marker_temp_authoritative: false,
-            }));
+        for artifact in artifacts {
+            artifact.remove("remove an interrupted first-publication artifact")?;
         }
-
-        // Either an empty namespace, or an initial generation whose pair was
-        // never completed. Neither was ever authoritative (no marker has ever
-        // named it), so creating the initial generation cannot discard
-        // durable progress.
-        if !Self::verify_incomplete_initial_pair_is_empty(
-            dir,
-            namespace_id,
-            limits,
-            max_tracked_files,
-            &mut *cancelled,
-        )? {
+        if removed > 0 {
+            fsio::sync_directory(dir)?;
+        }
+        if let Some(parent) = dir.parent() {
+            fsio::sync_directory(if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            })?;
+        }
+        if cancelled() {
             return Ok(None);
         }
         if !Self::create_generation_cancellable(
@@ -1370,128 +1169,215 @@ impl CheckpointStore {
         )? {
             return Ok(None);
         }
-        Ok(Some(Selection {
-            generation: INITIAL_GENERATION,
-            created: true,
-            adopted_without_marker: false,
-            marker_temp_authoritative: false,
-        }))
+        Ok(Some((
+            Selection {
+                generation: INITIAL_GENERATION,
+                created: true,
+            },
+            removed,
+        )))
     }
 
-    /// Refuses to overwrite an incomplete initial generation that carries
-    /// durable state.
-    ///
-    /// Creation writes the snapshot, then the WAL, then the marker, so the
-    /// only incomplete initial pair it can leave behind holds an *empty*
-    /// snapshot and an *empty* WAL: no caller ever received a store handle
-    /// for a generation that was never published, so nothing could have been
-    /// appended to it. A leftover that does carry records or transactions
-    /// therefore did not come from an interrupted creation -- something
-    /// outside this store removed the marker or the pair's other half -- and
-    /// recreating the generation would silently discard durable progress.
-    fn verify_incomplete_initial_pair_is_empty(
+    fn interrupted_initial_publication_artifacts(
         dir: &Path,
-        namespace_id: &str,
-        limits: &StoreLimits,
-        max_tracked_files: u32,
         cancelled: &mut impl FnMut() -> bool,
-    ) -> Result<bool, StoreError> {
-        let snapshot_path = dir.join(snapshot_file_name(INITIAL_GENERATION));
-        let Some(snapshot) = fsio::read_file_bounded_cancellable(
-            &snapshot_path,
-            "snapshot",
-            limits.max_snapshot_bytes,
-            &mut *cancelled,
-        )?
-        else {
-            return Ok(false);
-        };
-        if let Some(bytes) = snapshot {
-            let header = decode_snapshot_header(&bytes).map_err(|source| StoreError::Decode {
-                artifact: "snapshot",
-                path: snapshot_path.clone(),
+    ) -> Result<Option<Vec<PathBuf>>, StoreError> {
+        if cancelled() {
+            return Ok(None);
+        }
+        let allowed = [
+            OWNERSHIP_LOCK_FILE_NAME.to_owned(),
+            snapshot_file_name(INITIAL_GENERATION),
+            wal_file_name(INITIAL_GENERATION),
+            temp_file_name(
+                &snapshot_file_name(INITIAL_GENERATION),
+                PublicationRole::Create,
+            ),
+            temp_file_name(&wal_file_name(INITIAL_GENERATION), PublicationRole::Create),
+            CURRENT_CREATE_TEMP_FILE_NAME.to_owned(),
+        ];
+        let mut removable = Vec::with_capacity(allowed.len() - 1);
+        for entry in std::fs::read_dir(dir).map_err(|source| StoreError::Io {
+            operation: "inventory a markerless checkpoint namespace",
+            path: dir.to_path_buf(),
+            source,
+        })? {
+            if cancelled() {
+                return Ok(None);
+            }
+            let entry = entry.map_err(|source| StoreError::Io {
+                operation: "read a markerless checkpoint namespace entry",
+                path: dir.to_path_buf(),
                 source,
             })?;
-            if header.generation != INITIAL_GENERATION {
-                return Err(StoreError::GenerationMismatch {
-                    artifact: "snapshot",
-                    path: snapshot_path,
-                    expected: INITIAL_GENERATION,
-                    found: header.generation,
-                });
-            }
-            if header.record_count > max_tracked_files {
-                return Err(StoreError::RecoveredTrackedFilesExceedMaximum {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                return Err(StoreError::AuthorityMissingOrAmbiguous {
                     dir: dir.to_path_buf(),
-                    tracked: header.record_count as usize,
-                    max: max_tracked_files,
+                    reason: "a directory entry is not an exact version-1 ASCII artifact name",
                 });
-            }
-            if header.record_count != 0 {
-                return Err(StoreError::IncompleteInitialGeneration {
+            };
+            if !allowed.iter().any(|allowed| allowed == &name) {
+                return Err(StoreError::AuthorityMissingOrAmbiguous {
                     dir: dir.to_path_buf(),
-                    marker: CURRENT_FILE_NAME,
-                    reason: "its snapshot already holds records",
+                    reason: "the artifact set is not an interrupted first publication",
                 });
             }
-            let snapshot =
-                decode_snapshot(&bytes, &namespace_digest(namespace_id)).map_err(|source| {
-                    StoreError::Decode {
-                        artifact: "snapshot",
-                        path: snapshot_path.clone(),
-                        source,
-                    }
-                })?;
-            debug_assert!(snapshot.records.is_empty());
+            if name != OWNERSHIP_LOCK_FILE_NAME {
+                removable.push(dir.join(name));
+            }
+        }
+        if !dir.join(OWNERSHIP_LOCK_FILE_NAME).is_file() {
+            return Err(StoreError::AuthorityMissingOrAmbiguous {
+                dir: dir.to_path_buf(),
+                reason: "the ownership lock is missing after exclusive acquisition",
+            });
+        }
+        Ok(Some(removable))
+    }
+
+    fn cleanup_abandoned_publication_artifacts(
+        dir: &Path,
+        current_generation: u64,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<Option<usize>, StoreError> {
+        if cancelled() {
+            return Ok(None);
+        }
+        let namespace = fsio::DirectoryPathBinding::open_canonical(
+            dir,
+            "bind the checkpoint namespace for publication cleanup",
+        )?;
+        let marker = fsio::CheckpointFilePathBinding::open(
+            &dir.join(CURRENT_FILE_NAME),
+            "bind CURRENT for publication cleanup",
+        )?;
+        Self::require_current_generation(dir, current_generation)?;
+        marker.verify("revalidate CURRENT before publication cleanup")?;
+        let mut names: HashSet<String> = [
+            CURRENT_CREATE_TEMP_FILE_NAME.to_owned(),
+            CURRENT_COMPACT_TEMP_FILE_NAME.to_owned(),
+            temp_file_name(
+                &snapshot_file_name(INITIAL_GENERATION),
+                PublicationRole::Create,
+            ),
+            temp_file_name(&wal_file_name(INITIAL_GENERATION), PublicationRole::Create),
+        ]
+        .into_iter()
+        .collect();
+        if let Some(proposed) = current_generation.checked_add(1) {
+            names.extend([
+                snapshot_file_name(proposed),
+                wal_file_name(proposed),
+                temp_file_name(&snapshot_file_name(proposed), PublicationRole::Compact),
+                temp_file_name(&wal_file_name(proposed), PublicationRole::Compact),
+            ]);
+        }
+        let mut candidates = Vec::new();
+        let mut recognized_temporary_count = 0usize;
+        for entry in std::fs::read_dir(dir).map_err(|source| StoreError::Io {
+            operation: "inventory checkpoint publication artifacts",
+            path: dir.to_path_buf(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| StoreError::Io {
+                operation: "read a checkpoint publication directory entry",
+                path: dir.to_path_buf(),
+                source,
+            })?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if let Some(classification) = layout::classify_namespace_artifact(&name)
+                && classification.form != layout::ArtifactForm::Final
+            {
+                recognized_temporary_count += 1;
+                if recognized_temporary_count > layout::MAX_TEMP_FILES {
+                    return Err(StoreError::TooManyTemporaryFiles {
+                        dir: dir.to_path_buf(),
+                        max: layout::MAX_TEMP_FILES,
+                    });
+                }
+            }
+            if names.contains(&name) {
+                candidates.push(fsio::CheckpointFilePathBinding::open(
+                    &entry.path(),
+                    "bind an abandoned checkpoint publication artifact",
+                )?);
+                continue;
+            }
+            if let Some(canonical) = layout::canonical_artifact_name_ignoring_ascii_case(&name)
+                && canonical != name
+                && names.contains(&canonical)
+            {
+                return Err(StoreError::UnsafeFilesystemObject {
+                    path: entry.path(),
+                    reason: "a noncanonical case alias conflicts with a cleanup artifact",
+                });
+            }
+        }
+        let generations = layout::scan_generations(dir, &mut *cancelled)?.ok_or(
+            StoreError::AuthorityMissingOrAmbiguous {
+                dir: dir.to_path_buf(),
+                reason: "generation inventory was cancelled during publication cleanup",
+            },
+        )?;
+        if let Some(proposed) = current_generation.checked_add(1)
+            && generations.keys().any(|generation| *generation > proposed)
+        {
+            return Err(StoreError::AuthorityMissingOrAmbiguous {
+                dir: dir.to_path_buf(),
+                reason: "more than one unpublished generation is present",
+            });
         }
         if cancelled() {
-            return Ok(false);
+            return Ok(None);
         }
-        let wal_path = dir.join(wal_file_name(INITIAL_GENERATION));
-        let Some(wal) = fsio::read_file_bounded_cancellable(
-            &wal_path,
-            "WAL",
-            limits.max_wal_bytes,
-            &mut *cancelled,
+        namespace.verify("revalidate the checkpoint namespace before publication cleanup")?;
+        marker.verify("revalidate CURRENT before deleting publication artifacts")?;
+        Self::require_current_generation(dir, current_generation)?;
+        let removed = candidates.len();
+        for candidate in candidates {
+            namespace.verify("revalidate the checkpoint namespace during publication cleanup")?;
+            marker.verify("revalidate CURRENT during publication cleanup")?;
+            candidate.remove("remove an abandoned checkpoint publication artifact")?;
+        }
+        if removed > 0 {
+            namespace.verify("revalidate the checkpoint namespace after publication cleanup")?;
+            marker.verify("revalidate CURRENT after publication cleanup")?;
+            Self::require_current_generation(dir, current_generation)?;
+            namespace.sync("sync cleaned checkpoint publication artifacts")?;
+            if cancelled() {
+                return Ok(None);
+            }
+        }
+        Ok(Some(removed))
+    }
+
+    fn require_current_generation(dir: &Path, expected: u64) -> Result<(), StoreError> {
+        let path = dir.join(CURRENT_FILE_NAME);
+        let bytes = fsio::read_file_bounded_cancellable(
+            &path,
+            "CURRENT marker",
+            MARKER_READ_MAX_BYTES,
+            &mut || false,
         )?
-        else {
-            return Ok(false);
-        };
-        if let Some(bytes) = wal {
-            let wal_header = decode_wal_header(&bytes).map_err(|source| StoreError::Decode {
-                artifact: "WAL",
-                path: wal_path.clone(),
-                source,
-            })?;
-            if wal_header.generation != INITIAL_GENERATION {
-                return Err(StoreError::GenerationMismatch {
-                    artifact: "WAL",
-                    path: wal_path,
-                    expected: INITIAL_GENERATION,
-                    found: wal_header.generation,
-                });
-            }
-            if bytes.len() > WAL_HEADER_LEN {
-                let remaining = &bytes[WAL_HEADER_LEN..];
-                Self::validate_declared_transaction_size(remaining, &wal_path, limits)?;
-                let scan =
-                    scan_one_transaction(remaining, 1).map_err(|source| StoreError::Decode {
-                        artifact: "WAL",
-                        path: wal_path.clone(),
-                        source,
-                    })?;
-                let reason = match scan {
-                    TransactionScan::Complete(_, _) => "its WAL already holds transactions",
-                    TransactionScan::TornTail(_) => "its surviving WAL has a torn tail",
-                };
-                return Err(StoreError::IncompleteInitialGeneration {
-                    dir: dir.to_path_buf(),
-                    marker: CURRENT_FILE_NAME,
-                    reason,
-                });
-            }
+        .expect("non-cancellable CURRENT read cannot cancel")
+        .ok_or_else(|| StoreError::AuthorityMissingOrAmbiguous {
+            dir: dir.to_path_buf(),
+            reason: "CURRENT disappeared while publication artifacts were being cleaned",
+        })?;
+        let found = decode_current_marker(&bytes).map_err(|source| StoreError::Decode {
+            artifact: "CURRENT marker",
+            path,
+            source,
+        })?;
+        if found != expected {
+            return Err(StoreError::AuthorityMissingOrAmbiguous {
+                dir: dir.to_path_buf(),
+                reason: "CURRENT changed while publication artifacts were being cleaned",
+            });
         }
-        Ok(!cancelled())
+        Ok(())
     }
 
     /// Enforces the configured transaction bound from the transaction
@@ -1968,6 +1854,7 @@ impl CheckpointStore {
             generation,
             records,
             limits,
+            PublicationRole::Create,
             faults,
             &mut *cancelled,
         )? {
@@ -1976,7 +1863,8 @@ impl CheckpointStore {
         if cancelled() {
             return Ok(false);
         }
-        Self::publish_marker(dir, generation, faults).map_err(|failure| failure.error)?;
+        Self::publish_marker(dir, generation, PublicationRole::Create, faults)
+            .map_err(|failure| failure.error)?;
         Ok(true)
     }
 
@@ -2003,6 +1891,7 @@ impl CheckpointStore {
             generation,
             records,
             limits,
+            PublicationRole::Compact,
             faults,
             &mut || false,
         )
@@ -2017,6 +1906,7 @@ impl CheckpointStore {
         generation: u64,
         records: &[SnapshotRecord],
         limits: &StoreLimits,
+        role: PublicationRole,
         faults: &mut FaultPlan,
         cancelled: &mut impl FnMut() -> bool,
     ) -> Result<bool, StoreError> {
@@ -2052,6 +1942,8 @@ impl CheckpointStore {
             dir,
             &snapshot_file_name(generation),
             &snapshot_bytes,
+            role,
+            AtomicInstallMode::NoReplace,
             faults,
             AtomicWriteFaults::SNAPSHOT,
         )
@@ -2064,6 +1956,8 @@ impl CheckpointStore {
             dir,
             &wal_file_name(generation),
             &wal_bytes,
+            role,
+            AtomicInstallMode::NoReplace,
             faults,
             AtomicWriteFaults::WAL,
         )
@@ -2091,6 +1985,7 @@ impl CheckpointStore {
     pub(super) fn publish_marker(
         dir: &Path,
         generation: u64,
+        role: PublicationRole,
         faults: &mut FaultPlan,
     ) -> Result<(), AtomicWriteError> {
         let marker = encode_current_marker(generation);
@@ -2098,6 +1993,11 @@ impl CheckpointStore {
             dir,
             CURRENT_FILE_NAME,
             &marker,
+            role,
+            match role {
+                PublicationRole::Create => AtomicInstallMode::NoReplace,
+                PublicationRole::Compact => AtomicInstallMode::Replace,
+            },
             faults,
             AtomicWriteFaults::MARKER,
         )?;
@@ -2117,16 +2017,6 @@ impl CheckpointStore {
                 error,
                 destination_may_have_changed: true,
             })
-    }
-
-    /// Finishes publication of a bounded, checksum-valid `CURRENT.tmp`
-    /// whose complete target generation has already been loaded.
-    fn publish_existing_marker_temp(dir: &Path) -> Result<(), AtomicWriteError> {
-        fsio::publish_existing_temp_file(dir, CURRENT_FILE_NAME)?;
-        fsio::sync_directory(dir).map_err(|error| AtomicWriteError {
-            error,
-            destination_may_have_changed: true,
-        })
     }
 
     /// The namespace directory this store owns.
@@ -2796,6 +2686,8 @@ impl CheckpointStore {
         new_generation: u64,
     ) -> Result<(), StoreError> {
         self.ensure_usable("reset the complete checkpoint namespace")?;
+        self._namespace
+            .verify("revalidate the checkpoint namespace before reset publication")?;
         let highest = self
             .retired_generations
             .iter()
@@ -2825,15 +2717,20 @@ impl CheckpointStore {
         let mut cancelled = || false;
         let new_wal = fsio::open_for_append_cancellable(&new_wal_path, &mut cancelled)?
             .expect("a non-cancellable namespace-reset WAL open cannot be cancelled");
-        if let Err(failure) =
-            Self::publish_marker(&self.namespace_dir, new_generation, &mut self.faults)
-        {
+        if let Err(failure) = Self::publish_marker(
+            &self.namespace_dir,
+            new_generation,
+            PublicationRole::Compact,
+            &mut self.faults,
+        ) {
             if failure.destination_may_have_changed {
                 self.unusable =
                     Some("CURRENT was repointed or may have changed when publication failed");
             }
             return Err(failure.error);
         }
+        self._namespace
+            .verify("revalidate the checkpoint namespace after reset publication")?;
 
         let previous = self.generation;
         self.wal = new_wal;
@@ -2866,6 +2763,8 @@ impl CheckpointStore {
             return Ok(None);
         }
         self.ensure_usable("compact the checkpoint namespace")?;
+        self._namespace
+            .verify("revalidate the checkpoint namespace before compaction")?;
         if let Some(generation) = self.retired_generations.first().copied() {
             return Err(StoreError::RetiredGenerationCleanupRequired {
                 dir: self.namespace_dir.clone(),
@@ -2889,6 +2788,14 @@ impl CheckpointStore {
             .ok_or(StoreError::GenerationOverflow {
                 generation: previous,
             })?;
+        let Some(_removed) = Self::cleanup_abandoned_publication_artifacts(
+            &self.namespace_dir,
+            previous,
+            &mut *cancelled,
+        )?
+        else {
+            return Ok(None);
+        };
 
         let records = self.table.snapshot_records();
         if cancelled() {
@@ -2912,7 +2819,12 @@ impl CheckpointStore {
             return Ok(None);
         };
 
-        let published = Self::publish_marker(&self.namespace_dir, next, &mut self.faults);
+        let published = Self::publish_marker(
+            &self.namespace_dir,
+            next,
+            PublicationRole::Compact,
+            &mut self.faults,
+        );
         let cancelled_after_publish = cancelled();
         if let Err(failure) = published {
             if failure.destination_may_have_changed {
@@ -2921,6 +2833,8 @@ impl CheckpointStore {
             }
             return Err(failure.error);
         }
+        self._namespace
+            .verify("revalidate the checkpoint namespace after compaction publication")?;
 
         // Replacing the handle closes the previous generation's WAL, which
         // Windows requires before that file can be removed by cleanup.
@@ -2971,9 +2885,12 @@ impl CheckpointStore {
             return Ok(None);
         }
         self.ensure_usable("clean up retired checkpoint generations")?;
+        self._namespace
+            .verify("revalidate the checkpoint namespace before retired cleanup")?;
         if self.retired_generations.is_empty() {
             return Ok(Some(0));
         }
+        Self::require_current_generation(&self.namespace_dir, self.generation)?;
         let completed = self.retired_generations.len();
         for generation in self.retired_generations.iter().copied() {
             if generation == self.generation {
@@ -2996,12 +2913,15 @@ impl CheckpointStore {
         // Keep the complete pending list until the directory sync succeeds.
         // A retry after either an unlink or sync failure can therefore
         // repeat idempotent removals and retry the durability boundary.
+        Self::require_current_generation(&self.namespace_dir, self.generation)?;
         self.faults.check(FaultPoint::BeforeRetiredDirectorySync)?;
         let Some(()) = fsio::sync_directory_cancellable(&self.namespace_dir, &mut cancelled)?
         else {
             return Ok(None);
         };
         self.retired_generations.clear();
+        self._namespace
+            .verify("revalidate the checkpoint namespace after retired cleanup")?;
         Ok(Some(completed))
     }
 
@@ -3698,8 +3618,6 @@ fn duration_nanos(duration: Duration) -> u64 {
 struct Selection {
     generation: u64,
     created: bool,
-    adopted_without_marker: bool,
-    marker_temp_authoritative: bool,
 }
 
 #[derive(Debug)]

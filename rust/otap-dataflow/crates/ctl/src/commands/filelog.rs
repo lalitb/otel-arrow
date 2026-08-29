@@ -615,6 +615,11 @@ mod tests {
         }
     }
 
+    fn test_store_options(state_dir: &Path, checkpoint_id: &str) -> StoreOptions {
+        fs::create_dir_all(state_dir).unwrap();
+        StoreOptions::from_state_dir(state_dir, checkpoint_id).unwrap()
+    }
+
     fn seed_quarantine(
         state_dir: &Path,
         checkpoint_id: &str,
@@ -622,7 +627,7 @@ mod tests {
         locator: Locator,
         observed_size: u64,
     ) -> StoreOptions {
-        let options = StoreOptions::from_state_dir(state_dir, checkpoint_id).unwrap();
+        let options = test_store_options(state_dir, checkpoint_id);
         let mut store = CheckpointStore::open(options.clone()).unwrap();
         let _ = store
             .register_files(vec![registration(seed, locator)])
@@ -652,7 +657,7 @@ mod tests {
         let root = tempdir().unwrap();
         let state_dir = root.path().join("state");
         let checkpoint_id = "offline-corrupt";
-        let options = StoreOptions::from_state_dir(&state_dir, checkpoint_id).unwrap();
+        let options = test_store_options(&state_dir, checkpoint_id);
         drop(CheckpointStore::open(options.clone()).unwrap());
         let wal_path = options.namespace_dir.join(wal_file_name(0));
         let mut corrupt_wal = fs::read(&wal_path).unwrap();
@@ -718,7 +723,7 @@ mod tests {
         let root = tempdir().unwrap();
         let state_dir = root.path().join("state");
         let checkpoint_id = "offline-locked";
-        let options = StoreOptions::from_state_dir(&state_dir, checkpoint_id).unwrap();
+        let options = test_store_options(&state_dir, checkpoint_id);
         let store = CheckpointStore::open(options).unwrap();
         let cli = Cli::try_parse_from([
             "dfctl",
@@ -752,7 +757,7 @@ mod tests {
         let root = tempdir().unwrap();
         let state_dir = root.path().join("state");
         let checkpoint_id = "offline-reset";
-        let options = StoreOptions::from_state_dir(&state_dir, checkpoint_id).unwrap();
+        let options = test_store_options(&state_dir, checkpoint_id);
         let mut store = CheckpointStore::open(options.clone()).unwrap();
         let _ = store
             .register_files(vec![registration(2, synthetic_locator(2))])

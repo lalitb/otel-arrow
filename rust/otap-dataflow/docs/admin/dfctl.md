@@ -204,6 +204,9 @@ Every command requires:
 - `--checkpoint-id`, the exact raw checkpoint ID, not its lowercase-hex
   directory name.
 
+The state directory must already exist as the durable engine-owned root.
+Receiver startup creates and parent-syncs only the `filelog/@v1/<id>` descendants.
+
 The tool derives:
 
 ```text

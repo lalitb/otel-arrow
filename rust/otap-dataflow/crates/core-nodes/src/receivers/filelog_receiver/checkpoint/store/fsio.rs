@@ -12,11 +12,10 @@
 //! Three properties matter for correctness and are implemented here rather
 //! than at each call site:
 //!
-//! - **Atomic publication.** A file is written to a temporary name *in the
-//!   same directory*, synced, and then renamed over its final name. A
-//!   partially written file therefore never appears under a name recovery
-//!   reads, and the rename is atomic because both names live in one
-//!   directory.
+//! - **Atomic publication.** A file is written to a role-specific temporary
+//!   name in the same directory, synced, and atomically installed. Generation
+//!   names use exclusive no-replace installation; later `CURRENT` publication
+//!   replaces only the prior marker.
 //! - **Bounded reads.** A file's length is validated against a configured
 //!   maximum before any buffer is allocated for it, and the read itself is
 //!   capped, so a corrupted or hostile length can never drive an unbounded
@@ -31,9 +30,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
+use super::super::namespace::{CHECKPOINT_NAMESPACE_VERSION, FILELOG_NAMESPACE_DIRECTORY};
 use super::error::StoreError;
 use super::fault::{FaultPlan, FaultPoint};
-use super::layout::{backup_file_name, temp_file_name};
+use super::layout::{PublicationRole, temp_file_name};
 
 /// Directory mode for the checkpoint namespace on Unix.
 #[cfg(unix)]
@@ -75,6 +75,116 @@ pub(crate) struct DirectoryPathBinding {
     path: PathBuf,
     handle: File,
     identity: FileIdentity,
+}
+
+/// Namespace path and all versioned ancestors retained through publication.
+#[derive(Debug)]
+pub(crate) struct PreparedNamespace {
+    state_dir: Option<DirectoryPathBinding>,
+    filelog_dir: Option<DirectoryPathBinding>,
+    version_dir: Option<DirectoryPathBinding>,
+    namespace_dir: DirectoryPathBinding,
+}
+
+impl PreparedNamespace {
+    fn direct(namespace_dir: DirectoryPathBinding) -> Self {
+        Self {
+            state_dir: None,
+            filelog_dir: None,
+            version_dir: None,
+            namespace_dir,
+        }
+    }
+
+    /// Revalidates every retained ancestor and the namespace itself.
+    pub(crate) fn verify(&self, operation: &'static str) -> Result<(), StoreError> {
+        for binding in [
+            self.state_dir.as_ref(),
+            self.filelog_dir.as_ref(),
+            self.version_dir.as_ref(),
+            Some(&self.namespace_dir),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            binding.verify(operation)?;
+        }
+        Ok(())
+    }
+
+    /// Canonical namespace path retained by this preparation.
+    pub(crate) fn namespace_path(&self) -> &Path {
+        self.namespace_dir.path()
+    }
+
+    /// Retained namespace-directory binding used after publication.
+    pub(crate) fn into_namespace(self) -> DirectoryPathBinding {
+        self.namespace_dir
+    }
+}
+
+/// One exact checkpoint artifact path retained with its open file identity.
+#[derive(Debug)]
+pub(crate) struct CheckpointFilePathBinding {
+    path: PathBuf,
+    handle: File,
+    identity: FileIdentity,
+}
+
+impl CheckpointFilePathBinding {
+    /// Opens and validates one existing regular checkpoint artifact.
+    pub(crate) fn open(path: &Path, operation: &'static str) -> Result<Self, StoreError> {
+        let mut options = OpenOptions::new();
+        let _ = options.read(true);
+        no_follow(&mut options);
+        let handle = options.open(path).map_err(|source| StoreError::Io {
+            operation,
+            path: path.to_path_buf(),
+            source,
+        })?;
+        validate_checkpoint_file_cancellable(&handle, path, operation, &mut || false)?
+            .expect("non-cancellable checkpoint file validation cannot cancel");
+        let identity = file_identity(&handle, path, operation)?;
+        let binding = Self {
+            path: path.to_path_buf(),
+            handle,
+            identity,
+        };
+        binding.verify(operation)?;
+        Ok(binding)
+    }
+
+    /// Verifies that the exact pathname still resolves to the retained file.
+    pub(crate) fn verify(&self, operation: &'static str) -> Result<(), StoreError> {
+        let mut options = OpenOptions::new();
+        let _ = options.read(true);
+        no_follow(&mut options);
+        let current = options.open(&self.path).map_err(|source| StoreError::Io {
+            operation,
+            path: self.path.clone(),
+            source,
+        })?;
+        validate_checkpoint_file_cancellable(&current, &self.path, operation, &mut || false)?
+            .expect("non-cancellable checkpoint file validation cannot cancel");
+        let current_identity = file_identity(&current, &self.path, operation)?;
+        if current_identity != self.identity {
+            return Err(StoreError::UnsafeFilesystemObject {
+                path: self.path.clone(),
+                reason: "the artifact path no longer names the retained checkpoint file",
+            });
+        }
+        Ok(())
+    }
+
+    /// Removes the exact retained artifact after one final path verification.
+    pub(crate) fn remove(self, operation: &'static str) -> Result<(), StoreError> {
+        self.verify(operation)?;
+        std::fs::remove_file(&self.path).map_err(|source| StoreError::Io {
+            operation,
+            path: self.path,
+            source,
+        })
+    }
 }
 
 impl DirectoryPathBinding {
@@ -183,6 +293,15 @@ pub(crate) struct AtomicWriteFaults {
     pub(crate) after_publish: FaultPoint,
 }
 
+/// Whether installing a synced temporary may replace its destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomicInstallMode {
+    /// Generation artifacts and the initial marker must not replace anything.
+    NoReplace,
+    /// Later `CURRENT` publication atomically replaces the prior marker.
+    Replace,
+}
+
 impl AtomicWriteFaults {
     /// Boundaries of the snapshot file.
     pub(crate) const SNAPSHOT: Self = Self {
@@ -245,12 +364,33 @@ struct ReplaceFileError {
     destination_may_have_changed: bool,
 }
 
-/// Creates the checkpoint namespace directory (and any missing parent),
-/// with restrictive permissions on Unix. Succeeds if it already exists.
+/// Prepares the checkpoint namespace directory with restrictive permissions.
+///
+/// A versioned `filelog/@v1/<id>` path requires an already-existing engine
+/// state root and unconditionally syncs each immediate parent after opening or
+/// creating its child. Direct low-level test paths retain bounded recursive
+/// creation behavior.
 pub(crate) fn create_namespace_dir_cancellable(
     dir: &Path,
+    faults: &mut FaultPlan,
     cancelled: &mut impl FnMut() -> bool,
-) -> Result<Option<()>, StoreError> {
+) -> Result<Option<PreparedNamespace>, StoreError> {
+    if let Some((state_dir, filelog_dir, version_dir)) = versioned_namespace_parents(dir) {
+        let state_dir = if state_dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            state_dir
+        };
+        return create_versioned_namespace_cancellable(
+            state_dir,
+            filelog_dir,
+            version_dir,
+            dir,
+            faults,
+            cancelled,
+        );
+    }
+
     let mut missing_directories = Vec::new();
     let mut candidate = dir;
     let existing_boundary = loop {
@@ -390,7 +530,120 @@ pub(crate) fn create_namespace_dir_cancellable(
             return Ok(None);
         };
     }
-    Ok(Some(()))
+    let namespace =
+        DirectoryPathBinding::open_canonical(dir, "bind the prepared checkpoint namespace")?;
+    Ok(Some(PreparedNamespace::direct(namespace)))
+}
+
+fn versioned_namespace_parents(dir: &Path) -> Option<(&Path, &Path, &Path)> {
+    let version_dir = dir.parent()?;
+    if version_dir.file_name()? != CHECKPOINT_NAMESPACE_VERSION {
+        return None;
+    }
+    let filelog_dir = version_dir.parent()?;
+    if filelog_dir.file_name()? != FILELOG_NAMESPACE_DIRECTORY {
+        return None;
+    }
+    let state_dir = filelog_dir.parent()?;
+    Some((state_dir, filelog_dir, version_dir))
+}
+
+fn create_versioned_namespace_cancellable(
+    state_dir: &Path,
+    filelog_dir: &Path,
+    version_dir: &Path,
+    namespace_dir: &Path,
+    faults: &mut FaultPlan,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<PreparedNamespace>, StoreError> {
+    if cancelled() {
+        return Ok(None);
+    }
+    let state =
+        DirectoryPathBinding::open_canonical(state_dir, "bind the durable engine state directory")?;
+    let filelog = ensure_private_child_and_sync_parent(
+        &state,
+        filelog_dir,
+        FaultPoint::BeforeFilelogParentSync,
+        FaultPoint::AfterFilelogParentSync,
+        faults,
+    )?;
+    if cancelled() {
+        return Ok(None);
+    }
+    let version = ensure_private_child_and_sync_parent(
+        &filelog,
+        version_dir,
+        FaultPoint::BeforeVersionParentSync,
+        FaultPoint::AfterVersionParentSync,
+        faults,
+    )?;
+    if cancelled() {
+        return Ok(None);
+    }
+    let namespace = ensure_private_child_and_sync_parent(
+        &version,
+        namespace_dir,
+        FaultPoint::BeforeNamespaceParentSync,
+        FaultPoint::AfterNamespaceParentSync,
+        faults,
+    )?;
+    if cancelled() {
+        return Ok(None);
+    }
+    let prepared = PreparedNamespace {
+        state_dir: Some(state),
+        filelog_dir: Some(filelog),
+        version_dir: Some(version),
+        namespace_dir: namespace,
+    };
+    prepared.verify("revalidate the complete checkpoint namespace chain")?;
+    Ok(Some(prepared))
+}
+
+fn ensure_private_child_and_sync_parent(
+    parent: &DirectoryPathBinding,
+    child: &Path,
+    before_sync: FaultPoint,
+    after_sync: FaultPoint,
+    faults: &mut FaultPlan,
+) -> Result<DirectoryPathBinding, StoreError> {
+    parent.verify("revalidate a checkpoint namespace parent")?;
+    let child_name = child.file_name().ok_or_else(|| StoreError::Io {
+        operation: "derive a checkpoint namespace child name",
+        path: child.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "checkpoint namespace child has no final component",
+        ),
+    })?;
+    let child = parent.path().join(child_name);
+    #[allow(unused_mut)]
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let _ = builder.mode(NAMESPACE_DIR_MODE);
+    }
+    if let Err(source) = builder.create(&child)
+        && source.kind() != std::io::ErrorKind::AlreadyExists
+    {
+        return Err(StoreError::Io {
+            operation: "create a checkpoint namespace component",
+            path: child.clone(),
+            source,
+        });
+    }
+    secure_namespace_dir_cancellable(&child, &mut || false)?
+        .expect("non-cancellable namespace component validation cannot cancel");
+    let child_binding =
+        DirectoryPathBinding::open_canonical(&child, "bind a checkpoint namespace component")?;
+    faults.check(before_sync)?;
+    parent.sync("sync a checkpoint namespace parent")?;
+    faults.check(after_sync)?;
+    parent.verify("revalidate a checkpoint namespace parent")?;
+    child_binding.verify("revalidate a checkpoint namespace component")?;
+    Ok(child_binding)
 }
 
 #[cfg(unix)]
@@ -927,26 +1180,17 @@ pub(crate) fn write_file_atomically(
     dir: &Path,
     final_name: &str,
     bytes: &[u8],
+    role: PublicationRole,
+    install_mode: AtomicInstallMode,
     plan: &mut FaultPlan,
     faults: AtomicWriteFaults,
 ) -> Result<(), AtomicWriteError> {
-    let temp_path = dir.join(temp_file_name(final_name));
-    let backup_path = dir.join(backup_file_name(final_name));
+    let temp_path = dir.join(temp_file_name(final_name, role));
     let final_path = dir.join(final_name);
 
     plan.check(faults.before_write)
         .map_err(AtomicWriteError::staged)?;
 
-    // A previous staged write may have failed before publication. Removing
-    // the known temporary name is safe: unlinking a symlink removes the link
-    // itself rather than its target, and create_new below prevents a race
-    // from turning into truncation of an injected object.
-    let _removed = remove_file_if_present(&temp_path).map_err(AtomicWriteError::staged)?;
-    // Windows replacement uses one deterministic backup name so even error
-    // 1177 cannot create an unbounded, unknowable orphan. A usable store has
-    // already resolved marker authority, and generation backups are never
-    // authoritative, so a leftover is safe to remove before a new attempt.
-    let _removed_backup = remove_file_if_present(&backup_path).map_err(AtomicWriteError::staged)?;
     let mut file = create_file(&temp_path, "create a checkpoint temporary file")
         .map_err(AtomicWriteError::staged)?;
     file.write_all(bytes).map_err(|source| {
@@ -972,61 +1216,18 @@ pub(crate) fn write_file_atomically(
     plan.check(faults.after_sync)
         .map_err(AtomicWriteError::staged)?;
 
-    install_temp_file(&temp_path, &final_path, &backup_path)?;
+    install_temp_file(&temp_path, &final_path, install_mode)?;
 
     plan.check(faults.after_publish)
         .map_err(AtomicWriteError::published)
 }
 
-/// Syncs and installs an already-written same-directory temporary file.
-///
-/// Recovery uses this only after bounded validation establishes that
-/// `CURRENT.tmp`, together with any matching `CURRENT.bak`, is valid marker
-/// evidence for a complete generation.
-/// Syncing again also completes recovery from an interruption after the
-/// temporary marker was written but before its original sync boundary.
-pub(crate) fn publish_existing_temp_file(
-    dir: &Path,
-    final_name: &str,
-) -> Result<(), AtomicWriteError> {
-    let temp_path = dir.join(temp_file_name(final_name));
-    let backup_path = dir.join(backup_file_name(final_name));
-    let final_path = dir.join(final_name);
-
-    let mut options = OpenOptions::new();
-    let _ = options.read(true).write(true);
-    no_follow(&mut options);
-    let file = options.open(&temp_path).map_err(|source| {
-        AtomicWriteError::staged(StoreError::Io {
-            operation: "open a validated checkpoint temporary file for publication",
-            path: temp_path.clone(),
-            source,
-        })
-    })?;
-    secure_checkpoint_file(
-        &file,
-        &temp_path,
-        "validate a checkpoint temporary file before publication",
-    )
-    .map_err(AtomicWriteError::staged)?;
-    file.sync_all().map_err(|source| {
-        AtomicWriteError::staged(StoreError::Io {
-            operation: "sync a checkpoint temporary file before publication",
-            path: temp_path.clone(),
-            source,
-        })
-    })?;
-    drop(file);
-
-    install_temp_file(&temp_path, &final_path, &backup_path)
-}
-
 fn install_temp_file(
     temp_path: &Path,
     final_path: &Path,
-    backup_path: &Path,
+    install_mode: AtomicInstallMode,
 ) -> Result<(), AtomicWriteError> {
-    replace_file(temp_path, final_path, backup_path).map_err(|failure| {
+    install_file(temp_path, final_path, install_mode).map_err(|failure| {
         let error = StoreError::Io {
             operation: "atomically install a checkpoint temporary file",
             path: final_path.to_path_buf(),
@@ -1037,48 +1238,162 @@ fn install_temp_file(
         } else {
             AtomicWriteError::staged(error)
         }
-    })?;
-    remove_file_if_present(backup_path)
-        .map_err(AtomicWriteError::published)
-        .map(|_| ())
+    })
 }
 
 /// Installs `temp_path` at `final_path` atomically on the current platform.
 #[cfg(not(windows))]
-fn replace_file(
+fn install_file(
     temp_path: &Path,
     final_path: &Path,
-    _backup_path: &Path,
+    install_mode: AtomicInstallMode,
 ) -> Result<(), ReplaceFileError> {
-    std::fs::rename(temp_path, final_path).map_err(|source| ReplaceFileError {
+    match install_mode {
+        AtomicInstallMode::Replace => {
+            std::fs::rename(temp_path, final_path).map_err(|source| ReplaceFileError {
+                source,
+                destination_may_have_changed: false,
+            })
+        }
+        AtomicInstallMode::NoReplace => install_no_replace(temp_path, final_path),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(
+    unsafe_code,
+    reason = "renameat2 is the Linux atomic no-replace rename primitive"
+)]
+fn install_no_replace(temp_path: &Path, final_path: &Path) -> Result<(), ReplaceFileError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let temp = CString::new(temp_path.as_os_str().as_bytes()).map_err(|_| ReplaceFileError {
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "checkpoint temporary path contains an embedded NUL",
+        ),
+        destination_may_have_changed: false,
+    })?;
+    let final_path =
+        CString::new(final_path.as_os_str().as_bytes()).map_err(|_| ReplaceFileError {
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "checkpoint final path contains an embedded NUL",
+            ),
+            destination_may_have_changed: false,
+        })?;
+    // SAFETY: both C strings are NUL-terminated and alive for the call.
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            temp.as_ptr(),
+            libc::AT_FDCWD,
+            final_path.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(ReplaceFileError {
+            source: std::io::Error::last_os_error(),
+            destination_may_have_changed: false,
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(
+    unsafe_code,
+    reason = "renamex_np is the macOS atomic no-replace rename primitive"
+)]
+fn install_no_replace(temp_path: &Path, final_path: &Path) -> Result<(), ReplaceFileError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    unsafe extern "C" {
+        fn renamex_np(
+            from: *const libc::c_char,
+            to: *const libc::c_char,
+            flags: libc::c_uint,
+        ) -> libc::c_int;
+    }
+    const RENAME_EXCL: libc::c_uint = 0x0000_0002;
+
+    let temp = CString::new(temp_path.as_os_str().as_bytes()).map_err(|_| ReplaceFileError {
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "checkpoint temporary path contains an embedded NUL",
+        ),
+        destination_may_have_changed: false,
+    })?;
+    let final_path =
+        CString::new(final_path.as_os_str().as_bytes()).map_err(|_| ReplaceFileError {
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "checkpoint final path contains an embedded NUL",
+            ),
+            destination_may_have_changed: false,
+        })?;
+    // SAFETY: both C strings are NUL-terminated and alive for the call.
+    let result = unsafe { renamex_np(temp.as_ptr(), final_path.as_ptr(), RENAME_EXCL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(ReplaceFileError {
+            source: std::io::Error::last_os_error(),
+            destination_may_have_changed: false,
+        })
+    }
+}
+
+#[cfg(all(
+    not(windows),
+    not(any(target_os = "linux", target_os = "android", target_os = "macos"))
+))]
+fn install_no_replace(temp_path: &Path, final_path: &Path) -> Result<(), ReplaceFileError> {
+    std::fs::hard_link(temp_path, final_path).map_err(|source| ReplaceFileError {
         source,
         destination_may_have_changed: false,
+    })?;
+    std::fs::remove_file(temp_path).map_err(|source| ReplaceFileError {
+        source,
+        destination_may_have_changed: true,
     })
 }
 
 /// Installs `temp_path` at `final_path` with Windows replacement semantics.
 ///
 /// `std::fs::rename` cannot replace an existing destination on Windows.
-/// `ReplaceFileW` is the supported atomic replacement API when `CURRENT`
-/// (or a previously staged generation file) already exists. A new
-/// destination uses `MoveFileExW` with write-through so first publication
-/// is also a same-volume atomic rename and does not return before the move
-/// is flushed. Both handles created by this module are closed before this
-/// call, satisfying `ReplaceFileW`'s sharing requirements.
+/// `ReplaceFileW` is used only for later `CURRENT` replacement. Generation
+/// artifacts and the initial marker use `MoveFileExW` with no replacement
+/// flag and write-through semantics. Both handles created by this module are
+/// closed before installation, satisfying `ReplaceFileW` sharing rules.
 #[cfg(windows)]
 pub(super) fn windows_replace_failure_may_have_changed(raw_os_error: Option<i32>) -> bool {
-    use windows_sys::Win32::Foundation::ERROR_UNABLE_TO_MOVE_REPLACEMENT_2;
+    use windows_sys::Win32::Foundation::{
+        ERROR_UNABLE_TO_MOVE_REPLACEMENT, ERROR_UNABLE_TO_MOVE_REPLACEMENT_2,
+        ERROR_UNABLE_TO_REMOVE_REPLACED,
+    };
 
     raw_os_error
         .and_then(|code| u32::try_from(code).ok())
-        .is_some_and(|code| code == ERROR_UNABLE_TO_MOVE_REPLACEMENT_2)
+        .is_some_and(|code| {
+            matches!(
+                code,
+                ERROR_UNABLE_TO_REMOVE_REPLACED
+                    | ERROR_UNABLE_TO_MOVE_REPLACEMENT
+                    | ERROR_UNABLE_TO_MOVE_REPLACEMENT_2
+            )
+        })
 }
 
 #[cfg(windows)]
-fn replace_file(
+fn install_file(
     temp_path: &Path,
     final_path: &Path,
-    backup_path: &Path,
+    install_mode: AtomicInstallMode,
 ) -> Result<(), ReplaceFileError> {
     use std::os::windows::ffi::OsStrExt as _;
     use std::ptr;
@@ -1123,10 +1438,6 @@ fn replace_file(
         source,
         destination_may_have_changed: false,
     })?;
-    let backup = wide(backup_path).map_err(|source| ReplaceFileError {
-        source,
-        destination_may_have_changed: false,
-    })?;
     let destination_exists = match std::fs::symlink_metadata(final_path) {
         Ok(_) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -1138,17 +1449,34 @@ fn replace_file(
         }
     };
 
+    if install_mode == AtomicInstallMode::NoReplace && destination_exists {
+        return Err(ReplaceFileError {
+            source: std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "checkpoint destination already exists",
+            ),
+            destination_may_have_changed: false,
+        });
+    }
+    if install_mode == AtomicInstallMode::Replace && !destination_exists {
+        return Err(ReplaceFileError {
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "checkpoint replacement destination does not exist",
+            ),
+            destination_may_have_changed: false,
+        });
+    }
+
     // SAFETY: both path buffers are NUL-terminated and remain alive for the
-    // call. The exclusion pointers are null. The deterministic backup name
-    // bounds the otherwise unspecified renamed-original postcondition of
-    // error 1177. The temporary file handle was closed after sync_all, and
-    // this store never keeps a handle to CURRENT open while publishing it.
+    // call. The exclusion pointers are null. The temporary file handle was
+    // closed after sync_all.
     let succeeded = unsafe {
-        if destination_exists {
+        if install_mode == AtomicInstallMode::Replace {
             ReplaceFileW(
                 final_path_wide.as_ptr(),
                 temp.as_ptr(),
-                backup.as_ptr(),
+                ptr::null(),
                 0,
                 ptr::null(),
                 ptr::null(),

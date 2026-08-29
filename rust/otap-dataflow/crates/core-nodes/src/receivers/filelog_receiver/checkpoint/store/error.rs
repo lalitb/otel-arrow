@@ -142,38 +142,13 @@ pub enum StoreError {
         /// Which file of the pair is missing.
         missing: &'static str,
     },
-    /// `CURRENT` is absent from a namespace that has already advanced past
-    /// its first generation. Only an interrupted first-store creation can
-    /// legitimately leave the marker absent, so the store refuses to guess
-    /// which generation was authoritative.
-    #[error(
-        "checkpoint namespace {dir} has no {marker} marker but contains \
-         generation {highest_generation}; refusing to guess which generation \
-         was authoritative"
-    )]
-    MissingMarker {
-        /// The namespace directory.
+    /// A namespace without valid `CURRENT` contains an artifact set that is
+    /// not the exact bounded interrupted-first-publication state.
+    #[error("checkpoint namespace {dir} has no valid CURRENT authority and is ambiguous: {reason}")]
+    AuthorityMissingOrAmbiguous {
+        /// The checkpoint namespace.
         dir: PathBuf,
-        /// The marker file name that was expected.
-        marker: &'static str,
-        /// The highest generation found on disk.
-        highest_generation: u64,
-    },
-    /// `CURRENT` is absent and the namespace's initial generation is
-    /// incomplete, but the half that survives carries durable state, so it
-    /// cannot be the residue of an interrupted first creation. Recreating
-    /// the generation would discard that state, so the store fails closed
-    /// instead.
-    #[error(
-        "checkpoint namespace {dir} has no {marker} marker and an incomplete \
-         initial generation that {reason}; refusing to recreate it"
-    )]
-    IncompleteInitialGeneration {
-        /// The namespace directory.
-        dir: PathBuf,
-        /// The marker file name that was expected.
-        marker: &'static str,
-        /// What the surviving half of the pair holds.
+        /// Which exact first-publication condition was violated.
         reason: &'static str,
     },
     /// A stored file was larger than the configured bound, so it was

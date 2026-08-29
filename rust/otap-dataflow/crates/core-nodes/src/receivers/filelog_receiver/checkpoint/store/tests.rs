@@ -15,13 +15,12 @@
 //! fault compaction opens an existing namespace (where `open` itself
 //! publishes nothing) with the point already armed.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use super::super::current_marker::encode_current_marker;
 use super::super::primitives::{
     ADVISORY_PATH_STORED_MAX_BYTES, AdvisoryPath, ByteReader, CommittedFrontierGuard,
     FINGERPRINT_MAX_BYTES, FileId, FramingResume, LifecycleState, Locator, NAMESPACE_ID_MAX_BYTES,
@@ -36,9 +35,9 @@ use super::super::wal::{
 use super::error::StoreError;
 use super::fault::{FaultPlan, FaultPoint};
 use super::layout::{
-    CURRENT_BACKUP_FILE_NAME, CURRENT_FILE_NAME, CURRENT_TEMP_FILE_NAME, MAX_GENERATIONS_ON_DISK,
-    MAX_TEMP_FILES, OWNERSHIP_LOCK_FILE_NAME, backup_file_name, snapshot_file_name, temp_file_name,
-    wal_file_name,
+    CURRENT_COMPACT_TEMP_FILE_NAME, CURRENT_CREATE_TEMP_FILE_NAME, CURRENT_FILE_NAME,
+    MAX_GENERATIONS_ON_DISK, MAX_TEMP_FILES, OWNERSHIP_LOCK_FILE_NAME, PublicationRole,
+    snapshot_file_name, temp_file_name, wal_file_name,
 };
 use super::limits::{ARTIFACT_BYTES_CEILING, RECOVERY_WORKING_BYTES_CEILING, StoreLimits};
 use super::{AtomicGroupAppendOutcome, CheckpointStore, StoreOptions};
@@ -147,11 +146,11 @@ fn open(dir: &Path) -> CheckpointStore {
 
 /// Scenario: `CURRENT` is missing and the only surviving half of initial
 /// generation 0 declares another generation, or is a WAL with a torn tail.
-/// Guarantees: only an exact, complete, empty generation-0 artifact is
-/// treated as interrupted first creation; foreign or torn survivors fail
-/// closed instead of being overwritten by empty state.
+/// Guarantees: exact first-publication names are treated as unassigned
+/// interrupted output, removed without decoding, and replaced by a fresh
+/// empty generation zero.
 #[test]
-fn incomplete_initial_generation_rejects_foreign_or_torn_survivors() {
+fn markerless_recognized_initial_artifacts_are_replaced_without_decoding() {
     let dir = tempfile::tempdir().expect("temp dir");
 
     let foreign = dir.path().join("foreign");
@@ -162,15 +161,10 @@ fn incomplete_initial_generation_rejects_foreign_or_torn_survivors() {
         &foreign.join(snapshot_file_name(0)),
         &encode_snapshot(9, NAMESPACE_ID, &[]).expect("foreign snapshot encodes"),
     );
-    assert!(matches!(
-        CheckpointStore::open(options(&foreign)).expect_err("foreign generation fails closed"),
-        StoreError::GenerationMismatch {
-            artifact: "snapshot",
-            expected: 0,
-            found: 9,
-            ..
-        }
-    ));
+    let reopened = CheckpointStore::open(options(&foreign)).expect("publication restarts");
+    assert!(reopened.recovery().created);
+    assert!(reopened.table().is_empty());
+    drop(reopened);
 
     let torn = dir.path().join("torn");
     drop(open(&torn));
@@ -182,117 +176,9 @@ fn incomplete_initial_generation_rejects_foreign_or_torn_survivors() {
         .expect("WAL opens");
     wal.write_all(&[0, 0, 1]).expect("torn tail appends");
     drop(wal);
-    assert!(matches!(
-        CheckpointStore::open(options(&torn)).expect_err("torn survivor fails closed"),
-        StoreError::IncompleteInitialGeneration {
-            reason: "its surviving WAL has a torn tail",
-            ..
-        }
-    ));
-}
-
-/// Scenario: a markerless initial generation retains only a malicious
-/// snapshot declaring `u32::MAX` records, or only a complete WAL
-/// transaction whose declared frame is one byte over the configured bound.
-/// Guarantees: recovery applies the tracked-record and transaction-byte
-/// gates before record allocation or transaction decoding, even on the
-/// incomplete-first-generation path.
-#[test]
-fn incomplete_initial_generation_enforces_header_level_decode_bounds() {
-    let dir = tempfile::tempdir().expect("temp dir");
-
-    let snapshot_only = dir.path().join("snapshot-only");
-    let snapshot_options = StoreOptions {
-        max_tracked_files: 1,
-        ..options(&snapshot_only)
-    };
-    drop(
-        CheckpointStore::open(snapshot_options.clone())
-            .expect("the bounded namespace is initially created"),
-    );
-    fs::remove_file(snapshot_only.join(CURRENT_FILE_NAME)).expect("removes the marker");
-    fs::remove_file(snapshot_only.join(wal_file_name(0))).expect("removes the WAL");
-    let snapshot_path = snapshot_only.join(snapshot_file_name(0));
-    let mut snapshot = fs::read(&snapshot_path).expect("snapshot reads");
-    snapshot[52..56].copy_from_slice(&u32::MAX.to_be_bytes());
-    let header_crc = crc32c(&snapshot[..56]);
-    snapshot[56..60].copy_from_slice(&header_crc.to_be_bytes());
-    write_bytes(&snapshot_path, &snapshot);
-
-    assert!(matches!(
-        CheckpointStore::open(snapshot_options)
-            .expect_err("the malicious record count fails before decode"),
-        StoreError::RecoveredTrackedFilesExceedMaximum {
-            tracked,
-            max: 1,
-            ..
-        } if tracked == u32::MAX as usize
-    ));
-
-    let wal_only = dir.path().join("wal-only");
-    let wal_options = StoreOptions {
-        compact_after_bytes: 1,
-        ..options(&wal_only)
-    };
-    let limits = wal_options.limits().expect("the test limits are valid");
-    drop(
-        CheckpointStore::open(wal_options.clone())
-            .expect("the bounded namespace is initially created"),
-    );
-    fs::remove_file(wal_only.join(CURRENT_FILE_NAME)).expect("removes the marker");
-    fs::remove_file(wal_only.join(snapshot_file_name(0))).expect("removes the snapshot");
-
-    let oversized_transaction_len = limits
-        .max_transaction_bytes
-        .checked_add(1)
-        .expect("the test frame length is representable");
-    // The fixed 36-byte transaction envelope header plus the trailing
-    // 4-byte frame CRC surround the body.
-    let body_len = oversized_transaction_len
-        .checked_sub(36 + 4)
-        .expect("transaction framing is included");
-    let body_len_u32 = u32::try_from(body_len).expect("the configured transaction fits u32");
-    let body_len_usize = usize::try_from(body_len).expect("the test can allocate the frame");
-    let mut transaction = Vec::with_capacity(body_len_usize + 40);
-    transaction.extend_from_slice(b"FLOGTXN\0");
-    transaction.extend_from_slice(&1u16.to_be_bytes()); // tx_envelope_version
-    transaction.extend_from_slice(&0u16.to_be_bytes()); // tx_flags, reserved
-    transaction.extend_from_slice(&1u64.to_be_bytes()); // sequence
-    transaction.extend_from_slice(&body_len_u32.to_be_bytes());
-    transaction.extend_from_slice(&(body_len_u32 ^ 0xFFFF_FFFF).to_be_bytes());
-    transaction.extend_from_slice(&1u16.to_be_bytes()); // op_count (never reached)
-    transaction.extend_from_slice(&0u16.to_be_bytes()); // reserved
-    let header_crc = crc32c(&transaction);
-    transaction.extend_from_slice(&header_crc.to_be_bytes());
-    assert_eq!(transaction.len(), 36);
-    transaction.resize(36 + body_len_usize, 0);
-    let transaction_crc = crc32c(&transaction);
-    transaction.extend_from_slice(&transaction_crc.to_be_bytes());
-    assert_eq!(transaction.len() as u64, oversized_transaction_len);
-
-    let wal_path = wal_only.join(wal_file_name(0));
-    let mut wal = fs::OpenOptions::new()
-        .append(true)
-        .open(&wal_path)
-        .expect("WAL opens");
-    wal.write_all(&transaction)
-        .expect("complete oversized transaction appends");
-    drop(wal);
-    assert!(
-        fs::metadata(&wal_path).expect("WAL metadata").len() <= limits.max_wal_bytes,
-        "the artifact-level bound must not mask the transaction-level bound"
-    );
-
-    assert!(matches!(
-        CheckpointStore::open(wal_options)
-            .expect_err("the oversized complete transaction fails before decode"),
-        StoreError::FileTooLarge {
-            artifact: "WAL transaction",
-            len,
-            max,
-            ..
-        } if len == oversized_transaction_len && max == limits.max_transaction_bytes
-    ));
+    let reopened = CheckpointStore::open(options(&torn)).expect("publication restarts");
+    assert!(reopened.recovery().created);
+    assert!(reopened.table().is_empty());
 }
 
 fn file_id(seed: u8) -> FileId {
@@ -793,7 +679,7 @@ fn hard_linked_checkpoint_artifacts_are_rejected() {
 }
 
 /// Scenario: a markerless Unix namespace contains a FIFO at the exact
-/// `CURRENT.tmp` publication name and no process has opened its write end.
+/// `CURRENT.create.tmp` publication name and no process has opened its write end.
 /// Guarantees: startup opens checkpoint artifacts nonblocking and rejects
 /// the special file through handle metadata instead of waiting indefinitely
 /// while holding namespace ownership.
@@ -807,7 +693,7 @@ fn unix_fifo_checkpoint_artifact_is_rejected_without_blocking() {
     let path = dir.path().join("namespace");
     drop(open(&path));
     fs::remove_file(path.join(CURRENT_FILE_NAME)).expect("CURRENT is removed");
-    let fifo_path = path.join(CURRENT_TEMP_FILE_NAME);
+    let fifo_path = path.join(CURRENT_CREATE_TEMP_FILE_NAME);
     make_fifo(&fifo_path);
 
     let (tx, rx) = mpsc::channel();
@@ -1157,7 +1043,6 @@ fn initial_open_creates_generation_zero_and_reopen_selects_it() {
 
     let store = open(&path);
     assert!(store.recovery().created);
-    assert!(!store.recovery().adopted_without_marker);
     assert_eq!(store.generation(), 0);
     assert_eq!(store.table().len(), 0);
     assert!(path.join(CURRENT_FILE_NAME).is_file());
@@ -1171,6 +1056,188 @@ fn initial_open_creates_generation_zero_and_reopen_selects_it() {
     assert_eq!(reopened.generation(), 0);
     assert_eq!(reopened.recovery().transactions_replayed, 0);
     assert_eq!(reopened.stats().next_sequence, 1);
+}
+
+/// Scenario: a versioned namespace is opened below an engine state root that
+/// does not exist.
+/// Guarantees: the store refuses to create the engine-owned root and creates
+/// no descendant checkpoint path.
+#[test]
+fn versioned_namespace_requires_an_existing_engine_state_root() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let state_dir = dir.path().join("missing-state");
+    let options = StoreOptions::from_state_dir(&state_dir, NAMESPACE_ID).unwrap();
+    let namespace = options.namespace_dir.clone();
+
+    assert!(matches!(
+        CheckpointStore::open(options).expect_err("missing state root is refused"),
+        StoreError::Io { .. }
+    ));
+    assert!(!state_dir.exists());
+    assert!(!namespace.exists());
+}
+
+/// Scenario: every parent-directory sync boundary fails once during initial
+/// versioned namespace creation and once after the complete tree already
+/// exists.
+/// Guarantees: each failure is resumable, all three parent syncs are
+/// unconditional, and a later open publishes one complete generation zero.
+#[test]
+fn versioned_namespace_parent_sync_faults_are_resumable_and_unconditional() {
+    for point in FaultPoint::NAMESPACE_CREATION {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state_dir = dir.path().join("state");
+        fs::create_dir(&state_dir).expect("engine state root exists");
+        let mut options = StoreOptions::from_state_dir(&state_dir, NAMESPACE_ID).unwrap();
+        options.ownership_timeout = Duration::from_millis(200);
+        options.ownership_retry_interval = Duration::from_millis(10);
+
+        assert!(matches!(
+            CheckpointStore::open_with_fault(options.clone(), point)
+                .expect_err("the parent sync boundary fails"),
+            StoreError::InjectedFault { point: fired } if fired == point
+        ));
+        let created = CheckpointStore::open(options.clone()).expect("creation resumes");
+        assert_eq!(created.generation(), 0);
+        drop(created);
+
+        assert!(matches!(
+            CheckpointStore::open_with_fault(options.clone(), point)
+                .expect_err("existing ancestors are still synced"),
+            StoreError::InjectedFault { point: fired } if fired == point
+        ));
+        let reopened = CheckpointStore::open(options).expect("existing namespace reopens");
+        assert_eq!(reopened.generation(), 0);
+    }
+}
+
+/// Scenario: the complete versioned namespace chain is prepared, then its
+/// `filelog` ancestor is replaced before publication.
+/// Guarantees: retained ancestor bindings detect the replacement instead of
+/// accepting descendants under a different unsynced parent entry.
+#[test]
+fn prepared_namespace_rejects_ancestor_replacement() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let state_dir = dir.path().join("state");
+    fs::create_dir(&state_dir).expect("engine state root exists");
+    let options = StoreOptions::from_state_dir(&state_dir, NAMESPACE_ID).unwrap();
+    let mut faults = FaultPlan::disabled();
+    let prepared = super::fsio::create_namespace_dir_cancellable(
+        &options.namespace_dir,
+        &mut faults,
+        &mut || false,
+    )
+    .expect("namespace preparation succeeds")
+    .expect("preparation is not cancelled");
+
+    let filelog = state_dir.join("filelog");
+    let displaced = state_dir.join("filelog-displaced");
+    fs::rename(&filelog, &displaced).expect("the bound ancestor is displaced");
+    fs::create_dir(&filelog).expect("a replacement ancestor is created");
+
+    assert!(matches!(
+        prepared
+            .verify("verify the replaced namespace chain")
+            .expect_err("ancestor replacement is rejected"),
+        StoreError::UnsafeFilesystemObject { .. } | StoreError::Io { .. }
+    ));
+}
+
+/// Scenario: first publication and compaction fail after writing their
+/// snapshot temporary files.
+/// Guarantees: each sequence uses only its role-specific `.create.tmp` or
+/// `.compact.tmp` name and never the old generic temporary layout.
+#[test]
+fn publication_uses_role_specific_temporary_names() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let create_path = dir.path().join("create");
+    assert!(
+        CheckpointStore::open_with_fault(options(&create_path), FaultPoint::AfterSnapshotWrite)
+            .is_err()
+    );
+    assert!(
+        create_path
+            .join(temp_file_name(
+                &snapshot_file_name(0),
+                PublicationRole::Create
+            ))
+            .is_file()
+    );
+
+    let compact_path = dir.path().join("compact");
+    let mut store = open(&compact_path);
+    store.faults = FaultPlan::armed(FaultPoint::AfterSnapshotWrite);
+    assert!(store.compact().is_err());
+    assert!(
+        compact_path
+            .join(temp_file_name(
+                &snapshot_file_name(1),
+                PublicationRole::Compact
+            ))
+            .is_file()
+    );
+}
+
+/// Scenario: generation publication encounters an existing final name, then
+/// an existing role-specific temporary name.
+/// Guarantees: exclusive installation never replaces either object and
+/// preserves both conflicting byte sequences for cleanup or diagnosis.
+#[test]
+fn generation_publication_is_exclusive_and_never_replaces_collisions() {
+    use super::fsio::{AtomicInstallMode, AtomicWriteFaults};
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let final_name = "offsets-7.snapshot";
+    let final_path = dir.path().join(final_name);
+    write_bytes(&final_path, b"existing-final");
+    let mut faults = FaultPlan::disabled();
+    let error = super::fsio::write_file_atomically(
+        dir.path(),
+        final_name,
+        b"new-snapshot",
+        PublicationRole::Compact,
+        AtomicInstallMode::NoReplace,
+        &mut faults,
+        AtomicWriteFaults::SNAPSHOT,
+    )
+    .expect_err("the final-name collision is refused");
+    assert!(matches!(
+        error.error,
+        StoreError::Io { source, .. }
+            if source.kind() == std::io::ErrorKind::AlreadyExists
+    ));
+    assert_eq!(fs::read(&final_path).unwrap(), b"existing-final");
+    assert_eq!(
+        fs::read(
+            dir.path()
+                .join(temp_file_name(final_name, PublicationRole::Compact))
+        )
+        .unwrap(),
+        b"new-snapshot"
+    );
+
+    let second_name = "offsets-8.snapshot";
+    let second_temp = dir
+        .path()
+        .join(temp_file_name(second_name, PublicationRole::Compact));
+    write_bytes(&second_temp, b"existing-temp");
+    let error = super::fsio::write_file_atomically(
+        dir.path(),
+        second_name,
+        b"new-snapshot",
+        PublicationRole::Compact,
+        AtomicInstallMode::NoReplace,
+        &mut faults,
+        AtomicWriteFaults::SNAPSHOT,
+    )
+    .expect_err("the temporary-name collision is refused");
+    assert!(matches!(
+        error.error,
+        StoreError::Io { source, .. }
+            if source.kind() == std::io::ErrorKind::AlreadyExists
+    ));
+    assert_eq!(fs::read(second_temp).unwrap(), b"existing-temp");
+    assert!(!dir.path().join(second_name).exists());
 }
 
 /// Scenario: registering files, advancing progress, then reopening the
@@ -2440,18 +2507,59 @@ fn compaction_recovers_a_single_complete_generation_after_any_fault() {
         assert!(path.join(wal_file_name(expected_generation)).is_file());
         assert_eq!(
             reopened.recovery().removed_temp_files > 0,
-            matches!(
+            !matches!(
                 point,
-                FaultPoint::AfterSnapshotWrite
-                    | FaultPoint::AfterSnapshotSync
-                    | FaultPoint::AfterWalWrite
-                    | FaultPoint::AfterGenerationWalSync
-                    | FaultPoint::AfterMarkerWrite
-                    | FaultPoint::AfterMarkerSync
+                FaultPoint::BeforeSnapshotWrite
+                    | FaultPoint::AfterMarkerPublish
+                    | FaultPoint::BeforeMarkerDirSync
+                    | FaultPoint::AfterMarkerDirSync
             ),
             "unexpected temporary-file cleanup after a fault at {point}"
         );
     }
+}
+
+/// Scenario: compaction fails before marker publication after installing
+/// both proposed generation files, then retries on the same store handle.
+/// Guarantees: the retry first removes and syncs the exact abandoned proposal,
+/// reuses the unpublished number, and publishes one complete new generation.
+#[test]
+fn compaction_retry_cleans_the_exact_abandoned_proposal() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    let seeded = seeded_namespace(&path);
+    let mut store =
+        CheckpointStore::open_with_fault(options(&path), FaultPoint::BeforeMarkerWrite).unwrap();
+
+    assert!(matches!(
+        store
+            .compact()
+            .expect_err("the first marker write is faulted"),
+        StoreError::InjectedFault {
+            point: FaultPoint::BeforeMarkerWrite
+        }
+    ));
+    assert!(path.join(snapshot_file_name(1)).is_file());
+    assert!(path.join(wal_file_name(1)).is_file());
+
+    store
+        .compact()
+        .expect("the exact abandoned proposal is retried");
+    assert_eq!(store.generation(), 1);
+    assert_eq!(records(&store), seeded);
+    assert!(
+        !path
+            .join(temp_file_name(
+                &snapshot_file_name(1),
+                PublicationRole::Compact
+            ))
+            .exists()
+    );
+    assert!(
+        !path
+            .join(temp_file_name(&wal_file_name(1), PublicationRole::Compact))
+            .exists()
+    );
 }
 
 /// Scenario: creation of a namespace's first generation interrupted at each
@@ -2502,247 +2610,138 @@ fn initial_creation_recovers_a_complete_generation_after_any_fault() {
     }
 }
 
-/// Scenario: a namespace whose `CURRENT` marker was lost while it still held
-/// only its first generation, one whose marker was lost after it had been
-/// compacted, and one whose marker was lost after a compaction that left the
-/// newer generation incomplete while the older pair was still on disk.
-/// Guarantees: the highest complete snapshot/WAL pair is adopted only for a
-/// first-store namespace, where an interrupted creation is the sole way the
-/// marker can be absent; once a namespace has advanced past its first
-/// generation, a missing marker fails closed rather than guessing which
-/// generation was authoritative -- in particular it never falls back to a
-/// stale, still-present generation 0 just because the newer generation is
-/// incomplete, which would silently revert every transaction recorded since
-/// compaction.
+/// Scenario: `CURRENT` is absent while the namespace contains only the exact
+/// first-publication temporary/final names and the ownership lock.
+/// Guarantees: recovery removes that bounded set, syncs the namespace, and
+/// republishes a fresh empty generation zero instead of adopting any bytes.
 #[test]
-fn missing_marker_adopts_a_pair_only_for_a_first_store_namespace() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let first_store = dir.path().join("first-store");
-    let seeded = seeded_namespace(&first_store);
-    fs::remove_file(first_store.join(CURRENT_FILE_NAME)).expect("removes the marker");
-
-    let adopted = open(&first_store);
-    assert!(adopted.recovery().adopted_without_marker);
-    assert!(!adopted.recovery().created);
-    assert_eq!(adopted.generation(), 0);
-    assert_eq!(records(&adopted), seeded);
-    drop(adopted);
-
-    let compacted = dir.path().join("compacted");
-    let _seeded = seeded_namespace(&compacted);
-    let mut store = open(&compacted);
-    store.compact().expect("compaction succeeds");
-    drop(store);
-    fs::remove_file(compacted.join(CURRENT_FILE_NAME)).expect("removes the marker");
-
-    let error = CheckpointStore::open(options(&compacted)).expect_err("fails closed");
-    match error {
-        StoreError::MissingMarker {
-            highest_generation, ..
-        } => assert_eq!(highest_generation, 1),
-        other => panic!("expected a missing-marker failure, got {other:?}"),
-    }
-
-    // The newer generation is incomplete, so the only complete pair left is
-    // the retained generation 0. Adopting it would discard everything
-    // recorded since compaction.
-    for missing_half in [wal_file_name(1), snapshot_file_name(1)] {
-        let stale = dir.path().join(format!("stale-{missing_half}"));
-        let _seeded = seeded_namespace(&stale);
-        let mut store = open(&stale);
-        store.compact().expect("compaction succeeds");
-        let _progressed = store
-            .commit_progress(vec![progress(1, 4_096, 8_192)])
-            .expect("progress succeeds");
-        store.drain().expect("drain syncs");
-        drop(store);
-        fs::remove_file(stale.join(CURRENT_FILE_NAME)).expect("removes the marker");
-        fs::remove_file(stale.join(&missing_half)).expect("removes half of generation 1");
-
-        let error = CheckpointStore::open(options(&stale)).expect_err("fails closed");
-        match error {
-            StoreError::MissingMarker {
-                highest_generation, ..
-            } => assert_eq!(highest_generation, 1),
-            other => panic!("expected a missing-marker failure, got {other:?}"),
-        }
-    }
-}
-
-/// Scenario: `CURRENT` is missing during initial namespace creation after
-/// its checksum-valid generation-0 marker was left at `CURRENT.tmp`.
-/// Guarantees: recovery bounded-validates the temporary marker and target
-/// pair, adopts generation 0, and publishes that same evidence without first
-/// deleting the only surviving marker.
-#[test]
-fn missing_current_adopts_a_valid_authoritative_marker_temp() {
+fn markerless_exact_initial_publication_is_cleaned_and_restarted() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("namespace");
-    drop(open(&path));
-
-    fs::rename(
-        path.join(CURRENT_FILE_NAME),
-        path.join(CURRENT_TEMP_FILE_NAME),
-    )
-    .expect("simulates the authority-uncertain Windows postcondition");
+    let _seeded = seeded_namespace(&path);
+    fs::remove_file(path.join(CURRENT_FILE_NAME)).expect("removes CURRENT");
+    write_bytes(
+        &path.join(CURRENT_CREATE_TEMP_FILE_NAME),
+        b"untrusted marker bytes",
+    );
+    write_bytes(
+        &path.join(temp_file_name(
+            &snapshot_file_name(0),
+            PublicationRole::Create,
+        )),
+        b"partial snapshot",
+    );
 
     let reopened = open(&path);
+    assert!(reopened.recovery().created);
     assert_eq!(reopened.generation(), 0);
-    assert!(reopened.recovery().adopted_without_marker);
     assert!(reopened.table().is_empty());
     assert!(path.join(CURRENT_FILE_NAME).is_file());
-    assert!(!path.join(CURRENT_TEMP_FILE_NAME).exists());
+    assert!(!path.join(CURRENT_CREATE_TEMP_FILE_NAME).exists());
+    assert!(
+        !path
+            .join(temp_file_name(
+                &snapshot_file_name(0),
+                PublicationRole::Create
+            ))
+            .exists()
+    );
 }
 
-/// Scenario: an audited namespace reset jumps from generation 1 to 10 while
-/// retaining generation 0, and an authority-uncertain replacement leaves
-/// CURRENT absent with generation 1 in CURRENT.bak and 10 in CURRENT.tmp.
-/// Guarantees: recovery accepts the complete strictly-highest reset
-/// generation without requiring consecutive numbering or deleting retained
-/// evidence.
+/// Scenario: `CURRENT` is absent and the directory also contains either an
+/// unrelated name or a later-generation artifact.
+/// Guarantees: recovery preserves every byte and reports ambiguous authority
+/// instead of adopting, deleting, or recreating the namespace.
 #[test]
-fn missing_current_adopts_a_nonconsecutive_admin_reset_marker_temp() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().join("namespace");
-    let _ = seeded_namespace(&path);
-    let mut store = open(&path);
-    store.compact().expect("generation 1 publishes");
-    assert_eq!(store.generation(), 1);
-    drop(store);
+fn markerless_unrecognized_artifacts_fail_closed_without_cleanup() {
+    for extra_name in ["notes.txt".to_owned(), snapshot_file_name(1)] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("namespace");
+        drop(open(&path));
+        fs::remove_file(path.join(CURRENT_FILE_NAME)).expect("removes CURRENT");
+        write_bytes(&path.join(&extra_name), b"evidence");
+        let before = fs::read_dir(&path)
+            .expect("namespace lists")
+            .map(|entry| entry.expect("entry reads").file_name())
+            .collect::<BTreeSet<_>>();
 
-    fs::write(
-        path.join(snapshot_file_name(10)),
-        encode_snapshot(10, NAMESPACE_ID, &[]).expect("empty reset snapshot encodes"),
-    )
-    .expect("reset snapshot writes");
-    fs::write(
-        path.join(wal_file_name(10)),
-        encode_wal(10, NAMESPACE_ID, &[]).expect("empty reset WAL encodes"),
-    )
-    .expect("reset WAL writes");
-    fs::rename(
-        path.join(CURRENT_FILE_NAME),
-        path.join(CURRENT_BACKUP_FILE_NAME),
-    )
-    .expect("old marker moves to backup");
-    fs::write(path.join(CURRENT_TEMP_FILE_NAME), encode_current_marker(10))
-        .expect("new marker remains temporary");
-
-    let reopened = open(&path);
-    assert_eq!(reopened.generation(), 10);
-    assert!(reopened.table().is_empty());
-    assert!(path.join(snapshot_file_name(0)).is_file());
-    assert!(path.join(wal_file_name(0)).is_file());
-    assert!(path.join(snapshot_file_name(1)).is_file());
-    assert!(path.join(wal_file_name(1)).is_file());
+        assert!(matches!(
+            CheckpointStore::open(options(&path)).expect_err("authority is ambiguous"),
+            StoreError::AuthorityMissingOrAmbiguous { .. }
+        ));
+        let after = fs::read_dir(&path)
+            .expect("namespace lists")
+            .map(|entry| entry.expect("entry reads").file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(after, before);
+    }
 }
 
-/// Scenario: the exact Windows error-1177 postcondition leaves the old
-/// marker under `CURRENT.bak`, the new marker under `CURRENT.tmp`, and no
-/// `CURRENT`, while both consecutive generation pairs remain complete.
-/// Guarantees: recovery validates the deterministic backup as the target's
-/// predecessor, adopts the replacement, and removes both bounded recovery
-/// names after restoring `CURRENT`.
+/// Scenario: valid `CURRENT` selects generation one while exact stale create
+/// and next-generation compact temporaries remain.
+/// Guarantees: recovery validates current authority first, removes only those
+/// recognized abandoned publication artifacts, and preserves all other files.
 #[test]
-fn missing_current_resolves_a_valid_windows_backup_postcondition() {
+fn valid_current_cleans_only_exact_abandoned_publication_artifacts() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("namespace");
     let seeded = seeded_namespace(&path);
     let mut store = open(&path);
     store.compact().expect("compaction succeeds");
     drop(store);
-
-    fs::rename(
-        path.join(CURRENT_FILE_NAME),
-        path.join(CURRENT_TEMP_FILE_NAME),
-    )
-    .expect("new marker moves back to its replacement name");
-    write_bytes(
-        &path.join(CURRENT_BACKUP_FILE_NAME),
-        &encode_current_marker(0),
-    );
+    for name in [
+        CURRENT_CREATE_TEMP_FILE_NAME.to_owned(),
+        CURRENT_COMPACT_TEMP_FILE_NAME.to_owned(),
+        temp_file_name(&snapshot_file_name(0), PublicationRole::Create),
+        temp_file_name(&wal_file_name(0), PublicationRole::Create),
+        snapshot_file_name(2),
+        wal_file_name(2),
+        temp_file_name(&snapshot_file_name(2), PublicationRole::Compact),
+        temp_file_name(&wal_file_name(2), PublicationRole::Compact),
+    ] {
+        write_bytes(&path.join(name), b"stale");
+    }
+    write_bytes(&path.join("notes.tmp"), b"unrelated");
 
     let reopened = open(&path);
     assert_eq!(reopened.generation(), 1);
     assert_eq!(records(&reopened), seeded);
-    assert!(path.join(CURRENT_FILE_NAME).is_file());
-    assert!(!path.join(CURRENT_TEMP_FILE_NAME).exists());
-    assert!(!path.join(CURRENT_BACKUP_FILE_NAME).exists());
+    assert_eq!(reopened.recovery().removed_temp_files, 8);
+    assert!(path.join("notes.tmp").is_file());
 }
 
-/// Scenario: a compacted namespace has consecutive complete generations and
-/// a successor marker at `CURRENT.tmp`, but no `CURRENT` or deterministic
-/// predecessor backup.
-/// Guarantees: recovery does not infer successor authority from generation
-/// files alone, because the temporary generation may predate later writes to
-/// the missing predecessor marker's generation.
+/// Scenario: a valid namespace contains a case-only alias of the proposed
+/// generation snapshot name.
+/// Guarantees: cleanup rejects the alias before deleting anything, preventing
+/// canonical-path deletion on case-insensitive filesystems.
 #[test]
-fn missing_current_rejects_a_backup_less_successor_marker() {
+fn publication_cleanup_rejects_noncanonical_case_aliases() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("namespace");
-    let mut store = open(&path);
-    store.compact().expect("compaction succeeds");
-    drop(store);
-    fs::rename(
-        path.join(CURRENT_FILE_NAME),
-        path.join(CURRENT_TEMP_FILE_NAME),
-    )
-    .expect("successor marker moves back to its temporary name");
+    drop(open(&path));
+    let alias = path.join("OFFSETS-1.SNAPSHOT");
+    write_bytes(&alias, b"case alias");
 
     assert!(matches!(
-        CheckpointStore::open(options(&path))
-            .expect_err("a successor without predecessor evidence is ambiguous"),
-        StoreError::MissingMarker {
-            highest_generation: 1,
-            ..
-        }
+        CheckpointStore::open(options(&path)).expect_err("case alias is rejected"),
+        StoreError::UnsafeFilesystemObject { .. }
     ));
-    assert!(path.join(CURRENT_TEMP_FILE_NAME).is_file());
+    assert_eq!(fs::read(alias).expect("alias survives"), b"case alias");
+    assert!(path.join(CURRENT_FILE_NAME).is_file());
 }
 
-/// Scenario: a valid `CURRENT` selects a complete generation while a
-/// checksum-valid stale `CURRENT.tmp` names the previous complete
-/// generation.
-/// Guarantees: the fully validated `CURRENT` remains authoritative and the
-/// stale marker temp is removed only after its selected pair has loaded.
+/// Scenario: `CURRENT` is corrupt while an exact compact marker temporary
+/// remains.
+/// Guarantees: authoritative corruption fails closed before cleanup and the
+/// temporary evidence remains byte-identical.
 #[test]
-fn valid_current_wins_over_a_conflicting_marker_temp() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().join("namespace");
-    let seeded = seeded_namespace(&path);
-    let mut store = open(&path);
-    store.compact().expect("compaction succeeds");
-    drop(store);
-    write_bytes(
-        &path.join(CURRENT_TEMP_FILE_NAME),
-        &encode_current_marker(0),
-    );
-    write_bytes(
-        &path.join(CURRENT_BACKUP_FILE_NAME),
-        &encode_current_marker(0),
-    );
-
-    let reopened = open(&path);
-    assert_eq!(reopened.generation(), 1);
-    assert_eq!(records(&reopened), seeded);
-    assert_eq!(reopened.recovery().removed_temp_files, 2);
-    assert!(!path.join(CURRENT_TEMP_FILE_NAME).exists());
-    assert!(!path.join(CURRENT_BACKUP_FILE_NAME).exists());
-}
-
-/// Scenario: `CURRENT` is present but corrupt while `CURRENT.tmp` is a
-/// checksum-valid marker for a complete generation.
-/// Guarantees: recovery never falls back from corrupt authoritative state
-/// to a temporary candidate, and preserves the candidate for diagnosis
-/// rather than deleting evidence before authority is established.
-#[test]
-fn corrupt_current_does_not_fall_back_to_or_delete_marker_temp() {
+fn corrupt_current_preserves_publication_temporary_evidence() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("namespace");
     drop(open(&path));
     write_bytes(
-        &path.join(CURRENT_TEMP_FILE_NAME),
-        &encode_current_marker(0),
+        &path.join(CURRENT_COMPACT_TEMP_FILE_NAME),
+        b"temporary evidence",
     );
     let marker_path = path.join(CURRENT_FILE_NAME);
     let mut marker = fs::read(&marker_path).expect("CURRENT reads");
@@ -2756,144 +2755,10 @@ fn corrupt_current_does_not_fall_back_to_or_delete_marker_temp() {
             ..
         }
     ));
-    assert!(path.join(CURRENT_TEMP_FILE_NAME).is_file());
-}
-
-/// Scenario: `CURRENT` is missing and `CURRENT.tmp` exceeds the bounded
-/// marker read limit while a complete initial generation remains on disk.
-/// Guarantees: startup rejects the temporary marker before buffering or
-/// decoding it and preserves the oversized evidence instead of falling
-/// back to the otherwise recoverable pair.
-#[test]
-fn missing_current_bounded_reads_the_marker_temp() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().join("namespace");
-    drop(open(&path));
-    fs::remove_file(path.join(CURRENT_FILE_NAME)).expect("removes CURRENT");
-    write_bytes(
-        &path.join(CURRENT_TEMP_FILE_NAME),
-        &vec![0; super::MARKER_READ_MAX_BYTES as usize + 1],
+    assert_eq!(
+        fs::read(path.join(CURRENT_COMPACT_TEMP_FILE_NAME)).expect("temp reads"),
+        b"temporary evidence"
     );
-
-    assert!(matches!(
-        CheckpointStore::open(options(&path)).expect_err("oversized marker temp fails closed"),
-        StoreError::FileTooLarge {
-            artifact: "CURRENT temporary marker",
-            len,
-            max,
-            ..
-        } if len == super::MARKER_READ_MAX_BYTES + 1 && max == super::MARKER_READ_MAX_BYTES
-    ));
-    assert!(path.join(CURRENT_TEMP_FILE_NAME).is_file());
-}
-
-/// Scenario: `CURRENT` is missing and a checksum-valid `CURRENT.tmp` names
-/// generation 0 even though a later complete generation is also present.
-/// Guarantees: an arbitrary stale marker temp is not adopted from an
-/// ambiguous layout; recovery fails closed and preserves the evidence.
-#[test]
-fn missing_current_rejects_an_ambiguous_stale_marker_temp() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().join("namespace");
-    let mut store = open(&path);
-    store.compact().expect("compaction succeeds");
-    drop(store);
-    fs::remove_file(path.join(CURRENT_FILE_NAME)).expect("removes CURRENT");
-    write_bytes(
-        &path.join(CURRENT_TEMP_FILE_NAME),
-        &encode_current_marker(0),
-    );
-
-    assert!(matches!(
-        CheckpointStore::open(options(&path)).expect_err("ambiguous marker temp fails closed"),
-        StoreError::MissingMarker {
-            highest_generation: 1,
-            ..
-        }
-    ));
-    assert!(path.join(CURRENT_TEMP_FILE_NAME).is_file());
-}
-
-/// Scenario: `CURRENT` and `CURRENT.tmp` are absent but a deterministic
-/// Windows replacement backup remains beside a complete generation pair.
-/// Guarantees: recovery does not guess that the backup is authoritative,
-/// fails closed, and preserves the marker evidence for diagnosis.
-#[test]
-fn missing_current_does_not_adopt_a_backup_without_its_replacement() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().join("namespace");
-    drop(open(&path));
-    fs::rename(
-        path.join(CURRENT_FILE_NAME),
-        path.join(CURRENT_BACKUP_FILE_NAME),
-    )
-    .expect("CURRENT becomes the isolated backup");
-
-    assert!(matches!(
-        CheckpointStore::open(options(&path)).expect_err("backup-only authority is ambiguous"),
-        StoreError::MissingMarker {
-            highest_generation: 0,
-            ..
-        }
-    ));
-    assert!(path.join(CURRENT_BACKUP_FILE_NAME).is_file());
-}
-
-/// Scenario: a marker-less namespace whose initial generation is missing one
-/// half of its pair, once where the surviving half is empty and once where
-/// it already holds durable transactions.
-/// Guarantees: an interrupted creation (both halves empty) is recreated,
-/// while a pair whose surviving half carries state fails closed instead of
-/// being silently replaced by an empty generation.
-#[test]
-fn missing_marker_with_an_incomplete_initial_pair_only_recreates_empty_state() {
-    let dir = tempfile::tempdir().expect("temp dir");
-
-    let interrupted = dir.path().join("interrupted");
-    drop(open(&interrupted));
-    fs::remove_file(interrupted.join(CURRENT_FILE_NAME)).expect("removes the marker");
-    fs::remove_file(interrupted.join(wal_file_name(0))).expect("removes the WAL");
-
-    let recreated = open(&interrupted);
-    assert!(recreated.recovery().created);
-    assert_eq!(recreated.generation(), 0);
-    assert_eq!(recreated.table().len(), 0);
-    assert!(interrupted.join(CURRENT_FILE_NAME).is_file());
-    assert!(interrupted.join(wal_file_name(0)).is_file());
-    drop(recreated);
-
-    let populated = dir.path().join("populated");
-    let _seeded = seeded_namespace(&populated);
-    fs::remove_file(populated.join(CURRENT_FILE_NAME)).expect("removes the marker");
-    fs::remove_file(populated.join(snapshot_file_name(0))).expect("removes the snapshot");
-
-    let error = CheckpointStore::open(options(&populated)).expect_err("fails closed");
-    match error {
-        StoreError::IncompleteInitialGeneration { reason, .. } => {
-            assert_eq!(reason, "its WAL already holds transactions");
-        }
-        other => panic!("expected an incomplete initial generation, got {other:?}"),
-    }
-}
-
-/// Scenario: a marker-less first-store namespace whose complete pair is
-/// corrupt.
-/// Guarantees: adopting a pair without a marker still validates it in full,
-/// so a damaged pair fails closed instead of being adopted as authoritative.
-#[test]
-fn missing_marker_still_validates_the_adopted_pair() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().join("namespace");
-    let _seeded = seeded_namespace(&path);
-    fs::remove_file(path.join(CURRENT_FILE_NAME)).expect("removes the marker");
-
-    let snapshot_path = path.join(snapshot_file_name(0));
-    let mut bytes = fs::read(&snapshot_path).expect("snapshot reads");
-    bytes[10] ^= 0xFF;
-    write_bytes(&snapshot_path, &bytes);
-
-    let error = CheckpointStore::open(options(&path)).expect_err("fails closed");
-    assert!(matches!(error, StoreError::Decode { .. }));
 }
 
 /// Scenario: a retention pass over a namespace holding an idle active
@@ -3075,32 +2940,28 @@ fn namespace_files_are_not_group_or_world_accessible() {
     );
 }
 
-/// Scenario: opening a namespace that contains abandoned temporary files
-/// from an interrupted write alongside unrelated files.
-/// Guarantees: recovery removes exactly the temporary names this store
-/// writes and nothing else -- unrelated `.tmp` files, the marker, the live
-/// generation pair, and the ownership lock all survive.
+/// Scenario: valid generation zero has every exact stale create temporary and
+/// proposed-generation compact temporary alongside unrelated files.
+/// Guarantees: recovery removes only the role-correct abandoned names; foreign
+/// `.tmp` files, authority, and the ownership lock survive.
 #[test]
 fn temporary_file_cleanup_removes_only_this_namespace_temporaries() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("namespace");
     drop(open(&path));
 
-    let mut owned = vec![
-        temp_file_name(CURRENT_FILE_NAME),
-        backup_file_name(CURRENT_FILE_NAME),
+    let owned = [
+        CURRENT_CREATE_TEMP_FILE_NAME.to_owned(),
+        CURRENT_COMPACT_TEMP_FILE_NAME.to_owned(),
+        temp_file_name(&snapshot_file_name(0), PublicationRole::Create),
+        temp_file_name(&wal_file_name(0), PublicationRole::Create),
+        temp_file_name(&snapshot_file_name(1), PublicationRole::Compact),
+        temp_file_name(&wal_file_name(1), PublicationRole::Compact),
     ];
-    for generation in 1..=MAX_GENERATIONS_ON_DISK as u64 {
-        for final_name in [snapshot_file_name(generation), wal_file_name(generation)] {
-            owned.push(temp_file_name(&final_name));
-            owned.push(backup_file_name(&final_name));
-        }
-    }
-    assert_eq!(owned.len(), MAX_TEMP_FILES);
     let foreign = [
         "unrelated.tmp".to_owned(),
-        "offsets-x.snapshot.tmp".to_owned(),
-        "offsets-03.wal.tmp".to_owned(),
+        "offsets-x.snapshot.compact.tmp".to_owned(),
+        "offsets-03.wal.compact.tmp".to_owned(),
         "CURRENT.tmp.keep".to_owned(),
         "notes.txt".to_owned(),
     ];
@@ -3122,8 +2983,8 @@ fn temporary_file_cleanup_removes_only_this_namespace_temporaries() {
     assert!(path.join(OWNERSHIP_LOCK_FILE_NAME).is_file());
 }
 
-/// Scenario: a namespace contains one more recognized abandoned temporary
-/// artifact than bounded recovery cleanup permits.
+/// Scenario: a namespace contains one more recognized role-specific
+/// temporary artifact than bounded recovery permits.
 /// Guarantees: opening fails before deleting any candidate, so an
 /// adversarial directory cannot turn one open into unbounded cleanup work
 /// or make repeated opens erase an unbounded population in chunks.
@@ -3134,13 +2995,12 @@ fn excessive_temporary_file_population_is_rejected_without_cleanup() {
     drop(open(&path));
 
     let mut names = vec![
-        temp_file_name(CURRENT_FILE_NAME),
-        backup_file_name(CURRENT_FILE_NAME),
+        CURRENT_CREATE_TEMP_FILE_NAME.to_owned(),
+        CURRENT_COMPACT_TEMP_FILE_NAME.to_owned(),
     ];
     for generation in 0..MAX_GENERATIONS_ON_DISK as u64 + 1 {
         for final_name in [snapshot_file_name(generation), wal_file_name(generation)] {
-            names.push(temp_file_name(&final_name));
-            names.push(backup_file_name(&final_name));
+            names.push(temp_file_name(&final_name, PublicationRole::Compact));
         }
     }
     names.truncate(MAX_TEMP_FILES + 1);
@@ -3160,11 +3020,10 @@ fn excessive_temporary_file_population_is_rejected_without_cleanup() {
     );
 }
 
-/// Scenario: a namespace has exactly the maximum recognized generation
-/// population and then one generation beyond it.
-/// Guarantees: the compatibility allowance opens and can be cleaned, while
-/// the first excess generation fails with an explicit population error and
-/// unrelated directory entries remain ignored.
+/// Scenario: valid generation zero is accompanied by two unpublished future
+/// generations, then by a population above the hard inventory bound.
+/// Guarantees: more than the single next proposal is ambiguous and preserved;
+/// an over-bound population fails before any cleanup.
 #[test]
 fn excessive_generation_population_is_rejected() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3175,15 +3034,12 @@ fn excessive_generation_population_is_rejected() {
     }
     write_bytes(&path.join("unrelated.snapshot"), b"ignored");
 
-    let mut accepted = open(&path);
-    assert_eq!(accepted.retired_generations(), [1, 2]);
-    assert_eq!(
-        accepted
-            .cleanup_retired_generations()
-            .expect("the bounded population is cleaned"),
-        2
-    );
-    drop(accepted);
+    assert!(matches!(
+        CheckpointStore::open(options(&path)).expect_err("future authority is ambiguous"),
+        StoreError::AuthorityMissingOrAmbiguous { .. }
+    ));
+    assert!(path.join(snapshot_file_name(1)).is_file());
+    assert!(path.join(snapshot_file_name(2)).is_file());
 
     for generation in 1..=MAX_GENERATIONS_ON_DISK as u64 {
         write_bytes(&path.join(snapshot_file_name(generation)), b"not selected");
@@ -3349,7 +3205,7 @@ fn cancelled_namespace_waiter_never_acquires_or_mutates_after_release() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("namespace");
     let owner = open(&path);
-    let stale_temp = path.join(temp_file_name(CURRENT_FILE_NAME));
+    let stale_temp = path.join(CURRENT_COMPACT_TEMP_FILE_NAME);
     write_bytes(&stale_temp, b"stale");
     let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let waiter_cancelled = std::sync::Arc::clone(&cancelled);
@@ -3919,12 +3775,14 @@ fn namespace_creation_cancellation_stops_between_directories() {
     let first = dir.path().join("first");
     let namespace = first.join("namespace");
     let mut cancellation_checks = 0usize;
+    let mut faults = FaultPlan::disabled();
 
-    let result = super::fsio::create_namespace_dir_cancellable(&namespace, &mut || {
-        cancellation_checks += 1;
-        first.is_dir()
-    })
-    .expect("cancellation is not a namespace creation error");
+    let result =
+        super::fsio::create_namespace_dir_cancellable(&namespace, &mut faults, &mut || {
+            cancellation_checks += 1;
+            first.is_dir()
+        })
+        .expect("cancellation is not a namespace creation error");
 
     assert!(result.is_none());
     assert!(cancellation_checks > 0);
@@ -4100,7 +3958,7 @@ fn windows_compaction_atomically_replaces_current() {
         .expect("registers");
     store.compact().expect("CURRENT replacement succeeds");
     assert_eq!(store.generation(), 1);
-    assert!(!path.join(CURRENT_BACKUP_FILE_NAME).exists());
+    assert!(!path.join(CURRENT_COMPACT_TEMP_FILE_NAME).exists());
     drop(store);
 
     let reopened = open(&path);
@@ -4108,11 +3966,10 @@ fn windows_compaction_atomically_replaces_current() {
     assert_eq!(reopened.table().len(), 1);
 }
 
-/// Scenario: Windows reports each documented `ReplaceFileW` failure class
-/// while a deterministic backup name is supplied.
-/// Guarantees: only error 1177 is authority-uncertain; errors 1175 and 1176
-/// retain the original names and remain retryable against the current
-/// generation.
+/// Scenario: Windows reports each documented `ReplaceFileW` partial-progress
+/// failure class while no non-normative backup artifact is used.
+/// Guarantees: every class that may have removed or renamed `CURRENT` is
+/// treated as authority-uncertain; an ordinary access denial is not.
 #[cfg(windows)]
 #[test]
 fn windows_replace_failure_classifies_uncertain_authority() {
@@ -4121,13 +3978,13 @@ fn windows_replace_failure_classifies_uncertain_authority() {
         ERROR_UNABLE_TO_REMOVE_REPLACED,
     };
 
-    assert!(!super::fsio::windows_replace_failure_may_have_changed(
+    assert!(super::fsio::windows_replace_failure_may_have_changed(
         i32::try_from(ERROR_UNABLE_TO_MOVE_REPLACEMENT).ok()
     ));
     assert!(super::fsio::windows_replace_failure_may_have_changed(
         i32::try_from(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2).ok()
     ));
-    assert!(!super::fsio::windows_replace_failure_may_have_changed(
+    assert!(super::fsio::windows_replace_failure_may_have_changed(
         i32::try_from(ERROR_UNABLE_TO_REMOVE_REPLACED).ok()
     ));
     assert!(!super::fsio::windows_replace_failure_may_have_changed(

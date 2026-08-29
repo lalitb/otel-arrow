@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Deterministic fault injection at every persistence boundary of
-//! generation creation, compaction, live WAL appends, torn-tail repair, and
-//! retired-generation cleanup.
+//! namespace-parent creation, generation publication, compaction, live WAL
+//! appends, torn-tail repair, and retired-generation cleanup.
 //!
 //! A [`FaultPlan`] belongs to exactly one [`super::CheckpointStore`]
 //! instance; it is not a global, a thread-local, or an environment switch,
@@ -25,19 +25,31 @@ use std::fmt;
 use super::error::StoreError;
 
 /// One persistence boundary of the durable sequences the store performs:
-/// publishing a generation ([`FaultPoint::PUBLICATION`]), appending and
-/// syncing its live WAL ([`FaultPoint::WAL_DURABILITY`]), repairing a torn
-/// tail ([`FaultPoint::TORN_TAIL_REPAIR`]), and removing a retired one
+/// syncing namespace parents ([`FaultPoint::NAMESPACE_CREATION`]), publishing
+/// a generation ([`FaultPoint::PUBLICATION`]), appending and syncing its live
+/// WAL ([`FaultPoint::WAL_DURABILITY`]), repairing a torn tail
+/// ([`FaultPoint::TORN_TAIL_REPAIR`]), and removing a retired one
 /// ([`FaultPoint::CLEANUP`]).
 ///
 /// The publication boundaries are ordered exactly as the durable sequence
 /// executes them, and every artifact is written to a same-directory
-/// temporary file,
-/// synced, and then atomically renamed into place, so a fault at any single
-/// boundary leaves either the complete old generation or the complete new
-/// generation reachable, never a mixture.
+/// role-specific temporary file, synced, and then atomically installed, so a
+/// fault at any single boundary leaves either the complete old generation or
+/// the complete new generation reachable, never a mixture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FaultPoint {
+    /// Before syncing `engine.state_dir` after opening or creating `filelog`.
+    BeforeFilelogParentSync,
+    /// After syncing `engine.state_dir` for the `filelog` entry.
+    AfterFilelogParentSync,
+    /// Before syncing `filelog` after opening or creating `@v1`.
+    BeforeVersionParentSync,
+    /// After syncing `filelog` for the `@v1` entry.
+    AfterVersionParentSync,
+    /// Before syncing `@v1` after opening or creating the namespace.
+    BeforeNamespaceParentSync,
+    /// After syncing `@v1` for the namespace entry.
+    AfterNamespaceParentSync,
     /// Before the snapshot temporary file is created.
     BeforeSnapshotWrite,
     /// After the snapshot bytes are written, before they are synced.
@@ -99,6 +111,16 @@ pub enum FaultPoint {
 }
 
 impl FaultPoint {
+    /// Every required parent-directory durability boundary.
+    pub const NAMESPACE_CREATION: [FaultPoint; 6] = [
+        FaultPoint::BeforeFilelogParentSync,
+        FaultPoint::AfterFilelogParentSync,
+        FaultPoint::BeforeVersionParentSync,
+        FaultPoint::AfterVersionParentSync,
+        FaultPoint::BeforeNamespaceParentSync,
+        FaultPoint::AfterNamespaceParentSync,
+    ];
+
     /// Every boundary of the generation-publication sequence, in the order
     /// it executes them.
     pub const PUBLICATION: [FaultPoint; 16] = [
@@ -147,6 +169,12 @@ impl FaultPoint {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            FaultPoint::BeforeFilelogParentSync => "before_filelog_parent_sync",
+            FaultPoint::AfterFilelogParentSync => "after_filelog_parent_sync",
+            FaultPoint::BeforeVersionParentSync => "before_version_parent_sync",
+            FaultPoint::AfterVersionParentSync => "after_version_parent_sync",
+            FaultPoint::BeforeNamespaceParentSync => "before_namespace_parent_sync",
+            FaultPoint::AfterNamespaceParentSync => "after_namespace_parent_sync",
             FaultPoint::BeforeSnapshotWrite => "before_snapshot_write",
             FaultPoint::AfterSnapshotWrite => "after_snapshot_write",
             FaultPoint::AfterSnapshotSync => "after_snapshot_sync",

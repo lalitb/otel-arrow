@@ -1,0 +1,16 @@
+# One of 'breaking', 'deprecation', 'new_component', 'enhancement', 'bug_fix'
+change_type: bug_fix
+
+# The broad Rust component affected by this change.
+component: pipeline
+
+# A brief description of the user-visible change.
+note: Harden filelog checkpoint creation and compaction against namespace and publication crashes.
+
+# Tracking issue for the Phase 1 filelog receiver.
+issues: [2844]
+
+# Additional operator-facing context.
+subtext: |
+  Publication now syncs namespace parents, uses role-specific temporary names,
+  and never replaces an existing snapshot or WAL generation artifact.
