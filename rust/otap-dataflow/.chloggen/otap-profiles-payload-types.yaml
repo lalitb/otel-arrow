@@ -1,6 +1,6 @@
 change_type: enhancement
 component: otap
 note: "Declare OTAP payload types for the OpenTelemetry Profiles signal."
-issues: []
+issues: [2303]
 subtext: >-
   Pins the Alpha Profiles protobuf model used by the Rust dataflow implementation.

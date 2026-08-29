@@ -12,7 +12,8 @@
 
 The OTAP exporter sends OTAP Arrow payloads over gRPC streams to an
 OTAP-compatible receiver. It maintains independent per-signal stream tasks and
-correlates stream responses back to upstream ACK/NACK handling.
+correlates stream responses back to upstream ACK/NACK handling. Logs, metrics,
+traces, and Profiles each use their signal-specific OTAP service.
 
 ## Getting Started
 
@@ -151,6 +152,9 @@ unbounded telemetry state. Duration measurements are reported in seconds.
     the OTLP/gRPC exporter, which rebuilds metadata per unary request.
 - Compression values are limited to the variants supported by the shared OTAP
   transport layer.
+- Non-retryable OTAP batch and stream statuses produce permanent upstream NACKs.
+- Shutdown resolves correlated, queued, and pending batches instead of dropping
+  accepted pdata.
 - End-to-end delivery depends on downstream OTAP stream responses.
 
 ## Related Docs

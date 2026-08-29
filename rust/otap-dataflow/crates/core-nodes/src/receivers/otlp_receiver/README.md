@@ -11,8 +11,8 @@
 ## Overview
 
 The OTLP receiver accepts OTLP/gRPC, OTLP/HTTP, or both. It forwards received
-logs, metrics, and traces into the pipeline as pdata and can wait for immediate
-downstream ACK/NACK outcomes before responding to clients.
+logs, metrics, traces, and Profiles into the pipeline as pdata and can wait for
+immediate downstream ACK/NACK outcomes before responding to clients.
 
 ## Getting Started
 
@@ -142,9 +142,9 @@ never measurement attributes. Protocol-specific enforced rejections remain in
 | --- | --- | --- | --- |
 | `receiver.otlp.transport.errors` | `{error}` | `protocol` | Number of transport-level server errors. |
 
-Attribute values are bounded: `signal` is `traces`, `metrics`, or `logs`;
-`protocol` is `grpc` or `http`; `outcome` is `success`, `failure`, or
-`refused`; and `error.type` is `memory_pressure`, `concurrency_limit`,
+Attribute values are bounded: `signal` is `traces`, `metrics`, `logs`, or
+`profiles`; `protocol` is `grpc` or `http`; `outcome` is `success`, `failure`,
+or `refused`; and `error.type` is `memory_pressure`, `concurrency_limit`,
 `rate_limit`, `payload_too_large`, `invalid_request`, or `internal`.
 
 ### Events
@@ -161,6 +161,9 @@ Attribute values are bounded: `signal` is `traces`, `metrics`, or `logs`;
 - At least one of `protocols.grpc` or `protocols.http` is required.
 - HTTP request body limits apply to both compressed and decompressed payload
   size.
+- OTLP/HTTP accepts protobuf Profiles requests at
+  `POST /v1development/profiles`; OTLP/gRPC uses the standard experimental
+  Profiles service.
 - V1 rate limiting measures decompressed request bytes. A request larger than
   the configured burst is rejected as non-retryable while pressure gating is
   active: HTTP returns 413 without `Retry-After`, and gRPC sends negative retry

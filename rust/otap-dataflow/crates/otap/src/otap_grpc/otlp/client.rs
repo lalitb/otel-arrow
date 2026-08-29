@@ -12,6 +12,7 @@ use bytes::Bytes;
 use http::uri::PathAndQuery;
 use otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceResponse;
 use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceResponse;
+use otel_arrow_dfe_pdata::proto::opentelemetry::collector::profiles::v1development::ExportProfilesServiceResponse;
 use otel_arrow_dfe_pdata::proto::opentelemetry::collector::trace::v1::ExportTraceServiceResponse;
 use prost::Message;
 use prost::bytes::BufMut;
@@ -201,6 +202,14 @@ impl ServiceDescriptor for TraceServiceDescriptor {
     const SERVICE_NAME: &str = super::TRACE_SERVICE_NAME;
 }
 
+/// descriptor of ProfilesService
+pub struct ProfilesServiceDescriptor {}
+
+impl ServiceDescriptor for ProfilesServiceDescriptor {
+    const EXPORT_PATH: &str = super::PROFILES_SERVICE_EXPORT_PATH;
+    const SERVICE_NAME: &str = super::PROFILES_SERVICE_NAME;
+}
+
 /// Implementation of OTLP Logs Service client that can accept and send pre-serialized requests
 pub type LogsServiceClient<T> =
     OtlpServiceClient<T, ExportLogsServiceResponse, LogsServiceDescriptor>;
@@ -212,3 +221,7 @@ pub type MetricsServiceClient<T> =
 /// Implementation of OTLP Traces Service client that can accept and send pre-serialized requests
 pub type TraceServiceClient<T> =
     OtlpServiceClient<T, ExportTraceServiceResponse, TraceServiceDescriptor>;
+
+/// Implementation of OTLP Profiles Service client that can accept pre-serialized requests
+pub type ProfilesServiceClient<T> =
+    OtlpServiceClient<T, ExportProfilesServiceResponse, ProfilesServiceDescriptor>;

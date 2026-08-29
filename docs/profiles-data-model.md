@@ -1,10 +1,12 @@
 # OTAP Profiles Data Model Proposal
 
+<!-- markdownlint-disable MD060 -->
+
 ## Status
 
-This document proposes an Apache Arrow representation for the OpenTelemetry
-Profiles signal. It is a design proposal, not an implemented or stable OTAP
-schema.
+This document defines the experimental Apache Arrow representation implemented
+by the stacked OTAP Profiles work. The schema and transport remain unstable
+while the upstream Profiles signal is Alpha.
 
 The proposal targets the Alpha
 `opentelemetry.proto.profiles.v1development` model as it exists at the time of
@@ -862,6 +864,13 @@ batch processor must either:
 
 The initial implementation should prefer bounded separate messages until the
 merge path is implemented and benchmarked.
+
+The Rust transport exposes Profiles through the experimental OTLP Profiles
+gRPC service, `POST /v1development/profiles`, and the signal-specific OTAP
+`ArrowProfilesService`. OTLP requests and OTAP BARs retain their original
+message boundaries across these paths. OTAP-to-OTLP export conservatively
+preflights dictionary expansion and protobuf allocation before reconstructing
+the complete request.
 
 Admission control must account for all Arrow buffers retained by a Profiles
 payload, including validity bitmaps, offsets, values, dictionaries, and any

@@ -10,9 +10,9 @@
 
 ## Overview
 
-The OTLP gRPC exporter sends logs, metrics, and traces as unary OTLP export
-requests. It converts OTAP records to OTLP protobuf bytes when needed and
-propagates request success or failure back into the dataflow ACK/NACK path.
+The OTLP gRPC exporter sends logs, metrics, traces, and Profiles as unary OTLP
+export requests. It converts OTAP records to OTLP protobuf bytes when needed
+and propagates request success or failure back into the dataflow ACK/NACK path.
 
 ## Getting Started
 

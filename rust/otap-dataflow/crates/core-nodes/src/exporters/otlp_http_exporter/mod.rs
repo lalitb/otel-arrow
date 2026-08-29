@@ -44,6 +44,7 @@ use otel_arrow_dfe_engine::{ConsumerEffectHandlerExtension, ExporterFactory};
 use otel_arrow_dfe_pdata::TryIntoWithOptions;
 use otel_arrow_dfe_pdata::otlp::logs::LogsProtoBytesEncoder;
 use otel_arrow_dfe_pdata::otlp::metrics::MetricsProtoBytesEncoder;
+use otel_arrow_dfe_pdata::otlp::profiles::ProfilesProtoBytesEncoder;
 use otel_arrow_dfe_pdata::otlp::traces::TracesProtoBytesEncoder;
 use otel_arrow_dfe_pdata::otlp::{ProtoBuffer, ProtoBytesEncoder};
 use otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::{
@@ -51,6 +52,9 @@ use otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::{
 };
 use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::{
     ExportMetricsPartialSuccess, ExportMetricsServiceResponse,
+};
+use otel_arrow_dfe_pdata::proto::opentelemetry::collector::profiles::v1development::{
+    ExportProfilesPartialSuccess, ExportProfilesServiceResponse,
 };
 use otel_arrow_dfe_pdata::proto::opentelemetry::collector::trace::v1::{
     ExportTracePartialSuccess, ExportTraceServiceResponse,
@@ -65,7 +69,9 @@ use crate::exporters::otlp_grpc_exporter::InFlightExports;
 use otel_arrow_dfe_otap::OTAP_EXPORTER_FACTORIES;
 use otel_arrow_dfe_otap::bearer_auth::{BearerAuth, BearerAuthEvents, apply_auth_rejection};
 use otel_arrow_dfe_otap::otlp_http::client_settings::{HttpClientError, HttpClientSettings};
-use otel_arrow_dfe_otap::otlp_http::{LOGS_PATH, METRICS_PATH, PROTOBUF_CONTENT_TYPE, TRACES_PATH};
+use otel_arrow_dfe_otap::otlp_http::{
+    LOGS_PATH, METRICS_PATH, PROFILES_PATH, PROTOBUF_CONTENT_TYPE, TRACES_PATH,
+};
 use otel_arrow_dfe_otap::pdata::{Context, OtapPdata};
 
 mod config;
@@ -189,6 +195,11 @@ impl OtlpHttpExporter {
                 error: format!("invalid traces endpoint URL: {e}"),
             })?;
         }
+        if let Some(endpoint) = config.profiles_endpoint.as_ref() {
+            _ = reqwest::Url::parse(endpoint).map_err(|e| ConfigError::InvalidUserConfig {
+                error: format!("invalid profiles endpoint URL: {e}"),
+            })?;
+        }
 
         if let Some(tls) = &config.http.tls {
             // server_name not currently supported
@@ -218,6 +229,11 @@ impl OtlpHttpExporter {
                         .unwrap_or(false)
                     || config
                         .traces_endpoint
+                        .as_ref()
+                        .map(|e| e.starts_with("https://"))
+                        .unwrap_or(false)
+                    || config
+                        .profiles_endpoint
                         .as_ref()
                         .map(|e| e.starts_with("https://"))
                         .unwrap_or(false);
@@ -279,12 +295,19 @@ impl Exporter<OtapPdata> for OtlpHttpExporter {
                 .clone()
                 .unwrap_or(format!("{}{}", self.config.endpoint, TRACES_PATH)),
         );
+        let profiles_endpoint = Rc::new(
+            self.config
+                .profiles_endpoint
+                .clone()
+                .unwrap_or(format!("{}{}", self.config.endpoint, PROFILES_PATH)),
+        );
 
         otel_info!(
             "otlp.exporter.http.start",
             logs_endpoint = logs_endpoint.as_str(),
             metrics_endpoint = metrics_endpoint.as_str(),
             traces_endpoint = traces_endpoint.as_str(),
+            profiles_endpoint = profiles_endpoint.as_str(),
         );
 
         let max_in_flight = self.config.max_in_flight.max(1);
@@ -303,6 +326,7 @@ impl Exporter<OtapPdata> for OtlpHttpExporter {
         let mut logs_proto_encoder = LogsProtoBytesEncoder::new();
         let mut metrics_proto_encoder = MetricsProtoBytesEncoder::new();
         let mut traces_proto_encoder = TracesProtoBytesEncoder::new();
+        let mut profiles_proto_encoder = ProfilesProtoBytesEncoder::new();
         let mut proto_buffer = ProtoBuffer::default();
 
         let compression = self.config.http.compression();
@@ -475,22 +499,6 @@ impl Exporter<OtapPdata> for OtlpHttpExporter {
                         }
                     }
 
-                    if signal_type == SignalType::Profiles {
-                        let export_duration = export_started_at.elapsed();
-                        let mut nack = NackMsg::new(
-                            "OTLP HTTP Profiles export is not supported yet",
-                            OtapPdata::new(context, payload),
-                        );
-                        nack.permanent = true;
-                        _ = effect_handler.notify_nack(nack).await;
-                        self.metrics.record_failure(
-                            signal_type,
-                            OtlpHttpExporterErrorType::Other,
-                            export_duration,
-                        );
-                        continue;
-                    }
-
                     // The cached bearer header, together with the generation of the
                     // token it was built from, cloned per request. It takes
                     // precedence over any statically configured `authorization`; the
@@ -538,9 +546,8 @@ impl Exporter<OtapPdata> for OtlpHttpExporter {
                                         .encode(&mut otap_batch, &mut proto_buffer),
                                     SignalType::Traces => traces_proto_encoder
                                         .encode(&mut otap_batch, &mut proto_buffer),
-                                    SignalType::Profiles => {
-                                        unreachable!("Profiles export is rejected before encoding")
-                                    }
+                                    SignalType::Profiles => profiles_proto_encoder
+                                        .encode(&mut otap_batch, &mut proto_buffer),
                                 };
 
                             if !context.may_return_payload() {
@@ -607,9 +614,7 @@ impl Exporter<OtapPdata> for OtlpHttpExporter {
                         SignalType::Logs => &logs_endpoint,
                         SignalType::Metrics => &metrics_endpoint,
                         SignalType::Traces => &traces_endpoint,
-                        SignalType::Profiles => {
-                            unreachable!("Profiles export is rejected before endpoint selection")
-                        }
+                        SignalType::Profiles => &profiles_endpoint,
                     });
 
                     let max_response_body_len = self.config.max_response_body_length;
@@ -714,6 +719,15 @@ impl From<ExportTracePartialSuccess> for PartialSuccess {
     }
 }
 
+impl From<ExportProfilesPartialSuccess> for PartialSuccess {
+    fn from(value: ExportProfilesPartialSuccess) -> Self {
+        Self {
+            rejected: value.rejected_profiles,
+            error_message: value.error_message,
+        }
+    }
+}
+
 impl From<ExportLogsServiceResponse> for ServiceResponse {
     fn from(value: ExportLogsServiceResponse) -> Self {
         Self {
@@ -732,6 +746,14 @@ impl From<ExportMetricsServiceResponse> for ServiceResponse {
 
 impl From<ExportTraceServiceResponse> for ServiceResponse {
     fn from(value: ExportTraceServiceResponse) -> Self {
+        Self {
+            partial_success: value.partial_success.map(Into::into),
+        }
+    }
+}
+
+impl From<ExportProfilesServiceResponse> for ServiceResponse {
+    fn from(value: ExportProfilesServiceResponse) -> Self {
         Self {
             partial_success: value.partial_success.map(Into::into),
         }
@@ -857,9 +879,7 @@ async fn query_result_to_service_response(
         SignalType::Logs => ExportLogsServiceResponse::decode(&mut body).map(Into::into),
         SignalType::Metrics => ExportMetricsServiceResponse::decode(&mut body).map(Into::into),
         SignalType::Traces => ExportTraceServiceResponse::decode(&mut body).map(Into::into),
-        SignalType::Profiles => {
-            unreachable!("Profiles export is rejected before response decoding")
-        }
+        SignalType::Profiles => ExportProfilesServiceResponse::decode(&mut body).map(Into::into),
     };
 
     Ok(service_resp?)
@@ -1118,6 +1138,7 @@ mod test {
     use otel_arrow_dfe_engine::testing::node::test_node;
     use otel_arrow_dfe_pdata::OtapArrowRecords;
     use otel_arrow_dfe_pdata::OtlpProtoBytes;
+    use otel_arrow_dfe_pdata::encode::encode_profiles_otap_batch;
     use otel_arrow_dfe_pdata::otap::Logs;
     use otel_arrow_dfe_pdata::proto::OtlpProtoMessage;
     use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
@@ -1127,8 +1148,10 @@ mod test {
     use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{
         Metric, MetricsData, ResourceMetrics, ScopeMetrics,
     };
+    use otel_arrow_dfe_pdata::proto::opentelemetry::profiles::v1development::ProfilesData;
     use otel_arrow_dfe_pdata::proto::opentelemetry::trace::v1::{ResourceSpans, TracesData};
     use otel_arrow_dfe_pdata::testing::equiv::assert_equivalent;
+    use otel_arrow_dfe_pdata::testing::profiles::{ProfilesDatasetKind, profiles_dataset};
     use otel_arrow_dfe_pdata::testing::round_trip::otlp_to_otap;
     use otel_arrow_dfe_telemetry::common_attributes::{Outcome, SignalOutcomeAttributes};
     use otel_arrow_dfe_telemetry::registry::TelemetryRegistryHandle;
@@ -1281,6 +1304,15 @@ mod test {
                                         let service_resp = ExportTraceServiceResponse {
                                             partial_success: Some(ExportTracePartialSuccess {
                                                 rejected_spans: 1,
+                                                error_message: "partial success error".into(),
+                                            }),
+                                        };
+                                        service_resp.encode(&mut body).unwrap();
+                                    }
+                                    PROFILES_PATH => {
+                                        let service_resp = ExportProfilesServiceResponse {
+                                            partial_success: Some(ExportProfilesPartialSuccess {
+                                                rejected_profiles: 1,
                                                 error_message: "partial success error".into(),
                                             }),
                                         };
@@ -2221,6 +2253,10 @@ mod test {
         (logs_batch, metrics_batch, traces_batch)
     }
 
+    fn gen_profiles_batch() -> ProfilesData {
+        profiles_dataset(ProfilesDatasetKind::Cpu, 1, 2, 2)
+    }
+
     fn subscribe_pdatas(pdatas: Vec<OtapPdata>, return_payload: bool) -> Vec<OtapPdata> {
         let interests = if return_payload {
             Interests::ACKS | Interests::NACKS | Interests::RETURN_DATA
@@ -2243,6 +2279,7 @@ mod test {
             traces_endpoint: None,
             metrics_endpoint: None,
             logs_endpoint: None,
+            profiles_endpoint: None,
         }
     }
 
@@ -2272,6 +2309,8 @@ mod test {
         assert!(err.to_string().contains("invalid endpoint URL"))
     }
 
+    /// Scenario: Each signal-specific OTLP/HTTP endpoint override contains an invalid URL.
+    /// Guarantees: Profiles and the stable signals are rejected with signal-specific errors.
     #[test]
     fn test_from_config_validates_endpoint_overrides() {
         let test_cases = [
@@ -2302,6 +2341,15 @@ mod test {
                 }),
                 "traces",
             ),
+            (
+                serde_json::json!({
+                    "endpoint": "http://127.0.0.1",
+                    "http": {},
+                    "client_pool_size": 5,
+                    "profiles_endpoint": "invalid endpoint"
+                }),
+                "profiles",
+            ),
         ];
         for (invalid_config, signal_name) in test_cases {
             let test_runtime = TestRuntime::<OtapPdata>::new();
@@ -2326,6 +2374,8 @@ mod test {
         }
     }
 
+    /// Scenario: The OTLP/HTTP exporter sends all supported signals to their standard endpoints.
+    /// Guarantees: Profiles OTAP data uses `/v1development/profiles` and is ACKed on success.
     #[test]
     fn test_exports_otlp_signals() {
         let port = otel_arrow_dfe_test_net::pick_unused_loopback_tcp_port();
@@ -2341,6 +2391,7 @@ mod test {
             run_server(&tokio_rt, &pipeline_ctx, &endpoint_addr);
 
         let (logs_batch, metrics_batch, traces_batch) = gen_batches_for_each_signal_type();
+        let profiles_batch = gen_profiles_batch();
 
         let mut pdatas = vec![];
 
@@ -2362,6 +2413,10 @@ mod test {
             OtlpProtoBytes::ExportTracesRequest(Bytes::from(bytes)),
         )));
 
+        let profiles_otap =
+            encode_profiles_otap_batch(&profiles_batch).expect("encode Profiles OTAP fixture");
+        pdatas.push(OtapPdata::new_default(profiles_otap.into()));
+
         let pdatas = subscribe_pdatas(pdatas, false);
 
         test_runtime
@@ -2382,7 +2437,7 @@ mod test {
                     result.unwrap();
 
                     // ensure we got back all the signals we expected ...
-                    let num_expected_pdatas = 3;
+                    let num_expected_pdatas = 4;
                     let mut pdatas_received = Vec::new();
                     while let Some(pdata) = pdata_rx.recv().await {
                         pdatas_received.push(pdata);
@@ -2421,7 +2476,13 @@ mod test {
                                 );
                             }
                             SignalType::Profiles => {
-                                panic!("Profiles are not expected in this OTLP HTTP test")
+                                let pdata: OtlpProtoBytes =
+                                    pdata.take_payload().try_into_with_default().unwrap();
+                                let pdata_decoded = ProfilesData::decode(pdata.as_bytes()).unwrap();
+                                assert_equivalent(
+                                    &[OtlpProtoMessage::Profiles(pdata_decoded)],
+                                    &[OtlpProtoMessage::Profiles(profiles_batch.clone())],
+                                );
                             }
                         }
                     }
@@ -2763,6 +2824,8 @@ mod test {
             })
     }
 
+    /// Scenario: Every OTLP/HTTP signal response reports a nonzero partial rejection.
+    /// Guarantees: Profiles partial success is decoded and returned as a permanent NACK.
     #[test]
     fn test_handles_partial_success() {
         let port = otel_arrow_dfe_test_net::pick_unused_loopback_tcp_port();
@@ -2778,6 +2841,7 @@ mod test {
         let server_cancellation_token = run_error_server(&tokio_rt, &endpoint_addr, None);
 
         let (logs_batch, metrics_batch, traces_batch) = gen_batches_for_each_signal_type();
+        let profiles_batch = gen_profiles_batch();
 
         let mut pdatas = vec![];
         let mut bytes = Vec::new();
@@ -2796,6 +2860,12 @@ mod test {
         traces_batch.encode(&mut bytes).unwrap();
         pdatas.push(OtapPdata::new_default(OtapPayload::from(
             OtlpProtoBytes::ExportTracesRequest(Bytes::from(bytes)),
+        )));
+
+        let mut bytes = Vec::new();
+        profiles_batch.encode(&mut bytes).unwrap();
+        pdatas.push(OtapPdata::new_default(OtapPayload::from(
+            OtlpProtoBytes::ExportProfilesRequest(Bytes::from(bytes)),
         )));
 
         let pdatas = subscribe_pdatas(pdatas, false);
@@ -2819,7 +2889,7 @@ mod test {
                     result.unwrap();
 
                     let mut ack_count = 0;
-                    let num_expected_nacks = 3;
+                    let num_expected_nacks = 4;
                     let mut pipeline_completion_rx =
                         ctx.take_pipeline_completion_receiver().unwrap();
                     loop {

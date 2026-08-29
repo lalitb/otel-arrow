@@ -7,6 +7,7 @@
 //! - `POST /v1/logs`
 //! - `POST /v1/metrics`
 //! - `POST /v1/traces`
+//! - `POST /v1development/profiles`
 //!
 //! The receiver keeps request payloads in their serialized protobuf form and forwards them into
 //! the pipeline as `OtapPdata`, matching the OTLP/gRPC receiver's lazy-decoding strategy.
@@ -370,11 +371,15 @@ pub const METRICS_PATH: &str = "/v1/metrics";
 /// OTLP HTTP path for traces endpoint
 pub const TRACES_PATH: &str = "/v1/traces";
 
+/// OTLP HTTP path for profiles endpoint
+pub const PROFILES_PATH: &str = "/v1development/profiles";
+
 fn map_path_to_signal(path: &str) -> Option<SignalType> {
     match path {
         LOGS_PATH => Some(SignalType::Logs),
         METRICS_PATH => Some(SignalType::Metrics),
         TRACES_PATH => Some(SignalType::Traces),
+        PROFILES_PATH => Some(SignalType::Profiles),
         _ => None,
     }
 }
@@ -814,7 +819,7 @@ impl HttpHandler {
                     SignalType::Logs => self.ack_registry.logs.clone(),
                     SignalType::Metrics => self.ack_registry.metrics.clone(),
                     SignalType::Traces => self.ack_registry.traces.clone(),
-                    SignalType::Profiles => None,
+                    SignalType::Profiles => self.ack_registry.profiles.clone(),
                 };
 
                 let Some(state) = state else {
@@ -1113,11 +1118,17 @@ mod tests {
             .expect("configured test admission")
     }
 
+    /// Scenario: Every supported OTLP/HTTP protobuf endpoint is mapped to its signal.
+    /// Guarantees: The Alpha Profiles path is recognized and unknown paths remain rejected.
     #[test]
     fn maps_paths() {
         assert_eq!(map_path_to_signal("/v1/logs"), Some(SignalType::Logs));
         assert_eq!(map_path_to_signal("/v1/metrics"), Some(SignalType::Metrics));
         assert_eq!(map_path_to_signal("/v1/traces"), Some(SignalType::Traces));
+        assert_eq!(
+            map_path_to_signal("/v1development/profiles"),
+            Some(SignalType::Profiles)
+        );
         assert_eq!(map_path_to_signal("/nope"), None);
     }
 

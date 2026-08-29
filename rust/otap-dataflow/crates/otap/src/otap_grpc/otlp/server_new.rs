@@ -802,6 +802,65 @@ impl NamedService for TraceServiceServer {
     const NAME: &'static str = super::TRACE_SERVICE_NAME;
 }
 
+/// implementation of OTLP bytes -> OTAP GRPC server for profiles
+#[derive(Clone)]
+pub struct ProfilesServiceServer {
+    /// common support for OTLP servers
+    pub common: ServerCommon,
+}
+
+impl ProfilesServiceServer {
+    /// create a new instance of `ProfilesServiceServer`
+    #[must_use]
+    pub fn new(
+        effect_handler: EffectHandler<OtapPdata>,
+        settings: &OtlpServerSettings,
+        metrics: Arc<Mutex<OtlpReceiverMetrics>>,
+        rate_limiter: Option<SharedAdmissionGate>,
+        state: Option<AckSlot>,
+    ) -> Self {
+        Self {
+            common: ServerCommon::new(effect_handler, settings, metrics, rate_limiter, state),
+        }
+    }
+}
+
+impl tower_service::Service<Request<Body>> for ProfilesServiceServer {
+    type Response = Response<Body>;
+    type Error = Infallible;
+    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, _cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: Request<Body>) -> Self::Future {
+        match req.uri().path() {
+            super::PROFILES_SERVICE_EXPORT_PATH => {
+                let common = self.common.clone();
+                if let Some(response) = common.exhausted_rate_limit_response() {
+                    return Box::pin(async move { Ok(response) });
+                }
+                let mut grpc = new_grpc(SignalType::Profiles, common.settings.clone());
+                let rate_limit = common.grpc_rate_limit_context();
+                let service = OtapBatchService::new(
+                    common.effect_handler,
+                    common.state,
+                    common.metrics.clone(),
+                    SignalType::Profiles,
+                    rate_limit,
+                );
+                Box::pin(async move { Ok(grpc.unary(service, req).await) })
+            }
+            _ => Box::pin(async move { Ok(unimplemented_resp()) }),
+        }
+    }
+}
+
+impl NamedService for ProfilesServiceServer {
+    const NAME: &'static str = super::PROFILES_SERVICE_NAME;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

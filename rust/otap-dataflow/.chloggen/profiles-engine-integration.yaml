@@ -11,7 +11,7 @@ component: engine
 note: "Add df-engine support for OTAP Profiles payload storage and routing."
 
 # Mandatory: One or more tracking issues related to the change. You can use the PR number here if no issue exists.
-issues: []
+issues: [2303]
 
 # (Optional) One or more lines of additional information to render under the primary note.
 # These lines will be padded with 2 spaces and then inserted directly into the document.
@@ -19,4 +19,4 @@ issues: []
 # section with the specific action consumers must take. Keep notes to 200
 # characters and subtext to 300 characters.
 subtext: |
-  Profiles can now be represented, measured, routed, and persisted. Arrow BARs and OTLP requests preserve boundaries; conversion and export remain unsupported.
+  Profiles can now be represented, measured, routed, and persisted. Arrow BARs and OTLP requests preserve boundaries; graph-changing generic transforms remain unsupported.

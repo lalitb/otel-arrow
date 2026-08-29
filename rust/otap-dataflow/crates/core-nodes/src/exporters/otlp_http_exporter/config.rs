@@ -15,8 +15,8 @@ pub struct Config {
     pub http: HttpClientSettings,
 
     /// The endpoint to which the exporter will send OTLP HTTP requests. This should include the
-    /// scheme, host and port, but not the paths (/v1/logs) as these will be appended to requests
-    /// automatically for each batch of signals depending on the signal type.
+    /// scheme, host and port, but not a signal path such as `/v1/logs` or
+    /// `/v1development/profiles`; the appropriate path is appended automatically for each batch.
     ///
     /// Example: "http://localhost:4318" or "https://otel-collector:4318"
     pub endpoint: String,
@@ -38,6 +38,12 @@ pub struct Config {
     ///
     /// Example: https://example.com:4318/v1/logs
     pub logs_endpoint: Option<String>,
+
+    /// The target URL to send profile data to, including the path. If this setting is present the
+    /// endpoint setting is ignored for profiles.
+    ///
+    /// Example: https://example.com:4318/v1development/profiles
+    pub profiles_endpoint: Option<String>,
 
     /// Maximum allowed size for the body of OTLP HTTP responses. This is used to prevent unbounded
     /// memory usage when receiving responses from the OTLP server. If a response exceeds this size,

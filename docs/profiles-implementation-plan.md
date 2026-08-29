@@ -8,14 +8,13 @@ Each branch is stacked on the preceding branch.
 
 ## Current Status
 
-- Steps 1 through 7 are implemented and committed on their corresponding local
+- Steps 1 through 8 are implemented and committed on their corresponding local
   stack branches.
 - All stack branches are rebased onto upstream commit `80d38834` from August
   28, 2026.
-- Step 8 is implemented on the current branch with deterministic representative
-  datasets, bounded randomized conversion tests, malformed-input no-panic
-  coverage, semantic equivalence checks, and Criterion benchmarks for both
-  directions.
+- Step 9 is implemented on the current branch with OTLP/gRPC, OTLP/HTTP, and
+  OTAP Profiles receiver/exporter support. The shared OTAP protobuf has an
+  `ArrowProfilesService`, and Rust and Go bindings are regenerated.
 - Profiles BARs remain separate during batching, and oversized BARs are
   rejected until graph-aware partitioning and concatenation are implemented.
   Serialized OTLP Profiles requests likewise remain separate because each owns
@@ -24,7 +23,9 @@ Each branch is stacked on the preceding branch.
   [Profiles Upstream Architecture Notes](profiles-upstream-architecture-notes.md).
 - No privacy-safe real production capture or repository fuzz harness was
   available, so those remain explicit follow-ups.
-- Steps 9 through 11 have not started.
+- The Go binding exposes the Profiles stream API, but the Go runtime still has
+  no Profiles Arrow codec or receiver/exporter implementation.
+- Steps 10 and 11 have not started.
 
 1. `profiles/01-otap-data-model-design`
    - Define the Profiles OTAP data model, processing semantics, validation
@@ -61,6 +62,11 @@ Each branch is stacked on the preceding branch.
      captures and persistent fuzz corpora remain open.
 9. `profiles/09-profile-transport`
    - Add receiver, exporter, OTAP transport, and bounded batching behavior.
+   - Status: implemented; OTLP/gRPC and `/v1development/profiles` preserve
+     serialized request boundaries, OTLP exporters encode and send Profiles,
+     and OTAP uses bounded signal-specific streams with ACK/NACK correlation.
+     Generic transport byte, concurrency, and queue limits apply;
+     Profiles-specific graph cardinality limits remain open.
 10. `profiles/10-profile-transformations`
     - Add native filtering, attribute transformation, redaction, compaction,
       and copy-on-write handling for shared profile entities.

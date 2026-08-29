@@ -440,7 +440,7 @@ nodes:
 | -------- | --------- |
 | Default Port | 4318 |
 | Transport | HTTP/1.1 via hyper |
-| Endpoints | `POST /v1/logs`, `/v1/metrics`, `/v1/traces` |
+| Endpoints | `POST /v1/logs`, `/v1/metrics`, `/v1/traces`, `/v1development/profiles` |
 | Content-Type | `application/x-protobuf` (JSON not supported) |
 | Compression | gzip, deflate, zstd via `Content-Encoding` |
 | Concurrency | Local semaphore only (HTTP-only mode); global + local (dual-protocol mode) |
@@ -452,6 +452,7 @@ nodes:
 POST /v1/logs    -> ExportLogsServiceRequest    -> ExportLogsServiceResponse
 POST /v1/metrics -> ExportMetricsServiceRequest -> ExportMetricsServiceResponse
 POST /v1/traces  -> ExportTraceServiceRequest   -> ExportTraceServiceResponse
+POST /v1development/profiles -> ExportProfilesServiceRequest -> ExportProfilesServiceResponse
 ```
 
 #### HTTP Response Codes

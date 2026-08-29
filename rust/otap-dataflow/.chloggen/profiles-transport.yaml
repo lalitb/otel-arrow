@@ -1,0 +1,8 @@
+change_type: enhancement
+component: pipeline
+note: "Add experimental Profiles support to OTLP and OTAP receivers and exporters."
+issues: [2303]
+subtext: >-
+  Accepts OTLP Profiles over gRPC and /v1development/profiles, exports Profiles
+  over OTLP, and streams OTAP Profiles with bounded queues, correlated statuses,
+  and preserved retryability.

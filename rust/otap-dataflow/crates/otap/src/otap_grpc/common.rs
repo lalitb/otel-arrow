@@ -45,6 +45,8 @@ pub struct AckRegistry {
     pub metrics: Option<AckSlot>,
     /// Subscription map for trace acknowledgements.
     pub traces: Option<AckSlot>,
+    /// Subscription map for profile acknowledgements.
+    pub profiles: Option<AckSlot>,
 }
 
 impl AckRegistry {
@@ -59,6 +61,23 @@ impl AckRegistry {
             logs,
             metrics,
             traces,
+            profiles: None,
+        }
+    }
+
+    /// Creates a new bundle including Profiles subscriptions.
+    #[must_use]
+    pub const fn new_with_profiles(
+        logs: Option<AckSlot>,
+        metrics: Option<AckSlot>,
+        traces: Option<AckSlot>,
+        profiles: Option<AckSlot>,
+    ) -> Self {
+        Self {
+            logs,
+            metrics,
+            traces,
+            profiles,
         }
     }
 
@@ -68,6 +87,7 @@ impl AckRegistry {
         self.logs.as_ref().is_none_or(AckSlot::is_empty)
             && self.metrics.as_ref().is_none_or(AckSlot::is_empty)
             && self.traces.as_ref().is_none_or(AckSlot::is_empty)
+            && self.profiles.as_ref().is_none_or(AckSlot::is_empty)
     }
 
     /// Completes all outstanding wait-for-result slots with a shutdown Nack.
@@ -81,6 +101,9 @@ impl AckRegistry {
         if let Some(slot) = &self.traces {
             slot.force_shutdown(SignalType::Traces, reason);
         }
+        if let Some(slot) = &self.profiles {
+            slot.force_shutdown(SignalType::Profiles, reason);
+        }
     }
 }
 
@@ -93,7 +116,7 @@ pub fn route_ack_response(states: &AckRegistry, ack: AckMsg<OtapPdata>) -> Route
         SignalType::Logs => states.logs.as_ref(),
         SignalType::Metrics => states.metrics.as_ref(),
         SignalType::Traces => states.traces.as_ref(),
-        SignalType::Profiles => None,
+        SignalType::Profiles => states.profiles.as_ref(),
     };
 
     state
@@ -111,7 +134,7 @@ pub fn route_nack_response(states: &AckRegistry, mut nack: NackMsg<OtapPdata>) -
         SignalType::Logs => states.logs.as_ref(),
         SignalType::Metrics => states.metrics.as_ref(),
         SignalType::Traces => states.traces.as_ref(),
-        SignalType::Profiles => None,
+        SignalType::Profiles => states.profiles.as_ref(),
     };
 
     state

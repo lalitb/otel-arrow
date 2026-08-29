@@ -1,0 +1,7 @@
+change_type: enhancement
+component: pkg/arrow
+note: "Expose ArrowProfilesService in the generated Go OTAP API."
+issues: [2303]
+subtext: >-
+  Adds generated Profiles stream clients, servers, and mocks. Go Profiles Arrow
+  encoding and runtime transport integration remain future work.

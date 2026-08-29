@@ -17,3 +17,7 @@ const METRICS_SERVICE_EXPORT_PATH: &str =
 const TRACE_SERVICE_NAME: &str = "opentelemetry.proto.collector.trace.v1.TraceService";
 const TRACE_SERVICE_EXPORT_PATH: &str =
     "/opentelemetry.proto.collector.trace.v1.TraceService/Export";
+const PROFILES_SERVICE_NAME: &str =
+    "opentelemetry.proto.collector.profiles.v1development.ProfilesService";
+const PROFILES_SERVICE_EXPORT_PATH: &str =
+    "/opentelemetry.proto.collector.profiles.v1development.ProfilesService/Export";

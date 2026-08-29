@@ -24,7 +24,8 @@ otel_arrow_dfe_telemetry::otel_component_scope!(
 
 use otel_arrow_dfe_otap::OTAP_RECEIVER_FACTORIES;
 use otel_arrow_dfe_otap::otap_grpc::otlp::server_new::{
-    LogsServiceServer, MetricsServiceServer, OtlpServerSettings, RouteResponse, TraceServiceServer,
+    LogsServiceServer, MetricsServiceServer, OtlpServerSettings, ProfilesServiceServer,
+    RouteResponse, TraceServiceServer,
 };
 use otel_arrow_dfe_otap::pdata::OtapPdata;
 use otel_arrow_dfe_otap::tls_utils::{build_tls_acceptor, create_tls_stream};
@@ -150,7 +151,8 @@ pub struct Protocols {
     /// Optional HTTP server settings.
     ///
     /// When configured, the receiver listens for OTLP/HTTP on the specified address,
-    /// implementing `POST /v1/logs`, `POST /v1/metrics`, and `POST /v1/traces`.
+    /// implementing `POST /v1/logs`, `POST /v1/metrics`, `POST /v1/traces`, and
+    /// `POST /v1development/profiles`.
     #[serde(default)]
     pub http: Option<HttpServerSettings>,
 }
@@ -307,7 +309,7 @@ impl OTLPReceiver {
     /// Builds signal services for gRPC and/or HTTP.
     ///
     /// When `grpc_settings` is `None` (HTTP-only mode), no gRPC service servers are
-    /// constructed and the three service return values will be `None`. The `AckRegistry`
+    /// constructed and the four service return values will be `None`. The `AckRegistry`
     /// is still built based on which protocols (HTTP and/or gRPC) have `wait_for_result`
     /// enabled.
     fn build_signal_services(
@@ -319,6 +321,7 @@ impl OTLPReceiver {
         Option<LogsServiceServer>,
         Option<MetricsServiceServer>,
         Option<TraceServiceServer>,
+        Option<ProfilesServiceServer>,
         AckRegistry,
     ) {
         let http_wait = self
@@ -347,39 +350,57 @@ impl OTLPReceiver {
         let traces_slot = wait_for_result_any.then(|| {
             otel_arrow_dfe_otap::otap_grpc::otlp::server_new::AckSlot::new(shared_ack_slot_capacity)
         });
+        let profiles_slot = wait_for_result_any.then(|| {
+            otel_arrow_dfe_otap::otap_grpc::otlp::server_new::AckSlot::new(shared_ack_slot_capacity)
+        });
 
         // Build gRPC service servers only if gRPC is enabled.
-        let (logs_server, metrics_server, traces_server) = if let Some(settings) = grpc_settings {
-            (
-                Some(LogsServiceServer::new(
-                    effect_handler.clone(),
-                    settings,
-                    self.metrics.clone(),
-                    self.rate_limiter.clone(),
-                    grpc_wait.then(|| logs_slot.clone()).flatten(),
-                )),
-                Some(MetricsServiceServer::new(
-                    effect_handler.clone(),
-                    settings,
-                    self.metrics.clone(),
-                    self.rate_limiter.clone(),
-                    grpc_wait.then(|| metrics_slot.clone()).flatten(),
-                )),
-                Some(TraceServiceServer::new(
-                    effect_handler.clone(),
-                    settings,
-                    self.metrics.clone(),
-                    self.rate_limiter.clone(),
-                    grpc_wait.then(|| traces_slot.clone()).flatten(),
-                )),
-            )
-        } else {
-            (None, None, None)
-        };
+        let (logs_server, metrics_server, traces_server, profiles_server) =
+            if let Some(settings) = grpc_settings {
+                (
+                    Some(LogsServiceServer::new(
+                        effect_handler.clone(),
+                        settings,
+                        self.metrics.clone(),
+                        self.rate_limiter.clone(),
+                        grpc_wait.then(|| logs_slot.clone()).flatten(),
+                    )),
+                    Some(MetricsServiceServer::new(
+                        effect_handler.clone(),
+                        settings,
+                        self.metrics.clone(),
+                        self.rate_limiter.clone(),
+                        grpc_wait.then(|| metrics_slot.clone()).flatten(),
+                    )),
+                    Some(TraceServiceServer::new(
+                        effect_handler.clone(),
+                        settings,
+                        self.metrics.clone(),
+                        self.rate_limiter.clone(),
+                        grpc_wait.then(|| traces_slot.clone()).flatten(),
+                    )),
+                    Some(ProfilesServiceServer::new(
+                        effect_handler.clone(),
+                        settings,
+                        self.metrics.clone(),
+                        self.rate_limiter.clone(),
+                        grpc_wait.then(|| profiles_slot.clone()).flatten(),
+                    )),
+                )
+            } else {
+                (None, None, None, None)
+            };
 
-        let ack_registry = AckRegistry::new(logs_slot, metrics_slot, traces_slot);
+        let ack_registry =
+            AckRegistry::new_with_profiles(logs_slot, metrics_slot, traces_slot, profiles_slot);
 
-        (logs_server, metrics_server, traces_server, ack_registry)
+        (
+            logs_server,
+            metrics_server,
+            traces_server,
+            profiles_server,
+            ack_registry,
+        )
     }
 
     fn handle_ack(&mut self, registry: &AckRegistry, ack: AckMsg<OtapPdata>) {
@@ -515,7 +536,7 @@ impl shared::Receiver<OtapPdata> for OTLPReceiver {
             .map(|config| config.build_settings());
 
         // Build signal services (gRPC servers are only built if gRPC is enabled).
-        let (logs_server, metrics_server, traces_server, ack_registry) = self
+        let (logs_server, metrics_server, traces_server, profiles_server, ack_registry) = self
             .build_signal_services(
                 &effect_handler,
                 grpc_settings.as_ref(),
@@ -597,7 +618,8 @@ impl shared::Receiver<OtapPdata> for OTLPReceiver {
             let server = server
                 .add_service(logs_server.expect("gRPC enabled but logs_server is None"))
                 .add_service(metrics_server.expect("gRPC enabled but metrics_server is None"))
-                .add_service(traces_server.expect("gRPC enabled but traces_server is None"));
+                .add_service(traces_server.expect("gRPC enabled but traces_server is None"))
+                .add_service(profiles_server.expect("gRPC enabled but profiles_server is None"));
 
             let maybe_tls_acceptor =
                 build_tls_acceptor(grpc_config.tls.as_ref())
@@ -899,6 +921,10 @@ mod tests {
     use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::{
         ExportMetricsServiceRequest, ExportMetricsServiceResponse,
     };
+    use otel_arrow_dfe_pdata::proto::opentelemetry::collector::profiles::v1development::profiles_service_client::ProfilesServiceClient;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::collector::profiles::v1development::{
+        ExportProfilesServiceRequest, ExportProfilesServiceResponse,
+    };
     use otel_arrow_dfe_pdata::proto::opentelemetry::collector::trace::v1::trace_service_client::TraceServiceClient;
     use otel_arrow_dfe_pdata::proto::opentelemetry::collector::trace::v1::{
         ExportTraceServiceRequest, ExportTraceServiceResponse,
@@ -908,6 +934,7 @@ mod tests {
     use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{ResourceMetrics, ScopeMetrics};
     use otel_arrow_dfe_pdata::proto::opentelemetry::resource::v1::Resource;
     use otel_arrow_dfe_pdata::proto::opentelemetry::trace::v1::{ResourceSpans, ScopeSpans};
+    use otel_arrow_dfe_pdata::testing::profiles::{ProfilesDatasetKind, profiles_dataset};
     use otel_arrow_dfe_telemetry::common_attributes::ReceiverRejectionErrorType;
     use otel_arrow_dfe_telemetry::registry::TelemetryRegistryHandle;
     use prost::Message;
@@ -1099,6 +1126,14 @@ mod tests {
             .encode(&mut bytes)
             .expect("encode test OTLP request");
         OtapPdata::new_default(OtlpProtoBytes::ExportLogsRequest(Bytes::from(bytes)).into())
+    }
+
+    fn create_profiles_service_request() -> ExportProfilesServiceRequest {
+        let profiles = profiles_dataset(ProfilesDatasetKind::Cpu, 1, 2, 2);
+        ExportProfilesServiceRequest {
+            resource_profiles: profiles.resource_profiles,
+            dictionary: profiles.dictionary,
+        }
     }
 
     async fn yield_cycles(count: usize) {
@@ -1809,6 +1844,21 @@ mod tests {
                     }
                 );
 
+                let mut profiles_client = ProfilesServiceClient::connect(grpc_endpoint.clone())
+                    .await
+                    .expect("Failed to connect to server from Profiles Service Client");
+                let profiles_response = profiles_client
+                    .export(create_profiles_service_request())
+                    .await
+                    .expect("can send Profiles request")
+                    .into_inner();
+                assert_eq!(
+                    profiles_response,
+                    ExportProfilesServiceResponse {
+                        partial_success: None
+                    }
+                );
+
                 ctx.send_shutdown(Instant::now(), "Test")
                     .await
                     .expect("Failed to send Shutdown");
@@ -1917,10 +1967,38 @@ mod tests {
                         .await
                         .expect("Failed to send Ack for traces");
                 }
+
+                let profiles_pdata = timeout(Duration::from_secs(3), ctx.recv())
+                    .await
+                    .expect("Timed out waiting for Profiles message")
+                    .expect("No Profiles message received");
+
+                let profiles_proto: OtlpProtoBytes = profiles_pdata
+                    .clone()
+                    .payload()
+                    .try_into_with_default()
+                    .expect("can convert to OtlpProtoBytes");
+                assert!(matches!(
+                    profiles_proto,
+                    OtlpProtoBytes::ExportProfilesRequest(_)
+                ));
+
+                let expected = create_profiles_service_request();
+                let mut expected_bytes = Vec::new();
+                expected.encode(&mut expected_bytes).unwrap();
+                assert_eq!(&expected_bytes, profiles_proto.as_bytes());
+
+                if let Some((_node_id, ack)) = next_ack(AckMsg::new(profiles_pdata)) {
+                    ctx.send_control_msg(NodeControlMsg::Ack(ack))
+                        .await
+                        .expect("Failed to send Ack for Profiles");
+                }
             })
         }
     }
 
+    /// Scenario: OTLP/gRPC receives every supported signal with wait-for-result enabled.
+    /// Guarantees: Profiles uses its standard service and returns success after downstream ACK.
     #[test]
     fn test_otlp_receiver_ack() {
         let test_runtime = TestRuntime::new();
@@ -1959,8 +2037,10 @@ mod tests {
             .run_validation_concurrent(validation_procedure());
     }
 
+    /// Scenario: A protobuf Profiles request is posted to the OTLP/HTTP Profiles endpoint.
+    /// Guarantees: The request is forwarded byte-for-byte and its downstream ACK returns success.
     #[test]
-    fn test_otlp_http_receiver_ack() {
+    fn test_otlp_http_profiles_receiver_ack() {
         let test_runtime = TestRuntime::new();
 
         let grpc_addr = "127.0.0.1";
@@ -2002,18 +2082,19 @@ mod tests {
 
         let scenario = move |ctx: TestContext<OtapPdata>| {
             Box::pin(async move {
-                let request = create_logs_service_request();
+                let request = create_profiles_service_request();
                 let mut request_bytes = Vec::new();
                 request.encode(&mut request_bytes).unwrap();
 
-                let (status, body) = post_otlp_http(http_listen, "/v1/logs", request_bytes)
-                    .await
-                    .expect("http request should succeed");
+                let (status, body) =
+                    post_otlp_http(http_listen, "/v1development/profiles", request_bytes)
+                        .await
+                        .expect("http request should succeed");
 
                 assert_eq!(status, http::StatusCode::OK);
 
                 let mut expected = Vec::new();
-                ExportLogsServiceResponse::default()
+                ExportProfilesServiceResponse::default()
                     .encode(&mut expected)
                     .unwrap();
                 assert_eq!(body.as_ref(), expected.as_slice());
@@ -2026,24 +2107,27 @@ mod tests {
 
         let validation = |mut ctx: NotSendValidateContext<OtapPdata>| {
             Box::pin(async move {
-                let logs_pdata = timeout(Duration::from_secs(3), ctx.recv())
+                let profiles_pdata = timeout(Duration::from_secs(3), ctx.recv())
                     .await
-                    .expect("Timed out waiting for logs message")
-                    .expect("No logs message received");
+                    .expect("Timed out waiting for Profiles message")
+                    .expect("No Profiles message received");
 
-                let logs_proto: OtlpProtoBytes = logs_pdata
+                let profiles_proto: OtlpProtoBytes = profiles_pdata
                     .clone()
                     .payload()
                     .try_into_with_default()
                     .expect("can convert to OtlpProtoBytes");
-                assert!(matches!(logs_proto, OtlpProtoBytes::ExportLogsRequest(_)));
+                assert!(matches!(
+                    profiles_proto,
+                    OtlpProtoBytes::ExportProfilesRequest(_)
+                ));
 
-                let expected = create_logs_service_request();
+                let expected = create_profiles_service_request();
                 let mut expected_bytes = Vec::new();
                 expected.encode(&mut expected_bytes).unwrap();
-                assert_eq!(&expected_bytes, logs_proto.as_bytes());
+                assert_eq!(&expected_bytes, profiles_proto.as_bytes());
 
-                if let Some((_node_id, ack)) = next_ack(AckMsg::new(logs_pdata)) {
+                if let Some((_node_id, ack)) = next_ack(AckMsg::new(profiles_pdata)) {
                     ctx.send_control_msg(NodeControlMsg::Ack(ack))
                         .await
                         .expect("Failed to send Ack");
@@ -2149,6 +2233,8 @@ mod tests {
             .run_validation_concurrent(validation);
     }
 
+    /// Scenario: An identity-encoded Profiles request exceeds the configured HTTP body limit.
+    /// Guarantees: The Profiles endpoint rejects it before protobuf forwarding.
     #[test]
     fn test_otlp_http_rejects_oversized_identity_body() {
         let test_runtime = TestRuntime::new();
@@ -2194,9 +2280,10 @@ mod tests {
         let scenario = move |ctx: TestContext<OtapPdata>| {
             Box::pin(async move {
                 let request_bytes = vec![0u8; 2048];
-                let (status, body) = post_otlp_http(http_listen, "/v1/logs", request_bytes)
-                    .await
-                    .expect("http request should succeed");
+                let (status, body) =
+                    post_otlp_http(http_listen, "/v1development/profiles", request_bytes)
+                        .await
+                        .expect("http request should succeed");
 
                 assert_eq!(status, http::StatusCode::BAD_REQUEST);
                 assert!(!body.is_empty());
@@ -2213,6 +2300,8 @@ mod tests {
             .run_validation(|_| async {});
     }
 
+    /// Scenario: A compressed Profiles request expands beyond the configured HTTP body limit.
+    /// Guarantees: Decompression is bounded and the Profiles payload is never forwarded.
     #[test]
     fn test_otlp_http_rejects_oversized_gzip_body() {
         let test_runtime = TestRuntime::new();
@@ -2267,10 +2356,14 @@ mod tests {
                 encoder.write_all(&decoded).unwrap();
                 let compressed = encoder.finish().unwrap();
 
-                let (status, body) =
-                    post_otlp_http_with_encoding(http_listen, "/v1/logs", compressed, Some("gzip"))
-                        .await
-                        .expect("http request should succeed");
+                let (status, body) = post_otlp_http_with_encoding(
+                    http_listen,
+                    "/v1development/profiles",
+                    compressed,
+                    Some("gzip"),
+                )
+                .await
+                .expect("http request should succeed");
 
                 assert_eq!(status, http::StatusCode::BAD_REQUEST);
                 assert!(!body.is_empty());

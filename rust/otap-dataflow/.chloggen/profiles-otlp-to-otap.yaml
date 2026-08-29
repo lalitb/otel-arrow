@@ -1,8 +1,7 @@
 change_type: enhancement
 component: pdata
 note: "Encode OTLP Profiles requests into validated OTAP Profiles Arrow batches."
-issues: []
+issues: [2303]
 subtext: >-
   Resolves request-wide dictionaries and nested string references. Invalid
-  references reject the complete request; OTAP-to-OTLP conversion remains
-  unsupported.
+  references reject the complete request.

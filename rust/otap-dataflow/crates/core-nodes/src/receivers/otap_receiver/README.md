@@ -11,8 +11,9 @@
 ## Overview
 
 The OTAP receiver accepts OTAP Arrow streams over gRPC and forwards received
-payloads into the pipeline as `OtapPdata`. It can wait for immediate downstream
-ACK/NACK outcomes before responding to the client.
+logs, metrics, traces, and Profiles payloads into the pipeline as `OtapPdata`.
+It can wait for immediate downstream ACK/NACK outcomes before responding to the
+client.
 
 ## Getting Started
 
@@ -80,9 +81,9 @@ runtime metric sets may also be attached by the pipeline telemetry policy.
 | --- | --- | --- | --- |
 | `receiver.otap.acknowledgements.responses` | `{response}` | `signal`, `outcome` | Number of routed or invalid acknowledgement responses. |
 
-`signal` is one of `traces`, `metrics`, or `logs`. `outcome` is `success` for
-an ACK sent to the client, `refused` for a NACK sent to the client, and
-`failure` when the acknowledgement route was invalid or expired.
+`signal` is one of `traces`, `metrics`, `logs`, or `profiles`. `outcome` is
+`success` for an ACK sent to the client, `refused` for a NACK sent to the
+client, and `failure` when the acknowledgement route was invalid or expired.
 
 #### `receiver.otap.rejections`
 
@@ -109,8 +110,13 @@ not a terminal-only metric that cannot be handed off on an error return.
 
 - `max_concurrent_requests_per_stream` must be greater than zero and is clamped
   to `max_concurrent_requests` at runtime.
+- `max_concurrent_requests` is shared across logs, metrics, traces, and Profiles
+  streams.
 - `wait_for_result: false` suppresses downstream failures from client
   responses.
+- Malformed BARs receive an `INVALID_ARGUMENT` batch status before their stream
+  closes. Permanent downstream NACKs are also returned as non-retryable batch
+  statuses.
 - The server accepts OTAP Arrow stream clients, not standard OTLP clients.
 
 ## Related Docs

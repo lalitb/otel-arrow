@@ -37,14 +37,19 @@ use otel_arrow_dfe_engine::terminal_state::TerminalState;
 use otel_arrow_dfe_otap::OTAP_EXPORTER_FACTORIES;
 use otel_arrow_dfe_otap::otap_grpc::client_settings::GrpcClientSettings;
 use otel_arrow_dfe_otap::otap_grpc::otlp::client::{
-    LogsServiceClient, MetricsServiceClient, TraceServiceClient,
+    LogsServiceClient, MetricsServiceClient, ProfilesServiceClient, TraceServiceClient,
 };
 use otel_arrow_dfe_otap::pdata::{Context, OtapPdata};
 use otel_arrow_dfe_otap::transport_headers::ValueKind;
 use otel_arrow_dfe_pdata::otlp::logs::LogsProtoBytesEncoder;
 use otel_arrow_dfe_pdata::otlp::metrics::MetricsProtoBytesEncoder;
+use otel_arrow_dfe_pdata::otlp::profiles::ProfilesProtoBytesEncoder;
 use otel_arrow_dfe_pdata::otlp::traces::TracesProtoBytesEncoder;
 use otel_arrow_dfe_pdata::otlp::{ProtoBuffer, ProtoBytesEncoder};
+use otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceResponse;
+use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceResponse;
+use otel_arrow_dfe_pdata::proto::opentelemetry::collector::profiles::v1development::ExportProfilesServiceResponse;
+use otel_arrow_dfe_pdata::proto::opentelemetry::collector::trace::v1::ExportTraceServiceResponse;
 use otel_arrow_dfe_pdata::{
     OtapArrowRecords, OtapPayload, OtapPayloadHelpers, OtlpProtoBytes, PayloadData,
 };
@@ -255,10 +260,12 @@ impl Exporter<OtapPdata> for OTLPExporter {
         let mut logs_proto_encoder = LogsProtoBytesEncoder::new();
         let mut metrics_proto_encoder = MetricsProtoBytesEncoder::new();
         let mut traces_proto_encoder = TracesProtoBytesEncoder::new();
+        let mut profiles_proto_encoder = ProfilesProtoBytesEncoder::new();
 
         let mut logs_proto_buffer = ProtoBuffer::with_capacity(8 * 1024);
         let mut metrics_proto_buffer = ProtoBuffer::with_capacity(8 * 1024);
         let mut traces_proto_buffer = ProtoBuffer::with_capacity(8 * 1024);
+        let mut profiles_proto_buffer = ProtoBuffer::with_capacity(8 * 1024);
 
         let mut grpc_clients = GrpcClientPool::new(max_in_flight, channels, compression);
         grpc_clients.prepopulate_clients();
@@ -504,22 +511,6 @@ impl Exporter<OtapPdata> for OTLPExporter {
                     let signal_type = pdata.signal_type();
                     let (context, payload) = pdata.into_parts();
 
-                    if signal_type == SignalType::Profiles {
-                        let export_duration = export_started_at.elapsed();
-                        let mut nack = NackMsg::new(
-                            "OTLP gRPC Profiles export is not supported yet",
-                            OtapPdata::new(context, payload),
-                        );
-                        nack.permanent = true;
-                        _ = effect_handler.notify_nack(nack).await;
-                        self.metrics.record_failure(
-                            signal_type,
-                            OtlpGrpcExporterErrorType::Other,
-                            export_duration,
-                        );
-                        continue;
-                    }
-
                     // The cached bearer header, together with the generation of the
                     // token it was built from. The generation is echoed back on
                     // completion so an UNAUTHENTICATED response can be matched to the
@@ -607,8 +598,26 @@ impl Exporter<OtapPdata> for OTLPExporter {
                             )
                             .await;
                         }
-                        (SignalType::Profiles, PayloadData::OtapArrowRecords(_)) => {
-                            unreachable!("Profiles export is rejected before dispatch")
+                        (SignalType::Profiles, PayloadData::OtapArrowRecords(otap_batch)) => {
+                            dispatch_otap_export(
+                                otap_batch,
+                                context,
+                                metadata,
+                                SignalType::Profiles,
+                                export_started_at,
+                                &exporter_id,
+                                &mut profiles_proto_buffer,
+                                &mut profiles_proto_encoder,
+                                |encoded| {
+                                    let client =
+                                        SignalClient::Profiles(grpc_clients.take_profiles());
+                                    make_export_future(encoded, client)
+                                },
+                                &mut inflight_exports,
+                                &mut self.metrics,
+                                &effect_handler,
+                            )
+                            .await;
                         }
                         (_, PayloadData::OtlpBytes(service_req)) => {
                             let prepared = match service_req {
@@ -636,8 +645,15 @@ impl Exporter<OtapPdata> for OTLPExporter {
                                     export_started_at,
                                     |b| OtlpProtoBytes::ExportTracesRequest(b).into(),
                                 ),
-                                OtlpProtoBytes::ExportProfilesRequest(_) => {
-                                    unreachable!("Profiles export is rejected before dispatch")
+                                OtlpProtoBytes::ExportProfilesRequest(bytes) => {
+                                    prepare_otlp_export(
+                                        bytes,
+                                        context,
+                                        metadata,
+                                        SignalType::Profiles,
+                                        export_started_at,
+                                        |b| OtlpProtoBytes::ExportProfilesRequest(b).into(),
+                                    )
                                 }
                             };
 
@@ -650,9 +666,7 @@ impl Exporter<OtapPdata> for OTLPExporter {
                                     SignalClient::Traces(grpc_clients.take_traces())
                                 }
                                 SignalType::Profiles => {
-                                    unreachable!(
-                                        "Profiles export is rejected before client selection"
-                                    )
+                                    SignalClient::Profiles(grpc_clients.take_profiles())
                                 }
                             };
                             let future = make_export_future(prepared, client);
@@ -1241,7 +1255,10 @@ fn make_export_future(
     async move {
         match client {
             SignalClient::Logs(mut client) => {
-                let result = client.export(request).await.map(|_| ());
+                let result = client
+                    .export(request)
+                    .await
+                    .and_then(normalize_export_response);
                 CompletedExport {
                     result,
                     context,
@@ -1253,7 +1270,10 @@ fn make_export_future(
                 }
             }
             SignalClient::Metrics(mut client) => {
-                let result = client.export(request).await.map(|_| ());
+                let result = client
+                    .export(request)
+                    .await
+                    .and_then(normalize_export_response);
                 CompletedExport {
                     result,
                     context,
@@ -1265,7 +1285,10 @@ fn make_export_future(
                 }
             }
             SignalClient::Traces(mut client) => {
-                let result = client.export(request).await.map(|_| ());
+                let result = client
+                    .export(request)
+                    .await
+                    .and_then(normalize_export_response);
                 CompletedExport {
                     result,
                     context,
@@ -1276,8 +1299,74 @@ fn make_export_future(
                     token_generation,
                 }
             }
+            SignalClient::Profiles(mut client) => {
+                let result = client
+                    .export(request)
+                    .await
+                    .and_then(normalize_export_response);
+                CompletedExport {
+                    result,
+                    context,
+                    saved_payload,
+                    signal_type,
+                    export_started_at,
+                    client: SignalClient::Profiles(client),
+                    token_generation,
+                }
+            }
         }
     }
+}
+
+trait OtlpServiceResponse {
+    fn partial_rejection(self) -> Option<(i64, String)>;
+}
+
+impl OtlpServiceResponse for ExportLogsServiceResponse {
+    fn partial_rejection(self) -> Option<(i64, String)> {
+        self.partial_success
+            .filter(|partial| partial.rejected_log_records != 0)
+            .map(|partial| (partial.rejected_log_records, partial.error_message))
+    }
+}
+
+impl OtlpServiceResponse for ExportMetricsServiceResponse {
+    fn partial_rejection(self) -> Option<(i64, String)> {
+        self.partial_success
+            .filter(|partial| partial.rejected_data_points != 0)
+            .map(|partial| (partial.rejected_data_points, partial.error_message))
+    }
+}
+
+impl OtlpServiceResponse for ExportTraceServiceResponse {
+    fn partial_rejection(self) -> Option<(i64, String)> {
+        self.partial_success
+            .filter(|partial| partial.rejected_spans != 0)
+            .map(|partial| (partial.rejected_spans, partial.error_message))
+    }
+}
+
+impl OtlpServiceResponse for ExportProfilesServiceResponse {
+    fn partial_rejection(self) -> Option<(i64, String)> {
+        self.partial_success
+            .filter(|partial| partial.rejected_profiles != 0)
+            .map(|partial| (partial.rejected_profiles, partial.error_message))
+    }
+}
+
+fn normalize_export_response<T: OtlpServiceResponse>(
+    response: tonic::Response<T>,
+) -> Result<(), tonic::Status> {
+    let Some((rejected, error_message)) = response.into_inner().partial_rejection() else {
+        return Ok(());
+    };
+
+    let reason = if error_message.is_empty() {
+        format!("OTLP server rejected {rejected} items")
+    } else {
+        format!("{error_message} ({rejected} rejected)")
+    };
+    Err(tonic::Status::invalid_argument(reason))
 }
 
 /// FIFO-ish wrapper around the in-flight export RPCs.
@@ -1325,6 +1414,7 @@ struct GrpcClientPool {
     logs: VecDeque<LogsServiceClient<Channel>>,
     metrics: VecDeque<MetricsServiceClient<Channel>>,
     traces: VecDeque<TraceServiceClient<Channel>>,
+    profiles: VecDeque<ProfilesServiceClient<Channel>>,
 }
 
 impl GrpcClientPool {
@@ -1342,6 +1432,7 @@ impl GrpcClientPool {
             logs: VecDeque::with_capacity(pool_size),
             metrics: VecDeque::with_capacity(pool_size),
             traces: VecDeque::with_capacity(pool_size),
+            profiles: VecDeque::with_capacity(pool_size),
         }
     }
 
@@ -1366,6 +1457,13 @@ impl GrpcClientPool {
             let channel = self.channels[i % self.channels.len()].clone();
             self.traces.push_back(self.make_traces_client_with(channel));
         }
+
+        let profiles_cap = self.profiles.capacity();
+        for i in 0..profiles_cap {
+            let channel = self.channels[i % self.channels.len()].clone();
+            self.profiles
+                .push_back(self.make_profiles_client_with(channel));
+        }
     }
 
     #[inline(always)]
@@ -1389,11 +1487,19 @@ impl GrpcClientPool {
             .expect("client pool underflow: take_traces called with empty pool")
     }
 
+    #[inline(always)]
+    fn take_profiles(&mut self) -> ProfilesServiceClient<Channel> {
+        self.profiles
+            .pop_front()
+            .expect("client pool underflow: take_profiles called with empty pool")
+    }
+
     fn release(&mut self, client: SignalClient) {
         match client {
             SignalClient::Logs(client) => self.logs.push_back(client),
             SignalClient::Metrics(client) => self.metrics.push_back(client),
             SignalClient::Traces(client) => self.traces.push_back(client),
+            SignalClient::Profiles(client) => self.profiles.push_back(client),
         }
     }
 
@@ -1423,12 +1529,22 @@ impl GrpcClientPool {
         }
         client
     }
+
+    fn make_profiles_client_with(&self, channel: Channel) -> ProfilesServiceClient<Channel> {
+        let mut client = ProfilesServiceClient::new(channel);
+        if let Some(encoding) = self.compression {
+            client = client.send_compressed(encoding);
+            client = client.accept_compressed(encoding);
+        }
+        client
+    }
 }
 
 enum SignalClient {
     Logs(LogsServiceClient<Channel>),
     Metrics(MetricsServiceClient<Channel>),
     Traces(TraceServiceClient<Channel>),
+    Profiles(ProfilesServiceClient<Channel>),
 }
 
 /// Captures everything we need once a single export RPC has completed.
@@ -1477,15 +1593,20 @@ mod tests {
         test_node,
     };
     use otel_arrow_dfe_otap::otlp_grpc::OTLPData;
-    use otel_arrow_dfe_otap::otlp_mock::{LogsServiceMock, MetricsServiceMock, TraceServiceMock};
+    use otel_arrow_dfe_otap::otlp_mock::{
+        LogsServiceMock, MetricsServiceMock, ProfilesServiceMock, TraceServiceMock,
+    };
     use otel_arrow_dfe_otap::pdata::OtapPdata;
     use otel_arrow_dfe_otap::testing::{TestCallData, next_ack, next_nack};
     use otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest;
     use otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::logs_service_server::LogsServiceServer;
     use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceRequest;
     use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::metrics_service_server::MetricsServiceServer;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::collector::profiles::v1development::ExportProfilesServiceRequest;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::collector::profiles::v1development::profiles_service_server::ProfilesServiceServer;
     use otel_arrow_dfe_pdata::proto::opentelemetry::collector::trace::v1::ExportTraceServiceRequest;
     use otel_arrow_dfe_pdata::proto::opentelemetry::collector::trace::v1::trace_service_server::TraceServiceServer;
+    use otel_arrow_dfe_pdata::testing::profiles::{ProfilesDatasetKind, profiles_dataset};
     use otel_arrow_dfe_telemetry::metrics::MetricSetSnapshot;
     use otel_arrow_dfe_telemetry::registry::TelemetryRegistryHandle;
     use otel_arrow_dfe_telemetry::reporter::MetricsReporter;
@@ -1498,6 +1619,14 @@ mod tests {
     use tokio::time::{Duration, timeout};
     use tonic::codegen::tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Server;
+
+    fn create_profiles_service_request() -> ExportProfilesServiceRequest {
+        let profiles = profiles_dataset(ProfilesDatasetKind::Cpu, 1, 2, 2);
+        ExportProfilesServiceRequest {
+            resource_profiles: profiles.resource_profiles,
+            dictionary: profiles.dictionary,
+        }
+    }
 
     /// Helper function to wait for and validate an Ack or Nack message with the expected node_id
     async fn wait_for_ack_or_nack(
@@ -1552,8 +1681,10 @@ mod tests {
 
     /// Test closure that simulates a typical test scenario by sending timer ticks, config,
     /// data message, and shutdown control messages.
-    fn scenario() -> impl FnOnce(TestContext<OtapPdata>) -> Pin<Box<dyn Future<Output = ()>>> {
-        |ctx| {
+    fn scenario(
+        include_profiles: bool,
+    ) -> impl FnOnce(TestContext<OtapPdata>) -> Pin<Box<dyn Future<Output = ()>>> {
+        move |ctx| {
             Box::pin(async move {
                 // Send a data message
                 let req = ExportLogsServiceRequest::default();
@@ -1601,6 +1732,25 @@ mod tests {
                     .await
                     .expect("Failed to send metric message");
 
+                if include_profiles {
+                    for _ in 0..2 {
+                        let req = create_profiles_service_request();
+                        let mut req_bytes = vec![];
+                        req.encode(&mut req_bytes).unwrap();
+                        let profiles_pdata = OtapPdata::new_default(
+                            OtlpProtoBytes::ExportProfilesRequest(Bytes::from(req_bytes)).into(),
+                        )
+                        .test_subscribe_to(
+                            Interests::ACKS | Interests::NACKS,
+                            TestCallData::default().into(),
+                            123,
+                        );
+                        ctx.send_pdata(profiles_pdata)
+                            .await
+                            .expect("Failed to send Profiles message");
+                    }
+                }
+
                 // Send shutdown
                 ctx.send_shutdown(Instant::now() + Duration::from_millis(200), "test complete")
                     .await
@@ -1612,38 +1762,45 @@ mod tests {
     /// Validation closure that checks the expected counter values
     fn validation_procedure(
         mut receiver: tokio::sync::mpsc::Receiver<OTLPData>,
+        include_profiles: bool,
     ) -> impl FnOnce(TestContext<OtapPdata>, Result<(), Error>) -> Pin<Box<dyn Future<Output = ()>>>
     {
-        |_, exporter_result| {
+        move |_, exporter_result| {
             Box::pin(async move {
                 exporter_result.unwrap();
 
-                // check that the message was properly sent from the exporter
-                let logs_received = timeout(Duration::from_secs(3), receiver.recv())
-                    .await
-                    .expect("Timed out waiting for message");
-                // Assert that the message received is what the exporter sent
-                let _expected_logs_message = ExportLogsServiceRequest::default();
-                assert!(matches!(logs_received, _expected_logs_message));
-
-                let metrics_received = timeout(Duration::from_secs(3), receiver.recv())
-                    .await
-                    .expect("Timed out waiting for message")
-                    .expect("No message received");
-
-                let _expected_metrics_message = ExportMetricsServiceRequest::default();
-                assert!(matches!(metrics_received, _expected_metrics_message));
-
-                let traces_received = timeout(Duration::from_secs(3), receiver.recv())
-                    .await
-                    .expect("Timed out waiting for message")
-                    .expect("No message received");
-                let _expected_trace_message = ExportTraceServiceRequest::default();
-                assert!(matches!(traces_received, _expected_trace_message));
+                let mut signal_counts = HashMap::new();
+                let expected_messages = if include_profiles { 5 } else { 3 };
+                for _ in 0..expected_messages {
+                    let received = timeout(Duration::from_secs(3), receiver.recv())
+                        .await
+                        .expect("Timed out waiting for message")
+                        .expect("No message received");
+                    let signal = match received {
+                        OTLPData::Logs(_) => SignalType::Logs,
+                        OTLPData::Metrics(_) => SignalType::Metrics,
+                        OTLPData::Traces(_) => SignalType::Traces,
+                        OTLPData::Profiles(request) => {
+                            assert_eq!(request, create_profiles_service_request());
+                            SignalType::Profiles
+                        }
+                    };
+                    *signal_counts.entry(signal).or_insert(0) += 1;
+                }
+                assert_eq!(signal_counts.get(&SignalType::Logs), Some(&1));
+                assert_eq!(signal_counts.get(&SignalType::Metrics), Some(&1));
+                assert_eq!(signal_counts.get(&SignalType::Traces), Some(&1));
+                if include_profiles {
+                    assert_eq!(signal_counts.get(&SignalType::Profiles), Some(&2));
+                } else {
+                    assert!(!signal_counts.contains_key(&SignalType::Profiles));
+                }
             })
         }
     }
 
+    /// Scenario: OTLP/gRPC exports all signals and reuses its Profiles client for a second request.
+    /// Guarantees: Profiles requests reach the standard service and both complete with ACKs.
     #[test]
     fn test_otlp_exporter() {
         let test_runtime = TestRuntime::new();
@@ -1667,10 +1824,13 @@ mod tests {
             let mock_metrics_service =
                 MetricsServiceServer::new(MetricsServiceMock::new(sender.clone()));
             let mock_trace_service = TraceServiceServer::new(TraceServiceMock::new(sender.clone()));
+            let mock_profiles_service =
+                ProfilesServiceServer::new(ProfilesServiceMock::new(sender.clone()));
             Server::builder()
                 .add_service(mock_logs_service)
                 .add_service(mock_metrics_service)
                 .add_service(mock_trace_service)
+                .add_service(mock_profiles_service)
                 .serve_with_incoming_shutdown(tcp_stream, async {
                     // Wait for the shutdown signal
                     let _ = shutdown_signal.await;
@@ -1712,16 +1872,15 @@ mod tests {
 
         test_runtime
             .set_exporter(exporter)
-            .run_test(scenario())
+            .run_test(scenario(true))
             .run_validation(|mut ctx, result| {
                 Box::pin(async move {
-                    // Validate that we received 3 Acks
+                    // Validate that we received one ACK per export.
                     let mut ack_count = 0;
                     let mut pipeline_completion_rx =
                         ctx.take_pipeline_completion_receiver().unwrap();
 
-                    // Validate that we received 3 Acks with correct node_id
-                    for i in 0..3 {
+                    for i in 0..5 {
                         wait_for_ack_or_nack(
                             &mut pipeline_completion_rx,
                             true,
@@ -1733,8 +1892,8 @@ mod tests {
                         ack_count += 1;
                     }
 
-                    assert_eq!(ack_count, 3, "Expected 3 Acks for 3 successful exports");
-                    validation_procedure(receiver)(ctx, result).await;
+                    assert_eq!(ack_count, 5, "Expected 5 Acks for 5 successful exports");
+                    validation_procedure(receiver, true)(ctx, result).await;
                 })
             });
 
@@ -1837,7 +1996,7 @@ mod tests {
 
         test_runtime
             .set_exporter(exporter)
-            .run_test(scenario())
+            .run_test(scenario(false))
             .run_validation(|mut ctx, result| {
                 Box::pin(async move {
                     let mut pipeline_completion_rx =
@@ -1852,7 +2011,7 @@ mod tests {
                         .await
                         .expect("Failed to receive Ack");
                     }
-                    validation_procedure(receiver)(ctx, result).await;
+                    validation_procedure(receiver, false)(ctx, result).await;
                 })
             });
 
@@ -1966,7 +2125,7 @@ mod tests {
 
         test_runtime
             .set_exporter(exporter)
-            .run_test(scenario())
+            .run_test(scenario(false))
             .run_validation(|mut ctx, result| {
                 Box::pin(async move {
                     let mut pipeline_completion_rx =
@@ -1981,7 +2140,7 @@ mod tests {
                         .await
                         .expect("Failed to receive Ack");
                     }
-                    validation_procedure(receiver)(ctx, result).await;
+                    validation_procedure(receiver, false)(ctx, result).await;
                 })
             });
 
@@ -2526,6 +2685,30 @@ mod tests {
         );
     }
 
+    /// Scenario: A Profiles export response reports a nonzero partial rejection count.
+    /// Guarantees: The gRPC exporter converts it to a permanent rejected result, not an ACK.
+    #[test]
+    fn profiles_partial_success_is_a_permanent_rejection() {
+        use otel_arrow_dfe_pdata::proto::opentelemetry::collector::profiles::v1development::ExportProfilesPartialSuccess;
+
+        let result =
+            normalize_export_response(tonic::Response::new(ExportProfilesServiceResponse {
+                partial_success: Some(ExportProfilesPartialSuccess {
+                    rejected_profiles: 2,
+                    error_message: "profiles rejected".to_owned(),
+                }),
+            }));
+
+        let status = result.expect_err("nonzero partial rejection must fail");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(status.message(), "profiles rejected (2 rejected)");
+        assert!(!is_retryable_grpc_status(&status));
+        assert_eq!(
+            export_error_type(&Err(status)),
+            Some(OtlpGrpcExporterErrorType::Rejected)
+        );
+    }
+
     /// Helper builds a [`tonic::Status`] carrying a `RetryInfo` in its
     /// `grpc-status-details-bin` trailer, as a real server would.
     fn status_with_retry_info(code: Code) -> tonic::Status {
@@ -2750,9 +2933,7 @@ mod tests {
             &self,
             _request: tonic::Request<ExportLogsServiceRequest>,
         ) -> Result<
-            tonic::Response<
-                otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceResponse,
-            >,
+            tonic::Response<ExportLogsServiceResponse>,
             tonic::Status,
         > {
             if let Some(details) = &self.detail_bytes {

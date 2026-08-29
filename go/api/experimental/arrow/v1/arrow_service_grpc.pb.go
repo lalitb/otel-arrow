@@ -21,7 +21,6 @@ package v1
 
 import (
 	context "context"
-
 	grpc "google.golang.org/grpc"
 	codes "google.golang.org/grpc/codes"
 	status "google.golang.org/grpc/status"
@@ -391,6 +390,128 @@ var ArrowMetricsService_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "ArrowMetrics",
 			Handler:       _ArrowMetricsService_ArrowMetrics_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+	},
+	Metadata: "opentelemetry/proto/experimental/arrow/v1/arrow_service.proto",
+}
+
+const (
+	ArrowProfilesService_ArrowProfiles_FullMethodName = "/opentelemetry.proto.experimental.arrow.v1.ArrowProfilesService/ArrowProfiles"
+)
+
+// ArrowProfilesServiceClient is the client API for ArrowProfilesService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+type ArrowProfilesServiceClient interface {
+	ArrowProfiles(ctx context.Context, opts ...grpc.CallOption) (ArrowProfilesService_ArrowProfilesClient, error)
+}
+
+type arrowProfilesServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewArrowProfilesServiceClient(cc grpc.ClientConnInterface) ArrowProfilesServiceClient {
+	return &arrowProfilesServiceClient{cc}
+}
+
+func (c *arrowProfilesServiceClient) ArrowProfiles(ctx context.Context, opts ...grpc.CallOption) (ArrowProfilesService_ArrowProfilesClient, error) {
+	stream, err := c.cc.NewStream(ctx, &ArrowProfilesService_ServiceDesc.Streams[0], ArrowProfilesService_ArrowProfiles_FullMethodName, opts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &arrowProfilesServiceArrowProfilesClient{stream}
+	return x, nil
+}
+
+type ArrowProfilesService_ArrowProfilesClient interface {
+	Send(*BatchArrowRecords) error
+	Recv() (*BatchStatus, error)
+	grpc.ClientStream
+}
+
+type arrowProfilesServiceArrowProfilesClient struct {
+	grpc.ClientStream
+}
+
+func (x *arrowProfilesServiceArrowProfilesClient) Send(m *BatchArrowRecords) error {
+	return x.ClientStream.SendMsg(m)
+}
+
+func (x *arrowProfilesServiceArrowProfilesClient) Recv() (*BatchStatus, error) {
+	m := new(BatchStatus)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// ArrowProfilesServiceServer is the server API for ArrowProfilesService service.
+// All implementations must embed UnimplementedArrowProfilesServiceServer
+// for forward compatibility
+type ArrowProfilesServiceServer interface {
+	ArrowProfiles(ArrowProfilesService_ArrowProfilesServer) error
+	mustEmbedUnimplementedArrowProfilesServiceServer()
+}
+
+// UnimplementedArrowProfilesServiceServer must be embedded to have forward compatible implementations.
+type UnimplementedArrowProfilesServiceServer struct {
+}
+
+func (UnimplementedArrowProfilesServiceServer) ArrowProfiles(ArrowProfilesService_ArrowProfilesServer) error {
+	return status.Errorf(codes.Unimplemented, "method ArrowProfiles not implemented")
+}
+func (UnimplementedArrowProfilesServiceServer) mustEmbedUnimplementedArrowProfilesServiceServer() {}
+
+// UnsafeArrowProfilesServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to ArrowProfilesServiceServer will
+// result in compilation errors.
+type UnsafeArrowProfilesServiceServer interface {
+	mustEmbedUnimplementedArrowProfilesServiceServer()
+}
+
+func RegisterArrowProfilesServiceServer(s grpc.ServiceRegistrar, srv ArrowProfilesServiceServer) {
+	s.RegisterService(&ArrowProfilesService_ServiceDesc, srv)
+}
+
+func _ArrowProfilesService_ArrowProfiles_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(ArrowProfilesServiceServer).ArrowProfiles(&arrowProfilesServiceArrowProfilesServer{stream})
+}
+
+type ArrowProfilesService_ArrowProfilesServer interface {
+	Send(*BatchStatus) error
+	Recv() (*BatchArrowRecords, error)
+	grpc.ServerStream
+}
+
+type arrowProfilesServiceArrowProfilesServer struct {
+	grpc.ServerStream
+}
+
+func (x *arrowProfilesServiceArrowProfilesServer) Send(m *BatchStatus) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func (x *arrowProfilesServiceArrowProfilesServer) Recv() (*BatchArrowRecords, error) {
+	m := new(BatchArrowRecords)
+	if err := x.ServerStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// ArrowProfilesService_ServiceDesc is the grpc.ServiceDesc for ArrowProfilesService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var ArrowProfilesService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "opentelemetry.proto.experimental.arrow.v1.ArrowProfilesService",
+	HandlerType: (*ArrowProfilesServiceServer)(nil),
+	Methods:     []grpc.MethodDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "ArrowProfiles",
+			Handler:       _ArrowProfilesService_ArrowProfiles_Handler,
 			ServerStreams: true,
 			ClientStreams: true,
 		},

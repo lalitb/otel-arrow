@@ -4,11 +4,13 @@
 //! OTAP Profiles to OTLP Profiles encoding.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::mem::size_of;
 
 use arrow::array::{
-    Array, Int64Array, LargeBinaryArray, LargeListArray, RecordBatch, StructArray, UInt8Array,
-    UInt32Array, UInt64Array,
+    Array, ArrayRef, Int64Array, LargeBinaryArray, LargeListArray, RecordBatch, StructArray,
+    UInt8Array, UInt32Array, UInt64Array,
 };
+use arrow::datatypes::DataType as ArrowDataType;
 use prost::Message;
 
 use crate::arrays::{
@@ -71,6 +73,9 @@ impl ProtoBytesEncoder for ProfilesProtoBytesEncoder {
 
         let profiles = Profiles::try_from(profiles.clone().into_raw())?;
         let records = OtapArrowRecords::Profiles(profiles);
+        if estimated_reconstruction_bytes(&records, logical_arrow_bytes)? > result_buf.remaining() {
+            return Err(Error::Dropped);
+        }
         let request = reconstruct_profiles_request(&records)?;
         let encoded_len = request.encoded_len();
         if encoded_len > result_buf.remaining() {
@@ -79,6 +84,109 @@ impl ProtoBytesEncoder for ProfilesProtoBytesEncoder {
         let bytes = request.encode_to_vec();
         result_buf.extend_from_slice(&bytes)?;
         Ok(())
+    }
+}
+
+fn estimated_reconstruction_bytes(
+    records: &OtapArrowRecords,
+    logical_arrow_bytes: usize,
+) -> Result<usize> {
+    const ROW_ALLOCATION_COPIES: usize = 2;
+    let mut estimate = logical_arrow_bytes;
+
+    for payload_type in Profiles::allowed_payload_types() {
+        let Some(batch) = records.get(*payload_type) else {
+            continue;
+        };
+        let row_overhead = protobuf_row_overhead(*payload_type)?
+            .checked_mul(batch.num_rows())
+            // Account for both the protobuf graph and temporary lookup/grouping state.
+            .and_then(|value| value.checked_mul(ROW_ALLOCATION_COPIES))
+            .ok_or(Error::Dropped)?;
+        estimate = estimate.checked_add(row_overhead).ok_or(Error::Dropped)?;
+
+        for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+            estimate = estimate
+                .checked_add(dictionary_utf8_expansion(column)?)
+                .ok_or(Error::Dropped)?;
+            if field.name() == consts::ATTRIBUTE_SER {
+                let values = ByteArrayAccessor::try_new(column)?;
+                for row in 0..column.len() {
+                    if let Some(value) = values.slice_at(row) {
+                        let nested_overhead = value
+                            .len()
+                            .checked_mul(size_of::<AnyValue>() + size_of::<KeyValue>())
+                            .ok_or(Error::Dropped)?;
+                        estimate = estimate
+                            .checked_add(nested_overhead)
+                            .ok_or(Error::Dropped)?;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(estimate)
+}
+
+fn protobuf_row_overhead(payload_type: ArrowPayloadType) -> Result<usize> {
+    let overhead = match payload_type {
+        ArrowPayloadType::ResourceAttrs | ArrowPayloadType::ScopeAttrs => {
+            size_of::<KeyValue>() + size_of::<AnyValue>()
+        }
+        ArrowPayloadType::Profiles => {
+            size_of::<ResourceProfiles>()
+                + size_of::<Resource>()
+                + size_of::<ScopeProfiles>()
+                + size_of::<InstrumentationScope>()
+                + size_of::<Profile>()
+        }
+        ArrowPayloadType::ProfileValueTypes => size_of::<ValueType>(),
+        ArrowPayloadType::Samples => size_of::<Sample>(),
+        ArrowPayloadType::Stacks => size_of::<Stack>(),
+        ArrowPayloadType::StackLocations => size_of::<i32>(),
+        ArrowPayloadType::ProfileLocations => size_of::<Location>(),
+        ArrowPayloadType::ProfileLocationLines => size_of::<Line>(),
+        ArrowPayloadType::ProfileFunctions => size_of::<Function>(),
+        ArrowPayloadType::ProfileMappings => size_of::<Mapping>(),
+        ArrowPayloadType::ProfileLinks => size_of::<Link>(),
+        ArrowPayloadType::ProfileAttrs
+        | ArrowPayloadType::ProfileSampleAttrs
+        | ArrowPayloadType::ProfileMappingAttrs
+        | ArrowPayloadType::ProfileLocationAttrs => {
+            size_of::<KeyValueAndUnit>() + size_of::<AnyValue>()
+        }
+        _ => {
+            return Err(unexpected(
+                "Profiles reconstruction estimate received an unrelated payload",
+            ));
+        }
+    };
+    Ok(overhead)
+}
+
+fn dictionary_utf8_expansion(array: &ArrayRef) -> Result<usize> {
+    match array.data_type() {
+        ArrowDataType::Dictionary(_, value_type) if value_type.as_ref() == &ArrowDataType::Utf8 => {
+            let values = StringArrayAccessor::try_new(array)?;
+            (0..array.len()).try_fold(0usize, |total, row| {
+                total
+                    .checked_add(values.str_at(row).map_or(0, str::len))
+                    .ok_or(Error::Dropped)
+            })
+        }
+        ArrowDataType::Struct(_) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| unexpected("expected StructArray during Profiles preflight"))?;
+            values.columns().iter().try_fold(0usize, |total, column| {
+                total
+                    .checked_add(dictionary_utf8_expansion(column)?)
+                    .ok_or(Error::Dropped)
+            })
+        }
+        _ => Ok(0),
     }
 }
 
@@ -1391,6 +1499,36 @@ mod tests {
             });
 
         assert!(matches!(result, Err(Error::Dropped)));
+    }
+
+    /// Scenario: Many profile envelopes reference one large Arrow dictionary string.
+    /// Guarantees: Expanded protobuf allocation is rejected before graph reconstruction.
+    #[test]
+    fn profiles_output_preflights_dictionary_expansion() {
+        let mut data = full_profiles_data();
+        let template = data.resource_profiles.pop().unwrap();
+        let shared_schema_url = "s".repeat(16 * 1024);
+        for index in 0..32_u8 {
+            let mut resource = template.clone();
+            resource.schema_url = shared_schema_url.clone();
+            resource.scope_profiles[0].schema_url = shared_schema_url.clone();
+            resource.scope_profiles[0].profiles[0].profile_id = vec![index + 1; 16];
+            data.resource_profiles.push(resource);
+        }
+
+        let mut records = encode_profiles_otap_batch(&data).unwrap();
+        let logical_arrow_bytes = records.logical_arrow_bytes().unwrap();
+        let expanded = estimated_reconstruction_bytes(&records, logical_arrow_bytes).unwrap();
+        assert!(
+            expanded > logical_arrow_bytes + shared_schema_url.len() * data.resource_profiles.len(),
+            "preflight must account for repeated dictionary values"
+        );
+
+        let mut output =
+            ProtoBuffer::with_capacity_and_limit(0, logical_arrow_bytes.saturating_add(1));
+        let result = ProfilesProtoBytesEncoder::new().encode(&mut records, &mut output);
+        assert!(matches!(result, Err(Error::Dropped)));
+        assert!(output.is_empty());
     }
 
     /// Scenario: A non-empty Profiles store has child payloads but no root batch.

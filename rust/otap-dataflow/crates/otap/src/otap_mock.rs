@@ -25,9 +25,11 @@ use otel_arrow_dfe_pdata::{
         ArrowPayloadType, BatchArrowRecords, BatchStatus, StatusCode,
         arrow_logs_service_server::ArrowLogsService,
         arrow_metrics_service_server::ArrowMetricsService,
+        arrow_profiles_service_server::ArrowProfilesService,
         arrow_traces_service_server::ArrowTracesService,
     },
     schema::consts,
+    testing::profiles::{ProfilesDatasetKind, profiles_dataset},
 };
 use std::{pin::Pin, sync::Arc};
 use tokio::sync::mpsc::Sender;
@@ -67,6 +69,19 @@ pub struct ArrowTracesServiceMock {
 
 impl ArrowTracesServiceMock {
     /// create a new ArrowTracesServiceMock struct with a sendable effect handler
+    #[must_use]
+    pub fn new(sender: Sender<OtapPdata>) -> Self {
+        Self { sender }
+    }
+}
+
+/// struct that implements the ArrowProfilesService trait
+pub struct ArrowProfilesServiceMock {
+    sender: Sender<OtapPdata>,
+}
+
+impl ArrowProfilesServiceMock {
+    /// create a new ArrowProfilesServiceMock struct with a sendable effect handler
     #[must_use]
     pub fn new(sender: Sender<OtapPdata>) -> Self {
         Self { sender }
@@ -221,9 +236,63 @@ impl ArrowTracesService for ArrowTracesServiceMock {
     }
 }
 
+#[tonic::async_trait]
+impl ArrowProfilesService for ArrowProfilesServiceMock {
+    type ArrowProfilesStream =
+        Pin<Box<dyn Stream<Item = Result<BatchStatus, Status>> + Send + 'static>>;
+    async fn arrow_profiles(
+        &self,
+        request: Request<tonic::Streaming<BatchArrowRecords>>,
+    ) -> Result<Response<Self::ArrowProfilesStream>, Status> {
+        let mut input_stream = request.into_inner();
+        let (tx, rx) = tokio::sync::mpsc::channel(100);
+        let sender_clone = self.sender.clone();
+        let output = ReceiverStream::new(rx);
+
+        _ = tokio::spawn(async move {
+            let mut consumer = Consumer::default();
+
+            while let Ok(Some(mut batch)) = input_stream.message().await {
+                let batch_data = consumer
+                    .consume_bar(&mut batch)
+                    .expect("failed to decode profiles batch in mock OTAP stream");
+                let pdata =
+                    OtapArrowRecords::Profiles(from_record_messages(batch_data).expect("valid"));
+                let batch_id = batch.batch_id;
+                let status_result = match sender_clone
+                    .send(OtapPdata::new_default(pdata.into()))
+                    .await
+                {
+                    Ok(_) => (StatusCode::Ok, "Successfully received".to_string()),
+                    Err(error) => (StatusCode::Canceled, error.to_string()),
+                };
+                _ = tx
+                    .send(Ok(BatchStatus {
+                        batch_id,
+                        status_code: status_result.0 as i32,
+                        status_message: status_result.1,
+                    }))
+                    .await;
+            }
+        });
+
+        Ok(Response::new(Box::pin(output) as Self::ArrowProfilesStream))
+    }
+}
+
 /// creates a basic batch arrow record to use for testing
 #[must_use]
 pub fn create_otap_batch(batch_id: i64, payload_type: ArrowPayloadType) -> OtapArrowRecords {
+    if payload_type == ArrowPayloadType::Profiles {
+        return otel_arrow_dfe_pdata::encode::encode_profiles_otap_batch(&profiles_dataset(
+            ProfilesDatasetKind::Cpu,
+            1,
+            2,
+            2,
+        ))
+        .expect("failed to build test Profiles OTAP batch");
+    }
+
     let record_batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new(
             consts::ID,

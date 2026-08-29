@@ -167,7 +167,7 @@ before being proposed upstream.
 ### PA-011: Profiles conversion limits are not configurable
 
 - Status: `open`
-- Area: OTLP Profiles to OTAP conversion and `ConversionOptions`
+- Area: both Profiles conversion directions and `ConversionOptions`
 - Evidence: the encoder uses checked IDs and offsets, dictionary-backed repeated
   strings, a bounded AnyValue nesting depth, and Arrow capacity checks, but
   `ConversionOptions` exposes no Profiles-specific profile, sample, dictionary,
@@ -175,10 +175,16 @@ before being proposed upstream.
 - Impact: conversion still allocates proportional to a request that passes the
   receiver's encoded-byte limit, and embedders can invoke conversion without a
   transport admission limit.
-- Local direction: keep the step-6 encoder fail-fast for representational
-  limits and avoid repeated-string amplification.
-- Upstream framing: add configurable conversion/admission limits before
-  Profiles transport is enabled in step 9.
+- Local direction: keep conversion fail-fast for representational limits, avoid
+  repeated-string amplification, preserve whole request/BAR boundaries, and
+  apply the existing transport byte, concurrency, and queue bounds. Reverse
+  conversion also estimates expanded dictionary strings, protobuf row objects,
+  and serialized AnyValue structure before materialization.
+- Local result: step 9 enables experimental transport without claiming
+  profile, sample, dictionary, list-element, or retained-memory cardinality
+  bounds.
+- Upstream framing: add configurable Profiles conversion/admission limits
+  before treating the transport as production-ready.
 
 ### PA-012: Ordered-child validation assumed physical row order
 
@@ -200,13 +206,14 @@ before being proposed upstream.
 - Area: OTAP Profiles to OTLP conversion
 - Evidence: the step-7 encoder reconstructs a complete
   `ExportProfilesServiceRequest`, computes its encoded length, and then encodes
-  it into a bounded buffer.
-- Impact: logical Arrow size is checked against remaining output capacity first,
-  so retained work is bounded by the configured output limit, but conversion
-  temporarily holds the Arrow graph, protobuf graph, and encoded bytes
-  concurrently.
-- Local direction: use conservative preflight accounting and the existing
-  256 MiB maximum output limit.
+  it into a bounded buffer. Step 9 adds a conservative preflight for logical
+  Arrow bytes, expanded dictionary references, protobuf row objects, and
+  serialized AnyValue structure.
+- Impact: compact dictionary-backed input is rejected before large repeated
+  strings are cloned, but accepted conversion still temporarily holds the
+  Arrow graph, protobuf graph, and encoded bytes concurrently.
+- Local direction: bound materialization with conservative expansion accounting
+  and the existing 256 MiB maximum output limit.
 - Upstream framing: stream Profiles fields transactionally into `ProtoBuffer`
   once profiling shows the extra materialization is significant.
 
@@ -236,6 +243,21 @@ before being proposed upstream.
   suite so coverage remains dependency-free and repeatable.
 - Upstream framing: add shared fuzz infrastructure before maintaining
   Profiles-specific corpora and long-running CI jobs.
+
+### PA-016: The Go runtime has no Profiles Arrow implementation
+
+- Status: `open`
+- Area: Go OTAP producer, consumer, receiver, and exporter packages
+- Evidence: the shared protobuf and generated Go API declare Profiles payload
+  types and `ArrowProfilesService`, but the Go tree has no Profiles Arrow
+  schemas, encoder/decoder, or signal service integration.
+- Impact: Go users can compile against the new service interface but cannot
+  produce, consume, receive, or export OTAP Profiles with the repository's Go
+  runtime.
+- Local direction: regenerate the Go protocol binding and mocks so the shared
+  wire contract stays synchronized, without implying runtime support.
+- Upstream framing: implement the Go Profiles Arrow codec and transport path in
+  a separate change with cross-language Rust/Go fixtures.
 
 ## Review Policy
 

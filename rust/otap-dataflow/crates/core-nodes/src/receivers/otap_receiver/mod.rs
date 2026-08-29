@@ -21,8 +21,8 @@ use otel_arrow_dfe_otap::memory_pressure_layer::{MemoryPressureLayer, ReceiverRe
 use otel_arrow_dfe_otap::otap_grpc::middleware::zstd_header::ZstdRequestHeaderAdapter;
 use otel_arrow_dfe_otap::otap_grpc::otlp::server::{RouteResponse, SharedState};
 use otel_arrow_dfe_otap::otap_grpc::{
-    ArrowLogsServiceImpl, ArrowMetricsServiceImpl, ArrowTracesServiceImpl, OtapReceiverTelemetry,
-    OtapStreamTaskManager, Settings,
+    ArrowLogsServiceImpl, ArrowMetricsServiceImpl, ArrowProfilesServiceImpl,
+    ArrowTracesServiceImpl, OtapReceiverTelemetry, OtapStreamTaskManager, Settings,
 };
 use otel_arrow_dfe_otap::pdata::OtapPdata;
 use otel_arrow_dfe_otap::tls_utils::{build_tls_acceptor, create_tls_stream};
@@ -45,6 +45,7 @@ use otel_arrow_dfe_engine::terminal_state::TerminalState;
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::{
     arrow_logs_service_server::ArrowLogsServiceServer,
     arrow_metrics_service_server::ArrowMetricsServiceServer,
+    arrow_profiles_service_server::ArrowProfilesServiceServer,
     arrow_traces_service_server::ArrowTracesServiceServer,
 };
 use otel_arrow_dfe_telemetry::common_attributes::{
@@ -223,7 +224,7 @@ impl OTAPReceiver {
             SignalType::Logs => states.logs.as_ref(),
             SignalType::Metrics => states.metrics.as_ref(),
             SignalType::Traces => states.traces.as_ref(),
-            SignalType::Profiles => None,
+            SignalType::Profiles => states.profiles.as_ref(),
         };
 
         (
@@ -246,7 +247,7 @@ impl OTAPReceiver {
             SignalType::Logs => states.logs.as_ref(),
             SignalType::Metrics => states.metrics.as_ref(),
             SignalType::Traces => states.traces.as_ref(),
-            SignalType::Profiles => None,
+            SignalType::Profiles => states.profiles.as_ref(),
         };
 
         (
@@ -471,6 +472,7 @@ struct SharedStates {
     logs: Option<SharedState>,
     metrics: Option<SharedState>,
     traces: Option<SharedState>,
+    profiles: Option<SharedState>,
 }
 
 impl SharedStates {
@@ -478,6 +480,7 @@ impl SharedStates {
         self.logs.as_ref().is_none_or(SharedState::is_empty)
             && self.metrics.as_ref().is_none_or(SharedState::is_empty)
             && self.traces.as_ref().is_none_or(SharedState::is_empty)
+            && self.profiles.as_ref().is_none_or(SharedState::is_empty)
     }
 
     fn force_shutdown(&self, reason: &str) {
@@ -489,6 +492,9 @@ impl SharedStates {
         }
         if let Some(state) = &self.traces {
             state.force_shutdown(SignalType::Traces, reason);
+        }
+        if let Some(state) = &self.profiles {
+            state.force_shutdown(SignalType::Profiles, reason);
         }
     }
 }
@@ -520,6 +526,9 @@ impl shared::Receiver<OtapPdata> for OTAPReceiver {
                 .config
                 .max_concurrent_requests_per_stream
                 .get(),
+            request_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                self.config.max_concurrent_requests,
+            )),
             wait_for_result: self.config.wait_for_result,
             admission_state: self.admission_state.clone(),
             receiver_metrics: Some(self.metrics.clone()),
@@ -530,16 +539,19 @@ impl shared::Receiver<OtapPdata> for OTAPReceiver {
         let logs_service = ArrowLogsServiceImpl::new(effect_handler.clone(), &settings);
         let metrics_service = ArrowMetricsServiceImpl::new(effect_handler.clone(), &settings);
         let traces_service = ArrowTracesServiceImpl::new(effect_handler.clone(), &settings);
+        let profiles_service = ArrowProfilesServiceImpl::new(effect_handler.clone(), &settings);
 
         let states = SharedStates {
             logs: logs_service.state(),
             metrics: metrics_service.state(),
             traces: traces_service.state(),
+            profiles: profiles_service.state(),
         };
 
         let mut logs_server = ArrowLogsServiceServer::new(logs_service);
         let mut metrics_server = ArrowMetricsServiceServer::new(metrics_service);
         let mut traces_server = ArrowTracesServiceServer::new(traces_service);
+        let mut profiles_server = ArrowProfilesServiceServer::new(profiles_service);
 
         // apply the tonic compression if it is set
         if let Some(ref compression) = self.config.compression_method {
@@ -552,6 +564,9 @@ impl shared::Receiver<OtapPdata> for OTAPReceiver {
                 .send_compressed(encoding)
                 .accept_compressed(encoding);
             traces_server = traces_server
+                .send_compressed(encoding)
+                .accept_compressed(encoding);
+            profiles_server = profiles_server
                 .send_compressed(encoding)
                 .accept_compressed(encoding);
         }
@@ -583,7 +598,8 @@ impl shared::Receiver<OtapPdata> for OTAPReceiver {
             .layer(MiddlewareLayer::new(ZstdRequestHeaderAdapter::default()))
             .add_service(logs_server)
             .add_service(metrics_server)
-            .add_service(traces_server);
+            .add_service(traces_server)
+            .add_service(profiles_server);
 
         let grpc_shutdown = CancellationToken::new();
         let server_task = {
@@ -821,6 +837,7 @@ mod tests {
     use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::{
         ArrowPayloadType, arrow_logs_service_client::ArrowLogsServiceClient,
         arrow_metrics_service_client::ArrowMetricsServiceClient,
+        arrow_profiles_service_client::ArrowProfilesServiceClient,
         arrow_traces_service_client::ArrowTracesServiceClient,
     };
     use otel_arrow_dfe_telemetry::common_attributes::{Outcome, ReceiverRejectionErrorType};
@@ -926,6 +943,34 @@ mod tests {
                 )
                 .await;
 
+                let mut arrow_profiles_client =
+                    ArrowProfilesServiceClient::connect(grpc_endpoint.clone())
+                        .await
+                        .expect("Failed to connect to server from Profiles Service Client");
+                #[allow(tail_expr_drop_order)]
+                let profiles_stream = stream! {
+                    let mut producer = Producer::new();
+                    for batch_id in 0..3 {
+                        let mut profiles_records =
+                            create_otap_batch(batch_id, ArrowPayloadType::Profiles);
+                        let bar = producer.produce_bar(&mut profiles_records).unwrap();
+                        yield bar;
+                    }
+                };
+                let profiles_response = arrow_profiles_client
+                    .arrow_profiles(profiles_stream)
+                    .await
+                    .expect("Failed to receive response after sending Profiles Request");
+
+                validate_batch_responses(
+                    profiles_response.into_inner(),
+                    0,
+                    "Successfully received",
+                    3,
+                    "profiles",
+                )
+                .await;
+
                 assert_receiver_telemetry(&ctx, telemetry, None).await;
 
                 // Finally, send a Shutdown event to terminate the receiver.
@@ -1020,6 +1065,26 @@ mod tests {
                         ctx.send_control_msg(NodeControlMsg::Ack(ack))
                             .await
                             .expect("Failed to send Ack for traces");
+                    }
+                }
+
+                for _batch_id in 0..3 {
+                    let profiles_pdata = timeout(Duration::from_secs(3), ctx.recv())
+                        .await
+                        .expect("Timed out waiting for Profiles message")
+                        .expect("No Profiles message received");
+
+                    let profiles_records: OtapArrowRecords = profiles_pdata
+                        .clone()
+                        .payload()
+                        .try_into_with_default()
+                        .expect("Could convert pdata to Profiles OTAP data");
+                    assert!(matches!(profiles_records, OtapArrowRecords::Profiles(_)));
+
+                    if let Some((_node_id, ack)) = next_ack(AckMsg::new(profiles_pdata)) {
+                        ctx.send_control_msg(NodeControlMsg::Ack(ack))
+                            .await
+                            .expect("Failed to send Ack for Profiles");
                     }
                 }
             })
@@ -1131,6 +1196,36 @@ mod tests {
                 )
                 .await;
 
+                let mut arrow_profiles_client =
+                    ArrowProfilesServiceClient::connect(grpc_endpoint.clone())
+                        .await
+                        .expect("Failed to connect to server");
+
+                #[allow(tail_expr_drop_order)]
+                let profiles_stream = stream! {
+                    let mut producer = Producer::new();
+                    for batch_id in 0..3 {
+                        let mut profiles_records =
+                            create_otap_batch(batch_id, ArrowPayloadType::Profiles);
+                        let bar = producer.produce_bar(&mut profiles_records).unwrap();
+                        yield bar;
+                    }
+                };
+
+                let profiles_response = arrow_profiles_client
+                    .arrow_profiles(profiles_stream)
+                    .await
+                    .expect("Failed to receive response after sending Profiles Request");
+
+                validate_batch_responses(
+                    profiles_response.into_inner(),
+                    3,
+                    "Pipeline processing failed: Test NACK reason for profiles",
+                    3,
+                    "profiles",
+                )
+                .await;
+
                 assert_receiver_telemetry(&ctx, telemetry, Some("refused")).await;
 
                 // Shutdown
@@ -1188,6 +1283,22 @@ mod tests {
                         ctx.send_control_msg(NodeControlMsg::Nack(nack))
                             .await
                             .expect("Failed to send Nack for traces");
+                    }
+                }
+
+                // NACK profiles (3 batches)
+                for _batch_id in 0..3 {
+                    let profiles_pdata = timeout(Duration::from_secs(3), ctx.recv())
+                        .await
+                        .expect("Timed out waiting for profiles")
+                        .expect("No profiles received");
+
+                    let nack =
+                        NackMsg::new_permanent("Test NACK reason for profiles", profiles_pdata);
+                    if let Some((_node_id, nack)) = next_nack(nack) {
+                        ctx.send_control_msg(NodeControlMsg::Nack(nack))
+                            .await
+                            .expect("Failed to send Nack for profiles");
                     }
                 }
             }) as Pin<Box<dyn Future<Output = ()>>>
@@ -1264,9 +1375,9 @@ mod tests {
             .expect("receiver should accept telemetry collection");
 
         let expected_snapshots = if acknowledgement_outcome.is_some() {
-            6
+            8
         } else {
-            3
+            4
         };
         let mut batch_signals = HashSet::new();
         let mut acknowledgement_signals = HashSet::new();
@@ -1309,11 +1420,14 @@ mod tests {
             }
         }
 
-        assert_eq!(batch_signals, HashSet::from(["logs", "metrics", "traces"]));
+        assert_eq!(
+            batch_signals,
+            HashSet::from(["logs", "metrics", "traces", "profiles"])
+        );
         if acknowledgement_outcome.is_some() {
             assert_eq!(
                 acknowledgement_signals,
-                HashSet::from(["logs", "metrics", "traces"])
+                HashSet::from(["logs", "metrics", "traces", "profiles"])
             );
         } else {
             assert!(acknowledgement_signals.is_empty());
@@ -1416,7 +1530,7 @@ mod tests {
         assert!(saw_batch && saw_ack && saw_rejection);
     }
 
-    /// Scenario: Three valid batches per signal use fire-and-forget OTAP delivery.
+    /// Scenario: Three valid batches for each supported signal use fire-and-forget OTAP delivery.
     /// Guarantees: Lifecycle snapshots complete with positive bytes and no acknowledgement bucket.
     #[test]
     fn test_otap_receiver() {
@@ -1463,8 +1577,8 @@ mod tests {
             .run_validation(validation_procedure());
     }
 
-    /// Scenario: A malformed OTAP logs batch reaches the real receiver stream decoder.
-    /// Guarantees: Invalid-request rejection increments once without starting a batch lifecycle.
+    /// Scenario: A malformed OTAP Profiles batch reaches the real receiver stream decoder.
+    /// Guarantees: The batch receives INVALID_ARGUMENT and no lifecycle is started.
     #[test]
     fn invalid_batch_emits_rejection_without_lifecycle_metrics() {
         let test_runtime = TestRuntime::new();
@@ -1492,7 +1606,7 @@ mod tests {
         let telemetry = MetricsReporter::create_new_and_receiver(4);
         let scenario = move |ctx: TestContext<OtapPdata>| {
             Box::pin(async move {
-                let mut client = ArrowLogsServiceClient::connect(grpc_endpoint)
+                let mut client = ArrowProfilesServiceClient::connect(grpc_endpoint)
                     .await
                     .expect("connect to OTAP receiver");
                 let invalid_stream = stream! {
@@ -1501,7 +1615,7 @@ mod tests {
                         arrow_payloads: vec![
                             otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayload {
                                 schema_id: "invalid".to_owned(),
-                                r#type: ArrowPayloadType::Logs as i32,
+                                r#type: ArrowPayloadType::Profiles as i32,
                                 record: vec![1, 2, 3],
                             },
                         ],
@@ -1509,17 +1623,18 @@ mod tests {
                     };
                 };
                 let mut response = client
-                    .arrow_logs(invalid_stream)
+                    .arrow_profiles(invalid_stream)
                     .await
                     .expect("open invalid OTAP stream")
                     .into_inner();
-                assert!(
-                    timeout(Duration::from_secs(3), response.message())
-                        .await
-                        .expect("invalid OTAP stream should terminate")
-                        .expect("invalid OTAP stream should close cleanly")
-                        .is_none()
-                );
+                let status = timeout(Duration::from_secs(3), response.message())
+                    .await
+                    .expect("invalid OTAP stream should respond")
+                    .expect("invalid OTAP status should decode")
+                    .expect("invalid OTAP status should be present");
+                assert_eq!(status.batch_id, 17);
+                assert_eq!(status.status_code, 3);
+                assert_eq!(status.status_message, "Invalid OTAP batch");
                 assert_rejection_telemetry(&ctx, telemetry, "invalid_request", 0, 1).await;
                 ctx.send_shutdown(Instant::now(), "invalid batch test complete")
                     .await
@@ -1672,8 +1787,8 @@ mod tests {
             .run_validation_concurrent(validation);
     }
 
-    /// Scenario: A second logs stream arrives while one wait-for-result batch owns the only slot.
-    /// Guarantees: The second batch is rejected for concurrency without entering its lifecycle.
+    /// Scenario: A Profiles stream arrives while a logs batch owns the receiver-wide slot.
+    /// Guarantees: Cross-signal admission honors the global limit and excludes the rejected batch.
     #[test]
     fn concurrency_rejection_excludes_rejected_batch_from_lifecycle() {
         let test_runtime = TestRuntime::new();
@@ -1733,18 +1848,18 @@ mod tests {
                 timeout(Duration::from_secs(3), scenario_first_admitted.notified())
                     .await
                     .expect("first batch should reach the pipeline");
-                let mut second_client = ArrowLogsServiceClient::connect(grpc_endpoint)
+                let mut second_client = ArrowProfilesServiceClient::connect(grpc_endpoint)
                     .await
                     .expect("connect second OTAP client");
                 let second_stream = stream! {
                     let mut producer = Producer::new();
-                    let mut records = create_otap_batch(2, ArrowPayloadType::Logs);
+                    let mut records = create_otap_batch(2, ArrowPayloadType::Profiles);
                     yield producer.produce_bar(&mut records).expect("encode second OTAP batch");
                 };
                 let second_status = timeout(
                     Duration::from_secs(3),
                     second_client
-                        .arrow_logs(second_stream)
+                        .arrow_profiles(second_stream)
                         .await
                         .expect("open second OTAP stream")
                         .into_inner()
@@ -2021,7 +2136,7 @@ mod tests {
         assert!(metrics.terminal_snapshots().is_empty());
     }
 
-    /// Scenario: Three valid batches per signal are ACKed through real OTAP gRPC streams.
+    /// Scenario: Three valid batches for each supported signal are ACKed through real OTAP gRPC streams.
     /// Guarantees: Lifecycle and successful acknowledgement snapshots match every admitted batch.
     #[test]
     fn test_otap_receiver_ack() {
@@ -2063,7 +2178,7 @@ mod tests {
             .run_validation_concurrent(validation_procedure());
     }
 
-    /// Scenario: Three valid batches per signal are NACKed through real OTAP gRPC streams.
+    /// Scenario: Three valid batches for each supported signal are NACKed through real OTAP gRPC streams.
     /// Guarantees: Lifecycle and refused acknowledgement snapshots match every admitted batch.
     #[test]
     fn test_otap_receiver_nack() {

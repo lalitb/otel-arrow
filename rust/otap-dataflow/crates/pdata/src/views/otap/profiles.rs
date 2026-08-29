@@ -16,8 +16,8 @@ const PROFILE_PAYLOAD_COUNT: usize = 14;
 
 /// A schema-checked, zero-copy view over the record batches in one Profiles BAR.
 ///
-/// This type intentionally accepts a slice of payload/batch pairs. Profiles is
-/// not added to the engine-wide signal enum until the next implementation layer.
+/// This type accepts a slice of payload/batch pairs so transport and processor
+/// boundaries can validate a graph without taking ownership of its store.
 pub struct ProfilesBatchView<'a> {
     batches: [Option<&'a RecordBatch>; PROFILE_PAYLOAD_COUNT],
 }

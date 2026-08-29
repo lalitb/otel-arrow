@@ -10,9 +10,10 @@
 
 ## Overview
 
-The OTLP HTTP exporter sends logs, metrics, and traces to OTLP/HTTP endpoints.
-It uses `/v1/logs`, `/v1/metrics`, and `/v1/traces` paths derived from
-`endpoint` unless a signal-specific endpoint override is provided.
+The OTLP HTTP exporter sends logs, metrics, traces, and Profiles to OTLP/HTTP
+endpoints. It derives `/v1/logs`, `/v1/metrics`, `/v1/traces`, and
+`/v1development/profiles` from `endpoint` unless a signal-specific endpoint
+override is provided.
 
 ## Getting Started
 
@@ -40,6 +41,7 @@ config:
   traces_endpoint: "http://traces.example.test:4318/v1/traces"
   metrics_endpoint: "http://metrics.example.test:4318/v1/metrics"
   logs_endpoint: "http://logs.example.test:4318/v1/logs"
+  profiles_endpoint: "http://profiles.example.test:4318/v1development/profiles"
 
   # Maximum response body size in bytes (default: 10485760).
   max_response_body_length: 10485760
