@@ -42,6 +42,134 @@ const NAMESPACE_DIR_MODE: u32 = 0o700;
 #[cfg(unix)]
 const CHECKPOINT_FILE_MODE: u32 = 0o600;
 
+/// Whether a validated checkpoint read may repair private Unix file modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArtifactReadMode {
+    /// Runtime store behavior: validate the object and repair its mode.
+    RepairPermissions,
+    /// Administration behavior: validate without changing any metadata.
+    PreserveMetadata,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileIdentity {
+    #[cfg(unix)]
+    Unix { device: u64, inode: u64 },
+    #[cfg(windows)]
+    Windows {
+        volume_serial: u64,
+        file_id: [u8; 16],
+    },
+    #[cfg(not(any(unix, windows)))]
+    Unsupported,
+}
+
+/// A canonical path retained together with an open handle and stable
+/// filesystem identity.
+///
+/// Administration uses this to fail closed if a namespace, backup parent,
+/// or backup directory is renamed or replaced while pathname-based
+/// operations are in progress.
+#[derive(Debug)]
+pub(crate) struct DirectoryPathBinding {
+    path: PathBuf,
+    handle: File,
+    identity: FileIdentity,
+}
+
+impl DirectoryPathBinding {
+    /// Resolves an existing real directory to an absolute canonical path,
+    /// opens that directory without following its final component, and
+    /// retains its filesystem identity.
+    pub(crate) fn open_canonical(path: &Path, operation: &'static str) -> Result<Self, StoreError> {
+        validate_existing_directory_path(path, operation)?;
+        let binding = Self::open_canonical_resolving(path, operation)?;
+        validate_existing_directory_path(path, operation)?;
+        binding.verify(operation)?;
+        Ok(binding)
+    }
+
+    /// Resolves an existing directory path, including an intentional
+    /// symlink in the supplied final component, then retains the real
+    /// canonical directory identity.
+    ///
+    /// This is used only for a caller-selected backup parent. Source
+    /// namespaces and newly created backup directories use
+    /// [`Self::open_canonical`] and reject final-component links.
+    pub(crate) fn open_canonical_resolving(
+        path: &Path,
+        operation: &'static str,
+    ) -> Result<Self, StoreError> {
+        let canonical_path = std::fs::canonicalize(path).map_err(|source| StoreError::Io {
+            operation,
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let verified_path = std::fs::canonicalize(path).map_err(|source| StoreError::Io {
+            operation,
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if verified_path != canonical_path {
+            return Err(StoreError::UnsafeFilesystemObject {
+                path: path.to_path_buf(),
+                reason: "the directory path changed while it was being resolved",
+            });
+        }
+
+        let handle = open_directory_handle(&canonical_path, operation)?;
+        let identity = file_identity(&handle, &canonical_path, operation)?;
+        let binding = Self {
+            path: canonical_path,
+            handle,
+            identity,
+        };
+        binding.verify(operation)?;
+        Ok(binding)
+    }
+
+    /// The absolute canonical path whose binding is retained.
+    #[must_use]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Verifies that the retained canonical path still names the originally
+    /// opened directory.
+    pub(crate) fn verify(&self, operation: &'static str) -> Result<(), StoreError> {
+        let current = open_directory_handle(&self.path, operation)?;
+        let current_identity = file_identity(&current, &self.path, operation)?;
+        if current_identity != self.identity {
+            return Err(StoreError::UnsafeFilesystemObject {
+                path: self.path.clone(),
+                reason: "the directory path no longer names the originally opened directory",
+            });
+        }
+        Ok(())
+    }
+
+    /// Syncs the retained directory handle itself.
+    ///
+    /// On Windows this preserves the existing documented limitation: stable
+    /// directory handles can be retained and verified, but `std::fs` exposes
+    /// no supported directory-sync operation, so this is a no-op there.
+    pub(crate) fn sync(&self, operation: &'static str) -> Result<(), StoreError> {
+        #[cfg(unix)]
+        {
+            self.handle.sync_all().map_err(|source| StoreError::Io {
+                operation,
+                path: self.path.clone(),
+                source,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = operation;
+            Ok(())
+        }
+    }
+}
+
 /// The four persistence boundaries of one atomically published artifact.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AtomicWriteFaults {
@@ -219,6 +347,7 @@ pub(crate) fn create_namespace_dir_cancellable(
         };
     }
 
+    #[allow(unused_mut)]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -329,36 +458,9 @@ fn secure_namespace_dir_cancellable(
     dir: &Path,
     cancelled: &mut impl FnMut() -> bool,
 ) -> Result<Option<()>, StoreError> {
-    if cancelled() {
+    let Some(()) = validate_namespace_dir_cancellable(dir, &mut *cancelled)? else {
         return Ok(None);
-    }
-    let metadata = std::fs::symlink_metadata(dir);
-    if cancelled() {
-        return Ok(None);
-    }
-    let metadata = metadata.map_err(|source| StoreError::Io {
-        operation: "inspect the checkpoint namespace directory",
-        path: dir.to_path_buf(),
-        source,
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(StoreError::UnsafeFilesystemObject {
-            path: dir.to_path_buf(),
-            reason: "the checkpoint namespace must be a real directory, not a symlink",
-        });
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt as _;
-        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(StoreError::UnsafeFilesystemObject {
-                path: dir.to_path_buf(),
-                reason: "the checkpoint namespace must not be a Windows reparse point",
-            });
-        }
-    }
+    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -377,6 +479,268 @@ fn secure_namespace_dir_cancellable(
         })?;
     }
     Ok(Some(()))
+}
+
+/// Validates that an existing namespace is a real directory without
+/// creating it or changing its metadata.
+pub(crate) fn validate_existing_namespace_dir(dir: &Path) -> Result<(), StoreError> {
+    validate_directory_path_cancellable(
+        dir,
+        "inspect the checkpoint namespace directory",
+        &mut || false,
+    )
+    .map(|validated| validated.expect("non-cancellable directory validation cannot cancel"))
+}
+
+fn validate_namespace_dir_cancellable(
+    dir: &Path,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<()>, StoreError> {
+    validate_directory_path_cancellable(
+        dir,
+        "inspect the checkpoint namespace directory",
+        cancelled,
+    )
+}
+
+fn validate_existing_directory_path(dir: &Path, operation: &'static str) -> Result<(), StoreError> {
+    validate_directory_path_cancellable(dir, operation, &mut || false)
+        .map(|validated| validated.expect("non-cancellable directory validation cannot cancel"))
+}
+
+fn validate_directory_path_cancellable(
+    dir: &Path,
+    operation: &'static str,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<()>, StoreError> {
+    if cancelled() {
+        return Ok(None);
+    }
+    let metadata = std::fs::symlink_metadata(dir);
+    if cancelled() {
+        return Ok(None);
+    }
+    let metadata = metadata.map_err(|source| StoreError::Io {
+        operation,
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(StoreError::UnsafeFilesystemObject {
+            path: dir.to_path_buf(),
+            reason: "checkpoint directories must be real directories, not symlinks",
+        });
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(StoreError::UnsafeFilesystemObject {
+                path: dir.to_path_buf(),
+                reason: "checkpoint directories must not be Windows reparse points",
+            });
+        }
+    }
+    Ok(Some(()))
+}
+
+fn open_directory_handle(path: &Path, operation: &'static str) -> Result<File, StoreError> {
+    let mut options = OpenOptions::new();
+    let _ = options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let _ = options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+
+        let _ = options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let handle = options.open(path).map_err(|source| StoreError::Io {
+        operation,
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let metadata = handle.metadata().map_err(|source| StoreError::Io {
+        operation,
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(StoreError::UnsafeFilesystemObject {
+            path: path.to_path_buf(),
+            reason: "checkpoint directory handles must refer to real directories",
+        });
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        let information = windows_file_information(&handle, path, operation)?;
+        if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(StoreError::UnsafeFilesystemObject {
+                path: path.to_path_buf(),
+                reason: "checkpoint directory handles must not refer to Windows reparse points",
+            });
+        }
+    }
+    Ok(handle)
+}
+
+#[cfg(unix)]
+fn file_identity(
+    file: &File,
+    path: &Path,
+    operation: &'static str,
+) -> Result<FileIdentity, StoreError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file.metadata().map_err(|source| StoreError::Io {
+        operation,
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(FileIdentity::Unix {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn file_identity(
+    file: &File,
+    path: &Path,
+    operation: &'static str,
+) -> Result<FileIdentity, StoreError> {
+    let information = windows_file_id_information(file, path, operation)?;
+    Ok(FileIdentity::Windows {
+        volume_serial: information.VolumeSerialNumber,
+        file_id: information.FileId.Identifier,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identity(
+    _file: &File,
+    path: &Path,
+    operation: &'static str,
+) -> Result<FileIdentity, StoreError> {
+    Err(StoreError::Io {
+        operation,
+        path: path.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "stable filesystem identity is unsupported on this platform",
+        ),
+    })
+}
+
+#[cfg(windows)]
+#[allow(
+    unsafe_code,
+    reason = "GetFileInformationByHandle requires a raw Windows handle"
+)]
+fn windows_file_information(
+    file: &File,
+    path: &Path,
+    operation: &'static str,
+) -> Result<windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION, StoreError> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle as _;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    // SAFETY: `file` owns a live Windows handle and `information` is valid
+    // writable storage for the duration of this synchronous call.
+    let succeeded =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) };
+    if succeeded == 0 {
+        return Err(StoreError::Io {
+            operation,
+            path: path.to_path_buf(),
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    // SAFETY: a nonzero return guarantees the output was initialized.
+    Ok(unsafe { information.assume_init() })
+}
+
+#[cfg(windows)]
+#[allow(
+    unsafe_code,
+    reason = "GetFileInformationByHandleEx requires a raw Windows handle"
+)]
+fn windows_file_id_information(
+    file: &File,
+    path: &Path,
+    operation: &'static str,
+) -> Result<windows_sys::Win32::Storage::FileSystem::FILE_ID_INFO, StoreError> {
+    use std::mem::{MaybeUninit, size_of};
+    use std::os::windows::io::AsRawHandle as _;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+
+    let mut information = MaybeUninit::<FILE_ID_INFO>::zeroed();
+    // SAFETY: `file` owns a live Windows handle and `information` is valid
+    // writable storage for exactly the structure initialized by this call.
+    let succeeded = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            information.as_mut_ptr().cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if succeeded == 0 {
+        return Err(StoreError::Io {
+            operation,
+            path: path.to_path_buf(),
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    // SAFETY: a nonzero return guarantees the output was initialized.
+    Ok(unsafe { information.assume_init() })
+}
+
+/// Verifies that `path` still names the same regular checkpoint file as the
+/// retained open handle.
+pub(crate) fn verify_checkpoint_file_path_binding(
+    file: &File,
+    path: &Path,
+    operation: &'static str,
+) -> Result<(), StoreError> {
+    let expected_identity = file_identity(file, path, operation)?;
+    let mut options = OpenOptions::new();
+    let _ = options.read(true);
+    no_follow(&mut options);
+    let current = options.open(path).map_err(|source| StoreError::Io {
+        operation,
+        path: path.to_path_buf(),
+        source,
+    })?;
+    validate_checkpoint_file_cancellable(&current, path, operation, &mut || false)?
+        .expect("non-cancellable file validation cannot cancel");
+    let current_identity = file_identity(&current, path, operation)?;
+    if current_identity != expected_identity {
+        return Err(StoreError::UnsafeFilesystemObject {
+            path: path.to_path_buf(),
+            reason: "the file path no longer names the originally opened checkpoint file",
+        });
+    }
+    Ok(())
 }
 
 /// Applies platform flags that open the named object itself without blocking
@@ -406,6 +770,38 @@ pub(super) fn secure_checkpoint_file(
 }
 
 pub(super) fn secure_checkpoint_file_cancellable(
+    file: &File,
+    path: &Path,
+    operation: &'static str,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<()>, StoreError> {
+    let Some(()) = validate_checkpoint_file_cancellable(file, path, operation, &mut *cancelled)?
+    else {
+        return Ok(None);
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if cancelled() {
+            return Ok(None);
+        }
+        let permissions =
+            file.set_permissions(std::fs::Permissions::from_mode(CHECKPOINT_FILE_MODE));
+        if cancelled() {
+            return Ok(None);
+        }
+        permissions.map_err(|source| StoreError::Io {
+            operation: "set private checkpoint file permissions",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
+    Ok(Some(()))
+}
+
+/// Validates an opened checkpoint file without changing its contents or
+/// metadata.
+pub(super) fn validate_checkpoint_file_cancellable(
     file: &File,
     path: &Path,
     operation: &'static str,
@@ -472,26 +868,13 @@ pub(super) fn secure_checkpoint_file_cancellable(
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        use std::os::unix::fs::MetadataExt as _;
         if metadata.nlink() != 1 {
             return Err(StoreError::UnsafeFilesystemObject {
                 path: path.to_path_buf(),
                 reason: "checkpoint artifacts must not have multiple hard links",
             });
         }
-        if cancelled() {
-            return Ok(None);
-        }
-        let permissions =
-            file.set_permissions(std::fs::Permissions::from_mode(CHECKPOINT_FILE_MODE));
-        if cancelled() {
-            return Ok(None);
-        }
-        permissions.map_err(|source| StoreError::Io {
-            operation: "set private checkpoint file permissions",
-            path: path.to_path_buf(),
-            source,
-        })?;
     }
     Ok(Some(()))
 }
@@ -845,6 +1228,39 @@ pub(crate) fn read_file_bounded_cancellable(
     path: &Path,
     artifact: &'static str,
     max: u64,
+    cancelled: impl FnMut() -> bool,
+) -> Result<Option<Option<Vec<u8>>>, StoreError> {
+    read_file_bounded_cancellable_with_mode(
+        path,
+        artifact,
+        max,
+        ArtifactReadMode::RepairPermissions,
+        cancelled,
+    )
+}
+
+/// Reads an optional existing checkpoint artifact without creating it,
+/// repairing permissions, or changing its contents.
+pub(crate) fn read_file_bounded_read_only(
+    path: &Path,
+    artifact: &'static str,
+    max: u64,
+) -> Result<Option<Vec<u8>>, StoreError> {
+    read_file_bounded_cancellable_with_mode(
+        path,
+        artifact,
+        max,
+        ArtifactReadMode::PreserveMetadata,
+        || false,
+    )
+    .map(|result| result.expect("non-cancellable checkpoint read cannot be cancelled"))
+}
+
+pub(crate) fn read_file_bounded_cancellable_with_mode(
+    path: &Path,
+    artifact: &'static str,
+    max: u64,
+    mode: ArtifactReadMode,
     mut cancelled: impl FnMut() -> bool,
 ) -> Result<Option<Option<Vec<u8>>>, StoreError> {
     if cancelled() {
@@ -868,13 +1284,21 @@ pub(crate) fn read_file_bounded_cancellable(
             });
         }
     };
-    let Some(()) = secure_checkpoint_file_cancellable(
-        &file,
-        path,
-        "validate a checkpoint file",
-        &mut cancelled,
-    )?
-    else {
+    let validated = match mode {
+        ArtifactReadMode::RepairPermissions => secure_checkpoint_file_cancellable(
+            &file,
+            path,
+            "validate a checkpoint file",
+            &mut cancelled,
+        )?,
+        ArtifactReadMode::PreserveMetadata => validate_checkpoint_file_cancellable(
+            &file,
+            path,
+            "validate a checkpoint file",
+            &mut cancelled,
+        )?,
+    };
+    let Some(()) = validated else {
         return Ok(None);
     };
     let metadata = file.metadata();

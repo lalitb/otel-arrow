@@ -88,7 +88,7 @@
 
 pub mod error;
 pub mod fault;
-mod fsio;
+pub(super) mod fsio;
 pub mod layout;
 pub mod limits;
 pub mod lock;
@@ -106,6 +106,7 @@ use std::time::{Duration, Instant};
 
 use super::apply::CheckpointTable;
 use super::current_marker::{decode_current_marker, encode_current_marker};
+use super::namespace::{CheckpointNamespace, CheckpointNamespaceError};
 use super::primitives::{
     FileId, LifecycleState, NAMESPACE_ID_MAX_BYTES, REASON_CODE_RESERVED, TX_FRAME_CRC_BYTES,
     TX_HEADER_BYTES, WAL_MAX_NON_PROGRESS_OPS_PER_TX, WAL_MAX_OPS_PER_TX, WAL_MAX_TX_BODY_BYTES,
@@ -136,7 +137,7 @@ use lock::NamespaceLock;
 /// marker. The marker is 24 bytes; this bound exists only so that a larger
 /// file is rejected before it is buffered, while still letting the marker
 /// decoder report the precise structural reason.
-const MARKER_READ_MAX_BYTES: u64 = 4096;
+pub(super) const MARKER_READ_MAX_BYTES: u64 = 4096;
 
 /// Default interval between ownership-lock acquisition attempts.
 const DEFAULT_OWNERSHIP_RETRY_INTERVAL: Duration = Duration::from_millis(50);
@@ -199,6 +200,19 @@ impl StoreOptions {
             max_tracked_files: limits.max_tracked_files,
             fingerprint_bytes: identity.fingerprint_bytes,
         }
+    }
+
+    /// Default store options for a namespace derived below an engine state
+    /// directory by the shared version-1 namespace contract.
+    pub fn from_state_dir(
+        engine_state_dir: impl AsRef<Path>,
+        namespace_id: &str,
+    ) -> Result<Self, CheckpointNamespaceError> {
+        let namespace = CheckpointNamespace::derive(engine_state_dir, namespace_id)?;
+        Ok(Self::new(
+            namespace.into_directory(),
+            namespace_id.to_owned(),
+        ))
     }
 
     /// Options taken from the receiver's validated configuration.
@@ -796,6 +810,7 @@ impl CheckpointStore {
             &limits,
             max_tracked_files,
             fingerprint_bytes,
+            fsio::ArtifactReadMode::RepairPermissions,
             &mut *cancelled,
         )?
         else {
@@ -1304,22 +1319,24 @@ impl CheckpointStore {
     /// transactions are decoded and applied one at a time. This preserves
     /// transaction atomicity without retaining every raw artifact and every
     /// decoded operation concurrently.
-    fn load_generation(
+    pub(super) fn load_generation(
         dir: &Path,
         generation: u64,
         namespace_id: &str,
         limits: &StoreLimits,
         max_tracked_files: u32,
         fingerprint_bytes: u64,
+        read_mode: fsio::ArtifactReadMode,
         cancelled: &mut impl FnMut() -> bool,
     ) -> Result<Option<LoadedGeneration>, StoreError> {
         let snapshot_path = dir.join(snapshot_file_name(generation));
         let wal_path = dir.join(wal_file_name(generation));
 
-        let Some(snapshot_bytes) = fsio::read_file_bounded_cancellable(
+        let Some(snapshot_bytes) = fsio::read_file_bounded_cancellable_with_mode(
             &snapshot_path,
             "snapshot",
             limits.max_snapshot_bytes,
+            read_mode,
             &mut *cancelled,
         )?
         else {
@@ -1384,10 +1401,11 @@ impl CheckpointStore {
         Self::validate_recovered_configuration(&table, dir, max_tracked_files, fingerprint_bytes)?;
         Self::reject_recovered_reserved_reason_codes(&table, dir, generation)?;
 
-        let Some(wal_bytes) = fsio::read_file_bounded_cancellable(
+        let Some(wal_bytes) = fsio::read_file_bounded_cancellable_with_mode(
             &wal_path,
             "WAL",
             limits.max_wal_bytes,
+            read_mode,
             &mut *cancelled,
         )?
         else {
@@ -1536,6 +1554,31 @@ impl CheckpointStore {
             wal_valid_len,
             next_sequence: expected_sequence,
         }))
+    }
+
+    /// Loads one generation through the ordinary bounded decoder without
+    /// repairing permissions or performing any recovery mutation.
+    pub(super) fn load_generation_read_only(
+        dir: &Path,
+        generation: u64,
+        namespace_id: &str,
+        limits: &StoreLimits,
+        max_tracked_files: u32,
+        fingerprint_bytes: u64,
+    ) -> Result<LoadedGeneration, StoreError> {
+        Self::load_generation(
+            dir,
+            generation,
+            namespace_id,
+            limits,
+            max_tracked_files,
+            fingerprint_bytes,
+            fsio::ArtifactReadMode::PreserveMetadata,
+            &mut || false,
+        )
+        .map(|loaded| {
+            loaded.expect("a non-cancellable read-only generation load cannot be cancelled")
+        })
     }
 
     /// Fails closed when recovered durable state carries the reserved
@@ -3018,11 +3061,15 @@ struct Selection {
 
 /// One validated generation, recovered into memory.
 #[derive(Debug)]
-struct LoadedGeneration {
-    table: CheckpointTable,
-    snapshot_records: usize,
-    transactions_replayed: usize,
-    torn_tail_bytes: usize,
+pub(super) struct LoadedGeneration {
+    /// Snapshot state with every complete WAL transaction applied.
+    pub(super) table: CheckpointTable,
+    /// Number of records decoded from the snapshot recovery base.
+    pub(super) snapshot_records: usize,
+    /// Number of complete WAL transactions replayed.
+    pub(super) transactions_replayed: usize,
+    /// Allowed structurally incomplete bytes at the final WAL tail.
+    pub(super) torn_tail_bytes: usize,
     wal_valid_len: u64,
     next_sequence: u64,
 }

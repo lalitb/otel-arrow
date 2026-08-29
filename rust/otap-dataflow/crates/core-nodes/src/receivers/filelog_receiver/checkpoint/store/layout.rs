@@ -50,6 +50,41 @@ const WAL_EXTENSION: &str = ".wal";
 const TEMP_EXTENSION: &str = ".tmp";
 const BACKUP_EXTENSION: &str = ".bak";
 
+/// Recognized checkpoint artifact kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NamespaceArtifactKind {
+    /// Generation-selection marker.
+    Current,
+    /// Namespace ownership lock.
+    OwnershipLock,
+    /// Snapshot recovery base.
+    Snapshot,
+    /// Append-only write-ahead log.
+    Wal,
+}
+
+/// On-disk form of one recognized artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArtifactForm {
+    /// Published name.
+    Final,
+    /// Same-directory temporary publication name.
+    Temporary,
+    /// Deterministic Windows replacement-backup name.
+    Backup,
+}
+
+/// One recognized checkpoint namespace artifact name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NamespaceArtifact {
+    /// Marker, lock, snapshot, or WAL role.
+    pub(crate) kind: NamespaceArtifactKind,
+    /// Published, temporary, or backup form.
+    pub(crate) form: ArtifactForm,
+    /// Generation encoded in snapshot/WAL names.
+    pub(crate) generation: Option<u64>,
+}
+
 /// File name of `generation`'s snapshot.
 #[must_use]
 pub fn snapshot_file_name(generation: u64) -> String {
@@ -124,13 +159,93 @@ fn parse_generation(text: &str) -> Option<u64> {
 }
 
 /// Classifies a directory entry name as one of this generation-pair's files.
-fn classify_generation_file(name: &str) -> Option<(u64, bool)> {
+fn classify_generation_file(name: &str) -> Option<(u64, NamespaceArtifactKind)> {
     let rest = name.strip_prefix(GENERATION_PREFIX)?;
     if let Some(digits) = rest.strip_suffix(SNAPSHOT_EXTENSION) {
-        return parse_generation(digits).map(|generation| (generation, true));
+        return parse_generation(digits)
+            .map(|generation| (generation, NamespaceArtifactKind::Snapshot));
     }
     let digits = rest.strip_suffix(WAL_EXTENSION)?;
-    parse_generation(digits).map(|generation| (generation, false))
+    parse_generation(digits).map(|generation| (generation, NamespaceArtifactKind::Wal))
+}
+
+/// Classifies exactly the names the checkpoint store owns.
+#[must_use]
+pub(crate) fn classify_namespace_artifact(name: &str) -> Option<NamespaceArtifact> {
+    if name == OWNERSHIP_LOCK_FILE_NAME {
+        return Some(NamespaceArtifact {
+            kind: NamespaceArtifactKind::OwnershipLock,
+            form: ArtifactForm::Final,
+            generation: None,
+        });
+    }
+    let (final_name, form) = if let Some(final_name) = name.strip_suffix(TEMP_EXTENSION) {
+        (final_name, ArtifactForm::Temporary)
+    } else if let Some(final_name) = name.strip_suffix(BACKUP_EXTENSION) {
+        (final_name, ArtifactForm::Backup)
+    } else {
+        (name, ArtifactForm::Final)
+    };
+    if final_name == CURRENT_FILE_NAME {
+        return Some(NamespaceArtifact {
+            kind: NamespaceArtifactKind::Current,
+            form,
+            generation: None,
+        });
+    }
+    classify_generation_file(final_name).map(|(generation, kind)| NamespaceArtifact {
+        kind,
+        form,
+        generation: Some(generation),
+    })
+}
+
+/// Returns the exact canonical spelling of a recognized artifact when
+/// `name` differs only by ASCII case.
+///
+/// Administration uses this second-pass classifier to reject names that a
+/// case-insensitive filesystem may resolve through the canonical pathname
+/// even though an exact inventory would otherwise omit them.
+#[must_use]
+pub(crate) fn canonical_artifact_name_ignoring_ascii_case(name: &str) -> Option<String> {
+    if !name.is_ascii() {
+        return None;
+    }
+    if name.eq_ignore_ascii_case(OWNERSHIP_LOCK_FILE_NAME) {
+        return Some(OWNERSHIP_LOCK_FILE_NAME.to_owned());
+    }
+
+    let lowercase = name.to_ascii_lowercase();
+    let (final_name, suffix) = if let Some(final_name) = lowercase.strip_suffix(TEMP_EXTENSION) {
+        (final_name, TEMP_EXTENSION)
+    } else if let Some(final_name) = lowercase.strip_suffix(BACKUP_EXTENSION) {
+        (final_name, BACKUP_EXTENSION)
+    } else {
+        (lowercase.as_str(), "")
+    };
+
+    let canonical_final = if final_name == "current" {
+        CURRENT_FILE_NAME.to_owned()
+    } else {
+        let rest = final_name.strip_prefix(GENERATION_PREFIX)?;
+        let (digits, kind) = if let Some(digits) = rest.strip_suffix(SNAPSHOT_EXTENSION) {
+            (digits, NamespaceArtifactKind::Snapshot)
+        } else {
+            (
+                rest.strip_suffix(WAL_EXTENSION)?,
+                NamespaceArtifactKind::Wal,
+            )
+        };
+        let generation = parse_generation(digits)?;
+        match kind {
+            NamespaceArtifactKind::Snapshot => snapshot_file_name(generation),
+            NamespaceArtifactKind::Wal => wal_file_name(generation),
+            NamespaceArtifactKind::Current | NamespaceArtifactKind::OwnershipLock => {
+                unreachable!("the case-insensitive generation parser returns snapshot or WAL")
+            }
+        }
+    };
+    Some(format!("{canonical_final}{suffix}"))
 }
 
 /// Whether `name` is a temporary file this store itself writes.
@@ -142,14 +257,16 @@ fn classify_generation_file(name: &str) -> Option<(u64, bool)> {
 /// `CURRENT.tmp` and `CURRENT.bak` require marker-authority selection first.
 #[must_use]
 pub(crate) fn is_namespace_temp_file(name: &str) -> bool {
-    let final_name = if let Some(final_name) = name.strip_suffix(TEMP_EXTENSION) {
-        final_name
-    } else if let Some(final_name) = name.strip_suffix(BACKUP_EXTENSION) {
-        final_name
-    } else {
-        return false;
-    };
-    final_name == CURRENT_FILE_NAME || classify_generation_file(final_name).is_some()
+    matches!(
+        classify_namespace_artifact(name),
+        Some(NamespaceArtifact {
+            kind: NamespaceArtifactKind::Current
+                | NamespaceArtifactKind::Snapshot
+                | NamespaceArtifactKind::Wal,
+            form: ArtifactForm::Temporary | ArtifactForm::Backup,
+            ..
+        })
+    )
 }
 
 /// Scans `dir` for generation files, returning which members of each
@@ -190,7 +307,12 @@ pub(crate) fn scan_generations(
         let Some(name) = file_name.to_str() else {
             continue;
         };
-        let Some((generation, is_snapshot)) = classify_generation_file(name) else {
+        let Some(NamespaceArtifact {
+            kind,
+            form: ArtifactForm::Final,
+            generation: Some(generation),
+        }) = classify_namespace_artifact(name)
+        else {
             continue;
         };
         if !found.contains_key(&generation) && found.len() >= MAX_GENERATIONS_ON_DISK {
@@ -200,13 +322,23 @@ pub(crate) fn scan_generations(
             });
         }
         let files = found.entry(generation).or_default();
-        if is_snapshot {
-            files.snapshot = true;
-        } else {
-            files.wal = true;
+        match kind {
+            NamespaceArtifactKind::Snapshot => files.snapshot = true,
+            NamespaceArtifactKind::Wal => files.wal = true,
+            NamespaceArtifactKind::Current | NamespaceArtifactKind::OwnershipLock => {
+                unreachable!("only generation artifacts carry a generation")
+            }
         }
     }
     Ok(Some(found))
+}
+
+/// Non-cancellable read-only generation inventory.
+pub(crate) fn scan_generations_read_only(
+    dir: &Path,
+) -> Result<BTreeMap<u64, GenerationFiles>, StoreError> {
+    scan_generations(dir, || false)
+        .map(|scan| scan.expect("a non-cancellable generation scan cannot be cancelled"))
 }
 
 /// Removes every generation-artifact temporary file this store owns in

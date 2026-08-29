@@ -24,35 +24,15 @@ use globset::{GlobBuilder, GlobMatcher};
 use regex::Regex;
 
 use super::checkpoint::framing_profile;
+use super::checkpoint::namespace::{CheckpointNamespace, CheckpointNamespaceError};
 use super::checkpoint::primitives::{
     ADVISORY_PATH_STORED_MAX_BYTES, FINGERPRINT_MAX_BYTES, FINGERPRINT_PROFILE_VERSION,
-    FRAMING_PATTERN_MAX_BYTES, NAMESPACE_ID_MAX_BYTES,
+    FRAMING_PATTERN_MAX_BYTES,
 };
 use super::checkpoint::store::limits::StoreLimits;
 
 /// URN for the filelog receiver.
 pub const FILELOG_RECEIVER_URN: &str = "urn:otel:receiver:filelog";
-
-/// Namespace root matching Appendix B's layout:
-/// `${engine.state_dir}/filelog/@v1/<encoded checkpoint.id>/`.
-const CHECKPOINT_NAMESPACE_ROOT: &str = "${engine.state_dir}/filelog";
-/// Version directory separating this encoding from the earlier flat draft.
-///
-/// `@` was outside that draft's accepted ID alphabet, so this component
-/// cannot itself be an older flat namespace.
-const CHECKPOINT_NAMESPACE_VERSION: &str = "@v1";
-
-/// Common portable `NAME_MAX` (maximum bytes in a single path component)
-/// enforced by ext4, APFS, NTFS-under-WSL, and other primary targets.
-///
-/// Some mounted filesystems expose a smaller limit. Store opening queries
-/// the actual Unix filesystem before creating a missing namespace component
-/// and reports that narrower limit explicitly.
-const COMMON_PATH_SEGMENT_MAX_BYTES: usize = 255;
-
-/// Effective maximum length, in bytes, of the encoded `checkpoint.id` path
-/// segment.
-const CHECKPOINT_ID_SEGMENT_MAX_BYTES: usize = COMMON_PATH_SEGMENT_MAX_BYTES;
 
 /// Minimum accepted `identity.fingerprint_bytes`.
 const MIN_FINGERPRINT_BYTES: u64 = 16;
@@ -2092,42 +2072,13 @@ fn resolve_checkpoint_id(
     default_checkpoint_id: &str,
 ) -> Result<String, otap_df_config::error::Error> {
     let id = configured.unwrap_or(default_checkpoint_id);
-    if id.is_empty() {
-        return Err(invalid(
+    CheckpointNamespace::validate_id(id).map_err(|error| match error {
+        CheckpointNamespaceError::EmptyId => invalid(
             "checkpoint.id must not be empty; set checkpoint.id explicitly or ensure the \
              receiver node has a configured identity to default to",
-        ));
-    }
-    if !id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-    {
-        return Err(invalid(
-            "checkpoint.id must contain only ASCII alphanumerics, '_', '-', or '.'",
-        ));
-    }
-    // The checkpoint format's `remove_file.namespace_id` field stores the
-    // exact `checkpoint.id` in a `u16`-length-prefixed byte field bounded by
-    // `NAMESPACE_ID_MAX_BYTES`; a longer id could never round-trip through
-    // the durable audit record.
-    if id.len() > NAMESPACE_ID_MAX_BYTES {
-        return Err(invalid(&format!(
-            "checkpoint.id must be <= {NAMESPACE_ID_MAX_BYTES} bytes \
-            (the checkpoint format's NAMESPACE_ID_MAX_BYTES)"
-        )));
-    }
-    // The id is also encoded byte-for-byte as a single filesystem path
-    // component (Appendix B, "Namespace layout"). Check the expansion with
-    // overflow-safe arithmetic before allocating the encoded segment.
-    let encoded_len = checkpoint_id_path_segment_len(id).ok_or_else(|| {
-        invalid("checkpoint.id's encoded path segment length overflows addressable capacity")
+        ),
+        other => invalid(&other.to_string()),
     })?;
-    if encoded_len > CHECKPOINT_ID_SEGMENT_MAX_BYTES {
-        return Err(invalid(&format!(
-            "checkpoint.id's lowercase-hex path segment is {encoded_len} bytes, exceeding \
-            the common {CHECKPOINT_ID_SEGMENT_MAX_BYTES}-byte filesystem NAME_MAX"
-        )));
-    }
     Ok(id.to_owned())
 }
 
@@ -2146,64 +2097,23 @@ fn resolve_checkpoint_id(
 /// ([`include_targets_checkpoint_namespace`]) consistent with the same
 /// normalization applied to include patterns via [`glob_literal_prefix`].
 fn checkpoint_namespace_dir(checkpoint_id: &str) -> PathBuf {
-    let mut path = expand_state_dir(Path::new(CHECKPOINT_NAMESPACE_ROOT));
-    path.push(CHECKPOINT_NAMESPACE_VERSION);
-    path.push(
-        encode_checkpoint_id_path_segment(checkpoint_id)
-            .expect("a validated checkpoint id has a representable encoded length"),
-    );
-    strip_leading_curdir(&path)
+    CheckpointNamespace::derive(checkpoint_state_dir(), checkpoint_id)
+        .expect("a validated checkpoint id has a derivable namespace")
+        .into_directory()
 }
 
-fn expand_state_dir(root: &Path) -> PathBuf {
-    let text = root.to_string_lossy();
-    if let Some(rest) = text.strip_prefix("${engine.state_dir}") {
-        let base = std::env::var_os("OTAP_DF_STATE_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(".otap-state"));
-        return base.join(rest.trim_start_matches('/'));
-    }
-    root.to_path_buf()
+fn checkpoint_state_dir() -> PathBuf {
+    std::env::var_os("OTAP_DF_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".otap-state"))
 }
 
-/// Strips a single leading [`Component::CurDir`] (`.`) component, if
-/// present, so two paths that differ only by a redundant leading `./` (or
-/// an equivalent run of them, which [`Path::components`] itself collapses
-/// to at most one leading `CurDir`) compare equal. `Path::components`
-/// otherwise preserves a leading `CurDir` verbatim -- unlike an internal
-/// `.` component, which it already normalizes away -- so without this an
-/// include pattern like `./.otap-state/filelog/<id>/*.log` would not be
-/// recognized as targeting the same directory as
-/// `.otap-state/filelog/<id>/*.log`, letting the leading `./` bypass the
-/// direct checkpoint-namespace-inclusion rejection.
 fn strip_leading_curdir(path: &Path) -> PathBuf {
     let mut components = path.components().peekable();
     if matches!(components.peek(), Some(Component::CurDir)) {
         let _ = components.next();
     }
     components.collect()
-}
-
-fn checkpoint_id_path_segment_len(value: &str) -> Option<usize> {
-    value.len().checked_mul(2)
-}
-
-fn encode_checkpoint_id_path_segment(value: &str) -> Option<String> {
-    let encoded_len = checkpoint_id_path_segment_len(value)?;
-    let mut encoded = String::with_capacity(encoded_len);
-    for byte in value.bytes() {
-        encoded.push(char::from(lowercase_hex_digit(byte >> 4)));
-        encoded.push(char::from(lowercase_hex_digit(byte & 0x0f)));
-    }
-    Some(encoded)
-}
-
-fn lowercase_hex_digit(value: u8) -> u8 {
-    match value {
-        0..=9 => b'0' + value,
-        10..=15 => b'a' + (value - 10),
-        _ => unreachable!("nibble must be in range"),
-    }
 }
 
 /// Extracts the literal (non-glob) directory-component prefix of a glob
@@ -2376,6 +2286,10 @@ fn validate_exclude(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::receivers::filelog_receiver::checkpoint::namespace::{
+        CHECKPOINT_NAMESPACE_COMPONENT_MAX_BYTES, CHECKPOINT_NAMESPACE_ID_MAX_BYTES,
+        CHECKPOINT_NAMESPACE_VERSION, FILELOG_NAMESPACE_DIRECTORY,
+    };
     use crate::receivers::filelog_receiver::checkpoint::store::limits as store_limits;
 
     fn minimal_config() -> Config {
@@ -4027,20 +3941,26 @@ mod tests {
     /// version-1 path vectors remain stable.
     #[test]
     fn checkpoint_id_encoding_is_case_insensitive_filesystem_injective() {
-        let mixed = encode_checkpoint_id_path_segment("AppLogs").expect("length is representable");
-        let lower = encode_checkpoint_id_path_segment("applogs").expect("length is representable");
+        let mixed = CheckpointNamespace::derive(checkpoint_state_dir(), "AppLogs").unwrap();
+        let lower = CheckpointNamespace::derive(checkpoint_state_dir(), "applogs").unwrap();
 
-        assert_eq!(mixed, "4170704c6f6773");
-        assert_eq!(lower, "6170706c6f6773");
-        assert_eq!(mixed, mixed.to_ascii_lowercase());
-        assert_eq!(lower, lower.to_ascii_lowercase());
-        assert_ne!(mixed.to_ascii_lowercase(), lower.to_ascii_lowercase());
-        assert_ne!(
-            checkpoint_namespace_dir("AppLogs"),
-            checkpoint_namespace_dir("applogs")
+        assert_eq!(mixed.encoded_component(), "4170704c6f6773");
+        assert_eq!(lower.encoded_component(), "6170706c6f6773");
+        assert_eq!(
+            mixed.encoded_component(),
+            mixed.encoded_component().to_ascii_lowercase()
         );
+        assert_eq!(
+            lower.encoded_component(),
+            lower.encoded_component().to_ascii_lowercase()
+        );
+        assert_ne!(mixed.directory(), lower.directory());
+        assert_eq!(checkpoint_namespace_dir("AppLogs"), mixed.directory());
+        assert_eq!(checkpoint_namespace_dir("applogs"), lower.directory());
         let new_a = checkpoint_namespace_dir("a");
-        let legacy_version_id = expand_state_dir(Path::new(CHECKPOINT_NAMESPACE_ROOT)).join("v1");
+        let legacy_version_id = checkpoint_state_dir()
+            .join(FILELOG_NAMESPACE_DIRECTORY)
+            .join("v1");
         assert_ne!(new_a, legacy_version_id);
         assert!(
             !CHECKPOINT_NAMESPACE_VERSION
@@ -4050,11 +3970,9 @@ mod tests {
         );
         assert_eq!(
             new_a,
-            strip_leading_curdir(
-                &expand_state_dir(Path::new(CHECKPOINT_NAMESPACE_ROOT))
-                    .join(CHECKPOINT_NAMESPACE_VERSION)
-                    .join("61")
-            )
+            CheckpointNamespace::derive(checkpoint_state_dir(), "a")
+                .unwrap()
+                .into_directory()
         );
     }
 
@@ -4066,29 +3984,34 @@ mod tests {
     /// or off-by-one loss.
     #[test]
     fn checkpoint_id_encoded_segment_boundary_is_enforced() {
-        assert_eq!(CHECKPOINT_ID_SEGMENT_MAX_BYTES, 255);
-        let max_id_bytes = CHECKPOINT_ID_SEGMENT_MAX_BYTES / 2;
-        assert_eq!(max_id_bytes, 127);
+        assert_eq!(CHECKPOINT_NAMESPACE_COMPONENT_MAX_BYTES, 255);
+        assert_eq!(CHECKPOINT_NAMESPACE_ID_MAX_BYTES, 127);
 
         let mut cfg = minimal_config();
-        cfg.checkpoint.id = Some("a".repeat(max_id_bytes));
+        cfg.checkpoint.id = Some("a".repeat(CHECKPOINT_NAMESPACE_ID_MAX_BYTES));
         assert!(RuntimeConfig::from_config(cfg, "node-1").is_ok());
 
         let mut cfg = minimal_config();
-        cfg.checkpoint.id = Some("a".repeat(max_id_bytes + 1));
+        cfg.checkpoint.id = Some("a".repeat(CHECKPOINT_NAMESPACE_ID_MAX_BYTES + 1));
         let err = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
-        assert!(err.to_string().contains("lowercase-hex path segment"));
+        assert!(err.to_string().contains("lowercase hexadecimal encoding"));
     }
 
-    /// Scenario: `checkpoint.id` exceeds `NAMESPACE_ID_MAX_BYTES` by one
-    /// byte.
-    /// Guarantees: the durable administrative namespace-id field's raw
-    /// bound is enforced independently of the tighter encoded path bound.
+    /// Scenario: runtime configuration uses `.` and `..` as raw
+    /// `checkpoint.id` values.
+    /// Guarantees: both logical IDs are accepted and resolve through the
+    /// shared namespace helper to safe hexadecimal path components.
     #[test]
-    fn checkpoint_id_never_exceeds_namespace_id_max_bytes() {
-        let mut cfg = minimal_config();
-        cfg.checkpoint.id = Some("a".repeat(NAMESPACE_ID_MAX_BYTES + 1));
-        assert!(RuntimeConfig::from_config(cfg, "node-1").is_err());
+    fn checkpoint_id_dot_values_use_shared_namespace_derivation() {
+        for (id, encoded) in [(".", "2e"), ("..", "2e2e")] {
+            let mut cfg = minimal_config();
+            cfg.checkpoint.id = Some(id.to_owned());
+            let runtime = RuntimeConfig::from_config(cfg, "node-1").unwrap();
+            let expected = CheckpointNamespace::derive(checkpoint_state_dir(), id).unwrap();
+            assert_eq!(runtime.checkpoint_id, id);
+            assert_eq!(runtime.checkpoint_namespace_dir, expected.directory());
+            assert_eq!(expected.encoded_component(), encoded);
+        }
     }
 
     /// Scenario: an include pattern's literal (non-glob) prefix resolves

@@ -40,6 +40,12 @@ use super::os_lock::{TryLockOutcome, try_lock_exclusive, unlock_exclusive};
 #[cfg(unix)]
 const LOCK_FILE_MODE: u32 = 0o600;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockOpenMode {
+    CreateOrOpen,
+    ExistingOnly,
+}
+
 /// Exclusive ownership of a checkpoint namespace, held for the lifetime of
 /// the value.
 #[derive(Debug)]
@@ -67,6 +73,29 @@ impl NamespaceLock {
             .map(|lock| lock.expect("non-cancellable namespace acquisition cannot be cancelled"))
     }
 
+    /// Acquires exclusive ownership through an existing `ownership.lock`
+    /// without creating the lock file or repairing its permissions.
+    ///
+    /// This is the administration path: the namespace and lock must already
+    /// have been published by the runtime. A `timeout` of zero means a
+    /// single lock attempt.
+    pub fn acquire_existing(
+        dir: &Path,
+        timeout: Duration,
+        retry_interval: Duration,
+    ) -> Result<Self, StoreError> {
+        Self::acquire_cancellable_with_mode(
+            dir,
+            timeout,
+            retry_interval,
+            LockOpenMode::ExistingOnly,
+            || false,
+        )
+        .map(|lock| {
+            lock.expect("non-cancellable existing namespace acquisition cannot be cancelled")
+        })
+    }
+
     /// Acquires exclusive namespace ownership, abandoning the wait when
     /// `cancelled` becomes true.
     ///
@@ -77,6 +106,22 @@ impl NamespaceLock {
         dir: &Path,
         timeout: Duration,
         retry_interval: Duration,
+        cancelled: impl FnMut() -> bool,
+    ) -> Result<Option<Self>, StoreError> {
+        Self::acquire_cancellable_with_mode(
+            dir,
+            timeout,
+            retry_interval,
+            LockOpenMode::CreateOrOpen,
+            cancelled,
+        )
+    }
+
+    fn acquire_cancellable_with_mode(
+        dir: &Path,
+        timeout: Duration,
+        retry_interval: Duration,
+        mode: LockOpenMode,
         mut cancelled: impl FnMut() -> bool,
     ) -> Result<Option<Self>, StoreError> {
         if cancelled() {
@@ -84,7 +129,17 @@ impl NamespaceLock {
         }
         let path = dir.join(OWNERSHIP_LOCK_FILE_NAME);
         let mut options = OpenOptions::new();
-        let _ = options.read(true).write(true).create(true).truncate(false);
+        let _ = options.read(true).truncate(false);
+        if mode == LockOpenMode::CreateOrOpen {
+            let _ = options.write(true).create(true);
+        }
+        #[cfg(windows)]
+        if mode == LockOpenMode::ExistingOnly {
+            // LockFileEx requires a handle opened with compatible data
+            // access. Unix deliberately keeps this administration path
+            // read-only so opening it cannot change lock-file metadata.
+            let _ = options.write(true);
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
@@ -107,13 +162,21 @@ impl NamespaceLock {
             path: path.clone(),
             source,
         })?;
-        let Some(()) = fsio::secure_checkpoint_file_cancellable(
-            &file,
-            &path,
-            "validate the checkpoint namespace ownership lock",
-            &mut cancelled,
-        )?
-        else {
+        let validated = match mode {
+            LockOpenMode::CreateOrOpen => fsio::secure_checkpoint_file_cancellable(
+                &file,
+                &path,
+                "validate the checkpoint namespace ownership lock",
+                &mut cancelled,
+            )?,
+            LockOpenMode::ExistingOnly => fsio::validate_checkpoint_file_cancellable(
+                &file,
+                &path,
+                "validate the checkpoint namespace ownership lock",
+                &mut cancelled,
+            )?,
+        };
+        let Some(()) = validated else {
             return Ok(None);
         };
 
@@ -184,6 +247,16 @@ impl NamespaceLock {
         self.contentions
     }
 
+    /// Verifies that the retained lock handle is still reachable through the
+    /// canonical namespace path used to acquire it.
+    pub(crate) fn verify_path_binding(&self) -> Result<(), StoreError> {
+        fsio::verify_checkpoint_file_path_binding(
+            &self.file,
+            &self.path,
+            "verify the checkpoint namespace ownership-lock path binding",
+        )
+    }
+
     /// Releases the lock explicitly, reporting a failure instead of hiding
     /// it in `Drop`.
     ///
@@ -196,5 +269,32 @@ impl NamespaceLock {
             path: self.path.clone(),
             source,
         })
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use std::time::Duration;
+
+    use super::NamespaceLock;
+    use crate::receivers::filelog_receiver::checkpoint::store::layout::OWNERSHIP_LOCK_FILE_NAME;
+
+    /// Scenario: administration acquires an already-existing Windows
+    /// ownership lock without recreating the file.
+    /// Guarantees: the existing-only handle has access rights compatible
+    /// with exclusive LockFileEx acquisition.
+    #[test]
+    fn existing_windows_lock_uses_lockfileex_compatible_access() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join(OWNERSHIP_LOCK_FILE_NAME), []).unwrap();
+
+        NamespaceLock::acquire_existing(
+            directory.path(),
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+        )
+        .unwrap()
+        .release()
+        .unwrap();
     }
 }
