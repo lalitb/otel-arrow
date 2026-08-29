@@ -180,6 +180,36 @@ before being proposed upstream.
 - Upstream framing: add configurable conversion/admission limits before
   Profiles transport is enabled in step 9.
 
+### PA-012: Ordered-child validation assumed physical row order
+
+- Status: `resolved-local`
+- Area: `ProfilesBatchView` graph validation
+- Evidence: ordinal validation previously required rows for one parent to
+  arrive physically as `0, 1, 2, ...`, even though OTAP IDs and ordinals define
+  logical order independently of Arrow row order.
+- Impact: a semantically valid processor reorder was rejected before the
+  OTAP-to-OTLP encoder could sort by `(parent_id, ordinal)`.
+- Local direction: group and sort ordinal values before checking uniqueness and
+  contiguity.
+- Upstream framing: validation must distinguish logical ordering columns from
+  physical transport sort requirements.
+
+### PA-013: Reverse conversion materializes the protobuf graph
+
+- Status: `open`
+- Area: OTAP Profiles to OTLP conversion
+- Evidence: the step-7 encoder reconstructs a complete
+  `ExportProfilesServiceRequest`, computes its encoded length, and then encodes
+  it into a bounded buffer.
+- Impact: logical Arrow size is checked against remaining output capacity first,
+  so retained work is bounded by the configured output limit, but conversion
+  temporarily holds the Arrow graph, protobuf graph, and encoded bytes
+  concurrently.
+- Local direction: use conservative preflight accounting and the existing
+  256 MiB maximum output limit.
+- Upstream framing: stream Profiles fields transactionally into `ProtoBuffer`
+  once profiling shows the extra materialization is significant.
+
 ## Review Policy
 
 New findings should record evidence, practical Profiles impact, whether they

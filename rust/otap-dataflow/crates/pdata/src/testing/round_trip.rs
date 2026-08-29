@@ -92,8 +92,8 @@ pub fn otap_to_otlp(otap: &OtapArrowRecords) -> OtlpProtoMessage {
         OtlpProtoBytes::ExportMetricsRequest(bytes) => {
             MetricsData::decode(bytes.as_ref()).map(OtlpProtoMessage::Metrics)
         }
-        OtlpProtoBytes::ExportProfilesRequest(_) => {
-            panic!("Profiles OTAP to OTLP conversion is not supported yet")
+        OtlpProtoBytes::ExportProfilesRequest(bytes) => {
+            ProfilesData::decode(bytes.as_ref()).map(OtlpProtoMessage::Profiles)
         }
     }
     .expect("decode ok")

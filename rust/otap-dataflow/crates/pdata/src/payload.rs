@@ -90,6 +90,7 @@ use crate::error::Error;
 use crate::otap::{OtapArrowRecords, OtapBatchStore};
 use crate::otlp::logs::LogsProtoBytesEncoder;
 use crate::otlp::metrics::MetricsProtoBytesEncoder;
+use crate::otlp::profiles::ProfilesProtoBytesEncoder;
 use crate::otlp::traces::TracesProtoBytesEncoder;
 use crate::otlp::{OtlpProtoBytes, ProtoBuffer, ProtoBytesEncoder};
 use crate::proto::OtlpProtoMessage;
@@ -629,9 +630,12 @@ impl TryFromWithOptions<OtapArrowRecords> for OtlpProtoBytes {
                 traces_encoder.encode(&mut value, &mut buffer)?;
                 Ok(Self::ExportTracesRequest(buffer.into_bytes()))
             }
-            OtapArrowRecords::Profiles(_) => Err(Error::UnsupportedSignalType {
-                signal: SignalType::Profiles,
-            }),
+            OtapArrowRecords::Profiles(_) => {
+                let mut profiles_encoder = ProfilesProtoBytesEncoder::new();
+                let mut buffer = ProtoBuffer::new(opts);
+                profiles_encoder.encode(&mut value, &mut buffer)?;
+                Ok(Self::ExportProfilesRequest(buffer.into_bytes()))
+            }
         }
     }
 }

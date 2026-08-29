@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use arrow::array::{Array, LargeListArray, RecordBatch, UInt8Array, UInt32Array};
 use arrow::datatypes::{Int64Type, UInt64Type};
 
-use crate::arrays::{NullableArrayAccessor, UInt32ArrayAccessor};
+use crate::arrays::{NullableArrayAccessor, StringArrayAccessor, UInt32ArrayAccessor};
 use crate::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 use crate::schema::{consts, payloads};
 
@@ -100,6 +100,12 @@ pub enum ProfilesValidationError {
         parent_id: u32,
         /// The invalid or duplicated role.
         role: u8,
+    },
+    /// A zero ValueType was represented as a row instead of canonical absence.
+    #[error("zero value type row for profile {parent_id}")]
+    ZeroValueType {
+        /// The owning profile.
+        parent_id: u32,
     },
     /// A sample's observation lists violate the Profiles relationship rules.
     #[error("invalid observation lists for sample {sample_id}")]
@@ -290,19 +296,26 @@ impl<'a> ProfilesBatchView<'a> {
         };
         let parents = required_u32(batch, payload_type, consts::PARENT_ID)?;
         let ordinals = native_u32(batch, payload_type, consts::ORDINAL)?;
-        let mut next_by_parent = HashMap::new();
+        let mut ordinals_by_parent: HashMap<u32, Vec<u32>> = HashMap::new();
         for row in 0..batch.num_rows() {
             let parent_id = parents.value_at(row).unwrap_or_default();
-            let ordinal = ordinals.value(row);
-            let next = next_by_parent.entry(parent_id).or_insert(0);
-            if ordinal != *next {
-                return Err(ProfilesValidationError::InvalidOrdinal {
-                    payload_type,
-                    parent_id,
-                    ordinal,
-                });
+            ordinals_by_parent
+                .entry(parent_id)
+                .or_default()
+                .push(ordinals.value(row));
+        }
+        for (parent_id, mut values) in ordinals_by_parent {
+            values.sort_unstable();
+            for (expected, ordinal) in values.into_iter().enumerate() {
+                let expected = u32::try_from(expected).unwrap_or(u32::MAX);
+                if ordinal != expected {
+                    return Err(ProfilesValidationError::InvalidOrdinal {
+                        payload_type,
+                        parent_id,
+                        ordinal,
+                    });
+                }
             }
-            *next += 1;
         }
         Ok(())
     }
@@ -321,12 +334,45 @@ impl<'a> ProfilesBatchView<'a> {
                 column: consts::ROLE,
                 message: "expected UInt8".to_string(),
             })?;
+        let types = batch
+            .column_by_name(consts::ATTRIBUTE_TYPE)
+            .map(StringArrayAccessor::try_new)
+            .transpose()
+            .map_err(|error| ProfilesValidationError::InvalidColumn {
+                payload_type,
+                column: consts::ATTRIBUTE_TYPE,
+                message: error.to_string(),
+            })?
+            .ok_or_else(|| ProfilesValidationError::InvalidColumn {
+                payload_type,
+                column: consts::ATTRIBUTE_TYPE,
+                message: "missing type".to_string(),
+            })?;
+        let units = batch
+            .column_by_name(consts::UNIT)
+            .map(StringArrayAccessor::try_new)
+            .transpose()
+            .map_err(|error| ProfilesValidationError::InvalidColumn {
+                payload_type,
+                column: consts::UNIT,
+                message: error.to_string(),
+            })?
+            .ok_or_else(|| ProfilesValidationError::InvalidColumn {
+                payload_type,
+                column: consts::UNIT,
+                message: "missing unit".to_string(),
+            })?;
         let mut seen = HashSet::new();
         for row in 0..batch.num_rows() {
             let parent_id = parents.value_at(row).unwrap_or_default();
             let role = roles.value(row);
             if role > 1 || !seen.insert((parent_id, role)) {
                 return Err(ProfilesValidationError::InvalidValueTypeRole { parent_id, role });
+            }
+            if types.value_at(row).unwrap_or_default().is_empty()
+                && units.value_at(row).unwrap_or_default().is_empty()
+            {
+                return Err(ProfilesValidationError::ZeroValueType { parent_id });
             }
         }
         Ok(())
@@ -468,7 +514,7 @@ where
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{ArrayRef, Int64Array, UInt64Array};
+    use arrow::array::{ArrayRef, Int64Array, StringArray, UInt64Array};
     use arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use arrow::datatypes::{DataType, Field, Schema};
 
@@ -619,6 +665,95 @@ mod tests {
                 id: 1,
                 reason: "duplicate",
             })
+        );
+    }
+
+    /// Scenario: Ordered child rows are physically stored in reverse ordinal order.
+    /// Guarantees: Validation uses explicit ordinals rather than requiring physical row order.
+    #[test]
+    fn accepts_reordered_ordinal_rows() {
+        let mut batches = minimal_batches(1, &[&[7]], &[&[11]]);
+        batches.extend([
+            (
+                ArrowPayloadType::Stacks,
+                RecordBatch::try_from_iter([(
+                    consts::ID,
+                    Arc::new(UInt32Array::from(vec![20])) as ArrayRef,
+                )])
+                .unwrap(),
+            ),
+            (
+                ArrowPayloadType::ProfileLocations,
+                RecordBatch::try_from_iter([
+                    (
+                        consts::ID,
+                        Arc::new(UInt32Array::from(vec![30])) as ArrayRef,
+                    ),
+                    (
+                        consts::ADDRESS,
+                        Arc::new(UInt64Array::from(vec![1])) as ArrayRef,
+                    ),
+                ])
+                .unwrap(),
+            ),
+            (
+                ArrowPayloadType::StackLocations,
+                RecordBatch::try_from_iter([
+                    (
+                        consts::PARENT_ID,
+                        Arc::new(UInt32Array::from(vec![20, 20])) as ArrayRef,
+                    ),
+                    (
+                        consts::ORDINAL,
+                        Arc::new(UInt32Array::from(vec![1, 0])) as ArrayRef,
+                    ),
+                    (
+                        consts::LOCATION_ID,
+                        Arc::new(UInt32Array::from(vec![30, 30])) as ArrayRef,
+                    ),
+                ])
+                .unwrap(),
+            ),
+        ]);
+
+        ProfilesBatchView::try_new(&batches)
+            .unwrap()
+            .validate_graph()
+            .unwrap();
+    }
+
+    /// Scenario: A value-type row materializes the protobuf zero ValueType.
+    /// Guarantees: Canonical OTAP requires zero value types to be absent, not explicit rows.
+    #[test]
+    fn rejects_zero_value_type_row() {
+        let mut batches = minimal_batches(1, &[&[7]], &[&[11]]);
+        batches.push((
+            ArrowPayloadType::ProfileValueTypes,
+            RecordBatch::try_from_iter([
+                (
+                    consts::PARENT_ID,
+                    Arc::new(UInt32Array::from(vec![1])) as ArrayRef,
+                ),
+                (
+                    consts::ROLE,
+                    Arc::new(UInt8Array::from(vec![0])) as ArrayRef,
+                ),
+                (
+                    consts::ATTRIBUTE_TYPE,
+                    Arc::new(StringArray::from(vec![""])) as ArrayRef,
+                ),
+                (
+                    consts::UNIT,
+                    Arc::new(StringArray::from(vec![""])) as ArrayRef,
+                ),
+            ])
+            .unwrap(),
+        ));
+
+        let view = ProfilesBatchView::try_new(&batches).unwrap();
+        assert_eq!(
+            view.validate_graph(),
+            Err(ProfilesValidationError::ZeroValueType { parent_id: 1 })
         );
     }
 }

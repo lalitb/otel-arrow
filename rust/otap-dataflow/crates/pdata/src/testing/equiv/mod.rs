@@ -16,6 +16,7 @@
 mod canonical;
 mod logs;
 mod metrics;
+mod profiles;
 mod traces;
 
 use crate::proto::OtlpProtoMessage;
@@ -23,10 +24,12 @@ use otel_arrow_dfe_config::SignalType;
 
 use crate::proto::opentelemetry::logs::v1::LogsData;
 use crate::proto::opentelemetry::metrics::v1::MetricsData;
+use crate::proto::opentelemetry::profiles::v1development::ProfilesData;
 use crate::proto::opentelemetry::trace::v1::TracesData;
 
 use logs::{assert_logs_equivalent, validate_logs_equivalent};
 use metrics::{assert_metrics_equivalent, validate_metrics_equivalent};
+use profiles::{assert_profiles_equivalent, validate_profiles_equivalent};
 use traces::{assert_traces_equivalent, validate_traces_equivalent};
 
 fn otap_to_otlp_logs(msg: &OtlpProtoMessage) -> LogsData {
@@ -47,6 +50,13 @@ fn otap_to_otlp_traces(msg: &OtlpProtoMessage) -> TracesData {
     match msg {
         OtlpProtoMessage::Traces(traces) => traces.clone(),
         _ => panic!("expected traces"),
+    }
+}
+
+fn otap_to_otlp_profiles(msg: &OtlpProtoMessage) -> ProfilesData {
+    match msg {
+        OtlpProtoMessage::Profiles(profiles) => profiles.clone(),
+        _ => panic!("expected profiles"),
     }
 }
 
@@ -74,7 +84,10 @@ pub fn assert_equivalent(left: &[OtlpProtoMessage], right: &[OtlpProtoMessage]) 
             &left.iter().map(otap_to_otlp_traces).collect::<Vec<_>>(),
             &right.iter().map(otap_to_otlp_traces).collect::<Vec<_>>(),
         ),
-        SignalType::Profiles => panic!("Profiles OTLP equivalence is not supported yet"),
+        SignalType::Profiles => assert_profiles_equivalent(
+            &left.iter().map(otap_to_otlp_profiles).collect::<Vec<_>>(),
+            &right.iter().map(otap_to_otlp_profiles).collect::<Vec<_>>(),
+        ),
     }
 }
 
@@ -102,6 +115,9 @@ pub fn validate_equivalent(left: &[OtlpProtoMessage], right: &[OtlpProtoMessage]
             &left.iter().map(otap_to_otlp_traces).collect::<Vec<_>>(),
             &right.iter().map(otap_to_otlp_traces).collect::<Vec<_>>(),
         ),
-        SignalType::Profiles => false,
+        SignalType::Profiles => validate_profiles_equivalent(
+            &left.iter().map(otap_to_otlp_profiles).collect::<Vec<_>>(),
+            &right.iter().map(otap_to_otlp_profiles).collect::<Vec<_>>(),
+        ),
     }
 }

@@ -8,21 +8,21 @@ Each branch is stacked on the preceding branch.
 
 ## Current Status
 
-- Steps 1 through 5 are implemented and committed on their corresponding local
+- Steps 1 through 6 are implemented and committed on their corresponding local
   stack branches.
 - All stack branches are rebased onto upstream commit `80d38834` from August
   28, 2026.
-- Step 6 is implemented on the current branch. It decodes the pinned OTLP
-  Profiles request, resolves the request-wide dictionary, materializes nested
-  string references, emits all Profiles OTAP tables, and validates the complete
-  graph.
+- Step 7 is implemented on the current branch. It validates Profiles OTAP
+  graphs, rebuilds canonical protobuf dictionaries, rewrites every entity
+  reference, reconstructs resource/scope envelopes, and provides semantic
+  reachable-graph equivalence.
 - Profiles BARs remain separate during batching, and oversized BARs are
   rejected until graph-aware partitioning and concatenation are implemented.
   Serialized OTLP Profiles requests likewise remain separate because each owns
   a request-wide dictionary.
 - Architecture findings and decisions are tracked in
   [Profiles Upstream Architecture Notes](profiles-upstream-architecture-notes.md).
-- Steps 7 through 11 have not started.
+- Steps 8 through 11 have not started.
 
 1. `profiles/01-otap-data-model-design`
    - Define the Profiles OTAP data model, processing semantics, validation
@@ -47,6 +47,9 @@ Each branch is stacked on the preceding branch.
      resource entity references reject the complete request.
 7. `profiles/07-otap-to-otlp-profiles`
    - Decode OTAP Profiles into OTLP and add semantic round-trip coverage.
+   - Status: implemented; full-graph reconstruction, bounded output,
+     canonical fixed-point, reordered dictionary, and malformed-input tests
+     pass.
 8. `profiles/08-profile-validation-benchmarks`
    - Validate semantic equivalence with real profiling datasets, fuzz both
      conversion directions, and benchmark size, CPU, and memory behavior.
