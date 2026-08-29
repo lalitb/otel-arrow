@@ -640,6 +640,104 @@ impl CheckpointStore {
         .map(|store| store.expect("non-cancellable checkpoint open cannot be cancelled"))
     }
 
+    /// Converts an already locked, read-only administration authority into
+    /// the ordinary append-capable store without reacquiring the namespace
+    /// lock or reselecting another generation.
+    pub(super) fn from_admin_session(
+        options: StoreOptions,
+        limits: StoreLimits,
+        lock: &mut Option<NamespaceLock>,
+        generation: u64,
+        loaded: &mut Option<LoadedGeneration>,
+        retired_generations: Vec<u64>,
+        faults: FaultPlan,
+    ) -> Result<Self, StoreError> {
+        let wal_path = options.namespace_dir.join(wal_file_name(generation));
+        let loaded_ref = loaded
+            .as_mut()
+            .expect("an append-capable admin transition retains its loaded authority");
+        let wal_transactions = u64::try_from(loaded_ref.transactions_replayed).map_err(|_| {
+            StoreError::CounterOverflow {
+                counter: "WAL transaction",
+                value: u64::MAX,
+            }
+        })?;
+        let repaired_torn_tail_bytes = loaded_ref.torn_tail_bytes;
+        if repaired_torn_tail_bytes > 0 {
+            let mut cancelled = || false;
+            fsio::truncate_file_cancellable(&wal_path, loaded_ref.wal_valid_len, &mut cancelled)?
+                .expect("a non-cancellable admin WAL repair cannot be cancelled");
+            loaded_ref.torn_tail_bytes = 0;
+        }
+        let mut cancelled = || false;
+        let wal = fsio::open_for_append_cancellable(&wal_path, &mut cancelled)?
+            .expect("a non-cancellable admin WAL open cannot be cancelled");
+
+        let StoreOptions {
+            namespace_dir,
+            namespace_id,
+            sync_interval,
+            compact_after_bytes,
+            compact_after_transactions,
+            ownership_timeout: _,
+            ownership_retry_interval: _,
+            max_tracked_files,
+            fingerprint_bytes,
+        } = options;
+        let lock = lock
+            .take()
+            .expect("an append-capable admin transition retains its namespace lock");
+        let loaded = loaded
+            .take()
+            .expect("an append-capable admin transition retains its loaded authority");
+        let recovery = RecoveryReport {
+            generation,
+            created: false,
+            adopted_without_marker: false,
+            snapshot_records: loaded.snapshot_records,
+            transactions_replayed: loaded.transactions_replayed,
+            torn_tail_bytes: repaired_torn_tail_bytes,
+            removed_temp_files: 0,
+            retired_generations: retired_generations.clone(),
+        };
+
+        Ok(Self {
+            namespace_dir,
+            namespace_id,
+            sync_interval,
+            compact_after_bytes,
+            compact_after_transactions,
+            max_tracked_files,
+            fingerprint_bytes,
+            limits,
+            _lock: lock,
+            table: loaded.table,
+            generation,
+            retired_generations,
+            wal,
+            wal_path,
+            wal_bytes: loaded.wal_valid_len,
+            wal_transactions,
+            next_sequence: loaded.next_sequence,
+            unsynced_transactions: 0,
+            last_sync: Instant::now(),
+            syncs: 0,
+            wal_bytes_appended: 0,
+            transactions_appended: 0,
+            persist_duration_ns: 0,
+            persist_operations: 0,
+            sync_duration_ns: 0,
+            sync_operations: 0,
+            quarantine_reset_beginning: 0,
+            quarantine_reset_end: 0,
+            quarantine_keep_failed: 0,
+            quarantine_removals: 0,
+            faults,
+            unusable: None,
+            recovery,
+        })
+    }
+
     fn open_inner(
         options: StoreOptions,
         mut faults: FaultPlan,
@@ -983,8 +1081,10 @@ impl CheckpointStore {
     /// match a publication postcondition this store can produce.
     ///
     /// Generation 0 may be the sole pair after interrupted first
-    /// publication. A later candidate must be the complete successor of one
-    /// complete previous generation, with no other recognized generations.
+    /// publication. A later candidate must be complete, strictly newer than
+    /// the complete generation named by `CURRENT.bak`, and no recognized
+    /// generation may be newer than it. This also covers an audited
+    /// namespace reset that deliberately jumps above retained evidence.
     /// Any other layout is ambiguous and retains both recovery names for
     /// operator diagnosis.
     fn select_from_temporary_marker(
@@ -1025,7 +1125,6 @@ impl CheckpointStore {
         let exact_publication_layout = if generation == INITIAL_GENERATION {
             generations.len() == 1 && backup_generation.is_none()
         } else {
-            let previous = generation - 1;
             let Some(found) = backup_generation else {
                 return Err(StoreError::MissingMarker {
                     dir: dir.to_path_buf(),
@@ -1037,18 +1136,13 @@ impl CheckpointStore {
                         .unwrap_or(generation),
                 });
             };
-            if found != previous {
-                return Err(StoreError::GenerationMismatch {
-                    artifact: "CURRENT backup marker",
-                    path: marker_backup_path.to_path_buf(),
-                    expected: previous,
-                    found,
-                });
-            }
-            generations.len() == 2
+            found < generation
                 && generations
-                    .get(&previous)
+                    .get(&found)
                     .is_some_and(|files| files.is_complete())
+                && generations
+                    .keys()
+                    .all(|recognized| *recognized <= generation)
         };
         if !exact_publication_layout {
             return Err(StoreError::MissingMarker {
@@ -1687,7 +1781,7 @@ impl CheckpointStore {
     /// snapshot cap *before* the first byte is written, so a namespace can
     /// never be left holding a snapshot that its own recovery would refuse
     /// to read.
-    fn stage_generation(
+    pub(super) fn stage_generation(
         dir: &Path,
         namespace_id: &str,
         generation: u64,
@@ -1786,7 +1880,7 @@ impl CheckpointStore {
     /// The returned failure reports whether the replacement had already
     /// happened, because that is the point after which the caller's
     /// in-memory view no longer matches the authoritative generation.
-    fn publish_marker(
+    pub(super) fn publish_marker(
         dir: &Path,
         generation: u64,
         faults: &mut FaultPlan,
@@ -2440,6 +2534,75 @@ impl CheckpointStore {
             .map(|compacted| compacted.expect("non-cancellable compaction cannot be cancelled"))
     }
 
+    /// Publishes a complete empty generation strictly above every generation
+    /// the administration session recognized, retaining all old artifacts.
+    pub(super) fn reset_to_empty_generation(
+        &mut self,
+        new_generation: u64,
+    ) -> Result<(), StoreError> {
+        self.ensure_usable("reset the complete checkpoint namespace")?;
+        let highest = self
+            .retired_generations
+            .iter()
+            .copied()
+            .chain(std::iter::once(self.generation))
+            .max()
+            .unwrap_or(self.generation);
+        if new_generation <= highest {
+            return Err(StoreError::GenerationNotIncreasing {
+                proposed: new_generation,
+                highest,
+            });
+        }
+        if self.unsynced_transactions > 0 {
+            self.sync_wal()?;
+        }
+
+        Self::stage_generation(
+            &self.namespace_dir,
+            &self.namespace_id,
+            new_generation,
+            &[],
+            &self.limits,
+            &mut self.faults,
+        )?;
+        let new_wal_path = self.namespace_dir.join(wal_file_name(new_generation));
+        let mut cancelled = || false;
+        let new_wal = fsio::open_for_append_cancellable(&new_wal_path, &mut cancelled)?
+            .expect("a non-cancellable namespace-reset WAL open cannot be cancelled");
+        if let Err(failure) =
+            Self::publish_marker(&self.namespace_dir, new_generation, &mut self.faults)
+        {
+            if failure.destination_may_have_changed {
+                self.unusable =
+                    Some("CURRENT was repointed or may have changed when publication failed");
+            }
+            return Err(failure.error);
+        }
+
+        let previous = self.generation;
+        self.wal = new_wal;
+        self.wal_path = new_wal_path;
+        self.table = CheckpointTable::new();
+        self.generation = new_generation;
+        self.wal_bytes = WAL_HEADER_LEN as u64;
+        self.wal_transactions = 0;
+        self.next_sequence = 1;
+        self.unsynced_transactions = 0;
+        self.last_sync = Instant::now();
+        if !self.retired_generations.contains(&previous) {
+            self.retired_generations.push(previous);
+        }
+        self.retired_generations.sort_unstable();
+        self.retired_generations.dedup();
+        self.recovery.generation = new_generation;
+        self.recovery.snapshot_records = 0;
+        self.recovery.transactions_replayed = 0;
+        self.recovery.torn_tail_bytes = 0;
+        self.recovery.retired_generations = self.retired_generations.clone();
+        Ok(())
+    }
+
     fn compact_cancellable(
         &mut self,
         cancelled: &mut impl FnMut() -> bool,
@@ -2617,7 +2780,7 @@ impl CheckpointStore {
         Ok(Some(snapshot_removed || wal_removed))
     }
 
-    fn ensure_usable(&self, operation: &'static str) -> Result<(), StoreError> {
+    pub(super) fn ensure_usable(&self, operation: &'static str) -> Result<(), StoreError> {
         match self.unusable {
             Some(reason) => Err(StoreError::Unusable {
                 dir: self.namespace_dir.clone(),
@@ -2626,6 +2789,20 @@ impl CheckpointStore {
             }),
             None => Ok(()),
         }
+    }
+
+    pub(super) fn mark_unusable(&mut self, reason: &'static str) {
+        self.unusable = Some(reason);
+    }
+
+    pub(super) fn admin_lock(&self) -> &NamespaceLock {
+        &self._lock
+    }
+
+    pub(super) fn release_admin(self) -> Result<(), StoreError> {
+        let Self { _lock, wal, .. } = self;
+        drop(wal);
+        _lock.release()
     }
 
     /// Refuses an append whose bytes would push the live WAL past the
@@ -3070,6 +3247,6 @@ pub(super) struct LoadedGeneration {
     pub(super) transactions_replayed: usize,
     /// Allowed structurally incomplete bytes at the final WAL tail.
     pub(super) torn_tail_bytes: usize,
-    wal_valid_len: u64,
-    next_sequence: u64,
+    pub(super) wal_valid_len: u64,
+    pub(super) next_sequence: u64,
 }

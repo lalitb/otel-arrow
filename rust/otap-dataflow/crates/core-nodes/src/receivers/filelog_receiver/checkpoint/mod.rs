@@ -23,9 +23,11 @@
 //! [`store`] blocks and must run on the receiver's dedicated
 //! read/checkpoint OS thread, never in async code.
 //!
-//! [`admin`] provides exclusive synchronous inspection and evidence backup
-//! for an existing namespace. It reuses the store's bounded recovery decoder
-//! through non-mutating filesystem paths and never repairs durable state.
+//! [`admin`] provides exclusive synchronous inspection, evidence backup,
+//! audited quarantine mutations, and explicit whole-namespace reset for an
+//! existing namespace, including a backup/reset-only path for corrupt
+//! authority. It reuses the store's bounded recovery, append, and
+//! generation-publication paths while retaining one namespace lock.
 //!
 //! Locators are represented purely as normalized data ([`primitives::Locator`])
 //! with no OS FFI, so this module and its tests compile and run identically
@@ -48,11 +50,17 @@ mod test_vectors;
 mod tests;
 
 pub use admin::{
-    AdvisoryPathKindReport, AdvisoryPathReport, CheckpointAdminError, CheckpointAdminSession,
-    CheckpointInspectionReport, EVIDENCE_BACKUP_MANIFEST_FILE_NAME,
-    EVIDENCE_BACKUP_MANIFEST_VERSION, EvidenceArtifact, EvidenceArtifactRole,
-    EvidenceBackupManifest, FramingResumeReport, LocatorReport, NamespaceValidationReport,
-    NativePathKindReport, NativePathReport, QuarantineInspectionReport,
+    AdvisoryPathKindReport, AdvisoryPathReport, AuditMetadata, CheckpointAdminError,
+    CheckpointAdminSession, CheckpointInspectionReport, CheckpointLifecycleReport,
+    CheckpointNamespaceResetSession, CommittedFrontierGuardReport, DataEffect,
+    EVIDENCE_BACKUP_MANIFEST_FILE_NAME, EVIDENCE_BACKUP_MANIFEST_VERSION, EvidenceArtifact,
+    EvidenceArtifactRole, EvidenceBackupManifest, ExpectedQuarantineState, FileMutationResult,
+    FramingResumeReport, KeepFailedRequest, LocatorReport, NAMESPACE_VALIDATION_DETAIL_MAX_BYTES,
+    NamespaceAuthorityFailureKind, NamespaceAuthorityFailureReport, NamespaceAuthorityReport,
+    NamespaceResetConsequence, NamespaceResetReport, NamespaceResetRequest, NamespaceResetResult,
+    NamespaceValidationReport, NativePathKindReport, NativePathReport, QuarantineInspectionReport,
+    QuarantineMutationAction, QuarantinedFileTarget, RemovalConsequence, RemoveQuarantinedRequest,
+    ResetToBeginningRequest, ResetToEndEvidenceReport, ResetToEndRequest,
 };
 pub use apply::{CheckpointTable, TableRecord};
 pub use error::{ApplyError, DecodeError, EncodeError};

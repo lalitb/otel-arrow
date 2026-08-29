@@ -407,6 +407,18 @@ pub enum StoreError {
         /// The current generation.
         generation: u64,
     },
+    /// An administrative publication attempted to reuse or move backward
+    /// from a recognized generation number.
+    #[error(
+        "checkpoint generation {proposed} must be strictly greater than every recognized \
+         generation (highest is {highest})"
+    )]
+    GenerationNotIncreasing {
+        /// Proposed generation.
+        proposed: u64,
+        /// Highest generation already recognized by the locked session.
+        highest: u64,
+    },
     /// The WAL transaction sequence would overflow, so no further
     /// transaction can be appended to this generation.
     #[error("checkpoint WAL sequence would overflow past {sequence}; compaction is required")]

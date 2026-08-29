@@ -11,15 +11,21 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use super::*;
+use crate::receivers::filelog_receiver::checkpoint::current_marker::encode_current_marker;
 use crate::receivers::filelog_receiver::checkpoint::primitives::{
-    CommittedFrontierGuard, FRAMING_PROFILE_VERSION, FileId, Locator,
+    CommittedFrontierGuard, FRAMING_PROFILE_VERSION, FileId, Locator, namespace_digest,
 };
+use crate::receivers::filelog_receiver::checkpoint::snapshot::{
+    QuarantineEvidence, SnapshotRecord, encode_snapshot,
+};
+use crate::receivers::filelog_receiver::checkpoint::store::fault::FaultPoint;
 use crate::receivers::filelog_receiver::checkpoint::store::layout::{
     OWNERSHIP_LOCK_FILE_NAME, backup_file_name, snapshot_file_name, temp_file_name, wal_file_name,
 };
 use crate::receivers::filelog_receiver::checkpoint::wal::{
-    QuarantineFile, RegisterFile, UpdateProgress,
+    QuarantineFile, RegisterFile, UpdateProgress, decode_wal, encode_wal,
 };
+use crate::receivers::filelog_receiver::identity::platform::open_locator_for_stability_check_cancellable;
 
 fn options(state_dir: &Path, namespace_id: &str) -> StoreOptions {
     let mut options = StoreOptions::from_state_dir(state_dir, namespace_id).unwrap();
@@ -146,6 +152,15 @@ fn directory_names(directory: &Path) -> BTreeSet<String> {
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
         .collect()
+}
+
+fn valid_backup_validation(manifest: &EvidenceBackupManifest) -> &NamespaceValidationReport {
+    match &manifest.authority {
+        NamespaceAuthorityReport::Valid { validation } => validation,
+        NamespaceAuthorityReport::Invalid { failure } => {
+            panic!("expected valid backup authority, got {failure:?}")
+        }
+    }
 }
 
 /// Scenario: administration constructs StoreOptions for mixed-case, dot,
@@ -300,7 +315,7 @@ fn relative_admin_session_survives_working_directory_change() {
         std::env::set_current_dir(&second).unwrap();
         let destination = root.path().join("evidence");
         let manifest = session.backup(&destination).unwrap();
-        assert_eq!(manifest.validation.tracked_file_count, 1);
+        assert_eq!(valid_backup_validation(&manifest).tracked_file_count, 1);
         assert!(destination.join(CURRENT_FILE_NAME).is_file());
         assert!(!second.join("state").exists());
         session.release().unwrap();
@@ -469,7 +484,7 @@ fn torn_wal_tail_is_reported_without_truncation() {
     assert_eq!(session.validation().torn_wal_tail_bytes, 3);
     assert_eq!(session.validation().wal_transaction_count, 1);
     let manifest = session.backup(root.path().join("torn-evidence")).unwrap();
-    assert_eq!(manifest.validation.torn_wal_tail_bytes, 3);
+    assert_eq!(valid_backup_validation(&manifest).torn_wal_tail_bytes, 3);
     assert_eq!(
         fs::read(root.path().join("torn-evidence").join(wal_file_name(0))).unwrap(),
         fs::read(&wal_path).unwrap()
@@ -782,10 +797,10 @@ fn backup_copies_only_recognized_artifacts_with_manifest_hashes() {
     assert_eq!(manifest.namespace_id, "backup-report");
     assert_eq!(
         manifest.source_namespace,
-        manifest.validation.derived_namespace_path
+        valid_backup_validation(&manifest).derived_namespace_path
     );
-    assert_eq!(manifest.selected_generation, 1);
-    assert_eq!(manifest.validation.torn_wal_tail_bytes, 0);
+    assert_eq!(valid_backup_validation(&manifest).selected_generation, 1);
+    assert_eq!(valid_backup_validation(&manifest).torn_wal_tail_bytes, 0);
     let manifest_from_disk: EvidenceBackupManifest = serde_json::from_slice(
         &fs::read(destination.join(EVIDENCE_BACKUP_MANIFEST_FILE_NAME)).unwrap(),
     )
@@ -1015,4 +1030,1400 @@ fn make_fifo(path: &Path) {
         "mkfifo failed: {}",
         std::io::Error::last_os_error()
     );
+}
+
+fn mutation_audit(reason: &str, action_time_unix_nano: u64) -> AuditMetadata {
+    AuditMetadata {
+        reason: reason.to_owned(),
+        action_time_unix_nano,
+    }
+}
+
+fn mutation_target(seed: u8, epoch: u32) -> QuarantinedFileTarget {
+    QuarantinedFileTarget {
+        file_id: hex::encode([seed; 16]),
+        expected_lifecycle: ExpectedQuarantineState::Quarantined,
+        expected_quarantine_epoch: epoch,
+    }
+}
+
+fn source_locator(path: &Path) -> Locator {
+    open_locator_for_stability_check_cancellable(path, false, || false)
+        .unwrap()
+        .unwrap()
+}
+
+fn seed_quarantined_source(
+    store_options: &StoreOptions,
+    source_path: &Path,
+    seed: u8,
+    committed_offset: u64,
+    framing_resume: FramingResume,
+    advisory_path: AdvisoryPath,
+) -> SnapshotRecord {
+    let locator = source_locator(source_path);
+    let mut register = registration(seed, advisory_path);
+    register.locator = locator;
+    let mut store = CheckpointStore::open(store_options.clone()).unwrap();
+    let _ = store.register_files(vec![register]).unwrap();
+    if committed_offset != 0 {
+        let _ = store
+            .commit_progress(vec![UpdateProgress {
+                file_id: FileId([seed; 16]),
+                expected_committed_offset: 0,
+                expected_file_epoch: 1,
+                new_committed_offset: committed_offset,
+                new_committed_frontier_guard: guard(committed_offset, seed),
+                new_framing_resume: framing_resume,
+                new_last_seen_time_unix_nano: 2_000,
+                finalize: false,
+            }])
+            .unwrap();
+    }
+    let _ = store
+        .quarantine_files(vec![QuarantineFile {
+            file_id: FileId([seed; 16]),
+            expected_file_epoch: 1,
+            reason_code: 0x0003,
+            locator,
+            observed_size: fs::metadata(source_path).unwrap().len(),
+            quarantine_epoch: 1,
+            quarantine_time_unix_nano: 3_000,
+        }])
+        .unwrap();
+    let record = store.table().get(&FileId([seed; 16])).unwrap().clone();
+    drop(store);
+    record
+}
+
+fn beginning_request(seed: u8, epoch: u32, reason: &str) -> ResetToBeginningRequest {
+    ResetToBeginningRequest {
+        target: mutation_target(seed, epoch),
+        audit: mutation_audit(reason, 4_000),
+    }
+}
+
+fn keep_request(seed: u8, epoch: u32, reason: &str) -> KeepFailedRequest {
+    KeepFailedRequest {
+        target: mutation_target(seed, epoch),
+        audit: mutation_audit(reason, 4_000),
+    }
+}
+
+fn end_request(
+    seed: u8,
+    epoch: u32,
+    source_path: &Path,
+    follow_symlinks: bool,
+    reason: &str,
+) -> ResetToEndRequest {
+    ResetToEndRequest {
+        target: mutation_target(seed, epoch),
+        source_path: source_path.to_path_buf(),
+        follow_symlinks,
+        audit: mutation_audit(reason, 4_000),
+    }
+}
+
+/// Scenario: a quarantined continuation is reset to the beginning through
+/// the high-level administration API.
+/// Guarantees: the API increments the epoch, installs offset zero, the empty
+/// guard, and Clean resume, reports duplicate risk, syncs before success,
+/// retains the lock, and survives a fresh store reopen.
+#[test]
+fn reset_to_beginning_is_audited_synced_and_durable() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.log");
+    fs::write(&source, vec![b'a'; 128]).unwrap();
+    let store_options = options(&root.path().join("state"), "reset-beginning");
+    let _ = seed_quarantined_source(
+        &store_options,
+        &source,
+        1,
+        64,
+        FramingResume::Continuation {
+            record_start_offset: 8,
+            record_end_offset: 96,
+            next_fragment_index: 2,
+        },
+        AdvisoryPath::from_unix_bytes(b"/stale/source.log").unwrap(),
+    );
+
+    let mut session = CheckpointAdminSession::open(store_options.clone()).unwrap();
+    let result = session
+        .reset_to_beginning(beginning_request(1, 1, "replay this source"))
+        .unwrap();
+    assert_eq!(result.namespace_id, "reset-beginning");
+    assert_eq!(result.file_id, hex::encode([1; 16]));
+    assert_eq!(result.action, QuarantineMutationAction::ResetToBeginning);
+    assert_eq!(result.old_lifecycle, CheckpointLifecycleReport::Quarantined);
+    assert_eq!(result.new_lifecycle, CheckpointLifecycleReport::Active);
+    assert_eq!((result.old_epoch, result.new_epoch), (1, Some(2)));
+    assert_eq!((result.old_offset, result.new_offset), (64, Some(0)));
+    assert_eq!(result.data_effect, DataEffect::DuplicatePossible);
+    assert!(result.reset_to_end_evidence.is_none());
+    assert_eq!(
+        serde_json::from_slice::<FileMutationResult>(&serde_json::to_vec(&result).unwrap())
+            .unwrap(),
+        result
+    );
+    assert!(matches!(
+        CheckpointStore::open(store_options.clone()),
+        Err(StoreError::NamespaceLocked { .. })
+    ));
+    session.release().unwrap();
+
+    let reopened = CheckpointStore::open(store_options).unwrap();
+    let record = reopened.table().get(&FileId([1; 16])).unwrap();
+    assert_eq!(record.lifecycle_state, LifecycleState::Active);
+    assert_eq!(record.file_epoch, 2);
+    assert_eq!(record.committed_offset, 0);
+    assert_eq!(
+        record.committed_frontier_guard,
+        CommittedFrontierGuard::empty()
+    );
+    assert_eq!(record.framing_resume, FramingResume::Clean);
+    assert!(record.quarantine_evidence.is_none());
+}
+
+/// Scenario: an operator records keep-failed for a quarantined record with
+/// nonzero offset, continuation state, and immutable evidence.
+/// Guarantees: the WAL gains a synced audit transaction while the complete
+/// SnapshotRecord remains byte-identical both in the live session and after
+/// reopening.
+#[test]
+fn keep_failed_preserves_all_record_state_after_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.log");
+    fs::write(&source, vec![b'b'; 160]).unwrap();
+    let store_options = options(&root.path().join("state"), "keep-failed");
+    let old = seed_quarantined_source(
+        &store_options,
+        &source,
+        2,
+        80,
+        FramingResume::Continuation {
+            record_start_offset: 32,
+            record_end_offset: 128,
+            next_fragment_index: 4,
+        },
+        AdvisoryPath::from_unix_bytes(b"/var/log/keep.log").unwrap(),
+    );
+
+    let mut session = CheckpointAdminSession::open(store_options.clone()).unwrap();
+    let transactions_before = session.validation().wal_transaction_count;
+    let result = session
+        .keep_failed(keep_request(2, 1, "retain quarantine"))
+        .unwrap();
+    assert_eq!(result.action, QuarantineMutationAction::KeepFailed);
+    assert_eq!(result.old_lifecycle, CheckpointLifecycleReport::Quarantined);
+    assert_eq!(result.new_lifecycle, CheckpointLifecycleReport::Quarantined);
+    assert_eq!((result.old_epoch, result.new_epoch), (1, Some(1)));
+    assert_eq!((result.old_offset, result.new_offset), (80, Some(80)));
+    assert_eq!(result.data_effect, DataEffect::None);
+    assert_eq!(
+        session.validation().wal_transaction_count,
+        transactions_before + 1
+    );
+    session.release().unwrap();
+
+    let reopened = CheckpointStore::open(store_options).unwrap();
+    assert_eq!(reopened.table().get(&FileId([2; 16])), Some(&old));
+}
+
+/// Scenario: a read-only administration session observes an allowed torn
+/// WAL tail, repairs it while becoming writable, and then hits a no-write
+/// injected failure on the requested audit transaction.
+/// Guarantees: the live inspection is refreshed immediately after repair,
+/// the failed append cannot expose a stale backup from the unusable session,
+/// and reopening describes and copies the repaired authority.
+#[test]
+fn writable_transition_refreshes_repaired_torn_tail_before_append_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.log");
+    fs::write(&source, b"blocked\n").unwrap();
+    let store_options = options(&root.path().join("state"), "repair-before-append");
+    let _ = seed_quarantined_source(
+        &store_options,
+        &source,
+        22,
+        0,
+        FramingResume::Clean,
+        AdvisoryPath::unavailable(),
+    );
+    let wal_path = store_options.namespace_dir.join(wal_file_name(0));
+    let valid_len = fs::metadata(&wal_path).unwrap().len();
+    let mut wal = OpenOptions::new().append(true).open(&wal_path).unwrap();
+    wal.write_all(&[0x4f, 0x54, 0x41]).unwrap();
+    wal.sync_all().unwrap();
+    drop(wal);
+
+    let mut session = CheckpointAdminSession::open_with_fault(
+        store_options.clone(),
+        FaultPoint::BeforeWalTransactionWrite,
+    )
+    .unwrap();
+    assert_eq!(session.validation().torn_wal_tail_bytes, 3);
+    assert!(matches!(
+        session.keep_failed(keep_request(22, 1, "record failed retry")),
+        Err(CheckpointAdminError::Store(StoreError::InjectedFault {
+            point: FaultPoint::BeforeWalTransactionWrite,
+        }))
+    ));
+    assert_eq!(session.validation().torn_wal_tail_bytes, 0);
+    assert_eq!(fs::metadata(&wal_path).unwrap().len(), valid_len);
+
+    let backup = root.path().join("repaired-evidence");
+    assert!(matches!(
+        session.backup(&backup),
+        Err(CheckpointAdminError::Store(StoreError::Unusable { .. }))
+    ));
+    session.release().unwrap();
+
+    let reopened = CheckpointAdminSession::open(store_options).unwrap();
+    let manifest = reopened.backup(&backup).unwrap();
+    assert_eq!(valid_backup_validation(&manifest).torn_wal_tail_bytes, 0);
+    assert_eq!(
+        fs::read(backup.join(wal_file_name(0))).unwrap(),
+        fs::read(&wal_path).unwrap()
+    );
+}
+
+/// Scenario: an operator removes one exact quarantined record with matching
+/// lifecycle, epoch, nonzero reason, namespace, and audit evidence.
+/// Guarantees: explicit duplicate-or-loss acknowledgement is required, the
+/// result reports both future-registration risks, and the record remains
+/// absent after reopening.
+#[test]
+fn remove_quarantined_is_exact_audited_and_durable() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.log");
+    fs::write(&source, b"remove me\n").unwrap();
+    let store_options = options(&root.path().join("state"), "Remove.Quarantine");
+    let _ = seed_quarantined_source(
+        &store_options,
+        &source,
+        3,
+        0,
+        FramingResume::Clean,
+        AdvisoryPath::from_unix_bytes(b"/var/log/remove.log").unwrap(),
+    );
+
+    let mut session = CheckpointAdminSession::open(store_options.clone()).unwrap();
+    let request = RemoveQuarantinedRequest {
+        target: mutation_target(3, 1),
+        removal_reason: 0x0008,
+        consequence: RemovalConsequence::AcknowledgeDuplicateOrLossPossible,
+        audit: mutation_audit("delete blocked record", 5_000),
+    };
+    let mut missing_acknowledgement = serde_json::to_value(&request).unwrap();
+    let _ = missing_acknowledgement
+        .as_object_mut()
+        .unwrap()
+        .remove("consequence");
+    assert!(serde_json::from_value::<RemoveQuarantinedRequest>(missing_acknowledgement).is_err());
+    let result = session.remove_quarantined(request).unwrap();
+    assert_eq!(result.action, QuarantineMutationAction::RemoveQuarantined);
+    assert_eq!(result.old_lifecycle, CheckpointLifecycleReport::Quarantined);
+    assert_eq!(result.new_lifecycle, CheckpointLifecycleReport::Absent);
+    assert_eq!(result.new_epoch, None);
+    assert_eq!(result.new_offset, None);
+    assert_eq!(result.data_effect, DataEffect::DuplicateOrLossPossible);
+    assert_eq!(session.validation().tracked_file_count, 0);
+    let wal = decode_wal(
+        &fs::read(store_options.namespace_dir.join(wal_file_name(0))).unwrap(),
+        &namespace_digest("Remove.Quarantine"),
+    )
+    .unwrap();
+    let removal = match &wal.transactions.last().unwrap().operations[0] {
+        Operation::RemoveFile(removal) => removal,
+        other => panic!("expected administrative removal, got {other:?}"),
+    };
+    assert_eq!(removal.namespace_id.as_deref(), Some("Remove.Quarantine"));
+    assert_eq!(removal.expected_file_epoch, 1);
+    assert_eq!(removal.expected_prior_state, LifecycleState::Quarantined);
+    assert_eq!(
+        removal.audit_reason.as_deref(),
+        Some("delete blocked record")
+    );
+    session.release().unwrap();
+
+    let reopened = CheckpointStore::open(store_options).unwrap();
+    assert!(reopened.table().get(&FileId([3; 16])).is_none());
+}
+
+/// Scenario: reset-to-end samples a regular file longer than the 64-byte
+/// committed-frontier window through its immutable quarantine locator.
+/// Guarantees: EOF and the digest of exactly the final 64 raw bytes from the
+/// same handle are committed, reported without raw content, synced, and
+/// recovered after restart.
+#[test]
+fn reset_to_end_commits_exact_locator_eof_and_real_guard() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.log");
+    let bytes: Vec<u8> = (0..150).map(|value| value as u8).collect();
+    fs::write(&source, &bytes).unwrap();
+    let store_options = options(&root.path().join("state"), "reset-end");
+    let _ = seed_quarantined_source(
+        &store_options,
+        &source,
+        4,
+        32,
+        FramingResume::Clean,
+        AdvisoryPath::from_unix_bytes(b"/obsolete/path.log").unwrap(),
+    );
+    let expected_guard = CommittedFrontierGuard::compute(150, &bytes[86..]).unwrap();
+
+    let mut session = CheckpointAdminSession::open(store_options.clone()).unwrap();
+    let result = session
+        .reset_to_end(end_request(4, 1, &source, false, "skip blocked bytes"))
+        .unwrap();
+    assert_eq!(result.action, QuarantineMutationAction::ResetToEnd);
+    assert_eq!(result.new_lifecycle, CheckpointLifecycleReport::Active);
+    assert_eq!((result.old_epoch, result.new_epoch), (1, Some(2)));
+    assert_eq!((result.old_offset, result.new_offset), (32, Some(150)));
+    assert_eq!(result.data_effect, DataEffect::LossAccepted);
+    let evidence = result.reset_to_end_evidence.as_ref().unwrap();
+    assert_eq!(evidence.eof_offset, 150);
+    assert_eq!(evidence.locator, source_locator(&source).into());
+    assert_eq!(evidence.committed_frontier_guard.window_len, 64);
+    assert_eq!(
+        evidence.committed_frontier_guard.digest,
+        hex::encode(expected_guard.digest)
+    );
+    let encoded = serde_json::to_vec(&result).unwrap();
+    assert!(!encoded.windows(64).any(|window| window == &bytes[86..]));
+    session.release().unwrap();
+
+    let reopened = CheckpointStore::open(store_options).unwrap();
+    let record = reopened.table().get(&FileId([4; 16])).unwrap();
+    assert_eq!(record.file_epoch, 2);
+    assert_eq!(record.committed_offset, 150);
+    assert_eq!(record.committed_frontier_guard, expected_guard);
+    assert_eq!(record.framing_resume, FramingResume::Clean);
+    assert_eq!(record.lifecycle_state, LifecycleState::Active);
+}
+
+/// Scenario: malformed IDs, empty or oversized audit reasons, stale epochs,
+/// a zero removal reason, and an already-absent file are submitted.
+/// Guarantees: every invalid request fails before a WAL append; absent
+/// administrative removal is fail-closed rather than reported idempotent.
+#[test]
+fn invalid_mutation_requests_leave_the_wal_unchanged() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.log");
+    fs::write(&source, b"blocked\n").unwrap();
+    let store_options = options(&root.path().join("state"), "invalid-mutations");
+    let _ = seed_quarantined_source(
+        &store_options,
+        &source,
+        5,
+        0,
+        FramingResume::Clean,
+        AdvisoryPath::unavailable(),
+    );
+    let wal_path = store_options.namespace_dir.join(wal_file_name(0));
+    let before = fs::read(&wal_path).unwrap();
+    let mut session = CheckpointAdminSession::open(store_options).unwrap();
+
+    for invalid in [
+        hex::encode([5; 15]),
+        "AA000000000000000000000000000000".to_owned(),
+        "gg000000000000000000000000000000".to_owned(),
+    ] {
+        let mut request = beginning_request(5, 1, "valid audit");
+        request.target.file_id = invalid;
+        assert!(matches!(
+            session.reset_to_beginning(request),
+            Err(CheckpointAdminError::InvalidFileId)
+        ));
+    }
+
+    let mut empty_audit = beginning_request(5, 1, "");
+    empty_audit.audit.reason.clear();
+    assert!(matches!(
+        session.reset_to_beginning(empty_audit),
+        Err(CheckpointAdminError::AuditReasonRequired { .. })
+    ));
+    let mut oversized = beginning_request(5, 1, "oversized");
+    oversized.audit.reason = "x".repeat(AUDIT_REASON_MAX_BYTES + 1);
+    assert!(matches!(
+        session.reset_to_beginning(oversized),
+        Err(CheckpointAdminError::AuditReasonTooLong { .. })
+    ));
+    assert!(matches!(
+        session.reset_to_beginning(beginning_request(5, 2, "stale epoch")),
+        Err(CheckpointAdminError::QuarantineEpochMismatch { .. })
+    ));
+    assert!(matches!(
+        session.remove_quarantined(RemoveQuarantinedRequest {
+            target: mutation_target(5, 1),
+            removal_reason: 0,
+            consequence: RemovalConsequence::AcknowledgeDuplicateOrLossPossible,
+            audit: mutation_audit("invalid reason", 4_000),
+        }),
+        Err(CheckpointAdminError::Store(
+            StoreError::ReservedReasonCode { .. }
+        ))
+    ));
+    assert!(matches!(
+        session.remove_quarantined(RemoveQuarantinedRequest {
+            target: mutation_target(99, 1),
+            removal_reason: 1,
+            consequence: RemovalConsequence::AcknowledgeDuplicateOrLossPossible,
+            audit: mutation_audit("absent", 4_000),
+        }),
+        Err(CheckpointAdminError::FileNotFound { .. })
+    ));
+    assert_eq!(fs::read(&wal_path).unwrap(), before);
+}
+
+/// Scenario: a valid active record is targeted by a quarantine-only
+/// high-level mutation.
+/// Guarantees: current locked lifecycle is checked before constructing or
+/// appending a reset operation.
+#[test]
+fn mutation_rejects_a_record_that_is_not_quarantined() {
+    let root = tempfile::tempdir().unwrap();
+    let store_options = options(&root.path().join("state"), "active-target");
+    let mut store = CheckpointStore::open(store_options.clone()).unwrap();
+    let _ = store
+        .register_files(vec![registration(6, AdvisoryPath::unavailable())])
+        .unwrap();
+    let wal_path = store_options.namespace_dir.join(wal_file_name(0));
+    drop(store);
+    let before = fs::read(&wal_path).unwrap();
+
+    let mut session = CheckpointAdminSession::open(store_options).unwrap();
+    assert!(matches!(
+        session.reset_to_beginning(beginning_request(6, 1, "wrong state")),
+        Err(CheckpointAdminError::ExpectedQuarantine {
+            state: CheckpointLifecycleReport::Active,
+            ..
+        })
+    ));
+    assert_eq!(fs::read(wal_path).unwrap(), before);
+}
+
+/// Scenario: a quarantined record already has the maximum u32 epoch.
+/// Guarantees: reset-to-beginning detects checked-add overflow before
+/// transitioning the session to append mode or changing the WAL.
+#[test]
+fn reset_to_beginning_rejects_epoch_overflow_without_append() {
+    let root = tempfile::tempdir().unwrap();
+    let store_options = options(&root.path().join("state"), "epoch-overflow");
+    drop(CheckpointStore::open(store_options.clone()).unwrap());
+    let record = SnapshotRecord {
+        file_id: FileId([7; 16]),
+        file_epoch: u32::MAX,
+        committed_offset: 0,
+        committed_frontier_guard: CommittedFrontierGuard::empty(),
+        fingerprint: vec![7; 8],
+        ignored_header_bytes: 0,
+        locator: Locator::PosixDevIno { dev: 7, ino: 7 },
+        framing_profile_version: FRAMING_PROFILE_VERSION,
+        framing_profile_digest: [7; 32],
+        framing_resume: FramingResume::Clean,
+        lifecycle_state: LifecycleState::Quarantined,
+        quarantine_evidence: Some(QuarantineEvidence {
+            reason_code: 3,
+            observed_size: 0,
+            quarantine_epoch: u32::MAX,
+            quarantine_time_unix_nano: 3_000,
+        }),
+        last_seen_time_unix_nano: 2_000,
+        advisory_path: AdvisoryPath::unavailable(),
+    };
+    fs::write(
+        store_options.namespace_dir.join(snapshot_file_name(0)),
+        encode_snapshot(0, &store_options.namespace_id, &[record]).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        store_options.namespace_dir.join(wal_file_name(0)),
+        encode_wal(0, &store_options.namespace_id, &[]).unwrap(),
+    )
+    .unwrap();
+    let wal_path = store_options.namespace_dir.join(wal_file_name(0));
+    let before = fs::read(&wal_path).unwrap();
+
+    let mut session = CheckpointAdminSession::open(store_options).unwrap();
+    assert!(matches!(
+        session.reset_to_beginning(beginning_request(7, u32::MAX, "overflow")),
+        Err(CheckpointAdminError::FileEpochOverflow { .. })
+    ));
+    assert_eq!(fs::read(wal_path).unwrap(), before);
+}
+
+/// Scenario: reset-to-end is pointed at a different locator, a missing
+/// path, and a directory while the quarantined source still exists elsewhere.
+/// Guarantees: the API never searches aliases or falls back to advisory
+/// metadata, and every failed source validation leaves the WAL unchanged.
+#[test]
+fn reset_to_end_rejects_wrong_unreadable_and_nonregular_paths() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.log");
+    let wrong = root.path().join("wrong.log");
+    fs::write(&source, vec![b's'; 96]).unwrap();
+    fs::write(&wrong, vec![b'w'; 96]).unwrap();
+    let directory = root.path().join("directory");
+    fs::create_dir(&directory).unwrap();
+    let store_options = options(&root.path().join("state"), "source-failures");
+    let _ = seed_quarantined_source(
+        &store_options,
+        &source,
+        8,
+        0,
+        FramingResume::Clean,
+        AdvisoryPath::from_unix_bytes(wrong.as_os_str().as_encoded_bytes()).unwrap(),
+    );
+    let wal_path = store_options.namespace_dir.join(wal_file_name(0));
+    let before = fs::read(&wal_path).unwrap();
+    let mut session = CheckpointAdminSession::open(store_options).unwrap();
+
+    assert!(matches!(
+        session.reset_to_end(end_request(8, 1, &wrong, false, "wrong locator")),
+        Err(CheckpointAdminError::ResetSourceLocatorMismatch { .. })
+    ));
+    assert!(matches!(
+        session.reset_to_end(end_request(
+            8,
+            1,
+            &root.path().join("missing.log"),
+            false,
+            "missing",
+        )),
+        Err(CheckpointAdminError::ResetSourceIo { .. })
+    ));
+    assert!(matches!(
+        session.reset_to_end(end_request(8, 1, &directory, false, "directory")),
+        Err(CheckpointAdminError::ResetSourceNotRegular { .. })
+    ));
+    assert_eq!(fs::read(wal_path).unwrap(), before);
+}
+
+/// Scenario: a quarantine carries a deliberately truncated advisory path,
+/// but the real exact-locator source exists at another path.
+/// Guarantees: reset-to-end refuses the operator-supplied stale suffix and
+/// never treats bounded advisory evidence as a path authority or alias search
+/// hint.
+#[test]
+fn reset_to_end_never_trusts_a_truncated_advisory_path() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("real.log");
+    fs::write(&source, vec![b't'; 96]).unwrap();
+    let advisory = AdvisoryPath::from_unix_bytes(&vec![b'x'; 5_000]).unwrap();
+    assert!(advisory.is_truncated());
+    let store_options = options(&root.path().join("state"), "truncated-advisory");
+    let _ = seed_quarantined_source(
+        &store_options,
+        &source,
+        9,
+        0,
+        FramingResume::Clean,
+        advisory,
+    );
+    let wal_path = store_options.namespace_dir.join(wal_file_name(0));
+    let before = fs::read(&wal_path).unwrap();
+
+    let mut session = CheckpointAdminSession::open(store_options).unwrap();
+    let displayed_suffix = root.path().join("displayed-suffix.log");
+    assert!(matches!(
+        session.reset_to_end(end_request(
+            9,
+            1,
+            &displayed_suffix,
+            false,
+            "must supply exact path",
+        )),
+        Err(CheckpointAdminError::ResetSourceIo { .. })
+    ));
+    assert_eq!(fs::read(wal_path).unwrap(), before);
+}
+
+/// Scenario: the reset-to-end source grows, shrinks, or changes its trailing
+/// bytes at constant size between the first bounded sample and recheck.
+/// Guarantees: stable EOF evidence rejects every mutation and no WAL
+/// transaction is appended.
+#[test]
+fn reset_to_end_rejects_mutable_source_evidence_without_append() {
+    for case in ["grow", "shrink", "overwrite"] {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.log");
+        fs::write(&source, vec![b'm'; 128]).unwrap();
+        let store_options = options(
+            &root.path().join("state"),
+            &format!("mutable-source-{case}"),
+        );
+        let _ = seed_quarantined_source(
+            &store_options,
+            &source,
+            10,
+            0,
+            FramingResume::Clean,
+            AdvisoryPath::unavailable(),
+        );
+        let wal_path = store_options.namespace_dir.join(wal_file_name(0));
+        let before = fs::read(&wal_path).unwrap();
+        let mut session = CheckpointAdminSession::open(store_options).unwrap();
+        let mutation_path = source.clone();
+
+        let result = session.reset_to_end_with_hook(
+            end_request(10, 1, &source, false, "sample stable EOF"),
+            move || match case {
+                "grow" => {
+                    OpenOptions::new()
+                        .append(true)
+                        .open(&mutation_path)
+                        .unwrap()
+                        .write_all(b"growth")
+                        .unwrap();
+                }
+                "shrink" => {
+                    OpenOptions::new()
+                        .write(true)
+                        .open(&mutation_path)
+                        .unwrap()
+                        .set_len(32)
+                        .unwrap();
+                }
+                "overwrite" => {
+                    fs::write(&mutation_path, vec![b'n'; 128]).unwrap();
+                }
+                _ => unreachable!(),
+            },
+        );
+        assert!(
+            matches!(result, Err(CheckpointAdminError::ResetSourceChanged { .. })),
+            "unexpected mutable-source result for {case}: {result:?}"
+        );
+        assert_eq!(fs::read(&wal_path).unwrap(), before);
+    }
+}
+
+/// Scenario: a symlink points to the exact quarantined locator and the
+/// operator first selects no-follow, then explicitly selects follow.
+/// Guarantees: no-follow rejects without append, while explicit follow
+/// samples the target safely and commits the exact EOF.
+#[cfg(unix)]
+#[test]
+fn reset_to_end_enforces_the_explicit_symlink_policy() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.log");
+    let alias = root.path().join("source-link.log");
+    fs::write(&source, vec![b'l'; 72]).unwrap();
+    symlink(&source, &alias).unwrap();
+    let store_options = options(&root.path().join("state"), "symlink-policy");
+    let _ = seed_quarantined_source(
+        &store_options,
+        &source,
+        11,
+        0,
+        FramingResume::Clean,
+        AdvisoryPath::unavailable(),
+    );
+    let wal_path = store_options.namespace_dir.join(wal_file_name(0));
+    let before = fs::read(&wal_path).unwrap();
+    let mut session = CheckpointAdminSession::open(store_options.clone()).unwrap();
+
+    assert!(matches!(
+        session.reset_to_end(end_request(11, 1, &alias, false, "no links")),
+        Err(CheckpointAdminError::ResetSourceSymlinkOrReparse { .. })
+    ));
+    assert_eq!(fs::read(&wal_path).unwrap(), before);
+    let result = session
+        .reset_to_end(end_request(11, 1, &alias, true, "follow exact link"))
+        .unwrap();
+    assert_eq!(result.new_offset, Some(72));
+    session.release().unwrap();
+    assert_eq!(
+        CheckpointStore::open(store_options)
+            .unwrap()
+            .table()
+            .get(&FileId([11; 16]))
+            .unwrap()
+            .committed_offset,
+        72
+    );
+}
+
+/// Scenario: the exact source path is replaced by a symlink to another
+/// locator after the first EOF sample while explicit follow is enabled.
+/// Guarantees: the final path-bound locator/size recheck rejects the
+/// substitution and no reset transaction reaches the WAL.
+#[cfg(unix)]
+#[test]
+fn reset_to_end_rejects_path_substitution_during_sampling() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.log");
+    let displaced = root.path().join("displaced.log");
+    let replacement = root.path().join("replacement.log");
+    fs::write(&source, vec![b'o'; 72]).unwrap();
+    fs::write(&replacement, vec![b'n'; 72]).unwrap();
+    let store_options = options(&root.path().join("state"), "path-substitution");
+    let _ = seed_quarantined_source(
+        &store_options,
+        &source,
+        15,
+        0,
+        FramingResume::Clean,
+        AdvisoryPath::unavailable(),
+    );
+    let wal_path = store_options.namespace_dir.join(wal_file_name(0));
+    let before = fs::read(&wal_path).unwrap();
+    let mut session = CheckpointAdminSession::open(store_options).unwrap();
+    let source_for_hook = source.clone();
+    let displaced_for_hook = displaced.clone();
+    let replacement_for_hook = replacement.clone();
+
+    let result = session.reset_to_end_with_hook(
+        end_request(15, 1, &source, true, "reject path replacement"),
+        move || {
+            fs::rename(&source_for_hook, &displaced_for_hook).unwrap();
+            symlink(&replacement_for_hook, &source_for_hook).unwrap();
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(CheckpointAdminError::ResetSourceChanged { .. })
+    ));
+    assert_eq!(fs::read(wal_path).unwrap(), before);
+    assert!(displaced.is_file());
+}
+
+/// Scenario: reset-to-end is directed at a FIFO and another nonregular
+/// object under no-follow policy.
+/// Guarantees: nonblocking handle validation rejects both special objects
+/// without waiting for a writer and without appending to the WAL.
+#[cfg(unix)]
+#[test]
+fn reset_to_end_rejects_fifo_and_nonregular_sources_without_append() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.log");
+    let fifo = root.path().join("source.fifo");
+    fs::write(&source, vec![b'f'; 72]).unwrap();
+    make_fifo(&fifo);
+    let store_options = options(&root.path().join("state"), "fifo-source");
+    let _ = seed_quarantined_source(
+        &store_options,
+        &source,
+        12,
+        0,
+        FramingResume::Clean,
+        AdvisoryPath::unavailable(),
+    );
+    let wal_path = store_options.namespace_dir.join(wal_file_name(0));
+    let before = fs::read(&wal_path).unwrap();
+    let mut session = CheckpointAdminSession::open(store_options).unwrap();
+
+    assert!(matches!(
+        session.reset_to_end(end_request(12, 1, &fifo, false, "fifo")),
+        Err(CheckpointAdminError::ResetSourceNotRegular { .. })
+    ));
+    assert_eq!(fs::read(wal_path).unwrap(), before);
+}
+
+/// Scenario: a populated generation 1, a retained generation 0, and a
+/// recognized generation-9 temporary artifact are reset after keep-failed
+/// converts the session to append mode.
+/// Guarantees: a verified new backup is required, generation 10 is
+/// published empty, every old artifact remains as evidence, the same lock is
+/// retained, the live session switches authority, and restart selects 10.
+#[test]
+fn namespace_reset_backs_up_and_publishes_above_every_recognized_generation() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.log");
+    fs::write(&source, vec![b'r'; 96]).unwrap();
+    let store_options = options(&root.path().join("state"), "namespace-reset");
+    let _ = seed_quarantined_source(
+        &store_options,
+        &source,
+        13,
+        0,
+        FramingResume::Clean,
+        AdvisoryPath::unavailable(),
+    );
+    let mut store = CheckpointStore::open(store_options.clone()).unwrap();
+    store.compact().unwrap();
+    assert_eq!(store.generation(), 1);
+    drop(store);
+    let future_temp = store_options
+        .namespace_dir
+        .join(temp_file_name(&wal_file_name(9)));
+    fs::write(&future_temp, b"recognized future evidence").unwrap();
+    let old_names = directory_names(&store_options.namespace_dir);
+
+    let mut session = CheckpointAdminSession::open(store_options.clone()).unwrap();
+    let _ = session
+        .keep_failed(keep_request(13, 1, "confirm still blocked"))
+        .unwrap();
+    let backup = root.path().join("reset-evidence");
+    let result = session
+        .reset_namespace(NamespaceResetRequest {
+            backup_destination: backup.clone(),
+            consequence: NamespaceResetConsequence::AcknowledgeDuplicatePossible,
+            audit: mutation_audit("discard complete namespace", 6_000),
+        })
+        .unwrap();
+    assert_eq!(result.reset_report.old_generation, Some(1));
+    assert_eq!(result.reset_report.new_generation, 10);
+    assert_eq!(
+        result.reset_report.retained_evidence_generations,
+        vec![0, 1, 9]
+    );
+    assert_eq!(
+        result.reset_report.data_effect,
+        DataEffect::DuplicatePossible
+    );
+    assert_eq!(result.reset_report.old_tracked_file_count, Some(1));
+    assert_eq!(result.reset_report.old_quarantine_count, Some(1));
+    assert_eq!(result.reset_report.new_tracked_file_count, 0);
+    assert_eq!(result.reset_report.new_quarantine_count, 0);
+    assert_eq!(session.validation().selected_generation, 10);
+    assert_eq!(session.validation().tracked_file_count, 0);
+    assert_eq!(
+        serde_json::from_slice::<NamespaceResetResult>(&serde_json::to_vec(&result).unwrap())
+            .unwrap(),
+        result
+    );
+    for old_name in old_names {
+        assert!(
+            store_options.namespace_dir.join(old_name).exists(),
+            "pre-reset artifact was removed"
+        );
+    }
+    assert!(future_temp.exists());
+    assert!(
+        store_options
+            .namespace_dir
+            .join(snapshot_file_name(10))
+            .is_file()
+    );
+    assert!(
+        store_options
+            .namespace_dir
+            .join(wal_file_name(10))
+            .is_file()
+    );
+    assert!(backup.join(EVIDENCE_BACKUP_MANIFEST_FILE_NAME).is_file());
+    assert!(matches!(
+        CheckpointStore::open(store_options.clone()),
+        Err(StoreError::NamespaceLocked { .. })
+    ));
+    session.release().unwrap();
+
+    let reopened = CheckpointStore::open(store_options).unwrap();
+    assert_eq!(reopened.generation(), 10);
+    assert!(reopened.table().is_empty());
+}
+
+/// Scenario: an untouched read-only administration session resets an empty
+/// generation 0 namespace with explicit loss acknowledgement.
+/// Guarantees: the non-append session path publishes generation 1, updates
+/// its live inspection to the new empty authority, and returns the verified
+/// backup and loss consequence before releasing the retained lock.
+#[test]
+fn namespace_reset_from_read_only_session_updates_live_authority() {
+    let root = tempfile::tempdir().unwrap();
+    let store_options = options(&root.path().join("state"), "read-only-reset");
+    drop(CheckpointStore::open(store_options.clone()).unwrap());
+
+    let mut session = CheckpointAdminSession::open(store_options.clone()).unwrap();
+    let result = session
+        .reset_namespace(NamespaceResetRequest {
+            backup_destination: root.path().join("read-only-reset-evidence"),
+            consequence: NamespaceResetConsequence::AcknowledgeLossAccepted,
+            audit: mutation_audit("replace empty authority", 8_000),
+        })
+        .unwrap();
+    assert_eq!(result.reset_report.old_generation, Some(0));
+    assert_eq!(result.reset_report.new_generation, 1);
+    assert_eq!(result.reset_report.data_effect, DataEffect::LossAccepted);
+    assert_eq!(session.validation().selected_generation, 1);
+    assert_eq!(session.validation().tracked_file_count, 0);
+    assert!(matches!(
+        CheckpointStore::open(store_options.clone()),
+        Err(StoreError::NamespaceLocked { .. })
+    ));
+    session.release().unwrap();
+
+    let reopened = CheckpointStore::open(store_options).unwrap();
+    assert_eq!(reopened.generation(), 1);
+    assert!(reopened.table().is_empty());
+}
+
+/// Scenario: whole-namespace reset is given an existing backup destination,
+/// an empty audit reason, a recognized u64::MAX generation artifact, and a
+/// full bounded final-generation inventory.
+/// Guarantees: backup creation and explicit audit are hard preconditions,
+/// generation arithmetic and recoverable generation count are checked, and
+/// none of the failures repoints CURRENT or appends to the authoritative WAL.
+#[test]
+fn namespace_reset_requires_new_backup_audit_and_nonoverflowing_generation() {
+    let root = tempfile::tempdir().unwrap();
+    let store_options = options(&root.path().join("state"), "reset-preconditions");
+    drop(CheckpointStore::open(store_options.clone()).unwrap());
+    let current_path = store_options.namespace_dir.join(CURRENT_FILE_NAME);
+    let current_before = fs::read(&current_path).unwrap();
+    let wal_path = store_options.namespace_dir.join(wal_file_name(0));
+    let wal_before = fs::read(&wal_path).unwrap();
+    let existing_backup = root.path().join("existing-backup");
+    fs::create_dir(&existing_backup).unwrap();
+
+    let mut session = CheckpointAdminSession::open(store_options.clone()).unwrap();
+    assert!(matches!(
+        session.reset_namespace(NamespaceResetRequest {
+            backup_destination: existing_backup,
+            consequence: NamespaceResetConsequence::AcknowledgeLossAccepted,
+            audit: mutation_audit("reset", 1),
+        }),
+        Err(CheckpointAdminError::BackupDestinationExists { .. })
+    ));
+    assert!(matches!(
+        session.reset_namespace(NamespaceResetRequest {
+            backup_destination: root.path().join("empty-audit-backup"),
+            consequence: NamespaceResetConsequence::AcknowledgeLossAccepted,
+            audit: mutation_audit("", 1),
+        }),
+        Err(CheckpointAdminError::AuditReasonRequired { .. })
+    ));
+    let max_artifact = store_options
+        .namespace_dir
+        .join(temp_file_name(&wal_file_name(u64::MAX)));
+    fs::write(&max_artifact, b"max generation evidence").unwrap();
+    let overflow_backup = root.path().join("overflow-backup");
+    assert!(matches!(
+        session.reset_namespace(NamespaceResetRequest {
+            backup_destination: overflow_backup.clone(),
+            consequence: NamespaceResetConsequence::AcknowledgeLossAccepted,
+            audit: mutation_audit("overflow check", 2),
+        }),
+        Err(CheckpointAdminError::Store(
+            StoreError::GenerationOverflow {
+                generation: u64::MAX
+            }
+        ))
+    ));
+    assert!(!overflow_backup.exists());
+    fs::remove_file(max_artifact).unwrap();
+    for generation in [1, 2] {
+        fs::write(
+            store_options
+                .namespace_dir
+                .join(snapshot_file_name(generation)),
+            b"retained snapshot evidence",
+        )
+        .unwrap();
+        fs::write(
+            store_options.namespace_dir.join(wal_file_name(generation)),
+            b"retained WAL evidence",
+        )
+        .unwrap();
+    }
+    let capacity_backup = root.path().join("generation-capacity-backup");
+    assert!(matches!(
+        session.reset_namespace(NamespaceResetRequest {
+            backup_destination: capacity_backup.clone(),
+            consequence: NamespaceResetConsequence::AcknowledgeLossAccepted,
+            audit: mutation_audit("bounded generation inventory", 3),
+        }),
+        Err(CheckpointAdminError::NamespaceResetGenerationCapacity {
+            generations: MAX_GENERATIONS_ON_DISK,
+            max: MAX_GENERATIONS_ON_DISK,
+        })
+    ));
+    assert!(!capacity_backup.exists());
+    assert_eq!(fs::read(current_path).unwrap(), current_before);
+    assert_eq!(fs::read(wal_path).unwrap(), wal_before);
+}
+
+/// Scenario: a structurally complete authoritative WAL has a corrupted
+/// transaction checksum, so ordinary administration and runtime recovery
+/// both fail closed.
+/// Guarantees: the namespace-reset session retains exclusive ownership,
+/// records the selected-generation validation failure, backs up the exact
+/// corrupt bytes, and publishes only a higher complete empty authority.
+#[test]
+fn corrupt_namespace_can_be_backed_up_and_reset_without_salvage() {
+    let root = tempfile::tempdir().unwrap();
+    let store_options = options(&root.path().join("state"), "corrupt-reset");
+    let mut store = CheckpointStore::open(store_options.clone()).unwrap();
+    let _ = store
+        .register_files(vec![registration(31, AdvisoryPath::unavailable())])
+        .unwrap();
+    drop(store);
+
+    let wal_path = store_options.namespace_dir.join(wal_file_name(0));
+    let mut corrupt_wal = fs::read(&wal_path).unwrap();
+    let last = corrupt_wal.last_mut().unwrap();
+    *last ^= 0x80;
+    fs::write(&wal_path, &corrupt_wal).unwrap();
+    assert!(CheckpointAdminSession::open(store_options.clone()).is_err());
+
+    let mut session = CheckpointNamespaceResetSession::open(store_options.clone()).unwrap();
+    assert!(matches!(
+        session.authority(),
+        NamespaceAuthorityReport::Invalid {
+            failure: NamespaceAuthorityFailureReport {
+                kind: NamespaceAuthorityFailureKind::SelectedGenerationInvalid,
+                selected_generation: Some(0),
+                detail_truncated: false,
+                ..
+            }
+        }
+    ));
+    assert!(matches!(
+        CheckpointStore::open(store_options.clone()),
+        Err(StoreError::NamespaceLocked { .. })
+    ));
+
+    let backup = root.path().join("corrupt-evidence");
+    let result = session
+        .reset_namespace(NamespaceResetRequest {
+            backup_destination: backup.clone(),
+            consequence: NamespaceResetConsequence::AcknowledgeDuplicatePossible,
+            audit: mutation_audit("discard corrupt authority", 9_000),
+        })
+        .unwrap();
+    assert!(matches!(
+        &result.backup_manifest.authority,
+        NamespaceAuthorityReport::Invalid {
+            failure: NamespaceAuthorityFailureReport {
+                kind: NamespaceAuthorityFailureKind::SelectedGenerationInvalid,
+                selected_generation: Some(0),
+                ..
+            }
+        }
+    ));
+    assert_eq!(
+        fs::read(backup.join(wal_file_name(0))).unwrap(),
+        corrupt_wal
+    );
+    assert_eq!(result.reset_report.old_generation, Some(0));
+    assert_eq!(result.reset_report.old_tracked_file_count, None);
+    assert_eq!(result.reset_report.old_quarantine_count, None);
+    assert_eq!(result.reset_report.new_generation, 1);
+    assert_eq!(result.reset_report.retained_evidence_generations, vec![0]);
+    assert!(matches!(
+        session.authority(),
+        NamespaceAuthorityReport::Valid { validation }
+            if validation.selected_generation == 1 && validation.tracked_file_count == 0
+    ));
+    session.release().unwrap();
+
+    let reopened = CheckpointStore::open(store_options).unwrap();
+    assert_eq!(reopened.generation(), 1);
+    assert!(reopened.table().is_empty());
+}
+
+/// Scenario: durable generation zero contains state but its authoritative
+/// `CURRENT` marker is missing.
+/// Guarantees: the namespace-reset session reports the authority gap,
+/// preserves every surviving recognized artifact without inventing a
+/// selected generation, and publishes a higher complete empty authority.
+#[test]
+fn missing_current_namespace_can_be_backed_up_and_reset() {
+    let root = tempfile::tempdir().unwrap();
+    let store_options = options(&root.path().join("state"), "missing-current-reset");
+    let mut store = CheckpointStore::open(store_options.clone()).unwrap();
+    let _ = store
+        .register_files(vec![registration(32, AdvisoryPath::unavailable())])
+        .unwrap();
+    drop(store);
+    fs::remove_file(store_options.namespace_dir.join(CURRENT_FILE_NAME)).unwrap();
+    assert!(CheckpointAdminSession::open(store_options.clone()).is_err());
+
+    let mut session = CheckpointNamespaceResetSession::open(store_options.clone()).unwrap();
+    assert!(matches!(
+        session.authority(),
+        NamespaceAuthorityReport::Invalid {
+            failure: NamespaceAuthorityFailureReport {
+                kind: NamespaceAuthorityFailureKind::MissingCurrent,
+                selected_generation: None,
+                ..
+            }
+        }
+    ));
+    let backup = root.path().join("missing-current-evidence");
+    let result = session
+        .reset_namespace(NamespaceResetRequest {
+            backup_destination: backup.clone(),
+            consequence: NamespaceResetConsequence::AcknowledgeLossAccepted,
+            audit: mutation_audit("replace authority gap", 10_000),
+        })
+        .unwrap();
+    assert_eq!(result.reset_report.old_generation, None);
+    assert_eq!(result.reset_report.new_generation, 1);
+    assert!(
+        !result
+            .backup_manifest
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.role == EvidenceArtifactRole::Current)
+    );
+    assert!(backup.join(snapshot_file_name(0)).is_file());
+    assert!(backup.join(wal_file_name(0)).is_file());
+    assert!(!backup.join(CURRENT_FILE_NAME).exists());
+    session.release().unwrap();
+
+    let reopened = CheckpointStore::open(store_options).unwrap();
+    assert_eq!(reopened.generation(), 1);
+    assert!(reopened.table().is_empty());
+}
+
+/// Scenario: valid `CURRENT` bytes name a missing generation above every
+/// surviving recognized artifact.
+/// Guarantees: recovery records the decoded generation, publishes strictly
+/// above it, and reports only generations with actual retained artifacts as
+/// evidence.
+#[test]
+fn missing_selected_generation_reset_stays_monotonic_without_invented_evidence() {
+    let root = tempfile::tempdir().unwrap();
+    let store_options = options(&root.path().join("state"), "missing-selected-reset");
+    drop(CheckpointStore::open(store_options.clone()).unwrap());
+    fs::write(
+        store_options.namespace_dir.join(CURRENT_FILE_NAME),
+        encode_current_marker(99),
+    )
+    .unwrap();
+
+    let mut session = CheckpointNamespaceResetSession::open(store_options.clone()).unwrap();
+    assert!(matches!(
+        session.authority(),
+        NamespaceAuthorityReport::Invalid {
+            failure: NamespaceAuthorityFailureReport {
+                kind: NamespaceAuthorityFailureKind::SelectedGenerationInvalid,
+                selected_generation: Some(99),
+                ..
+            }
+        }
+    ));
+    let result = session
+        .reset_namespace(NamespaceResetRequest {
+            backup_destination: root.path().join("missing-selected-evidence"),
+            consequence: NamespaceResetConsequence::AcknowledgeDuplicatePossible,
+            audit: mutation_audit("replace missing selected generation", 11_000),
+        })
+        .unwrap();
+    assert_eq!(result.reset_report.old_generation, Some(99));
+    assert_eq!(result.reset_report.new_generation, 100);
+    assert_eq!(result.reset_report.retained_evidence_generations, vec![0]);
+    session.release().unwrap();
+
+    let reopened = CheckpointStore::open(store_options).unwrap();
+    assert_eq!(reopened.generation(), 100);
+    assert!(reopened.table().is_empty());
+}
+
+/// Scenario: whole-namespace reset fails at each snapshot, WAL, marker, and
+/// directory-sync publication boundary.
+/// Guarantees: reopening selects generation 1 with the complete old table or
+/// generation 2 with the complete new empty table, never retained generation
+/// 0 or a mixed pair; marker-uncertain live sessions refuse further work.
+#[test]
+fn namespace_reset_faults_recover_only_old_or_new_complete_authority() {
+    for point in FaultPoint::PUBLICATION {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.log");
+        fs::write(&source, vec![b'p'; 96]).unwrap();
+        let store_options = options(
+            &root.path().join("state"),
+            &format!("reset-fault-{}", point.as_str()),
+        );
+        let _ = seed_quarantined_source(
+            &store_options,
+            &source,
+            14,
+            0,
+            FramingResume::Clean,
+            AdvisoryPath::unavailable(),
+        );
+        let mut store = CheckpointStore::open(store_options.clone()).unwrap();
+        store.compact().unwrap();
+        assert_eq!(store.generation(), 1);
+        drop(store);
+
+        let mut session =
+            CheckpointAdminSession::open_with_fault(store_options.clone(), point).unwrap();
+        let error = session
+            .reset_namespace(NamespaceResetRequest {
+                backup_destination: root.path().join("fault-evidence"),
+                consequence: NamespaceResetConsequence::AcknowledgeDuplicatePossible,
+                audit: mutation_audit("fault injection", 7_000),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                CheckpointAdminError::Store(StoreError::InjectedFault { point: fired })
+                    if fired == point
+            ),
+            "unexpected reset fault at {point}: {error:?}"
+        );
+        assert!(matches!(
+            CheckpointStore::open(store_options.clone()),
+            Err(StoreError::NamespaceLocked { .. })
+        ));
+        let marker_changed = matches!(
+            point,
+            FaultPoint::AfterMarkerPublish
+                | FaultPoint::BeforeMarkerDirSync
+                | FaultPoint::AfterMarkerDirSync
+        );
+        if marker_changed {
+            assert!(matches!(
+                session.backup(root.path().join("must-reopen")),
+                Err(CheckpointAdminError::Store(StoreError::Unusable { .. }))
+            ));
+        }
+        session.release().unwrap();
+
+        let reopened = CheckpointStore::open(store_options).unwrap();
+        assert_eq!(
+            reopened.generation(),
+            if marker_changed { 2 } else { 1 },
+            "wrong authority after reset fault at {point}"
+        );
+        assert_eq!(
+            reopened.table().len(),
+            if marker_changed { 0 } else { 1 },
+            "mixed or rolled-back table after reset fault at {point}"
+        );
+        assert_ne!(reopened.generation(), 0);
+    }
+}
+
+/// Scenario: reset of a corrupt selected generation fails at each
+/// publication boundary.
+/// Guarantees: failures before `CURRENT` replacement leave the corrupt old
+/// authority selected, failures after replacement select the complete new
+/// empty authority, and marker-uncertain sessions refuse further work.
+#[test]
+fn corrupt_namespace_reset_faults_never_publish_mixed_authority() {
+    for point in FaultPoint::PUBLICATION {
+        let root = tempfile::tempdir().unwrap();
+        let store_options = options(
+            &root.path().join("state"),
+            &format!("corrupt-reset-fault-{}", point.as_str()),
+        );
+        let mut store = CheckpointStore::open(store_options.clone()).unwrap();
+        let _ = store
+            .register_files(vec![registration(41, AdvisoryPath::unavailable())])
+            .unwrap();
+        drop(store);
+        let wal_path = store_options.namespace_dir.join(wal_file_name(0));
+        let mut bytes = fs::read(&wal_path).unwrap();
+        *bytes.last_mut().unwrap() ^= 0x40;
+        fs::write(&wal_path, bytes).unwrap();
+
+        let mut session =
+            CheckpointNamespaceResetSession::open_with_fault(store_options.clone(), point).unwrap();
+        let error = session
+            .reset_namespace(NamespaceResetRequest {
+                backup_destination: root.path().join("fault-evidence"),
+                consequence: NamespaceResetConsequence::AcknowledgeDuplicatePossible,
+                audit: mutation_audit("fault corrupt reset", 12_000),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                CheckpointAdminError::Store(StoreError::InjectedFault { point: fired })
+                    if fired == point
+            ),
+            "unexpected corrupt reset fault at {point}: {error:?}"
+        );
+        let marker_changed = matches!(
+            point,
+            FaultPoint::AfterMarkerPublish
+                | FaultPoint::BeforeMarkerDirSync
+                | FaultPoint::AfterMarkerDirSync
+        );
+        if marker_changed {
+            assert!(matches!(
+                session.backup(root.path().join("must-reopen")),
+                Err(CheckpointAdminError::Store(StoreError::Unusable { .. }))
+            ));
+        }
+        session.release().unwrap();
+
+        let reopened = CheckpointStore::open(store_options);
+        if marker_changed {
+            let reopened = reopened.unwrap();
+            assert_eq!(reopened.generation(), 1);
+            assert!(reopened.table().is_empty());
+        } else {
+            assert!(reopened.is_err());
+        }
+    }
+}
+
+/// Scenario: a corrupt namespace already retains two final generations, and
+/// a reset fails after publishing the empty snapshot for the only remaining
+/// bounded generation slot.
+/// Guarantees: a fresh reset session verifies and resumes that higher empty
+/// staging generation after a new evidence backup instead of exceeding the
+/// generation bound or becoming permanently unable to recover.
+#[test]
+fn corrupt_namespace_reset_resumes_empty_staging_at_generation_capacity() {
+    let root = tempfile::tempdir().unwrap();
+    let store_options = options(&root.path().join("state"), "resume-reset-staging");
+    let mut store = CheckpointStore::open(store_options.clone()).unwrap();
+    let _ = store
+        .register_files(vec![registration(51, AdvisoryPath::unavailable())])
+        .unwrap();
+    store.compact().unwrap();
+    assert_eq!(store.generation(), 1);
+    drop(store);
+    let wal_path = store_options.namespace_dir.join(wal_file_name(1));
+    let mut bytes = fs::read(&wal_path).unwrap();
+    *bytes.last_mut().unwrap() ^= 0x20;
+    fs::write(&wal_path, bytes).unwrap();
+
+    let mut interrupted = CheckpointNamespaceResetSession::open_with_fault(
+        store_options.clone(),
+        FaultPoint::AfterSnapshotPublish,
+    )
+    .unwrap();
+    assert!(matches!(
+        interrupted.reset_namespace(NamespaceResetRequest {
+            backup_destination: root.path().join("first-reset-evidence"),
+            consequence: NamespaceResetConsequence::AcknowledgeDuplicatePossible,
+            audit: mutation_audit("first reset attempt", 13_000),
+        }),
+        Err(CheckpointAdminError::Store(StoreError::InjectedFault {
+            point: FaultPoint::AfterSnapshotPublish,
+        }))
+    ));
+    interrupted.release().unwrap();
+    assert!(
+        store_options
+            .namespace_dir
+            .join(snapshot_file_name(2))
+            .is_file()
+    );
+    assert!(!store_options.namespace_dir.join(wal_file_name(2)).is_file());
+
+    let mut resumed = CheckpointNamespaceResetSession::open(store_options.clone()).unwrap();
+    let result = resumed
+        .reset_namespace(NamespaceResetRequest {
+            backup_destination: root.path().join("resumed-reset-evidence"),
+            consequence: NamespaceResetConsequence::AcknowledgeDuplicatePossible,
+            audit: mutation_audit("resume reset staging", 14_000),
+        })
+        .unwrap();
+    assert_eq!(result.reset_report.new_generation, 2);
+    assert_eq!(
+        result.reset_report.retained_evidence_generations,
+        vec![0, 1, 2]
+    );
+    resumed.release().unwrap();
+
+    let reopened = CheckpointStore::open(store_options).unwrap();
+    assert_eq!(reopened.generation(), 2);
+    assert!(reopened.table().is_empty());
 }

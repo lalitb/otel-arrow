@@ -1,15 +1,18 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Exclusive, non-mutating administration for one existing checkpoint
-//! namespace.
+//! Exclusive administration for one existing checkpoint namespace.
 //!
-//! Opening a session validates the exact version-1 namespace path and raw ID,
-//! requires an existing namespace, ownership lock, and `CURRENT`, acquires the
-//! runtime's exclusive operating-system lock, and reuses the store's bounded
-//! snapshot/WAL recovery decoder without its repair steps. The session never
-//! creates source artifacts, changes permissions, truncates a torn WAL tail,
-//! adopts markers, publishes generations, or opens a WAL for append.
+//! Both session types validate the exact version-1 namespace path and raw ID,
+//! require an existing namespace and ownership lock, and acquire the runtime's
+//! exclusive operating-system lock. [`CheckpointAdminSession`] requires a
+//! valid `CURRENT` authority for inspection and per-file mutations.
+//! [`CheckpointNamespaceResetSession`] retains bounded validation failure
+//! evidence when authority is corrupt or missing and exposes only backup and
+//! whole-namespace reset. Read-only inspection and backup preserve source
+//! artifacts byte-for-byte. Explicit mutations construct audited WAL
+//! operations internally or publish a strictly newer empty generation only
+//! after a verified evidence backup.
 
 use std::collections::BTreeSet;
 use std::fs::OpenOptions;
@@ -22,8 +25,15 @@ use sha2::{Digest, Sha256};
 use super::current_marker::decode_current_marker;
 use super::error::EncodeError;
 use super::namespace::{CheckpointNamespace, CheckpointNamespaceError};
-use super::primitives::{AdvisoryPath, AdvisoryPathKind, FramingResume, LifecycleState};
+use super::primitives::{
+    AUDIT_REASON_MAX_BYTES, AdvisoryPath, AdvisoryPathKind, CommittedFrontierGuard, FileId,
+    FramingResume, LifecycleState, REASON_CODE_RESERVED,
+};
+use super::snapshot::{SnapshotRecord, encode_snapshot};
 use super::store::error::StoreError;
+use super::store::fault::FaultPlan;
+#[cfg(test)]
+use super::store::fault::FaultPoint;
 use super::store::fsio;
 use super::store::layout::{
     self, ArtifactForm, CURRENT_FILE_NAME, MAX_GENERATIONS_ON_DISK, MAX_TEMP_FILES,
@@ -32,14 +42,19 @@ use super::store::layout::{
 };
 use super::store::limits::StoreLimits;
 use super::store::lock::NamespaceLock;
-use super::store::{CheckpointStore, MARKER_READ_MAX_BYTES, StoreOptions};
+use super::store::{CheckpointStore, LoadedGeneration, MARKER_READ_MAX_BYTES, StoreOptions};
+use super::wal::{Operation, RemoveFile, ResetQuarantineAction, ResetQuarantinedFile, encode_wal};
+use crate::receivers::filelog_receiver::identity::IdentityError;
+use crate::receivers::filelog_receiver::identity::platform::{StableEofEvidence, open_stable_eof};
 
 /// File name of the machine-readable evidence-backup manifest.
 pub const EVIDENCE_BACKUP_MANIFEST_FILE_NAME: &str = "manifest.json";
 /// Version of the evidence-backup manifest schema.
 pub const EVIDENCE_BACKUP_MANIFEST_VERSION: u16 = 1;
+/// Maximum UTF-8 bytes retained from one authority-validation failure.
+pub const NAMESPACE_VALIDATION_DETAIL_MAX_BYTES: usize = 4_096;
 
-/// A read-only administration or evidence-backup failure.
+/// An administration, mutation, or evidence-backup failure.
 #[derive(Debug, thiserror::Error)]
 pub enum CheckpointAdminError {
     /// The raw checkpoint namespace ID violated the shared namespace
@@ -151,6 +166,155 @@ pub enum CheckpointAdminError {
         /// Required byte-for-byte canonical ASCII file name.
         canonical_name: String,
     },
+    /// A caller-supplied file ID was not exactly 32 lowercase hexadecimal
+    /// characters.
+    #[error("checkpoint file_id must be exactly 32 lowercase hexadecimal characters")]
+    InvalidFileId,
+    /// A mutation's audit reason was empty.
+    #[error("checkpoint administrative {operation} requires a non-empty audit reason")]
+    AuditReasonRequired {
+        /// Administrative operation that was refused.
+        operation: &'static str,
+    },
+    /// A mutation's audit reason exceeded the checkpoint-format bound.
+    #[error(
+        "checkpoint administrative {operation} audit reason is {len} bytes, exceeding the \
+         {max}-byte maximum"
+    )]
+    AuditReasonTooLong {
+        /// Administrative operation that was refused.
+        operation: &'static str,
+        /// Actual UTF-8 byte length.
+        len: usize,
+        /// Checkpoint-format maximum.
+        max: usize,
+    },
+    /// The exact requested file ID is absent from the locked authority.
+    #[error("checkpoint file {file_id} is absent from the locked namespace")]
+    FileNotFound {
+        /// Lowercase-hex file ID.
+        file_id: String,
+    },
+    /// A quarantine-only mutation found another lifecycle state.
+    #[error("checkpoint file {file_id} must be quarantined for {operation}, but is {state:?}")]
+    ExpectedQuarantine {
+        /// Administrative operation that was refused.
+        operation: &'static str,
+        /// Lowercase-hex file ID.
+        file_id: String,
+        /// Locked current lifecycle.
+        state: CheckpointLifecycleReport,
+    },
+    /// The supplied quarantine epoch was stale.
+    #[error(
+        "checkpoint file {file_id} quarantine epoch mismatch: expected {expected}, current {actual}"
+    )]
+    QuarantineEpochMismatch {
+        /// Lowercase-hex file ID.
+        file_id: String,
+        /// Caller-supplied epoch.
+        expected: u32,
+        /// Locked current quarantine epoch.
+        actual: u32,
+    },
+    /// Incrementing a quarantined file epoch would overflow.
+    #[error("checkpoint file {file_id} epoch {epoch} cannot be incremented")]
+    FileEpochOverflow {
+        /// Lowercase-hex file ID.
+        file_id: String,
+        /// Current quarantine epoch.
+        epoch: u32,
+    },
+    /// The selected generation changed while this exclusive session was
+    /// live.
+    #[error(
+        "checkpoint authority changed while locked: expected generation {expected}, found {found}"
+    )]
+    AuthorityChanged {
+        /// Generation held by the live session.
+        expected: u64,
+        /// Generation read from `CURRENT`.
+        found: u64,
+    },
+    /// The authoritative table or WAL sequence changed behind the retained
+    /// lock.
+    #[error("checkpoint authority state changed while the administration lock was retained")]
+    AuthorityStateChanged,
+    /// Reset-to-end could not open or read the exact operator-supplied path.
+    #[error("failed to {operation} at reset-to-end source {path}: {source}")]
+    ResetSourceIo {
+        /// Source operation.
+        operation: &'static str,
+        /// Exact operator-supplied path.
+        path: PathBuf,
+        /// Underlying operating-system error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// Reset-to-end reached a nonregular object.
+    #[error("reset-to-end source is not a regular file: {path}")]
+    ResetSourceNotRegular {
+        /// Exact operator-supplied path.
+        path: PathBuf,
+    },
+    /// Reset-to-end refused a symlink or Windows reparse point under
+    /// no-follow policy.
+    #[error("reset-to-end source is a symlink or reparse point: {path}")]
+    ResetSourceSymlinkOrReparse {
+        /// Exact operator-supplied path.
+        path: PathBuf,
+    },
+    /// Reset-to-end opened a locator other than the immutable quarantine
+    /// locator.
+    #[error("reset-to-end source locator does not match quarantined file {file_id}")]
+    ResetSourceLocatorMismatch {
+        /// Lowercase-hex checkpoint file ID.
+        file_id: String,
+        /// Immutable locator held in quarantine.
+        expected: LocatorReport,
+        /// Locator reached through the supplied path.
+        found: LocatorReport,
+    },
+    /// Reset-to-end evidence changed while its bounded sample was read.
+    #[error("reset-to-end source changed while EOF evidence was sampled: {path}")]
+    ResetSourceChanged {
+        /// Exact operator-supplied path.
+        path: PathBuf,
+    },
+    /// Reset-to-end is unsupported on the current target.
+    #[error("reset-to-end source identity is unsupported on this platform: {path}")]
+    ResetSourceUnsupported {
+        /// Exact operator-supplied path.
+        path: PathBuf,
+    },
+    /// An unexpected identity-layer validation failure occurred.
+    #[error("reset-to-end source validation failed at {path}: {reason}")]
+    ResetSourceValidation {
+        /// Exact operator-supplied path.
+        path: PathBuf,
+        /// Bounded diagnostic category.
+        reason: &'static str,
+    },
+    /// A freshly written backup no longer matches its manifest or source.
+    #[error("checkpoint evidence backup verification failed at {path}: {reason}")]
+    BackupVerification {
+        /// Backup or source path involved.
+        path: PathBuf,
+        /// Exact bounded verification failure.
+        reason: &'static str,
+    },
+    /// Retaining every recognized final generation while adding a new one
+    /// would exceed the store's bounded recovery inventory.
+    #[error(
+        "checkpoint namespace reset cannot retain {generations} final generations and add one \
+         more; the recovery maximum is {max}"
+    )]
+    NamespaceResetGenerationCapacity {
+        /// Distinct recognized final generations before reset.
+        generations: usize,
+        /// Maximum final generations recovery can inventory.
+        max: usize,
+    },
 }
 
 /// Native path encoding used by bounded administration reports.
@@ -200,6 +364,54 @@ pub struct NamespaceValidationReport {
     pub torn_wal_tail_bytes: u64,
     /// Other recognized final generation numbers present in the namespace.
     pub retired_generations: Vec<u64>,
+}
+
+/// Bounded category for an invalid checkpoint namespace authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NamespaceAuthorityFailureKind {
+    /// The canonical `CURRENT` marker is absent.
+    MissingCurrent,
+    /// The canonical `CURRENT` marker could not be safely read.
+    CurrentUnreadable,
+    /// The canonical `CURRENT` marker bytes are invalid.
+    CurrentInvalid,
+    /// The generation named by `CURRENT` is absent, corrupt, or incompatible.
+    SelectedGenerationInvalid,
+    /// The bounded recognized-generation inventory is invalid.
+    GenerationInventoryInvalid,
+    /// A validated authority could not be represented in the report schema.
+    ReportInvalid,
+}
+
+/// Bounded validation failure retained in inspection and evidence backup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceAuthorityFailureReport {
+    /// Stable failure category.
+    pub kind: NamespaceAuthorityFailureKind,
+    /// Generation decoded from `CURRENT`, when that decoding succeeded.
+    pub selected_generation: Option<u64>,
+    /// Bounded human-readable detail from the exact failed validation.
+    pub detail: String,
+    /// Whether `detail` was shortened to its documented bound.
+    pub detail_truncated: bool,
+}
+
+/// Result of validating the namespace authority under exclusive ownership.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum NamespaceAuthorityReport {
+    /// `CURRENT` and its selected snapshot/WAL pair decoded completely.
+    Valid {
+        /// Complete bounded authority validation.
+        validation: NamespaceValidationReport,
+    },
+    /// Authority is missing, corrupt, incompatible, or otherwise invalid.
+    Invalid {
+        /// Bounded failure evidence. Raw artifacts remain available to a
+        /// separately verified evidence backup.
+        failure: NamespaceAuthorityFailureReport,
+    },
 }
 
 /// Serializable framing-resume evidence for a quarantined record.
@@ -351,53 +563,621 @@ pub struct EvidenceBackupManifest {
     /// Bounded native representation of the source namespace held under the
     /// retained exclusive lock.
     pub source_namespace: NativePathReport,
-    /// Generation selected by `CURRENT`.
-    pub selected_generation: u64,
     /// Copied recognized artifacts, ordered by file name.
     pub artifacts: Vec<EvidenceArtifact>,
-    /// Validation summary, including any allowed torn WAL tail.
-    pub validation: NamespaceValidationReport,
+    /// Valid authority summary or the bounded reason authority validation
+    /// failed.
+    pub authority: NamespaceAuthorityReport,
 }
 
-/// Exclusive read-only administration session for one existing namespace.
+/// Bounded audit metadata attached to one administrative mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditMetadata {
+    /// Nonempty operator-supplied reason, bounded by
+    /// `AUDIT_REASON_MAX_BYTES`.
+    pub reason: String,
+    /// Operator action time in Unix nanoseconds.
+    pub action_time_unix_nano: u64,
+}
+
+/// Compile-time restriction for APIs that only accept quarantined state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpectedQuarantineState {
+    /// The caller expects the locked record to remain quarantined.
+    Quarantined,
+}
+
+/// Exact optimistic-concurrency evidence for one quarantined record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuarantinedFileTarget {
+    /// Exactly 32 lowercase hexadecimal characters encoding 16 bytes.
+    pub file_id: String,
+    /// Explicit expected lifecycle.
+    pub expected_lifecycle: ExpectedQuarantineState,
+    /// Exact immutable quarantine epoch the caller inspected.
+    pub expected_quarantine_epoch: u32,
+}
+
+/// Request to release a quarantine at source offset zero.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResetToBeginningRequest {
+    /// Exact quarantined record and expected evidence.
+    pub target: QuarantinedFileTarget,
+    /// Bounded operator audit metadata.
+    pub audit: AuditMetadata,
+}
+
+/// Request to retain a quarantine while durably recording the decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeepFailedRequest {
+    /// Exact quarantined record and expected evidence.
+    pub target: QuarantinedFileTarget,
+    /// Bounded operator audit metadata.
+    pub audit: AuditMetadata,
+}
+
+/// Request to remove one exact quarantined record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoveQuarantinedRequest {
+    /// Exact quarantined record and expected evidence.
+    pub target: QuarantinedFileTarget,
+    /// Nonzero opaque removal reason persisted in the WAL.
+    pub removal_reason: u16,
+    /// Explicit acknowledgement that later registration may duplicate
+    /// already delivered bytes or exclude existing bytes.
+    pub consequence: RemovalConsequence,
+    /// Bounded operator audit metadata.
+    pub audit: AuditMetadata,
+}
+
+/// Explicit operator acknowledgement required for quarantine removal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemovalConsequence {
+    /// The operator accepts that later registration can either replay
+    /// previously delivered bytes or skip existing bytes.
+    AcknowledgeDuplicateOrLossPossible,
+}
+
+/// Request to release a quarantine at a handle-verified current EOF.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResetToEndRequest {
+    /// Exact quarantined record and expected evidence.
+    pub target: QuarantinedFileTarget,
+    /// Exact source path selected by the operator for this call.
+    pub source_path: PathBuf,
+    /// Whether the final path component may be a symlink or reparse point.
+    pub follow_symlinks: bool,
+    /// Bounded operator audit metadata.
+    pub audit: AuditMetadata,
+}
+
+/// Observable data consequence of one administrative mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DataEffect {
+    /// No operational checkpoint state changed.
+    None,
+    /// Previously delivered source bytes may be delivered again.
+    DuplicatePossible,
+    /// The operator explicitly accepted a possibility of excluding source
+    /// bytes.
+    LossAccepted,
+    /// The operator explicitly accepted that later registration may either
+    /// replay previously delivered bytes or exclude existing bytes.
+    DuplicateOrLossPossible,
+}
+
+/// Lifecycle value used by mutation reports, including record absence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointLifecycleReport {
+    /// No durable record exists.
+    Absent,
+    /// The durable record is active.
+    Active,
+    /// The durable record is rotation-finalized.
+    RotatedFinalized,
+    /// The durable record remains quarantined.
+    Quarantined,
+}
+
+/// Administrative per-file action recorded by a result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuarantineMutationAction {
+    /// Release at offset zero.
+    ResetToBeginning,
+    /// Release at sampled EOF.
+    ResetToEnd,
+    /// Retain quarantine and append only audit history.
+    KeepFailed,
+    /// Delete the matching quarantined record.
+    RemoveQuarantined,
+}
+
+/// Digest-only committed-frontier evidence safe for operator output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommittedFrontierGuardReport {
+    /// Raw-source window width covered by the digest.
+    pub window_len: u16,
+    /// Lowercase-hex SHA-256 digest. Raw source bytes are never exposed.
+    pub digest: String,
+}
+
+/// Bounded source evidence used by a successful reset-to-end.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResetToEndEvidenceReport {
+    /// Exact operator-supplied source path in bounded native encoding.
+    pub source_path: NativePathReport,
+    /// Explicit path-following policy used for the open.
+    pub follow_symlinks: bool,
+    /// Handle-derived locator matched against immutable quarantine state.
+    pub locator: LocatorReport,
+    /// Stable EOF committed by the reset.
+    pub eof_offset: u64,
+    /// Digest-only real trailing source evidence committed with EOF.
+    pub committed_frontier_guard: CommittedFrontierGuardReport,
+}
+
+/// Serializable result of one audited per-file mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileMutationResult {
+    /// Exact raw `checkpoint.id`.
+    pub namespace_id: String,
+    /// Exact version-1 namespace path in bounded native encoding.
+    pub namespace_path: NativePathReport,
+    /// Exact lowercase-hex file ID.
+    pub file_id: String,
+    /// Authoritative generation whose WAL carries the action.
+    pub generation: u64,
+    /// Administrative action that was durably applied.
+    pub action: QuarantineMutationAction,
+    /// Lifecycle before the action.
+    pub old_lifecycle: CheckpointLifecycleReport,
+    /// Lifecycle after the action.
+    pub new_lifecycle: CheckpointLifecycleReport,
+    /// File epoch before the action.
+    pub old_epoch: u32,
+    /// File epoch after the action, or `None` after removal.
+    pub new_epoch: Option<u32>,
+    /// Committed offset before the action.
+    pub old_offset: u64,
+    /// Committed offset after the action, or `None` after removal.
+    pub new_offset: Option<u64>,
+    /// Sequence of the synced WAL transaction carrying the action.
+    pub wal_sequence: u64,
+    /// Exact bounded audit metadata persisted by the action.
+    pub audit: AuditMetadata,
+    /// Classified data consequence.
+    pub data_effect: DataEffect,
+    /// Clear bounded explanation of the consequence.
+    pub consequence: String,
+    /// Handle-bound source evidence for reset-to-end only.
+    pub reset_to_end_evidence: Option<ResetToEndEvidenceReport>,
+}
+
+/// Explicit operator acknowledgement required for a whole-namespace reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NamespaceResetConsequence {
+    /// The operator accepts that rediscovered sources may replay data.
+    AcknowledgeDuplicatePossible,
+    /// The operator accepts that later registration policy may exclude data.
+    AcknowledgeLossAccepted,
+}
+
+/// Request to back up and replace the complete namespace authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceResetRequest {
+    /// New create-only evidence-backup destination.
+    pub backup_destination: PathBuf,
+    /// Explicit duplicate/loss acknowledgement.
+    pub consequence: NamespaceResetConsequence,
+    /// Bounded operator audit metadata.
+    pub audit: AuditMetadata,
+}
+
+/// Serializable report for a successful whole-namespace reset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceResetReport {
+    /// Exact raw `checkpoint.id`.
+    pub namespace_id: String,
+    /// Exact version-1 namespace path in bounded native encoding.
+    pub namespace_path: NativePathReport,
+    /// Canonical create-only backup destination in bounded native encoding.
+    pub backup_destination: NativePathReport,
+    /// Generation decoded from the pre-reset `CURRENT`, when its marker
+    /// bytes were valid.
+    pub old_generation: Option<u64>,
+    /// Strictly higher empty generation selected after reset.
+    pub new_generation: u64,
+    /// Records discarded from authority, when the old authority decoded.
+    pub old_tracked_file_count: Option<u64>,
+    /// Quarantines discarded from authority, when the old authority decoded.
+    pub old_quarantine_count: Option<u64>,
+    /// Empty authority record count.
+    pub new_tracked_file_count: u64,
+    /// Empty authority quarantine count.
+    pub new_quarantine_count: u64,
+    /// Every pre-reset generation represented by a recognized artifact and
+    /// retained as evidence.
+    pub retained_evidence_generations: Vec<u64>,
+    /// Bounded operator audit metadata.
+    pub audit: AuditMetadata,
+    /// Classified data consequence.
+    pub data_effect: DataEffect,
+    /// Clear bounded explanation of the consequence.
+    pub consequence: String,
+}
+
+/// Evidence manifest and authority report returned by one namespace reset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceResetResult {
+    /// Verified backup of all recognized pre-reset evidence.
+    pub backup_manifest: EvidenceBackupManifest,
+    /// Durable reset publication report.
+    pub reset_report: NamespaceResetReport,
+}
+
+/// Exclusive backup/reset session that remains operable when `CURRENT` or
+/// its selected generation is corrupt.
+///
+/// The session never permits per-file mutations because invalid authority
+/// cannot prove a file's current state or epoch. It can only preserve a
+/// bounded create-only evidence backup and publish a strictly higher empty
+/// generation.
+#[derive(Debug)]
+pub struct CheckpointNamespaceResetSession {
+    options: StoreOptions,
+    limits: StoreLimits,
+    namespace: fsio::DirectoryPathBinding,
+    lock: Option<NamespaceLock>,
+    faults: FaultPlan,
+    unusable: Option<&'static str>,
+    authority: NamespaceAuthorityReport,
+}
+
+/// Exclusive administration session for one existing namespace.
 #[derive(Debug)]
 pub struct CheckpointAdminSession {
     options: StoreOptions,
     limits: StoreLimits,
     namespace: fsio::DirectoryPathBinding,
-    lock: NamespaceLock,
+    lock: Option<NamespaceLock>,
+    loaded: Option<LoadedGeneration>,
+    store: Option<CheckpointStore>,
+    generation: u64,
+    retired_generations: Vec<u64>,
+    faults: FaultPlan,
+    unusable: Option<&'static str>,
     inspection: CheckpointInspectionReport,
+}
+
+#[derive(Debug)]
+struct LockedNamespace {
+    options: StoreOptions,
+    limits: StoreLimits,
+    namespace: fsio::DirectoryPathBinding,
+    lock: NamespaceLock,
+}
+
+fn open_locked_namespace(
+    mut options: StoreOptions,
+) -> Result<LockedNamespace, CheckpointAdminError> {
+    let namespace_suffix =
+        CheckpointNamespace::derive(Path::new(""), &options.namespace_id)?.into_directory();
+    if !options.namespace_dir.ends_with(&namespace_suffix) {
+        return Err(CheckpointAdminError::NamespacePathMismatch {
+            path: options.namespace_dir.clone(),
+            expected_suffix: namespace_suffix.clone(),
+        });
+    }
+    let limits = options.limits()?;
+    let namespace = fsio::DirectoryPathBinding::open_canonical(
+        &options.namespace_dir,
+        "resolve the existing checkpoint namespace directory",
+    )?;
+    options.namespace_dir = namespace.path().to_path_buf();
+    if !options.namespace_dir.ends_with(&namespace_suffix) {
+        return Err(CheckpointAdminError::NamespacePathMismatch {
+            path: options.namespace_dir.clone(),
+            expected_suffix: namespace_suffix,
+        });
+    }
+    let lock = NamespaceLock::acquire_existing(
+        &options.namespace_dir,
+        options.ownership_timeout,
+        options.ownership_retry_interval,
+    )?;
+    Ok(LockedNamespace {
+        options,
+        limits,
+        namespace,
+        lock,
+    })
+}
+
+impl CheckpointNamespaceResetSession {
+    /// Opens an existing namespace for bounded evidence backup and optional
+    /// whole-namespace reset.
+    ///
+    /// Unlike [`CheckpointAdminSession::open`], this entry point retains the
+    /// exclusive lock when `CURRENT` or its selected authority is invalid.
+    /// The failure is reported as bounded evidence, and no per-file mutation
+    /// API is exposed.
+    pub fn open(options: StoreOptions) -> Result<Self, CheckpointAdminError> {
+        Self::open_inner(options, FaultPlan::disabled())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_with_fault(
+        options: StoreOptions,
+        point: FaultPoint,
+    ) -> Result<Self, CheckpointAdminError> {
+        Self::open_inner(options, FaultPlan::armed(point))
+    }
+
+    fn open_inner(options: StoreOptions, faults: FaultPlan) -> Result<Self, CheckpointAdminError> {
+        let LockedNamespace {
+            options,
+            limits,
+            namespace,
+            lock,
+        } = open_locked_namespace(options)?;
+        let authority = probe_namespace_authority(&options, &limits, &namespace, &lock)?;
+        verify_source_binding(&namespace, &lock)?;
+        Ok(Self {
+            options,
+            limits,
+            namespace,
+            lock: Some(lock),
+            faults,
+            unusable: None,
+            authority,
+        })
+    }
+
+    /// Valid authority summary or bounded validation failure observed at
+    /// session open.
+    #[must_use]
+    pub fn authority(&self) -> &NamespaceAuthorityReport {
+        &self.authority
+    }
+
+    /// Copies every canonical recognized bounded artifact to a new
+    /// create-only destination and records either valid authority or the
+    /// exact bounded validation failure.
+    pub fn backup(
+        &self,
+        destination: impl AsRef<Path>,
+    ) -> Result<EvidenceBackupManifest, CheckpointAdminError> {
+        self.ensure_usable("back up namespace-reset evidence")?;
+        self.revalidate_authority()?;
+        let sources = self.inventory_sources()?;
+        let completed = create_evidence_backup(
+            &self.options,
+            &self.namespace,
+            self.active_lock(),
+            destination.as_ref(),
+            sources,
+            self.authority.clone(),
+        )?;
+        completed.verify()?;
+        let _ = verify_source_matches_backup(
+            &self.options,
+            &self.limits,
+            &self.namespace,
+            self.active_lock(),
+            &completed.manifest,
+            None,
+        )?;
+        Ok(completed.manifest)
+    }
+
+    /// Creates and verifies an evidence backup, then atomically publishes a
+    /// complete empty generation above every recognized generation.
+    pub fn reset_namespace(
+        &mut self,
+        request: NamespaceResetRequest,
+    ) -> Result<NamespaceResetResult, CheckpointAdminError> {
+        validate_audit("reset_namespace", &request.audit)?;
+        self.ensure_usable("reset the complete checkpoint namespace")?;
+        self.revalidate_authority()?;
+
+        let initial_sources = self.inventory_sources()?;
+        let initial_plan = namespace_reset_plan(
+            &self.options,
+            &self.limits,
+            &self.namespace,
+            self.active_lock(),
+            &initial_sources,
+            self.authority.selected_generation(),
+            true,
+        )?;
+        let old_authority = self.authority.clone();
+        let completed_backup = create_evidence_backup(
+            &self.options,
+            &self.namespace,
+            self.active_lock(),
+            request.backup_destination.as_path(),
+            initial_sources,
+            old_authority.clone(),
+        )?;
+        completed_backup.verify()?;
+        let verified_sources = verify_source_matches_backup(
+            &self.options,
+            &self.limits,
+            &self.namespace,
+            self.active_lock(),
+            &completed_backup.manifest,
+            None,
+        )?;
+        let verified_plan = namespace_reset_plan(
+            &self.options,
+            &self.limits,
+            &self.namespace,
+            self.active_lock(),
+            &verified_sources,
+            self.authority.selected_generation(),
+            true,
+        )?;
+        if verified_plan != initial_plan {
+            return Err(CheckpointAdminError::BackupVerification {
+                path: self.options.namespace_dir.clone(),
+                reason: "namespace reset generation plan changed after backup",
+            });
+        }
+
+        CheckpointStore::stage_generation(
+            &self.options.namespace_dir,
+            &self.options.namespace_id,
+            initial_plan.new_generation,
+            &[],
+            &self.limits,
+            &mut self.faults,
+        )?;
+        if let Err(failure) = CheckpointStore::publish_marker(
+            &self.options.namespace_dir,
+            initial_plan.new_generation,
+            &mut self.faults,
+        ) {
+            if failure.destination_may_have_changed {
+                self.mark_unusable(
+                    "CURRENT was repointed or may have changed when namespace reset failed",
+                );
+            }
+            return Err(failure.error.into());
+        }
+
+        let authority = match probe_namespace_authority(
+            &self.options,
+            &self.limits,
+            &self.namespace,
+            self.active_lock(),
+        ) {
+            Ok(authority) => authority,
+            Err(error) => {
+                self.mark_unusable(
+                    "the newly published namespace authority could not be revalidated",
+                );
+                return Err(error);
+            }
+        };
+        let validation = match &authority {
+            NamespaceAuthorityReport::Valid { validation }
+                if validation.selected_generation == initial_plan.new_generation
+                    && validation.tracked_file_count == 0
+                    && validation.quarantine_count == 0 =>
+            {
+                validation.clone()
+            }
+            _ => {
+                self.mark_unusable(
+                    "the published namespace reset did not reopen as empty authority",
+                );
+                return Err(CheckpointAdminError::AuthorityStateChanged);
+            }
+        };
+        self.authority = authority;
+
+        let (data_effect, consequence) = request.consequence.effect();
+        let reset_report = NamespaceResetReport {
+            namespace_id: self.options.namespace_id.clone(),
+            namespace_path: validation.derived_namespace_path.clone(),
+            backup_destination: native_path_report(completed_backup.destination.directory.path())?,
+            old_generation: old_authority.selected_generation(),
+            new_generation: initial_plan.new_generation,
+            old_tracked_file_count: old_authority.tracked_file_count(),
+            old_quarantine_count: old_authority.quarantine_count(),
+            new_tracked_file_count: validation.tracked_file_count,
+            new_quarantine_count: validation.quarantine_count,
+            retained_evidence_generations: initial_plan.retained_evidence_generations,
+            audit: request.audit,
+            data_effect,
+            consequence: consequence.to_owned(),
+        };
+        Ok(NamespaceResetResult {
+            backup_manifest: completed_backup.manifest,
+            reset_report,
+        })
+    }
+
+    /// Releases the exclusive namespace lock and reports an unlock failure.
+    pub fn release(mut self) -> Result<(), CheckpointAdminError> {
+        self.lock
+            .take()
+            .expect("a namespace-reset session retains its namespace lock")
+            .release()
+            .map_err(CheckpointAdminError::from)
+    }
+
+    fn active_lock(&self) -> &NamespaceLock {
+        self.lock
+            .as_ref()
+            .expect("a namespace-reset session retains its namespace lock")
+    }
+
+    fn ensure_usable(&self, operation: &'static str) -> Result<(), CheckpointAdminError> {
+        if let Some(reason) = self.unusable {
+            return Err(StoreError::Unusable {
+                dir: self.options.namespace_dir.clone(),
+                operation,
+                reason,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    fn mark_unusable(&mut self, reason: &'static str) {
+        self.unusable = Some(reason);
+    }
+
+    fn revalidate_authority(&self) -> Result<(), CheckpointAdminError> {
+        self.ensure_usable("revalidate namespace-reset authority")?;
+        let current = probe_namespace_authority(
+            &self.options,
+            &self.limits,
+            &self.namespace,
+            self.active_lock(),
+        )?;
+        if current != self.authority {
+            return Err(CheckpointAdminError::AuthorityStateChanged);
+        }
+        Ok(())
+    }
+
+    fn inventory_sources(&self) -> Result<Vec<BackupSourceArtifact>, CheckpointAdminError> {
+        with_verified_source(&self.namespace, self.active_lock(), || {
+            inventory_recognized_artifacts(&self.options.namespace_dir, &self.limits)
+        })
+    }
 }
 
 impl CheckpointAdminSession {
     /// Opens and boundedly validates an existing namespace without repairing
     /// or mutating any source artifact.
-    pub fn open(mut options: StoreOptions) -> Result<Self, CheckpointAdminError> {
-        let namespace_suffix =
-            CheckpointNamespace::derive(Path::new(""), &options.namespace_id)?.into_directory();
-        if !options.namespace_dir.ends_with(&namespace_suffix) {
-            return Err(CheckpointAdminError::NamespacePathMismatch {
-                path: options.namespace_dir.clone(),
-                expected_suffix: namespace_suffix.clone(),
-            });
-        }
-        let limits = options.limits()?;
-        let namespace = fsio::DirectoryPathBinding::open_canonical(
-            &options.namespace_dir,
-            "resolve the existing checkpoint namespace directory",
-        )?;
-        options.namespace_dir = namespace.path().to_path_buf();
-        if !options.namespace_dir.ends_with(&namespace_suffix) {
-            return Err(CheckpointAdminError::NamespacePathMismatch {
-                path: options.namespace_dir.clone(),
-                expected_suffix: namespace_suffix,
-            });
-        }
-        let lock = NamespaceLock::acquire_existing(
-            &options.namespace_dir,
-            options.ownership_timeout,
-            options.ownership_retry_interval,
-        )?;
+    pub fn open(options: StoreOptions) -> Result<Self, CheckpointAdminError> {
+        Self::open_inner(options, FaultPlan::disabled())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_with_fault(
+        options: StoreOptions,
+        point: FaultPoint,
+    ) -> Result<Self, CheckpointAdminError> {
+        Self::open_inner(options, FaultPlan::armed(point))
+    }
+
+    fn open_inner(options: StoreOptions, faults: FaultPlan) -> Result<Self, CheckpointAdminError> {
+        let LockedNamespace {
+            options,
+            limits,
+            namespace,
+            lock,
+        } = open_locked_namespace(options)?;
 
         let marker_path = options.namespace_dir.join(CURRENT_FILE_NAME);
         let marker_bytes = with_verified_source(&namespace, &lock, || {
@@ -431,33 +1211,26 @@ impl CheckpointAdminSession {
         let generations = with_verified_source(&namespace, &lock, || {
             Ok(layout::scan_generations_read_only(&options.namespace_dir)?)
         })?;
-        let retired_generations = generations
+        let retired_generations: Vec<u64> = generations
             .into_keys()
             .filter(|found| *found != generation)
             .collect();
-        let quarantines = quarantine_reports(&loaded.table)?;
-        let validation = NamespaceValidationReport {
-            namespace_id: options.namespace_id.clone(),
-            derived_namespace_path: native_path_report(&options.namespace_dir)?,
-            selected_generation: generation,
-            snapshot_record_count: report_count(loaded.snapshot_records, "snapshot record")?,
-            wal_transaction_count: report_count(loaded.transactions_replayed, "WAL transaction")?,
-            tracked_file_count: report_count(loaded.table.len(), "tracked file")?,
-            quarantine_count: report_count(loaded.table.quarantined_len(), "quarantine")?,
-            torn_wal_tail_bytes: report_count(loaded.torn_tail_bytes, "torn WAL tail byte")?,
-            retired_generations,
-        };
+        let inspection =
+            inspection_report(&options, generation, &loaded, retired_generations.clone())?;
         verify_source_binding(&namespace, &lock)?;
 
         Ok(Self {
             options,
             limits,
             namespace,
-            lock,
-            inspection: CheckpointInspectionReport {
-                validation,
-                quarantines,
-            },
+            lock: Some(lock),
+            loaded: Some(loaded),
+            store: None,
+            generation,
+            retired_generations,
+            faults,
+            unusable: None,
+            inspection,
         })
     }
 
@@ -471,6 +1244,393 @@ impl CheckpointAdminSession {
     #[must_use]
     pub fn inspection(&self) -> &CheckpointInspectionReport {
         &self.inspection
+    }
+
+    /// Releases a matching quarantine at offset zero with a checked epoch
+    /// increment and a forced durable WAL sync.
+    pub fn reset_to_beginning(
+        &mut self,
+        request: ResetToBeginningRequest,
+    ) -> Result<FileMutationResult, CheckpointAdminError> {
+        validate_audit("reset_to_beginning", &request.audit)?;
+        let (file_id, file_id_hex, old) =
+            self.prepare_quarantined_target(&request.target, "reset_to_beginning")?;
+        let new_epoch = old.file_epoch.checked_add(1).ok_or_else(|| {
+            CheckpointAdminError::FileEpochOverflow {
+                file_id: file_id_hex.clone(),
+                epoch: old.file_epoch,
+            }
+        })?;
+        let operation = ResetQuarantinedFile {
+            file_id,
+            expected_quarantine_epoch: request.target.expected_quarantine_epoch,
+            action: ResetQuarantineAction::ResetToBeginning,
+            resulting_epoch: new_epoch,
+            resulting_offset: 0,
+            new_committed_frontier_guard: CommittedFrontierGuard::empty(),
+            new_framing_resume: FramingResume::Clean,
+            reset_time_unix_nano: request.audit.action_time_unix_nano,
+            audit_reason: request.audit.reason.clone(),
+        };
+        let outcome = {
+            let store = self.ensure_writable()?;
+            let outcome = store.reset_quarantined_file(operation)?;
+            store.sync()?;
+            outcome
+        };
+        let loaded =
+            self.refresh_live_authority("a completed audited append could not be revalidated")?;
+        let new = loaded.table.get(&file_id).ok_or_else(|| {
+            self.mark_unusable("a reset-to-beginning result disappeared after durable append");
+            CheckpointAdminError::AuthorityStateChanged
+        })?;
+        if new.lifecycle_state != LifecycleState::Active
+            || new.file_epoch != new_epoch
+            || new.committed_offset != 0
+            || new.committed_frontier_guard != CommittedFrontierGuard::empty()
+            || new.framing_resume != FramingResume::Clean
+        {
+            self.mark_unusable("a reset-to-beginning result did not match its durable operation");
+            return Err(CheckpointAdminError::AuthorityStateChanged);
+        }
+        Ok(self.file_mutation_result(
+            file_id_hex,
+            QuarantineMutationAction::ResetToBeginning,
+            &old,
+            Some(new),
+            outcome.sequence,
+            request.audit,
+            DataEffect::DuplicatePossible,
+            "Reading resumes at offset 0; source bytes delivered before quarantine may be delivered again.",
+            None,
+        ))
+    }
+
+    /// Appends an audited keep-failed decision while preserving every
+    /// operational field and all quarantine evidence exactly.
+    pub fn keep_failed(
+        &mut self,
+        request: KeepFailedRequest,
+    ) -> Result<FileMutationResult, CheckpointAdminError> {
+        validate_audit("keep_failed", &request.audit)?;
+        let (file_id, file_id_hex, old) =
+            self.prepare_quarantined_target(&request.target, "keep_failed")?;
+        let operation = ResetQuarantinedFile {
+            file_id,
+            expected_quarantine_epoch: request.target.expected_quarantine_epoch,
+            action: ResetQuarantineAction::KeepFailed,
+            resulting_epoch: old.file_epoch,
+            resulting_offset: old.committed_offset,
+            new_committed_frontier_guard: old.committed_frontier_guard,
+            new_framing_resume: old.framing_resume,
+            reset_time_unix_nano: request.audit.action_time_unix_nano,
+            audit_reason: request.audit.reason.clone(),
+        };
+        let outcome = {
+            let store = self.ensure_writable()?;
+            let outcome = store.reset_quarantined_file(operation)?;
+            store.sync()?;
+            if store.table().get(&file_id) != Some(&old) {
+                store.mark_unusable("keep-failed changed operational checkpoint state");
+                return Err(CheckpointAdminError::AuthorityStateChanged);
+            }
+            outcome
+        };
+        let loaded =
+            self.refresh_live_authority("a completed audited append could not be revalidated")?;
+        let new = loaded.table.get(&file_id).ok_or_else(|| {
+            self.mark_unusable("a keep-failed record disappeared after durable append");
+            CheckpointAdminError::AuthorityStateChanged
+        })?;
+        if new != &old {
+            self.mark_unusable("keep-failed changed reopened operational checkpoint state");
+            return Err(CheckpointAdminError::AuthorityStateChanged);
+        }
+        Ok(self.file_mutation_result(
+            file_id_hex,
+            QuarantineMutationAction::KeepFailed,
+            &old,
+            Some(new),
+            outcome.sequence,
+            request.audit,
+            DataEffect::None,
+            "The record remains quarantined; every operational field and all quarantine evidence are unchanged.",
+            None,
+        ))
+    }
+
+    /// Removes an exact matching quarantined record through an internally
+    /// constructed administrative WAL operation.
+    pub fn remove_quarantined(
+        &mut self,
+        request: RemoveQuarantinedRequest,
+    ) -> Result<FileMutationResult, CheckpointAdminError> {
+        validate_audit("remove_quarantined", &request.audit)?;
+        if request.removal_reason == REASON_CODE_RESERVED {
+            return Err(StoreError::ReservedReasonCode {
+                field: "remove_file.removal_reason",
+            }
+            .into());
+        }
+        let (file_id, file_id_hex, old) =
+            self.prepare_quarantined_target(&request.target, "remove_quarantined")?;
+        let operation = RemoveFile {
+            file_id,
+            expected_file_epoch: request.target.expected_quarantine_epoch,
+            expected_prior_state: LifecycleState::Quarantined,
+            removal_reason: request.removal_reason,
+            removal_time_unix_nano: request.audit.action_time_unix_nano,
+            administrative: true,
+            namespace_id: Some(self.options.namespace_id.clone()),
+            audit_reason: Some(request.audit.reason.clone()),
+        };
+        let outcome = {
+            let store = self.ensure_writable()?;
+            let outcome = store.append(vec![Operation::RemoveFile(operation)])?;
+            store.sync()?;
+            outcome
+        };
+        let loaded =
+            self.refresh_live_authority("a completed audited append could not be revalidated")?;
+        if loaded.table.get(&file_id).is_some() {
+            self.mark_unusable("an administrative removal remained present after durable append");
+            return Err(CheckpointAdminError::AuthorityStateChanged);
+        }
+        Ok(self.file_mutation_result(
+            file_id_hex,
+            QuarantineMutationAction::RemoveQuarantined,
+            &old,
+            None,
+            outcome.sequence,
+            request.audit,
+            DataEffect::DuplicateOrLossPossible,
+            request.consequence.description(),
+            None,
+        ))
+    }
+
+    /// Releases a matching quarantine at a stable EOF sampled from the
+    /// operator-supplied exact source path.
+    pub fn reset_to_end(
+        &mut self,
+        request: ResetToEndRequest,
+    ) -> Result<FileMutationResult, CheckpointAdminError> {
+        self.reset_to_end_sampled(request, open_stable_eof)
+    }
+
+    #[cfg(test)]
+    fn reset_to_end_with_hook(
+        &mut self,
+        request: ResetToEndRequest,
+        after_first_sample: impl FnOnce(),
+    ) -> Result<FileMutationResult, CheckpointAdminError> {
+        self.reset_to_end_sampled(request, |path, follow_symlinks, locator| {
+            crate::receivers::filelog_receiver::identity::platform::open_stable_eof_with_hook(
+                path,
+                follow_symlinks,
+                locator,
+                after_first_sample,
+            )
+        })
+    }
+
+    fn reset_to_end_sampled(
+        &mut self,
+        request: ResetToEndRequest,
+        sample: impl FnOnce(
+            &Path,
+            bool,
+            super::primitives::Locator,
+        ) -> Result<StableEofEvidence, IdentityError>,
+    ) -> Result<FileMutationResult, CheckpointAdminError> {
+        validate_audit("reset_to_end", &request.audit)?;
+        let (file_id, file_id_hex, old) =
+            self.prepare_quarantined_target(&request.target, "reset_to_end")?;
+        let new_epoch = old.file_epoch.checked_add(1).ok_or_else(|| {
+            CheckpointAdminError::FileEpochOverflow {
+                file_id: file_id_hex.clone(),
+                epoch: old.file_epoch,
+            }
+        })?;
+        let source = sample(&request.source_path, request.follow_symlinks, old.locator)
+            .map_err(|error| map_reset_source_error(&file_id_hex, &request.source_path, error))?;
+        let source_report = ResetToEndEvidenceReport {
+            source_path: native_path_report(&request.source_path)?,
+            follow_symlinks: request.follow_symlinks,
+            locator: source.locator.into(),
+            eof_offset: source.offset,
+            committed_frontier_guard: source.committed_frontier_guard.into(),
+        };
+        let operation = ResetQuarantinedFile {
+            file_id,
+            expected_quarantine_epoch: request.target.expected_quarantine_epoch,
+            action: ResetQuarantineAction::ResetToEnd,
+            resulting_epoch: new_epoch,
+            resulting_offset: source.offset,
+            new_committed_frontier_guard: source.committed_frontier_guard,
+            new_framing_resume: FramingResume::Clean,
+            reset_time_unix_nano: request.audit.action_time_unix_nano,
+            audit_reason: request.audit.reason.clone(),
+        };
+        let outcome = {
+            let store = self.ensure_writable()?;
+            let outcome = store.reset_quarantined_file(operation)?;
+            store.sync()?;
+            outcome
+        };
+        let loaded =
+            self.refresh_live_authority("a completed audited append could not be revalidated")?;
+        let new = loaded.table.get(&file_id).ok_or_else(|| {
+            self.mark_unusable("a reset-to-end result disappeared after durable append");
+            CheckpointAdminError::AuthorityStateChanged
+        })?;
+        if new.lifecycle_state != LifecycleState::Active
+            || new.file_epoch != new_epoch
+            || new.committed_offset != source.offset
+            || new.committed_frontier_guard != source.committed_frontier_guard
+            || new.framing_resume != FramingResume::Clean
+        {
+            self.mark_unusable("a reset-to-end result did not match its durable operation");
+            return Err(CheckpointAdminError::AuthorityStateChanged);
+        }
+        Ok(self.file_mutation_result(
+            file_id_hex,
+            QuarantineMutationAction::ResetToEnd,
+            &old,
+            Some(new),
+            outcome.sequence,
+            request.audit,
+            DataEffect::LossAccepted,
+            "Reading resumes at the sampled EOF; any undelivered source bytes before that offset are intentionally skipped.",
+            Some(source_report),
+        ))
+    }
+
+    /// Creates and verifies a new evidence backup, then atomically publishes
+    /// a strictly higher empty authority without removing old generations.
+    pub fn reset_namespace(
+        &mut self,
+        request: NamespaceResetRequest,
+    ) -> Result<NamespaceResetResult, CheckpointAdminError> {
+        validate_audit("reset_namespace", &request.audit)?;
+        self.revalidate_authority()?;
+        let old_validation = self.inspection.validation.clone();
+        let initial_sources = with_verified_source(&self.namespace, self.active_lock(), || {
+            inventory_backup_artifacts(&self.options.namespace_dir, &self.limits, self.generation)
+        })?;
+        let initial_plan = namespace_reset_plan(
+            &self.options,
+            &self.limits,
+            &self.namespace,
+            self.active_lock(),
+            &initial_sources,
+            Some(self.generation),
+            false,
+        )?;
+        let completed_backup = self.create_evidence_backup(request.backup_destination.as_path())?;
+        completed_backup.verify()?;
+        let sources = self.verify_source_matches_backup(&completed_backup.manifest)?;
+        self.revalidate_authority()?;
+        let verified_plan = namespace_reset_plan(
+            &self.options,
+            &self.limits,
+            &self.namespace,
+            self.active_lock(),
+            &sources,
+            Some(self.generation),
+            false,
+        )?;
+        if verified_plan != initial_plan {
+            return Err(CheckpointAdminError::BackupVerification {
+                path: self.options.namespace_dir.clone(),
+                reason: "namespace reset generation plan changed after backup",
+            });
+        }
+        let new_generation = initial_plan.new_generation;
+
+        if let Some(store) = self.store.as_mut() {
+            store.reset_to_empty_generation(new_generation)?;
+        } else {
+            CheckpointStore::stage_generation(
+                &self.options.namespace_dir,
+                &self.options.namespace_id,
+                new_generation,
+                &[],
+                &self.limits,
+                &mut self.faults,
+            )?;
+            if let Err(failure) = CheckpointStore::publish_marker(
+                &self.options.namespace_dir,
+                new_generation,
+                &mut self.faults,
+            ) {
+                if failure.destination_may_have_changed {
+                    self.mark_unusable(
+                        "CURRENT was repointed or may have changed when namespace reset failed",
+                    );
+                }
+                return Err(failure.error.into());
+            }
+        }
+        self.generation = new_generation;
+
+        let (selected, loaded, retired_generations) = match self.load_locked_authority() {
+            Ok(authority) => authority,
+            Err(error) => {
+                self.mark_unusable(
+                    "the newly published namespace authority could not be revalidated",
+                );
+                return Err(error);
+            }
+        };
+        if selected != new_generation || !loaded.table.is_empty() {
+            self.mark_unusable("the published namespace reset did not reopen as empty authority");
+            return Err(CheckpointAdminError::AuthorityStateChanged);
+        }
+        if let Some(store) = &self.store {
+            if !store.table().is_empty() || store.generation() != new_generation {
+                self.mark_unusable("the live namespace reset state disagrees with CURRENT");
+                return Err(CheckpointAdminError::AuthorityStateChanged);
+            }
+        }
+        let inspection = match inspection_report(
+            &self.options,
+            new_generation,
+            &loaded,
+            retired_generations.clone(),
+        ) {
+            Ok(inspection) => inspection,
+            Err(error) => {
+                self.mark_unusable("the newly published namespace report could not be built");
+                return Err(error);
+            }
+        };
+        self.retired_generations = retired_generations;
+        if self.store.is_none() {
+            self.loaded = Some(loaded);
+        }
+        self.inspection = inspection;
+
+        let (data_effect, consequence) = request.consequence.effect();
+        let reset_report = NamespaceResetReport {
+            namespace_id: self.options.namespace_id.clone(),
+            namespace_path: self.inspection.validation.derived_namespace_path.clone(),
+            backup_destination: native_path_report(completed_backup.destination.directory.path())?,
+            old_generation: Some(old_validation.selected_generation),
+            new_generation,
+            old_tracked_file_count: Some(old_validation.tracked_file_count),
+            old_quarantine_count: Some(old_validation.quarantine_count),
+            new_tracked_file_count: self.inspection.validation.tracked_file_count,
+            new_quarantine_count: self.inspection.validation.quarantine_count,
+            retained_evidence_generations: initial_plan.retained_evidence_generations,
+            audit: request.audit,
+            data_effect,
+            consequence: consequence.to_owned(),
+        };
+        Ok(NamespaceResetResult {
+            backup_manifest: completed_backup.manifest,
+            reset_report,
+        })
     }
 
     /// Copies recognized bounded checkpoint artifacts to a new destination
@@ -488,60 +1648,494 @@ impl CheckpointAdminSession {
         &self,
         destination: impl AsRef<Path>,
     ) -> Result<EvidenceBackupManifest, CheckpointAdminError> {
-        let sources = with_verified_source(&self.namespace, &self.lock, || {
-            inventory_backup_artifacts(
-                &self.options.namespace_dir,
-                &self.limits,
-                self.inspection.validation.selected_generation,
-            )
-        })?;
-        let destination = with_verified_source(&self.namespace, &self.lock, || {
-            PreparedBackupDestination::create(&self.options.namespace_dir, destination.as_ref())
-        })?;
+        let completed = self.create_evidence_backup(destination.as_ref())?;
+        completed.verify()?;
+        let _ = self.verify_source_matches_backup(&completed.manifest)?;
+        Ok(completed.manifest)
+    }
 
-        let mut artifacts = Vec::with_capacity(sources.len());
-        for source in sources {
-            let source_path = self.options.namespace_dir.join(&source.name);
-            let bytes = with_verified_source(&self.namespace, &self.lock, || {
-                fsio::read_file_bounded_read_only(&source_path, source.artifact, source.max_bytes)?
-                    .ok_or_else(|| CheckpointAdminError::BackupArtifactDisappeared {
-                        path: source_path.clone(),
-                    })
-            })?;
-            destination.write_file(&source.name, &bytes)?;
-            artifacts.push(EvidenceArtifact {
-                role: source.role,
-                name: source.name,
-                generation: source.generation,
-                length: u64::try_from(bytes.len()).map_err(|_| {
-                    CheckpointAdminError::CountOverflow {
-                        field: "backup artifact byte",
-                    }
-                })?,
-                sha256: hex::encode(Sha256::digest(&bytes)),
-            });
-        }
-
-        verify_source_binding(&self.namespace, &self.lock)?;
-        let manifest = EvidenceBackupManifest {
-            manifest_version: EVIDENCE_BACKUP_MANIFEST_VERSION,
-            namespace_id: self.options.namespace_id.clone(),
-            source_namespace: self.inspection.validation.derived_namespace_path.clone(),
-            selected_generation: self.inspection.validation.selected_generation,
-            artifacts,
-            validation: self.inspection.validation.clone(),
-        };
-        let manifest_bytes = serde_json::to_vec_pretty(&manifest)
-            .map_err(|source| CheckpointAdminError::ManifestEncode { source })?;
-        destination.write_file(EVIDENCE_BACKUP_MANIFEST_FILE_NAME, &manifest_bytes)?;
-        sync_backup_directories(&destination)?;
-        verify_source_binding(&self.namespace, &self.lock)?;
-        Ok(manifest)
+    fn create_evidence_backup(
+        &self,
+        destination: &Path,
+    ) -> Result<CompletedEvidenceBackup, CheckpointAdminError> {
+        self.ensure_usable("back up checkpoint evidence")?;
+        let lock = self.active_lock();
+        let sources = with_verified_source(&self.namespace, lock, || {
+            inventory_backup_artifacts(&self.options.namespace_dir, &self.limits, self.generation)
+        })?;
+        create_evidence_backup(
+            &self.options,
+            &self.namespace,
+            lock,
+            destination,
+            sources,
+            NamespaceAuthorityReport::Valid {
+                validation: self.inspection.validation.clone(),
+            },
+        )
     }
 
     /// Releases the exclusive namespace lock and reports an unlock failure.
-    pub fn release(self) -> Result<(), CheckpointAdminError> {
-        self.lock.release().map_err(CheckpointAdminError::from)
+    pub fn release(mut self) -> Result<(), CheckpointAdminError> {
+        if let Some(store) = self.store.take() {
+            store.release_admin().map_err(CheckpointAdminError::from)
+        } else {
+            self.lock
+                .take()
+                .expect("a read-only admin session retains its namespace lock")
+                .release()
+                .map_err(CheckpointAdminError::from)
+        }
+    }
+
+    fn active_lock(&self) -> &NamespaceLock {
+        self.store.as_ref().map_or_else(
+            || {
+                self.lock
+                    .as_ref()
+                    .expect("a read-only admin session retains its namespace lock")
+            },
+            CheckpointStore::admin_lock,
+        )
+    }
+
+    fn ensure_usable(&self, operation: &'static str) -> Result<(), CheckpointAdminError> {
+        if let Some(store) = &self.store {
+            store.ensure_usable(operation)?;
+        }
+        if let Some(reason) = self.unusable {
+            return Err(StoreError::Unusable {
+                dir: self.options.namespace_dir.clone(),
+                operation,
+                reason,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    fn mark_unusable(&mut self, reason: &'static str) {
+        if let Some(store) = self.store.as_mut() {
+            store.mark_unusable(reason);
+        } else {
+            self.unusable = Some(reason);
+        }
+    }
+
+    fn ensure_writable(&mut self) -> Result<&mut CheckpointStore, CheckpointAdminError> {
+        self.ensure_usable("prepare an audited checkpoint mutation")?;
+        if self.store.is_none() {
+            let transition = CheckpointStore::from_admin_session(
+                self.options.clone(),
+                self.limits,
+                &mut self.lock,
+                self.generation,
+                &mut self.loaded,
+                self.retired_generations.clone(),
+                self.faults,
+            );
+            self.faults = FaultPlan::disabled();
+            match transition {
+                Ok(store) => self.store = Some(store),
+                Err(error) => {
+                    self.mark_unusable(
+                        "the append-capable transition may have changed checkpoint artifacts",
+                    );
+                    return Err(error.into());
+                }
+            }
+            let _ = self.refresh_live_authority(
+                "the append-capable transition could not revalidate its checkpoint authority",
+            )?;
+        }
+        Ok(self
+            .store
+            .as_mut()
+            .expect("a successful admin transition installs its checkpoint store"))
+    }
+
+    fn load_locked_authority(
+        &self,
+    ) -> Result<(u64, LoadedGeneration, Vec<u64>), CheckpointAdminError> {
+        self.ensure_usable("revalidate the locked checkpoint authority")?;
+        let lock = self.active_lock();
+        let marker_path = self.options.namespace_dir.join(CURRENT_FILE_NAME);
+        let marker_bytes = with_verified_source(&self.namespace, lock, || {
+            fsio::read_file_bounded_read_only(
+                &marker_path,
+                "CURRENT marker",
+                MARKER_READ_MAX_BYTES,
+            )?
+            .ok_or_else(|| CheckpointAdminError::RequiredArtifactMissing {
+                artifact: "CURRENT marker",
+                path: marker_path.clone(),
+            })
+        })?;
+        let generation =
+            decode_current_marker(&marker_bytes).map_err(|source| StoreError::Decode {
+                artifact: "CURRENT marker",
+                path: marker_path,
+                source,
+            })?;
+        let loaded = with_verified_source(&self.namespace, lock, || {
+            Ok(CheckpointStore::load_generation_read_only(
+                &self.options.namespace_dir,
+                generation,
+                &self.options.namespace_id,
+                &self.limits,
+                self.options.max_tracked_files,
+                self.options.fingerprint_bytes,
+            )?)
+        })?;
+        let generations = with_verified_source(&self.namespace, lock, || {
+            Ok(layout::scan_generations_read_only(
+                &self.options.namespace_dir,
+            )?)
+        })?;
+        let retired_generations = generations
+            .into_keys()
+            .filter(|recognized| *recognized != generation)
+            .collect();
+        Ok((generation, loaded, retired_generations))
+    }
+
+    fn revalidate_authority(&mut self) -> Result<(), CheckpointAdminError> {
+        let (generation, loaded, retired_generations) = self.load_locked_authority()?;
+        if generation != self.generation {
+            let expected = self.generation;
+            self.mark_unusable("CURRENT changed while the administration lock was retained");
+            return Err(CheckpointAdminError::AuthorityChanged {
+                expected,
+                found: generation,
+            });
+        }
+        let authority_records = self.authority_records();
+        let expected_validation = &self.inspection.validation;
+        let state_matches = authority_records == loaded.table.snapshot_records()
+            && expected_validation.snapshot_record_count
+                == report_count(loaded.snapshot_records, "snapshot record")?
+            && expected_validation.wal_transaction_count
+                == report_count(loaded.transactions_replayed, "WAL transaction")?
+            && expected_validation.torn_wal_tail_bytes
+                == report_count(loaded.torn_tail_bytes, "torn WAL tail byte")?;
+        if !state_matches {
+            self.mark_unusable(
+                "checkpoint artifacts changed while the administration lock was retained",
+            );
+            return Err(CheckpointAdminError::AuthorityStateChanged);
+        }
+        if self.store.is_none() {
+            self.loaded = Some(loaded);
+        }
+        self.inspection.validation.retired_generations = retired_generations.clone();
+        self.retired_generations = retired_generations;
+        Ok(())
+    }
+
+    fn refresh_live_authority(
+        &mut self,
+        load_failure_reason: &'static str,
+    ) -> Result<LoadedGeneration, CheckpointAdminError> {
+        let (generation, loaded, retired_generations) = match self.load_locked_authority() {
+            Ok(authority) => authority,
+            Err(error) => {
+                self.mark_unusable(load_failure_reason);
+                return Err(error);
+            }
+        };
+        if generation != self.generation {
+            let expected = self.generation;
+            self.mark_unusable("CURRENT changed after an audited checkpoint append");
+            return Err(CheckpointAdminError::AuthorityChanged {
+                expected,
+                found: generation,
+            });
+        }
+        let Some(store) = &self.store else {
+            self.mark_unusable("an audited mutation completed without a live checkpoint store");
+            return Err(CheckpointAdminError::AuthorityStateChanged);
+        };
+        let stats = store.stats();
+        if store.table().snapshot_records() != loaded.table.snapshot_records()
+            || stats.wal_bytes != loaded.wal_valid_len
+            || stats.wal_transactions
+                != u64::try_from(loaded.transactions_replayed).unwrap_or(u64::MAX)
+        {
+            self.mark_unusable("reopened checkpoint state disagreed with the completed append");
+            return Err(CheckpointAdminError::AuthorityStateChanged);
+        }
+        self.inspection = match inspection_report(
+            &self.options,
+            generation,
+            &loaded,
+            retired_generations.clone(),
+        ) {
+            Ok(inspection) => inspection,
+            Err(error) => {
+                self.mark_unusable("a completed audited append report could not be built");
+                return Err(error);
+            }
+        };
+        self.retired_generations = retired_generations;
+        Ok(loaded)
+    }
+
+    fn authority_records(&self) -> Vec<SnapshotRecord> {
+        self.store.as_ref().map_or_else(
+            || {
+                self.loaded
+                    .as_ref()
+                    .expect("a read-only admin session retains its loaded authority")
+                    .table
+                    .snapshot_records()
+            },
+            |store| store.table().snapshot_records(),
+        )
+    }
+
+    fn prepare_quarantined_target(
+        &mut self,
+        target: &QuarantinedFileTarget,
+        operation: &'static str,
+    ) -> Result<(FileId, String, SnapshotRecord), CheckpointAdminError> {
+        let file_id = parse_file_id(&target.file_id)?;
+        self.revalidate_authority()?;
+        let record = self
+            .store
+            .as_ref()
+            .map_or_else(
+                || {
+                    self.loaded
+                        .as_ref()
+                        .expect("a read-only admin session retains its loaded authority")
+                        .table
+                        .get(&file_id)
+                },
+                |store| store.table().get(&file_id),
+            )
+            .cloned()
+            .ok_or_else(|| CheckpointAdminError::FileNotFound {
+                file_id: target.file_id.clone(),
+            })?;
+        if record.lifecycle_state != LifecycleState::Quarantined {
+            return Err(CheckpointAdminError::ExpectedQuarantine {
+                operation,
+                file_id: target.file_id.clone(),
+                state: record.lifecycle_state.into(),
+            });
+        }
+        let evidence = record.quarantine_evidence.as_ref().ok_or_else(|| {
+            CheckpointAdminError::MissingQuarantineEvidence {
+                file_id: target.file_id.clone(),
+            }
+        })?;
+        if evidence.quarantine_epoch != target.expected_quarantine_epoch
+            || record.file_epoch != target.expected_quarantine_epoch
+        {
+            return Err(CheckpointAdminError::QuarantineEpochMismatch {
+                file_id: target.file_id.clone(),
+                expected: target.expected_quarantine_epoch,
+                actual: evidence.quarantine_epoch,
+            });
+        }
+        Ok((file_id, target.file_id.clone(), record))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn file_mutation_result(
+        &self,
+        file_id: String,
+        action: QuarantineMutationAction,
+        old: &SnapshotRecord,
+        new: Option<&SnapshotRecord>,
+        wal_sequence: u64,
+        audit: AuditMetadata,
+        data_effect: DataEffect,
+        consequence: &'static str,
+        reset_to_end_evidence: Option<ResetToEndEvidenceReport>,
+    ) -> FileMutationResult {
+        FileMutationResult {
+            namespace_id: self.options.namespace_id.clone(),
+            namespace_path: self.inspection.validation.derived_namespace_path.clone(),
+            file_id,
+            generation: self.generation,
+            action,
+            old_lifecycle: old.lifecycle_state.into(),
+            new_lifecycle: new.map_or(CheckpointLifecycleReport::Absent, |record| {
+                record.lifecycle_state.into()
+            }),
+            old_epoch: old.file_epoch,
+            new_epoch: new.map(|record| record.file_epoch),
+            old_offset: old.committed_offset,
+            new_offset: new.map(|record| record.committed_offset),
+            wal_sequence,
+            audit,
+            data_effect,
+            consequence: consequence.to_owned(),
+            reset_to_end_evidence,
+        }
+    }
+
+    fn verify_source_matches_backup(
+        &self,
+        manifest: &EvidenceBackupManifest,
+    ) -> Result<Vec<BackupSourceArtifact>, CheckpointAdminError> {
+        verify_source_matches_backup(
+            &self.options,
+            &self.limits,
+            &self.namespace,
+            self.active_lock(),
+            manifest,
+            Some(self.generation),
+        )
+    }
+}
+
+fn inspection_report(
+    options: &StoreOptions,
+    generation: u64,
+    loaded: &LoadedGeneration,
+    retired_generations: Vec<u64>,
+) -> Result<CheckpointInspectionReport, CheckpointAdminError> {
+    Ok(CheckpointInspectionReport {
+        validation: NamespaceValidationReport {
+            namespace_id: options.namespace_id.clone(),
+            derived_namespace_path: native_path_report(&options.namespace_dir)?,
+            selected_generation: generation,
+            snapshot_record_count: report_count(loaded.snapshot_records, "snapshot record")?,
+            wal_transaction_count: report_count(loaded.transactions_replayed, "WAL transaction")?,
+            tracked_file_count: report_count(loaded.table.len(), "tracked file")?,
+            quarantine_count: report_count(loaded.table.quarantined_len(), "quarantine")?,
+            torn_wal_tail_bytes: report_count(loaded.torn_tail_bytes, "torn WAL tail byte")?,
+            retired_generations,
+        },
+        quarantines: quarantine_reports(&loaded.table)?,
+    })
+}
+
+fn validate_audit(
+    operation: &'static str,
+    audit: &AuditMetadata,
+) -> Result<(), CheckpointAdminError> {
+    if audit.reason.is_empty() {
+        return Err(CheckpointAdminError::AuditReasonRequired { operation });
+    }
+    if audit.reason.len() > AUDIT_REASON_MAX_BYTES {
+        return Err(CheckpointAdminError::AuditReasonTooLong {
+            operation,
+            len: audit.reason.len(),
+            max: AUDIT_REASON_MAX_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn parse_file_id(value: &str) -> Result<FileId, CheckpointAdminError> {
+    if value.len() != 32
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(CheckpointAdminError::InvalidFileId);
+    }
+    let mut bytes = [0u8; 16];
+    hex::decode_to_slice(value, &mut bytes).map_err(|_| CheckpointAdminError::InvalidFileId)?;
+    Ok(FileId(bytes))
+}
+
+fn map_reset_source_error(
+    file_id: &str,
+    source_path: &Path,
+    error: IdentityError,
+) -> CheckpointAdminError {
+    match error {
+        IdentityError::Io {
+            operation, source, ..
+        } => CheckpointAdminError::ResetSourceIo {
+            operation,
+            path: source_path.to_path_buf(),
+            source,
+        },
+        IdentityError::NotRegularFile { .. } => CheckpointAdminError::ResetSourceNotRegular {
+            path: source_path.to_path_buf(),
+        },
+        IdentityError::SymlinkOrReparsePoint { .. } => {
+            CheckpointAdminError::ResetSourceSymlinkOrReparse {
+                path: source_path.to_path_buf(),
+            }
+        }
+        IdentityError::ReopenLocatorMismatch {
+            expected, found, ..
+        } => CheckpointAdminError::ResetSourceLocatorMismatch {
+            file_id: file_id.to_owned(),
+            expected: expected.into(),
+            found: found.into(),
+        },
+        IdentityError::CandidateChangedDuringIdentity { .. } => {
+            CheckpointAdminError::ResetSourceChanged {
+                path: source_path.to_path_buf(),
+            }
+        }
+        IdentityError::UnsupportedPlatform { .. } => CheckpointAdminError::ResetSourceUnsupported {
+            path: source_path.to_path_buf(),
+        },
+        IdentityError::InvalidEvidence { .. }
+        | IdentityError::InvalidAdvisoryPath { .. }
+        | IdentityError::ReopenFingerprintMismatch { .. }
+        | IdentityError::ReopenOffsetBeyondSize { .. }
+        | IdentityError::ReopenFrontierGuardMismatch { .. }
+        | IdentityError::DuplicateCandidateLocator { .. }
+        | IdentityError::AmbiguousQuarantinedLocator { .. }
+        | IdentityError::IncompatibleProfile { .. }
+        | IdentityError::FileIdCollisionLimit { .. }
+        | IdentityError::Store(_) => CheckpointAdminError::ResetSourceValidation {
+            path: source_path.to_path_buf(),
+            reason: "unexpected identity-layer failure",
+        },
+    }
+}
+
+impl RemovalConsequence {
+    fn description(self) -> &'static str {
+        match self {
+            Self::AcknowledgeDuplicateOrLossPossible => {
+                "The checkpoint record is deleted; later registration may replay previously delivered bytes or skip existing bytes according to registration policy."
+            }
+        }
+    }
+}
+
+impl NamespaceResetConsequence {
+    fn effect(self) -> (DataEffect, &'static str) {
+        match self {
+            Self::AcknowledgeDuplicatePossible => (
+                DataEffect::DuplicatePossible,
+                "All checkpoint records are discarded; rediscovered sources may deliver previously delivered bytes again.",
+            ),
+            Self::AcknowledgeLossAccepted => (
+                DataEffect::LossAccepted,
+                "All checkpoint records are discarded; later registration policy may intentionally skip existing source bytes.",
+            ),
+        }
+    }
+}
+
+impl From<LifecycleState> for CheckpointLifecycleReport {
+    fn from(value: LifecycleState) -> Self {
+        match value {
+            LifecycleState::Active => Self::Active,
+            LifecycleState::RotatedFinalized => Self::RotatedFinalized,
+            LifecycleState::Quarantined => Self::Quarantined,
+        }
+    }
+}
+
+impl From<CommittedFrontierGuard> for CommittedFrontierGuardReport {
+    fn from(value: CommittedFrontierGuard) -> Self {
+        Self {
+            window_len: value.window_len,
+            digest: hex::encode(value.digest),
+        }
     }
 }
 
@@ -564,6 +2158,417 @@ fn with_verified_source<T>(
     let result = operation();
     verify_source_binding(namespace, lock)?;
     result
+}
+
+impl NamespaceAuthorityReport {
+    fn selected_generation(&self) -> Option<u64> {
+        match self {
+            Self::Valid { validation } => Some(validation.selected_generation),
+            Self::Invalid { failure } => failure.selected_generation,
+        }
+    }
+
+    fn tracked_file_count(&self) -> Option<u64> {
+        match self {
+            Self::Valid { validation } => Some(validation.tracked_file_count),
+            Self::Invalid { .. } => None,
+        }
+    }
+
+    fn quarantine_count(&self) -> Option<u64> {
+        match self {
+            Self::Valid { validation } => Some(validation.quarantine_count),
+            Self::Invalid { .. } => None,
+        }
+    }
+}
+
+fn probe_namespace_authority(
+    options: &StoreOptions,
+    limits: &StoreLimits,
+    namespace: &fsio::DirectoryPathBinding,
+    lock: &NamespaceLock,
+) -> Result<NamespaceAuthorityReport, CheckpointAdminError> {
+    let marker_path = options.namespace_dir.join(CURRENT_FILE_NAME);
+    verify_source_binding(namespace, lock)?;
+    let marker_result =
+        fsio::read_file_bounded_read_only(&marker_path, "CURRENT marker", MARKER_READ_MAX_BYTES);
+    verify_source_binding(namespace, lock)?;
+    let marker_bytes = match marker_result {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            return Ok(invalid_authority_report(
+                NamespaceAuthorityFailureKind::MissingCurrent,
+                None,
+                "the canonical CURRENT marker is absent",
+            ));
+        }
+        Err(error) => {
+            return Ok(invalid_authority_report(
+                NamespaceAuthorityFailureKind::CurrentUnreadable,
+                None,
+                error,
+            ));
+        }
+    };
+    let generation = match decode_current_marker(&marker_bytes) {
+        Ok(generation) => generation,
+        Err(error) => {
+            return Ok(invalid_authority_report(
+                NamespaceAuthorityFailureKind::CurrentInvalid,
+                None,
+                error,
+            ));
+        }
+    };
+
+    verify_source_binding(namespace, lock)?;
+    let loaded_result = CheckpointStore::load_generation_read_only(
+        &options.namespace_dir,
+        generation,
+        &options.namespace_id,
+        limits,
+        options.max_tracked_files,
+        options.fingerprint_bytes,
+    );
+    verify_source_binding(namespace, lock)?;
+    let loaded = match loaded_result {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            return Ok(invalid_authority_report(
+                NamespaceAuthorityFailureKind::SelectedGenerationInvalid,
+                Some(generation),
+                error,
+            ));
+        }
+    };
+
+    verify_source_binding(namespace, lock)?;
+    let generations_result = layout::scan_generations_read_only(&options.namespace_dir);
+    verify_source_binding(namespace, lock)?;
+    let generations = match generations_result {
+        Ok(generations) => generations,
+        Err(error) => {
+            return Ok(invalid_authority_report(
+                NamespaceAuthorityFailureKind::GenerationInventoryInvalid,
+                Some(generation),
+                error,
+            ));
+        }
+    };
+    let retired_generations = generations
+        .into_keys()
+        .filter(|recognized| *recognized != generation)
+        .collect();
+    match inspection_report(options, generation, &loaded, retired_generations) {
+        Ok(inspection) => Ok(NamespaceAuthorityReport::Valid {
+            validation: inspection.validation,
+        }),
+        Err(error) => Ok(invalid_authority_report(
+            NamespaceAuthorityFailureKind::ReportInvalid,
+            Some(generation),
+            error,
+        )),
+    }
+}
+
+fn invalid_authority_report(
+    kind: NamespaceAuthorityFailureKind,
+    selected_generation: Option<u64>,
+    error: impl std::fmt::Display,
+) -> NamespaceAuthorityReport {
+    let detail = error.to_string();
+    let (detail, detail_truncated) = bounded_validation_detail(detail);
+    NamespaceAuthorityReport::Invalid {
+        failure: NamespaceAuthorityFailureReport {
+            kind,
+            selected_generation,
+            detail,
+            detail_truncated,
+        },
+    }
+}
+
+fn bounded_validation_detail(mut detail: String) -> (String, bool) {
+    if detail.len() <= NAMESPACE_VALIDATION_DETAIL_MAX_BYTES {
+        return (detail, false);
+    }
+    let mut end = NAMESPACE_VALIDATION_DETAIL_MAX_BYTES;
+    while !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    detail.truncate(end);
+    (detail, true)
+}
+
+fn create_evidence_backup(
+    options: &StoreOptions,
+    namespace: &fsio::DirectoryPathBinding,
+    lock: &NamespaceLock,
+    requested_destination: &Path,
+    sources: Vec<BackupSourceArtifact>,
+    authority: NamespaceAuthorityReport,
+) -> Result<CompletedEvidenceBackup, CheckpointAdminError> {
+    let destination = with_verified_source(namespace, lock, || {
+        PreparedBackupDestination::create(&options.namespace_dir, requested_destination)
+    })?;
+
+    let mut artifacts = Vec::with_capacity(sources.len());
+    for source in sources {
+        let source_path = options.namespace_dir.join(&source.name);
+        let bytes = with_verified_source(namespace, lock, || {
+            fsio::read_file_bounded_read_only(&source_path, source.artifact, source.max_bytes)?
+                .ok_or_else(|| CheckpointAdminError::BackupArtifactDisappeared {
+                    path: source_path.clone(),
+                })
+        })?;
+        destination.write_file(&source.name, &bytes)?;
+        artifacts.push(EvidenceArtifact {
+            role: source.role,
+            name: source.name,
+            generation: source.generation,
+            length: u64::try_from(bytes.len()).map_err(|_| {
+                CheckpointAdminError::CountOverflow {
+                    field: "backup artifact byte",
+                }
+            })?,
+            sha256: hex::encode(Sha256::digest(&bytes)),
+        });
+    }
+
+    verify_source_binding(namespace, lock)?;
+    let manifest = EvidenceBackupManifest {
+        manifest_version: EVIDENCE_BACKUP_MANIFEST_VERSION,
+        namespace_id: options.namespace_id.clone(),
+        source_namespace: native_path_report(&options.namespace_dir)?,
+        artifacts,
+        authority,
+    };
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest)
+        .map_err(|source| CheckpointAdminError::ManifestEncode { source })?;
+    destination.write_file(EVIDENCE_BACKUP_MANIFEST_FILE_NAME, &manifest_bytes)?;
+    sync_backup_directories(&destination)?;
+    verify_source_binding(namespace, lock)?;
+    Ok(CompletedEvidenceBackup {
+        destination,
+        manifest,
+        manifest_bytes,
+    })
+}
+
+fn verify_source_matches_backup(
+    options: &StoreOptions,
+    limits: &StoreLimits,
+    namespace: &fsio::DirectoryPathBinding,
+    lock: &NamespaceLock,
+    manifest: &EvidenceBackupManifest,
+    required_generation: Option<u64>,
+) -> Result<Vec<BackupSourceArtifact>, CheckpointAdminError> {
+    if manifest.manifest_version != EVIDENCE_BACKUP_MANIFEST_VERSION
+        || manifest.namespace_id != options.namespace_id
+        || manifest.source_namespace != native_path_report(&options.namespace_dir)?
+    {
+        return Err(CheckpointAdminError::BackupVerification {
+            path: options.namespace_dir.clone(),
+            reason: "backup manifest does not identify the locked namespace",
+        });
+    }
+    let sources = with_verified_source(namespace, lock, || match required_generation {
+        Some(generation) => inventory_backup_artifacts(&options.namespace_dir, limits, generation),
+        None => inventory_recognized_artifacts(&options.namespace_dir, limits),
+    })?;
+    if sources.len() != manifest.artifacts.len() {
+        return Err(CheckpointAdminError::BackupVerification {
+            path: options.namespace_dir.clone(),
+            reason: "source artifact inventory changed after backup",
+        });
+    }
+    for (source, artifact) in sources.iter().zip(&manifest.artifacts) {
+        if source.name != artifact.name
+            || source.role != artifact.role
+            || source.generation != artifact.generation
+        {
+            return Err(CheckpointAdminError::BackupVerification {
+                path: options.namespace_dir.join(&source.name),
+                reason: "source artifact identity changed after backup",
+            });
+        }
+        let source_path = options.namespace_dir.join(&source.name);
+        let bytes = with_verified_source(namespace, lock, || {
+            fsio::read_file_bounded_read_only(&source_path, source.artifact, source.max_bytes)?
+                .ok_or_else(|| CheckpointAdminError::BackupArtifactDisappeared {
+                    path: source_path.clone(),
+                })
+        })?;
+        if u64::try_from(bytes.len()).ok() != Some(artifact.length)
+            || hex::encode(Sha256::digest(&bytes)) != artifact.sha256
+        {
+            return Err(CheckpointAdminError::BackupVerification {
+                path: source_path,
+                reason: "source artifact bytes changed after backup",
+            });
+        }
+    }
+    let authority = probe_namespace_authority(options, limits, namespace, lock)?;
+    if authority != manifest.authority {
+        return Err(CheckpointAdminError::BackupVerification {
+            path: options.namespace_dir.clone(),
+            reason: "source authority changed after backup",
+        });
+    }
+    Ok(sources)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NamespaceResetPlan {
+    new_generation: u64,
+    retained_evidence_generations: Vec<u64>,
+}
+
+fn namespace_reset_plan(
+    options: &StoreOptions,
+    limits: &StoreLimits,
+    namespace: &fsio::DirectoryPathBinding,
+    lock: &NamespaceLock,
+    sources: &[BackupSourceArtifact],
+    selected_generation: Option<u64>,
+    allow_staged_resume: bool,
+) -> Result<NamespaceResetPlan, CheckpointAdminError> {
+    let final_generation_count = sources
+        .iter()
+        .filter(|source| {
+            matches!(
+                source.role,
+                EvidenceArtifactRole::Snapshot | EvidenceArtifactRole::Wal
+            )
+        })
+        .filter_map(|source| source.generation)
+        .collect::<BTreeSet<_>>()
+        .len();
+
+    let mut retained_evidence_generations: Vec<u64> = sources
+        .iter()
+        .filter_map(|source| source.generation)
+        .collect();
+    retained_evidence_generations.sort_unstable();
+    retained_evidence_generations.dedup();
+    if final_generation_count >= MAX_GENERATIONS_ON_DISK && allow_staged_resume {
+        let resumable = resumable_empty_generation(
+            options,
+            limits,
+            namespace,
+            lock,
+            sources,
+            selected_generation,
+        )?;
+        let Some(new_generation) = resumable else {
+            return Err(CheckpointAdminError::NamespaceResetGenerationCapacity {
+                generations: final_generation_count,
+                max: MAX_GENERATIONS_ON_DISK,
+            });
+        };
+        return Ok(NamespaceResetPlan {
+            new_generation,
+            retained_evidence_generations,
+        });
+    }
+    if final_generation_count >= MAX_GENERATIONS_ON_DISK {
+        return Err(CheckpointAdminError::NamespaceResetGenerationCapacity {
+            generations: final_generation_count,
+            max: MAX_GENERATIONS_ON_DISK,
+        });
+    }
+
+    let highest = retained_evidence_generations
+        .last()
+        .copied()
+        .into_iter()
+        .chain(selected_generation)
+        .max();
+    let new_generation = match highest {
+        Some(highest) => highest
+            .checked_add(1)
+            .ok_or(StoreError::GenerationOverflow {
+                generation: highest,
+            })?,
+        None => 0,
+    };
+    Ok(NamespaceResetPlan {
+        new_generation,
+        retained_evidence_generations,
+    })
+}
+
+fn resumable_empty_generation(
+    options: &StoreOptions,
+    limits: &StoreLimits,
+    namespace: &fsio::DirectoryPathBinding,
+    lock: &NamespaceLock,
+    sources: &[BackupSourceArtifact],
+    selected_generation: Option<u64>,
+) -> Result<Option<u64>, CheckpointAdminError> {
+    let Some(candidate) = sources.iter().filter_map(|source| source.generation).max() else {
+        return Ok(None);
+    };
+    if selected_generation.is_some_and(|selected| candidate <= selected) {
+        return Ok(None);
+    }
+    let candidate_sources: Vec<&BackupSourceArtifact> = sources
+        .iter()
+        .filter(|source| source.generation == Some(candidate))
+        .collect();
+    if !candidate_sources.iter().any(|source| {
+        matches!(
+            source.role,
+            EvidenceArtifactRole::Snapshot | EvidenceArtifactRole::Wal
+        )
+    }) {
+        return Ok(None);
+    }
+
+    let expected_snapshot =
+        encode_snapshot(candidate, &options.namespace_id, &[]).map_err(|source| {
+            StoreError::Encode {
+                artifact: "empty namespace-reset snapshot",
+                generation: candidate,
+                source,
+            }
+        })?;
+    let expected_wal =
+        encode_wal(candidate, &options.namespace_id, &[]).map_err(|source| StoreError::Encode {
+            artifact: "empty namespace-reset WAL",
+            generation: candidate,
+            source,
+        })?;
+    for source in candidate_sources {
+        let expected = match source.role {
+            EvidenceArtifactRole::Snapshot => expected_snapshot.as_slice(),
+            EvidenceArtifactRole::Wal => expected_wal.as_slice(),
+            EvidenceArtifactRole::SnapshotTemporary
+            | EvidenceArtifactRole::SnapshotBackup
+            | EvidenceArtifactRole::WalTemporary
+            | EvidenceArtifactRole::WalBackup => continue,
+            EvidenceArtifactRole::Current
+            | EvidenceArtifactRole::CurrentTemporary
+            | EvidenceArtifactRole::CurrentBackup => return Ok(None),
+        };
+        let source_path = options.namespace_dir.join(&source.name);
+        let bytes = with_verified_source(namespace, lock, || {
+            fsio::read_file_bounded_read_only(&source_path, source.artifact, source.max_bytes)?
+                .ok_or_else(|| CheckpointAdminError::BackupArtifactDisappeared {
+                    path: source_path.clone(),
+                })
+        })?;
+        if bytes != expected {
+            return Ok(None);
+        }
+    }
+    if expected_snapshot.len() as u64 > limits.max_snapshot_bytes
+        || expected_wal.len() as u64 > limits.max_wal_bytes
+    {
+        return Ok(None);
+    }
+    Ok(Some(candidate))
 }
 
 fn native_path_report(path: &Path) -> Result<NativePathReport, CheckpointAdminError> {
@@ -700,6 +2705,100 @@ impl PreparedBackupDestination {
     }
 }
 
+#[derive(Debug)]
+struct CompletedEvidenceBackup {
+    destination: PreparedBackupDestination,
+    manifest: EvidenceBackupManifest,
+    manifest_bytes: Vec<u8>,
+}
+
+impl CompletedEvidenceBackup {
+    fn verify(&self) -> Result<(), CheckpointAdminError> {
+        self.destination.verify()?;
+        let mut expected_names: BTreeSet<String> = self
+            .manifest
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.name.clone())
+            .collect();
+        let _ = expected_names.insert(EVIDENCE_BACKUP_MANIFEST_FILE_NAME.to_owned());
+        let actual_names: BTreeSet<String> = std::fs::read_dir(self.destination.directory.path())
+            .map_err(|source| CheckpointAdminError::BackupIo {
+                operation: "list the completed checkpoint evidence backup",
+                path: self.destination.directory.path().to_path_buf(),
+                source,
+            })?
+            .map(|entry| {
+                entry
+                    .map_err(|source| CheckpointAdminError::BackupIo {
+                        operation: "read a completed checkpoint evidence-backup entry",
+                        path: self.destination.directory.path().to_path_buf(),
+                        source,
+                    })?
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| CheckpointAdminError::BackupVerification {
+                        path: self.destination.directory.path().to_path_buf(),
+                        reason: "backup contains a non-UTF-8 artifact name",
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+        self.destination.verify()?;
+        if actual_names != expected_names {
+            return Err(CheckpointAdminError::BackupVerification {
+                path: self.destination.directory.path().to_path_buf(),
+                reason: "backup artifact inventory does not match the manifest",
+            });
+        }
+
+        for artifact in &self.manifest.artifacts {
+            let path = self.destination.directory.path().join(&artifact.name);
+            self.destination.verify()?;
+            let bytes = fsio::read_file_bounded_read_only(
+                &path,
+                "checkpoint evidence-backup artifact",
+                artifact.length,
+            )?
+            .ok_or_else(|| CheckpointAdminError::BackupVerification {
+                path: path.clone(),
+                reason: "manifest artifact is absent",
+            })?;
+            self.destination.verify()?;
+            if u64::try_from(bytes.len()).ok() != Some(artifact.length)
+                || hex::encode(Sha256::digest(&bytes)) != artifact.sha256
+            {
+                return Err(CheckpointAdminError::BackupVerification {
+                    path,
+                    reason: "manifest artifact length or digest does not match",
+                });
+            }
+        }
+
+        let manifest_path = self
+            .destination
+            .directory
+            .path()
+            .join(EVIDENCE_BACKUP_MANIFEST_FILE_NAME);
+        let manifest_bytes = fsio::read_file_bounded_read_only(
+            &manifest_path,
+            "checkpoint evidence-backup manifest",
+            self.manifest_bytes.len() as u64,
+        )?
+        .ok_or_else(|| CheckpointAdminError::BackupVerification {
+            path: manifest_path.clone(),
+            reason: "backup manifest is absent",
+        })?;
+        self.destination.verify()?;
+        if manifest_bytes != self.manifest_bytes {
+            return Err(CheckpointAdminError::BackupVerification {
+                path: manifest_path,
+                reason: "backup manifest bytes changed after sync",
+            });
+        }
+        Ok(())
+    }
+}
+
 fn sync_backup_directories(
     destination: &PreparedBackupDestination,
 ) -> Result<(), CheckpointAdminError> {
@@ -824,10 +2923,9 @@ struct BackupSourceArtifact {
     max_bytes: u64,
 }
 
-fn inventory_backup_artifacts(
+fn inventory_recognized_artifacts(
     namespace_dir: &Path,
     limits: &StoreLimits,
-    selected_generation: u64,
 ) -> Result<Vec<BackupSourceArtifact>, CheckpointAdminError> {
     let entries =
         std::fs::read_dir(namespace_dir).map_err(|source| CheckpointAdminError::BackupIo {
@@ -838,9 +2936,6 @@ fn inventory_backup_artifacts(
     let mut sources = Vec::new();
     let mut temporary_count = 0usize;
     let mut final_generations = BTreeSet::new();
-    let mut has_current = false;
-    let mut has_selected_snapshot = false;
-    let mut has_selected_wal = false;
     for entry in entries {
         let entry = entry.map_err(|source| CheckpointAdminError::BackupIo {
             operation: "read a checkpoint namespace entry for evidence backup",
@@ -865,26 +2960,6 @@ fn inventory_backup_artifacts(
         };
         if classification.kind == NamespaceArtifactKind::OwnershipLock {
             continue;
-        }
-        match (
-            classification.kind,
-            classification.form,
-            classification.generation,
-        ) {
-            (NamespaceArtifactKind::Current, ArtifactForm::Final, None) => {
-                has_current = true;
-            }
-            (NamespaceArtifactKind::Snapshot, ArtifactForm::Final, Some(generation))
-                if generation == selected_generation =>
-            {
-                has_selected_snapshot = true;
-            }
-            (NamespaceArtifactKind::Wal, ArtifactForm::Final, Some(generation))
-                if generation == selected_generation =>
-            {
-                has_selected_wal = true;
-            }
-            _ => {}
         }
         if classification.form != ArtifactForm::Final {
             if temporary_count >= MAX_TEMP_FILES {
@@ -962,6 +3037,26 @@ fn inventory_backup_artifacts(
             max_bytes,
         });
     }
+    sources.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(sources)
+}
+
+fn inventory_backup_artifacts(
+    namespace_dir: &Path,
+    limits: &StoreLimits,
+    selected_generation: u64,
+) -> Result<Vec<BackupSourceArtifact>, CheckpointAdminError> {
+    let sources = inventory_recognized_artifacts(namespace_dir, limits)?;
+    let has_current = sources
+        .iter()
+        .any(|source| source.role == EvidenceArtifactRole::Current && source.generation.is_none());
+    let has_selected_snapshot = sources.iter().any(|source| {
+        source.role == EvidenceArtifactRole::Snapshot
+            && source.generation == Some(selected_generation)
+    });
+    let has_selected_wal = sources.iter().any(|source| {
+        source.role == EvidenceArtifactRole::Wal && source.generation == Some(selected_generation)
+    });
     if !has_current {
         return Err(CheckpointAdminError::RequiredArtifactMissing {
             artifact: "canonical CURRENT marker",
@@ -980,7 +3075,6 @@ fn inventory_backup_artifacts(
             path: namespace_dir.join(wal_file_name(selected_generation)),
         });
     }
-    sources.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(sources)
 }
 

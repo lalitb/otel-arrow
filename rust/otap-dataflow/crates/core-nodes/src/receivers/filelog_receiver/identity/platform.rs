@@ -10,7 +10,8 @@ use std::path::Path;
 
 use super::{CandidateEvidence, IdentityError};
 use crate::receivers::filelog_receiver::checkpoint::primitives::{
-    AdvisoryPath, COMMITTED_FRONTIER_GUARD_WINDOW_BYTES, CommittedFrontierWindow, Locator,
+    AdvisoryPath, COMMITTED_FRONTIER_GUARD_WINDOW_BYTES, CommittedFrontierGuard,
+    CommittedFrontierWindow, Locator,
 };
 
 /// An opened regular-file candidate and the evidence collected from that
@@ -19,6 +20,14 @@ use crate::receivers::filelog_receiver::checkpoint::primitives::{
 pub(crate) struct OpenedCandidate {
     pub(crate) file: File,
     pub(crate) evidence: CandidateEvidence,
+}
+
+/// Stable EOF evidence sampled from one exact-locator regular-file handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StableEofEvidence {
+    pub(crate) locator: Locator,
+    pub(crate) offset: u64,
+    pub(crate) committed_frontier_guard: CommittedFrontierGuard,
 }
 
 struct OpenedLocator {
@@ -183,8 +192,17 @@ fn open_candidate_at_expected_cancellable(
 pub(crate) fn open_locator_for_stability_check_cancellable(
     open_path: &Path,
     follow_symlinks: bool,
-    mut cancelled: impl FnMut() -> bool,
+    cancelled: impl FnMut() -> bool,
 ) -> Result<Option<Locator>, IdentityError> {
+    open_locator_and_size_for_stability_check_cancellable(open_path, follow_symlinks, cancelled)
+        .map(|observation| observation.map(|(locator, _size)| locator))
+}
+
+fn open_locator_and_size_for_stability_check_cancellable(
+    open_path: &Path,
+    follow_symlinks: bool,
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<Option<(Locator, u64)>, IdentityError> {
     if cancelled() {
         return Ok(None);
     }
@@ -211,7 +229,169 @@ pub(crate) fn open_locator_for_stability_check_cancellable(
             path: open_path.to_path_buf(),
         });
     }
-    locator_from_handle_cancellable(&file, open_path, follow_symlinks, &mut cancelled)
+    let Some(locator) =
+        locator_from_handle_cancellable(&file, open_path, follow_symlinks, &mut cancelled)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((locator, metadata.len())))
+}
+
+/// Opens an operator-supplied path, proves the immutable locator, and
+/// samples a stable EOF plus its real trailing committed-frontier guard.
+pub(crate) fn open_stable_eof(
+    open_path: &Path,
+    follow_symlinks: bool,
+    expected_locator: Locator,
+) -> Result<StableEofEvidence, IdentityError> {
+    open_stable_eof_inner(open_path, follow_symlinks, expected_locator, || {})
+}
+
+#[cfg(test)]
+pub(crate) fn open_stable_eof_with_hook(
+    open_path: &Path,
+    follow_symlinks: bool,
+    expected_locator: Locator,
+    after_first_sample: impl FnOnce(),
+) -> Result<StableEofEvidence, IdentityError> {
+    open_stable_eof_inner(
+        open_path,
+        follow_symlinks,
+        expected_locator,
+        after_first_sample,
+    )
+}
+
+fn open_stable_eof_inner(
+    open_path: &Path,
+    follow_symlinks: bool,
+    expected_locator: Locator,
+    after_first_sample: impl FnOnce(),
+) -> Result<StableEofEvidence, IdentityError> {
+    let file = open_read_only(open_path, follow_symlinks).map_err(|source| {
+        if no_follow_rejected_symlink(&source, follow_symlinks) {
+            IdentityError::SymlinkOrReparsePoint {
+                path: open_path.to_path_buf(),
+            }
+        } else {
+            IdentityError::Io {
+                operation: "open reset-to-end source",
+                path: open_path.to_path_buf(),
+                source,
+            }
+        }
+    })?;
+    let first_metadata = file.metadata().map_err(|source| IdentityError::Io {
+        operation: "read reset-to-end source metadata",
+        path: open_path.to_path_buf(),
+        source,
+    })?;
+    let first_locator =
+        locator_from_handle_cancellable(&file, open_path, follow_symlinks, &mut || false)?
+            .expect("non-cancellable reset-to-end locator collection cannot be cancelled");
+    if !first_metadata.is_file() {
+        return Err(IdentityError::NotRegularFile {
+            path: open_path.to_path_buf(),
+        });
+    }
+    if first_locator != expected_locator {
+        return Err(IdentityError::ReopenLocatorMismatch {
+            path: open_path.to_path_buf(),
+            expected: expected_locator,
+            found: first_locator,
+        });
+    }
+    let offset = first_metadata.len();
+    let window_len = offset.min(u64::from(COMMITTED_FRONTIER_GUARD_WINDOW_BYTES)) as usize;
+    let window_offset = offset - window_len as u64;
+    let first_window =
+        read_fingerprint_cancellable(&file, window_offset, window_len, &mut || false)
+            .map_err(|source| IdentityError::Io {
+                operation: "read reset-to-end committed-frontier window",
+                path: open_path.to_path_buf(),
+                source,
+            })?
+            .expect("non-cancellable reset-to-end source read cannot be cancelled");
+    if first_window.len() != window_len {
+        return Err(IdentityError::CandidateChangedDuringIdentity {
+            path: open_path.to_path_buf(),
+        });
+    }
+
+    after_first_sample();
+
+    let second_metadata = file.metadata().map_err(|source| IdentityError::Io {
+        operation: "recheck reset-to-end source metadata",
+        path: open_path.to_path_buf(),
+        source,
+    })?;
+    let second_locator =
+        locator_from_handle_cancellable(&file, open_path, follow_symlinks, &mut || false)?
+            .expect("non-cancellable reset-to-end locator recheck cannot be cancelled");
+    if !second_metadata.is_file()
+        || second_metadata.len() != offset
+        || second_locator != first_locator
+    {
+        return Err(IdentityError::CandidateChangedDuringIdentity {
+            path: open_path.to_path_buf(),
+        });
+    }
+    let second_window =
+        read_fingerprint_cancellable(&file, window_offset, window_len, &mut || false)
+            .map_err(|source| IdentityError::Io {
+                operation: "reread reset-to-end committed-frontier window",
+                path: open_path.to_path_buf(),
+                source,
+            })?
+            .expect("non-cancellable reset-to-end source reread cannot be cancelled");
+    if second_window != first_window {
+        return Err(IdentityError::CandidateChangedDuringIdentity {
+            path: open_path.to_path_buf(),
+        });
+    }
+    let final_metadata = file.metadata().map_err(|source| IdentityError::Io {
+        operation: "finalize reset-to-end source metadata",
+        path: open_path.to_path_buf(),
+        source,
+    })?;
+    let final_locator =
+        locator_from_handle_cancellable(&file, open_path, follow_symlinks, &mut || false)?
+            .expect("non-cancellable reset-to-end final locator check cannot be cancelled");
+    if !final_metadata.is_file() || final_metadata.len() != offset || final_locator != first_locator
+    {
+        return Err(IdentityError::CandidateChangedDuringIdentity {
+            path: open_path.to_path_buf(),
+        });
+    }
+    let (path_locator, path_size) =
+        open_locator_and_size_for_stability_check_cancellable(open_path, follow_symlinks, || {
+            false
+        })?
+        .expect("non-cancellable reset-to-end path recheck cannot be cancelled");
+    if path_locator != first_locator || path_size != offset {
+        return Err(IdentityError::CandidateChangedDuringIdentity {
+            path: open_path.to_path_buf(),
+        });
+    }
+    let committed_frontier_guard = CommittedFrontierGuard::compute(offset, &second_window)
+        .map_err(|_| IdentityError::CandidateChangedDuringIdentity {
+            path: open_path.to_path_buf(),
+        })?;
+    Ok(StableEofEvidence {
+        locator: first_locator,
+        offset,
+        committed_frontier_guard,
+    })
+}
+
+#[cfg(unix)]
+fn no_follow_rejected_symlink(source: &io::Error, follow_symlinks: bool) -> bool {
+    !follow_symlinks && source.raw_os_error() == Some(libc::ELOOP)
+}
+
+#[cfg(not(unix))]
+fn no_follow_rejected_symlink(_source: &io::Error, _follow_symlinks: bool) -> bool {
+    false
 }
 
 fn open_verified_locator_at_expected_cancellable(
@@ -576,16 +756,19 @@ fn open_read_only(path: &Path, follow_symlinks: bool) -> io::Result<File> {
 fn open_read_only(path: &Path, follow_symlinks: bool) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
     let mut options = OpenOptions::new();
     options
         .read(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+    let mut flags = FILE_FLAG_BACKUP_SEMANTICS;
     if !follow_symlinks {
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        flags |= FILE_FLAG_OPEN_REPARSE_POINT;
     }
+    options.custom_flags(flags);
     options.open(path)
 }
 

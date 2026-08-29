@@ -2315,6 +2315,49 @@ fn missing_current_adopts_a_valid_authoritative_marker_temp() {
     assert!(!path.join(CURRENT_TEMP_FILE_NAME).exists());
 }
 
+/// Scenario: an audited namespace reset jumps from generation 1 to 10 while
+/// retaining generation 0, and an authority-uncertain replacement leaves
+/// CURRENT absent with generation 1 in CURRENT.bak and 10 in CURRENT.tmp.
+/// Guarantees: recovery accepts the complete strictly-highest reset
+/// generation without requiring consecutive numbering or deleting retained
+/// evidence.
+#[test]
+fn missing_current_adopts_a_nonconsecutive_admin_reset_marker_temp() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    let _ = seeded_namespace(&path);
+    let mut store = open(&path);
+    store.compact().expect("generation 1 publishes");
+    assert_eq!(store.generation(), 1);
+    drop(store);
+
+    fs::write(
+        path.join(snapshot_file_name(10)),
+        encode_snapshot(10, NAMESPACE_ID, &[]).expect("empty reset snapshot encodes"),
+    )
+    .expect("reset snapshot writes");
+    fs::write(
+        path.join(wal_file_name(10)),
+        encode_wal(10, NAMESPACE_ID, &[]).expect("empty reset WAL encodes"),
+    )
+    .expect("reset WAL writes");
+    fs::rename(
+        path.join(CURRENT_FILE_NAME),
+        path.join(CURRENT_BACKUP_FILE_NAME),
+    )
+    .expect("old marker moves to backup");
+    fs::write(path.join(CURRENT_TEMP_FILE_NAME), encode_current_marker(10))
+        .expect("new marker remains temporary");
+
+    let reopened = open(&path);
+    assert_eq!(reopened.generation(), 10);
+    assert!(reopened.table().is_empty());
+    assert!(path.join(snapshot_file_name(0)).is_file());
+    assert!(path.join(wal_file_name(0)).is_file());
+    assert!(path.join(snapshot_file_name(1)).is_file());
+    assert!(path.join(wal_file_name(1)).is_file());
+}
+
 /// Scenario: the exact Windows error-1177 postcondition leaves the old
 /// marker under `CURRENT.bak`, the new marker under `CURRENT.tmp`, and no
 /// `CURRENT`, while both consecutive generation pairs remain complete.
