@@ -456,6 +456,10 @@ impl TrafficGeneratorReceiver {
                             self.metrics.logs_bytes_produced.add(bytes as u64);
                         }
                     }
+                    // The producer returns a typed error before it can emit Profiles.
+                    otel_arrow_dfe_config::SignalType::Profiles => {
+                        unreachable!("traffic generator cannot produce Profiles")
+                    }
                 };
                 Ok(Ok(count))
             }
@@ -775,6 +779,7 @@ mod tests {
     use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::LogsData;
     use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::MetricsData;
     use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::metric::Data;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::profiles::v1development::ProfilesData;
     use otel_arrow_dfe_pdata::proto::opentelemetry::trace::v1::TracesData;
     use otel_arrow_dfe_telemetry::registry::TelemetryRegistryHandle;
     use prost::Message;
@@ -887,6 +892,9 @@ mod tests {
             ),
             OtlpProtoBytes::ExportTracesRequest(bytes) => OtlpProtoMessage::Traces(
                 TracesData::decode(bytes.as_ref()).expect("can decode bytes"),
+            ),
+            OtlpProtoBytes::ExportProfilesRequest(bytes) => OtlpProtoMessage::Profiles(
+                ProfilesData::decode(bytes.as_ref()).expect("can decode bytes"),
             ),
         }
     }
@@ -1064,6 +1072,9 @@ mod tests {
                                 }
                             }
                         }
+                        OtlpProtoMessage::Profiles(_) => {
+                            panic!("traffic generator does not produce Profiles")
+                        }
                     }
                 }
             })
@@ -1143,6 +1154,9 @@ mod tests {
                                     assert!(scope.log_records.len() <= MAX_BATCH);
                                 }
                             }
+                        }
+                        OtlpProtoMessage::Profiles(_) => {
+                            panic!("traffic generator does not produce Profiles")
                         }
                     }
                 }
@@ -1224,6 +1238,9 @@ mod tests {
                                 }
                             }
                         }
+                        OtlpProtoMessage::Profiles(_) => {
+                            panic!("traffic generator does not produce Profiles")
+                        }
                     }
                 }
 
@@ -1295,6 +1312,9 @@ mod tests {
                                     received_messages += scope.log_records.len();
                                 }
                             }
+                        }
+                        OtlpProtoMessage::Profiles(_) => {
+                            panic!("traffic generator does not produce Profiles")
                         }
                     }
                 }

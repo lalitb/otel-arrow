@@ -467,10 +467,12 @@ impl AzureMonitorExporter {
                             })?;
                             Some(self.transformer.convert_to_log_analytics(&logs_view))
                         }
-                        OtapArrowRecords::Metrics(_) | OtapArrowRecords::Traces(_) => {
+                        OtapArrowRecords::Metrics(_)
+                        | OtapArrowRecords::Traces(_)
+                        | OtapArrowRecords::Profiles(_) => {
                             otel_warn!(
                                 "azure_monitor_exporter.message.unsupported_signal",
-                                signal = "metrics_or_traces",
+                                signal = "metrics_traces_or_profiles",
                                 format = "otap_arrow"
                             );
                             None
@@ -482,10 +484,11 @@ impl AzureMonitorExporter {
                             Some(self.transformer.convert_to_log_analytics(&logs_view))
                         }
                         OtlpProtoBytes::ExportMetricsRequest(_)
-                        | OtlpProtoBytes::ExportTracesRequest(_) => {
+                        | OtlpProtoBytes::ExportTracesRequest(_)
+                        | OtlpProtoBytes::ExportProfilesRequest(_) => {
                             otel_warn!(
                                 "azure_monitor_exporter.message.unsupported_signal",
-                                signal = "metrics_or_traces",
+                                signal = "metrics_traces_or_profiles",
                                 format = "otlp_proto"
                             );
                             None

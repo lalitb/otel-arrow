@@ -250,6 +250,7 @@ struct SegmentMetricsSummary {
     total_logs: u64,
     total_metrics: u64,
     total_spans: u64,
+    total_profiles: u64,
 }
 
 /// Cached segment summary with recency tracking for bounded eviction.
@@ -665,6 +666,7 @@ impl DurableBuffer {
         let mut logs = 0u64;
         let mut metrics = 0u64;
         let mut spans = 0u64;
+        let mut profiles = 0u64;
 
         // Step 2: iterate finalized segments, populating cache on miss.
         for (&seg_seq, progress) in &progress_snapshot {
@@ -687,6 +689,7 @@ impl DurableBuffer {
                             let mut tl = 0u64;
                             let mut tm = 0u64;
                             let mut ts = 0u64;
+                            let mut tp = 0u64;
 
                             let bundles: Vec<_> = metadata
                                 .iter()
@@ -700,6 +703,7 @@ impl DurableBuffer {
                                         Some(SignalType::Logs) => tl += entry.item_count,
                                         Some(SignalType::Metrics) => tm += entry.item_count,
                                         Some(SignalType::Traces) => ts += entry.item_count,
+                                        Some(SignalType::Profiles) => tp += entry.item_count,
                                         None => {}
                                     }
                                     (entry.item_count, sig)
@@ -711,6 +715,7 @@ impl DurableBuffer {
                                 total_logs: tl,
                                 total_metrics: tm,
                                 total_spans: ts,
+                                total_profiles: tp,
                             }
                         }
                         Err(e) => {
@@ -738,12 +743,14 @@ impl DurableBuffer {
             let mut seg_logs = 0;
             let mut seg_metrics = 0;
             let mut seg_spans = 0;
+            let mut seg_profiles = 0;
 
             // Fast path: no bundles resolved -> use precomputed totals.
             if progress.resolved_count() == 0 {
                 seg_logs = summary.total_logs;
                 seg_metrics = summary.total_metrics;
                 seg_spans = summary.total_spans;
+                seg_profiles = summary.total_profiles;
             } else {
                 // Slow path: iterate per-bundle, skipping resolved.
                 for (idx, &(item_count, signal)) in summary.bundles.iter().enumerate() {
@@ -762,6 +769,7 @@ impl DurableBuffer {
                             Some(SignalType::Logs) => seg_logs += item_count,
                             Some(SignalType::Metrics) => seg_metrics += item_count,
                             Some(SignalType::Traces) => seg_spans += item_count,
+                            Some(SignalType::Profiles) => seg_profiles += item_count,
                             None => {}
                         }
                     }
@@ -771,6 +779,7 @@ impl DurableBuffer {
             logs += seg_logs;
             metrics += seg_metrics;
             spans += seg_spans;
+            profiles += seg_profiles;
         }
 
         // Step 3: add items from the open (accumulating) segment.
@@ -790,6 +799,7 @@ impl DurableBuffer {
                 Some(SignalType::Logs) => logs += bundle.item_count,
                 Some(SignalType::Metrics) => metrics += bundle.item_count,
                 Some(SignalType::Traces) => spans += bundle.item_count,
+                Some(SignalType::Profiles) => profiles += bundle.item_count,
                 None => {}
             }
         }
@@ -848,6 +858,10 @@ impl DurableBuffer {
             .items_for_signal(SignalType::Traces)
             .queued
             .set(spans);
+        self.metrics
+            .items_for_signal(SignalType::Profiles)
+            .queued
+            .set(profiles);
     }
 
     /// Initialize the Quiver engine and subscriber.
@@ -2659,6 +2673,38 @@ mod tests {
         );
     }
 
+    /// Scenario: A Profiles bundle is present in the open durable-buffer segment.
+    /// Guarantees: Queued item gauges include Profiles items before segment finalization.
+    #[tokio::test]
+    async fn test_open_segment_profiles_included_in_queued_gauge() {
+        let (mut processor, engine, subscriber_id, _temp_dir) = setup_test_processor(None).await;
+
+        let slot_id = SlotId::new(46);
+        let bundle = make_simple_bundle(slot_id, 7);
+
+        engine.ingest(&bundle).await.unwrap();
+
+        let open_bundles = engine.open_segment_bundle_summaries();
+        assert_eq!(open_bundles.len(), 1);
+        assert_eq!(open_bundles[0].item_count, 7);
+        assert!(open_bundles[0].slot_ids.contains(&slot_id));
+
+        processor.recompute_metrics(&engine, &subscriber_id);
+
+        assert_eq!(
+            processor
+                .metrics
+                .item_metrics
+                .get(SignalAttributes {
+                    signal: SignalType::Profiles,
+                })
+                .queued
+                .get(),
+            7,
+            "queued Profiles gauge should include open-segment items"
+        );
+    }
+
     #[test]
     fn test_segment_cache_bound_evicts_oldest_and_warn_marker() {
         use otel_arrow_dfe_engine::context::ControllerContext;
@@ -2692,6 +2738,7 @@ mod tests {
                     total_logs: 0,
                     total_metrics: 0,
                     total_spans: 0,
+                    total_profiles: 0,
                 },
                 last_seen_generation: 1,
             },
@@ -2704,6 +2751,7 @@ mod tests {
                     total_logs: 0,
                     total_metrics: 0,
                     total_spans: 0,
+                    total_profiles: 0,
                 },
                 last_seen_generation: 2,
             },
@@ -2716,6 +2764,7 @@ mod tests {
                     total_logs: 0,
                     total_metrics: 0,
                     total_spans: 0,
+                    total_profiles: 0,
                 },
                 last_seen_generation: 3,
             },

@@ -58,7 +58,7 @@ use otel_arrow_dfe_pdata::TryIntoWithOptions;
 use otel_arrow_dfe_pdata::{
     OtapArrowRecords, OtapPayload, OtapPayloadHelpers, OtlpProtoBytes, PayloadData,
     error::Error as PDataError,
-    otap::batching::make_item_batches,
+    otap::{Profiles, batching::make_item_batches},
     otlp::batching::{BytesBatches, make_bytes_batches_owned},
 };
 use otel_arrow_dfe_telemetry::instrument::{Counter, Mmsc};
@@ -93,12 +93,13 @@ const LOG_MSG_BATCHING_FAILED_SUFFIX: &str = "; dropping";
 const fn wakeup_slot(format: SignalFormat, signal: SignalType) -> WakeupSlot {
     let format_base = match format {
         SignalFormat::OtapRecords => 0,
-        SignalFormat::OtlpBytes => 3,
+        SignalFormat::OtlpBytes => 4,
     };
     let signal_offset = match signal {
         SignalType::Logs => 0,
         SignalType::Metrics => 1,
         SignalType::Traces => 2,
+        SignalType::Profiles => 3,
     };
     WakeupSlot(format_base + signal_offset)
 }
@@ -108,9 +109,11 @@ const fn signal_from_wakeup_slot(slot: WakeupSlot) -> Option<(SignalFormat, Sign
         0 => Some((SignalFormat::OtapRecords, SignalType::Logs)),
         1 => Some((SignalFormat::OtapRecords, SignalType::Metrics)),
         2 => Some((SignalFormat::OtapRecords, SignalType::Traces)),
-        3 => Some((SignalFormat::OtlpBytes, SignalType::Logs)),
-        4 => Some((SignalFormat::OtlpBytes, SignalType::Metrics)),
-        5 => Some((SignalFormat::OtlpBytes, SignalType::Traces)),
+        3 => Some((SignalFormat::OtapRecords, SignalType::Profiles)),
+        4 => Some((SignalFormat::OtlpBytes, SignalType::Logs)),
+        5 => Some((SignalFormat::OtlpBytes, SignalType::Metrics)),
+        6 => Some((SignalFormat::OtlpBytes, SignalType::Traces)),
+        7 => Some((SignalFormat::OtlpBytes, SignalType::Profiles)),
         _ => None,
     }
 }
@@ -496,6 +499,7 @@ struct SignalBatches<T: OtapPayloadHelpers> {
     logs: SignalBuffer<T>,
     metrics: SignalBuffer<T>,
     traces: SignalBuffer<T>,
+    profiles: SignalBuffer<T>,
 }
 
 /// Per-input wait context, including the arriving request's context.
@@ -725,12 +729,17 @@ impl BatchProcessor {
         Ok(ProcessorWrapper::local(proc, node, user_config, proc_cfg))
     }
 
-    /// Flush all per-signal buffers (logs, metrics, traces).
+    /// Flush all per-signal buffers.
     async fn flush_shutdown(
         &mut self,
         effect: &mut local::EffectHandler<OtapPdata>,
     ) -> Result<(), EngineError> {
-        for signal in [SignalType::Logs, SignalType::Traces, SignalType::Metrics] {
+        for signal in [
+            SignalType::Logs,
+            SignalType::Traces,
+            SignalType::Metrics,
+            SignalType::Profiles,
+        ] {
             if let Some(mut otap_signals) = self.otap_format() {
                 otap_signals
                     .for_signal(signal)
@@ -853,6 +862,7 @@ where
                 SignalType::Logs => &mut self.signals.logs,
                 SignalType::Traces => &mut self.signals.traces,
                 SignalType::Metrics => &mut self.signals.metrics,
+                SignalType::Profiles => &mut self.signals.profiles,
             },
             metrics: self.metrics,
         }
@@ -892,6 +902,7 @@ impl Batcher<OtapArrowRecords> for SignalBuffer<OtapArrowRecords> {
             SignalType::Traces => {
                 OtapArrowRecords::Traces(otel_arrow_dfe_pdata::otap::Traces::default())
             }
+            SignalType::Profiles => OtapArrowRecords::Profiles(Profiles::default()),
         }
     }
 
@@ -930,6 +941,7 @@ impl Batcher<OtlpProtoBytes> for SignalBuffer<OtlpProtoBytes> {
             SignalType::Logs => OtlpProtoBytes::ExportLogsRequest(Bytes::new()),
             SignalType::Metrics => OtlpProtoBytes::ExportMetricsRequest(Bytes::new()),
             SignalType::Traces => OtlpProtoBytes::ExportTracesRequest(Bytes::new()),
+            SignalType::Profiles => OtlpProtoBytes::ExportProfilesRequest(Bytes::new()),
         }
     }
 
@@ -1435,6 +1447,7 @@ where
             logs: SignalBuffer::new(config),
             traces: SignalBuffer::new(config),
             metrics: SignalBuffer::new(config),
+            profiles: SignalBuffer::new(config),
         }
     }
 }
@@ -2033,6 +2046,7 @@ mod tests {
                                     encode_logs_otap_batch(l).expect("encode logs")
                                 }
                                 OtlpProtoMessage::Metrics(_) => unimplemented!("metrics"),
+                                OtlpProtoMessage::Profiles(_) => unimplemented!("profiles"),
                             };
 
                             let pdata = OtapPdata::new_default(rec.into());
@@ -2709,6 +2723,87 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 // 1 input consumed; 1 batch produced by the shutdown flush.
             });
+    }
+
+    /// Scenario: A subscribed OTLP Profiles request remains below the size threshold at shutdown.
+    /// Guarantees: Shutdown flushes the Profiles buffer and downstream Ack releases its completion.
+    #[test]
+    fn test_shutdown_flushes_buffered_otlp_profiles() {
+        let (_telemetry_registry, metrics_reporter, phase) = setup_test_runtime(json!({
+            "format": "otlp",
+            "otlp": {
+                "min_size": 100,
+                "max_size": 100,
+                "sizer": "bytes",
+            },
+            "max_batch_duration": "10s"
+        }));
+
+        phase
+            .run_test(move |mut ctx| async move {
+                let (runtime_ctrl_tx, _runtime_ctrl_rx) = runtime_ctrl_msg_channel(10);
+                let (pipeline_completion_tx, mut pipeline_completion_rx) =
+                    pipeline_completion_msg_channel(10);
+                ctx.set_runtime_ctrl_sender(runtime_ctrl_tx);
+                ctx.set_pipeline_completion_sender(pipeline_completion_tx);
+
+                let request =
+                    OtlpProtoBytes::ExportProfilesRequest(Bytes::from_static(b"\x0a\x00\x12\x00"));
+                let pdata = OtapPdata::new_default(request.into()).test_subscribe_to(
+                    Interests::ACKS | Interests::NACKS,
+                    TestCallData::default().into(),
+                    18,
+                );
+
+                ctx.process(Message::PData(pdata))
+                    .await
+                    .expect("process Profiles input");
+                assert!(
+                    ctx.drain_pdata().await.is_empty(),
+                    "Profiles input should remain buffered before shutdown"
+                );
+
+                ctx.process(Message::Control(NodeControlMsg::Shutdown {
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    reason: "test shutdown".into(),
+                }))
+                .await
+                .expect("process shutdown");
+
+                let mut outputs = ctx.drain_pdata().await;
+                assert_eq!(outputs.len(), 1, "shutdown should flush Profiles");
+                let output = outputs.remove(0);
+                assert_eq!(output.signal_type(), SignalType::Profiles);
+
+                let (_, ack) = next_ack(AckMsg::new(output)).expect("expected ack subscriber");
+                ctx.process(Message::Control(NodeControlMsg::Ack(ack)))
+                    .await
+                    .expect("process ack");
+
+                match next_completion(
+                    &mut pipeline_completion_rx,
+                    Duration::from_secs(1),
+                    "Profiles completion after shutdown flush",
+                )
+                .await
+                {
+                    PipelineCompletionMsg::DeliverAck { ack } => {
+                        let (node_id, ack) = next_ack(ack).expect("expected ack subscriber");
+                        assert_eq!(node_id, 18);
+                        let calldata: TestCallData =
+                            ack.unwind.route.calldata.try_into().expect("calldata");
+                        assert_eq!(TestCallData::default(), calldata);
+                    }
+                    other => panic!("expected Profiles Ack after shutdown, got {other:?}"),
+                }
+
+                ctx.process(Message::Control(NodeControlMsg::CollectTelemetry {
+                    metrics_reporter,
+                }))
+                .await
+                .expect("collect telemetry");
+            })
+            .validate(|_| async move {});
     }
 
     // Subscribed requests consume bounded inbound slots until downstream outcomes

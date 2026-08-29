@@ -213,6 +213,7 @@ impl local::Processor<OtapPdata> for FilterProcessor {
                                     )?;
                                 Ok((filtered, consumed, filtered_count))
                             }
+                            SignalType::Profiles => Ok((arrow_records, 0, 0)),
                         }
                     })?;
 

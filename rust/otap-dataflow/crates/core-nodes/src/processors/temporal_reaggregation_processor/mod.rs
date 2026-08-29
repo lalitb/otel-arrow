@@ -286,7 +286,7 @@ impl local::Processor<OtapPdata> for TemporalReaggregationProcessor {
                         self.process_metric_pdata(effect_handler, pdata).await?;
                     }
                     // Non-metrics signals pass through unchanged.
-                    SignalType::Logs | SignalType::Traces => {
+                    SignalType::Logs | SignalType::Traces | SignalType::Profiles => {
                         effect_handler.send_message_with_source_node(pdata).await?;
                     }
                 }

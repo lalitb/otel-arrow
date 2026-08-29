@@ -1491,6 +1491,9 @@ impl GenevaExporter {
                         self.metrics.metrics_payloads_dropped.inc();
                         Err("Geneva exporter does not support metrics signal".to_string())
                     }
+                    OtapArrowRecords::Profiles(_) => {
+                        Err("Geneva exporter does not support Profiles signal".to_string())
+                    }
                 }
             }
 
@@ -1566,6 +1569,9 @@ impl GenevaExporter {
                     OtlpProtoBytes::ExportMetricsRequest(_) => {
                         self.metrics.metrics_payloads_dropped.inc();
                         Err("Geneva exporter does not support metrics signal".to_string())
+                    }
+                    OtlpProtoBytes::ExportProfilesRequest(_) => {
+                        Err("Geneva exporter does not support Profiles signal".to_string())
                     }
                 }
             }

@@ -90,6 +90,7 @@ use crate::otlp::metrics::MetricsProtoBytesEncoder;
 use crate::otlp::traces::TracesProtoBytesEncoder;
 use crate::otlp::{OtlpProtoBytes, ProtoBuffer, ProtoBytesEncoder};
 use crate::proto::OtlpProtoMessage;
+use crate::proto::opentelemetry::collector::profiles::v1development::ExportProfilesServiceRequest;
 use crate::views::otlp::bytes::logs::RawLogsData;
 use crate::views::otlp::bytes::metrics::RawMetricsData;
 use crate::views::otlp::bytes::traces::RawTraceData;
@@ -378,6 +379,7 @@ impl OtapPayloadHelpers for OtapArrowRecords {
             Self::Logs(_) => SignalType::Logs,
             Self::Metrics(_) => SignalType::Metrics,
             Self::Traces(_) => SignalType::Traces,
+            Self::Profiles(_) => SignalType::Profiles,
         }
     }
 
@@ -394,6 +396,7 @@ impl OtapPayloadHelpers for OtapArrowRecords {
             Self::Logs(value) => Self::Logs(std::mem::take(value)),
             Self::Metrics(value) => Self::Metrics(std::mem::take(value)),
             Self::Traces(value) => Self::Traces(std::mem::take(value)),
+            Self::Profiles(value) => Self::Profiles(std::mem::take(value)),
         }
     }
 
@@ -408,6 +411,9 @@ impl OtapPayloadHelpers for OtapArrowRecords {
             Self::Metrics(_) => self
                 .get(crate::proto::opentelemetry::arrow::v1::ArrowPayloadType::UnivariateMetrics)
                 .is_none_or(|batch| batch.num_rows() == 0),
+            Self::Profiles(_) => self
+                .get(crate::proto::opentelemetry::arrow::v1::ArrowPayloadType::Profiles)
+                .is_none_or(|batch| batch.num_rows() == 0),
         }
     }
 
@@ -417,6 +423,7 @@ impl OtapPayloadHelpers for OtapArrowRecords {
             Self::Logs(records) => records.num_items(),
             Self::Traces(records) => records.num_items(),
             Self::Metrics(records) => records.num_items(),
+            Self::Profiles(records) => records.num_items(),
         }
     }
 }
@@ -427,6 +434,7 @@ impl OtapPayloadHelpers for OtlpProtoBytes {
             Self::ExportLogsRequest(_) => SignalType::Logs,
             Self::ExportMetricsRequest(_) => SignalType::Metrics,
             Self::ExportTracesRequest(_) => SignalType::Traces,
+            Self::ExportProfilesRequest(_) => SignalType::Profiles,
         }
     }
 
@@ -443,6 +451,7 @@ impl OtapPayloadHelpers for OtlpProtoBytes {
             Self::ExportLogsRequest(bytes) => bytes.is_empty(),
             Self::ExportMetricsRequest(bytes) => bytes.is_empty(),
             Self::ExportTracesRequest(bytes) => bytes.is_empty(),
+            Self::ExportProfilesRequest(bytes) => bytes.is_empty(),
         }
     }
 
@@ -451,6 +460,9 @@ impl OtapPayloadHelpers for OtlpProtoBytes {
             Self::ExportLogsRequest(value) => Self::ExportLogsRequest(std::mem::take(value)),
             Self::ExportMetricsRequest(value) => Self::ExportMetricsRequest(std::mem::take(value)),
             Self::ExportTracesRequest(value) => Self::ExportTracesRequest(std::mem::take(value)),
+            Self::ExportProfilesRequest(value) => {
+                Self::ExportProfilesRequest(std::mem::take(value))
+            }
         }
     }
 
@@ -521,6 +533,16 @@ impl OtapPayloadHelpers for OtlpProtoBytes {
                             .sum::<usize>()
                     })
                     .sum()
+            }
+            Self::ExportProfilesRequest(bytes) => {
+                ExportProfilesServiceRequest::decode(bytes.as_ref()).map_or(0, |request| {
+                    request
+                        .resource_profiles
+                        .iter()
+                        .flat_map(|resource| &resource.scope_profiles)
+                        .map(|scope| scope.profiles.len())
+                        .sum()
+                })
             }
         }
     }
@@ -604,6 +626,9 @@ impl TryFromWithOptions<OtapArrowRecords> for OtlpProtoBytes {
                 traces_encoder.encode(&mut value, &mut buffer)?;
                 Ok(Self::ExportTracesRequest(buffer.into_bytes()))
             }
+            OtapArrowRecords::Profiles(_) => Err(Error::UnsupportedSignalType {
+                signal: SignalType::Profiles,
+            }),
         }
     }
 }
@@ -634,6 +659,11 @@ impl TryFromWithOptions<OtlpProtoBytes> for OtapArrowRecords {
 
                 Ok(otap_batch)
             }
+            OtlpProtoBytes::ExportProfilesRequest(_) => Err(crate::encode::Error::OtapError(
+                Error::UnsupportedSignalType {
+                    signal: SignalType::Profiles,
+                },
+            )),
         }
     }
 }
@@ -656,6 +686,10 @@ impl TryFrom<OtlpProtoMessage> for OtapPayload {
                 trace_data.encode(&mut bytes)?;
                 OtlpProtoBytes::ExportTracesRequest(bytes.freeze()).into()
             }
+            OtlpProtoMessage::Profiles(profiles_data) => {
+                profiles_data.encode(&mut bytes)?;
+                OtapPayload::from_otlp(OtlpProtoBytes::ExportProfilesRequest(bytes.freeze()))
+            }
         })
     }
 }
@@ -669,6 +703,7 @@ mod test {
         proto::opentelemetry::{
             collector::{
                 logs::v1::ExportLogsServiceRequest, metrics::v1::ExportMetricsServiceRequest,
+                profiles::v1development::ExportProfilesServiceRequest,
                 trace::v1::ExportTraceServiceRequest,
             },
             common::v1::{AnyValue, InstrumentationScope, KeyValue},
@@ -680,6 +715,7 @@ mod test {
                 exemplar, exponential_histogram_data_point::Buckets, metric::Data,
                 number_data_point::Value, summary_data_point::ValueAtQuantile,
             },
+            profiles::v1development::{Profile, ResourceProfiles, ScopeProfiles},
             resource::v1::Resource,
             trace::v1::{
                 ResourceSpans, ScopeSpans, Span, SpanFlags, Status,
@@ -691,6 +727,38 @@ mod test {
     use bytes::Bytes;
     use pretty_assertions::assert_eq;
     use prost::Message;
+
+    /// Scenario: Serialized OTLP Profiles contains profiles across multiple resources and scopes.
+    /// Guarantees: Item accounting reports the total profile count and caches it on the payload.
+    #[test]
+    fn test_otlp_profiles_num_items() {
+        let request = ExportProfilesServiceRequest {
+            resource_profiles: vec![
+                ResourceProfiles {
+                    scope_profiles: vec![ScopeProfiles {
+                        profiles: vec![Profile::default(), Profile::default()],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                ResourceProfiles {
+                    scope_profiles: vec![ScopeProfiles {
+                        profiles: vec![Profile::default()],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+            dictionary: None,
+        };
+        let mut bytes = Vec::new();
+        request.encode(&mut bytes).unwrap();
+
+        let mut payload =
+            OtapPayload::from_otlp(OtlpProtoBytes::ExportProfilesRequest(bytes.into()));
+        assert_eq!(payload.num_items(), 3);
+        assert!(payload.test_has_cached_item_count());
+    }
 
     #[test]
     fn test_conversion_logs() {

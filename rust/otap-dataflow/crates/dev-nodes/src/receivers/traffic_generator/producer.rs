@@ -178,11 +178,8 @@ impl TrafficProducer {
                 shape.push((leftover_signal, leftover_count));
             }
             ProductionStrategy::Replay { ref mut payloads } => {
-                let new_batch = match leftover_signal {
-                    SignalType::Traces => self.generator.generate_traces(leftover_count),
-                    SignalType::Metrics => self.generator.generate_metrics(leftover_count),
-                    SignalType::Logs => self.generator.generate_logs(leftover_count),
-                }?;
+                let new_batch =
+                    generate_signal(&mut *self.generator, leftover_signal, leftover_count)?;
 
                 payloads.push(new_batch);
             }
@@ -224,11 +221,7 @@ impl<'a> Iterator for TrafficRun<'a> {
         let next = match &self.strategy {
             ProductionStrategy::Fresh { shape, .. } => {
                 let (signal_type, count) = shape[self.idx];
-                match signal_type {
-                    SignalType::Traces => self.generator.generate_traces(count),
-                    SignalType::Metrics => self.generator.generate_metrics(count),
-                    SignalType::Logs => self.generator.generate_logs(count),
-                }
+                generate_signal(&mut *self.generator, signal_type, count)
             }
             ProductionStrategy::Replay { payloads, .. } => Ok(payloads[self.idx].clone()),
         };
@@ -364,12 +357,23 @@ fn create_fresh_payloads(
 ) -> Result<Vec<OtapPayload>, GenerateError> {
     shape
         .iter()
-        .map(|(signal_type, count)| match signal_type {
-            SignalType::Traces => generator.generate_traces(*count),
-            SignalType::Metrics => generator.generate_metrics(*count),
-            SignalType::Logs => generator.generate_logs(*count),
-        })
+        .map(|(signal_type, count)| generate_signal(generator, *signal_type, *count))
         .collect()
+}
+
+fn generate_signal(
+    generator: &mut dyn SignalGenerator,
+    signal_type: SignalType,
+    count: usize,
+) -> GenerateResult {
+    match signal_type {
+        SignalType::Traces => generator.generate_traces(count),
+        SignalType::Metrics => generator.generate_metrics(count),
+        SignalType::Logs => generator.generate_logs(count),
+        SignalType::Profiles => Err(GenerateError::Configuration(
+            "Profiles traffic generation is not supported".to_string(),
+        )),
+    }
 }
 
 enum ProductionStrategy {

@@ -12,9 +12,14 @@ Each branch is stacked on the preceding branch.
   stack branches.
 - All stack branches are rebased onto upstream commit `80d38834` from August
   28, 2026.
-- Step 5 is in progress. Its first change replaces protobuf-number-indexed
-  payload storage and the exhausted `u64` membership bitmap with explicit,
-  compact per-signal layouts.
+- Step 5 is reconciled on the current handoff branch. It adds the Profiles
+  signal and payload variants, retained-memory and item accounting,
+  boundary-preserving batching, query-engine guards, and durable-buffer
+  persistence and reconstruction.
+- Profiles BARs remain separate during batching, and oversized BARs are
+  rejected until graph-aware partitioning and concatenation are implemented.
+  Serialized OTLP Profiles requests likewise remain separate because each owns
+  a request-wide dictionary.
 - Architecture findings and decisions are tracked in
   [Profiles Upstream Architecture Notes](profiles-upstream-architecture-notes.md).
 - Steps 6 through 11 have not started.
@@ -34,8 +39,8 @@ Each branch is stacked on the preceding branch.
 5. `profiles/05-profile-engine-integration`
    - Add the Profiles signal and payload variants, memory accounting, batching
      primitives, and usable durable-buffer persistence and reconstruction.
-   - Status: in progress; compact signal-local payload storage is implemented,
-     while the Profiles signal and engine-wide variants remain to be added.
+   - Status: implemented on the handoff branch; unsafe generic filtering,
+     mutation, merge, partitioning, and unsupported exporters fail explicitly.
 6. `profiles/06-otlp-to-otap-profiles`
    - Encode OTLP Profiles into the OTAP Profiles representation.
 7. `profiles/07-otap-to-otlp-profiles`

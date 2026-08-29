@@ -58,6 +58,12 @@ impl PipelineStage for FilterPipelineStage {
         _task_context: Arc<TaskContext>,
         exec_state: &mut ExecutionState,
     ) -> Result<OtapArrowRecords> {
+        if matches!(&otap_batch, OtapArrowRecords::Profiles(_)) {
+            return Err(Error::NotYetSupportedError {
+                message: "filtering Profiles requires graph-aware selection and compaction".into(),
+            });
+        }
+
         let root_rb = match otap_batch.root_record_batch() {
             Some(rb) => rb,
             None => return Ok(otap_batch), // empty batch, nothing to filter

@@ -1629,6 +1629,12 @@ pub fn filter_otap_batch(
     otap_batch: &OtapArrowRecords,
     pool: &mut IdBitmapPool,
 ) -> Result<OtapArrowRecords> {
+    if matches!(otap_batch, OtapArrowRecords::Profiles(_)) {
+        return Err(Error::UnsupportedSignalType {
+            signal: otel_arrow_dfe_config::SignalType::Profiles,
+        });
+    }
+
     let root_batch = match otap_batch.root_record_batch() {
         Some(rb) => rb,
         None => return Ok(otap_batch.clone()),
@@ -1855,6 +1861,22 @@ mod tests {
     use arrow::array::{Array, BooleanArray, UInt16Array};
     use roaring::RoaringBitmap;
     use std::sync::Arc;
+
+    /// Scenario: Generic OTAP filtering is invoked for a Profiles batch.
+    /// Guarantees: Filtering returns an explicit unsupported error instead of changing signal type.
+    #[test]
+    fn filter_profiles_returns_unsupported_error() {
+        let records = OtapArrowRecords::Profiles(crate::otap::Profiles::default());
+        let selection = BooleanArray::from(Vec::<bool>::new());
+        let mut pool = IdBitmapPool::new();
+
+        assert!(matches!(
+            filter_otap_batch(&selection, &records, &mut pool),
+            Err(Error::UnsupportedSignalType {
+                signal: otel_arrow_dfe_config::SignalType::Profiles
+            })
+        ));
+    }
 
     #[test]
     fn test_build_uint16_id_filter_basic() {

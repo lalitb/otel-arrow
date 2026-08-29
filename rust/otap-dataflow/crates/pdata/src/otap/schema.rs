@@ -63,6 +63,7 @@ impl SchemaIdBuilder {
             Float64 => self.out.push_str("F64"),
             Utf8 => self.out.push_str("Str"),
             Binary => self.out.push_str("Bin"),
+            LargeBinary => self.out.push_str("LBin"),
             FixedSizeBinary(n) => {
                 use std::fmt::Write;
                 write!(&mut self.out, "FSB<{n}>").expect("writing to String should never fail");
@@ -72,6 +73,12 @@ impl SchemaIdBuilder {
 
             List(field) => {
                 self.out.push('[');
+                self.write_data_type(field.data_type());
+                self.out.push(']');
+            }
+
+            LargeList(field) => {
+                self.out.push_str("L[");
                 self.write_data_type(field.data_type());
                 self.out.push(']');
             }
@@ -143,6 +150,8 @@ mod test {
 
     use crate::otap::schema::SchemaIdBuilder;
 
+    /// Scenario: A schema uses every Arrow type supported by OTAP schema identifiers.
+    /// Guarantees: Each type has a stable, distinct textual encoding, including large values.
     #[test]
     pub fn test_all_field_types() {
         let schema = Schema::new(vec![
@@ -159,12 +168,18 @@ mod test {
             Field::new("float64", DataType::Float64, true),
             Field::new("string", DataType::Utf8, true),
             Field::new("binary", DataType::Binary, true),
+            Field::new("large_binary", DataType::LargeBinary, true),
             Field::new("fsb4", DataType::FixedSizeBinary(4), true),
             Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
             Field::new("duration", DataType::Duration(TimeUnit::Nanosecond), true),
             Field::new(
                 "list",
                 DataType::List(Arc::new(Field::new("item", DataType::UInt8, true))),
+                true,
+            ),
+            Field::new(
+                "large_list",
+                DataType::LargeList(Arc::new(Field::new("item", DataType::UInt8, true))),
                 true,
             ),
             Field::new(
@@ -290,10 +305,12 @@ mod test {
             "float64:F64",
             "string:Str",
             "binary:Bin",
+            "large_binary:LBin",
             "fsb4:FSB<4>",
             "ts:Tns",
             "duration:Dur",
             "list:[U8]",
+            "large_list:L[U8]",
             "dict:Dic<U8,Str>",
             "map:Map<Str,Str>",
             "map_invalid:Map<>",

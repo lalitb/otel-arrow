@@ -51,6 +51,8 @@ use std::sync::Arc;
 use tokio::time::Instant;
 use writer::{SignalWriter, WriterFailure};
 
+const FILE_SIGNAL_COUNT: usize = 4;
+
 /// Component URN for the file exporter.
 pub const FILE_EXPORTER_URN: &str = "urn:otel:exporter:file";
 
@@ -58,9 +60,9 @@ pub const FILE_EXPORTER_URN: &str = "urn:otel:exporter:file";
 pub struct FileExporter {
     config: FileExporterConfig,
     paths: RenderedPaths,
-    writers: [Option<SignalWriter>; 3],
+    writers: [Option<SignalWriter>; FILE_SIGNAL_COUNT],
     frame: Vec<u8>,
-    failure_active: [bool; 3],
+    failure_active: [bool; FILE_SIGNAL_COUNT],
     export_metrics: MeasurementMetricSet<FileExporterExportMetrics>,
     signal_metrics: MeasurementMetricSet<FileSignalMetrics>,
     failure_metrics: MeasurementMetricSet<FileFailureMetrics>,
@@ -86,7 +88,7 @@ pub static FILE_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
                 config,
                 paths,
                 writers: std::array::from_fn(|_| None),
-                failure_active: [false; 3],
+                failure_active: [false; FILE_SIGNAL_COUNT],
                 export_metrics: FileExporterExportMetrics::register(&pipeline),
                 signal_metrics: FileSignalMetrics::register(&pipeline),
                 failure_metrics: FileFailureMetrics::register(&pipeline),
@@ -321,7 +323,12 @@ impl FileExporter {
     ) -> Result<(), Error> {
         let result = tokio::time::timeout_at(Instant::from_std(deadline), async {
             let mut failures = Vec::new();
-            for signal in [SignalType::Logs, SignalType::Metrics, SignalType::Traces] {
+            for signal in [
+                SignalType::Logs,
+                SignalType::Metrics,
+                SignalType::Traces,
+                SignalType::Profiles,
+            ] {
                 let writer = &mut self.writers[signal_index(signal)];
                 if let Some(writer) = writer
                     && let Err(failure) = writer.finalize().await
@@ -385,6 +392,11 @@ fn encode_payload(
                     .map_err(|error| EncodeFailure::View(error.to_string()))?;
                 encode_traces(&view, frame, max_frame_bytes)?;
             }
+            otel_arrow_dfe_pdata::OtlpProtoBytes::ExportProfilesRequest(_) => {
+                return Err(EncodeFailure::View(
+                    "file export does not support Profiles yet".to_string(),
+                ));
+            }
         },
         PayloadData::OtapArrowRecords(records) => match records.signal_type() {
             SignalType::Logs => {
@@ -402,6 +414,11 @@ fn encode_payload(
                     .map_err(|error| EncodeFailure::View(error.to_string()))?;
                 encode_traces(&view, frame, max_frame_bytes)?;
             }
+            SignalType::Profiles => {
+                return Err(EncodeFailure::View(
+                    "file export does not support Profiles yet".to_string(),
+                ));
+            }
         },
     }
     Ok(())
@@ -412,6 +429,7 @@ const fn signal_index(signal: SignalType) -> usize {
         SignalType::Logs => 0,
         SignalType::Metrics => 1,
         SignalType::Traces => 2,
+        SignalType::Profiles => 3,
     }
 }
 

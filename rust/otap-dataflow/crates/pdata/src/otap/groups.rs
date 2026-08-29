@@ -6,7 +6,7 @@ use std::num::{NonZeroU32, NonZeroU64};
 
 use crate::{
     otap::{
-        Logs, Metrics, OtapArrowRecords, OtapBatchStore, Traces,
+        Logs, Metrics, OtapArrowRecords, OtapBatchStore, Profiles, Traces,
         error::{Error, Result},
         num_items, raw_batch_store,
         raw_batch_store::payload_position,
@@ -33,6 +33,8 @@ pub(crate) enum RecordsGroup {
     Metrics(Vec<[Option<RecordBatch>; Metrics::COUNT]>),
     /// OTAP traces
     Traces(Vec<[Option<RecordBatch>; Traces::COUNT]>),
+    /// OTAP profiles
+    Profiles(Vec<[Option<RecordBatch>; Profiles::COUNT]>),
 }
 
 impl RecordsGroup {
@@ -41,7 +43,7 @@ impl RecordsGroup {
     /// component to separate data by signal type. The public APIs for separating
     /// by expected signal type enforce this.
     #[must_use]
-    fn separate_by_type(records: Vec<OtapArrowRecords>) -> [Self; 3] {
+    fn separate_by_type(records: Vec<OtapArrowRecords>) -> [Self; 4] {
         let log_count = signal_count(&records, SignalType::Logs);
         let mut log_records = Vec::with_capacity(log_count);
 
@@ -50,6 +52,9 @@ impl RecordsGroup {
 
         let trace_count = signal_count(&records, SignalType::Traces);
         let mut trace_records = Vec::with_capacity(trace_count);
+
+        let profile_count = signal_count(&records, SignalType::Profiles);
+        let mut profile_records = Vec::with_capacity(profile_count);
 
         for records in records {
             match records {
@@ -80,6 +85,15 @@ impl RecordsGroup {
                         trace_records.push(batches);
                     }
                 }
+                OtapArrowRecords::Profiles(profiles) => {
+                    let batches = profiles.into_batches();
+                    if primary_table(&batches)
+                        .map(|batch| batch.num_rows() > 0)
+                        .unwrap_or(false)
+                    {
+                        profile_records.push(batches);
+                    }
+                }
             }
         }
 
@@ -87,13 +101,14 @@ impl RecordsGroup {
             RecordsGroup::Logs(log_records),
             RecordsGroup::Metrics(metric_records),
             RecordsGroup::Traces(trace_records),
+            RecordsGroup::Profiles(profile_records),
         ]
     }
 
     /// Separate, expecting only logs.
     pub(crate) fn separate_logs(records: Vec<OtapArrowRecords>) -> Result<Self> {
-        let [logs, metrics, traces] = RecordsGroup::separate_by_type(records);
-        if !metrics.is_empty() || !traces.is_empty() {
+        let [logs, metrics, traces, profiles] = RecordsGroup::separate_by_type(records);
+        if !metrics.is_empty() || !traces.is_empty() || !profiles.is_empty() {
             Err(Error::MixedSignals)
         } else {
             Ok(logs)
@@ -102,8 +117,8 @@ impl RecordsGroup {
 
     /// Separate, expecting only metrics.
     pub(crate) fn separate_metrics(records: Vec<OtapArrowRecords>) -> Result<Self> {
-        let [logs, metrics, traces] = RecordsGroup::separate_by_type(records);
-        if !logs.is_empty() || !traces.is_empty() {
+        let [logs, metrics, traces, profiles] = RecordsGroup::separate_by_type(records);
+        if !logs.is_empty() || !traces.is_empty() || !profiles.is_empty() {
             Err(Error::MixedSignals)
         } else {
             Ok(metrics)
@@ -112,17 +127,28 @@ impl RecordsGroup {
 
     /// Separate, expecting only traces.
     pub(crate) fn separate_traces(records: Vec<OtapArrowRecords>) -> Result<Self> {
-        let [logs, metrics, traces] = RecordsGroup::separate_by_type(records);
-        if !logs.is_empty() || !metrics.is_empty() {
+        let [logs, metrics, traces, profiles] = RecordsGroup::separate_by_type(records);
+        if !logs.is_empty() || !metrics.is_empty() || !profiles.is_empty() {
             Err(Error::MixedSignals)
         } else {
             Ok(traces)
         }
     }
 
+    /// Separate, expecting only profiles.
+    pub(crate) fn separate_profiles(records: Vec<OtapArrowRecords>) -> Result<Self> {
+        let [logs, metrics, traces, profiles] = RecordsGroup::separate_by_type(records);
+        if !logs.is_empty() || !metrics.is_empty() || !traces.is_empty() {
+            Err(Error::MixedSignals)
+        } else {
+            Ok(profiles)
+        }
+    }
+
     /// Split `RecordBatch`es as needed when they're larger than our threshold or when we need them in
     /// smaller pieces to concatenate together into our target size.
     pub(crate) fn split(self, max_items: NonZeroU64) -> Result<Self> {
+        let max_items_u64 = max_items.get();
         let max_items = NonZeroU32::new(max_items.get() as u32)
             .unwrap_or(NonZeroU32::try_from(u32::MAX).expect("u32::MAX is not 0"));
         Ok(match self {
@@ -134,6 +160,21 @@ impl RecordsGroup {
             }
             RecordsGroup::Traces(mut items) => {
                 RecordsGroup::Traces(split::split::<{ Traces::COUNT }>(&mut items, max_items)?)
+            }
+            RecordsGroup::Profiles(items) => {
+                for batches in &items {
+                    let count = num_items(batches);
+                    if count as u64 > max_items_u64 {
+                        return Err(Error::TooManyItems {
+                            payload_type: ArrowPayloadType::Profiles,
+                            count,
+                            max: max_items_u64,
+                            message: "Profiles batches cannot be split until graph-aware partitioning is implemented"
+                                .to_string(),
+                        });
+                    }
+                }
+                RecordsGroup::Profiles(items)
             }
         })
     }
@@ -151,6 +192,7 @@ impl RecordsGroup {
             RecordsGroup::Traces(items) => {
                 RecordsGroup::Traces(generic_concatenate(items, max_items)?)
             }
+            RecordsGroup::Profiles(items) => RecordsGroup::Profiles(items),
         })
     }
 
@@ -179,6 +221,13 @@ impl RecordsGroup {
                     Traces::try_from(raw).map(OtapArrowRecords::Traces)
                 })
                 .collect(),
+            RecordsGroup::Profiles(items) => items
+                .into_iter()
+                .map(|batches| {
+                    let raw = raw_batch_store::RawProfilesStore::from_batches(batches);
+                    Profiles::try_from(raw).map(OtapArrowRecords::Profiles)
+                })
+                .collect(),
         }
     }
 
@@ -189,6 +238,7 @@ impl RecordsGroup {
             Self::Logs(logs) => logs.is_empty(),
             Self::Metrics(metrics) => metrics.is_empty(),
             Self::Traces(traces) => traces.is_empty(),
+            Self::Profiles(profiles) => profiles.is_empty(),
         }
     }
 }
@@ -221,6 +271,9 @@ fn primary_table<const N: usize>(batches: &[Option<RecordBatch>; N]) -> Option<&
         Traces::COUNT => {
             batches[payload_position(ArrowPayloadType::Spans).expect("spans position")].as_ref()
         }
+        Profiles::COUNT => batches
+            [payload_position(ArrowPayloadType::Profiles).expect("profiles position")]
+        .as_ref(),
         _ => {
             unreachable!()
         }

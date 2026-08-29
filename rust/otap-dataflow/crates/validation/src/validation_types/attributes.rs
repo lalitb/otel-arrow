@@ -68,11 +68,12 @@ pub enum AttributeDomain {
 pub(crate) fn collect_attributes<'a>(
     message: &'a OtlpProtoMessage,
     domains: &[AttributeDomain],
-) -> Vec<&'a [ProtoKeyValue]> {
+) -> Option<Vec<&'a [ProtoKeyValue]>> {
     match message {
-        OtlpProtoMessage::Logs(logs) => collect_log_attrs(logs, domains),
-        OtlpProtoMessage::Traces(traces) => collect_span_attrs(traces, domains),
-        OtlpProtoMessage::Metrics(metrics) => collect_metric_attrs(metrics, domains),
+        OtlpProtoMessage::Logs(logs) => Some(collect_log_attrs(logs, domains)),
+        OtlpProtoMessage::Traces(traces) => Some(collect_span_attrs(traces, domains)),
+        OtlpProtoMessage::Metrics(metrics) => Some(collect_metric_attrs(metrics, domains)),
+        OtlpProtoMessage::Profiles(_) => None,
     }
 }
 
@@ -83,12 +84,12 @@ pub(crate) fn validate_deny_keys(
     keys: &[String],
 ) -> bool {
     messages.iter().all(|message| {
-        collect_attributes(message, domains)
-            .into_iter()
-            .all(|attrs| {
+        collect_attributes(message, domains).is_some_and(|attribute_lists| {
+            attribute_lists.into_iter().all(|attrs| {
                 keys.iter()
                     .all(|deny| attrs.iter().all(|kv| deny != &kv.key))
             })
+        })
     })
 }
 
@@ -99,9 +100,11 @@ pub(crate) fn validate_require_keys(
     keys: &[String],
 ) -> bool {
     messages.iter().all(|message| {
-        collect_attributes(message, domains)
-            .into_iter()
-            .all(|attrs| keys.iter().all(|req| attrs.iter().any(|kv| req == &kv.key)))
+        collect_attributes(message, domains).is_some_and(|attribute_lists| {
+            attribute_lists
+                .into_iter()
+                .all(|attrs| keys.iter().all(|req| attrs.iter().any(|kv| req == &kv.key)))
+        })
     })
 }
 
@@ -112,17 +115,16 @@ pub(crate) fn validate_require_key_values(
     pairs: &[KeyValue],
 ) -> bool {
     let pairs_proto_kv: Vec<ProtoKeyValue> = pairs.iter().filter_map(keyvalue_to_proto).collect();
-
     messages.iter().all(|message| {
-        collect_attributes(message, domains)
-            .into_iter()
-            .all(|attrs| {
+        collect_attributes(message, domains).is_some_and(|attribute_lists| {
+            attribute_lists.into_iter().all(|attrs| {
                 pairs_proto_kv.iter().all(|req| {
                     attrs
                         .iter()
                         .any(|kv| kv.key == req.key && kv.value == req.value)
                 })
             })
+        })
     })
 }
 
@@ -134,12 +136,12 @@ pub(crate) fn validate_no_duplicate_keys(messages: &[OtlpProtoMessage]) -> bool 
         AttributeDomain::Signal,
     ];
     messages.iter().all(|message| {
-        collect_attributes(message, &domains)
-            .into_iter()
-            .all(|attrs| {
+        collect_attributes(message, &domains).is_some_and(|attribute_lists| {
+            attribute_lists.into_iter().all(|attrs| {
                 let mut seen = std::collections::HashSet::new();
                 attrs.iter().all(|kv| seen.insert(&kv.key))
             })
+        })
     })
 }
 
@@ -305,6 +307,27 @@ mod tests {
     use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::{LogsData, ResourceLogs, ScopeLogs};
     use otel_arrow_dfe_pdata::proto::opentelemetry::resource::v1::Resource;
 
+    /// Scenario: Attribute validation receives an OTLP Profiles message before Profiles support.
+    /// Guarantees: Unsupported Profiles attributes fail closed instead of passing vacuously.
+    #[test]
+    fn profiles_attribute_validation_fails_closed() {
+        let message = OtlpProtoMessage::Profiles(Default::default());
+        let messages = [message];
+
+        assert!(collect_attributes(&messages[0], &[AttributeDomain::Signal]).is_none());
+        assert!(!validate_deny_keys(
+            &messages,
+            &[AttributeDomain::Signal],
+            &["secret".to_string()]
+        ));
+        assert!(!validate_require_keys(
+            &messages,
+            &[AttributeDomain::Signal],
+            &[]
+        ));
+        assert!(!validate_no_duplicate_keys(&messages));
+    }
+
     #[test]
     fn collect_log_attributes_includes_all_domains() {
         use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::InstrumentationScope;
@@ -342,15 +365,15 @@ mod tests {
         };
         let msg = OtlpProtoMessage::Logs(logs);
 
-        let attrs = collect_attributes(&msg, &[AttributeDomain::Resource]);
+        let attrs = collect_attributes(&msg, &[AttributeDomain::Resource]).unwrap();
         assert_eq!(attrs.len(), 1);
         assert_eq!(attrs[0][0].key, "res");
 
-        let attrs = collect_attributes(&msg, &[AttributeDomain::Scope]);
+        let attrs = collect_attributes(&msg, &[AttributeDomain::Scope]).unwrap();
         assert_eq!(attrs.len(), 1);
         assert_eq!(attrs[0][0].key, "scope");
 
-        let attrs = collect_attributes(&msg, &[AttributeDomain::Signal]);
+        let attrs = collect_attributes(&msg, &[AttributeDomain::Signal]).unwrap();
         assert_eq!(attrs.len(), 1);
         assert_eq!(attrs[0][0].key, "sig");
 
@@ -361,7 +384,8 @@ mod tests {
                 AttributeDomain::Scope,
                 AttributeDomain::Signal,
             ],
-        );
+        )
+        .unwrap();
         let keys: Vec<_> = attrs
             .iter()
             .flat_map(|slice| slice.iter().map(|kv| kv.key.as_str()))

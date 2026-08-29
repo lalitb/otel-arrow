@@ -506,6 +506,13 @@ impl local::Processor<OtapPdata> for ResourceValidatorProcessor {
                             let trace_data = RawTraceData::new(bytes.as_ref());
                             self.validate_traces(&trace_data, &allowed_values)
                         }
+                        (SignalType::Profiles, OtlpProtoBytes::ExportProfilesRequest(_)) => {
+                            let failure = ValidationFailure::ConversionError;
+                            Err((
+                                failure,
+                                "Profiles resource validation is not supported".to_string(),
+                            ))
+                        }
                         _ => {
                             // Signal type doesn't match payload type - this shouldn't happen
                             // but pass through rather than fail
@@ -534,6 +541,13 @@ impl local::Processor<OtapPdata> for ResourceValidatorProcessor {
                                     Err((failure, self.format_error_message(failure)))
                                 }
                             }
+                        }
+                        SignalType::Profiles => {
+                            let failure = ValidationFailure::ConversionError;
+                            Err((
+                                failure,
+                                "Profiles resource validation is not supported".to_string(),
+                            ))
                         }
                     },
                 };

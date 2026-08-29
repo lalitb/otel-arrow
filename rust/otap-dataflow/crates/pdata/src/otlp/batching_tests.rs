@@ -3,6 +3,7 @@
 
 //! This module tests batching.rs logic.
 
+use crate::error::Error;
 use crate::otlp::OtlpProtoBytes;
 use crate::otlp::batching::make_bytes_batches;
 use crate::otlp::batching::make_bytes_batches_owned;
@@ -19,8 +20,58 @@ use crate::testing::equiv::assert_equivalent;
 use crate::testing::fixtures::DataGenerator;
 use crate::testing::round_trip::otlp_bytes_to_message;
 use crate::testing::round_trip::otlp_message_to_bytes;
+use bytes::Bytes;
 use otel_arrow_dfe_config::SignalType;
 use std::num::NonZeroU64;
+
+/// Scenario: Multiple serialized Profiles requests have independent request-wide dictionaries.
+/// Guarantees: Byte batching preserves each request and its ownership weight without concatenation.
+#[test]
+fn profiles_requests_preserve_message_boundaries() {
+    let inputs = vec![
+        OtlpProtoBytes::ExportProfilesRequest(Bytes::from_static(b"\x0a\x00")),
+        OtlpProtoBytes::ExportProfilesRequest(Bytes::from_static(b"\x12\x00")),
+    ];
+
+    let output =
+        make_bytes_batches_owned(SignalType::Profiles, None, None, None, None, inputs).unwrap();
+
+    assert_eq!(output.batches.len(), 2);
+    assert_eq!(output.batches[0].0.as_bytes(), b"\x0a\x00");
+    assert_eq!(output.batches[0].1, 2);
+    assert_eq!(output.batches[1].0.as_bytes(), b"\x12\x00");
+    assert_eq!(output.batches[1].1, 2);
+}
+
+/// Scenario: One serialized Profiles request exceeds the configured byte limit.
+/// Guarantees: Byte batching rejects the request instead of separating it from its dictionary.
+#[test]
+fn profiles_requests_reject_oversized_message() {
+    let result = make_bytes_batches_owned(
+        SignalType::Profiles,
+        Some(NonZeroU64::new(3).unwrap()),
+        None,
+        None,
+        None,
+        vec![OtlpProtoBytes::ExportProfilesRequest(Bytes::from_static(
+            b"\x0a\x00\x12\x00",
+        ))],
+    );
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("oversized Profiles request should be rejected"),
+    };
+
+    assert!(matches!(
+        error,
+        Error::TooManyItems {
+            payload_type: crate::proto::opentelemetry::arrow::v1::ArrowPayloadType::Profiles,
+            count: 4,
+            max: 3,
+            ..
+        }
+    ));
+}
 
 /// Test bytes-based batching with various size limits
 fn test_batching(inputs_otlp: impl Iterator<Item = OtlpProtoMessage>) {
@@ -35,6 +86,7 @@ fn test_batching(inputs_otlp: impl Iterator<Item = OtlpProtoMessage>) {
             OtlpProtoMessage::Logs(data) => data.resource_logs.len(),
             OtlpProtoMessage::Metrics(data) => data.resource_metrics.len(),
             OtlpProtoMessage::Traces(data) => data.resource_spans.len(),
+            OtlpProtoMessage::Profiles(data) => data.resource_profiles.len(),
         })
         .sum();
 

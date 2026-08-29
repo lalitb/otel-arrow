@@ -241,6 +241,11 @@ pub enum Error {
         source: crate::schema::error::Error,
     },
 
+    #[error("Invalid Profiles graph: {source}")]
+    InvalidProfilesGraph {
+        source: crate::views::otap::ProfilesValidationError,
+    },
+
     #[error("Payload type {payload_type:?} is not valid for this batch store")]
     InvalidPayloadTypeForSignal {
         signal: SignalType,
@@ -252,6 +257,9 @@ pub enum Error {
         found: SignalType,
         expected: SignalType,
     },
+
+    #[error("Unsupported signal type: {signal:?}")]
+    UnsupportedSignalType { signal: SignalType },
 }
 
 impl From<crate::otlp::common::Dropped> for Error {

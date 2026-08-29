@@ -223,6 +223,7 @@ impl OTAPReceiver {
             SignalType::Logs => states.logs.as_ref(),
             SignalType::Metrics => states.metrics.as_ref(),
             SignalType::Traces => states.traces.as_ref(),
+            SignalType::Profiles => None,
         };
 
         (
@@ -245,6 +246,7 @@ impl OTAPReceiver {
             SignalType::Logs => states.logs.as_ref(),
             SignalType::Metrics => states.metrics.as_ref(),
             SignalType::Traces => states.traces.as_ref(),
+            SignalType::Profiles => None,
         };
 
         (

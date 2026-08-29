@@ -40,7 +40,7 @@ use crate::effect_handler::{
 };
 use crate::error::{Error, TypedError};
 use crate::flow_metrics::{
-    DecisionFlowMetrics, EndFlowMetrics, FLOW_SIGNALS, FlowDroppedItemsMetrics,
+    DecisionFlowMetrics, EndFlowMetrics, FLOW_SIGNAL_COUNT, FLOW_SIGNALS, FlowDroppedItemsMetrics,
     FlowDurationMetrics, FlowInputItemsMetrics, FlowInputMessageMetrics, FlowInputSizeMetrics,
     FlowOutputItemsMetrics, FlowOutputMessageMetrics, FlowOutputSizeMetrics, InputFlowMetrics,
     SharedFlowMetricState, flow_signal_index, nanos_u64,
@@ -252,9 +252,11 @@ impl<PData> EffectHandler<PData> {
         self.flow.needs_timing = flow_needs_timing;
         self.flow.input = InputFlowMetrics {
             input_messages: input_message_metric
-                .map(|metrics| (metrics, Arc::new(Mutex::new([0; 3])))),
-            input_items: input_items_metric.map(|metrics| (metrics, Arc::new(Mutex::new([0; 3])))),
-            input_size: input_size_metric.map(|metrics| (metrics, Arc::new(Mutex::new([0; 3])))),
+                .map(|metrics| (metrics, Arc::new(Mutex::new([0; FLOW_SIGNAL_COUNT])))),
+            input_items: input_items_metric
+                .map(|metrics| (metrics, Arc::new(Mutex::new([0; FLOW_SIGNAL_COUNT])))),
+            input_size: input_size_metric
+                .map(|metrics| (metrics, Arc::new(Mutex::new([0; FLOW_SIGNAL_COUNT])))),
         };
         self.flow.end = EndFlowMetrics {
             duration: duration_metric.map(|metrics| {
@@ -266,14 +268,15 @@ impl<PData> EffectHandler<PData> {
                 )
             }),
             output_messages: output_message_metric
-                .map(|metrics| (metrics, Arc::new(Mutex::new([0; 3])))),
+                .map(|metrics| (metrics, Arc::new(Mutex::new([0; FLOW_SIGNAL_COUNT])))),
             output_items: output_items_metric
-                .map(|metrics| (metrics, Arc::new(Mutex::new([0; 3])))),
-            output_size: output_size_metric.map(|metrics| (metrics, Arc::new(Mutex::new([0; 3])))),
+                .map(|metrics| (metrics, Arc::new(Mutex::new([0; FLOW_SIGNAL_COUNT])))),
+            output_size: output_size_metric
+                .map(|metrics| (metrics, Arc::new(Mutex::new([0; FLOW_SIGNAL_COUNT])))),
         };
         self.flow.decision = DecisionFlowMetrics {
             dropped_items: dropped_items_metric
-                .map(|metrics| (metrics, Arc::new(Mutex::new([0; 3])))),
+                .map(|metrics| (metrics, Arc::new(Mutex::new([0; FLOW_SIGNAL_COUNT])))),
         };
     }
 
@@ -1187,7 +1190,7 @@ mod tests {
             .1
             .lock()
             .unwrap();
-        assert_eq!(*start_before_report, [0, 20, 10]);
+        assert_eq!(*start_before_report, [0, 20, 10, 0]);
 
         let before_report = eh.flow.end.duration.as_ref().unwrap().1.lock().unwrap();
         let (count, sum, _, _) = before_report[2].get().summary();
@@ -1195,7 +1198,7 @@ mod tests {
         assert!((sum - 0.000_006).abs() < f64::EPSILON);
         drop(before_report);
         let output_before_report = eh.flow.end.output_items.as_ref().unwrap().1.lock().unwrap();
-        assert_eq!(*output_before_report, [0, 8, 7]);
+        assert_eq!(*output_before_report, [0, 8, 7, 0]);
 
         drop(start_before_report);
         drop(output_before_report);
@@ -1211,7 +1214,7 @@ mod tests {
             .lock()
             .unwrap();
         assert_eq!(
-            *start_drained, [0; 3],
+            *start_drained, [0; FLOW_SIGNAL_COUNT],
             "start accumulator should be drained"
         );
 
@@ -1223,7 +1226,7 @@ mod tests {
         );
         let output_drained = eh.flow.end.output_items.as_ref().unwrap().1.lock().unwrap();
         assert_eq!(
-            *output_drained, [0; 3],
+            *output_drained, [0; FLOW_SIGNAL_COUNT],
             "stop item accumulator should be drained"
         );
 
@@ -1325,7 +1328,7 @@ mod tests {
                 .1
                 .lock()
                 .unwrap(),
-            [0, 0, 1]
+            [0, 0, 1, 0]
         );
         assert_eq!(
             *handler
@@ -1337,7 +1340,7 @@ mod tests {
                 .1
                 .lock()
                 .unwrap(),
-            [0, 20, 0]
+            [0, 20, 0, 0]
         );
 
         handler.report_flow_metrics();
@@ -1352,7 +1355,7 @@ mod tests {
                 .1
                 .lock()
                 .unwrap(),
-            [0; 3]
+            [0; FLOW_SIGNAL_COUNT]
         );
         assert_eq!(
             *handler
@@ -1364,7 +1367,7 @@ mod tests {
                 .1
                 .lock()
                 .unwrap(),
-            [0; 3]
+            [0; FLOW_SIGNAL_COUNT]
         );
         assert_eq!(
             *handler
@@ -1376,7 +1379,7 @@ mod tests {
                 .1
                 .lock()
                 .unwrap(),
-            [0; 3]
+            [0; FLOW_SIGNAL_COUNT]
         );
         assert_eq!(
             *handler
@@ -1388,7 +1391,7 @@ mod tests {
                 .1
                 .lock()
                 .unwrap(),
-            [0; 3]
+            [0; FLOW_SIGNAL_COUNT]
         );
     }
 }

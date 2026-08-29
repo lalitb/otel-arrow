@@ -58,6 +58,7 @@ use otel_arrow_dfe_otap::{
     OTAP_PROCESSOR_FACTORIES, opaque_string::OpaqueString, pdata::OtapPdata,
 };
 use otel_arrow_dfe_pdata::TryIntoWithOptions;
+use otel_arrow_dfe_pdata::error::Error as PDataError;
 use otel_arrow_dfe_pdata::otap::transform::apply_attribute_transform;
 use otel_arrow_dfe_pdata::otap::{
     OtapArrowRecords,
@@ -372,6 +373,9 @@ impl AttributesProcessor {
                 SignalType::Logs => payload_sets::LOGS_SIGNAL,
                 SignalType::Metrics => payload_sets::METRICS_SIGNAL,
                 SignalType::Traces => payload_sets::TRACES_SIGNAL,
+                SignalType::Profiles => {
+                    return Err(PDataError::UnsupportedSignalType { signal }.into());
+                }
             };
             let (d, r, i, u, upd, h) = apply_domain(payloads)?;
             per_domain.push((metrics::TargetDomain::Signal, d, r, i, u, upd, h));
@@ -582,7 +586,6 @@ mod payload_sets {
         A::HistogramDpExemplarAttrs,
     ];
     pub(super) const TRACES_SIGNAL: &[A] = &[A::SpanAttrs, A::SpanEventAttrs, A::SpanLinkAttrs];
-
     // Resource domain
     pub(super) const RESOURCE_ONLY: &[A] = &[A::ResourceAttrs];
 

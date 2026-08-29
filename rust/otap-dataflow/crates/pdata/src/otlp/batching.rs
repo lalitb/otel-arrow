@@ -514,6 +514,11 @@ fn split_scope_entry(
 /// Limitation: the smallest metric unit is a whole `Metric` (all of its data
 /// points), not an individual data point, so a single metric with many points
 /// may still exceed `max_bytes`. Data point-level splitting is a follow-up.
+///
+/// Profiles requests are never concatenated or split because each request has
+/// one shared dictionary referenced by all resource profiles. Each non-empty
+/// input is returned unchanged, and an input larger than `max_bytes` is
+/// rejected until dictionary-aware batching is implemented.
 pub fn make_bytes_batches(
     signal: SignalType,
     max_bytes: Option<NonZeroU64>,
@@ -571,6 +576,34 @@ pub fn make_bytes_batches_owned(
     let total_size: usize = inputs.iter().map(|i| i.num_bytes()).sum();
     if total_size == 0 {
         return Err(Error::EmptyBatch);
+    }
+
+    if signal == SignalType::Profiles {
+        let max_size = max_bytes.map(|value| value.get() as usize);
+        let mut batches = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let weight = input.num_bytes();
+            if weight == 0 {
+                continue;
+            }
+            if let Some(max) = max_size
+                && weight > max
+            {
+                return Err(Error::TooManyItems {
+                    payload_type:
+                        crate::proto::opentelemetry::arrow::v1::ArrowPayloadType::Profiles,
+                    count: weight,
+                    max: max as u64,
+                    message: "OTLP Profiles requests cannot be split until dictionary-aware batching is implemented"
+                        .to_string(),
+                });
+            }
+            batches.push((input, weight));
+        }
+        return Ok(BytesBatches {
+            batches,
+            budget_fallbacks: 0,
+        });
     }
 
     // Emit a single input (or the whole concatenation) as one batch whose

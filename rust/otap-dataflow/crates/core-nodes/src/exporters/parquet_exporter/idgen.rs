@@ -61,6 +61,12 @@ impl PartitionSequenceIdGenerator {
         &mut self,
         otap_batch: &mut OtapParquetRecords,
     ) -> Result<(), ParquetExporterError> {
+        if matches!(otap_batch, OtapParquetRecords::Profiles(_)) {
+            return Err(ParquetExporterError::InvalidRecordBatch {
+                error: "Parquet export does not support Profiles graph ID remapping".to_string(),
+            });
+        }
+
         let payload_types = otap_batch.allowed_payload_types();
 
         // find the max ID in any of the record batches. We'll use this later on to increment
@@ -219,7 +225,7 @@ pub mod test {
     use arrow::array::UInt16Array;
     use otel_arrow_dfe_pdata::Consumer;
     use otel_arrow_dfe_pdata::otap::{
-        Metrics, OtapArrowRecords, Traces, from_record_messages, testing::complete_batch,
+        Metrics, OtapArrowRecords, Profiles, Traces, from_record_messages, testing::complete_batch,
     };
     use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
     use otel_arrow_dfe_pdata::schema::consts::metadata;
@@ -228,6 +234,21 @@ pub mod test {
     use crate::exporters::parquet_exporter::fixtures::{
         SimpleDataGenOptions, create_simple_logs_arrow_record_batches,
     };
+
+    /// Scenario: The Parquet ID generator receives a Profiles graph.
+    /// Guarantees: Export is rejected before partial ID and parent-ID remapping can corrupt links.
+    #[test]
+    fn test_partition_sequence_id_generator_rejects_profiles() {
+        let mut id_generator = PartitionSequenceIdGenerator::new();
+        let mut profiles: OtapParquetRecords =
+            OtapArrowRecords::Profiles(Profiles::default()).into();
+
+        let error = id_generator.generate_unique_ids(&mut profiles).unwrap_err();
+        assert!(matches!(
+            error,
+            ParquetExporterError::InvalidRecordBatch { .. }
+        ));
+    }
 
     use super::*;
 

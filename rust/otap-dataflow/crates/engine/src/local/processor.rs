@@ -41,7 +41,7 @@ use crate::effect_handler::{
 };
 use crate::error::{Error, TypedError};
 use crate::flow_metrics::{
-    DecisionFlowMetrics, EndFlowMetrics, FLOW_SIGNALS, FlowDroppedItemsMetrics,
+    DecisionFlowMetrics, EndFlowMetrics, FLOW_SIGNAL_COUNT, FLOW_SIGNALS, FlowDroppedItemsMetrics,
     FlowDurationMetrics, FlowInputItemsMetrics, FlowInputMessageMetrics, FlowInputSizeMetrics,
     FlowOutputItemsMetrics, FlowOutputMessageMetrics, FlowOutputSizeMetrics, InputFlowMetrics,
     LocalFlowMetricState, flow_signal_index, nanos_u64,
@@ -281,9 +281,12 @@ impl<PData> EffectHandler<PData> {
         self.flow.active = flow_metrics_active;
         self.flow.needs_timing = flow_needs_timing;
         self.flow.input = InputFlowMetrics {
-            input_messages: input_message_metric.map(|metrics| (metrics, Cell::new([0; 3]))),
-            input_items: input_items_metric.map(|metrics| (metrics, Cell::new([0; 3]))),
-            input_size: input_size_metric.map(|metrics| (metrics, Cell::new([0; 3]))),
+            input_messages: input_message_metric
+                .map(|metrics| (metrics, Cell::new([0; FLOW_SIGNAL_COUNT]))),
+            input_items: input_items_metric
+                .map(|metrics| (metrics, Cell::new([0; FLOW_SIGNAL_COUNT]))),
+            input_size: input_size_metric
+                .map(|metrics| (metrics, Cell::new([0; FLOW_SIGNAL_COUNT]))),
         };
         self.flow.end = EndFlowMetrics {
             duration: duration_metric.map(|metrics| {
@@ -292,12 +295,16 @@ impl<PData> EffectHandler<PData> {
                     RefCell::new(std::array::from_fn(|_| HistogramNormal::default())),
                 )
             }),
-            output_messages: output_message_metric.map(|metrics| (metrics, Cell::new([0; 3]))),
-            output_items: output_items_metric.map(|metrics| (metrics, Cell::new([0; 3]))),
-            output_size: output_size_metric.map(|metrics| (metrics, Cell::new([0; 3]))),
+            output_messages: output_message_metric
+                .map(|metrics| (metrics, Cell::new([0; FLOW_SIGNAL_COUNT]))),
+            output_items: output_items_metric
+                .map(|metrics| (metrics, Cell::new([0; FLOW_SIGNAL_COUNT]))),
+            output_size: output_size_metric
+                .map(|metrics| (metrics, Cell::new([0; FLOW_SIGNAL_COUNT]))),
         };
         self.flow.decision = DecisionFlowMetrics {
-            dropped_items: dropped_items_metric.map(|metrics| (metrics, Cell::new([0; 3]))),
+            dropped_items: dropped_items_metric
+                .map(|metrics| (metrics, Cell::new([0; FLOW_SIGNAL_COUNT]))),
         };
     }
 
@@ -419,7 +426,7 @@ impl<PData> EffectHandler<PData> {
     /// shutdown -- the same cadence as `ComputeDuration::report`.
     pub(crate) fn report_flow_metrics(&mut self) {
         if let Some((metrics, acc_cell)) = self.flow.input.input_messages.as_mut() {
-            let drained = acc_cell.replace([0; 3]);
+            let drained = acc_cell.replace([0; FLOW_SIGNAL_COUNT]);
             for signal in FLOW_SIGNALS {
                 let count = drained[flow_signal_index(signal)];
                 if count != 0 {
@@ -432,7 +439,7 @@ impl<PData> EffectHandler<PData> {
             let _ = self.core.metrics_reporter.report_measurement(metrics);
         }
         if let Some((metrics, acc_cell)) = self.flow.input.input_items.as_mut() {
-            let drained = acc_cell.replace([0; 3]);
+            let drained = acc_cell.replace([0; FLOW_SIGNAL_COUNT]);
             for signal in FLOW_SIGNALS {
                 let count = drained[flow_signal_index(signal)];
                 if count != 0 {
@@ -442,7 +449,7 @@ impl<PData> EffectHandler<PData> {
             let _ = self.core.metrics_reporter.report_measurement(metrics);
         }
         if let Some((metrics, acc_cell)) = self.flow.input.input_size.as_mut() {
-            let drained = acc_cell.replace([0; 3]);
+            let drained = acc_cell.replace([0; FLOW_SIGNAL_COUNT]);
             for signal in FLOW_SIGNALS {
                 let size = drained[flow_signal_index(signal)];
                 if size != 0 {
@@ -464,7 +471,7 @@ impl<PData> EffectHandler<PData> {
             let _ = self.core.metrics_reporter.report_measurement(metrics);
         }
         if let Some((metrics, acc_cell)) = self.flow.end.output_messages.as_mut() {
-            let drained = acc_cell.replace([0; 3]);
+            let drained = acc_cell.replace([0; FLOW_SIGNAL_COUNT]);
             for signal in FLOW_SIGNALS {
                 let count = drained[flow_signal_index(signal)];
                 if count != 0 {
@@ -477,7 +484,7 @@ impl<PData> EffectHandler<PData> {
             let _ = self.core.metrics_reporter.report_measurement(metrics);
         }
         if let Some((metrics, acc_cell)) = self.flow.end.output_items.as_mut() {
-            let drained = acc_cell.replace([0; 3]);
+            let drained = acc_cell.replace([0; FLOW_SIGNAL_COUNT]);
             for signal in FLOW_SIGNALS {
                 let count = drained[flow_signal_index(signal)];
                 if count != 0 {
@@ -487,7 +494,7 @@ impl<PData> EffectHandler<PData> {
             let _ = self.core.metrics_reporter.report_measurement(metrics);
         }
         if let Some((metrics, acc_cell)) = self.flow.end.output_size.as_mut() {
-            let drained = acc_cell.replace([0; 3]);
+            let drained = acc_cell.replace([0; FLOW_SIGNAL_COUNT]);
             for signal in FLOW_SIGNALS {
                 let size = drained[flow_signal_index(signal)];
                 if size != 0 {
@@ -497,7 +504,7 @@ impl<PData> EffectHandler<PData> {
             let _ = self.core.metrics_reporter.report_measurement(metrics);
         }
         if let Some((metrics, acc_cell)) = self.flow.decision.dropped_items.as_mut() {
-            let drained = acc_cell.replace([0; 3]);
+            let drained = acc_cell.replace([0; FLOW_SIGNAL_COUNT]);
             for signal in FLOW_SIGNALS {
                 let count = drained[flow_signal_index(signal)];
                 if count != 0 {
@@ -518,7 +525,7 @@ impl<PData> EffectHandler<PData> {
     ) -> Result<(), TelemetryError> {
         let reporter = self.core.metrics_reporter.clone();
         if let Some((metrics, acc_cell)) = self.flow.input.input_messages.as_mut() {
-            let drained = acc_cell.replace([0; 3]);
+            let drained = acc_cell.replace([0; FLOW_SIGNAL_COUNT]);
             for signal in FLOW_SIGNALS {
                 let count = drained[flow_signal_index(signal)];
                 if count != 0 {
@@ -533,7 +540,7 @@ impl<PData> EffectHandler<PData> {
                 .await?;
         }
         if let Some((metrics, acc_cell)) = self.flow.input.input_items.as_mut() {
-            let drained = acc_cell.replace([0; 3]);
+            let drained = acc_cell.replace([0; FLOW_SIGNAL_COUNT]);
             for signal in FLOW_SIGNALS {
                 let count = drained[flow_signal_index(signal)];
                 if count != 0 {
@@ -545,7 +552,7 @@ impl<PData> EffectHandler<PData> {
                 .await?;
         }
         if let Some((metrics, acc_cell)) = self.flow.input.input_size.as_mut() {
-            let drained = acc_cell.replace([0; 3]);
+            let drained = acc_cell.replace([0; FLOW_SIGNAL_COUNT]);
             for signal in FLOW_SIGNALS {
                 let size = drained[flow_signal_index(signal)];
                 if size != 0 {
@@ -571,7 +578,7 @@ impl<PData> EffectHandler<PData> {
                 .await?;
         }
         if let Some((metrics, acc_cell)) = self.flow.end.output_messages.as_mut() {
-            let drained = acc_cell.replace([0; 3]);
+            let drained = acc_cell.replace([0; FLOW_SIGNAL_COUNT]);
             for signal in FLOW_SIGNALS {
                 let count = drained[flow_signal_index(signal)];
                 if count != 0 {
@@ -586,7 +593,7 @@ impl<PData> EffectHandler<PData> {
                 .await?;
         }
         if let Some((metrics, acc_cell)) = self.flow.end.output_items.as_mut() {
-            let drained = acc_cell.replace([0; 3]);
+            let drained = acc_cell.replace([0; FLOW_SIGNAL_COUNT]);
             for signal in FLOW_SIGNALS {
                 let count = drained[flow_signal_index(signal)];
                 if count != 0 {
@@ -598,7 +605,7 @@ impl<PData> EffectHandler<PData> {
                 .await?;
         }
         if let Some((metrics, acc_cell)) = self.flow.end.output_size.as_mut() {
-            let drained = acc_cell.replace([0; 3]);
+            let drained = acc_cell.replace([0; FLOW_SIGNAL_COUNT]);
             for signal in FLOW_SIGNALS {
                 let size = drained[flow_signal_index(signal)];
                 if size != 0 {
@@ -610,7 +617,7 @@ impl<PData> EffectHandler<PData> {
                 .await?;
         }
         if let Some((metrics, acc_cell)) = self.flow.decision.dropped_items.as_mut() {
-            let drained = acc_cell.replace([0; 3]);
+            let drained = acc_cell.replace([0; FLOW_SIGNAL_COUNT]);
             for signal in FLOW_SIGNALS {
                 let count = drained[flow_signal_index(signal)];
                 if count != 0 {
@@ -1388,7 +1395,7 @@ mod tests {
         let start_acc = eh.flow.input.input_items.as_ref().unwrap().1.get();
         assert_eq!(
             start_acc,
-            [0, 20, 10],
+            [0, 20, 10, 0],
             "start items should accumulate by signal"
         );
 
@@ -1400,7 +1407,7 @@ mod tests {
         let output_acc = eh.flow.end.output_items.as_ref().unwrap().1.get();
         assert_eq!(
             output_acc,
-            [0, 8, 7],
+            [0, 8, 7, 0],
             "output items should accumulate by signal"
         );
 
@@ -1429,7 +1436,7 @@ mod tests {
         // Accumulators should be drained.
         let start_acc_after = eh.flow.input.input_items.as_ref().unwrap().1.get();
         assert_eq!(
-            start_acc_after, [0; 3],
+            start_acc_after, [0; FLOW_SIGNAL_COUNT],
             "start accumulator should be drained"
         );
         let acc_after = eh.flow.end.duration.as_ref().unwrap().1.borrow();
@@ -1441,7 +1448,7 @@ mod tests {
         drop(acc_after);
         let output_acc_after = eh.flow.end.output_items.as_ref().unwrap().1.get();
         assert_eq!(
-            output_acc_after, [0; 3],
+            output_acc_after, [0; FLOW_SIGNAL_COUNT],
             "stop item accumulator should be drained"
         );
 
@@ -1526,38 +1533,38 @@ mod tests {
 
         assert_eq!(
             handler.flow.input.input_messages.as_ref().unwrap().1.get(),
-            [0, 1, 1]
+            [0, 1, 1, 0]
         );
         assert_eq!(
             handler.flow.input.input_size.as_ref().unwrap().1.get(),
-            [0, 20, 10]
+            [0, 20, 10, 0]
         );
         assert_eq!(
             handler.flow.end.output_messages.as_ref().unwrap().1.get(),
-            [0, 0, 2]
+            [0, 0, 2, 0]
         );
         assert_eq!(
             handler.flow.end.output_size.as_ref().unwrap().1.get(),
-            [0, 40, 30]
+            [0, 40, 30, 0]
         );
 
         handler.report_flow_metrics();
 
         assert_eq!(
             handler.flow.input.input_messages.as_ref().unwrap().1.get(),
-            [0; 3]
+            [0; FLOW_SIGNAL_COUNT]
         );
         assert_eq!(
             handler.flow.input.input_size.as_ref().unwrap().1.get(),
-            [0; 3]
+            [0; FLOW_SIGNAL_COUNT]
         );
         assert_eq!(
             handler.flow.end.output_messages.as_ref().unwrap().1.get(),
-            [0; 3]
+            [0; FLOW_SIGNAL_COUNT]
         );
         assert_eq!(
             handler.flow.end.output_size.as_ref().unwrap().1.get(),
-            [0; 3]
+            [0; FLOW_SIGNAL_COUNT]
         );
     }
 

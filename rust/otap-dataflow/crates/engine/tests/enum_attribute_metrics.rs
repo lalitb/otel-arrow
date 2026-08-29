@@ -244,32 +244,42 @@ fn signal_type_uses_canonical_values() {
     assert_eq!(SignalType::Logs.as_str(), "logs");
     assert_eq!(SignalType::Metrics.as_str(), "metrics");
     assert_eq!(SignalType::Traces.as_str(), "traces");
-    assert_eq!(SignalType::CARDINALITY, 3);
-    assert_eq!(SignalType::VARIANTS, &["traces", "metrics", "logs"]);
+    assert_eq!(SignalType::Profiles.as_str(), "profiles");
+    assert_eq!(SignalType::CARDINALITY, 4);
+    assert_eq!(
+        SignalType::VARIANTS,
+        &["traces", "metrics", "logs", "profiles"]
+    );
     assert_eq!(SignalType::Traces.variant_index(), 0);
     assert_eq!(SignalType::Logs.variant_index(), 2);
+    assert_eq!(SignalType::Profiles.variant_index(), 3);
 }
 
 /// Scenario: a two-field enum attribute set selects item buckets.
 /// Guarantees: descriptors and mixed-radix indexes match declaration order.
 #[test]
 fn measurement_attribute_set_descriptors_and_bucketing() {
-    assert_eq!(ImplicitMeasurementAttributes::CARDINALITY, 6);
+    assert_eq!(ImplicitMeasurementAttributes::CARDINALITY, 8);
     let descriptors = ImplicitMeasurementAttributes::DESCRIPTORS;
     assert_eq!(descriptors.len(), 2);
     assert_eq!(descriptors[0].key, "signal");
-    assert_eq!(descriptors[0].variants, &["traces", "metrics", "logs"]);
+    assert_eq!(
+        descriptors[0].variants,
+        &["traces", "metrics", "logs", "profiles"]
+    );
     assert_eq!(descriptors[1].key, "outcome");
     assert_eq!(descriptors[1].variants, &["dropped", "expired"]);
 
-    // First declared field (signal) is the low-order digit; radix 3 then 2.
+    // First declared field (signal) is the low-order digit; radix 4 then 2.
     let idx = |signal, outcome| ImplicitMeasurementAttributes { signal, outcome }.bucket_index();
     assert_eq!(idx(SignalType::Traces, LossOutcome::Dropped), 0);
     assert_eq!(idx(SignalType::Metrics, LossOutcome::Dropped), 1);
     assert_eq!(idx(SignalType::Logs, LossOutcome::Dropped), 2);
-    assert_eq!(idx(SignalType::Traces, LossOutcome::Expired), 3);
-    assert_eq!(idx(SignalType::Metrics, LossOutcome::Expired), 4);
-    assert_eq!(idx(SignalType::Logs, LossOutcome::Expired), 5);
+    assert_eq!(idx(SignalType::Profiles, LossOutcome::Dropped), 3);
+    assert_eq!(idx(SignalType::Traces, LossOutcome::Expired), 4);
+    assert_eq!(idx(SignalType::Metrics, LossOutcome::Expired), 5);
+    assert_eq!(idx(SignalType::Logs, LossOutcome::Expired), 6);
+    assert_eq!(idx(SignalType::Profiles, LossOutcome::Expired), 7);
 }
 
 /// Item measurement attributes remain serializable outside the metrics bucket model.

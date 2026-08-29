@@ -15,14 +15,15 @@ use otel_arrow_dfe_telemetry_macros::{AttributeEnum, attribute_set};
 //
 // Other closed-set attributes use the `AttributeEnum` macro to implement the trait automatically.
 impl AttributeEnum for SignalType {
-    const CARDINALITY: usize = 3;
-    const VARIANTS: &'static [&'static str] = &["traces", "metrics", "logs"];
+    const CARDINALITY: usize = 4;
+    const VARIANTS: &'static [&'static str] = &["traces", "metrics", "logs", "profiles"];
 
     fn variant_index(self) -> usize {
         match self {
             Self::Traces => 0,
             Self::Metrics => 1,
             Self::Logs => 2,
+            Self::Profiles => 3,
         }
     }
 }

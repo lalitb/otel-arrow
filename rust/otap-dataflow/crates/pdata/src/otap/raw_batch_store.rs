@@ -6,7 +6,7 @@
 //!
 //! [`RawBatchStore`] is the inner storage type used by the validated
 //! [`OtapBatchStore`](super::OtapBatchStore) implementations (`Logs`, `Metrics`,
-//! `Traces`). It can also be used directly by terminal consumers (e.g. the
+//! `Traces`, `Profiles`). It can also be used directly by terminal consumers (e.g. the
 //! Parquet exporter) that legitimately transform batches in ways that may not
 //! conform to the OTAP wire-protocol schema.
 
@@ -308,7 +308,7 @@ mod tests {
     /// and `false` for every other known payload type.
     #[test]
     fn type_mask_matches_allowed_payload_types() {
-        use crate::otap::{Logs, Metrics, OtapBatchStore, Traces};
+        use crate::otap::{Logs, Metrics, OtapBatchStore, Profiles, Traces};
         use std::collections::HashSet;
 
         // Union of all known payload types across all signals, plus Unknown.
@@ -316,6 +316,7 @@ mod tests {
             .chain(Logs::allowed_payload_types().iter().copied())
             .chain(Metrics::allowed_payload_types().iter().copied())
             .chain(Traces::allowed_payload_types().iter().copied())
+            .chain(Profiles::allowed_payload_types().iter().copied())
             .collect();
 
         let cases: &[(&str, fn(ArrowPayloadType) -> bool, &[ArrowPayloadType])] = &[
@@ -333,6 +334,11 @@ mod tests {
                 "Traces",
                 RawTracesStore::is_valid_type,
                 Traces::allowed_payload_types(),
+            ),
+            (
+                "Profiles",
+                RawProfilesStore::is_valid_type,
+                Profiles::allowed_payload_types(),
             ),
         ];
 
@@ -359,5 +365,8 @@ mod tests {
 
         let store = RawTracesStore::new();
         assert_eq!(store.into_batches().len(), TRACES_COUNT);
+
+        let store = RawProfilesStore::new();
+        assert_eq!(store.into_batches().len(), PROFILES_COUNT);
     }
 }

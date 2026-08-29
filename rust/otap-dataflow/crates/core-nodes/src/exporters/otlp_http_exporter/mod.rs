@@ -475,6 +475,22 @@ impl Exporter<OtapPdata> for OtlpHttpExporter {
                         }
                     }
 
+                    if signal_type == SignalType::Profiles {
+                        let export_duration = export_started_at.elapsed();
+                        let mut nack = NackMsg::new(
+                            "OTLP HTTP Profiles export is not supported yet",
+                            OtapPdata::new(context, payload),
+                        );
+                        nack.permanent = true;
+                        _ = effect_handler.notify_nack(nack).await;
+                        self.metrics.record_failure(
+                            signal_type,
+                            OtlpHttpExporterErrorType::Other,
+                            export_duration,
+                        );
+                        continue;
+                    }
+
                     // The cached bearer header, together with the generation of the
                     // token it was built from, cloned per request. It takes
                     // precedence over any statically configured `authorization`; the
@@ -522,6 +538,9 @@ impl Exporter<OtapPdata> for OtlpHttpExporter {
                                         .encode(&mut otap_batch, &mut proto_buffer),
                                     SignalType::Traces => traces_proto_encoder
                                         .encode(&mut otap_batch, &mut proto_buffer),
+                                    SignalType::Profiles => {
+                                        unreachable!("Profiles export is rejected before encoding")
+                                    }
                                 };
 
                             if !context.may_return_payload() {
@@ -588,6 +607,9 @@ impl Exporter<OtapPdata> for OtlpHttpExporter {
                         SignalType::Logs => &logs_endpoint,
                         SignalType::Metrics => &metrics_endpoint,
                         SignalType::Traces => &traces_endpoint,
+                        SignalType::Profiles => {
+                            unreachable!("Profiles export is rejected before endpoint selection")
+                        }
                     });
 
                     let max_response_body_len = self.config.max_response_body_length;
@@ -835,6 +857,9 @@ async fn query_result_to_service_response(
         SignalType::Logs => ExportLogsServiceResponse::decode(&mut body).map(Into::into),
         SignalType::Metrics => ExportMetricsServiceResponse::decode(&mut body).map(Into::into),
         SignalType::Traces => ExportTraceServiceResponse::decode(&mut body).map(Into::into),
+        SignalType::Profiles => {
+            unreachable!("Profiles export is rejected before response decoding")
+        }
     };
 
     Ok(service_resp?)
@@ -2395,6 +2420,9 @@ mod test {
                                     &[OtlpProtoMessage::Traces(traces_batch.clone())],
                                 );
                             }
+                            SignalType::Profiles => {
+                                panic!("Profiles are not expected in this OTLP HTTP test")
+                            }
                         }
                     }
 
@@ -3199,6 +3227,9 @@ mod test {
                                     &[OtlpProtoMessage::Traces(pdata_decoded)],
                                     &[OtlpProtoMessage::Traces(traces_batch.clone())],
                                 );
+                            }
+                            SignalType::Profiles => {
+                                panic!("Profiles are not expected in this OTLP HTTP test")
                             }
                         }
                     }

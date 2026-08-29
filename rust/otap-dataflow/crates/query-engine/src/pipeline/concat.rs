@@ -13,7 +13,7 @@ use otel_arrow_dfe_pdata::otap::raw_batch_store::{
 };
 use otel_arrow_dfe_pdata::otap::transform::concatenate::concatenate;
 use otel_arrow_dfe_pdata::otap::transform::reindex::reindex;
-use otel_arrow_dfe_pdata::otap::{Logs, Metrics, OtapBatchStore, Traces};
+use otel_arrow_dfe_pdata::otap::{Logs, Metrics, OtapBatchStore, Profiles, Traces};
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 
 use crate::error::{Error, Result};
@@ -56,6 +56,18 @@ pub(crate) fn concatenate_traces(
     branch_results: &mut Vec<OtapArrowRecords>,
 ) -> Result<OtapArrowRecords> {
     concat_generic::<Traces, TRACES_LAYOUT, { Traces::COUNT }>(branch_results)
+}
+
+pub(crate) fn concatenate_profiles(
+    branch_results: &mut Vec<OtapArrowRecords>,
+) -> Result<OtapArrowRecords> {
+    match branch_results.len() {
+        0 => Ok(OtapArrowRecords::Profiles(Profiles::default())),
+        1 => Ok(branch_results.pop().expect("one Profiles branch result")),
+        _ => Err(Error::NotYetSupportedError {
+            message: "concatenating Profiles requires profile graph reindexing".into(),
+        }),
+    }
 }
 
 pub(crate) fn concatenate_attrs_record_batches(
@@ -120,4 +132,36 @@ pub(crate) fn reindex_metrics(branch_results: &mut Vec<OtapArrowRecords>) -> Res
 
 pub(crate) fn reindex_traces(branch_results: &mut Vec<OtapArrowRecords>) -> Result<()> {
     reindex_generic::<Traces, TRACES_LAYOUT, { Traces::COUNT }>(branch_results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Scenario: A Profiles conditional produces exactly one non-empty branch result.
+    /// Guarantees: The result is returned unchanged without graph reindexing.
+    #[test]
+    fn concatenate_profiles_preserves_single_result() {
+        let expected = OtapArrowRecords::Profiles(Profiles::default());
+        let mut results = vec![expected.clone()];
+
+        assert_eq!(concatenate_profiles(&mut results).unwrap(), expected);
+        assert!(results.is_empty());
+    }
+
+    /// Scenario: A Profiles conditional produces multiple non-empty branch results.
+    /// Guarantees: The query engine rejects unsafe graph concatenation with a typed error.
+    #[test]
+    fn concatenate_profiles_rejects_multiple_results() {
+        let mut results = vec![
+            OtapArrowRecords::Profiles(Profiles::default()),
+            OtapArrowRecords::Profiles(Profiles::default()),
+        ];
+
+        assert!(matches!(
+            concatenate_profiles(&mut results),
+            Err(Error::NotYetSupportedError { .. })
+        ));
+        assert_eq!(results.len(), 2);
+    }
 }

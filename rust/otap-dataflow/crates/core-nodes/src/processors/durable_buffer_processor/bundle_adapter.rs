@@ -52,7 +52,9 @@ use otel_arrow_dfe_quiver::segment::ReconstructedBundle;
 
 use otel_arrow_dfe_config::SignalType;
 use otel_arrow_dfe_pdata::otap::schema::SchemaIdBuilder;
-use otel_arrow_dfe_pdata::otap::{Logs, Metrics, OtapArrowRecords, OtapBatchStore, Traces};
+use otel_arrow_dfe_pdata::otap::{
+    Logs, Metrics, OtapArrowRecords, OtapBatchStore, Profiles, Traces,
+};
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 use otel_arrow_dfe_pdata::{OtapPayload, OtapPayloadHelpers, OtlpProtoBytes};
 
@@ -80,23 +82,18 @@ mod otlp_slots {
     pub const OTLP_LOGS: u16 = 60;
     pub const OTLP_TRACES: u16 = 61;
     pub const OTLP_METRICS: u16 = 62;
-    // Reserved until Profiles is integrated with SignalType and opaque storage.
     pub const OTLP_PROFILES: u16 = 63;
 }
 
 #[derive(Clone, Copy)]
 enum PayloadSignal {
     Shared,
-    Reserved,
     Signal(SignalType),
 }
 
 macro_rules! payload_signal {
     (Shared) => {
         PayloadSignal::Shared
-    };
-    (ProfilesReserved) => {
-        PayloadSignal::Reserved
     };
     ($signal:ident) => {
         PayloadSignal::Signal(SignalType::$signal)
@@ -113,7 +110,7 @@ macro_rules! define_arrow_wal_slots {
             _signal_type: SignalType,
             payload_type: ArrowPayloadType,
         ) -> SlotId {
-            let raw = match payload_type {
+    let raw = match payload_type {
                 // Bundle descriptors only iterate signal-specific allowed payload types,
                 // which exclude Unknown. Reaching this arm is an internal invariant violation.
                 ArrowPayloadType::Unknown => {
@@ -168,20 +165,20 @@ define_arrow_wal_slots! {
     SpanLinks => (43, Traces),
     SpanEventAttrs => (44, Traces),
     SpanLinkAttrs => (45, Traces),
-    Profiles => (46, ProfilesReserved),
-    ProfileValueTypes => (47, ProfilesReserved),
-    Samples => (48, ProfilesReserved),
-    Stacks => (49, ProfilesReserved),
-    StackLocations => (50, ProfilesReserved),
-    ProfileLocations => (51, ProfilesReserved),
-    ProfileLocationLines => (52, ProfilesReserved),
-    ProfileFunctions => (53, ProfilesReserved),
-    ProfileMappings => (54, ProfilesReserved),
-    ProfileLinks => (55, ProfilesReserved),
-    ProfileAttrs => (56, ProfilesReserved),
-    ProfileSampleAttrs => (57, ProfilesReserved),
-    ProfileMappingAttrs => (58, ProfilesReserved),
-    ProfileLocationAttrs => (59, ProfilesReserved),
+    Profiles => (46, Profiles),
+    ProfileValueTypes => (47, Profiles),
+    Samples => (48, Profiles),
+    Stacks => (49, Profiles),
+    StackLocations => (50, Profiles),
+    ProfileLocations => (51, Profiles),
+    ProfileLocationLines => (52, Profiles),
+    ProfileFunctions => (53, Profiles),
+    ProfileMappings => (54, Profiles),
+    ProfileLinks => (55, Profiles),
+    ProfileAttrs => (56, Profiles),
+    ProfileSampleAttrs => (57, Profiles),
+    ProfileMappingAttrs => (58, Profiles),
+    ProfileLocationAttrs => (59, Profiles),
 }
 
 /// Convert signal type to OTLP slot ID (for opaque binary storage)
@@ -190,6 +187,7 @@ pub(crate) const fn to_otlp_slot_id(signal_type: SignalType) -> SlotId {
         SignalType::Logs => otlp_slots::OTLP_LOGS,
         SignalType::Traces => otlp_slots::OTLP_TRACES,
         SignalType::Metrics => otlp_slots::OTLP_METRICS,
+        SignalType::Profiles => otlp_slots::OTLP_PROFILES,
     })
 }
 
@@ -199,6 +197,7 @@ const fn is_otlp_slot(slot: SlotId) -> Option<SignalType> {
         otlp_slots::OTLP_LOGS => Some(SignalType::Logs),
         otlp_slots::OTLP_TRACES => Some(SignalType::Traces),
         otlp_slots::OTLP_METRICS => Some(SignalType::Metrics),
+        otlp_slots::OTLP_PROFILES => Some(SignalType::Profiles),
         _ => None,
     }
 }
@@ -238,11 +237,11 @@ const fn is_shared_slot(slot: SlotId) -> bool {
 /// # Returns
 /// - `Some((signal_type, payload_type))` for signal-specific slots
 /// - `None` for shared slots (RESOURCE_ATTRS, SCOPE_ATTRS) since they're used by all signals
-/// - `None` for OTLP opaque slots (60-62) or invalid slot IDs
+/// - `None` for OTLP opaque slots or invalid slot IDs
 fn from_slot_id(slot: SlotId) -> Option<(SignalType, ArrowPayloadType)> {
     let payload_type = slot_to_payload_type(slot)?;
     let signal_type = match payload_signal_type(payload_type)? {
-        PayloadSignal::Shared | PayloadSignal::Reserved => return None,
+        PayloadSignal::Shared => return None,
         PayloadSignal::Signal(signal_type) => signal_type,
     };
 
@@ -255,6 +254,7 @@ fn slot_label(signal_type: SignalType, payload_type: ArrowPayloadType) -> Cow<'s
         SignalType::Logs => "Log",
         SignalType::Traces => "Trace",
         SignalType::Metrics => "Metric",
+        SignalType::Profiles => "Profile",
     };
     Cow::Owned(format!("{}:{}", signal_prefix, payload_type.as_str_name()))
 }
@@ -265,6 +265,7 @@ const fn otlp_slot_label(signal_type: SignalType) -> Cow<'static, str> {
         SignalType::Logs => "OtlpLogs",
         SignalType::Traces => "OtlpTraces",
         SignalType::Metrics => "OtlpMetrics",
+        SignalType::Profiles => "OtlpProfiles",
     })
 }
 
@@ -305,7 +306,7 @@ fn compute_schema_fingerprint(batch: &RecordBatch) -> SchemaFingerprint {
 pub struct OtapRecordBundleAdapter {
     /// The underlying OTAP arrow records
     records: OtapArrowRecords,
-    /// The signal type (Logs, Traces, or Metrics)
+    /// The signal type (Logs, Traces, Metrics, or Profiles)
     signal_type: SignalType,
     /// Cached bundle descriptor
     descriptor: BundleDescriptor,
@@ -321,6 +322,7 @@ impl OtapRecordBundleAdapter {
             OtapArrowRecords::Logs(_) => SignalType::Logs,
             OtapArrowRecords::Traces(_) => SignalType::Traces,
             OtapArrowRecords::Metrics(_) => SignalType::Metrics,
+            OtapArrowRecords::Profiles(_) => SignalType::Profiles,
         };
         let descriptor = Self::build_descriptor(&records, signal_type);
         Self {
@@ -403,7 +405,7 @@ impl RecordBundle for OtapRecordBundleAdapter {
 pub struct OtlpBytesAdapter {
     /// The original OTLP bytes (preserved for recovery on NACK)
     bytes: OtlpProtoBytes,
-    /// The signal type (Logs, Traces, or Metrics)
+    /// The signal type (Logs, Traces, Metrics, or Profiles)
     signal_type: SignalType,
     /// The record batch containing the binary data
     batch: RecordBatch,
@@ -429,6 +431,7 @@ impl OtlpBytesAdapter {
             OtlpProtoBytes::ExportLogsRequest(_) => SignalType::Logs,
             OtlpProtoBytes::ExportMetricsRequest(_) => SignalType::Metrics,
             OtlpProtoBytes::ExportTracesRequest(_) => SignalType::Traces,
+            OtlpProtoBytes::ExportProfilesRequest(_) => SignalType::Profiles,
         };
 
         // Create a record batch with a single binary column containing the OTLP bytes.
@@ -623,6 +626,7 @@ pub fn recover_item_count(bundle: &dyn RecordBundle) -> Option<u64> {
         SignalType::Logs => create_records::<Logs>(&payloads).ok()?,
         SignalType::Traces => create_records::<Traces>(&payloads).ok()?,
         SignalType::Metrics => create_records::<Metrics>(&payloads).ok()?,
+        SignalType::Profiles => create_records::<Profiles>(&payloads).ok()?,
     };
     Some(records.num_items() as u64)
 }
@@ -655,6 +659,7 @@ pub fn convert_bundle_to_pdata(
         SignalType::Logs => create_records::<Logs>(payloads)?,
         SignalType::Traces => create_records::<Traces>(payloads)?,
         SignalType::Metrics => create_records::<Metrics>(payloads)?,
+        SignalType::Profiles => create_records::<Profiles>(payloads)?,
     };
 
     // Wrap in OtapPayload and OtapPdata
@@ -688,13 +693,17 @@ where
         }
     }
 
-    Ok(store.into())
+    Ok(store
+        .validate()
+        .map_err(|e| BundleConversionError::RecordBatchCreationError(e.to_string()))?
+        .into())
 }
 
 #[cfg(test)]
 #[allow(unused_imports)]
 mod tests {
     use super::*;
+    use arrow::array::{ArrayRef, Int64Array, LargeListArray, UInt32Array, UInt64Array};
     use otel_arrow_dfe_pdata::otap::OtapBatchStore;
     use otel_arrow_dfe_pdata::{logs, metrics, record_batch, traces};
 
@@ -704,6 +713,44 @@ mod tests {
             .get(payload_type)
             .unwrap_or_else(|| panic!("Expected batch for {payload_type:?}"))
             .clone()
+    }
+
+    fn profiles_samples_batch() -> RecordBatch {
+        let values = LargeListArray::new(
+            Arc::new(Field::new("item", DataType::Int64, true)),
+            OffsetBuffer::from_lengths([1]),
+            Arc::new(Int64Array::new(ScalarBuffer::from(vec![1]), None)) as ArrayRef,
+            None,
+        );
+        let timestamps = LargeListArray::new(
+            Arc::new(Field::new("item", DataType::UInt64, true)),
+            OffsetBuffer::from_lengths([1]),
+            Arc::new(UInt64Array::new(ScalarBuffer::from(vec![1]), None)) as ArrayRef,
+            None,
+        );
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::UInt32, false),
+                Field::new("parent_id", DataType::UInt32, false),
+                Field::new(
+                    "values",
+                    DataType::LargeList(Arc::new(Field::new("item", DataType::Int64, true))),
+                    false,
+                ),
+                Field::new(
+                    "timestamps_unix_nano",
+                    DataType::LargeList(Arc::new(Field::new("item", DataType::UInt64, true))),
+                    false,
+                ),
+            ])),
+            vec![
+                Arc::new(UInt32Array::from(vec![10])),
+                Arc::new(UInt32Array::from(vec![1])),
+                Arc::new(values),
+                Arc::new(timestamps),
+            ],
+        )
+        .unwrap()
     }
 
     /// Scenario: Every assigned Arrow WAL slot is decoded and encoded again.
@@ -773,6 +820,38 @@ mod tests {
             assert!(raw < WAL_SLOT_COUNT);
             assert_eq!(to_slot_id(SignalType::Logs, payload_type).raw(), raw);
             assert_eq!(slot_to_payload_type(SlotId::new(raw)), Some(payload_type));
+        }
+    }
+
+    /// Scenario: Profiles payloads are assigned storage slots for durable buffering.
+    /// Guarantees: The 14 tables occupy exactly slots 46-59 in declaration order.
+    #[test]
+    fn test_profiles_arrow_slots_are_reserved_contiguously() {
+        let profiles = [
+            ArrowPayloadType::Profiles,
+            ArrowPayloadType::ProfileValueTypes,
+            ArrowPayloadType::Samples,
+            ArrowPayloadType::Stacks,
+            ArrowPayloadType::StackLocations,
+            ArrowPayloadType::ProfileLocations,
+            ArrowPayloadType::ProfileLocationLines,
+            ArrowPayloadType::ProfileFunctions,
+            ArrowPayloadType::ProfileMappings,
+            ArrowPayloadType::ProfileLinks,
+            ArrowPayloadType::ProfileAttrs,
+            ArrowPayloadType::ProfileSampleAttrs,
+            ArrowPayloadType::ProfileMappingAttrs,
+            ArrowPayloadType::ProfileLocationAttrs,
+        ];
+
+        for (offset, payload_type) in profiles.into_iter().enumerate() {
+            let raw = 46 + offset as u16;
+            assert_eq!(to_slot_id(SignalType::Profiles, payload_type).raw(), raw);
+            assert_eq!(slot_to_payload_type(SlotId::new(raw)), Some(payload_type));
+            assert_eq!(
+                from_slot_id(SlotId::new(raw)),
+                Some((SignalType::Profiles, payload_type))
+            );
         }
     }
 
@@ -1124,6 +1203,49 @@ mod tests {
         }
     }
 
+    /// Scenario: A valid Profiles graph is persisted into WAL slots and reconstructed.
+    /// Guarantees: Root and sample slots reconstruct with the original root row count.
+    #[test]
+    fn test_profiles_bundle_roundtrip() {
+        let mut profiles = Profiles::default();
+        profiles
+            .set(
+                ArrowPayloadType::Profiles,
+                record_batch!(
+                    ("id", UInt32, [1u32, 2, 3]),
+                    ("time_unix_nano", UInt64, [100u64, 200, 300]),
+                    ("duration_nano", UInt64, [10u64, 20, 30])
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        profiles
+            .set(ArrowPayloadType::Samples, profiles_samples_batch())
+            .unwrap();
+        let records = OtapArrowRecords::Profiles(profiles);
+        let adapter = OtapRecordBundleAdapter::new(records);
+
+        let mut recovered_payloads: HashMap<SlotId, RecordBatch> = HashMap::new();
+        for slot_desc in &adapter.descriptor().slots {
+            if let Some(payload) = adapter.payload(slot_desc.id) {
+                let _ = recovered_payloads.insert(slot_desc.id, payload.batch.clone());
+            }
+        }
+
+        assert_eq!(recovered_payloads.len(), 2);
+        assert!(recovered_payloads.contains_key(&SlotId::new(46)));
+        assert!(recovered_payloads.contains_key(&SlotId::new(48)));
+        assert_eq!(
+            determine_signal_type(&recovered_payloads).unwrap(),
+            SignalType::Profiles
+        );
+
+        let reconstructed = create_records::<Profiles>(&recovered_payloads).unwrap();
+        assert_eq!(reconstructed.signal_type(), SignalType::Profiles);
+        assert_eq!(reconstructed.num_items(), 3);
+        assert!(matches!(reconstructed, OtapArrowRecords::Profiles(_)));
+    }
+
     #[test]
     fn test_metrics_bundle_with_shared_slots_roundtrip() {
         // Metrics bundle with shared slots
@@ -1437,13 +1559,14 @@ mod tests {
         }
     }
 
+    /// Scenario: Opaque OTLP slots are inspected as Arrow storage slots.
+    /// Guarantees: Slots 60-63 never decode as Arrow payloads or shared slots.
     #[test]
     fn test_otlp_slots_are_not_arrow_slots() {
-        // OTLP slots (60-62) should not be treated as Arrow payload slots
-        for raw in [60, 61, 62] {
+        // OTLP slots (60-63) should not be treated as Arrow payload slots.
+        for raw in [60, 61, 62, 63] {
             let slot = SlotId::new(raw);
 
-            // Should be identified as OTLP slot
             assert!(is_otlp_slot(slot).is_some(), "slot {} should be OTLP", raw);
 
             // Should NOT be an Arrow payload type

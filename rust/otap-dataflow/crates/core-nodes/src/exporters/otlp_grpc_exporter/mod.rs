@@ -504,6 +504,22 @@ impl Exporter<OtapPdata> for OTLPExporter {
                     let signal_type = pdata.signal_type();
                     let (context, payload) = pdata.into_parts();
 
+                    if signal_type == SignalType::Profiles {
+                        let export_duration = export_started_at.elapsed();
+                        let mut nack = NackMsg::new(
+                            "OTLP gRPC Profiles export is not supported yet",
+                            OtapPdata::new(context, payload),
+                        );
+                        nack.permanent = true;
+                        _ = effect_handler.notify_nack(nack).await;
+                        self.metrics.record_failure(
+                            signal_type,
+                            OtlpGrpcExporterErrorType::Other,
+                            export_duration,
+                        );
+                        continue;
+                    }
+
                     // The cached bearer header, together with the generation of the
                     // token it was built from. The generation is echoed back on
                     // completion so an UNAUTHENTICATED response can be matched to the
@@ -591,6 +607,9 @@ impl Exporter<OtapPdata> for OTLPExporter {
                             )
                             .await;
                         }
+                        (SignalType::Profiles, PayloadData::OtapArrowRecords(_)) => {
+                            unreachable!("Profiles export is rejected before dispatch")
+                        }
                         (_, PayloadData::OtlpBytes(service_req)) => {
                             let prepared = match service_req {
                                 OtlpProtoBytes::ExportLogsRequest(bytes) => prepare_otlp_export(
@@ -617,6 +636,9 @@ impl Exporter<OtapPdata> for OTLPExporter {
                                     export_started_at,
                                     |b| OtlpProtoBytes::ExportTracesRequest(b).into(),
                                 ),
+                                OtlpProtoBytes::ExportProfilesRequest(_) => {
+                                    unreachable!("Profiles export is rejected before dispatch")
+                                }
                             };
 
                             let client = match signal_type {
@@ -626,6 +648,11 @@ impl Exporter<OtapPdata> for OTLPExporter {
                                 }
                                 SignalType::Traces => {
                                     SignalClient::Traces(grpc_clients.take_traces())
+                                }
+                                SignalType::Profiles => {
+                                    unreachable!(
+                                        "Profiles export is rejected before client selection"
+                                    )
                                 }
                             };
                             let future = make_export_future(prepared, client);

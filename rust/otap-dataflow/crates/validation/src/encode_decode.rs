@@ -22,7 +22,14 @@ impl OtelProtoSimulator {
     ) -> Result<OtlpProtoMessage, String> {
         // take otlp proto message
         // convert to otap arrow records which we can pass to the producer
-        let mut otap_message = otlp_to_otap(proto_message);
+        let mut otap_message = match proto_message {
+            OtlpProtoMessage::Logs(_)
+            | OtlpProtoMessage::Metrics(_)
+            | OtlpProtoMessage::Traces(_) => otlp_to_otap(proto_message),
+            OtlpProtoMessage::Profiles(_) => {
+                return Err("Profiles encode/decode validation is not supported yet".to_string());
+            }
+        };
         // convert to batch arrow records
         // converg batch arrow records
         // convert msg to proto bytes?
@@ -43,6 +50,9 @@ impl OtelProtoSimulator {
             }
             OtlpProtoMessage::Traces(_) => {
                 OtapArrowRecords::Traces(from_record_messages(records).map_err(|e| e.to_string())?)
+            }
+            OtlpProtoMessage::Profiles(_) => {
+                return Err("Profiles encode/decode validation is not supported yet".to_string());
             }
         };
         Ok(otap_to_otlp(&otap_message))
