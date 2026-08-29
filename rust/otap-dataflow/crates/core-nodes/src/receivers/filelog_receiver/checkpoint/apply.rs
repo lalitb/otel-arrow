@@ -435,6 +435,15 @@ impl CheckpointTable {
                         reason: "a zero-delta update must repeat the stored guard exactly",
                     });
                 }
+                if op.new_committed_offset == op.expected_committed_offset
+                    && op.new_framing_resume != record.framing_resume
+                {
+                    return Err(ApplyError::ImpossibleTransition {
+                        operation: "update_progress",
+                        file_id: op.file_id,
+                        reason: "a zero-delta update must repeat the stored framing resume exactly",
+                    });
+                }
                 if op.finalize && op.new_framing_resume != FramingResume::Clean {
                     return Err(ApplyError::ImpossibleTransition {
                         operation: "update_progress",

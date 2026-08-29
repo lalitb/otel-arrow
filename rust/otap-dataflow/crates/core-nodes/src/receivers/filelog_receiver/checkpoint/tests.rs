@@ -639,6 +639,129 @@ fn update_progress_rejects_offset_regression() {
     assert!(matches!(err, ApplyError::OffsetRegression { .. }));
 }
 
+/// Scenario: a zero-delta finalizing update targets an active record whose
+/// durable framing resume is a split-record continuation.
+/// Guarantees: replay cannot replace the continuation with `Clean` or finalize
+/// the record without advancing through the remaining source bytes.
+#[test]
+fn zero_delta_finalization_cannot_discard_continuation() {
+    let file_id = FileId([94; 16]);
+    let mut table = CheckpointTable::new();
+    let continuation = FramingResume::Continuation {
+        record_start_offset: 0,
+        record_end_offset: 20,
+        next_fragment_index: 1,
+    };
+    table
+        .apply_transaction(
+            &Transaction {
+                sequence: 1,
+                operations: vec![Operation::RegisterFile(sample_register(file_id))],
+            },
+            NAMESPACE,
+        )
+        .unwrap();
+    table
+        .apply_transaction(
+            &Transaction {
+                sequence: 2,
+                operations: vec![Operation::UpdateProgress(UpdateProgress {
+                    file_id,
+                    expected_committed_offset: 0,
+                    expected_file_epoch: 1,
+                    new_committed_offset: 10,
+                    new_committed_frontier_guard: zero_guard(10),
+                    new_framing_resume: continuation,
+                    new_last_seen_time_unix_nano: 2,
+                    finalize: false,
+                })],
+            },
+            NAMESPACE,
+        )
+        .unwrap();
+    let before = table
+        .get(&file_id)
+        .expect("continuation record is present")
+        .clone();
+
+    let err = table
+        .apply_transaction(
+            &Transaction {
+                sequence: 3,
+                operations: vec![Operation::UpdateProgress(UpdateProgress {
+                    file_id,
+                    expected_committed_offset: 10,
+                    expected_file_epoch: 1,
+                    new_committed_offset: 10,
+                    new_committed_frontier_guard: zero_guard(10),
+                    new_framing_resume: FramingResume::Clean,
+                    new_last_seen_time_unix_nano: 3,
+                    finalize: true,
+                })],
+            },
+            NAMESPACE,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        ApplyError::ImpossibleTransition {
+            operation: "update_progress",
+            reason: "a zero-delta update must repeat the stored framing resume exactly",
+            ..
+        }
+    ));
+
+    let record = table.get(&file_id).expect("record remains present");
+    assert_eq!(record, &before);
+}
+
+/// Scenario: a zero-delta finalizing update targets an active record whose
+/// durable framing resume is already `Clean`.
+/// Guarantees: the valid zero-delta rotation-finalization path remains
+/// accepted while the continuation-discarding transition is rejected.
+#[test]
+fn zero_delta_finalization_accepts_already_clean_state() {
+    let file_id = FileId([95; 16]);
+    let mut table = CheckpointTable::new();
+    let mut register = sample_register(file_id);
+    register.committed_offset = 10;
+    register.committed_frontier_guard = zero_guard(10);
+    table
+        .apply_transaction(
+            &Transaction {
+                sequence: 1,
+                operations: vec![Operation::RegisterFile(register)],
+            },
+            NAMESPACE,
+        )
+        .unwrap();
+
+    table
+        .apply_transaction(
+            &Transaction {
+                sequence: 2,
+                operations: vec![Operation::UpdateProgress(UpdateProgress {
+                    file_id,
+                    expected_committed_offset: 10,
+                    expected_file_epoch: 1,
+                    new_committed_offset: 10,
+                    new_committed_frontier_guard: zero_guard(10),
+                    new_framing_resume: FramingResume::Clean,
+                    new_last_seen_time_unix_nano: 2,
+                    finalize: true,
+                })],
+            },
+            NAMESPACE,
+        )
+        .unwrap();
+
+    let record = table.get(&file_id).expect("record remains present");
+    assert_eq!(record.committed_offset, 10);
+    assert_eq!(record.framing_resume, FramingResume::Clean);
+    assert_eq!(record.lifecycle_state, LifecycleState::RotatedFinalized);
+    assert_eq!(record.last_seen_time_unix_nano, 2);
+}
+
 /// Scenario: `update_progress` with `finalize = true` transitions a record
 /// to `RotatedFinalized`; a subsequent `update_progress` is then replayed
 /// against that finalized record.

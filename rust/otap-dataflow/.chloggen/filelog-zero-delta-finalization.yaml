@@ -1,0 +1,16 @@
+# One of 'breaking', 'deprecation', 'new_component', 'enhancement', 'bug_fix'
+change_type: bug_fix
+
+# The name of the component, or a single word describing the area of concern.
+component: pipeline
+
+# A brief description of the change.
+note: Prevent zero-delta filelog checkpoint updates from discarding split-record resume state or finalizing an incomplete record.
+
+# One or more tracking issues related to the change.
+issues: [2844]
+
+# Optional additional release-note context.
+subtext: |
+  Checkpoint replay now requires a zero-delta progress update to preserve the
+  stored framing resume exactly. Valid finalization from clean state is unchanged.
