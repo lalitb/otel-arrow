@@ -7604,6 +7604,7 @@ dependencies = [
  "humantime-serde",
  "otap-df-admin-api",
  "otap-df-config",
+ "otap-df-core-nodes",
  "ratatui",
  "rustls",
  "rustls-openssl",

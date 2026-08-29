@@ -79,6 +79,15 @@ impl CliError {
         }
     }
 
+    /// Builds an invalid or conflicting local mutation request.
+    pub fn invalid_request(message: impl Into<String>) -> Self {
+        Self::Message {
+            exit_code: 4,
+            message: message.into(),
+            print: true,
+        }
+    }
+
     /// Builds a terminal operation failure that should exit with code 5.
     pub fn outcome_failure(message: impl Into<String>) -> Self {
         Self::Message {
@@ -217,5 +226,20 @@ mod tests {
 
         assert!(error.should_print());
         assert_eq!(error.exit_code(), 5);
+    }
+
+    /// Scenario: a local checkpoint mutation conflicts with locked or
+    /// inspected state.
+    /// Guarantees: the shared structured error contract reports exit code 4
+    /// and the stable `invalid_request` kind.
+    #[test]
+    fn local_invalid_request_uses_exit_code_four() {
+        let error = CliError::invalid_request("checkpoint epoch changed");
+        let mut output = Vec::new();
+
+        error.write_to(&mut output, ErrorFormat::Json).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(value["kind"], "invalid_request");
+        assert_eq!(value["exitCode"], 4);
     }
 }

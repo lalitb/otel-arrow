@@ -23,7 +23,7 @@ use std::time::Duration;
 #[command(
     name = BIN_NAME,
     version,
-    about = "Control CLI for the OTAP Dataflow Engine admin API"
+    about = "Control and administer the OTAP Dataflow Engine"
 )]
 /// Top-level parsed CLI arguments for `dfctl`.
 pub struct Cli {
@@ -275,6 +275,7 @@ pub enum Command {
     Commands(CommandsArgs),
     Schemas(SchemasArgs),
     Config(ConfigArgs),
+    Filelog(FilelogArgs),
     Ui(UiArgs),
     Engine(EngineArgs),
     Groups(GroupsArgs),
@@ -291,6 +292,7 @@ impl Command {
             Command::Config(args) => match &mut args.command {
                 ConfigCommand::View(output) => output.output = ReadOutput::AgentJson,
             },
+            Command::Filelog(args) => apply_filelog_agent_output_default(args),
             Command::Engine(args) => match &mut args.command {
                 EngineCommand::Status(output)
                 | EngineCommand::Livez(output)
@@ -300,6 +302,39 @@ impl Command {
             Command::Pipelines(args) => apply_pipeline_agent_output_default(args),
             Command::Telemetry(args) => apply_telemetry_agent_output_default(args),
         }
+    }
+}
+
+fn apply_filelog_agent_output_default(args: &mut FilelogArgs) {
+    match &mut args.command {
+        FilelogCommand::Checkpoint(args) => match &mut args.command {
+            FilelogCheckpointCommand::Inspect(args) => {
+                args.output.output = ReadOutput::AgentJson;
+            }
+            FilelogCheckpointCommand::Validate(args) => {
+                args.output.output = ReadOutput::AgentJson;
+            }
+            FilelogCheckpointCommand::Backup(args) => {
+                args.output.output = ReadOutput::AgentJson;
+            }
+            FilelogCheckpointCommand::Reset(args) => match &mut args.command {
+                CheckpointResetCommand::Beginning(args) => {
+                    args.output.output = FilelogMutationOutput::AgentJson;
+                }
+                CheckpointResetCommand::End(args) => {
+                    args.output.output = FilelogMutationOutput::AgentJson;
+                }
+                CheckpointResetCommand::KeepFailed(args) => {
+                    args.output.output = FilelogMutationOutput::AgentJson;
+                }
+                CheckpointResetCommand::Namespace(args) => {
+                    args.output.output = FilelogMutationOutput::AgentJson;
+                }
+            },
+            FilelogCheckpointCommand::Remove(args) => {
+                args.output.output = FilelogMutationOutput::AgentJson;
+            }
+        },
     }
 }
 
@@ -435,6 +470,276 @@ pub struct ConfigArgs {
 #[derive(Subcommand, Debug, Clone)]
 pub enum ConfigCommand {
     View(ReadOutputArgs),
+}
+
+/// Arguments for offline filelog operations.
+#[derive(Args, Debug, Clone)]
+pub struct FilelogArgs {
+    #[command(subcommand)]
+    pub command: FilelogCommand,
+}
+
+/// Offline filelog command set.
+#[derive(Subcommand, Debug, Clone)]
+pub enum FilelogCommand {
+    /// Inspect, validate, back up, or mutate durable checkpoint state.
+    Checkpoint(FilelogCheckpointArgs),
+}
+
+/// Arguments for offline filelog checkpoint administration.
+#[derive(Args, Debug, Clone)]
+pub struct FilelogCheckpointArgs {
+    #[command(subcommand)]
+    pub command: FilelogCheckpointCommand,
+}
+
+/// Offline filelog checkpoint commands.
+#[derive(Subcommand, Debug, Clone)]
+pub enum FilelogCheckpointCommand {
+    /// Inspect valid authority and list quarantined records.
+    Inspect(CheckpointInspectArgs),
+    /// Validate valid, missing, or corrupt namespace authority without repair.
+    Validate(CheckpointValidateArgs),
+    /// Create and verify a bounded evidence backup.
+    Backup(CheckpointBackupArgs),
+    /// Apply an audited per-file or whole-namespace reset.
+    Reset(CheckpointResetArgs),
+    /// Remove one exact quarantined record.
+    Remove(CheckpointRemoveArgs),
+}
+
+/// Shared namespace location and bounded recovery overrides.
+#[derive(Args, Debug, Clone)]
+pub struct CheckpointNamespaceArgs {
+    /// Engine state directory containing the `filelog/@v1` namespace tree.
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: PathBuf,
+
+    /// Exact raw checkpoint ID, before versioned lowercase-hex path mapping.
+    #[arg(long, value_name = "ID")]
+    pub checkpoint_id: String,
+
+    /// Override the bounded namespace-lock wait.
+    #[arg(long, value_parser = parse_nonzero_duration_arg, value_name = "DURATION")]
+    pub ownership_timeout: Option<Duration>,
+
+    /// Match a nondefault receiver `checkpoint.compact_after_bytes` value.
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u64).range(1..),
+        value_name = "BYTES"
+    )]
+    pub compact_after_bytes: Option<u64>,
+
+    /// Match a nondefault receiver `limits.max_tracked_files` value.
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u32).range(1..),
+        value_name = "COUNT"
+    )]
+    pub max_tracked_files: Option<u32>,
+
+    /// Match a nondefault receiver `identity.fingerprint_bytes` value.
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u64).range(16..=65_535),
+        value_name = "BYTES"
+    )]
+    pub fingerprint_bytes: Option<u64>,
+}
+
+/// Exact optimistic-concurrency target for a quarantined record.
+#[derive(Args, Debug, Clone)]
+pub struct CheckpointTargetArgs {
+    /// Exact 32-character lowercase-hex checkpoint file ID.
+    #[arg(long, value_name = "HEX")]
+    pub file_id: String,
+
+    /// Exact quarantine epoch observed by `checkpoint inspect`.
+    #[arg(long, value_name = "EPOCH")]
+    pub expected_epoch: u32,
+}
+
+/// Shared audit metadata supplied to a checkpoint mutation.
+#[derive(Args, Debug, Clone)]
+pub struct CheckpointAuditArgs {
+    /// Nonempty operator reason persisted in the checkpoint WAL.
+    #[arg(long, value_name = "TEXT")]
+    pub reason: String,
+}
+
+/// Arguments for full quarantine inspection.
+#[derive(Args, Debug, Clone)]
+pub struct CheckpointInspectArgs {
+    #[command(flatten)]
+    pub namespace: CheckpointNamespaceArgs,
+
+    #[command(flatten)]
+    pub output: ReadOutputArgs,
+}
+
+/// Arguments for valid-or-corrupt namespace validation.
+#[derive(Args, Debug, Clone)]
+pub struct CheckpointValidateArgs {
+    #[command(flatten)]
+    pub namespace: CheckpointNamespaceArgs,
+
+    #[command(flatten)]
+    pub output: ReadOutputArgs,
+}
+
+/// Arguments for a create-only checkpoint evidence backup.
+#[derive(Args, Debug, Clone)]
+pub struct CheckpointBackupArgs {
+    #[command(flatten)]
+    pub namespace: CheckpointNamespaceArgs,
+
+    /// New evidence-backup directory. Existing paths are refused.
+    #[arg(long, value_name = "DIR")]
+    pub destination: PathBuf,
+
+    #[command(flatten)]
+    pub output: ReadOutputArgs,
+}
+
+/// Arguments for checkpoint reset subcommands.
+#[derive(Args, Debug, Clone)]
+pub struct CheckpointResetArgs {
+    #[command(subcommand)]
+    pub command: CheckpointResetCommand,
+}
+
+/// Audited checkpoint reset operations.
+#[derive(Subcommand, Debug, Clone)]
+pub enum CheckpointResetCommand {
+    /// Resume the quarantined source from offset zero.
+    Beginning(CheckpointResetBeginningArgs),
+    /// Resume the quarantined source from a stable sampled EOF.
+    End(CheckpointResetEndArgs),
+    /// Append an audit decision while preserving quarantine exactly.
+    KeepFailed(CheckpointKeepFailedArgs),
+    /// Back up and replace the complete namespace authority.
+    Namespace(CheckpointResetNamespaceArgs),
+}
+
+/// Arguments for reset-to-beginning.
+#[derive(Args, Debug, Clone)]
+pub struct CheckpointResetBeginningArgs {
+    #[command(flatten)]
+    pub namespace: CheckpointNamespaceArgs,
+
+    #[command(flatten)]
+    pub target: CheckpointTargetArgs,
+
+    #[command(flatten)]
+    pub audit: CheckpointAuditArgs,
+
+    /// Explicitly accept possible duplicate replay from offset zero.
+    #[arg(long, action = ArgAction::SetTrue, required = true)]
+    pub acknowledge_duplicates: bool,
+
+    #[command(flatten)]
+    pub output: FilelogMutationOutputArgs,
+}
+
+/// Arguments for reset-to-end.
+#[derive(Args, Debug, Clone)]
+pub struct CheckpointResetEndArgs {
+    #[command(flatten)]
+    pub namespace: CheckpointNamespaceArgs,
+
+    #[command(flatten)]
+    pub target: CheckpointTargetArgs,
+
+    /// Exact current source path selected by the operator.
+    #[arg(long, value_name = "PATH")]
+    pub source_path: PathBuf,
+
+    /// Permit the final source path component to be a symlink or reparse point.
+    #[arg(long, default_value_t = false)]
+    pub follow_symlinks: bool,
+
+    #[command(flatten)]
+    pub audit: CheckpointAuditArgs,
+
+    /// Explicitly accept skipping undelivered bytes before sampled EOF.
+    #[arg(long, action = ArgAction::SetTrue, required = true)]
+    pub acknowledge_loss: bool,
+
+    #[command(flatten)]
+    pub output: FilelogMutationOutputArgs,
+}
+
+/// Arguments for an audited keep-failed decision.
+#[derive(Args, Debug, Clone)]
+pub struct CheckpointKeepFailedArgs {
+    #[command(flatten)]
+    pub namespace: CheckpointNamespaceArgs,
+
+    #[command(flatten)]
+    pub target: CheckpointTargetArgs,
+
+    #[command(flatten)]
+    pub audit: CheckpointAuditArgs,
+
+    #[command(flatten)]
+    pub output: FilelogMutationOutputArgs,
+}
+
+/// Explicit consequence selected for a whole-namespace reset.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum CheckpointNamespaceResetAcknowledgement {
+    DuplicatePossible,
+    LossAccepted,
+}
+
+/// Arguments for backup-gated whole-namespace reset.
+#[derive(Args, Debug, Clone)]
+pub struct CheckpointResetNamespaceArgs {
+    #[command(flatten)]
+    pub namespace: CheckpointNamespaceArgs,
+
+    /// New create-only evidence-backup directory required before publication.
+    #[arg(long, value_name = "DIR")]
+    pub backup_destination: PathBuf,
+
+    /// Explicitly select the duplicate or loss consequence being accepted.
+    #[arg(long, value_enum, value_name = "CONSEQUENCE")]
+    pub acknowledge: CheckpointNamespaceResetAcknowledgement,
+
+    #[command(flatten)]
+    pub audit: CheckpointAuditArgs,
+
+    #[command(flatten)]
+    pub output: FilelogMutationOutputArgs,
+}
+
+/// Arguments for exact quarantined-record removal.
+#[derive(Args, Debug, Clone)]
+pub struct CheckpointRemoveArgs {
+    #[command(flatten)]
+    pub namespace: CheckpointNamespaceArgs,
+
+    #[command(flatten)]
+    pub target: CheckpointTargetArgs,
+
+    /// Nonzero opaque reason code persisted in the administrative WAL entry.
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u16).range(1..),
+        value_name = "CODE"
+    )]
+    pub removal_reason_code: u16,
+
+    #[command(flatten)]
+    pub audit: CheckpointAuditArgs,
+
+    /// Explicitly accept that later registration may duplicate or skip data.
+    #[arg(long, action = ArgAction::SetTrue, required = true)]
+    pub acknowledge_duplicate_or_loss: bool,
+
+    #[command(flatten)]
+    pub output: FilelogMutationOutputArgs,
 }
 
 /// Arguments for launching the interactive TUI.
@@ -1109,6 +1414,33 @@ pub struct ReadOutputArgs {
     pub output: ReadOutput,
 }
 
+/// Output selector for finite offline filelog mutation responses.
+#[derive(Args, Debug, Clone)]
+pub struct FilelogMutationOutputArgs {
+    #[arg(long, value_enum, default_value_t = FilelogMutationOutput::Human)]
+    pub output: FilelogMutationOutput,
+}
+
+/// Output modes supported by finite offline filelog mutations.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum FilelogMutationOutput {
+    Human,
+    Json,
+    Yaml,
+    AgentJson,
+}
+
+impl From<FilelogMutationOutput> for MutationOutput {
+    fn from(value: FilelogMutationOutput) -> Self {
+        match value {
+            FilelogMutationOutput::Human => Self::Human,
+            FilelogMutationOutput::Json => Self::Json,
+            FilelogMutationOutput::Yaml => Self::Yaml,
+            FilelogMutationOutput::AgentJson => Self::AgentJson,
+        }
+    }
+}
+
 /// Shared output selector for long-running stream commands.
 #[derive(Args, Debug, Clone)]
 pub struct StreamOutputArgs {
@@ -1206,6 +1538,15 @@ pub fn parse_poll_interval_arg(raw: &str) -> Result<Duration, String> {
     let minimum = Duration::from_millis(100);
     if duration < minimum {
         return Err("poll intervals must be at least 100ms".to_string());
+    }
+    Ok(duration)
+}
+
+/// Parses a required positive duration.
+pub fn parse_nonzero_duration_arg(raw: &str) -> Result<Duration, String> {
+    let duration = parse_duration_arg(raw)?;
+    if duration.is_zero() {
+        return Err("duration must be greater than zero".to_string());
     }
     Ok(duration)
 }
@@ -1420,6 +1761,170 @@ mod tests {
                 assert_eq!(args.name.as_deref(), Some("dfctl.error.v1"));
                 assert_eq!(args.output.output, ReadOutput::Json);
             }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    /// Scenario: an operator selects offline checkpoint inspection with
+    /// nondefault recovery bounds.
+    /// Guarantees: clap preserves the exact state directory, raw checkpoint
+    /// ID, ownership timeout, and size-bound overrides.
+    #[test]
+    fn filelog_checkpoint_inspect_parses_namespace_and_bounds() {
+        let cli = Cli::try_parse_from([
+            "dfctl",
+            "filelog",
+            "checkpoint",
+            "inspect",
+            "--state-dir",
+            "/var/lib/otel-arrow",
+            "--checkpoint-id",
+            "App.Logs",
+            "--ownership-timeout",
+            "5s",
+            "--compact-after-bytes",
+            "4096",
+            "--max-tracked-files",
+            "25",
+            "--fingerprint-bytes",
+            "64",
+            "--output",
+            "json",
+        ])
+        .expect("filelog inspect should parse");
+
+        match cli.command {
+            Command::Filelog(FilelogArgs {
+                command:
+                    FilelogCommand::Checkpoint(FilelogCheckpointArgs {
+                        command: FilelogCheckpointCommand::Inspect(args),
+                    }),
+            }) => {
+                assert_eq!(
+                    args.namespace.state_dir,
+                    PathBuf::from("/var/lib/otel-arrow")
+                );
+                assert_eq!(args.namespace.checkpoint_id, "App.Logs");
+                assert_eq!(
+                    args.namespace.ownership_timeout,
+                    Some(Duration::from_secs(5))
+                );
+                assert_eq!(args.namespace.compact_after_bytes, Some(4096));
+                assert_eq!(args.namespace.max_tracked_files, Some(25));
+                assert_eq!(args.namespace.fingerprint_bytes, Some(64));
+                assert_eq!(args.output.output, ReadOutput::Json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    /// Scenario: a destructive filelog reset omits its explicit data
+    /// consequence acknowledgement.
+    /// Guarantees: clap rejects the command before any namespace path can be
+    /// opened or mutated.
+    #[test]
+    fn filelog_destructive_reset_requires_acknowledgement() {
+        let result = Cli::try_parse_from([
+            "dfctl",
+            "filelog",
+            "checkpoint",
+            "reset",
+            "beginning",
+            "--state-dir",
+            "state",
+            "--checkpoint-id",
+            "app-logs",
+            "--file-id",
+            "00112233445566778899aabbccddeeff",
+            "--expected-epoch",
+            "1",
+            "--reason",
+            "replay",
+        ]);
+
+        assert!(result.is_err());
+    }
+
+    /// Scenario: agent mode invokes a finite offline filelog mutation without
+    /// an explicit output flag.
+    /// Guarantees: effective parsing selects the shared agent JSON mutation
+    /// envelope while retaining the required acknowledgement.
+    #[test]
+    fn filelog_agent_mode_defaults_mutation_output() {
+        let cli = Cli::try_parse_effective_from([
+            "dfctl",
+            "--agent",
+            "filelog",
+            "checkpoint",
+            "remove",
+            "--state-dir",
+            "state",
+            "--checkpoint-id",
+            "app-logs",
+            "--file-id",
+            "00112233445566778899aabbccddeeff",
+            "--expected-epoch",
+            "1",
+            "--removal-reason-code",
+            "8",
+            "--reason",
+            "remove",
+            "--acknowledge-duplicate-or-loss",
+        ])
+        .expect("agent filelog removal should parse");
+
+        match cli.command {
+            Command::Filelog(FilelogArgs {
+                command:
+                    FilelogCommand::Checkpoint(FilelogCheckpointArgs {
+                        command: FilelogCheckpointCommand::Remove(args),
+                    }),
+            }) => {
+                assert!(args.acknowledge_duplicate_or_loss);
+                assert_eq!(args.output.output, FilelogMutationOutput::AgentJson);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    /// Scenario: whole-namespace reset selects the duplicate consequence
+    /// explicitly.
+    /// Guarantees: clap maps the kebab-case acknowledgement value to the typed
+    /// reset choice used by the core API.
+    #[test]
+    fn filelog_namespace_reset_parses_consequence() {
+        let cli = Cli::try_parse_from([
+            "dfctl",
+            "filelog",
+            "checkpoint",
+            "reset",
+            "namespace",
+            "--state-dir",
+            "state",
+            "--checkpoint-id",
+            "app-logs",
+            "--backup-destination",
+            "evidence",
+            "--acknowledge",
+            "duplicate-possible",
+            "--reason",
+            "rebuild",
+        ])
+        .expect("namespace reset should parse");
+
+        match cli.command {
+            Command::Filelog(FilelogArgs {
+                command:
+                    FilelogCommand::Checkpoint(FilelogCheckpointArgs {
+                        command:
+                            FilelogCheckpointCommand::Reset(CheckpointResetArgs {
+                                command: CheckpointResetCommand::Namespace(args),
+                            }),
+                    }),
+            }) => assert_eq!(
+                args.acknowledge,
+                CheckpointNamespaceResetAcknowledgement::DuplicatePossible
+            ),
             other => panic!("unexpected command: {other:?}"),
         }
     }

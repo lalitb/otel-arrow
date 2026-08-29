@@ -1,6 +1,6 @@
 [package]
 name = "otap-df-ctl"
-description = "Control CLI for the OTAP dataflow engine admin SDK"
+description = "Control and administration CLI for the OTAP dataflow engine"
 version.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -29,6 +29,7 @@ crypto-symcrypt = ["otap-df-admin-api/crypto-symcrypt", "dep:rustls", "dep:rustl
 [dependencies]
 otap-df-admin-api = { path = "../admin-api", default-features = false, features = ["http-client"] }
 otap-df-config = { workspace = true }
+otap-df-core-nodes = { workspace = true }
 
 clap = { workspace = true, features = ["derive", "env"] }
 clap_complete = { workspace = true }

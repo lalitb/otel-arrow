@@ -390,13 +390,14 @@ fn examples_for(
     arguments: &[ArgumentEntry],
     output_modes: &[String],
 ) -> Vec<String> {
-    let mut examples = vec![baseline_example(path, arguments)];
+    let baseline = baseline_example(path, arguments);
+    let mut examples = vec![baseline.clone()];
     examples.extend(curated_examples(path));
 
     if output_modes.iter().any(|mode| mode == "json") {
-        examples.push(format!("{} --output json", command_line(path)));
+        examples.push(format!("{baseline} --output json"));
     } else if output_modes.iter().any(|mode| mode == "ndjson") {
-        examples.push(format!("{} --output ndjson", command_line(path)));
+        examples.push(format!("{baseline} --output ndjson"));
     }
 
     dedupe(examples)
@@ -413,6 +414,14 @@ fn baseline_example(path: &[String], arguments: &[ArgumentEntry]) -> String {
         if let Some(long) = &argument.long {
             parts.push(format!("--{long}"));
             parts.push(format!("<{}>", value_placeholder(argument)));
+        }
+    }
+
+    for argument in arguments.iter().filter(|argument| {
+        !argument.global && argument.required && argument.kind == ArgumentKind::Flag
+    }) {
+        if let Some(long) = &argument.long {
+            parts.push(format!("--{long}"));
         }
     }
 
@@ -448,6 +457,30 @@ fn curated_examples(path: &[String]) -> Vec<String> {
         ["completions"] => vec![command_example("completions bash")],
         ["completions", "install"] => vec![command_example("completions install zsh")],
         ["config", "view"] => vec![command_example("config view --output json")],
+        ["filelog", "checkpoint", "inspect"] => vec![command_example(
+            "filelog checkpoint inspect --state-dir ./state --checkpoint-id app-logs",
+        )],
+        ["filelog", "checkpoint", "validate"] => vec![command_example(
+            "filelog checkpoint validate --state-dir ./state --checkpoint-id app-logs --output json",
+        )],
+        ["filelog", "checkpoint", "backup"] => vec![command_example(
+            "filelog checkpoint backup --state-dir ./state --checkpoint-id app-logs --destination ./checkpoint-evidence",
+        )],
+        ["filelog", "checkpoint", "reset", "beginning"] => vec![command_example(
+            "filelog checkpoint reset beginning --state-dir ./state --checkpoint-id app-logs --file-id 00112233445566778899aabbccddeeff --expected-epoch 1 --reason replay --acknowledge-duplicates",
+        )],
+        ["filelog", "checkpoint", "reset", "end"] => vec![command_example(
+            "filelog checkpoint reset end --state-dir ./state --checkpoint-id app-logs --file-id 00112233445566778899aabbccddeeff --expected-epoch 1 --source-path ./app.log --reason skip --acknowledge-loss",
+        )],
+        ["filelog", "checkpoint", "reset", "keep-failed"] => vec![command_example(
+            "filelog checkpoint reset keep-failed --state-dir ./state --checkpoint-id app-logs --file-id 00112233445566778899aabbccddeeff --expected-epoch 1 --reason investigate",
+        )],
+        ["filelog", "checkpoint", "reset", "namespace"] => vec![command_example(
+            "filelog checkpoint reset namespace --state-dir ./state --checkpoint-id app-logs --backup-destination ./checkpoint-evidence --acknowledge duplicate-possible --reason rebuild",
+        )],
+        ["filelog", "checkpoint", "remove"] => vec![command_example(
+            "filelog checkpoint remove --state-dir ./state --checkpoint-id app-logs --file-id 00112233445566778899aabbccddeeff --expected-epoch 1 --removal-reason-code 8 --reason remove --acknowledge-duplicate-or-loss",
+        )],
         ["ui"] => vec![command_example("ui --start-view pipelines")],
         ["engine", "status"] => vec![command_example("engine status --output json")],
         ["engine", "livez"] => vec![command_example("engine livez")],
@@ -589,7 +622,7 @@ fn dedupe(values: Vec<String>) -> Vec<String> {
 fn requires_admin_client(path: &[String]) -> bool {
     !matches!(
         path.first().map(String::as_str),
-        Some("completions" | "commands" | "schemas" | "config")
+        Some("completions" | "commands" | "schemas" | "config" | "filelog")
     )
 }
 
@@ -611,6 +644,12 @@ fn is_mutation(path: &[String]) -> bool {
             .collect::<Vec<_>>()
             .as_slice(),
         ["completions", "install"]
+            | ["filelog", "checkpoint", "backup"]
+            | ["filelog", "checkpoint", "reset", "beginning"]
+            | ["filelog", "checkpoint", "reset", "end"]
+            | ["filelog", "checkpoint", "reset", "keep-failed"]
+            | ["filelog", "checkpoint", "reset", "namespace"]
+            | ["filelog", "checkpoint", "remove"]
             | ["groups", "shutdown"]
             | ["pipelines", "reconfigure"]
             | ["pipelines", "shutdown"]
@@ -631,9 +670,11 @@ fn output_schema(path: &[String]) -> Option<&'static str> {
         ["schemas", _] => Some(JSON_SCHEMA_SCHEMA),
         ["groups", "bundle"] | ["pipelines", "bundle"] => Some(SUPPORT_BUNDLE_SCHEMA),
         ["groups", "diagnose", _] | ["pipelines", "diagnose", _] => Some(DIAGNOSE_REPORT_SCHEMA),
-        ["groups", "shutdown"] | ["pipelines", "reconfigure"] | ["pipelines", "shutdown"] => {
-            Some(MUTATION_OUTCOME_SCHEMA)
-        }
+        ["filelog", "checkpoint", "reset", _]
+        | ["filelog", "checkpoint", "remove"]
+        | ["groups", "shutdown"]
+        | ["pipelines", "reconfigure"]
+        | ["pipelines", "shutdown"] => Some(MUTATION_OUTCOME_SCHEMA),
         _ if is_long_running(path) => None,
         _ if has_read_output(path) => Some(AGENT_ENVELOPE_SCHEMA),
         _ => None,
@@ -686,6 +727,12 @@ fn safety(path: &[String]) -> SafetyLevel {
         .collect::<Vec<_>>()
         .as_slice()
     {
+        ["filelog", "checkpoint", "reset", "beginning"]
+        | ["filelog", "checkpoint", "reset", "end"]
+        | ["filelog", "checkpoint", "reset", "namespace"]
+        | ["filelog", "checkpoint", "remove"] => SafetyLevel::Destructive,
+        ["filelog", "checkpoint", "reset", "keep-failed"] => SafetyLevel::HighImpact,
+        ["filelog", "checkpoint", "backup"] => SafetyLevel::LowImpact,
         ["groups", "shutdown"] | ["pipelines", "reconfigure"] | ["pipelines", "shutdown"] => {
             SafetyLevel::HighImpact
         }
@@ -697,6 +744,15 @@ fn safety(path: &[String]) -> SafetyLevel {
 /// Reports whether retrying a command is expected to be safe without changing
 /// remote state more than once.
 fn is_idempotent(path: &[String]) -> bool {
+    if matches!(
+        path.iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice(),
+        ["filelog", "checkpoint", "backup"]
+    ) {
+        return false;
+    }
     match safety(path) {
         SafetyLevel::Read => true,
         SafetyLevel::LowImpact => true,
@@ -706,7 +762,36 @@ fn is_idempotent(path: &[String]) -> bool {
 
 /// Lists the documented process exit codes for a command.
 fn exit_codes(path: &[String]) -> Vec<ExitCodeEntry> {
-    if requires_admin_client(path) {
+    if matches!(path.first().map(String::as_str), Some("filelog")) {
+        let mut codes = vec![
+            ExitCodeEntry::new(0, "success"),
+            ExitCodeEntry::new(2, "invalid CLI usage"),
+        ];
+        if matches!(
+            path.iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            ["filelog", "checkpoint", "reset", "beginning"]
+                | ["filelog", "checkpoint", "reset", "end"]
+                | ["filelog", "checkpoint", "reset", "keep-failed"]
+                | ["filelog", "checkpoint", "remove"]
+        ) {
+            codes.push(ExitCodeEntry::new(
+                3,
+                "requested checkpoint file was not found",
+            ));
+        }
+        codes.push(ExitCodeEntry::new(
+            4,
+            "namespace lock, expected state, or local mutation conflict",
+        ));
+        codes.push(ExitCodeEntry::new(
+            6,
+            "checkpoint configuration, I/O, decode, or internal error",
+        ));
+        codes
+    } else if requires_admin_client(path) {
         vec![
             ExitCodeEntry::new(0, "success"),
             ExitCodeEntry::new(2, "invalid CLI usage"),
@@ -1178,5 +1263,105 @@ mod tests {
         assert!(reconfigure.supports_wait);
         assert!(reconfigure.supports_watch);
         assert_eq!(reconfigure.output_schema, Some(MUTATION_OUTCOME_SCHEMA));
+    }
+
+    /// Scenario: an automation client discovers offline filelog checkpoint
+    /// administration.
+    /// Guarantees: read commands require no admin client, destructive leaves
+    /// are non-idempotent mutations, backup is a local create-only low-impact
+    /// mutation, exit codes are complete, and every published example parses
+    /// after placeholder substitution.
+    #[test]
+    fn catalog_classifies_filelog_checkpoint_commands() {
+        use clap::Parser as _;
+
+        let catalog = build_catalog();
+        let validate = catalog
+            .commands
+            .iter()
+            .find(|command| command.path == ["filelog", "checkpoint", "validate"])
+            .expect("filelog validate command");
+        let backup = catalog
+            .commands
+            .iter()
+            .find(|command| command.path == ["filelog", "checkpoint", "backup"])
+            .expect("filelog backup command");
+        let reset = catalog
+            .commands
+            .iter()
+            .find(|command| command.path == ["filelog", "checkpoint", "reset", "namespace"])
+            .expect("filelog namespace reset command");
+
+        assert!(!validate.requires_admin_client);
+        assert!(!validate.mutation);
+        assert_eq!(validate.safety, SafetyLevel::Read);
+        assert_eq!(validate.output_schema, Some(AGENT_ENVELOPE_SCHEMA));
+        assert_eq!(
+            validate
+                .exit_codes
+                .iter()
+                .map(|entry| entry.code)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 4, 6]
+        );
+
+        assert!(!backup.requires_admin_client);
+        assert!(backup.mutation);
+        assert_eq!(backup.safety, SafetyLevel::LowImpact);
+        assert!(!backup.idempotent);
+
+        assert!(!reset.requires_admin_client);
+        assert!(reset.mutation);
+        assert_eq!(reset.safety, SafetyLevel::Destructive);
+        assert!(!reset.idempotent);
+        assert_eq!(
+            reset.output_modes,
+            vec!["human", "json", "yaml", "agent-json"]
+        );
+        assert_eq!(reset.output_schema, Some(MUTATION_OUTCOME_SCHEMA));
+        assert!(
+            reset
+                .examples
+                .iter()
+                .any(|example| { example.contains("--acknowledge duplicate-possible") })
+        );
+
+        let remove = catalog
+            .commands
+            .iter()
+            .find(|command| command.path == ["filelog", "checkpoint", "remove"])
+            .expect("filelog remove command");
+        assert_eq!(
+            remove
+                .exit_codes
+                .iter()
+                .map(|entry| entry.code)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3, 4, 6]
+        );
+
+        for command in catalog.commands.iter().filter(|command| {
+            command.path.first().map(String::as_str) == Some("filelog") && command.runnable
+        }) {
+            for example in &command.examples {
+                let args = example
+                    .split_whitespace()
+                    .map(|part| match part {
+                        "<DIR>" => "state",
+                        "<ID>" => "app-logs",
+                        "<HEX>" => "00112233445566778899aabbccddeeff",
+                        "<EPOCH>" => "1",
+                        "<TEXT>" => "reason",
+                        "<PATH>" => "source.log",
+                        "<CONSEQUENCE>" => "duplicate-possible",
+                        "<CODE>" => "8",
+                        other => other,
+                    })
+                    .collect::<Vec<_>>();
+                let _parsed = Cli::try_parse_from(args).unwrap_or_else(|error| {
+                    panic!("catalog example must parse: {example}: {error}")
+                });
+            }
+        }
     }
 }

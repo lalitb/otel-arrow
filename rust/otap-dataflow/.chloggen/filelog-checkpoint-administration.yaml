@@ -1,0 +1,17 @@
+# One of 'breaking', 'deprecation', 'new_component', 'enhancement', 'bug_fix'
+change_type: enhancement
+
+# The broad Rust component affected by this change.
+component: pipeline
+
+# A brief description of the user-visible change.
+note: Add offline dfctl commands to inspect, back up, and explicitly reset filelog checkpoint state.
+
+# Tracking issue for the Phase 1 filelog receiver.
+issues: [2844]
+
+# Additional operator-facing context.
+subtext: |
+  Mutations require exclusive ownership and audited reasons. Per-file actions
+  require exact file and epoch evidence; destructive actions require explicit
+  duplicate or loss acknowledgement.

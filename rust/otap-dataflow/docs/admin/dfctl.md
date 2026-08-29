@@ -1,7 +1,8 @@
 # dfctl
 
-`dfctl` is the OTAP Dataflow Engine command-line client built on top of
-the public Rust admin SDK, `otap-df-admin-api`.
+`dfctl` is the OTAP Dataflow Engine command-line client. Remote engine
+operations use the public Rust admin SDK, `otap-df-admin-api`; explicitly
+offline filelog checkpoint administration uses the core-nodes checkpoint API.
 
 It is intended to be:
 
@@ -14,8 +15,9 @@ It is intended to be:
 `dfctl` is designed as the operator-facing control surface for the admin API.
 These principles guide command design, output contracts, and TUI behavior:
 
-- The public `otap-df-admin-api` SDK is the source of truth. The CLI should
-  expose SDK capabilities directly and avoid duplicating protocol logic.
+- The public `otap-df-admin-api` SDK is the source of truth for remote
+  operations. Offline commands should delegate to a reviewed local subsystem
+  API rather than duplicating durable-state logic.
 - Local and remote engines should have the same user experience. Target URL,
   TLS, profile, and environment resolution should be consistent for every
   command.
@@ -70,15 +72,19 @@ bundles and telemetry outputs are not redacted by default.
   `<client-key-file>` and labels the generated command as redacted.
 - Support bundles written with `--file` are created with owner-only `0600`
   permissions on Unix.
+- Filelog checkpoint evidence backups are create-only, use owner-only Unix
+  directory/file modes, exclude the ownership lock and unrelated entries, and
+  encode native paths as bounded evidence rather than assuming UTF-8.
 - Client-side diagnostics use stderr, preserving stdout for command output and
   reducing accidental mixing between machine-readable data and diagnostics.
 - Machine-readable outputs do not include ANSI escape sequences, even when
   color is forced for human output.
 - Human renderers and TUI row builders neutralize terminal control sequences in
   engine-provided text before writing them to a terminal.
-- Mutating commands expose dry-run or preflight paths, and the command catalog
-  marks high-impact commands plus dry-run, wait, watch, stdin, and idempotency
-  metadata for automation clients.
+- Mutating commands that support dry-run or preflight expose those paths. The
+  command catalog marks high-impact commands plus actual dry-run, wait, watch,
+  stdin, idempotency, and explicit-acknowledgement metadata for automation
+  clients.
 
 ### How This Is Tested
 
@@ -112,6 +118,8 @@ the following scenarios:
 - Unix private bundle file permissions are implemented, but there is no direct
   regression test for the `0600` file mode and no equivalent Windows ACL
   hardening guarantee.
+- Filelog checkpoint evidence backups rely on platform-default Windows ACLs;
+  operators must protect the destination as trusted local state.
 - dfctl tests cover TLS option resolution, but not end-to-end TLS or mTLS
   handshake behavior.
 - Errors and diagnostics may include server-provided messages; there is no
@@ -127,6 +135,9 @@ dfctl completions install <shell>
 dfctl commands
 dfctl schemas [schema-name]
 dfctl config view
+dfctl filelog checkpoint inspect|validate|backup
+dfctl filelog checkpoint reset beginning|end|keep-failed|namespace
+dfctl filelog checkpoint remove
 dfctl engine status|livez|readyz
 dfctl groups describe|status|shutdown
 dfctl groups events get|watch
@@ -175,6 +186,172 @@ Inspect the resolved client configuration without contacting the engine:
 dfctl config view
 dfctl --profile-file ./dfctl-profile.yaml config view --output json
 ```
+
+## Offline Filelog Checkpoint Administration
+
+`dfctl filelog checkpoint` operates directly on trusted host-local filelog
+checkpoint state. It does not resolve `--url` or `--profile-file`, install a
+TLS crypto provider, or contact the admin API.
+
+Stop or exclude the matching filelog receiver before running any command. Each
+command acquires the same exclusive namespace lock as the receiver. Lock
+acquisition proves that no cooperating receiver currently owns the namespace;
+it is not distributed fencing.
+
+Every command requires:
+
+- `--state-dir`, the engine state directory above `filelog/@v1`;
+- `--checkpoint-id`, the exact raw checkpoint ID, not its lowercase-hex
+  directory name.
+
+The tool derives:
+
+```text
+<state-dir>/filelog/@v1/<lowercase-hex(checkpoint-id)>/
+```
+
+It does not search for or migrate a direct checkpoint-ID directory.
+
+### Inspect and validate
+
+Inspect a valid authority and list bounded quarantine evidence:
+
+```bash
+dfctl filelog checkpoint inspect \
+  --state-dir /var/lib/otel-arrow \
+  --checkpoint-id app-logs
+```
+
+Validate authority without repairing it:
+
+```bash
+dfctl filelog checkpoint validate \
+  --state-dir /var/lib/otel-arrow \
+  --checkpoint-id app-logs \
+  --output json
+```
+
+Validation returns either `status: valid` with generation and record counts, or
+`status: invalid` with a bounded failure category and detail. Invalid authority
+is a validation result, so the command exits successfully when it can acquire
+and safely inspect the namespace. Filesystem, lock, and execution failures
+still use the normal nonzero `dfctl` error contract.
+
+Read `file_id` and `quarantine_epoch` from `inspect` output before a per-file
+mutation. Mutations require both values as `--file-id` and `--expected-epoch`.
+
+### Evidence backup
+
+Create and verify a new evidence directory:
+
+```bash
+dfctl filelog checkpoint backup \
+  --state-dir /var/lib/otel-arrow \
+  --checkpoint-id app-logs \
+  --destination ./app-logs-checkpoint-evidence \
+  --output json
+```
+
+The destination must not already exist or be inside the source namespace.
+Backup copies canonical recognized bounded artifacts, excludes
+`ownership.lock` and unrelated entries, records lengths and SHA-256 digests,
+and preserves either valid authority or the bounded validation failure.
+
+### Quarantine actions
+
+Reset to offset zero only after accepting possible duplicate replay:
+
+```bash
+dfctl filelog checkpoint reset beginning \
+  --state-dir /var/lib/otel-arrow \
+  --checkpoint-id app-logs \
+  --file-id 00112233445566778899aabbccddeeff \
+  --expected-epoch 3 \
+  --reason "replay quarantined source" \
+  --acknowledge-duplicates
+```
+
+Reset to the stable current EOF only after accepting loss of undelivered bytes
+before that offset:
+
+```bash
+dfctl filelog checkpoint reset end \
+  --state-dir /var/lib/otel-arrow \
+  --checkpoint-id app-logs \
+  --file-id 00112233445566778899aabbccddeeff \
+  --expected-epoch 3 \
+  --source-path /var/log/app.log \
+  --reason "skip malformed historical bytes" \
+  --acknowledge-loss
+```
+
+The reset-to-end path must resolve to the immutable locator stored in
+quarantine. The tool samples stable EOF and the real trailing checkpoint guard
+from one handle. It does not search advisory aliases. Symlinks and Windows
+reparse points are rejected unless `--follow-symlinks` is explicitly set.
+
+Record an audited decision without changing operational quarantine state:
+
+```bash
+dfctl filelog checkpoint reset keep-failed \
+  --state-dir /var/lib/otel-arrow \
+  --checkpoint-id app-logs \
+  --file-id 00112233445566778899aabbccddeeff \
+  --expected-epoch 3 \
+  --reason "retain for investigation"
+```
+
+Remove the exact quarantined record only after accepting that later
+registration may either replay delivered bytes or skip existing bytes:
+
+```bash
+dfctl filelog checkpoint remove \
+  --state-dir /var/lib/otel-arrow \
+  --checkpoint-id app-logs \
+  --file-id 00112233445566778899aabbccddeeff \
+  --expected-epoch 3 \
+  --removal-reason-code 8 \
+  --reason "discard incompatible state" \
+  --acknowledge-duplicate-or-loss
+```
+
+### Whole-namespace reset
+
+Whole-namespace reset works for valid, missing-authority, and corrupt
+namespaces. It always creates and verifies a new evidence backup before
+publishing a complete empty authority:
+
+```bash
+dfctl filelog checkpoint reset namespace \
+  --state-dir /var/lib/otel-arrow \
+  --checkpoint-id app-logs \
+  --backup-destination ./app-logs-reset-evidence \
+  --acknowledge duplicate-possible \
+  --reason "replace corrupt checkpoint authority"
+```
+
+Use `--acknowledge loss-accepted` instead when later registration is
+intentionally expected to skip existing source bytes. Reset never salvages a
+corrupt WAL prefix, never repoints `CURRENT` to an older generation, and never
+edits checkpoint bytes in place.
+
+### Nondefault recovery bounds
+
+Checkpoint artifact bounds depend on receiver configuration. Defaults match the
+normative receiver defaults. If the namespace used nondefault values, pass the
+matching overrides:
+
+- `--compact-after-bytes`;
+- `--max-tracked-files`;
+- `--fingerprint-bytes`;
+- `--ownership-timeout`.
+
+Supplying smaller bounds can correctly refuse an artifact that the original
+receiver configuration accepted. Do not increase bounds merely to bypass a
+corruption or unsafe-filesystem error.
+
+Offline mutations support `human`, `json`, `yaml`, and `agent-json`. They are
+finite operations, so `--output ndjson` is rejected.
 
 ## Output Modes
 

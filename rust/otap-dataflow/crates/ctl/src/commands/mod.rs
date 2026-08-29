@@ -14,6 +14,7 @@ pub(crate) mod completions;
 pub(crate) mod config;
 pub(crate) mod engine;
 pub(crate) mod fetch;
+pub(crate) mod filelog;
 pub(crate) mod filters;
 pub(crate) mod groups;
 pub(crate) mod output;

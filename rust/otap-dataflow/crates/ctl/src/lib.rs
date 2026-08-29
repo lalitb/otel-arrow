@@ -1,7 +1,7 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! `dfctl` library entrypoints for the OTAP Dataflow Engine admin CLI.
+//! `dfctl` library entrypoints for remote control and offline administration.
 //!
 //! This crate keeps the command implementation behind a small public surface so
 //! tests, the binary wrapper, and future embedders can execute the same parsed
@@ -111,6 +111,11 @@ pub async fn run_with_terminal_and_diagnostics(
             commands::schemas::run(stdout, human_style, args)?;
             return Ok(());
         }
+        Command::Filelog(args) => {
+            let human_style = HumanStyle::resolve(color, stdout_is_terminal);
+            commands::filelog::run(stdout, human_style, args).await?;
+            return Ok(());
+        }
         other => other,
     };
 
@@ -145,6 +150,7 @@ pub async fn run_with_terminal_and_diagnostics(
         Command::Commands(_) => unreachable!("commands returned before client creation"),
         Command::Schemas(_) => unreachable!("schemas returned before client creation"),
         Command::Config(_) => unreachable!("config commands returned before client creation"),
+        Command::Filelog(_) => unreachable!("filelog commands returned before client creation"),
         Command::Ui(args) => {
             ui::run_ui(
                 &client,
