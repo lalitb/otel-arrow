@@ -76,8 +76,9 @@ runtime metric sets may also be attached by the pipeline telemetry policy.
 - The named topic must be declared and visible to the pipeline.
 - Queue capacity and ack propagation limits are configured on the topic
   declaration, not on this exporter.
-- Broadcast topic ack propagation currently resolves on the first subscriber
-  outcome, as described in the configuration model.
+- Broadcast completion follows the topic's `broadcast.ack_mode`: `first`
+  resolves on the first subscriber outcome, while `all` requires every ready
+  subscriber in the publication snapshot.
 
 ## Related Docs
 

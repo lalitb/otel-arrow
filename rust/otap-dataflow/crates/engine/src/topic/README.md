@@ -119,6 +119,12 @@ upstream:
   Acks. `all` requires `ack_propagation.mode: auto` and a broadcast-only
   topic.
 
+For a node that requires aggregate delivery completion, controller validation
+continues through every configured broadcast topic receiver and any later topic
+hop. Intermediate processors must explicitly declare that they preserve or
+aggregate the required completion; the fanout processor does so only with
+`await_ack: all`.
+
 Remaining work is tracked in
 [GH-2252](https://github.com/open-telemetry/otel-arrow/issues/2252).
 

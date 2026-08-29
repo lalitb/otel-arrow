@@ -369,8 +369,7 @@ struct PreparedControllerExtension {
     task_factory: ControllerExtensionTaskFactory,
 }
 
-struct DeclaredTopics<PData: 'static + Clone + Send + Sync + std::fmt::Debug> {
-    broker: TopicBroker<PData>,
+struct PreparedTopics {
     global_names: HashMap<TopicName, TopicName>,
     group_names: HashMap<(PipelineGroupId, TopicName), TopicName>,
     inferred_mode_reports: Vec<InferredTopicModeReport>,
@@ -379,11 +378,18 @@ struct DeclaredTopics<PData: 'static + Clone + Send + Sync + std::fmt::Debug> {
     route_facts: HashMap<TopicName, TopicRouteFacts>,
 }
 
+struct DeclaredTopics<PData: 'static + Clone + Send + Sync + std::fmt::Debug> {
+    broker: TopicBroker<PData>,
+    global_names: HashMap<TopicName, TopicName>,
+    group_names: HashMap<(PipelineGroupId, TopicName), TopicName>,
+    inferred_mode_reports: Vec<InferredTopicModeReport>,
+}
+
 /// Resolved topology and policy facts for one declared topic.
 ///
 /// These are the only inputs the delivery-completion validator needs about a
-/// topic hop. They are captured while topics are declared, so validation reasons
-/// about the same resolved graph and policies the runtime uses.
+/// topic hop. They are captured while topics are prepared, so validation reasons
+/// about the same resolved graph and policies the runtime later uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TopicRouteFacts {
     pub(crate) selected_mode: InferredTopicMode,
@@ -1199,8 +1205,7 @@ impl<
         }
     }
 
-    fn declare_topics(config: &OtelDataflowSpec) -> Result<DeclaredTopics<PData>, Error> {
-        let broker = TopicBroker::<PData>::new();
+    fn prepare_topics(config: &OtelDataflowSpec) -> Result<PreparedTopics, Error> {
         let (global_names, group_names) = Self::build_declared_topic_name_maps(config)?;
         Self::validate_topic_wiring_acyclic(config, &global_names, &group_names)?;
         let (inferred_modes, mut inferred_mode_reports) =
@@ -1214,7 +1219,7 @@ impl<
                 .ok_or_else(|| Error::PipelineRuntimeError {
                     source: Box::new(EngineError::InternalError {
                         message: format!(
-                            "missing declared topic name for global topic `{}` during topic declaration",
+                            "missing declared topic name for global topic `{}` during topic preparation",
                             topic_name.as_ref()
                         ),
                     }),
@@ -1242,7 +1247,7 @@ impl<
                     selected_mode,
                 ),
             );
-            Self::declare_topic(&broker, declared_name, spec, selected_mode)?;
+            Self::validate_topic_runtime_support(&declared_name, spec, selected_mode)?;
         }
 
         for (group_id, group_cfg) in &config.groups {
@@ -1252,7 +1257,7 @@ impl<
                     .ok_or_else(|| Error::PipelineRuntimeError {
                         source: Box::new(EngineError::InternalError {
                             message: format!(
-                                "missing declared topic name for group `{}` topic `{}` during topic declaration",
+                                "missing declared topic name for group `{}` topic `{}` during topic preparation",
                                 group_id.as_ref(),
                                 topic_name.as_ref()
                             ),
@@ -1281,17 +1286,96 @@ impl<
                         selected_mode,
                     ),
                 );
+                Self::validate_topic_runtime_support(&declared_name, spec, selected_mode)?;
+            }
+        }
+
+        Ok(PreparedTopics {
+            global_names,
+            group_names,
+            inferred_mode_reports,
+            route_facts,
+        })
+    }
+
+    fn declare_prepared_topics(
+        config: &OtelDataflowSpec,
+        prepared: PreparedTopics,
+    ) -> Result<DeclaredTopics<PData>, Error> {
+        let broker = TopicBroker::<PData>::new();
+
+        for (topic_name, spec) in &config.topics {
+            let declared_name = prepared
+                .global_names
+                .get(topic_name)
+                .ok_or_else(|| Error::PipelineRuntimeError {
+                    source: Box::new(EngineError::InternalError {
+                        message: format!(
+                            "missing prepared topic name for global topic `{}` during declaration",
+                            topic_name.as_ref()
+                        ),
+                    }),
+                })?
+                .clone();
+            let selected_mode = prepared
+                .route_facts
+                .get(&declared_name)
+                .ok_or_else(|| Error::PipelineRuntimeError {
+                    source: Box::new(EngineError::InternalError {
+                        message: format!(
+                            "missing prepared route facts for global topic `{}` during declaration",
+                            topic_name.as_ref()
+                        ),
+                    }),
+                })?
+                .selected_mode;
+            Self::declare_topic(&broker, declared_name, spec, selected_mode)?;
+        }
+
+        for (group_id, group_cfg) in &config.groups {
+            for (topic_name, spec) in &group_cfg.topics {
+                let declared_name = prepared
+                    .group_names
+                    .get(&(group_id.clone(), topic_name.clone()))
+                    .ok_or_else(|| Error::PipelineRuntimeError {
+                        source: Box::new(EngineError::InternalError {
+                            message: format!(
+                                "missing prepared topic name for group `{}` topic `{}` during declaration",
+                                group_id.as_ref(),
+                                topic_name.as_ref()
+                            ),
+                        }),
+                    })?
+                    .clone();
+                let selected_mode = prepared
+                    .route_facts
+                    .get(&declared_name)
+                    .ok_or_else(|| Error::PipelineRuntimeError {
+                        source: Box::new(EngineError::InternalError {
+                            message: format!(
+                                "missing prepared route facts for group `{}` topic `{}` during declaration",
+                                group_id.as_ref(),
+                                topic_name.as_ref()
+                            ),
+                        }),
+                    })?
+                    .selected_mode;
                 Self::declare_topic(&broker, declared_name, spec, selected_mode)?;
             }
         }
 
         Ok(DeclaredTopics {
             broker,
-            global_names,
-            group_names,
-            inferred_mode_reports,
-            route_facts,
+            global_names: prepared.global_names,
+            group_names: prepared.group_names,
+            inferred_mode_reports: prepared.inferred_mode_reports,
         })
+    }
+
+    #[cfg(test)]
+    fn declare_topics(config: &OtelDataflowSpec) -> Result<DeclaredTopics<PData>, Error> {
+        let prepared = Self::prepare_topics(config)?;
+        Self::declare_prepared_topics(config, prepared)
     }
 
     fn build_pipeline_topic_set(
@@ -1383,6 +1467,21 @@ impl<
             })?;
         let num_pipelines = pipelines.len();
         let admin_settings = engine.http_admin.clone().unwrap_or_default();
+
+        // Resolve and validate the complete topic and aggregate-delivery graph
+        // before telemetry setup, memory sampling/purge, or background thread
+        // creation can produce startup side effects.
+        let prepared_topics = Self::prepare_topics(&engine_config)?;
+        delivery_completion::validate_delivery_completion_requirements(
+            &engine_config,
+            self.pipeline_factory,
+            &delivery_completion::TopicGraphView {
+                global_names: &prepared_topics.global_names,
+                group_names: &prepared_topics.group_names,
+                route_facts: &prepared_topics.route_facts,
+            },
+        )?;
+        let declared_topics = Self::declare_prepared_topics(&engine_config, prepared_topics)?;
 
         // Create the shared telemetry registry first - it is used by both the
         // observed state store and the internal telemetry system, and by the
@@ -1552,22 +1651,6 @@ impl<
                 },
             )?);
         }
-        // Declare all topics up front before any pipeline thread starts.
-        let declared_topics = Self::declare_topics(&engine_config)?;
-
-        // Prove every aggregate-Ack-required route before any worker starts.
-        // This uses factory wiring contracts plus the resolved pipeline and
-        // topic graph, and fails closed on any route it cannot prove.
-        delivery_completion::validate_delivery_completion_requirements(
-            &engine_config,
-            self.pipeline_factory,
-            &delivery_completion::TopicGraphView {
-                global_names: &declared_topics.global_names,
-                group_names: &declared_topics.group_names,
-                route_facts: &declared_topics.route_facts,
-            },
-        )?;
-
         for pipeline_entry in &pipelines {
             let pipeline_key = PipelineKey::new(
                 pipeline_entry.pipeline_group_id.clone(),

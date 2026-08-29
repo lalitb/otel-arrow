@@ -25,6 +25,7 @@
 //! Configuration alone never claims that a subscriber is running.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use otap_df_config::engine::{
     OtelDataflowSpec, SYSTEM_OBSERVABILITY_PIPELINE_ID, SYSTEM_PIPELINE_GROUP_ID,
@@ -70,6 +71,151 @@ impl TopicGraphView<'_> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PipelineNodeKey {
+    pipeline_group_id: PipelineGroupId,
+    pipeline_id: PipelineId,
+    node_id: NodeId,
+}
+
+impl PipelineNodeKey {
+    fn new(
+        pipeline_group_id: &PipelineGroupId,
+        pipeline_id: &PipelineId,
+        node_id: &NodeId,
+    ) -> Self {
+        Self {
+            pipeline_group_id: pipeline_group_id.clone(),
+            pipeline_id: pipeline_id.clone(),
+            node_id: node_id.clone(),
+        }
+    }
+
+    fn label(&self) -> String {
+        format!(
+            "{}/{}/{}",
+            self.pipeline_group_id.as_ref(),
+            self.pipeline_id.as_ref(),
+            self.node_id.as_ref()
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum RouteVertex {
+    PipelineNode(PipelineNodeKey),
+    Topic(TopicName),
+}
+
+#[derive(Default)]
+struct DeliveryGraph {
+    nodes: HashMap<PipelineNodeKey, Arc<NodeUserConfig>>,
+    destinations: HashMap<PipelineNodeKey, Vec<PipelineNodeKey>>,
+    output_ports: HashMap<PipelineNodeKey, HashSet<String>>,
+    broadcast_receivers: HashMap<TopicName, Vec<PipelineNodeKey>>,
+}
+
+impl DeliveryGraph {
+    fn from_config(config: &OtelDataflowSpec, topics: &TopicGraphView<'_>) -> Self {
+        let mut graph = Self::default();
+
+        let mut group_ids = config.groups.keys().cloned().collect::<Vec<_>>();
+        group_ids.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
+        for group_id in group_ids {
+            let Some(group_cfg) = config.groups.get(&group_id) else {
+                continue;
+            };
+            let mut pipelines = group_cfg.pipelines.iter().collect::<Vec<_>>();
+            pipelines.sort_by(|(left, _), (right, _)| left.as_ref().cmp(right.as_ref()));
+            for (pipeline_id, pipeline_cfg) in pipelines {
+                graph.add_pipeline(&group_id, pipeline_id, pipeline_cfg, topics);
+            }
+        }
+
+        let system_group_id: PipelineGroupId = SYSTEM_PIPELINE_GROUP_ID.into();
+        let observability_pipeline_id: PipelineId = SYSTEM_OBSERVABILITY_PIPELINE_ID.into();
+        let observability_pipeline = config
+            .engine
+            .observability
+            .pipeline
+            .clone()
+            .into_pipeline_config();
+        graph.add_pipeline(
+            &system_group_id,
+            &observability_pipeline_id,
+            &observability_pipeline,
+            topics,
+        );
+
+        for destinations in graph.destinations.values_mut() {
+            destinations.sort_by_key(PipelineNodeKey::label);
+            destinations.dedup();
+        }
+        for receivers in graph.broadcast_receivers.values_mut() {
+            receivers.sort_by_key(PipelineNodeKey::label);
+            receivers.dedup();
+        }
+
+        graph
+    }
+
+    fn add_pipeline(
+        &mut self,
+        pipeline_group_id: &PipelineGroupId,
+        pipeline_id: &PipelineId,
+        pipeline: &PipelineConfig,
+        topics: &TopicGraphView<'_>,
+    ) {
+        for (node_id, node_cfg) in pipeline.node_iter() {
+            let key = PipelineNodeKey::new(pipeline_group_id, pipeline_id, node_id);
+            let _ = self.nodes.insert(key, Arc::clone(node_cfg));
+        }
+
+        for connection in pipeline.connection_iter() {
+            let targets = connection.to_nodes();
+            for source in connection.from_sources() {
+                let source_key =
+                    PipelineNodeKey::new(pipeline_group_id, pipeline_id, source.node_id());
+                let _ = self
+                    .output_ports
+                    .entry(source_key.clone())
+                    .or_default()
+                    .insert(source.resolved_output_port().to_string());
+                let destinations = self.destinations.entry(source_key).or_default();
+                destinations.extend(
+                    targets
+                        .iter()
+                        .map(|target| PipelineNodeKey::new(pipeline_group_id, pipeline_id, target)),
+                );
+            }
+        }
+
+        for (node_id, node_cfg) in pipeline.node_iter() {
+            if node_cfg.kind() != NodeKind::Receiver
+                || !is_topic_node(node_cfg)
+                || !is_broadcast_topic_receiver(node_cfg)
+            {
+                continue;
+            }
+            let Some(topic_name) = topic_name_of(node_cfg) else {
+                continue;
+            };
+            let Some(declared_name) = topics.resolve_declared_name(pipeline_group_id, &topic_name)
+            else {
+                continue;
+            };
+            self.broadcast_receivers
+                .entry(declared_name)
+                .or_default()
+                .push(PipelineNodeKey::new(
+                    pipeline_group_id,
+                    pipeline_id,
+                    node_id,
+                ));
+        }
+    }
+}
+
 /// Validates every aggregate-Ack-required source route in the configuration.
 ///
 /// Returns the first unsupported route as an error. Validation is fail-closed:
@@ -82,111 +228,43 @@ pub(crate) fn validate_delivery_completion_requirements<
     factory: &PipelineFactory<PData>,
     topics: &TopicGraphView<'_>,
 ) -> Result<(), Error> {
-    let mut group_ids = config.groups.keys().cloned().collect::<Vec<_>>();
-    group_ids.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
-    for group_id in group_ids {
-        let Some(group_cfg) = config.groups.get(&group_id) else {
-            continue;
-        };
-        let mut pipelines = group_cfg.pipelines.iter().collect::<Vec<_>>();
-        pipelines.sort_by(|(left, _), (right, _)| left.as_ref().cmp(right.as_ref()));
-        for (pipeline_id, pipeline_cfg) in pipelines {
-            validate_pipeline(&group_id, pipeline_id, pipeline_cfg, factory, topics)?;
-        }
-    }
-
-    let system_group_id: PipelineGroupId = SYSTEM_PIPELINE_GROUP_ID.into();
-    let observability_pipeline_id: PipelineId = SYSTEM_OBSERVABILITY_PIPELINE_ID.into();
-    let observability_pipeline = config
-        .engine
-        .observability
-        .pipeline
-        .clone()
-        .into_pipeline_config();
-    validate_pipeline(
-        &system_group_id,
-        &observability_pipeline_id,
-        &observability_pipeline,
-        factory,
-        topics,
-    )
-}
-
-fn validate_pipeline<PData: 'static + Clone + std::fmt::Debug>(
-    pipeline_group_id: &PipelineGroupId,
-    pipeline_id: &PipelineId,
-    pipeline: &PipelineConfig,
-    factory: &PipelineFactory<PData>,
-    topics: &TopicGraphView<'_>,
-) -> Result<(), Error> {
-    let nodes: HashMap<&NodeId, &NodeUserConfig> = pipeline
-        .node_iter()
-        .map(|(node_id, node_cfg)| (node_id, node_cfg.as_ref()))
-        .collect();
-
+    let graph = DeliveryGraph::from_config(config, topics);
     let mut required_sources = Vec::new();
-    for (node_id, node_cfg) in &nodes {
+    for (node_key, node_cfg) in &graph.nodes {
         let contract = node_wiring_contract(factory, node_cfg);
         if contract.is_some_and(|contract| contract.requires_aggregate_ack()) {
-            required_sources.push(*node_id);
+            required_sources.push(node_key.clone());
         }
     }
     if required_sources.is_empty() {
         return Ok(());
     }
-    required_sources.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
-
-    let mut destinations: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
-    let mut output_ports: HashMap<NodeId, HashSet<String>> = HashMap::new();
-    for connection in pipeline.connection_iter() {
-        let targets = connection.to_nodes();
-        for source in connection.from_sources() {
-            let _ = output_ports
-                .entry(source.node_id().clone())
-                .or_default()
-                .insert(source.resolved_output_port().to_string());
-            destinations
-                .entry(source.node_id().clone())
-                .or_default()
-                .extend(targets.iter().cloned());
-        }
-    }
+    required_sources.sort_by_key(PipelineNodeKey::label);
 
     for source in required_sources {
-        validate_required_route(
-            pipeline_group_id,
-            pipeline_id,
-            source,
-            &nodes,
-            &destinations,
-            &output_ports,
-            factory,
-            topics,
-        )?;
+        validate_required_route(&source, &graph, factory, topics)?;
     }
 
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn validate_required_route<PData: 'static + Clone + std::fmt::Debug>(
-    pipeline_group_id: &PipelineGroupId,
-    pipeline_id: &PipelineId,
-    source: &NodeId,
-    nodes: &HashMap<&NodeId, &NodeUserConfig>,
-    destinations: &HashMap<NodeId, Vec<NodeId>>,
-    output_ports: &HashMap<NodeId, HashSet<String>>,
+    source: &PipelineNodeKey,
+    graph: &DeliveryGraph,
     factory: &PipelineFactory<PData>,
     topics: &TopicGraphView<'_>,
 ) -> Result<(), Error> {
     let reject = |reason: String| Error::AggregateAckRouteUnsupported {
-        pipeline_group: pipeline_group_id.as_ref().to_owned(),
-        pipeline: pipeline_id.as_ref().to_owned(),
-        node: source.as_ref().to_owned(),
+        pipeline_group: source.pipeline_group_id.as_ref().to_owned(),
+        pipeline: source.pipeline_id.as_ref().to_owned(),
+        node: source.node_id.as_ref().to_owned(),
         reason,
     };
 
-    let source_destinations = destinations.get(source).filter(|list| !list.is_empty());
+    let source_destinations = graph
+        .destinations
+        .get(source)
+        .filter(|list| !list.is_empty());
     let Some(source_destinations) = source_destinations else {
         return Err(reject(
             "the node has no output route, so no delivery completion can ever reach it".to_owned(),
@@ -196,7 +274,8 @@ fn validate_required_route<PData: 'static + Clone + std::fmt::Debug>(
     // More than one output port from the requiring node means the completion
     // path is not a single provable route. Fail closed rather than guess which
     // port carries the Ack-gated data.
-    if output_ports
+    if graph
+        .output_ports
         .get(source)
         .is_some_and(|ports| ports.len() > 1)
     {
@@ -205,49 +284,135 @@ fn validate_required_route<PData: 'static + Clone + std::fmt::Debug>(
         ));
     }
 
-    let mut visited: HashSet<NodeId> = HashSet::new();
-    let mut queue: VecDeque<NodeId> = source_destinations.iter().cloned().collect();
+    let mut visited: HashSet<RouteVertex> = HashSet::new();
+    let mut queue: VecDeque<RouteVertex> = source_destinations
+        .iter()
+        .cloned()
+        .map(RouteVertex::PipelineNode)
+        .collect();
 
-    while let Some(node_id) = queue.pop_front() {
-        if !visited.insert(node_id.clone()) {
+    while let Some(vertex) = queue.pop_front() {
+        if !visited.insert(vertex.clone()) {
             continue;
         }
-        let Some(node_cfg) = nodes.get(&node_id) else {
-            return Err(reject(format!(
-                "route reaches node `{}`, which is missing from the resolved pipeline topology",
-                node_id.as_ref()
-            )));
-        };
-        if node_wiring_contract(factory, node_cfg).is_none() {
-            return Err(reject(format!(
-                "route reaches node `{}` of unregistered type `{}`, so the delivery path cannot be proven",
-                node_id.as_ref(),
-                node_cfg.r#type.as_str()
-            )));
-        }
+        match vertex {
+            RouteVertex::PipelineNode(node_key) => {
+                let Some(node_cfg) = graph.nodes.get(&node_key) else {
+                    return Err(reject(format!(
+                        "route reaches node `{}`, which is missing from the resolved pipeline topology",
+                        node_key.label()
+                    )));
+                };
+                let Some(contract) = node_wiring_contract(factory, node_cfg) else {
+                    return Err(reject(format!(
+                        "route reaches node `{}` of unregistered type `{}`, so the delivery path cannot be proven",
+                        node_key.label(),
+                        node_cfg.r#type.as_str()
+                    )));
+                };
 
-        let next = destinations
-            .get(&node_id)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
+                let next = graph
+                    .destinations
+                    .get(&node_key)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
 
-        if node_cfg.kind() == NodeKind::Exporter {
-            if is_topic_node(node_cfg) {
-                validate_topic_hop(pipeline_group_id, &node_id, node_cfg, topics, &reject)?;
+                match node_cfg.kind() {
+                    NodeKind::Exporter if is_topic_node(node_cfg) => {
+                        let declared_name = validate_topic_hop(
+                            &node_key.pipeline_group_id,
+                            &node_key.node_id,
+                            node_cfg,
+                            topics,
+                            &reject,
+                        )?;
+                        queue.push_back(RouteVertex::Topic(declared_name));
+                    }
+                    NodeKind::Exporter => {
+                        // A non-topic exporter terminates the route inside this
+                        // pipeline, where its Ack/Nack is the completion.
+                    }
+                    NodeKind::Processor => {
+                        contract
+                            .validate_aggregate_ack_propagation(&node_cfg.config)
+                            .map_err(|reason| {
+                                reject(format!(
+                                    "route reaches processor `{}` of type `{}`, but {reason}",
+                                    node_key.label(),
+                                    node_cfg.r#type.as_str()
+                                ))
+                            })?;
+                        if next.is_empty() {
+                            return Err(reject(format!(
+                                "route ends at processor `{}`, which cannot complete delivery",
+                                node_key.label()
+                            )));
+                        }
+                        queue.extend(next.iter().cloned().map(RouteVertex::PipelineNode));
+                    }
+                    NodeKind::Receiver => {
+                        return Err(reject(format!(
+                            "route reaches receiver `{}` directly instead of through a validated topic hop",
+                            node_key.label()
+                        )));
+                    }
+                }
             }
-            // A non-topic exporter terminates the route inside this pipeline,
-            // where the engine already turns the exporter's own Ack/Nack into
-            // the upstream completion.
-            continue;
-        }
+            RouteVertex::Topic(declared_name) => {
+                let Some(receivers) = graph
+                    .broadcast_receivers
+                    .get(&declared_name)
+                    .filter(|receivers| !receivers.is_empty())
+                else {
+                    return Err(reject(format!(
+                        "topic `{}` has no resolvable broadcast topic receiver route",
+                        declared_name.as_ref()
+                    )));
+                };
 
-        if next.is_empty() {
-            return Err(reject(format!(
-                "route ends at `{}`, which is not an exporter and cannot complete delivery",
-                node_id.as_ref()
-            )));
+                for receiver_key in receivers {
+                    let Some(receiver_cfg) = graph.nodes.get(receiver_key) else {
+                        return Err(reject(format!(
+                            "topic `{}` reaches missing receiver node `{}`",
+                            declared_name.as_ref(),
+                            receiver_key.label()
+                        )));
+                    };
+                    if receiver_cfg.kind() != NodeKind::Receiver
+                        || !is_topic_node(receiver_cfg)
+                        || !is_broadcast_topic_receiver(receiver_cfg)
+                    {
+                        return Err(reject(format!(
+                            "topic `{}` reaches node `{}` that is not a resolvable broadcast topic receiver",
+                            declared_name.as_ref(),
+                            receiver_key.label()
+                        )));
+                    }
+                    if graph
+                        .output_ports
+                        .get(receiver_key)
+                        .is_some_and(|ports| ports.len() > 1)
+                    {
+                        return Err(reject(format!(
+                            "topic receiver `{}` uses multiple output ports, so its completion path is ambiguous",
+                            receiver_key.label()
+                        )));
+                    }
+                    let next = graph
+                        .destinations
+                        .get(receiver_key)
+                        .filter(|destinations| !destinations.is_empty());
+                    let Some(next) = next else {
+                        return Err(reject(format!(
+                            "topic receiver `{}` has no downstream route, so topic `{}` cannot complete delivery",
+                            receiver_key.label(),
+                            declared_name.as_ref()
+                        )));
+                    };
+                    queue.extend(next.iter().cloned().map(RouteVertex::PipelineNode));
+                }
+            }
         }
-        queue.extend(next.iter().cloned());
     }
 
     Ok(())
@@ -259,7 +424,7 @@ fn validate_topic_hop(
     node_cfg: &NodeUserConfig,
     topics: &TopicGraphView<'_>,
     reject: &impl Fn(String) -> Error,
-) -> Result<(), Error> {
+) -> Result<TopicName, Error> {
     let Some(topic_name) = topic_name_of(node_cfg) else {
         return Err(reject(format!(
             "topic exporter `{}` has no resolvable `topic` name",
@@ -318,7 +483,7 @@ fn validate_topic_hop(
         )));
     }
 
-    Ok(())
+    Ok(declared_name)
 }
 
 fn is_topic_node(node_cfg: &NodeUserConfig) -> bool {
@@ -327,6 +492,16 @@ fn is_topic_node(node_cfg: &NodeUserConfig) -> bool {
 
 fn topic_name_of(node_cfg: &NodeUserConfig) -> Option<TopicName> {
     TopicName::parse(node_cfg.config.get("topic")?.as_str()?).ok()
+}
+
+fn is_broadcast_topic_receiver(node_cfg: &NodeUserConfig) -> bool {
+    let Some(subscription) = node_cfg.config.get("subscription") else {
+        return true;
+    };
+    subscription
+        .get("mode")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|mode| mode == "broadcast")
 }
 
 fn node_wiring_contract<PData: 'static + Clone + std::fmt::Debug>(
@@ -373,6 +548,8 @@ mod tests {
     const PLAIN_RECEIVER_URN: &str = "urn:test:receiver:plain";
     const TOPIC_RECEIVER_URN: &str = "urn:otel:receiver:topic";
     const PASSTHROUGH_PROCESSOR_URN: &str = "urn:test:processor:passthrough";
+    const UNPROVEN_PROCESSOR_URN: &str = "urn:test:processor:unproven";
+    const CONDITIONAL_PROCESSOR_URN: &str = "urn:test:processor:conditional";
     const PLAIN_EXPORTER_URN: &str = "urn:test:exporter:plain";
     const TOPIC_EXPORTER_URN: &str = "urn:otel:exporter:topic";
 
@@ -431,12 +608,27 @@ mod tests {
         },
     ];
 
-    static TEST_PROCESSORS: &[ProcessorFactory<()>] = &[ProcessorFactory {
-        name: PASSTHROUGH_PROCESSOR_URN,
-        create: unused_processor,
-        wiring_contract: WiringContract::UNRESTRICTED,
-        validate_config: accept_any,
-    }];
+    static TEST_PROCESSORS: &[ProcessorFactory<()>] = &[
+        ProcessorFactory {
+            name: PASSTHROUGH_PROCESSOR_URN,
+            create: unused_processor,
+            wiring_contract: WiringContract::UNRESTRICTED.propagating_aggregate_ack(),
+            validate_config: accept_any,
+        },
+        ProcessorFactory {
+            name: UNPROVEN_PROCESSOR_URN,
+            create: unused_processor,
+            wiring_contract: WiringContract::UNRESTRICTED,
+            validate_config: accept_any,
+        },
+        ProcessorFactory {
+            name: CONDITIONAL_PROCESSOR_URN,
+            create: unused_processor,
+            wiring_contract: WiringContract::UNRESTRICTED
+                .propagating_aggregate_ack_when_config_equals("/await_ack", "all"),
+            validate_config: accept_any,
+        },
+    ];
 
     static TEST_EXPORTERS: &[ExporterFactory<()>] = &[
         ExporterFactory {
@@ -517,7 +709,7 @@ version: otel_dataflow/v1
 groups:
   g1:
     pipelines:
-      p1:
+      source:
         nodes:
           required:
             type: "{REQUIRED_RECEIVER_URN}"
@@ -529,6 +721,18 @@ groups:
         connections:
           - from: required
             to: to_topic
+      sink:
+        nodes:
+          from_topic:
+            type: "{TOPIC_RECEIVER_URN}"
+            config:
+              topic: {exporter_topic}
+          out:
+            type: "{PLAIN_EXPORTER_URN}"
+            config: null
+        connections:
+          - from: from_topic
+            to: out
 "#
         )
     }
@@ -615,6 +819,85 @@ groups:
 "#
         );
         run(&direct, &[]).expect("single-hop provable route should be accepted");
+    }
+
+    /// Scenario: an aggregate-Ack-required receiver routes through a registered
+    /// processor whose factory has not declared completion propagation.
+    /// Guarantees: registration alone is not treated as proof, so an
+    /// early-Ack or fire-and-forget processor fails closed.
+    #[test]
+    fn rejects_registered_processor_without_completion_contract() {
+        let yaml = format!(
+            r#"
+version: otel_dataflow/v1
+groups:
+  g1:
+    pipelines:
+      p1:
+        nodes:
+          required:
+            type: "{REQUIRED_RECEIVER_URN}"
+            config: null
+          mid:
+            type: "{UNPROVEN_PROCESSOR_URN}"
+            config: null
+          out:
+            type: "{PLAIN_EXPORTER_URN}"
+            config: null
+        connections:
+          - from: required
+            to: mid
+          - from: mid
+            to: out
+"#
+        );
+        let message = reason(run(&yaml, &[]));
+        assert!(
+            message.contains("does not declare safe aggregate-Ack propagation"),
+            "{message}"
+        );
+    }
+
+    /// Scenario: a processor declares aggregate-Ack propagation only for one
+    /// exact configuration value.
+    /// Guarantees: the safe value is accepted and a fire-and-forget value is
+    /// rejected before runtime.
+    #[test]
+    fn enforces_config_gated_processor_completion_contract() {
+        let yaml = |await_ack: &str| {
+            format!(
+                r#"
+version: otel_dataflow/v1
+groups:
+  g1:
+    pipelines:
+      p1:
+        nodes:
+          required:
+            type: "{REQUIRED_RECEIVER_URN}"
+            config: null
+          mid:
+            type: "{CONDITIONAL_PROCESSOR_URN}"
+            config:
+              await_ack: {await_ack}
+          out:
+            type: "{PLAIN_EXPORTER_URN}"
+            config: null
+        connections:
+          - from: required
+            to: mid
+          - from: mid
+            to: out
+"#
+            )
+        };
+
+        run(&yaml("all"), &[]).expect("matching processor contract should be accepted");
+        let message = reason(run(&yaml("none"), &[]));
+        assert!(
+            message.contains("requires config `/await_ack`"),
+            "{message}"
+        );
     }
 
     /// Scenario: an aggregate-Ack-required receiver has no outgoing connection.
@@ -838,6 +1121,94 @@ groups:
         let yaml = topic_pipeline_yaml("topics:\n  events: {}", "events");
         run(&yaml, &[("global::events", supported_topic_facts())])
             .expect("supported topic hop should be accepted");
+    }
+
+    fn nested_topic_pipeline_yaml() -> String {
+        format!(
+            r#"
+version: otel_dataflow/v1
+topics:
+  first: {{}}
+  second: {{}}
+groups:
+  g1:
+    pipelines:
+      source:
+        nodes:
+          required:
+            type: "{REQUIRED_RECEIVER_URN}"
+            config: null
+          to_first:
+            type: "{TOPIC_EXPORTER_URN}"
+            config:
+              topic: first
+        connections:
+          - from: required
+            to: to_first
+      bridge:
+        nodes:
+          from_first:
+            type: "{TOPIC_RECEIVER_URN}"
+            config:
+              topic: first
+          to_second:
+            type: "{TOPIC_EXPORTER_URN}"
+            config:
+              topic: second
+        connections:
+          - from: from_first
+            to: to_second
+      sink:
+        nodes:
+          from_second:
+            type: "{TOPIC_RECEIVER_URN}"
+            config:
+              topic: second
+          out:
+            type: "{PLAIN_EXPORTER_URN}"
+            config: null
+        connections:
+          - from: from_second
+            to: out
+"#
+        )
+    }
+
+    /// Scenario: an aggregate-Ack-required route crosses two properly
+    /// configured broadcast topics before reaching an exporter.
+    /// Guarantees: validation follows required topic receivers recursively and
+    /// accepts a fully proven nested route.
+    #[test]
+    fn accepts_safe_nested_topic_route() {
+        run(
+            &nested_topic_pipeline_yaml(),
+            &[
+                ("global::first", supported_topic_facts()),
+                ("global::second", supported_topic_facts()),
+            ],
+        )
+        .expect("every nested topic hop should be proven");
+    }
+
+    /// Scenario: the first topic hop is safe, but its required receiver forwards
+    /// into a second topic with Ack propagation disabled.
+    /// Guarantees: validation does not terminate at the first topic exporter and
+    /// rejects the unsafe later hop before filelog can advance on an early Ack.
+    #[test]
+    fn rejects_unsafe_later_topic_hop() {
+        let unsafe_second = TopicRouteFacts {
+            ack_propagation_mode: TopicAckPropagationMode::Disabled,
+            ..supported_topic_facts()
+        };
+        let message = reason(run(
+            &nested_topic_pipeline_yaml(),
+            &[
+                ("global::first", supported_topic_facts()),
+                ("global::second", unsafe_second),
+            ],
+        ));
+        assert!(message.contains("global::second"), "{message}");
+        assert!(message.contains("ack_propagation.mode: auto"), "{message}");
     }
 
     /// Scenario: an aggregate-Ack-required receiver fans out to both a supported

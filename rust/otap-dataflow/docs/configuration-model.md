@@ -858,10 +858,13 @@ subscriber processed the message. Remaining work is tracked in
 Some receivers only make durable progress on such an aggregate completion (for
 example the filelog receiver, which advances its checkpoint only after an
 aggregate Ack). Startup validation rejects a configuration in which any route
-from such a receiver cannot provide it: the route must reach a proven
-completion point, and any topic hop on it must be a declared, broadcast-only
-topic with at least one configured broadcast topic receiver,
-`ack_propagation.mode: auto`, and `broadcast.ack_mode: all`.
+from such a receiver cannot provide it. Validation follows every configured
+broadcast topic receiver and every later topic hop until the route reaches a
+proven completion point. Each topic hop must be declared, broadcast-only, have
+at least one configured broadcast topic receiver, and set
+`ack_propagation.mode: auto` plus `broadcast.ack_mode: all`. Intermediate
+processors must explicitly declare safe aggregate-Ack propagation;
+`processor:fanout` provides that contract only with `await_ack: all`.
 
 Topic defaults:
 

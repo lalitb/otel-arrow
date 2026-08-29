@@ -489,7 +489,10 @@ fn create_transform_processor(
 pub static TRANSFORM_PROCESSOR_FACTORY: ProcessorFactory<OtapPdata> = ProcessorFactory {
     name: TRANSFORM_PROCESSOR_URN,
     create: create_transform_processor,
-    wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
+    // The transform processor preserves the inbound context for one output and
+    // explicitly aggregates every routed output before completing upstream.
+    wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED
+        .propagating_aggregate_ack(),
     validate_config: otap_df_config::validation::validate_typed_config::<Config>,
 };
 

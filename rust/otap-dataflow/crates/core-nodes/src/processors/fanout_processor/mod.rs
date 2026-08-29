@@ -1191,7 +1191,8 @@ pub static FANOUT_PROCESSOR_FACTORY: ProcessorFactory<OtapPdata> = ProcessorFact
              _capabilities: &otap_df_engine::capability::registry::Capabilities| {
         create_fanout_processor(pipeline_ctx, node, node_config, proc_cfg)
     },
-    wiring_contract: otap_df_engine::wiring_contract::WiringContract::at_most_per_output(1),
+    wiring_contract: otap_df_engine::wiring_contract::WiringContract::at_most_per_output(1)
+        .propagating_aggregate_ack_when_config_equals("/await_ack", "all"),
     validate_config: otap_df_config::validation::validate_typed_config::<FanoutConfig>,
 };
 
@@ -1219,6 +1220,28 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
     use tokio::time::sleep;
+
+    /// Scenario: the fanout processor is placed on an
+    /// aggregate-Ack-required route with different `await_ack` policies.
+    /// Guarantees: only `await_ack: all` advertises completion of every required
+    /// fanout destination; primary-only and fire-and-forget modes fail closed.
+    #[test]
+    fn wiring_contract_requires_all_destination_acknowledgements() {
+        let contract = FANOUT_PROCESSOR_FACTORY.wiring_contract;
+        contract
+            .validate_aggregate_ack_propagation(&json!({"await_ack": "all"}))
+            .expect("all-destination aggregation should be accepted");
+        assert!(
+            contract
+                .validate_aggregate_ack_propagation(&json!({"await_ack": "primary"}))
+                .is_err()
+        );
+        assert!(
+            contract
+                .validate_aggregate_ack_propagation(&json!({"await_ack": "none"}))
+                .is_err()
+        );
+    }
 
     fn make_dest(
         port: &str,

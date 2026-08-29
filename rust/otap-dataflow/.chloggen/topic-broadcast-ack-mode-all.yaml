@@ -19,7 +19,6 @@ issues: [2252]
 # section with the specific action consumers must take. Keep notes to 200
 # characters and subtext to 300 characters.
 subtext: |
-  Defaults to `first`. `all` requires `ack_propagation.mode: auto` on a
-  broadcast-only topic. A publish with no ready subscriber is then rejected and
-  Nacked upstream, never Acked. Startup rejects Ack-gated sources whose route
-  cannot provide this guarantee.
+  Defaults to `first`; `all` requires automatic propagation on a broadcast-only
+  topic. Zero membership is Nacked. Ack-required route validation follows
+  nested topics and accepts fanout only with `await_ack: all`.
