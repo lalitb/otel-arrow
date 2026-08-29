@@ -2917,6 +2917,107 @@ fn namespace_ownership_is_exclusive_and_bounded() {
     assert_eq!(successor.generation(), 0);
 }
 
+const NAMESPACE_LOCK_CHILD_MODE_ENV: &str = "OTAP_FILELOG_NAMESPACE_LOCK_CHILD_MODE";
+const NAMESPACE_LOCK_CHILD_PATH_ENV: &str = "OTAP_FILELOG_NAMESPACE_LOCK_CHILD_PATH";
+const NAMESPACE_LOCK_CHILD_TEST_NAME: &str = "receivers::filelog_receiver::checkpoint::store::\
+                                              tests::namespace_lock_subprocess_helper";
+
+fn run_namespace_lock_child(path: &Path, mode: &str) -> std::process::ExitStatus {
+    std::process::Command::new(std::env::current_exe().expect("test binary path"))
+        .args([
+            "--ignored",
+            "--exact",
+            NAMESPACE_LOCK_CHILD_TEST_NAME,
+            "--nocapture",
+        ])
+        .env(NAMESPACE_LOCK_CHILD_MODE_ENV, mode)
+        .env(NAMESPACE_LOCK_CHILD_PATH_ENV, path)
+        .status()
+        .expect("namespace-lock child process starts")
+}
+
+/// Scenario: the current test binary is launched as a dedicated child process
+/// to contend for, acquire, or terminate while holding one namespace lock.
+/// Guarantees: parent tests exercise real process-scoped kernel cleanup rather
+/// than simulating cross-process behavior with threads.
+#[test]
+#[ignore = "subprocess helper"]
+#[allow(clippy::exit)]
+fn namespace_lock_subprocess_helper() {
+    let Some(mode) = std::env::var_os(NAMESPACE_LOCK_CHILD_MODE_ENV) else {
+        return;
+    };
+    let path = PathBuf::from(
+        std::env::var_os(NAMESPACE_LOCK_CHILD_PATH_ENV)
+            .expect("namespace-lock child path is configured"),
+    );
+    match mode.to_str().expect("namespace-lock child mode is UTF-8") {
+        "expect_contended" => {
+            let error = CheckpointStore::open(StoreOptions {
+                ownership_timeout: Duration::from_millis(100),
+                ownership_retry_interval: Duration::from_millis(10),
+                ..options(&path)
+            })
+            .expect_err("the parent process owns the namespace");
+            assert!(matches!(error, StoreError::NamespaceLocked { .. }));
+        }
+        "acquire_release" => {
+            drop(open(&path));
+        }
+        "exit_while_held" => {
+            let _owner = open(&path);
+            fs::write(path.join("child-held-lock"), b"held")
+                .expect("child records successful lock acquisition");
+            std::process::exit(17);
+        }
+        other => panic!("unknown namespace-lock child mode `{other}`"),
+    }
+}
+
+/// Scenario: one process owns a checkpoint namespace while a second local
+/// process attempts to open it, then retries after the owner releases it.
+/// Guarantees: ownership conflicts across processes and a later process can
+/// acquire the same namespace after release.
+#[test]
+fn namespace_ownership_conflicts_across_processes_and_releases() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("namespace");
+    let owner = open(&path);
+
+    let contended = run_namespace_lock_child(&path, "expect_contended");
+    assert!(
+        contended.success(),
+        "child process did not observe namespace contention"
+    );
+
+    drop(owner);
+    let acquired = run_namespace_lock_child(&path, "acquire_release");
+    assert!(
+        acquired.success(),
+        "child process could not acquire the released namespace"
+    );
+}
+
+/// Scenario: a child process terminates without running destructors while it
+/// owns the checkpoint namespace lock.
+/// Guarantees: process teardown releases the operating-system lock so a
+/// successor can immediately recover the namespace.
+#[test]
+fn abnormal_process_exit_releases_namespace_lock() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("namespace");
+
+    let status = run_namespace_lock_child(&path, "exit_while_held");
+    assert_eq!(status.code(), Some(17));
+    assert!(
+        path.join("child-held-lock").is_file(),
+        "child did not prove that it acquired the namespace"
+    );
+
+    let successor = open(&path);
+    assert_eq!(successor.generation(), 0);
+}
+
 /// Scenario: a cancellable store open is waiting behind a live namespace
 /// owner when shutdown is asserted and the owner then releases the lock.
 /// Guarantees: the cancelled waiter returns without acquiring or cleaning

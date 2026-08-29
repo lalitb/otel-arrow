@@ -36,7 +36,6 @@ crc.workspace = true
 hashbrown.workspace = true
 data_engine_expressions.workspace = true
 data_engine_kql_parser.workspace = true
-fs4.workspace = true
 futures.workspace = true
 futures-timer.workspace = true
 globset.workspace = true

@@ -110,15 +110,11 @@ datafusion = { version = "53.0.0", default-features = false }
 dhat = "0.3.3"
 fluke-hpack = "0.3.1"
 flume = { version = "0.12.0", default-features = false, features = ["async"] }
-# Cross-platform advisory file locking: maps to POSIX `flock` (via rustix) and
-# Windows `LockFileEx`. Only the blocking/std API is used, and only on dedicated
-# blocking threads. `std::fs::File::try_lock` would remove this dependency but
-# was stabilized in Rust 1.89, past this workspace's 1.87 MSRV.
-fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
 globset = "0.4.20"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
+    "Win32_System_IO",
 ] }
 futures = "0.3.32"
 futures-core = "0.3.32"

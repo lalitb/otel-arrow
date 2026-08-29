@@ -16,10 +16,10 @@
 //! - Windows: `LockFileEx` with `LOCKFILE_EXCLUSIVE_LOCK |
 //!   LOCKFILE_FAIL_IMMEDIATELY`.
 //!
-//! Both are reached through the `fs4` crate, which maps directly onto those
-//! two APIs and adds no lock implementation of its own. The lock is released
-//! when the file descriptor/handle is closed, which happens when
-//! [`NamespaceLock`] is dropped, including on abnormal process exit.
+//! A small internal target-gated wrapper calls those operating-system APIs
+//! directly. The lock is released when the file descriptor/handle is closed,
+//! which happens when [`NamespaceLock`] is dropped, including on abnormal
+//! process exit.
 //!
 //! Acquisition is bounded: it retries at a fixed interval until the
 //! configured `checkpoint.ownership_timeout` elapses and then fails with
@@ -31,11 +31,10 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use fs4::{FileExt, TryLockError};
-
 use super::error::StoreError;
 use super::fsio;
 use super::layout::OWNERSHIP_LOCK_FILE_NAME;
+use super::os_lock::{TryLockOutcome, try_lock_exclusive, unlock_exclusive};
 
 /// Unix mode for the ownership lock file.
 #[cfg(unix)]
@@ -124,17 +123,12 @@ impl NamespaceLock {
             if cancelled() {
                 return Ok(None);
             }
-            // Called as an explicit trait call rather than `file.try_lock()`:
-            // `std::fs::File` gained an inherent `try_lock` in Rust 1.89,
-            // which would silently take precedence over the trait method on
-            // a newer toolchain while failing to compile at this
-            // workspace's 1.87 MSRV.
-            let attempt = FileExt::try_lock(&file);
+            let attempt = try_lock_exclusive(&file);
             if cancelled() {
                 return Ok(None);
             }
             match attempt {
-                Ok(()) => {
+                Ok(TryLockOutcome::Acquired) => {
                     return Ok(Some(Self {
                         file,
                         path,
@@ -142,10 +136,10 @@ impl NamespaceLock {
                         contentions,
                     }));
                 }
-                Err(TryLockError::WouldBlock) => {
+                Ok(TryLockOutcome::WouldBlock) => {
                     contentions = contentions.saturating_add(1);
                 }
-                Err(TryLockError::Error(source)) => {
+                Err(source) => {
                     return Err(StoreError::Io {
                         operation: "lock the checkpoint namespace ownership lock",
                         path,
@@ -197,7 +191,7 @@ impl NamespaceLock {
     /// because the operating system releases an advisory lock when the
     /// descriptor is closed.
     pub fn release(self) -> Result<(), StoreError> {
-        FileExt::unlock(&self.file).map_err(|source| StoreError::Io {
+        unlock_exclusive(&self.file).map_err(|source| StoreError::Io {
             operation: "release the checkpoint namespace ownership lock",
             path: self.path.clone(),
             source,

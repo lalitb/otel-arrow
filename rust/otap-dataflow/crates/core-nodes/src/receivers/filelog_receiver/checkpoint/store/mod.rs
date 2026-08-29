@@ -92,6 +92,7 @@ mod fsio;
 pub mod layout;
 pub mod limits;
 pub mod lock;
+mod os_lock;
 
 #[cfg(test)]
 mod tests;
