@@ -229,7 +229,7 @@ pub struct FilelogReceiverMetrics {
     /// Source data observed after rotation inactivity began.
     #[metric(name = "rotation.late_writes", unit = "{write}")]
     pub rotation_late_writes: Counter<u64>,
-    /// Removed readers quarantined because their descriptor was unavailable.
+    /// Removed readers whose descriptor was unavailable for late-write capture.
     #[metric(name = "rotation.descriptor_unavailable", unit = "{file}")]
     pub rotation_descriptor_unavailable: Counter<u64>,
     /// Observable copy-truncate transitions.
@@ -303,9 +303,6 @@ pub struct FilelogReceiverMetrics {
     /// Recovery-mismatch quarantines.
     #[metric(name = "quarantine.recovery_mismatch", unit = "{file}")]
     pub quarantine_recovery_mismatch: Counter<u64>,
-    /// Descriptor-unavailable quarantines.
-    #[metric(name = "quarantine.descriptor_unavailable", unit = "{file}")]
-    pub quarantine_descriptor_unavailable: Counter<u64>,
     /// Distribution-defined or otherwise unclassified quarantines.
     #[metric(name = "quarantine.other", unit = "{file}")]
     pub quarantine_other: Counter<u64>,
@@ -413,7 +410,6 @@ pub(super) enum WorkerCounter {
     QuarantineDecode,
     QuarantineTruncate,
     QuarantineRecoveryMismatch,
-    QuarantineDescriptorUnavailable,
     QuarantineOther,
     QuarantineResetBeginning,
     QuarantineResetEnd,
@@ -576,10 +572,6 @@ impl WorkerTelemetryBridge {
         drain!(QuarantineDecode, quarantine_decode);
         drain!(QuarantineTruncate, quarantine_truncate);
         drain!(QuarantineRecoveryMismatch, quarantine_recovery_mismatch);
-        drain!(
-            QuarantineDescriptorUnavailable,
-            quarantine_descriptor_unavailable
-        );
         drain!(QuarantineOther, quarantine_other);
         drain!(QuarantineResetBeginning, quarantine_reset_beginning);
         drain!(QuarantineResetEnd, quarantine_reset_end);

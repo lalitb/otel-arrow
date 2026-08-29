@@ -2475,51 +2475,57 @@ fn encode_non_quarantined_record_with_evidence_fails_closed() {
     ));
 }
 
-/// Scenario: a quarantined snapshot record carries reserved reason code
-/// `0x0000` with otherwise complete quarantine evidence.
-/// Guarantees: the snapshot encoder rejects the reserved value at its own
+/// Scenario: a quarantined snapshot record carries either version-1 reserved
+/// reason code with otherwise complete quarantine evidence.
+/// Guarantees: the snapshot encoder rejects `0x0000` and `0x0004` at its own
 /// public boundary instead of relying on store-level append validation.
 #[test]
 fn snapshot_encoder_rejects_reserved_quarantine_reason() {
-    let mut record = sample_snapshot_record(FileId([135; 16]));
-    record.lifecycle_state = LifecycleState::Quarantined;
-    record.quarantine_evidence = Some(QuarantineEvidence {
-        reason_code: REASON_CODE_RESERVED,
-        observed_size: 1,
-        quarantine_epoch: 1,
-        quarantine_time_unix_nano: 1,
-    });
+    for reason_code in [REASON_CODE_RESERVED, 0x0004] {
+        let mut record = sample_snapshot_record(FileId([135; 16]));
+        record.lifecycle_state = LifecycleState::Quarantined;
+        record.quarantine_evidence = Some(QuarantineEvidence {
+            reason_code,
+            observed_size: 1,
+            quarantine_epoch: 1,
+            quarantine_time_unix_nano: 1,
+        });
 
-    assert!(matches!(
-        record.encode().expect_err("reserved reason must fail"),
-        EncodeError::ReservedReasonCode {
-            field: "quarantine_evidence.reason_code"
-        }
-    ));
+        assert!(matches!(
+            record.encode().expect_err("reserved reason must fail"),
+            EncodeError::ReservedReasonCode {
+                field: "quarantine_evidence.reason_code",
+                reason_code: found,
+            } if found == reason_code
+        ));
+    }
 }
 
-/// Scenario: a `quarantine_file` WAL operation carries reserved reason code
-/// `0x0000`.
-/// Guarantees: operation encoding fails before producing a frame, including
-/// when callers use the codec directly without a `CheckpointStore`.
+/// Scenario: a `quarantine_file` WAL operation carries either version-1
+/// reserved reason code.
+/// Guarantees: operation encoding rejects `0x0000` and `0x0004` before
+/// producing a frame, including direct codec callers.
 #[test]
 fn quarantine_operation_encoder_rejects_reserved_reason() {
-    let operation = Operation::QuarantineFile(QuarantineFile {
-        file_id: FileId([136; 16]),
-        expected_file_epoch: 1,
-        reason_code: REASON_CODE_RESERVED,
-        locator: Locator::Unspecified,
-        observed_size: 1,
-        quarantine_epoch: 1,
-        quarantine_time_unix_nano: 1,
-    });
+    for reason_code in [REASON_CODE_RESERVED, 0x0004] {
+        let operation = Operation::QuarantineFile(QuarantineFile {
+            file_id: FileId([136; 16]),
+            expected_file_epoch: 1,
+            reason_code,
+            locator: Locator::Unspecified,
+            observed_size: 1,
+            quarantine_epoch: 1,
+            quarantine_time_unix_nano: 1,
+        });
 
-    assert!(matches!(
-        operation.encode().expect_err("reserved reason must fail"),
-        EncodeError::ReservedReasonCode {
-            field: "quarantine_file.reason_code"
-        }
-    ));
+        assert!(matches!(
+            operation.encode().expect_err("reserved reason must fail"),
+            EncodeError::ReservedReasonCode {
+                field: "quarantine_file.reason_code",
+                reason_code: found,
+            } if found == reason_code
+        ));
+    }
 }
 
 /// Scenario: a `remove_file` WAL operation carries reserved removal reason
@@ -2542,7 +2548,8 @@ fn remove_operation_encoder_rejects_reserved_reason() {
     assert!(matches!(
         operation.encode().expect_err("reserved reason must fail"),
         EncodeError::ReservedReasonCode {
-            field: "remove_file.removal_reason"
+            field: "remove_file.removal_reason",
+            reason_code: REASON_CODE_RESERVED,
         }
     ));
 }

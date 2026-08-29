@@ -1369,6 +1369,7 @@ impl CheckpointAdminSession {
         if request.removal_reason == REASON_CODE_RESERVED {
             return Err(StoreError::ReservedReasonCode {
                 field: "remove_file.removal_reason",
+                reason_code: request.removal_reason,
             }
             .into());
         }

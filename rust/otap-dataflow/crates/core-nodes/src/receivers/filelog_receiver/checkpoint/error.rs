@@ -260,12 +260,14 @@ pub enum EncodeError {
         /// The field name.
         field: &'static str,
     },
-    /// A quarantine or removal reason used the value `0x0000`, which this
-    /// format reserves and forbids encoders from producing.
-    #[error("field {field} uses reserved reason code 0x0000")]
+    /// A quarantine or removal reason used a value this version reserves and
+    /// forbids encoders from producing.
+    #[error("field {field} uses reserved reason code {reason_code:#06x}")]
     ReservedReasonCode {
         /// The reason-code field that carried the reserved value.
         field: &'static str,
+        /// The reserved value.
+        reason_code: u16,
     },
     /// A transaction was constructed with zero operations, which this
     /// format forbids (mirrors `DecodeError::EmptyTransaction`).

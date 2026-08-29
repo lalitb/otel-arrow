@@ -1,0 +1,16 @@
+# One of 'breaking', 'deprecation', 'new_component', 'enhancement', 'bug_fix'
+change_type: bug_fix
+
+# The broad Rust component affected by this change.
+component: pipeline
+
+# A brief description of the user-visible change.
+note: Keep filelog checkpoint state active when a removed file cannot be reopened after descriptor eviction.
+
+# Tracking issue for the Phase 1 filelog receiver.
+issues: [2844]
+
+# Additional operator-facing context.
+subtext: |
+  The receiver now reports the late-write capture limitation without emitting
+  a reserved quarantine reason or silently finalizing the file.

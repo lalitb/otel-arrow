@@ -123,7 +123,8 @@ fn log_attr<'a>(log: &'a LogRecord, key: &str) -> Option<&'a Value> {
 
 /// Scenario: framed outputs and lifecycle transitions cover decode policies,
 /// record truncation, splitting, bounded flushes, copy-truncate policies,
-/// descriptor quarantine, rotation finalization, and checkpoint maintenance.
+/// descriptor-unavailable rotation, rotation finalization, and checkpoint
+/// maintenance.
 /// Guarantees: worker-owned authoritative frame observations increment only
 /// their fixed telemetry counters with exact malformed and discarded counts.
 #[test]
@@ -143,7 +144,7 @@ fn framed_record_telemetry_uses_exact_bounded_categories() {
     record_truncation_outcome(&telemetry, OnTruncate::Fail);
     record_truncation_detection(&telemetry);
     record_truncation_outcome(&telemetry, OnTruncate::ReadNew);
-    record_descriptor_quarantine_telemetry(&telemetry);
+    record_descriptor_unavailable_telemetry(&telemetry);
     record_rotation_finalization_telemetry(&telemetry);
     record_checkpoint_maintenance_telemetry(&telemetry, 1, 2, Duration::from_nanos(11), 2, true);
     record_framed_telemetry(
@@ -211,10 +212,6 @@ fn framed_record_telemetry_uses_exact_bounded_categories() {
     );
     assert_eq!(
         telemetry.take_counter_for_test(WorkerCounter::RotationDescriptorUnavailable),
-        1
-    );
-    assert_eq!(
-        telemetry.take_counter_for_test(WorkerCounter::QuarantineDescriptorUnavailable),
         1
     );
     assert_eq!(
@@ -1845,8 +1842,8 @@ async fn read_new_reopens_a_present_nonresident_reader() {
 
 /// Scenario: a present file's descriptor is evicted, then move/create
 /// rotation removes that path while another file remains readable.
-/// Guarantees: the affected identity is durably quarantined with explicit
-/// missing-handle evidence and unrelated file collection continues.
+/// Guarantees: the affected durable identity remains Active and unfinalized,
+/// the volatile reader is released, and unrelated file collection continues.
 #[tokio::test]
 async fn removed_nonresident_reader_is_contained_per_file() {
     let directory = tempdir().unwrap();
@@ -1910,21 +1907,14 @@ async fn removed_nonresident_reader_is_contained_per_file() {
     stop_worker(worker, &mut events).await.unwrap();
 
     let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
-    let quarantined = store
+    let unavailable = store
         .table()
         .iter()
-        .find(|(_, record)| record.lifecycle_state == LifecycleState::Quarantined)
+        .find(|(_, record)| record.committed_offset == 4)
         .map(|(_, record)| record)
-        .expect("descriptor-free rotation must be quarantined");
-    assert_eq!(quarantined.committed_offset, 4);
-    assert_eq!(
-        quarantined
-            .quarantine_evidence
-            .as_ref()
-            .unwrap()
-            .reason_code,
-        QUARANTINE_REASON_ROTATION_DESCRIPTOR_UNAVAILABLE
-    );
+        .expect("descriptor-free rotation must retain its durable record");
+    assert_eq!(unavailable.lifecycle_state, LifecycleState::Active);
+    assert!(unavailable.quarantine_evidence.is_none());
     assert!(store.table().iter().any(|(_, record)| {
         record.lifecycle_state == LifecycleState::Active && record.committed_offset == 8
     }));
@@ -2933,8 +2923,9 @@ fn direct_recordless_finalization_commits_without_otap() {
 
 /// Scenario: an admitted nonresident reader's path is replaced before
 /// discovery can deliver the old locator's `Removed` event.
-/// Guarantees: reopen reports descriptor unavailability, the worker durably
-/// quarantines the old identity, and retains it for later discovery cleanup.
+/// Guarantees: reopen reports descriptor unavailability, the worker releases
+/// volatile state, the old durable identity remains Active and unfinalized,
+/// and same-epoch record numbering does not restart.
 #[test]
 fn pre_discovery_path_replacement_uses_per_file_containment() {
     let directory = tempdir().unwrap();
@@ -2971,6 +2962,7 @@ fn pre_discovery_path_replacement_uses_per_file_containment() {
             advisory_path: evidence.advisory_path.clone(),
         }])
         .unwrap();
+    let durable_before = runtime.store.table().get(&file_id).unwrap().clone();
     let mut readers = ReaderTable::new(ReaderSettings::from_runtime(&runtime.config)).unwrap();
     readers
         .insert(
@@ -2993,6 +2985,12 @@ fn pre_discovery_path_replacement_uses_per_file_containment() {
         )
         .unwrap();
     runtime.readers = Some(readers);
+    let first_number = runtime
+        .record_numbers
+        .prepare(file_id, 1, None)
+        .and_then(|reservation| runtime.record_numbers.commit(reservation))
+        .unwrap();
+    assert_eq!(first_number, Some(0));
 
     std::fs::rename(&source, &rotated).unwrap();
     std::fs::write(&source, b"new\n").unwrap();
@@ -3005,18 +3003,21 @@ fn pre_discovery_path_replacement_uses_per_file_containment() {
     let released = runtime
         .contain_removed_without_descriptor(file_id)
         .unwrap()
-        .expect("descriptor quarantine was not cancelled");
+        .expect("descriptor containment was not cancelled");
     runtime
         .remember_inactive_locator(released, file_id)
         .unwrap();
-
     let record = runtime.store.table().get(&file_id).unwrap();
-    assert_eq!(record.lifecycle_state, LifecycleState::Quarantined);
-    assert_eq!(
-        record.quarantine_evidence.as_ref().unwrap().reason_code,
-        QUARANTINE_REASON_ROTATION_DESCRIPTOR_UNAVAILABLE
-    );
+    assert_eq!(record, &durable_before);
     assert_eq!(runtime.inactive_locators.get(&locator), Some(&file_id));
+    assert_eq!(
+        runtime
+            .record_numbers
+            .prepare(file_id, 1, None)
+            .unwrap()
+            .record_number(),
+        Some(1)
+    );
     runtime.shutdown_resources().unwrap();
 }
 

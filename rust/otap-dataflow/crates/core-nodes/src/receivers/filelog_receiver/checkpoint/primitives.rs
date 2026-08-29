@@ -155,6 +155,8 @@ pub const TRUNCATE_RESET_REASON_READ_NEW: u16 = 0x0001;
 
 /// Reserved reason-code value that an encoder MUST NOT produce.
 pub const REASON_CODE_RESERVED: u16 = 0x0000;
+/// Version-1 quarantine reason reserved by the format.
+pub(crate) const QUARANTINE_REASON_RESERVED_V1: u16 = 0x0004;
 /// Quarantine reason: malformed input was rejected by the decode `fail`
 /// policy.
 pub const QUARANTINE_REASON_DECODE: u16 = 0x0001;
@@ -164,9 +166,13 @@ pub const QUARANTINE_REASON_RECOVERY_MISMATCH: u16 = 0x0003;
 /// Quarantine reason: observable truncation was detected under the `fail`
 /// policy.
 pub const QUARANTINE_REASON_TRUNCATE: u16 = 0x0002;
-/// Quarantine reason: rotation removed a file after its native descriptor
-/// had already been evicted, so late writes could not be captured safely.
-pub const QUARANTINE_REASON_ROTATION_DESCRIPTOR_UNAVAILABLE: u16 = 0x0004;
+
+/// Whether a quarantine reason is reserved from version-1 encoder output.
+#[must_use]
+pub(crate) const fn quarantine_reason_is_reserved(reason_code: u16) -> bool {
+    reason_code == REASON_CODE_RESERVED || reason_code == QUARANTINE_REASON_RESERVED_V1
+}
+
 /// Removal reason: a stale non-quarantined record (`Active` or
 /// `RotatedFinalized`) was superseded by a new identity created for the
 /// same runtime locator under recovery-mismatch handling. `removal_reason`

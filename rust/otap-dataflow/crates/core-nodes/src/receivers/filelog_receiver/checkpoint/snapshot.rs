@@ -12,7 +12,7 @@ use super::error::{DecodeError, EncodeError};
 use super::primitives::{
     AdvisoryPath, ByteReader, ByteWriter, COMMITTED_FRONTIER_GUARD_WINDOW_BYTES,
     CommittedFrontierGuard, FINGERPRINT_MAX_BYTES, FileId, FramingResume, LifecycleState, Locator,
-    REASON_CODE_RESERVED, SNAPSHOT_FOOTER_MAGIC, SNAPSHOT_MAGIC, crc32c, namespace_digest,
+    SNAPSHOT_FOOTER_MAGIC, SNAPSHOT_MAGIC, crc32c, namespace_digest, quarantine_reason_is_reserved,
 };
 
 /// Fixed width of the snapshot header, in bytes.
@@ -23,8 +23,8 @@ pub const SNAPSHOT_FOOTER_LEN: usize = 24;
 /// Immutable quarantine evidence, present only for a `Quarantined` record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuarantineEvidence {
-    /// Opaque diagnostic reason code; encoders reject the reserved value
-    /// `0x0000`.
+    /// Opaque diagnostic reason code. Decoders accept every `u16`; current
+    /// encoders reject values reserved by version 1.
     pub reason_code: u16,
     /// Observed file size at the moment of quarantine.
     pub observed_size: u64,
@@ -120,9 +120,6 @@ impl SnapshotRecord {
         // `lifecycle_state == Quarantined`); this only validates evidence
         // *content* once it is known to be present.
         if let Some(evidence) = &self.quarantine_evidence {
-            if evidence.reason_code == REASON_CODE_RESERVED {
-                return Err("quarantine_evidence.reason_code must not be 0x0000");
-            }
             if self.lifecycle_state == LifecycleState::Quarantined
                 && evidence.quarantine_epoch != self.file_epoch
             {
@@ -151,9 +148,10 @@ impl SnapshotRecord {
         out.write_u8(self.lifecycle_state.to_wire());
         match (&self.lifecycle_state, &self.quarantine_evidence) {
             (LifecycleState::Quarantined, Some(evidence)) => {
-                if evidence.reason_code == REASON_CODE_RESERVED {
+                if quarantine_reason_is_reserved(evidence.reason_code) {
                     return Err(EncodeError::ReservedReasonCode {
                         field: "quarantine_evidence.reason_code",
+                        reason_code: evidence.reason_code,
                     });
                 }
                 out.write_u16(evidence.reason_code);
@@ -178,12 +176,10 @@ impl SnapshotRecord {
                 });
             }
         }
-        // Runs after the presence/reason checks above (which already cover
-        // their own specific error variants) so this shared invariant
-        // check -- also used by `decode_payload`, which has no equivalent
-        // dedicated error for a reserved reason code -- never preempts a
-        // more specific encode-time error with the generic
-        // `InvalidSnapshotState`.
+        // Runs after the presence/reason checks above so encoder-specific
+        // errors are not replaced by a generic reachable-state failure.
+        // Decoding uses the same reachable-state checks but treats reason
+        // values as structurally opaque.
         self.validate_reachable_state()
             .map_err(|reason| EncodeError::InvalidSnapshotState {
                 file_id: self.file_id,

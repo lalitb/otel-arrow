@@ -110,7 +110,7 @@ use super::namespace::{CheckpointNamespace, CheckpointNamespaceError};
 use super::primitives::{
     FileId, LifecycleState, NAMESPACE_ID_MAX_BYTES, REASON_CODE_RESERVED, TX_FRAME_CRC_BYTES,
     TX_HEADER_BYTES, WAL_MAX_NON_PROGRESS_OPS_PER_TX, WAL_MAX_OPS_PER_TX, WAL_MAX_TX_BODY_BYTES,
-    namespace_digest,
+    namespace_digest, quarantine_reason_is_reserved,
 };
 use super::snapshot::{SnapshotRecord, decode_snapshot, decode_snapshot_header, encode_snapshot};
 use super::wal::{
@@ -511,13 +511,21 @@ fn chunk_non_progress_operations(operations: &[Operation]) -> Result<Vec<usize>,
     Ok(lengths)
 }
 
-/// Refuses the reserved reason code the format forbids an encoder from
-/// writing (`docs/filelog-checkpoint-format.md`, "Reason codes"): `0x0000`
-/// is reserved for both `quarantine_file.reason_code` and
-/// `remove_file.removal_reason`.
+/// Refuses `0x0000`, which is reserved for every reason field.
 fn reject_reserved_reason_code(field: &'static str, reason_code: u16) -> Result<(), StoreError> {
     if reason_code == REASON_CODE_RESERVED {
-        return Err(StoreError::ReservedReasonCode { field });
+        return Err(StoreError::ReservedReasonCode { field, reason_code });
+    }
+    Ok(())
+}
+
+/// Refuses every quarantine reason reserved from version-1 encoder output.
+fn reject_reserved_quarantine_reason_code(
+    field: &'static str,
+    reason_code: u16,
+) -> Result<(), StoreError> {
+    if quarantine_reason_is_reserved(reason_code) {
+        return Err(StoreError::ReservedReasonCode { field, reason_code });
     }
     Ok(())
 }
@@ -534,7 +542,10 @@ fn reject_reserved_reason_codes(operations: &[Operation]) -> Result<(), StoreErr
     for operation in operations {
         match operation {
             Operation::QuarantineFile(op) => {
-                reject_reserved_reason_code("quarantine_file.reason_code", op.reason_code)?;
+                reject_reserved_quarantine_reason_code(
+                    "quarantine_file.reason_code",
+                    op.reason_code,
+                )?;
             }
             Operation::RemoveFile(op) => {
                 reject_reserved_reason_code("remove_file.removal_reason", op.removal_reason)?;
@@ -1682,7 +1693,7 @@ impl CheckpointStore {
     /// table -- a removal's reason leaves with the record it removed -- and
     /// compaction re-encodes that evidence verbatim into the next snapshot.
     /// Every append this store accepts is already checked, so a recovered
-    /// record carrying `0x0000` did not come from here; accepting it would
+    /// record carrying a reserved value did not come from here; accepting it would
     /// make the store itself produce the value the format forbids, so
     /// recovery reports it rather than propagating it.
     fn reject_recovered_reserved_reason_codes(
@@ -1691,16 +1702,16 @@ impl CheckpointStore {
         generation: u64,
     ) -> Result<(), StoreError> {
         for (file_id, record) in table.iter() {
-            let reserved = record
-                .quarantine_evidence
-                .as_ref()
-                .is_some_and(|evidence| evidence.reason_code == REASON_CODE_RESERVED);
-            if reserved {
+            let reserved = record.quarantine_evidence.as_ref().and_then(|evidence| {
+                quarantine_reason_is_reserved(evidence.reason_code).then_some(evidence.reason_code)
+            });
+            if let Some(reason_code) = reserved {
                 return Err(StoreError::ReservedReasonCodeRecovered {
                     dir: dir.to_path_buf(),
                     generation,
                     file_id: *file_id,
                     field: "quarantine_file.reason_code",
+                    reason_code,
                 });
             }
         }
@@ -1717,12 +1728,12 @@ impl CheckpointStore {
                 Operation::QuarantineFile(op) => (
                     op.file_id,
                     "quarantine_file.reason_code",
-                    op.reason_code == REASON_CODE_RESERVED,
+                    quarantine_reason_is_reserved(op.reason_code).then_some(op.reason_code),
                 ),
                 Operation::RemoveFile(op) => (
                     op.file_id,
                     "remove_file.removal_reason",
-                    op.removal_reason == REASON_CODE_RESERVED,
+                    (op.removal_reason == REASON_CODE_RESERVED).then_some(op.removal_reason),
                 ),
                 Operation::RegisterFile(_)
                 | Operation::UpdateProgress(_)
@@ -1731,12 +1742,13 @@ impl CheckpointStore {
                 | Operation::UpdateMetadata(_)
                 | Operation::ResetQuarantinedFile(_) => continue,
             };
-            if reserved {
+            if let Some(reason_code) = reserved {
                 return Err(StoreError::ReservedReasonCodeRecovered {
                     dir: dir.to_path_buf(),
                     generation,
                     file_id,
                     field,
+                    reason_code,
                 });
             }
         }
@@ -2272,8 +2284,8 @@ impl CheckpointStore {
     /// Persists fail-policy quarantines. Durable before this call returns, so
     /// a quarantine is never reported before it survives a crash.
     ///
-    /// A `reason_code` of [`REASON_CODE_RESERVED`] is refused, as it is on
-    /// every other path that can encode one.
+    /// Every quarantine reason reserved from version-1 encoder output is
+    /// refused, as it is on every other path that can encode one.
     pub fn quarantine_files(
         &mut self,
         quarantines: Vec<QuarantineFile>,

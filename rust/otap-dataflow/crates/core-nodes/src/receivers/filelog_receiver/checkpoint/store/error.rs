@@ -360,7 +360,7 @@ pub enum StoreError {
     /// the next compaction re-encode it, so recovery fails closed instead.
     #[error(
         "checkpoint generation {generation} in {dir} holds a record ({file_id:?}) whose {field} \
-         is the reserved value 0x0000, which no encoder may write"
+         is the reserved value {reason_code:#06x}, which no encoder may write"
     )]
     ReservedReasonCodeRecovered {
         /// The namespace directory.
@@ -371,6 +371,8 @@ pub enum StoreError {
         file_id: FileId,
         /// The durable field carrying it.
         field: &'static str,
+        /// The reserved value.
+        reason_code: u16,
     },
     /// The configured `checkpoint.id` cannot be represented by the durable
     /// format, so an administrative operation could never name this
@@ -461,12 +463,13 @@ pub enum StoreError {
         /// Its current lifecycle state.
         state: super::super::primitives::LifecycleState,
     },
-    /// A reason code of `0x0000` was supplied; the format reserves it and
-    /// forbids an encoder from writing it.
-    #[error("{field} must not be the reserved reason code 0x0000")]
+    /// A reason code reserved by this format version was supplied.
+    #[error("{field} must not use reserved reason code {reason_code:#06x}")]
     ReservedReasonCode {
         /// The durable field that was given the reserved value.
         field: &'static str,
+        /// The reserved value.
+        reason_code: u16,
     },
     /// A test armed a fault point and execution reached it. Production code
     /// has no way to arm a fault point (see [`super::fault::FaultPlan`]), so

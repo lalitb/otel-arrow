@@ -26,8 +26,7 @@ use super::batching::{
 };
 use super::checkpoint::primitives::{
     FileId, FramingResume, LifecycleState, Locator, QUARANTINE_REASON_DECODE,
-    QUARANTINE_REASON_ROTATION_DESCRIPTOR_UNAVAILABLE, QUARANTINE_REASON_TRUNCATE,
-    TRUNCATE_RESET_REASON_READ_NEW, WAL_MAX_OPS_PER_TX,
+    QUARANTINE_REASON_TRUNCATE, TRUNCATE_RESET_REASON_READ_NEW, WAL_MAX_OPS_PER_TX,
 };
 use super::checkpoint::store::error::StoreError;
 use super::checkpoint::store::{CheckpointStore, StoreOptions, StoreStats};
@@ -1966,7 +1965,7 @@ impl WorkerRuntime {
             });
         }
         self.readers_ref()?.preflight_release_revoked(file_id)?;
-        let (expected_file_epoch, committed_offset, locator) = {
+        let (committed_offset, locator) = {
             let record = self
                 .store
                 .table()
@@ -1978,33 +1977,17 @@ impl WorkerRuntime {
                     state: record.lifecycle_state,
                 });
             }
-            (record.file_epoch, record.committed_offset, record.locator)
+            (record.committed_offset, record.locator)
         };
-        let mut quarantines = reserved_vec(1, "descriptor-free rotation quarantine")?;
-        quarantines.push(QuarantineFile {
-            file_id,
-            expected_file_epoch,
-            reason_code: QUARANTINE_REASON_ROTATION_DESCRIPTOR_UNAVAILABLE,
-            locator,
-            observed_size: committed_offset,
-            quarantine_epoch: expected_file_epoch,
-            quarantine_time_unix_nano: unix_nanos()?.1,
-        });
         if self.cancellation_requested() {
             return Ok(None);
         }
-        let result = self
-            .store
-            .quarantine_files(quarantines)
-            .map_err(WorkerError::Store);
-        let _outcomes = self.observe_direct_checkpoint_result(result)?;
-        let result = self.store.sync().map_err(WorkerError::Store);
-        self.observe_direct_checkpoint_result(result)?;
-        record_descriptor_quarantine_telemetry(&self.telemetry);
-        if let Some(suppressed) = self.health_event(HealthEventCategory::Quarantine) {
+        record_descriptor_unavailable_telemetry(&self.telemetry);
+        if let Some(suppressed) = self.health_event(HealthEventCategory::Rotation) {
             otel_warn!(
                 "filelog_receiver.rotation_descriptor_unavailable",
                 committed_offset,
+                durable_state = "active_unfinalized",
                 suppressed_events = suppressed
             );
         }
@@ -2018,7 +2001,6 @@ impl WorkerRuntime {
         }
         self.discard_framer(file_id);
         let _ = self.rotation_waits.remove(&file_id);
-        let _ = self.record_numbers.remove(file_id);
         self.remove_drain_file(file_id);
         Ok(Some(locator))
     }
@@ -2872,9 +2854,8 @@ fn record_truncation_outcome(telemetry: &WorkerTelemetryBridge, policy: OnTrunca
     }
 }
 
-fn record_descriptor_quarantine_telemetry(telemetry: &WorkerTelemetryBridge) {
+fn record_descriptor_unavailable_telemetry(telemetry: &WorkerTelemetryBridge) {
     telemetry.add(WorkerCounter::RotationDescriptorUnavailable, 1);
-    telemetry.add(WorkerCounter::QuarantineDescriptorUnavailable, 1);
 }
 
 fn record_rotation_finalization_telemetry(telemetry: &WorkerTelemetryBridge) {

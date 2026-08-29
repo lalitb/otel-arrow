@@ -22,7 +22,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::super::current_marker::encode_current_marker;
-use super::super::error::DecodeError;
 use super::super::primitives::{
     ADVISORY_PATH_STORED_MAX_BYTES, AdvisoryPath, ByteReader, CommittedFrontierGuard,
     FINGERPRINT_MAX_BYTES, FileId, FramingResume, LifecycleState, Locator, NAMESPACE_ID_MAX_BYTES,
@@ -4043,14 +4042,10 @@ fn compaction_requires_retired_generation_cleanup() {
     assert_eq!(store.retired_generations(), [1]);
 }
 
-/// Scenario: the reserved reason code `0x0000` supplied to every public
-/// path that can encode a `quarantine_file.reason_code` or a
-/// `remove_file.removal_reason`, including the raw transaction API and an
-/// administrative removal of a record that is not present.
-/// Guarantees: the format's "an encoder MUST NOT write 0x0000" rule is
-/// enforced once, at the single append funnel plus the two paths that can
-/// return early, so no entry point can persist a reserved reason code and
-/// none of the refusals advances durable or in-memory state.
+/// Scenario: each reason value reserved from version-1 encoder output is
+/// supplied through every public quarantine or removal path.
+/// Guarantees: quarantine rejects `0x0000` and `0x0004`, removal rejects
+/// `0x0000`, and no refusal advances durable or in-memory state.
 #[test]
 fn reserved_reason_codes_are_refused_on_every_public_path() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -4065,28 +4060,34 @@ fn reserved_reason_codes_are_refused_on_every_public_path() {
     let bytes_before = store.stats().wal_bytes;
     let sequence_before = store.stats().next_sequence;
 
-    let mut reserved_quarantine = quarantine(1);
-    reserved_quarantine.reason_code = REASON_CODE_RESERVED;
-    let expect_quarantine_field = |error: StoreError| match error {
-        StoreError::ReservedReasonCode { field } => {
+    let expect_quarantine_field = |error: StoreError, expected| match error {
+        StoreError::ReservedReasonCode { field, reason_code } => {
             assert_eq!(field, "quarantine_file.reason_code");
+            assert_eq!(reason_code, expected);
         }
         other => panic!("expected a reserved reason code refusal, got {other:?}"),
     };
-    expect_quarantine_field(
-        store
-            .quarantine_files(vec![reserved_quarantine.clone()])
-            .expect_err("quarantine_files refuses the reserved code"),
-    );
-    expect_quarantine_field(
-        store
-            .append(vec![Operation::QuarantineFile(reserved_quarantine)])
-            .expect_err("append refuses the reserved code"),
-    );
+    for reason_code in [REASON_CODE_RESERVED, 0x0004] {
+        let mut reserved_quarantine = quarantine(1);
+        reserved_quarantine.reason_code = reason_code;
+        expect_quarantine_field(
+            store
+                .quarantine_files(vec![reserved_quarantine.clone()])
+                .expect_err("quarantine_files refuses the reserved code"),
+            reason_code,
+        );
+        expect_quarantine_field(
+            store
+                .append(vec![Operation::QuarantineFile(reserved_quarantine)])
+                .expect_err("append refuses the reserved code"),
+            reason_code,
+        );
+    }
 
     let expect_removal_field = |error: StoreError| match error {
-        StoreError::ReservedReasonCode { field } => {
+        StoreError::ReservedReasonCode { field, reason_code } => {
             assert_eq!(field, "remove_file.removal_reason");
+            assert_eq!(reason_code, REASON_CODE_RESERVED);
         }
         other => panic!("expected a reserved reason code refusal, got {other:?}"),
     };
@@ -4152,24 +4153,32 @@ fn reserved_reason_codes_are_refused_on_every_public_path() {
     assert_eq!(store.table().len(), 0);
 }
 
-/// Scenario: a checksum-valid WAL contains either a quarantine or removal
-/// operation with the reason code encoders reserve.
-/// Guarantees: recovery rejects both operations before applying them, so a
-/// reserved removal cannot evade validation by deleting its own evidence
-/// from the final table.
+/// Scenario: a checksum-valid WAL contains a quarantine using `0x0000` or
+/// `0x0004`, or a removal using reserved `0x0000`.
+/// Guarantees: structural decoding accepts the opaque `u16`, then store
+/// recovery rejects it before applying the operation.
 #[test]
 fn recovered_wal_rejects_every_reserved_reason_code() {
-    for (name, operation, reason_offset, expected_field) in [
+    for (name, operation, reason_offset, reserved_reason, expected_field) in [
         (
-            "quarantine",
+            "quarantine-zero",
             Operation::QuarantineFile(quarantine(1)),
             1 + 16 + 4,
+            REASON_CODE_RESERVED,
+            "quarantine_file.reason_code",
+        ),
+        (
+            "quarantine-four",
+            Operation::QuarantineFile(quarantine(1)),
+            1 + 16 + 4,
+            0x0004,
             "quarantine_file.reason_code",
         ),
         (
             "removal",
             Operation::RemoveFile(removal(1, 0x0001)),
             1 + 16 + 4 + 1,
+            REASON_CODE_RESERVED,
             "remove_file.removal_reason",
         ),
     ] {
@@ -4187,11 +4196,7 @@ fn recovered_wal_rejects_every_reserved_reason_code() {
         }
         .encode()
         .expect("the structurally valid transaction encodes");
-        patch_first_transaction_operation_u16(
-            &mut transaction,
-            reason_offset,
-            REASON_CODE_RESERVED,
-        );
+        patch_first_transaction_operation_u16(&mut transaction, reason_offset, reserved_reason);
         let wal_path = path.join(wal_file_name(0));
         let mut wal = fs::OpenOptions::new()
             .append(true)
@@ -4209,18 +4214,20 @@ fn recovered_wal_rejects_every_reserved_reason_code() {
             StoreError::ReservedReasonCodeRecovered {
                 file_id: found,
                 field,
+                reason_code,
                 ..
-            } if found == file_id(1) && field == expected_field
+            } if found == file_id(1)
+                && field == expected_field
+                && reason_code == reserved_reason
         ));
     }
 }
 
-/// Scenario: a checksum-valid snapshot contains reserved quarantine evidence
-/// and its WAL immediately resets or administratively removes that record.
-/// Guarantees: recovery validates the snapshot's reachable-state invariants
-/// (including the quarantine evidence `reason_code != 0` invariant) before
-/// replay, so a later valid operation cannot erase the forbidden durable
-/// value before it is reported.
+/// Scenario: a checksum-valid snapshot contains `0x0000` or `0x0004`
+/// quarantine evidence and its WAL immediately resets or removes that record.
+/// Guarantees: snapshot decoding accepts the opaque reason structurally, but
+/// store recovery rejects the reserved encoder value before replay can erase
+/// the evidence.
 #[test]
 fn recovered_snapshot_rejects_reserved_reason_before_wal_can_erase_it() {
     let reset = Operation::ResetQuarantinedFile(ResetQuarantinedFile {
@@ -4245,7 +4252,12 @@ fn recovered_snapshot_rejects_reserved_reason_before_wal_can_erase_it() {
         audit_reason: Some("operator removal".to_owned()),
     });
 
-    for (name, operation) in [("reset", reset), ("removal", removal)] {
+    for (name, operation, reserved_reason) in [
+        ("reset-zero", reset.clone(), REASON_CODE_RESERVED),
+        ("reset-four", reset, 0x0004),
+        ("removal-zero", removal.clone(), REASON_CODE_RESERVED),
+        ("removal-four", removal, 0x0004),
+    ] {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join(name);
         let mut store = open(&path);
@@ -4261,7 +4273,7 @@ fn recovered_snapshot_rejects_reserved_reason_before_wal_can_erase_it() {
 
         let mut snapshot = encode_snapshot(1, NAMESPACE_ID, &snapshot_records)
             .expect("the valid snapshot encodes");
-        patch_first_snapshot_quarantine_reason(&mut snapshot, REASON_CODE_RESERVED);
+        patch_first_snapshot_quarantine_reason(&mut snapshot, reserved_reason);
         write_bytes(&path.join(snapshot_file_name(1)), &snapshot);
         let transaction = Transaction {
             sequence: 1,
@@ -4283,11 +4295,12 @@ fn recovered_snapshot_rejects_reserved_reason_before_wal_can_erase_it() {
             .expect_err("the snapshot's reserved code fails recovery");
         assert!(matches!(
             error,
-            StoreError::Decode {
-                artifact: "snapshot",
-                source: DecodeError::InvalidSnapshotState { file_id: found, .. },
+            StoreError::ReservedReasonCodeRecovered {
+                file_id: found,
+                field: "quarantine_file.reason_code",
+                reason_code,
                 ..
-            } if found == file_id(1)
+            } if found == file_id(1) && reason_code == reserved_reason
         ));
     }
 }

@@ -16,6 +16,7 @@ use super::primitives::{
     NAMESPACE_ID_MAX_BYTES, REASON_CODE_RESERVED, TX_ENVELOPE_VERSION, TX_FRAME_CRC_BYTES,
     TX_HEADER_BYTES, TX_MAGIC, TX_MIN_BODY_BYTES, WAL_MAGIC, WAL_MAX_NON_PROGRESS_OPS_PER_TX,
     WAL_MAX_OPS_PER_TX, WAL_MAX_TX_BODY_BYTES, crc32c, namespace_digest,
+    quarantine_reason_is_reserved,
 };
 
 /// Fixed width of the WAL header, in bytes.
@@ -357,9 +358,10 @@ impl Operation {
                 }
             }
             Operation::QuarantineFile(op) => {
-                if op.reason_code == REASON_CODE_RESERVED {
+                if quarantine_reason_is_reserved(op.reason_code) {
                     return Err(EncodeError::ReservedReasonCode {
                         field: "quarantine_file.reason_code",
+                        reason_code: op.reason_code,
                     });
                 }
                 out.write_u8(OP_QUARANTINE_FILE);
@@ -396,6 +398,7 @@ impl Operation {
                 if op.removal_reason == REASON_CODE_RESERVED {
                     return Err(EncodeError::ReservedReasonCode {
                         field: "remove_file.removal_reason",
+                        reason_code: op.removal_reason,
                     });
                 }
                 out.write_u8(OP_REMOVE_FILE);
