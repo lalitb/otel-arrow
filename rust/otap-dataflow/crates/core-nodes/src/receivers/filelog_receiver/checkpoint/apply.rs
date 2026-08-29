@@ -78,7 +78,7 @@ pub type TableRecord = SnapshotRecord;
 
 /// The in-memory, replayed checkpoint state for one namespace: a table of
 /// [`TableRecord`] keyed by [`FileId`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CheckpointTable {
     records: HashMap<FileId, TableRecord>,
     quarantined_records: usize,
@@ -219,6 +219,48 @@ impl CheckpointTable {
                 }
             }
         }
+    }
+
+    /// Whether this table is exactly the result of committing `staged` to
+    /// `base`, without cloning the complete bounded table on a failure path.
+    pub(crate) fn matches_staged_commit(&self, base: &Self, staged: &StagedOperations) -> bool {
+        for (file_id, base_record) in &base.records {
+            let expected = staged
+                .touched
+                .get(file_id)
+                .map(Option::as_ref)
+                .unwrap_or(Some(base_record));
+            if self.records.get(file_id) != expected {
+                return false;
+            }
+        }
+        for (file_id, staged_record) in &staged.touched {
+            if !base.records.contains_key(file_id)
+                && self.records.get(file_id) != staged_record.as_ref()
+            {
+                return false;
+            }
+        }
+        self.records.len()
+            == base.records.len().saturating_sub(
+                staged
+                    .touched
+                    .iter()
+                    .filter(|(file_id, record)| {
+                        base.records.contains_key(file_id) && record.is_none()
+                    })
+                    .count(),
+            ) + staged
+                .touched
+                .iter()
+                .filter(|(file_id, record)| !base.records.contains_key(file_id) && record.is_some())
+                .count()
+            && self.quarantined_records
+                == self
+                    .records
+                    .values()
+                    .filter(|record| record.lifecycle_state == LifecycleState::Quarantined)
+                    .count()
     }
 
     /// Validates every supplied operation without changing the table.

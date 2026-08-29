@@ -51,10 +51,12 @@
 //! A caller-supplied transaction is validated against the in-memory table
 //! *before* any byte reaches the WAL, so an operation that could not be
 //! replayed can never be persisted. The staged table transition is committed
-//! only after the append and any required sync succeed. A write error marks
-//! the handle unusable because disk may contain a partial or complete frame;
-//! a failed required sync attempts to restore and sync the prior WAL length.
-//! Reopening always recovers the authoritative WAL state.
+//! only after the append and any required sync succeed. An uncertain write
+//! retains fixed-size identity for the exact transaction retry. That retry
+//! reopens and validates the WAL from the prior known boundary, repairs only
+//! a structurally torn suffix, accepts an exact complete transaction without
+//! appending it again, and retries any required sync before committing the
+//! staged table transition.
 //!
 //! # Resource bounds
 //!
@@ -104,7 +106,9 @@ use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use super::apply::CheckpointTable;
+use sha2::{Digest as _, Sha256};
+
+use super::apply::{CheckpointTable, StagedOperations};
 use super::current_marker::{decode_current_marker, encode_current_marker};
 use super::namespace::{CheckpointNamespace, CheckpointNamespaceError};
 use super::primitives::{
@@ -314,6 +318,19 @@ pub(crate) enum AtomicGroupAppendOutcome {
     },
 }
 
+/// A preflighted sequence of transaction-bounded atomic operation groups.
+///
+/// `next_transaction` advances only after one complete transaction succeeds,
+/// so an uncertain transaction retry resumes at the exact encoded chunk
+/// instead of rebuilding an already committed prefix.
+#[derive(Debug)]
+pub(crate) struct AtomicGroupAppendPlan {
+    operations: Vec<Operation>,
+    transaction_lengths: Vec<usize>,
+    next_transaction: usize,
+    next_operation: usize,
+}
+
 /// Durable and in-memory accounting for one store instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreStats {
@@ -368,6 +385,102 @@ enum SyncPolicy {
     Immediate,
     /// Sync when the configured interval has elapsed.
     Interval,
+}
+
+/// Fixed-size identity and accounting retained after an uncertain append.
+///
+/// The logical batch already owns the complete operations while the caller
+/// retries. Keeping only a digest here avoids retaining a second transaction-
+/// sized allocation in the store.
+#[derive(Debug, Clone, Copy)]
+struct PendingWalAppend {
+    boundary: u64,
+    wal_transactions_before: u64,
+    unsynced_transactions_before: u64,
+    sequence: u64,
+    transaction_bytes: u64,
+    wal_bytes_after: u64,
+    wal_transactions_after: u64,
+    unsynced_transactions_after: u64,
+    next_sequence_after: u64,
+    transaction_digest: [u8; 32],
+    operation_count: usize,
+    policy: SyncPolicy,
+    requires_sync: bool,
+    repair_sync_required: bool,
+}
+
+impl PendingWalAppend {
+    fn new(
+        store: &CheckpointStore,
+        bytes: &[u8],
+        policy: SyncPolicy,
+        sequence: u64,
+        operation_count: usize,
+    ) -> Result<Self, StoreError> {
+        let transaction_bytes = u64::try_from(bytes.len())
+            .map_err(|_| StoreError::AccountingOverflow { bytes: u64::MAX })?;
+        let wal_bytes_after = store.wal_bytes.checked_add(transaction_bytes).ok_or(
+            StoreError::AccountingOverflow {
+                bytes: store.wal_bytes,
+            },
+        )?;
+        let wal_transactions_after =
+            store
+                .wal_transactions
+                .checked_add(1)
+                .ok_or(StoreError::CounterOverflow {
+                    counter: "WAL transactions",
+                    value: store.wal_transactions,
+                })?;
+        let unsynced_transactions_after =
+            store
+                .unsynced_transactions
+                .checked_add(1)
+                .ok_or(StoreError::CounterOverflow {
+                    counter: "unsynced WAL transactions",
+                    value: store.unsynced_transactions,
+                })?;
+        let next_sequence_after = sequence
+            .checked_add(1)
+            .ok_or(StoreError::SequenceOverflow { sequence })?;
+        Ok(Self {
+            boundary: store.wal_bytes,
+            wal_transactions_before: store.wal_transactions,
+            unsynced_transactions_before: store.unsynced_transactions,
+            sequence,
+            transaction_bytes,
+            wal_bytes_after,
+            wal_transactions_after,
+            unsynced_transactions_after,
+            next_sequence_after,
+            transaction_digest: Sha256::digest(bytes).into(),
+            operation_count,
+            policy,
+            requires_sync: false,
+            repair_sync_required: false,
+        })
+    }
+
+    fn matches(self, other: Self) -> bool {
+        self.boundary == other.boundary
+            && self.wal_transactions_before == other.wal_transactions_before
+            && self.unsynced_transactions_before == other.unsynced_transactions_before
+            && self.sequence == other.sequence
+            && self.transaction_bytes == other.transaction_bytes
+            && self.wal_bytes_after == other.wal_bytes_after
+            && self.wal_transactions_after == other.wal_transactions_after
+            && self.unsynced_transactions_after == other.unsynced_transactions_after
+            && self.next_sequence_after == other.next_sequence_after
+            && self.transaction_digest == other.transaction_digest
+            && self.operation_count == other.operation_count
+            && self.policy == other.policy
+    }
+}
+
+enum PendingAppendResolution {
+    RetryWrite,
+    Complete(AppendOutcome),
 }
 
 /// Classifies a transaction's durability requirement from its operations.
@@ -599,6 +712,7 @@ pub struct CheckpointStore {
     quarantine_keep_failed: u64,
     quarantine_removals: u64,
     faults: FaultPlan,
+    pending_wal_append: Option<PendingWalAppend>,
     unusable: Option<&'static str>,
     recovery: RecoveryReport,
 }
@@ -744,6 +858,7 @@ impl CheckpointStore {
             quarantine_keep_failed: 0,
             quarantine_removals: 0,
             faults,
+            pending_wal_append: None,
             unusable: None,
             recovery,
         })
@@ -1037,6 +1152,7 @@ impl CheckpointStore {
             quarantine_keep_failed: 0,
             quarantine_removals: 0,
             faults,
+            pending_wal_append: None,
             unusable: None,
             recovery,
         }))
@@ -1434,6 +1550,36 @@ impl CheckpointStore {
         read_mode: fsio::ArtifactReadMode,
         cancelled: &mut impl FnMut() -> bool,
     ) -> Result<Option<LoadedGeneration>, StoreError> {
+        Self::load_generation_inspecting_append(
+            dir,
+            generation,
+            namespace_id,
+            limits,
+            max_tracked_files,
+            fingerprint_bytes,
+            read_mode,
+            None,
+            cancelled,
+        )
+        .map(|loaded| {
+            loaded.map(|(loaded, observation)| {
+                debug_assert!(observation.is_none());
+                loaded
+            })
+        })
+    }
+
+    fn load_generation_inspecting_append(
+        dir: &Path,
+        generation: u64,
+        namespace_id: &str,
+        limits: &StoreLimits,
+        max_tracked_files: u32,
+        fingerprint_bytes: u64,
+        read_mode: fsio::ArtifactReadMode,
+        append_boundary: Option<u64>,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<Option<(LoadedGeneration, Option<WalAppendObservation>)>, StoreError> {
         let snapshot_path = dir.join(snapshot_file_name(generation));
         let wal_path = dir.join(wal_file_name(generation));
 
@@ -1543,6 +1689,16 @@ impl CheckpointStore {
             });
         }
 
+        let append_boundary = append_boundary
+            .map(|boundary| {
+                usize::try_from(boundary).map_err(|_| StoreError::WalAppendRecoveryMismatch {
+                    path: wal_path.clone(),
+                    boundary,
+                    reason: "the known boundary does not fit this platform's address space",
+                })
+            })
+            .transpose()?;
+        let mut append_observation = None;
         let mut cursor = WAL_HEADER_LEN;
         let mut expected_sequence = 1u64;
         let mut transactions_replayed = 0usize;
@@ -1550,6 +1706,21 @@ impl CheckpointStore {
         while cursor < wal_bytes.len() {
             if cancelled() {
                 return Ok(None);
+            }
+            let at_append_boundary = append_boundary == Some(cursor);
+            if append_observation.is_some() {
+                return Err(StoreError::WalAppendRecoveryMismatch {
+                    path: wal_path.clone(),
+                    boundary: append_boundary.unwrap_or(cursor) as u64,
+                    reason: "bytes follow the one transaction being reconciled",
+                });
+            }
+            if append_boundary.is_some_and(|boundary| cursor > boundary) {
+                return Err(StoreError::WalAppendRecoveryMismatch {
+                    path: wal_path.clone(),
+                    boundary: append_boundary.unwrap_or(cursor) as u64,
+                    reason: "the known boundary falls inside a recovered transaction",
+                });
             }
             let remaining = &wal_bytes[cursor..];
             Self::validate_declared_transaction_size(remaining, &wal_path, limits)?;
@@ -1561,6 +1732,9 @@ impl CheckpointStore {
                 }
             })? {
                 TransactionScan::TornTail(bytes) => {
+                    if at_append_boundary {
+                        append_observation = Some(WalAppendObservation::Torn { bytes });
+                    }
                     torn_tail_bytes = bytes;
                     break;
                 }
@@ -1642,7 +1816,26 @@ impl CheckpointStore {
                             value: u64::try_from(transactions_replayed).unwrap_or(u64::MAX),
                         },
                     )?;
+                    if at_append_boundary {
+                        append_observation = Some(WalAppendObservation::Complete {
+                            transaction,
+                            bytes: consumed,
+                        });
+                    }
                 }
+            }
+        }
+        if let Some(boundary) = append_boundary
+            && append_observation.is_none()
+        {
+            if cursor == boundary && cursor == wal_bytes.len() {
+                append_observation = Some(WalAppendObservation::NoWrite);
+            } else {
+                return Err(StoreError::WalAppendRecoveryMismatch {
+                    path: wal_path.clone(),
+                    boundary: boundary as u64,
+                    reason: "the known boundary was not a complete recovered transaction boundary",
+                });
             }
         }
         let wal_valid_len = u64::try_from(cursor)
@@ -1651,14 +1844,17 @@ impl CheckpointStore {
         if cancelled() {
             return Ok(None);
         }
-        Ok(Some(LoadedGeneration {
-            table,
-            snapshot_records,
-            transactions_replayed,
-            torn_tail_bytes,
-            wal_valid_len,
-            next_sequence: expected_sequence,
-        }))
+        Ok(Some((
+            LoadedGeneration {
+                table,
+                snapshot_records,
+                transactions_replayed,
+                torn_tail_bytes,
+                wal_valid_len,
+                next_sequence: expected_sequence,
+            },
+            append_observation,
+        )))
     }
 
     /// Loads one generation through the ordinary bounded decoder without
@@ -2023,7 +2219,7 @@ impl CheckpointStore {
     /// untouched; compacting frees the whole budget and the same
     /// transaction then fits.
     pub fn append(&mut self, operations: Vec<Operation>) -> Result<AppendOutcome, StoreError> {
-        self.ensure_usable("append a checkpoint transaction")?;
+        self.ensure_not_unusable("append a checkpoint transaction")?;
         if operations.is_empty() {
             return Err(StoreError::EmptyTransaction);
         }
@@ -2108,7 +2304,14 @@ impl CheckpointStore {
                 source,
             })?;
         let started = Instant::now();
-        let result = self.write_transaction(&bytes, policy, transaction.sequence, operation_count);
+        let result = self.write_transaction(
+            &transaction,
+            &staged,
+            &bytes,
+            policy,
+            transaction.sequence,
+            operation_count,
+        );
         self.persist_duration_ns = self
             .persist_duration_ns
             .saturating_add(duration_nanos(started.elapsed()));
@@ -2148,7 +2351,7 @@ impl CheckpointStore {
         &mut self,
         operations: Vec<Operation>,
     ) -> Result<Vec<AppendOutcome>, StoreError> {
-        self.ensure_usable("append batched checkpoint transactions")?;
+        self.ensure_not_unusable("append batched checkpoint transactions")?;
         if operations.is_empty() {
             return Err(StoreError::EmptyTransaction);
         }
@@ -2196,7 +2399,17 @@ impl CheckpointStore {
         groups: Vec<Vec<Operation>>,
         mut cancelled: impl FnMut() -> bool,
     ) -> Result<AtomicGroupAppendOutcome, StoreError> {
-        self.ensure_usable("append grouped checkpoint transactions")?;
+        let mut plan = self.prepare_atomic_group_append(groups)?;
+        self.append_atomic_group_plan_cancellable(&mut plan, &mut cancelled)
+    }
+
+    /// Preflights and retains one bounded grouped-append plan for exact
+    /// filesystem-failure retries.
+    pub(crate) fn prepare_atomic_group_append(
+        &self,
+        groups: Vec<Vec<Operation>>,
+    ) -> Result<AtomicGroupAppendPlan, StoreError> {
+        self.ensure_not_unusable("append grouped checkpoint transactions")?;
         let (operations, transaction_lengths) = pack_atomic_groups(groups)?;
         let mut offset = 0usize;
         let transaction_slices = transaction_lengths.iter().map(|length| {
@@ -2205,17 +2418,44 @@ impl CheckpointStore {
             &operations[start..offset]
         });
         self.preflight_transactions(&operations, transaction_slices)?;
+        Ok(AtomicGroupAppendPlan {
+            operations,
+            transaction_lengths,
+            next_transaction: 0,
+            next_operation: 0,
+        })
+    }
 
-        let mut outcomes = Vec::with_capacity(transaction_lengths.len());
-        let mut operations = operations.into_iter();
-        for length in transaction_lengths {
-            let transaction: Vec<Operation> = operations.by_ref().take(length).collect();
+    /// Appends the remaining transactions in a preflighted grouped plan.
+    pub(crate) fn append_atomic_group_plan_cancellable(
+        &mut self,
+        plan: &mut AtomicGroupAppendPlan,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<AtomicGroupAppendOutcome, StoreError> {
+        self.ensure_not_unusable("resume grouped checkpoint transactions")?;
+        let mut outcomes = Vec::with_capacity(
+            plan.transaction_lengths
+                .len()
+                .saturating_sub(plan.next_transaction),
+        );
+        while plan.next_transaction < plan.transaction_lengths.len() {
             if cancelled() {
                 return Ok(AtomicGroupAppendOutcome::Cancelled {
                     completed: outcomes,
                 });
             }
+            let length = plan.transaction_lengths[plan.next_transaction];
+            let end =
+                plan.next_operation
+                    .checked_add(length)
+                    .ok_or(StoreError::CounterOverflow {
+                        counter: "grouped checkpoint operation cursor",
+                        value: u64::try_from(plan.next_operation).unwrap_or(u64::MAX),
+                    })?;
+            let transaction = plan.operations[plan.next_operation..end].to_vec();
             outcomes.push(self.append(transaction)?);
+            plan.next_transaction += 1;
+            plan.next_operation = end;
         }
         Ok(AtomicGroupAppendOutcome::Completed(outcomes))
     }
@@ -2370,13 +2610,14 @@ impl CheckpointStore {
         retention: Duration,
         removal_reason: u16,
     ) -> Result<usize, StoreError> {
-        self.ensure_usable("remove expired checkpoint records")?;
+        self.ensure_not_unusable("remove expired checkpoint records")?;
         // Checked before the table is scanned as well as inside `append`,
         // so a reserved reason code is refused even when retention selects
         // nothing and no transaction would be built at all.
         reject_reserved_reason_code("remove_file.removal_reason", removal_reason)?;
         let candidates = self.retention_candidates(eligible_absent, now_unix_nano, retention);
         if candidates.is_empty() {
+            self.ensure_usable("remove expired checkpoint records")?;
             return Ok(0);
         }
         let mut removals = Vec::with_capacity(candidates.len());
@@ -2397,6 +2638,7 @@ impl CheckpointStore {
         }
         let removed = removals.len();
         if removed == 0 {
+            self.ensure_usable("remove expired checkpoint records")?;
             return Ok(0);
         }
         let _outcomes = self.append_batched(removals)?;
@@ -2416,7 +2658,7 @@ impl CheckpointStore {
         removal_time_unix_nano: u64,
         audit_reason: String,
     ) -> Result<Option<AppendOutcome>, StoreError> {
-        self.ensure_usable("remove a quarantined checkpoint record")?;
+        self.ensure_not_unusable("remove a quarantined checkpoint record")?;
         if audit_reason.is_empty() {
             return Err(StoreError::AuditReasonRequired {
                 operation: "remove_quarantined_file",
@@ -2427,6 +2669,7 @@ impl CheckpointStore {
         // the idempotent "already absent" no-op below.
         reject_reserved_reason_code("remove_file.removal_reason", removal_reason)?;
         let Some(record) = self.table.get(&file_id) else {
+            self.ensure_usable("remove a quarantined checkpoint record")?;
             return Ok(None);
         };
         if record.lifecycle_state != LifecycleState::Quarantined {
@@ -2793,6 +3036,18 @@ impl CheckpointStore {
     }
 
     pub(super) fn ensure_usable(&self, operation: &'static str) -> Result<(), StoreError> {
+        self.ensure_not_unusable(operation)?;
+        if let Some(pending) = self.pending_wal_append {
+            return Err(StoreError::PendingWalAppend {
+                path: self.wal_path.clone(),
+                operation,
+                sequence: pending.sequence,
+            });
+        }
+        Ok(())
+    }
+
+    pub(super) fn ensure_not_unusable(&self, operation: &'static str) -> Result<(), StoreError> {
         match self.unusable {
             Some(reason) => Err(StoreError::Unusable {
                 dir: self.namespace_dir.clone(),
@@ -2805,6 +3060,11 @@ impl CheckpointStore {
 
     pub(super) fn mark_unusable(&mut self, reason: &'static str) {
         self.unusable = Some(reason);
+    }
+
+    #[must_use]
+    pub(crate) const fn has_pending_wal_append(&self) -> bool {
+        self.pending_wal_append.is_some()
     }
 
     pub(super) fn admin_lock(&self) -> &NamespaceLock {
@@ -3093,31 +3353,45 @@ impl CheckpointStore {
 
     fn write_transaction(
         &mut self,
+        transaction: &Transaction,
+        staged: &StagedOperations,
         bytes: &[u8],
         policy: SyncPolicy,
         sequence: u64,
         operation_count: usize,
     ) -> Result<AppendOutcome, StoreError> {
-        if let Err(error) = self.faults.check(FaultPoint::BeforeWalTransactionWrite) {
-            self.unusable =
-                Some("a fault was injected before writing a prevalidated WAL transaction");
-            return Err(error);
+        let mut pending = PendingWalAppend::new(self, bytes, policy, sequence, operation_count)?;
+        if let Some(expected) = self.pending_wal_append {
+            if !expected.matches(pending) {
+                return Err(StoreError::PendingWalAppendMismatch {
+                    path: self.wal_path.clone(),
+                    expected_sequence: expected.sequence,
+                    expected_bytes: expected.transaction_bytes,
+                    found_sequence: pending.sequence,
+                    found_bytes: pending.transaction_bytes,
+                });
+            }
+            match self.reconcile_pending_append(transaction, staged, expected)? {
+                PendingAppendResolution::RetryWrite => {}
+                PendingAppendResolution::Complete(outcome) => return Ok(outcome),
+            }
         }
+        self.faults.check(FaultPoint::BeforeWalTransactionWrite)?;
         if let Err(error) = self.faults.check(FaultPoint::DuringWalTransactionWrite) {
             let prefix_len = (bytes.len() / 2).max(1);
-            if let Err(source) = self.wal.write_all(&bytes[..prefix_len]) {
-                self.unusable = Some("a partial WAL transaction write failed");
-                return Err(StoreError::Io {
+            let result = self.wal.write_all(&bytes[..prefix_len]);
+            self.pending_wal_append = Some(pending);
+            return match result {
+                Ok(()) => Err(error),
+                Err(source) => Err(StoreError::Io {
                     operation: "write a partial checkpoint WAL transaction",
                     path: self.wal_path.clone(),
                     source,
-                });
-            }
-            self.unusable = Some("a fault left a partial WAL transaction");
-            return Err(error);
+                }),
+            };
         }
         if let Err(source) = self.wal.write_all(bytes) {
-            self.unusable = Some("a WAL transaction write failed with uncertain partial output");
+            self.pending_wal_append = Some(pending);
             return Err(StoreError::Io {
                 operation: "append a transaction to the checkpoint WAL",
                 path: self.wal_path.clone(),
@@ -3125,57 +3399,16 @@ impl CheckpointStore {
             });
         }
         if let Err(error) = self.faults.check(FaultPoint::AfterWalTransactionWrite) {
-            self.unusable =
-                Some("a fault followed a WAL transaction write with uncertain durability");
+            self.pending_wal_append = Some(pending);
             return Err(error);
         }
-        let len = bytes.len() as u64;
-        let Some(wal_bytes) = self.wal_bytes.checked_add(len) else {
-            self.unusable = Some("WAL byte accounting overflowed after a transaction was written");
-            return Err(StoreError::AccountingOverflow {
-                bytes: self.wal_bytes,
-            });
-        };
-        let Some(next_sequence) = sequence.checked_add(1) else {
-            self.unusable = Some("the WAL sequence overflowed after a transaction was written");
-            return Err(StoreError::SequenceOverflow { sequence });
-        };
-        let Some(wal_transactions) = self.wal_transactions.checked_add(1) else {
-            self.unusable = Some("the WAL transaction counter overflowed");
-            return Err(StoreError::CounterOverflow {
-                counter: "WAL transactions",
-                value: self.wal_transactions,
-            });
-        };
-        let Some(unsynced_transactions) = self.unsynced_transactions.checked_add(1) else {
-            self.unusable = Some("the unsynced transaction counter overflowed");
-            return Err(StoreError::CounterOverflow {
-                counter: "unsynced WAL transactions",
-                value: self.unsynced_transactions,
-            });
-        };
-        let wal_bytes_before = self.wal_bytes;
-        let wal_transactions_before = self.wal_transactions;
-        let unsynced_transactions_before = self.unsynced_transactions;
-        let next_sequence_before = self.next_sequence;
-        self.wal_bytes = wal_bytes;
-        self.next_sequence = next_sequence;
-        self.wal_transactions = wal_transactions;
-        self.unsynced_transactions = unsynced_transactions;
+        self.install_pending_append_accounting(pending);
 
         let synced = if self.should_sync(policy) {
-            if let Err(error) = self.sync_wal() {
-                if self.wal.set_len(wal_bytes_before).is_ok() && self.wal.sync_data().is_ok() {
-                    self.wal_bytes = wal_bytes_before;
-                    self.wal_transactions = wal_transactions_before;
-                    self.unsynced_transactions = unsynced_transactions_before;
-                    self.next_sequence = next_sequence_before;
-                    self.unusable =
-                        Some("a failed WAL sync was rolled back to the prior durable boundary");
-                } else {
-                    self.unusable =
-                        Some("a failed WAL sync could not be rolled back to a durable boundary");
-                }
+            if let Err(error) = self.sync_wal_for_pending_append() {
+                self.restore_pending_append_accounting(pending);
+                pending.requires_sync = true;
+                self.pending_wal_append = Some(pending);
                 return Err(error);
             }
             true
@@ -3185,15 +3418,228 @@ impl CheckpointStore {
         Ok(AppendOutcome {
             sequence,
             operations: operation_count,
-            bytes: len,
+            bytes: pending.transaction_bytes,
             synced,
             compaction_due: self.compaction_due(),
         })
     }
 
+    fn reconcile_pending_append(
+        &mut self,
+        transaction: &Transaction,
+        staged: &StagedOperations,
+        mut pending: PendingWalAppend,
+    ) -> Result<PendingAppendResolution, StoreError> {
+        fsio::verify_checkpoint_file_path_binding(
+            &self.wal,
+            &self.wal_path,
+            "verify the checkpoint WAL before append reconciliation",
+        )?;
+        let Some((loaded, observation)) = Self::load_generation_inspecting_append(
+            &self.namespace_dir,
+            self.generation,
+            &self.namespace_id,
+            &self.limits,
+            self.max_tracked_files,
+            self.fingerprint_bytes,
+            fsio::ArtifactReadMode::RepairPermissions,
+            Some(pending.boundary),
+            &mut || false,
+        )?
+        else {
+            unreachable!("non-cancellable WAL append reconciliation cannot be cancelled")
+        };
+        fsio::verify_checkpoint_file_path_binding(
+            &self.wal,
+            &self.wal_path,
+            "verify the checkpoint WAL after append reconciliation",
+        )?;
+        let observation = observation.expect("append reconciliation requested an observation");
+        let replayed = u64::try_from(loaded.transactions_replayed).map_err(|_| {
+            StoreError::WalAppendRecoveryMismatch {
+                path: self.wal_path.clone(),
+                boundary: pending.boundary,
+                reason: "the recovered transaction count does not fit u64",
+            }
+        })?;
+
+        let prefix_matches = loaded.wal_valid_len == pending.boundary
+            && replayed == pending.wal_transactions_before
+            && loaded.next_sequence == pending.sequence
+            && loaded.table == self.table;
+        let resolution = match observation {
+            WalAppendObservation::NoWrite => {
+                if loaded.torn_tail_bytes != 0 || !prefix_matches {
+                    return Err(self.wal_append_recovery_mismatch(
+                        pending,
+                        "a no-write result did not reproduce the exact known prefix",
+                    ));
+                }
+                if pending.repair_sync_required {
+                    self.sync_torn_append_repair(pending)?;
+                }
+                PendingAppendResolution::RetryWrite
+            }
+            WalAppendObservation::Torn { bytes } => {
+                if bytes == 0 || loaded.torn_tail_bytes != bytes || !prefix_matches {
+                    return Err(self.wal_append_recovery_mismatch(
+                        pending,
+                        "a torn append did not begin at the exact known prefix",
+                    ));
+                }
+                pending.repair_sync_required = true;
+                self.pending_wal_append = Some(pending);
+                self.sync_torn_append_repair(pending)?;
+                PendingAppendResolution::RetryWrite
+            }
+            WalAppendObservation::Complete {
+                transaction: recovered,
+                bytes,
+            } => {
+                let bytes = u64::try_from(bytes).map_err(|_| {
+                    self.wal_append_recovery_mismatch(
+                        pending,
+                        "the recovered transaction length does not fit u64",
+                    )
+                })?;
+                if &recovered != transaction
+                    || bytes != pending.transaction_bytes
+                    || loaded.torn_tail_bytes != 0
+                    || loaded.wal_valid_len != pending.wal_bytes_after
+                    || replayed != pending.wal_transactions_after
+                    || loaded.next_sequence != pending.next_sequence_after
+                    || !loaded.table.matches_staged_commit(&self.table, staged)
+                {
+                    return Err(self.wal_append_recovery_mismatch(
+                        pending,
+                        "the complete suffix is not exactly the pending transaction",
+                    ));
+                }
+                self.reopen_validated_wal()?;
+                self.install_pending_append_accounting(pending);
+                let synced = if pending.requires_sync || self.should_sync(pending.policy) {
+                    if let Err(error) = self.sync_wal_for_pending_append() {
+                        self.restore_pending_append_accounting(pending);
+                        let mut pending = pending;
+                        pending.requires_sync = true;
+                        self.pending_wal_append = Some(pending);
+                        return Err(error);
+                    }
+                    true
+                } else {
+                    false
+                };
+                self.pending_wal_append = None;
+                return Ok(PendingAppendResolution::Complete(AppendOutcome {
+                    sequence: pending.sequence,
+                    operations: pending.operation_count,
+                    bytes: pending.transaction_bytes,
+                    synced,
+                    compaction_due: self.compaction_due(),
+                }));
+            }
+        };
+
+        self.reopen_validated_wal()?;
+        self.pending_wal_append = None;
+        Ok(resolution)
+    }
+
+    fn sync_torn_append_repair(&mut self, pending: PendingWalAppend) -> Result<(), StoreError> {
+        fsio::verify_checkpoint_file_path_binding(
+            &self.wal,
+            &self.wal_path,
+            "verify the checkpoint WAL before torn-append repair",
+        )?;
+        self.faults.check(FaultPoint::BeforeTornTailTruncate)?;
+        let repair = fsio::open_for_wal_repair_cancellable(&self.wal_path, &mut || false)?
+            .expect("non-cancellable WAL repair open cannot be cancelled");
+        fsio::verify_same_checkpoint_file(
+            &self.wal,
+            &repair,
+            &self.wal_path,
+            "verify the checkpoint WAL repair handle",
+        )?;
+        repair
+            .set_len(pending.boundary)
+            .map_err(|source| StoreError::Io {
+                operation: "truncate a torn checkpoint WAL append",
+                path: self.wal_path.clone(),
+                source,
+            })?;
+        repair.sync_all().map_err(|source| StoreError::Io {
+            operation: "sync a truncated checkpoint WAL append",
+            path: self.wal_path.clone(),
+            source,
+        })?;
+        self.faults.check(FaultPoint::AfterTornTailTruncate)?;
+        fsio::verify_checkpoint_file_path_binding(
+            &self.wal,
+            &self.wal_path,
+            "verify the checkpoint WAL after torn-append repair",
+        )
+    }
+
+    fn reopen_validated_wal(&mut self) -> Result<(), StoreError> {
+        fsio::verify_checkpoint_file_path_binding(
+            &self.wal,
+            &self.wal_path,
+            "verify the checkpoint WAL before reopening it",
+        )?;
+        let wal = fsio::open_for_append_cancellable(&self.wal_path, &mut || false)?
+            .expect("non-cancellable WAL append reopen cannot be cancelled");
+        fsio::verify_same_checkpoint_file(
+            &self.wal,
+            &wal,
+            &self.wal_path,
+            "verify the reopened checkpoint WAL identity",
+        )?;
+        fsio::verify_checkpoint_file_path_binding(
+            &wal,
+            &self.wal_path,
+            "verify the reopened checkpoint WAL path",
+        )?;
+        self.wal = wal;
+        Ok(())
+    }
+
+    fn install_pending_append_accounting(&mut self, pending: PendingWalAppend) {
+        self.wal_bytes = pending.wal_bytes_after;
+        self.wal_transactions = pending.wal_transactions_after;
+        self.unsynced_transactions = pending.unsynced_transactions_after;
+        self.next_sequence = pending.next_sequence_after;
+    }
+
+    fn restore_pending_append_accounting(&mut self, pending: PendingWalAppend) {
+        self.wal_bytes = pending.boundary;
+        self.wal_transactions = pending.wal_transactions_before;
+        self.unsynced_transactions = pending.unsynced_transactions_before;
+        self.next_sequence = pending.sequence;
+    }
+
+    fn wal_append_recovery_mismatch(
+        &self,
+        pending: PendingWalAppend,
+        reason: &'static str,
+    ) -> StoreError {
+        StoreError::WalAppendRecoveryMismatch {
+            path: self.wal_path.clone(),
+            boundary: pending.boundary,
+            reason,
+        }
+    }
+
     fn sync_wal(&mut self) -> Result<(), StoreError> {
+        self.sync_wal_with_failure_mode(true)
+    }
+
+    fn sync_wal_for_pending_append(&mut self) -> Result<(), StoreError> {
+        self.sync_wal_with_failure_mode(false)
+    }
+
+    fn sync_wal_with_failure_mode(&mut self, mark_unusable: bool) -> Result<(), StoreError> {
         let started = Instant::now();
-        let result = self.sync_wal_inner();
+        let result = self.sync_wal_inner(mark_unusable);
         self.sync_duration_ns = self
             .sync_duration_ns
             .saturating_add(duration_nanos(started.elapsed()));
@@ -3201,7 +3647,7 @@ impl CheckpointStore {
         result
     }
 
-    fn sync_wal_inner(&mut self) -> Result<(), StoreError> {
+    fn sync_wal_inner(&mut self, mark_unusable: bool) -> Result<(), StoreError> {
         let Some(syncs) = self.syncs.checked_add(1) else {
             return Err(StoreError::CounterOverflow {
                 counter: "WAL syncs",
@@ -3209,14 +3655,20 @@ impl CheckpointStore {
             });
         };
         if let Err(error) = self.faults.check(FaultPoint::BeforeWalSync) {
-            self.unusable = Some("a fault was injected before syncing appended WAL transactions");
+            if mark_unusable {
+                self.unusable =
+                    Some("a fault was injected before syncing appended WAL transactions");
+            }
             return Err(error);
         }
         // `sync_data` is sufficient and cheaper than `sync_all` here: POSIX
         // requires it to persist the metadata needed to read the data back,
         // which for an append-only file includes the new length.
         if let Err(source) = self.wal.sync_data() {
-            self.unusable = Some("a WAL sync failed, so acknowledged progress may not be durable");
+            if mark_unusable {
+                self.unusable =
+                    Some("a WAL sync failed, so acknowledged progress may not be durable");
+            }
             return Err(StoreError::Io {
                 operation: "sync the checkpoint WAL",
                 path: self.wal_path.clone(),
@@ -3224,8 +3676,10 @@ impl CheckpointStore {
             });
         }
         if let Err(error) = self.faults.check(FaultPoint::AfterWalSync) {
-            self.unusable =
-                Some("a fault followed WAL sync, so the caller cannot rely on its outcome");
+            if mark_unusable {
+                self.unusable =
+                    Some("a fault followed WAL sync, so the caller cannot rely on its outcome");
+            }
             return Err(error);
         }
         self.unsynced_transactions = 0;
@@ -3246,6 +3700,18 @@ struct Selection {
     created: bool,
     adopted_without_marker: bool,
     marker_temp_authoritative: bool,
+}
+
+#[derive(Debug)]
+enum WalAppendObservation {
+    NoWrite,
+    Torn {
+        bytes: usize,
+    },
+    Complete {
+        transaction: Transaction,
+        bytes: usize,
+    },
 }
 
 /// One validated generation, recovered into memory.

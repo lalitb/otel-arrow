@@ -1235,8 +1235,8 @@ fn keep_failed_preserves_all_record_state_after_reopen() {
 /// WAL tail, repairs it while becoming writable, and then hits a no-write
 /// injected failure on the requested audit transaction.
 /// Guarantees: the live inspection is refreshed immediately after repair,
-/// the failed append cannot expose a stale backup from the unusable session,
-/// and reopening describes and copies the repaired authority.
+/// the definitive no-write leaves the session usable, and its next backup
+/// describes and copies the repaired authority without a reopen.
 #[test]
 fn writable_transition_refreshes_repaired_torn_tail_before_append_failure() {
     let root = tempfile::tempdir().unwrap();
@@ -1274,18 +1274,62 @@ fn writable_transition_refreshes_repaired_torn_tail_before_append_failure() {
     assert_eq!(fs::metadata(&wal_path).unwrap().len(), valid_len);
 
     let backup = root.path().join("repaired-evidence");
-    assert!(matches!(
-        session.backup(&backup),
-        Err(CheckpointAdminError::Store(StoreError::Unusable { .. }))
-    ));
-    session.release().unwrap();
-
-    let reopened = CheckpointAdminSession::open(store_options).unwrap();
-    let manifest = reopened.backup(&backup).unwrap();
+    let manifest = session.backup(&backup).unwrap();
     assert_eq!(valid_backup_validation(&manifest).torn_wal_tail_bytes, 0);
     assert_eq!(
         fs::read(backup.join(wal_file_name(0))).unwrap(),
         fs::read(&wal_path).unwrap()
+    );
+    session.release().unwrap();
+}
+
+/// Scenario: an audited keep-failed transaction is completely appended but
+/// its first call observes an uncertain write result.
+/// Guarantees: the same administration session can retry the exact request,
+/// reconcile one transaction, and refresh authority without a duplicate
+/// audit append.
+#[test]
+fn keep_failed_retries_an_exact_pending_append() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.log");
+    fs::write(&source, b"blocked\n").unwrap();
+    let store_options = options(&root.path().join("state"), "keep-failed-retry");
+    let old = seed_quarantined_source(
+        &store_options,
+        &source,
+        23,
+        0,
+        FramingResume::Clean,
+        AdvisoryPath::unavailable(),
+    );
+
+    let mut session = CheckpointAdminSession::open_with_fault(
+        store_options.clone(),
+        FaultPoint::AfterWalTransactionWrite,
+    )
+    .unwrap();
+    let transactions_before = session.validation().wal_transaction_count;
+    assert!(matches!(
+        session.keep_failed(keep_request(23, 1, "retain after retry")),
+        Err(CheckpointAdminError::Store(StoreError::InjectedFault {
+            point: FaultPoint::AfterWalTransactionWrite,
+        }))
+    ));
+    let result = session
+        .keep_failed(keep_request(23, 1, "retain after retry"))
+        .unwrap();
+    assert_eq!(result.action, QuarantineMutationAction::KeepFailed);
+    assert_eq!(
+        session.validation().wal_transaction_count,
+        transactions_before + 1
+    );
+    session.release().unwrap();
+
+    let reopened = CheckpointStore::open(store_options).unwrap();
+    assert_eq!(reopened.table().get(&FileId([23; 16])), Some(&old));
+    assert_eq!(
+        reopened.recovery().transactions_replayed,
+        usize::try_from(transactions_before + 1).unwrap()
     );
 }
 

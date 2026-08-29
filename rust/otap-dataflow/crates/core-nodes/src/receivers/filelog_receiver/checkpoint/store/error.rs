@@ -471,6 +471,54 @@ pub enum StoreError {
         /// The reserved value.
         reason_code: u16,
     },
+    /// An uncertain WAL append is awaiting an exact retry and no unrelated
+    /// store operation may proceed until it is reconciled.
+    #[error(
+        "checkpoint WAL at {path} is reconciling transaction {sequence}; \
+         refusing to {operation} until that exact append is retried"
+    )]
+    PendingWalAppend {
+        /// The WAL whose final append has an uncertain result.
+        path: PathBuf,
+        /// The unrelated operation that was refused.
+        operation: &'static str,
+        /// Sequence of the transaction that must be retried.
+        sequence: u64,
+    },
+    /// A caller retried a different transaction while an uncertain append
+    /// still owns the next WAL sequence.
+    #[error(
+        "checkpoint WAL at {path} requires an exact retry of transaction {expected_sequence} \
+         ({expected_bytes} bytes), but received transaction {found_sequence} \
+         ({found_bytes} bytes)"
+    )]
+    PendingWalAppendMismatch {
+        /// The WAL whose append is awaiting reconciliation.
+        path: PathBuf,
+        /// Sequence retained by the failed append.
+        expected_sequence: u64,
+        /// Encoded length retained by the failed append.
+        expected_bytes: u64,
+        /// Sequence supplied by the new append request.
+        found_sequence: u64,
+        /// Encoded length supplied by the new append request.
+        found_bytes: u64,
+    },
+    /// Reopening a WAL after an uncertain append did not reproduce the exact
+    /// known prefix plus either no transaction, one torn attempt, or the
+    /// expected complete transaction.
+    #[error(
+        "checkpoint WAL append reconciliation at {path} disagreed with the known valid \
+         boundary {boundary}: {reason}"
+    )]
+    WalAppendRecoveryMismatch {
+        /// The WAL being reconciled.
+        path: PathBuf,
+        /// Byte offset immediately after the previously validated prefix.
+        boundary: u64,
+        /// Which exact recovery invariant failed.
+        reason: &'static str,
+    },
     /// A test armed a fault point and execution reached it. Production code
     /// has no way to arm a fault point (see [`super::fault::FaultPlan`]), so
     /// this variant is unreachable outside this crate's own tests.

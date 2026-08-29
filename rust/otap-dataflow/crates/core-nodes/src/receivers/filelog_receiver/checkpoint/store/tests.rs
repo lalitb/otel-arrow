@@ -34,7 +34,7 @@ use super::super::wal::{
     ResetQuarantinedFile, Transaction, UpdateProgress, WAL_HEADER_LEN, encode_wal,
 };
 use super::error::StoreError;
-use super::fault::FaultPoint;
+use super::fault::{FaultPlan, FaultPoint};
 use super::layout::{
     CURRENT_BACKUP_FILE_NAME, CURRENT_FILE_NAME, CURRENT_TEMP_FILE_NAME, MAX_GENERATIONS_ON_DISK,
     MAX_TEMP_FILES, OWNERSHIP_LOCK_FILE_NAME, backup_file_name, snapshot_file_name, temp_file_name,
@@ -533,6 +533,65 @@ fn atomic_group_boundary_survives_every_wal_fault() {
             );
         }
     }
+}
+
+/// Scenario: a preflighted grouped plan commits its first full transaction,
+/// then the second transaction has an ambiguous complete-write result.
+/// Guarantees: the retained plan cursor retries that exact second
+/// transaction instead of rebuilding or duplicating the committed prefix.
+#[test]
+fn atomic_group_plan_resumes_the_exact_failed_transaction() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    let count = usize::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX) + 1;
+    let store_options = StoreOptions {
+        max_tracked_files: count as u32,
+        ..options(&path)
+    };
+    drop(CheckpointStore::open(store_options.clone()).expect("namespace initializes"));
+    let groups: Vec<Vec<Operation>> = distinct_registrations(count)
+        .into_iter()
+        .map(|registration| vec![Operation::RegisterFile(registration)])
+        .collect();
+    let mut store = CheckpointStore::open_with_fault_after(
+        store_options.clone(),
+        FaultPoint::AfterWalTransactionWrite,
+        1,
+    )
+    .expect("namespace opens");
+    let mut plan = store
+        .prepare_atomic_group_append(groups)
+        .expect("the complete grouped plan preflights");
+
+    assert!(matches!(
+        store
+            .append_atomic_group_plan_cancellable(&mut plan, || false)
+            .expect_err("the second transaction result is uncertain"),
+        StoreError::InjectedFault {
+            point: FaultPoint::AfterWalTransactionWrite
+        }
+    ));
+    assert_eq!(plan.next_transaction, 1);
+    assert_eq!(
+        store.table().len(),
+        usize::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX)
+    );
+    let outcome = store
+        .append_atomic_group_plan_cancellable(&mut plan, || false)
+        .expect("the retained exact transaction retries");
+    assert!(matches!(
+        outcome,
+        AtomicGroupAppendOutcome::Completed(ref outcomes)
+            if outcomes.len() == 1 && outcomes[0].sequence == 2
+    ));
+    assert_eq!(plan.next_transaction, 2);
+    assert_eq!(store.table().len(), count);
+    assert_eq!(store.stats().wal_transactions, 2);
+    drop(store);
+
+    let reopened = CheckpointStore::open(store_options).expect("complete plan reopens");
+    assert_eq!(reopened.table().len(), count);
+    assert_eq!(reopened.recovery().transactions_replayed, 2);
 }
 
 /// Scenario: one Ack delta set exceeds the format's operation maximum, and
@@ -1271,9 +1330,9 @@ fn registrations_batch_into_bounded_synced_transactions() {
 
 /// Scenario: a filesystem failure occurs before writing the second WAL
 /// transaction of a two-chunk registration batch.
-/// Guarantees: the first chunk remains durable, the divergent live handle
-/// becomes unusable, reopen exposes exactly the durable prefix, and retrying
-/// the absent suffix completes the logical batch without duplication.
+/// Guarantees: the first chunk remains durable, the definitive no-write
+/// leaves the live handle usable, and retrying the absent suffix completes
+/// the logical batch without duplication.
 #[test]
 fn filesystem_failure_between_batch_chunks_recovers_a_retryable_prefix() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1301,27 +1360,21 @@ fn filesystem_failure_between_batch_chunks_recovers_a_retryable_prefix() {
             point: FaultPoint::BeforeWalTransactionWrite
         }
     ));
-    assert!(matches!(
-        store.sync().expect_err("the divergent handle is unusable"),
-        StoreError::Unusable { .. }
-    ));
-    drop(store);
-
-    let mut reopened =
-        CheckpointStore::open(store_options.clone()).expect("durable prefix reopens");
+    store
+        .sync()
+        .expect("the completed first chunk remains syncable");
     assert_eq!(
-        reopened.table().len(),
+        store.table().len(),
         usize::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX)
     );
-    assert_eq!(reopened.recovery().transactions_replayed, 1);
-    assert!(reopened.table().get(&retry.file_id).is_none());
+    assert!(store.table().get(&retry.file_id).is_none());
 
-    let outcomes = reopened
+    let outcomes = store
         .register_files(vec![retry.clone()])
         .expect("the absent suffix retries");
     assert_eq!(outcomes[0].sequence, 2);
-    assert_eq!(reopened.table().len(), count);
-    drop(reopened);
+    assert_eq!(store.table().len(), count);
+    drop(store);
 
     let complete = CheckpointStore::open(store_options).expect("completed batch reopens");
     assert_eq!(complete.table().len(), count);
@@ -1817,18 +1870,20 @@ fn torn_final_wal_transaction_is_discarded_and_truncated() {
     assert_eq!(committed_offset(&reopened, 1), 8_192);
 }
 
-/// Scenario: each ordinary WAL write and sync boundary fails in turn while
-/// an immediately durable registration is being appended.
-/// Guarantees: every injected failure makes the live handle unusable; a
-/// reopen recovers the old state before/no-partial-write boundaries and the
-/// complete new state after complete-write boundaries, repairing the one
-/// intentionally torn tail without exposing a partial transaction.
+/// Scenario: each ordinary WAL write and sync boundary fails once while an
+/// immediately durable registration is appended, then the exact transaction
+/// is retried.
+/// Guarantees: no-write retries append once, partial writes are repaired,
+/// complete writes are never appended again, required sync is retried, and
+/// the transaction is applied exactly once.
 #[test]
-fn wal_append_faults_recover_only_complete_transactions() {
+fn wal_append_faults_reconcile_the_exact_retry_once() {
     for point in FaultPoint::WAL_DURABILITY {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("namespace");
         drop(open(&path));
+        let wal_path = path.join(wal_file_name(0));
+        let initial_wal = fs::read(&wal_path).expect("initial WAL reads");
 
         let mut store = CheckpointStore::open_with_fault(
             StoreOptions {
@@ -1845,52 +1900,277 @@ fn wal_append_faults_recover_only_complete_transactions() {
             matches!(error, StoreError::InjectedFault { point: fired } if fired == point),
             "expected the injected fault at {point}, got {error:?}"
         );
-        assert!(matches!(
-            store.sync().expect_err("the failed handle is unusable"),
-            StoreError::Unusable { .. }
-        ));
-        assert!(matches!(
-            store
-                .remove_quarantined_file(file_id(9), 1, 1, "cleanup".to_owned())
-                .expect_err("an unusable handle cannot report an absent no-op"),
-            StoreError::Unusable { .. }
-        ));
-        assert!(matches!(
-            store
-                .remove_expired(&HashSet::new(), 1, Duration::from_secs(1), 1,)
-                .expect_err("an unusable handle cannot report empty retention"),
-            StoreError::Unusable { .. }
-        ));
-        assert!(matches!(
-            store
-                .compact_if_due()
-                .expect_err("an unusable handle cannot report compaction state"),
-            StoreError::Unusable { .. }
-        ));
-        drop(store);
-
-        let reopened = open(&path);
-        let transaction_was_complete = !matches!(
+        assert!(store.table().is_empty());
+        assert_eq!(store.stats().wal_transactions, 0);
+        assert_eq!(store.stats().next_sequence, 1);
+        let failed_wal = fs::read(&wal_path).expect("failed WAL reads");
+        let transaction_was_written = !matches!(
             point,
-            FaultPoint::BeforeWalTransactionWrite
-                | FaultPoint::DuringWalTransactionWrite
-                | FaultPoint::BeforeWalSync
-                | FaultPoint::AfterWalSync
+            FaultPoint::BeforeWalTransactionWrite | FaultPoint::DuringWalTransactionWrite
         );
-        assert_eq!(
-            reopened.table().get(&file_id(1)).is_some(),
-            transaction_was_complete,
-            "unexpected recovered state after a fault at {point}"
-        );
-        assert_eq!(
-            reopened.recovery().transactions_replayed,
-            usize::from(transaction_was_complete)
-        );
-        assert_eq!(
-            reopened.recovery().torn_tail_bytes > 0,
-            point == FaultPoint::DuringWalTransactionWrite
-        );
+        if point == FaultPoint::BeforeWalTransactionWrite {
+            assert_eq!(failed_wal, initial_wal);
+            store
+                .sync()
+                .expect("a definitive no-write leaves no repair");
+        } else {
+            assert!(failed_wal.len() > initial_wal.len());
+            assert!(matches!(
+                store
+                    .sync()
+                    .expect_err("unrelated operations wait for exact append repair"),
+                StoreError::PendingWalAppend { sequence: 1, .. }
+            ));
+            assert!(matches!(
+                store
+                    .register_files(vec![registration(2)])
+                    .expect_err("a different transaction cannot consume the pending sequence"),
+                StoreError::PendingWalAppendMismatch {
+                    expected_sequence: 1,
+                    found_sequence: 1,
+                    ..
+                }
+            ));
+        }
+
+        let outcomes = store
+            .register_files(vec![registration(1)])
+            .expect("the exact bounded retry succeeds");
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].sequence, 1);
+        assert!(outcomes[0].synced);
+        assert_eq!(store.table().len(), 1);
+        assert!(store.table().get(&file_id(1)).is_some());
+        assert_eq!(store.stats().wal_transactions, 1);
+        assert_eq!(store.stats().next_sequence, 2);
+        let repaired_wal = fs::read(&wal_path).expect("repaired WAL reads");
+        if transaction_was_written {
+            assert_eq!(
+                repaired_wal, failed_wal,
+                "a complete append at {point} must not be written twice"
+            );
+        } else {
+            assert!(repaired_wal.len() > initial_wal.len());
+        }
+
+        drop(store);
+        let reopened = open(&path);
+        assert_eq!(reopened.recovery().transactions_replayed, 1);
+        assert_eq!(reopened.recovery().torn_tail_bytes, 0);
+        assert_eq!(reopened.table().len(), 1);
+        assert!(reopened.table().get(&file_id(1)).is_some());
     }
+}
+
+/// Scenario: an ambiguous append leaves one complete transaction whose frame
+/// CRC is corrupted before the exact live retry.
+/// Guarantees: reconciliation fails closed, preserves every byte for
+/// evidence, and never truncates or applies a structurally complete invalid
+/// frame.
+#[test]
+fn wal_append_retry_rejects_complete_corruption_without_truncation() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    drop(open(&path));
+    let wal_path = path.join(wal_file_name(0));
+
+    let mut store = CheckpointStore::open_with_fault(
+        StoreOptions {
+            sync_interval: Duration::ZERO,
+            ..options(&path)
+        },
+        FaultPoint::AfterWalTransactionWrite,
+    )
+    .expect("existing namespace opens without appending");
+    let error = store
+        .register_files(vec![registration(1)])
+        .expect_err("the ambiguous append boundary fails");
+    assert!(matches!(
+        error,
+        StoreError::InjectedFault {
+            point: FaultPoint::AfterWalTransactionWrite
+        }
+    ));
+
+    let mut corrupted = fs::read(&wal_path).expect("complete WAL reads");
+    let final_byte = corrupted.last_mut().expect("transaction has a frame CRC");
+    *final_byte ^= 0x01;
+    write_bytes(&wal_path, &corrupted);
+
+    let error = store
+        .register_files(vec![registration(1)])
+        .expect_err("complete corruption fails reconciliation");
+    assert!(matches!(error, StoreError::Decode { .. }));
+    assert_eq!(
+        fs::read(&wal_path).expect("corrupt WAL remains readable"),
+        corrupted
+    );
+    assert!(store.table().is_empty());
+    assert!(matches!(
+        store
+            .sync()
+            .expect_err("the pending append still blocks unrelated sync"),
+        StoreError::PendingWalAppend { sequence: 1, .. }
+    ));
+    drop(store);
+
+    assert!(matches!(
+        CheckpointStore::open(options(&path)).expect_err("reopen fails closed"),
+        StoreError::Decode { .. }
+    ));
+    assert_eq!(
+        fs::read(&wal_path).expect("corrupt WAL evidence remains"),
+        corrupted
+    );
+}
+
+/// Scenario: the store retains an uncertain maximum-sized transaction only
+/// by fixed accounting and digest fields.
+/// Guarantees: append-retry state cannot grow with transaction payload size.
+#[test]
+fn pending_wal_append_state_is_fixed_size() {
+    assert!(size_of::<super::PendingWalAppend>() <= 128);
+}
+
+/// Scenario: live repair truncates a known partial append, but a fault makes
+/// the post-sync outcome uncertain before the exact transaction is retried.
+/// Guarantees: the shortened WAL retains a required-repair-sync obligation;
+/// the next retry syncs that boundary again before appending one transaction.
+#[test]
+fn torn_append_repair_retries_sync_before_reappend() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    drop(open(&path));
+    let wal_path = path.join(wal_file_name(0));
+    let boundary = fs::metadata(&wal_path).expect("initial WAL metadata").len();
+
+    let mut store = CheckpointStore::open_with_fault(
+        StoreOptions {
+            sync_interval: Duration::ZERO,
+            ..options(&path)
+        },
+        FaultPoint::DuringWalTransactionWrite,
+    )
+    .expect("existing namespace opens without appending");
+    assert!(matches!(
+        store
+            .register_files(vec![registration(1)])
+            .expect_err("the partial append fault fires"),
+        StoreError::InjectedFault {
+            point: FaultPoint::DuringWalTransactionWrite
+        }
+    ));
+    store.faults = FaultPlan::armed(FaultPoint::AfterTornTailTruncate);
+    assert!(matches!(
+        store
+            .register_files(vec![registration(1)])
+            .expect_err("repair sync outcome is uncertain"),
+        StoreError::InjectedFault {
+            point: FaultPoint::AfterTornTailTruncate
+        }
+    ));
+    assert_eq!(
+        fs::metadata(&wal_path)
+            .expect("truncated WAL metadata")
+            .len(),
+        boundary
+    );
+    assert!(
+        store
+            .pending_wal_append
+            .expect("the append remains pending")
+            .repair_sync_required
+    );
+
+    let outcomes = store
+        .register_files(vec![registration(1)])
+        .expect("the repair sync and exact append retry succeed");
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].sequence, 1);
+    assert!(outcomes[0].synced);
+    assert_eq!(store.table().len(), 1);
+    assert_eq!(store.stats().wal_transactions, 1);
+    drop(store);
+
+    let reopened = open(&path);
+    assert_eq!(reopened.recovery().transactions_replayed, 1);
+    assert!(reopened.table().get(&file_id(1)).is_some());
+}
+
+/// Scenario: a complete uncertain append is validated while the WAL pathname
+/// is replaced with another regular file before the exact retry.
+/// Guarantees: stable file identity rejects the replacement before sync,
+/// truncation, handle installation, or logical application.
+#[test]
+fn wal_append_reconciliation_rejects_regular_file_replacement() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    drop(open(&path));
+    let wal_path = path.join(wal_file_name(0));
+    let displaced = path.join("displaced.wal");
+
+    let mut store = CheckpointStore::open_with_fault(
+        StoreOptions {
+            sync_interval: Duration::ZERO,
+            ..options(&path)
+        },
+        FaultPoint::AfterWalTransactionWrite,
+    )
+    .expect("existing namespace opens without appending");
+    assert!(store.register_files(vec![registration(1)]).is_err());
+    fs::rename(&wal_path, &displaced).expect("the original WAL is displaced");
+    let replacement = encode_wal(0, NAMESPACE_ID, &[]).expect("replacement WAL encodes");
+    write_bytes(&wal_path, &replacement);
+
+    assert!(matches!(
+        store
+            .register_files(vec![registration(1)])
+            .expect_err("the replacement is rejected"),
+        StoreError::UnsafeFilesystemObject { .. }
+    ));
+    assert_eq!(
+        fs::read(&wal_path).expect("replacement WAL remains readable"),
+        replacement
+    );
+    assert!(store.table().is_empty());
+}
+
+/// Scenario: an administrative removal's complete append has an uncertain
+/// result, then the exact convenience API call is retried.
+/// Guarantees: the pre-append gate permits the exact removal to reach WAL
+/// reconciliation and removes the quarantined record with one transaction.
+#[test]
+fn quarantined_removal_retries_the_pending_exact_append() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    let mut seed = open(&path);
+    let _registered = seed
+        .register_files(vec![registration(1)])
+        .expect("registration succeeds");
+    let _quarantined = seed
+        .quarantine_files(vec![quarantine(1)])
+        .expect("quarantine succeeds");
+    drop(seed);
+
+    let mut store =
+        CheckpointStore::open_with_fault(options(&path), FaultPoint::AfterWalTransactionWrite)
+            .expect("the quarantined namespace opens");
+    assert!(matches!(
+        store
+            .remove_quarantined_file(file_id(1), 0x0008, 10, "operator purge".to_owned())
+            .expect_err("the first removal result is uncertain"),
+        StoreError::InjectedFault {
+            point: FaultPoint::AfterWalTransactionWrite
+        }
+    ));
+    let outcome = store
+        .remove_quarantined_file(file_id(1), 0x0008, 10, "operator purge".to_owned())
+        .expect("the exact removal retry reconciles")
+        .expect("the record was present before the pending transaction");
+    assert_eq!(outcome.sequence, 3);
+    assert!(outcome.synced);
+    assert!(store.table().is_empty());
+    assert_eq!(store.stats().wal_transactions, 3);
 }
 
 /// Scenario: opening a WAL with a three-byte torn tail fails immediately

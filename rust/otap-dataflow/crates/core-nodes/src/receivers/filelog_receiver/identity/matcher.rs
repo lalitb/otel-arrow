@@ -13,7 +13,7 @@ use crate::receivers::filelog_receiver::checkpoint::primitives::{
 };
 use crate::receivers::filelog_receiver::checkpoint::snapshot::SnapshotRecord;
 use crate::receivers::filelog_receiver::checkpoint::store::{
-    AtomicGroupAppendOutcome, CheckpointStore,
+    AtomicGroupAppendOutcome, AtomicGroupAppendPlan, CheckpointStore,
 };
 use crate::receivers::filelog_receiver::checkpoint::wal::{
     Operation, QuarantineFile, RegisterFile, RemoveFile, UpdateFingerprint, UpdateMetadata,
@@ -242,6 +242,36 @@ pub(crate) enum IdentityResolution {
     Deferred,
 }
 
+/// One fully planned reconciliation whose checkpoint transactions can resume
+/// at the exact failed transaction without regenerating file identities.
+#[derive(Debug)]
+pub(crate) struct IdentityResolutionPlan {
+    checkpoint: Option<AtomicGroupAppendPlan>,
+    resolutions: Option<Vec<IdentityResolution>>,
+}
+
+impl IdentityResolutionPlan {
+    /// Persists the remaining checkpoint transactions and returns the planned
+    /// resolutions once every transaction succeeds.
+    pub(crate) fn persist_cancellable(
+        &mut self,
+        store: &mut CheckpointStore,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<Option<Vec<IdentityResolution>>, IdentityError> {
+        if let Some(checkpoint) = &mut self.checkpoint {
+            match store.append_atomic_group_plan_cancellable(checkpoint, &mut cancelled)? {
+                AtomicGroupAppendOutcome::Completed(_outcomes) => {
+                    self.checkpoint = None;
+                }
+                AtomicGroupAppendOutcome::Cancelled { .. } => return Ok(None),
+            }
+        }
+        Ok(Some(self.resolutions.take().expect(
+            "a completed identity plan returns its resolutions once",
+        )))
+    }
+}
+
 #[derive(Debug)]
 struct PlannedIdentity {
     resolved: ResolvedIdentity,
@@ -368,6 +398,32 @@ pub(crate) fn resolve_and_persist_with_admission_cancellable(
     )
 }
 
+/// Plans one capacity-aware reconciliation without beginning checkpoint I/O.
+///
+/// The caller can retain the returned plan across bounded store retries, so
+/// randomly assigned file IDs and transaction boundaries remain exact.
+pub(crate) fn plan_with_admission(
+    store: &CheckpointStore,
+    candidates: &[CandidateEvidence],
+    inventory: &CandidateInventory,
+    settings: &IdentitySettings,
+    now_unix_nano: u64,
+    recognized_replacements: &HashSet<Locator>,
+    confirmed_path_bindings: &HashSet<Locator>,
+) -> Result<IdentityResolutionPlan, IdentityError> {
+    plan_with_source_mode(
+        store,
+        candidates,
+        inventory,
+        settings,
+        now_unix_nano,
+        &mut RandomFileIdSource,
+        true,
+        recognized_replacements,
+        ConfirmedPathBindings::Only(confirmed_path_bindings),
+    )
+}
+
 pub(super) fn resolve_and_persist_with_source(
     store: &mut CheckpointStore,
     candidates: &[CandidateEvidence],
@@ -414,6 +470,35 @@ fn resolve_with_source_mode(
     recognized_replacements: &HashSet<Locator>,
     confirmed_path_bindings: ConfirmedPathBindings<'_>,
 ) -> Result<Option<Vec<IdentityResolution>>, IdentityError> {
+    let mut plan = plan_with_source_mode(
+        store,
+        candidates,
+        inventory,
+        settings,
+        now_unix_nano,
+        file_ids,
+        defer_new_at_capacity,
+        recognized_replacements,
+        confirmed_path_bindings,
+    )?;
+    if cancelled() {
+        return Ok(None);
+    }
+    plan.persist_cancellable(store, cancelled)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_with_source_mode(
+    store: &CheckpointStore,
+    candidates: &[CandidateEvidence],
+    inventory: &CandidateInventory,
+    settings: &IdentitySettings,
+    now_unix_nano: u64,
+    file_ids: &mut impl FileIdSource,
+    defer_new_at_capacity: bool,
+    recognized_replacements: &HashSet<Locator>,
+    confirmed_path_bindings: ConfirmedPathBindings<'_>,
+) -> Result<IdentityResolutionPlan, IdentityError> {
     validate_resumption_profiles(store, settings)?;
     validate_candidates(candidates, inventory, settings)?;
 
@@ -597,17 +682,15 @@ fn resolve_with_source_mode(
         }
         resolutions.push(IdentityResolution::Resolved(plan.resolved));
     }
-    if cancelled() {
-        return Ok(None);
-    }
-    if !operation_groups.is_empty() {
-        match store.append_atomic_groups_cancellable(operation_groups, &mut *cancelled)? {
-            AtomicGroupAppendOutcome::Completed(_outcomes) => {}
-            AtomicGroupAppendOutcome::Cancelled { .. } => return Ok(None),
-        }
-    }
-
-    Ok(Some(resolutions))
+    let checkpoint = if operation_groups.is_empty() {
+        None
+    } else {
+        Some(store.prepare_atomic_group_append(operation_groups)?)
+    };
+    Ok(IdentityResolutionPlan {
+        checkpoint,
+        resolutions: Some(resolutions),
+    })
 }
 
 fn validate_candidates(

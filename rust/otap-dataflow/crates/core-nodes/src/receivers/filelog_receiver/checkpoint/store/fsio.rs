@@ -743,6 +743,24 @@ pub(crate) fn verify_checkpoint_file_path_binding(
     Ok(())
 }
 
+/// Verifies that two already validated handles name the same checkpoint file.
+pub(crate) fn verify_same_checkpoint_file(
+    expected: &File,
+    actual: &File,
+    path: &Path,
+    operation: &'static str,
+) -> Result<(), StoreError> {
+    let expected_identity = file_identity(expected, path, operation)?;
+    let actual_identity = file_identity(actual, path, operation)?;
+    if actual_identity != expected_identity {
+        return Err(StoreError::UnsafeFilesystemObject {
+            path: path.to_path_buf(),
+            reason: "the reopened handle is not the validated checkpoint file",
+        });
+    }
+    Ok(())
+}
+
 /// Applies platform flags that open the named object itself without blocking
 /// on a special file before handle-based validation can reject it.
 fn no_follow(options: &mut OpenOptions) {
@@ -1433,6 +1451,35 @@ pub(crate) fn truncate_file_cancellable(
     len: u64,
     cancelled: &mut impl FnMut() -> bool,
 ) -> Result<Option<()>, StoreError> {
+    let Some(file) = open_for_wal_repair_cancellable(path, &mut *cancelled)? else {
+        return Ok(None);
+    };
+    let truncated = file.set_len(len);
+    if cancelled() {
+        return Ok(None);
+    }
+    truncated.map_err(|source| StoreError::Io {
+        operation: "truncate a checkpoint WAL to its last complete transaction",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let synced = file.sync_all();
+    if cancelled() {
+        return Ok(None);
+    }
+    synced.map_err(|source| StoreError::Io {
+        operation: "sync a truncated checkpoint WAL",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(Some(()))
+}
+
+/// Opens an existing WAL with the write rights required for exact tail repair.
+pub(crate) fn open_for_wal_repair_cancellable(
+    path: &Path,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<File>, StoreError> {
     if cancelled() {
         return Ok(None);
     }
@@ -1457,25 +1504,7 @@ pub(crate) fn truncate_file_cancellable(
     else {
         return Ok(None);
     };
-    let truncated = file.set_len(len);
-    if cancelled() {
-        return Ok(None);
-    }
-    truncated.map_err(|source| StoreError::Io {
-        operation: "truncate a checkpoint WAL to its last complete transaction",
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let synced = file.sync_all();
-    if cancelled() {
-        return Ok(None);
-    }
-    synced.map_err(|source| StoreError::Io {
-        operation: "sync a truncated checkpoint WAL",
-        path: path.to_path_buf(),
-        source,
-    })?;
-    Ok(Some(()))
+    Ok(Some(file))
 }
 
 /// Opens an existing WAL for appending. Every write lands at the current end

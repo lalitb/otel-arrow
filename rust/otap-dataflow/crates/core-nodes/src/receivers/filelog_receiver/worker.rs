@@ -44,8 +44,7 @@ use super::framing::{DecodeError, DecodeOutcome, FlushReason, FramedRecord, Fram
 use super::identity::CandidateEvidence;
 use super::identity::IdentityError;
 use super::identity::matcher::{
-    IdentityMatch, IdentityResolution, IdentitySettings,
-    resolve_and_persist_with_admission_cancellable,
+    IdentityMatch, IdentityResolution, IdentitySettings, plan_with_admission,
 };
 use super::lease::LeaseError;
 use super::reader::{
@@ -1233,21 +1232,29 @@ impl WorkerRuntime {
             return Ok(LoopControl::Shutdown);
         }
         let shutdown_requested = Arc::clone(&self.shutdown_requested);
-        let resolved = resolve_and_persist_with_admission_cancellable(
-            &mut self.store,
+        let mut plan = plan_with_admission(
+            &self.store,
             &self.candidate_evidence,
             &batch.inventory,
             &self.identity_settings,
             now_unix_nano,
             &batch.recognized_replacements,
             &confirmed_path_bindings,
-            || shutdown_requested.load(Ordering::Acquire),
         )
-        .map_err(WorkerError::Identity);
+        .map_err(WorkerError::Identity)?;
         if self.cancellation_requested() {
             return Ok(LoopControl::Shutdown);
         }
-        let resolved = self.observe_direct_checkpoint_result(resolved)?;
+        let Some(resolved) =
+            self.retry_direct_checkpoint_operation("persist identity reconciliation", |runtime| {
+                plan.persist_cancellable(&mut runtime.store, || {
+                    shutdown_requested.load(Ordering::Acquire)
+                })
+                .map_err(WorkerError::Identity)
+            })?
+        else {
+            return Ok(LoopControl::Shutdown);
+        };
         let Some(resolved) = resolved else {
             return Ok(LoopControl::Shutdown);
         };
@@ -1837,13 +1844,19 @@ impl WorkerRuntime {
                 if self.cancellation_requested() {
                     return Ok(false);
                 }
-                let result = self
-                    .store
-                    .quarantine_files(quarantines)
-                    .map_err(WorkerError::Store);
-                let _outcomes = self.observe_direct_checkpoint_result(result)?;
-                let result = self.store.sync().map_err(WorkerError::Store);
-                self.observe_direct_checkpoint_result(result)?;
+                let Some(()) = self.retry_direct_checkpoint_operation(
+                    "persist a truncate quarantine",
+                    |runtime| {
+                        let _outcomes = runtime
+                            .store
+                            .quarantine_files(quarantines.clone())
+                            .map_err(WorkerError::Store)?;
+                        runtime.store.sync().map_err(WorkerError::Store)
+                    },
+                )?
+                else {
+                    return Ok(false);
+                };
                 record_truncation_outcome(&self.telemetry, OnTruncate::Fail);
                 if let Some(suppressed) = self.health_event(HealthEventCategory::Truncation) {
                     otel_warn!(
@@ -1906,10 +1919,19 @@ impl WorkerRuntime {
                 if self.cancellation_requested() {
                     return Ok(false);
                 }
-                let result = self.store.append(operations).map_err(WorkerError::Store);
-                let _outcome = self.observe_direct_checkpoint_result(result)?;
-                let result = self.store.sync().map_err(WorkerError::Store);
-                self.observe_direct_checkpoint_result(result)?;
+                let Some(()) = self.retry_direct_checkpoint_operation(
+                    "persist a truncate reset",
+                    |runtime| {
+                        let _outcome = runtime
+                            .store
+                            .append(operations.clone())
+                            .map_err(WorkerError::Store)?;
+                        runtime.store.sync().map_err(WorkerError::Store)
+                    },
+                )?
+                else {
+                    return Ok(false);
+                };
                 record_truncation_outcome(&self.telemetry, OnTruncate::ReadNew);
                 if let Some(suppressed) = self.health_event(HealthEventCategory::Truncation) {
                     otel_warn!(
@@ -2337,13 +2359,17 @@ impl WorkerRuntime {
         if self.cancellation_requested() {
             return Ok(false);
         }
-        let result = self
-            .store
-            .quarantine_files(quarantines)
-            .map_err(WorkerError::Store);
-        let _outcomes = self.observe_direct_checkpoint_result(result)?;
-        let result = self.store.sync().map_err(WorkerError::Store);
-        self.observe_direct_checkpoint_result(result)?;
+        let Some(()) =
+            self.retry_direct_checkpoint_operation("persist a decode quarantine", |runtime| {
+                let _outcomes = runtime
+                    .store
+                    .quarantine_files(quarantines.clone())
+                    .map_err(WorkerError::Store)?;
+                runtime.store.sync().map_err(WorkerError::Store)
+            })?
+        else {
+            return Ok(false);
+        };
         self.telemetry.add(WorkerCounter::QuarantineDecode, 1);
         if let Some(suppressed) = self.health_event(HealthEventCategory::Quarantine) {
             otel_warn!(
@@ -3368,19 +3394,54 @@ impl WorkerRuntime {
         }
     }
 
-    fn observe_direct_checkpoint_result<T>(
+    fn retry_direct_checkpoint_operation<T>(
         &mut self,
-        result: Result<T, WorkerError>,
-    ) -> Result<T, WorkerError> {
-        if result.as_ref().is_err_and(|error| {
-            matches!(
-                error,
-                WorkerError::Store(_) | WorkerError::Identity(IdentityError::Store(_))
-            )
-        }) {
-            self.telemetry.add(WorkerCounter::CheckpointFailures, 1);
+        operation: &'static str,
+        mut attempt: impl FnMut(&mut Self) -> Result<T, WorkerError>,
+    ) -> Result<Option<T>, WorkerError> {
+        loop {
+            if self.cancellation_requested() {
+                return Ok(None);
+            }
+            match attempt(self) {
+                Ok(value) => {
+                    self.checkpoint_maintenance_failures = 0;
+                    self.maintenance_retry_pending = false;
+                    return Ok(Some(value));
+                }
+                Err(error)
+                    if matches!(
+                        &error,
+                        WorkerError::Store(_) | WorkerError::Identity(IdentityError::Store(_))
+                    ) =>
+                {
+                    self.telemetry.add(WorkerCounter::CheckpointFailures, 1);
+                    self.checkpoint_maintenance_failures = self
+                        .checkpoint_maintenance_failures
+                        .checked_add(1)
+                        .ok_or(WorkerError::Inconsistent {
+                            reason: "checkpoint operation failure counter overflowed",
+                        })?;
+                    if let Some(suppressed) =
+                        self.health_event(HealthEventCategory::CheckpointMaintenance)
+                    {
+                        otel_warn!(
+                            "filelog_receiver.checkpoint_operation_failed",
+                            operation = operation,
+                            consecutive_failures = u64::from(self.checkpoint_maintenance_failures),
+                            suppressed_events = suppressed
+                        );
+                    }
+                    if self.checkpoint_maintenance_failures
+                        >= self.config.checkpoint.max_consecutive_failures
+                    {
+                        return Err(error);
+                    }
+                    std::thread::yield_now();
+                }
+                Err(error) => return Err(error),
+            }
         }
-        result
     }
 
     fn publish_observations(&mut self) {
@@ -3602,16 +3663,24 @@ impl WorkerRuntime {
         self.telemetry.set(WorkerGauge::CandidateOldestAgeNs, 0);
         self.telemetry
             .set(WorkerGauge::CandidateOverflowPersistenceNs, 0);
-        loop {
-            let result = self.store.drain();
-            match self.observe_checkpoint_operation(result, "shut down checkpoint state") {
-                Ok(true) => break,
-                Ok(false) => std::thread::yield_now(),
-                Err(error) => {
-                    if first_error.is_none() {
-                        first_error = Some(error);
+        if self.store.has_pending_wal_append() {
+            if let Err(error) = self.store.drain()
+                && first_error.is_none()
+            {
+                first_error = Some(WorkerError::Store(error));
+            }
+        } else {
+            loop {
+                let result = self.store.drain();
+                match self.observe_checkpoint_operation(result, "shut down checkpoint state") {
+                    Ok(true) => break,
+                    Ok(false) => std::thread::yield_now(),
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                        break;
                     }
-                    break;
                 }
             }
         }
@@ -3642,8 +3711,13 @@ impl WorkerRuntime {
         if self.cancellation_requested() {
             return Ok(false);
         }
-        let result = persist_direct_progress(&mut self.store, delta);
-        self.observe_direct_checkpoint_result(result)?;
+        let Some(()) = self
+            .retry_direct_checkpoint_operation("persist direct progress", |runtime| {
+                persist_direct_progress(&mut runtime.store, delta)
+            })?
+        else {
+            return Ok(false);
+        };
         self.readers_mut()?.observe_committed_progress(
             delta.file_id(),
             delta.expected_file_epoch(),

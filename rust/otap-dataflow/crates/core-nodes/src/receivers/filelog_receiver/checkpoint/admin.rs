@@ -1724,7 +1724,19 @@ impl CheckpointAdminSession {
     }
 
     fn ensure_writable(&mut self) -> Result<&mut CheckpointStore, CheckpointAdminError> {
-        self.ensure_usable("prepare an audited checkpoint mutation")?;
+        if let Some(store) = &self.store {
+            store.ensure_not_unusable("prepare an audited checkpoint mutation")?;
+            if let Some(reason) = self.unusable {
+                return Err(StoreError::Unusable {
+                    dir: self.options.namespace_dir.clone(),
+                    operation: "prepare an audited checkpoint mutation",
+                    reason,
+                }
+                .into());
+            }
+        } else {
+            self.ensure_usable("prepare an audited checkpoint mutation")?;
+        }
         if self.store.is_none() {
             let transition = CheckpointStore::from_admin_session(
                 self.options.clone(),
@@ -1900,7 +1912,13 @@ impl CheckpointAdminSession {
         operation: &'static str,
     ) -> Result<(FileId, String, SnapshotRecord), CheckpointAdminError> {
         let file_id = parse_file_id(&target.file_id)?;
-        self.revalidate_authority()?;
+        if !self
+            .store
+            .as_ref()
+            .is_some_and(CheckpointStore::has_pending_wal_append)
+        {
+            self.revalidate_authority()?;
+        }
         let record = self
             .store
             .as_ref()

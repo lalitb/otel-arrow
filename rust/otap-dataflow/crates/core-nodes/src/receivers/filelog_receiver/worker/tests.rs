@@ -1132,13 +1132,15 @@ fn durable_decode_quarantine_is_reported_before_reader_cleanup() {
 
 /// Scenario: decode quarantine persistence faults before its WAL append or
 /// at its required WAL sync after registration already succeeded.
-/// Guarantees: detection remains visible, successful-quarantine telemetry is
-/// zero, rollback preserves the old active state, and the worker fails closed.
+/// Guarantees: the exact quarantine retries once within the checkpoint
+/// failure budget, success is reported only after required sync, and the
+/// worker remains operational with durable quarantine state.
 #[tokio::test]
-async fn decode_quarantine_faults_never_report_success() {
+async fn decode_quarantine_faults_retry_before_success() {
     for point in [
         FaultPoint::BeforeWalTransactionWrite,
         FaultPoint::BeforeWalSync,
+        FaultPoint::AfterWalSync,
     ] {
         let directory = tempdir().unwrap();
         let source = directory.path().join("malformed.log");
@@ -1150,75 +1152,138 @@ async fn decode_quarantine_faults_never_report_success() {
         let worker = spawn_worker_with_store_fault(runtime.clone(), event_tx, point, 1).unwrap();
         let telemetry = Arc::clone(&worker.telemetry);
 
-        let failure = loop {
-            match tokio::time::timeout(Duration::from_secs(5), events.recv())
-                .await
-                .expect("worker failure timeout")
-                .expect("worker event channel closed")
-            {
-                WorkerEvent::Failed(message) => break message,
-                WorkerEvent::Stopped => panic!("worker stopped without failure evidence"),
-                WorkerEvent::Batch(_) | WorkerEvent::CommitResult { .. } | WorkerEvent::Drained => {
-                }
-            }
-        };
-        assert!(failure.contains("checkpoint"), "{failure}");
+        wait_for_worker_counter(&telemetry, WorkerCounter::QuarantineDecode, 1).await;
         assert_eq!(telemetry.counter_for_test(WorkerCounter::DecodeFailures), 1);
         assert_eq!(
             telemetry.counter_for_test(WorkerCounter::QuarantineDecode),
-            0
+            1
         );
         assert_eq!(
             telemetry.counter_for_test(WorkerCounter::CheckpointFailures),
-            u64::from(runtime.checkpoint.max_consecutive_failures) + 1
+            1
         );
-        assert_eq!(telemetry.gauge_for_test(WorkerGauge::FilesQuarantined), 0);
-        events.close();
-        drop(worker.command_tx);
-        assert!(
-            tokio::task::spawn_blocking(move || worker.join.join())
-                .await
-                .unwrap()
-                .unwrap()
-                .is_err()
-        );
+        assert_eq!(telemetry.gauge_for_test(WorkerGauge::FilesQuarantined), 1);
+        stop_worker(worker, &mut events).await.unwrap();
 
         let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
         let record = store.table().iter().next().unwrap().1;
-        assert_eq!(record.lifecycle_state, LifecycleState::Active);
+        assert_eq!(record.lifecycle_state, LifecycleState::Quarantined);
         assert_eq!(record.committed_offset, 0);
     }
 }
 
-/// Scenario: the progress WAL fails before writing the Ack transaction, then
-/// async retries the same commit while the store is fail-closed.
-/// Guarantees: every failure returns a CommitResult, the logical batch stays
-/// retained and can still be shallow-resent, and reopen observes no progress
-/// from either failed checkpoint attempt.
+/// Scenario: each WAL append/sync boundary fails once while discovery is
+/// registering a newly observed file.
+/// Guarantees: the retained identity plan retries the exact transaction,
+/// preserves its generated file ID, and emits the source batch without
+/// terminating the worker.
 #[tokio::test]
-async fn checkpoint_fault_retains_batch_across_retries() {
+async fn identity_registration_retries_each_wal_fault_boundary() {
+    for point in FaultPoint::WAL_DURABILITY {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("identity-retry.log");
+        std::fs::write(&source, b"line\n").unwrap();
+        let namespace = directory.path().join("checkpoint");
+        let mut runtime = runtime_config(source.to_str().unwrap(), &namespace, 1);
+        runtime.checkpoint.max_consecutive_failures = 2;
+        let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+        let worker = spawn_worker_with_store_fault(runtime.clone(), event_tx, point, 0).unwrap();
+
+        let batch = receive_batch(&mut events).await;
+        assert_eq!(batch.record_count, 1);
+        assert_eq!(
+            worker
+                .telemetry
+                .counter_for_test(WorkerCounter::CheckpointFailures),
+            1
+        );
+        worker
+            .command_tx
+            .send(WorkerCommand::Commit {
+                batch_id: batch.batch_id,
+                attempt: batch.attempt,
+                explicit_loss: false,
+            })
+            .unwrap();
+        receive_commit(&mut events).await.3.unwrap();
+        stop_worker(worker, &mut events).await.unwrap();
+
+        let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
+        assert_eq!(store.table().len(), 1);
+        assert_eq!(store.table().iter().next().unwrap().1.committed_offset, 5);
+    }
+}
+
+/// Scenario: a direct identity-registration append fails with a configured
+/// checkpoint failure budget of one attempt.
+/// Guarantees: no retry exceeds the configured bound, the worker terminates
+/// after one reported failure, and no registration becomes durable.
+#[tokio::test]
+async fn direct_checkpoint_retry_honors_the_failure_budget() {
     let directory = tempdir().unwrap();
-    let source = directory.path().join("fault.log");
+    let source = directory.path().join("identity-budget.log");
     std::fs::write(&source, b"line\n").unwrap();
     let namespace = directory.path().join("checkpoint");
-    let runtime = runtime_config(source.to_str().unwrap(), &namespace, 1);
+    let mut runtime = runtime_config(source.to_str().unwrap(), &namespace, 1);
+    runtime.checkpoint.max_consecutive_failures = 1;
     let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
     let worker = spawn_worker_with_store_fault(
         runtime.clone(),
         event_tx,
         FaultPoint::BeforeWalTransactionWrite,
-        1,
+        0,
     )
     .unwrap();
+    let telemetry = Arc::clone(&worker.telemetry);
 
-    let first = receive_batch(&mut events).await;
-    let first_column = first
-        .records
-        .get(ArrowPayloadType::Logs)
-        .unwrap()
-        .column(0)
-        .clone();
-    for _ in 0..2 {
+    let failure = loop {
+        match tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("worker failure timeout")
+            .expect("worker event channel closed")
+        {
+            WorkerEvent::Failed(message) => break message,
+            WorkerEvent::Stopped => panic!("worker stopped without failure evidence"),
+            WorkerEvent::Batch(_) | WorkerEvent::CommitResult { .. } | WorkerEvent::Drained => {}
+        }
+    };
+    assert!(failure.contains("checkpoint"), "{failure}");
+    assert_eq!(
+        telemetry.counter_for_test(WorkerCounter::CheckpointFailures),
+        1
+    );
+    events.close();
+    drop(worker.command_tx);
+    assert!(
+        tokio::task::spawn_blocking(move || worker.join.join())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+
+    let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
+    assert!(store.table().is_empty());
+}
+
+/// Scenario: each WAL append/sync boundary fails once for an Ack transaction,
+/// then the same retained commit is retried.
+/// Guarantees: every first failure returns a CommitResult, each exact bounded
+/// retry succeeds, the retained batch is released once, and reopen observes
+/// one committed progress transaction.
+#[tokio::test]
+async fn checkpoint_fault_commits_on_the_exact_bounded_retry() {
+    for point in FaultPoint::WAL_DURABILITY {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("fault.log");
+        std::fs::write(&source, b"line\n").unwrap();
+        let namespace = directory.path().join("checkpoint");
+        let runtime = runtime_config(source.to_str().unwrap(), &namespace, 1);
+        let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+        let worker = spawn_worker_with_store_fault(runtime.clone(), event_tx, point, 1).unwrap();
+
+        let first = receive_batch(&mut events).await;
+        assert_eq!((first.batch_id, first.attempt), (1, 1));
         worker
             .command_tx
             .send(WorkerCommand::Commit {
@@ -1229,30 +1294,26 @@ async fn checkpoint_fault_retains_batch_across_retries() {
             .unwrap();
         let (batch_id, attempt, _, result) = receive_commit(&mut events).await;
         assert_eq!((batch_id, attempt), (1, 1));
-        assert!(result.is_err());
+        assert!(result.is_err(), "{point} must fail the first commit");
+
+        worker
+            .command_tx
+            .send(WorkerCommand::Commit {
+                batch_id: 1,
+                attempt: 1,
+                explicit_loss: false,
+            })
+            .unwrap();
+        let (batch_id, attempt, _, result) = receive_commit(&mut events).await;
+        assert_eq!((batch_id, attempt), (1, 1));
+        result.unwrap_or_else(|error| panic!("the exact retry after {point} failed: {error}"));
+        stop_worker(worker, &mut events).await.unwrap();
+
+        let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
+        let record = store.table().iter().next().unwrap().1;
+        assert_eq!(record.committed_offset, 5);
+        assert_eq!(store.recovery().transactions_replayed, 2);
     }
-
-    worker
-        .command_tx
-        .send(WorkerCommand::Resend {
-            batch_id: 1,
-            next_attempt: 2,
-        })
-        .unwrap();
-    let resend = receive_batch(&mut events).await;
-    assert!(Arc::ptr_eq(
-        &first_column,
-        resend
-            .records
-            .get(ArrowPayloadType::Logs)
-            .unwrap()
-            .column(0)
-    ));
-    assert!(stop_worker(worker, &mut events).await.is_err());
-
-    let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
-    let record = store.table().iter().next().unwrap().1;
-    assert_eq!(record.committed_offset, 0);
 }
 
 /// Scenario: the first post-registration compaction attempt fails at a safe
@@ -1691,14 +1752,17 @@ fn durable_truncate_quarantine_is_reported_before_reader_cleanup() {
 
 /// Scenario: the WAL fails at append or required sync for either a truncate
 /// quarantine or a `read_new` reset transaction.
-/// Guarantees: detection is counted while successful outcomes remain zero,
-/// both policies fail closed, and reopen retains the old active frontier.
+/// Guarantees: each exact transition retries within the checkpoint failure
+/// budget, reports success only after required sync, and remains durable
+/// without terminating the worker.
 #[tokio::test]
-async fn truncate_transitions_fail_closed_at_wal_fault_boundary() {
+async fn truncate_transitions_retry_at_wal_fault_boundary() {
     for policy in [OnTruncate::Fail, OnTruncate::ReadNew] {
         for point in [
             FaultPoint::BeforeWalTransactionWrite,
+            FaultPoint::AfterWalTransactionWrite,
             FaultPoint::BeforeWalSync,
+            FaultPoint::AfterWalSync,
         ] {
             let directory = tempdir().unwrap();
             let source = directory.path().join("fault-truncate.log");
@@ -1723,54 +1787,53 @@ async fn truncate_transitions_fail_closed_at_wal_fault_boundary() {
             receive_commit(&mut events).await.3.unwrap();
             std::fs::write(&source, b"new\n").unwrap();
 
-            let failure = loop {
-                let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
-                    .await
-                    .unwrap()
-                    .unwrap();
-                match event {
-                    WorkerEvent::Failed(message) => break message,
-                    WorkerEvent::Stopped => panic!("worker stopped without fault evidence"),
-                    WorkerEvent::Batch(_)
-                    | WorkerEvent::CommitResult { .. }
-                    | WorkerEvent::Drained => {}
+            match policy {
+                OnTruncate::Fail => {
+                    wait_for_worker_counter(&telemetry, WorkerCounter::CopytruncateFail, 1).await;
                 }
-            };
-            assert!(failure.contains("checkpoint"), "{failure}");
+                OnTruncate::ReadNew => {
+                    wait_for_worker_counter(&telemetry, WorkerCounter::CopytruncateReadNew, 1)
+                        .await;
+                }
+            }
             assert_eq!(
                 telemetry.counter_for_test(WorkerCounter::CopytruncateDetected),
                 1
             );
             assert_eq!(
                 telemetry.counter_for_test(WorkerCounter::CopytruncateFail),
-                0
+                u64::from(policy == OnTruncate::Fail)
             );
             assert_eq!(
                 telemetry.counter_for_test(WorkerCounter::CopytruncateReadNew),
-                0
+                u64::from(policy == OnTruncate::ReadNew)
             );
             assert_eq!(
                 telemetry.counter_for_test(WorkerCounter::QuarantineTruncate),
-                0
+                u64::from(policy == OnTruncate::Fail)
             );
             assert_eq!(
                 telemetry.counter_for_test(WorkerCounter::CheckpointFailures),
-                u64::from(runtime.checkpoint.max_consecutive_failures) + 1
+                1
             );
-            events.close();
-            drop(worker.command_tx);
-            assert!(
-                tokio::task::spawn_blocking(move || worker.join.join())
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .is_err()
-            );
+            stop_worker(worker, &mut events).await.unwrap();
 
             let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
             let record = store.table().iter().next().unwrap().1;
-            assert_eq!((record.file_epoch, record.committed_offset), (1, 4));
-            assert_eq!(record.lifecycle_state, LifecycleState::Active);
+            match policy {
+                OnTruncate::Fail => {
+                    assert_eq!((record.file_epoch, record.committed_offset), (1, 4));
+                    assert_eq!(record.lifecycle_state, LifecycleState::Quarantined);
+                    assert_eq!(
+                        record.quarantine_evidence.as_ref().unwrap().reason_code,
+                        QUARANTINE_REASON_TRUNCATE
+                    );
+                }
+                OnTruncate::ReadNew => {
+                    assert_eq!((record.file_epoch, record.committed_offset), (2, 0));
+                    assert_eq!(record.lifecycle_state, LifecycleState::Active);
+                }
+            }
         }
     }
 }
