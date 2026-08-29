@@ -210,6 +210,33 @@ before being proposed upstream.
 - Upstream framing: stream Profiles fields transactionally into `ProtoBuffer`
   once profiling shows the extra materialization is significant.
 
+### PA-014: No privacy-safe real Profiles capture is checked in
+
+- Status: `open`
+- Area: validation datasets and benchmarks
+- Evidence: the repository contains no pprof, JFR, Linux perf, or OTLP Profiles
+  capture suitable for repeatable tests.
+- Impact: current validation uses deterministic synthetic workloads and cannot
+  prove fidelity or compression behavior for every producer-specific shape.
+- Local direction: cover CPU, allocation, off-CPU, timestamp-only,
+  high-cardinality attribute, and original-payload workloads synthetically.
+- Upstream framing: contribute anonymized, redistributable captures with
+  documented provenance and expected semantics.
+
+### PA-015: The Rust workspace has no persistent fuzz harness
+
+- Status: `open`
+- Area: conversion robustness
+- Evidence: there is no checked-in `cargo-fuzz`, `proptest`, `quickcheck`, or
+  corpus infrastructure.
+- Impact: bounded deterministic randomized tests exercise both conversion
+  directions, malformed protobuf bytes, and mutated OTAP graphs, but they do
+  not provide coverage-guided fuzzing across revisions.
+- Local direction: use fixed-seed randomized no-panic tests in the normal test
+  suite so coverage remains dependency-free and repeatable.
+- Upstream framing: add shared fuzz infrastructure before maintaining
+  Profiles-specific corpora and long-running CI jobs.
+
 ## Review Policy
 
 New findings should record evidence, practical Profiles impact, whether they

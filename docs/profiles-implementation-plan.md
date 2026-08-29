@@ -8,21 +8,23 @@ Each branch is stacked on the preceding branch.
 
 ## Current Status
 
-- Steps 1 through 6 are implemented and committed on their corresponding local
+- Steps 1 through 7 are implemented and committed on their corresponding local
   stack branches.
 - All stack branches are rebased onto upstream commit `80d38834` from August
   28, 2026.
-- Step 7 is implemented on the current branch. It validates Profiles OTAP
-  graphs, rebuilds canonical protobuf dictionaries, rewrites every entity
-  reference, reconstructs resource/scope envelopes, and provides semantic
-  reachable-graph equivalence.
+- Step 8 is implemented on the current branch with deterministic representative
+  datasets, bounded randomized conversion tests, malformed-input no-panic
+  coverage, semantic equivalence checks, and Criterion benchmarks for both
+  directions.
 - Profiles BARs remain separate during batching, and oversized BARs are
   rejected until graph-aware partitioning and concatenation are implemented.
   Serialized OTLP Profiles requests likewise remain separate because each owns
   a request-wide dictionary.
 - Architecture findings and decisions are tracked in
   [Profiles Upstream Architecture Notes](profiles-upstream-architecture-notes.md).
-- Steps 8 through 11 have not started.
+- No privacy-safe real production capture or repository fuzz harness was
+  available, so those remain explicit follow-ups.
+- Steps 9 through 11 have not started.
 
 1. `profiles/01-otap-data-model-design`
    - Define the Profiles OTAP data model, processing semantics, validation
@@ -53,6 +55,10 @@ Each branch is stacked on the preceding branch.
 8. `profiles/08-profile-validation-benchmarks`
    - Validate semantic equivalence with real profiling datasets, fuzz both
      conversion directions, and benchmark size, CPU, and memory behavior.
+   - Status: deterministic CPU, allocation, off-CPU, timestamp-only,
+     high-cardinality, and original-payload datasets are covered. Bounded
+     randomized tests and both-direction benchmarks are implemented; real
+     captures and persistent fuzz corpora remain open.
 9. `profiles/09-profile-transport`
    - Add receiver, exporter, OTAP transport, and bounded batching behavior.
 10. `profiles/10-profile-transformations`
