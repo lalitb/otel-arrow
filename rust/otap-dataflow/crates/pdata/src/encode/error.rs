@@ -21,6 +21,17 @@ pub enum Error {
         error: String,
     },
 
+    /// Invalid or unsupported content in an OTLP Profiles request.
+    #[error("Invalid OTLP Profiles data: {message}")]
+    InvalidProfilesData {
+        /// Description of the violated Profiles invariant.
+        message: String,
+    },
+
+    /// Wrapper for protobuf decoding errors.
+    #[error("An error occurred decoding protobuf data: {0}")]
+    ProtobufDecode(#[from] prost::DecodeError),
+
     /// u16 underflow error
     #[error("An error occurred packing more than 2**16 - 1 entries into a record batch")]
     U16OverflowError,

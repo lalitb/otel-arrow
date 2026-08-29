@@ -82,7 +82,10 @@
 // directly from OTAP -> OTLP bytes. The utility functions we use might change as part of
 // this diagram may need to be updated (https://github.com/open-telemetry/otel-arrow/issues/1095)
 
-use crate::encode::{encode_logs_otap_batch, encode_metrics_otap_batch, encode_spans_otap_batch};
+use crate::encode::{
+    encode_logs_otap_batch, encode_metrics_otap_batch, encode_profiles_request_otap_batch,
+    encode_spans_otap_batch,
+};
 use crate::error::Error;
 use crate::otap::{OtapArrowRecords, OtapBatchStore};
 use crate::otlp::logs::LogsProtoBytesEncoder;
@@ -659,11 +662,10 @@ impl TryFromWithOptions<OtlpProtoBytes> for OtapArrowRecords {
 
                 Ok(otap_batch)
             }
-            OtlpProtoBytes::ExportProfilesRequest(_) => Err(crate::encode::Error::OtapError(
-                Error::UnsupportedSignalType {
-                    signal: SignalType::Profiles,
-                },
-            )),
+            OtlpProtoBytes::ExportProfilesRequest(bytes) => {
+                let request = ExportProfilesServiceRequest::decode(bytes)?;
+                encode_profiles_request_otap_batch(&request)
+            }
         }
     }
 }

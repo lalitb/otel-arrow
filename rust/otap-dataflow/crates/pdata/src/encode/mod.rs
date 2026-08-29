@@ -8,8 +8,10 @@ pub mod record;
 
 mod cbor;
 mod error;
+mod profiles;
 
 pub use error::{Error, Result};
+pub use profiles::{encode_profiles_otap_batch, encode_profiles_request_otap_batch};
 
 use crate::{
     encode::record::{

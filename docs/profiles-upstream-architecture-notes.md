@@ -150,6 +150,36 @@ before being proposed upstream.
   copy-on-write, `UInt32` owner support, ordinal maintenance, and post-mutation
   validation.
 
+### PA-010: Resource entity references have no Profiles OTAP representation
+
+- Status: `resolved-local`
+- Area: OTLP Profiles to OTAP conversion
+- Evidence: the pinned `Resource` message can carry `entity_refs`, but the
+  current Profiles root and shared resource-attribute tables have no columns or
+  related payload for them.
+- Impact: accepting those requests would silently lose entity identity and
+  description-key semantics during conversion.
+- Local direction: reject a Profiles request containing resource entity
+  references.
+- Upstream framing: define a signal-independent OTAP entity-reference
+  representation before enabling conversion of this field.
+
+### PA-011: Profiles conversion limits are not configurable
+
+- Status: `open`
+- Area: OTLP Profiles to OTAP conversion and `ConversionOptions`
+- Evidence: the encoder uses checked IDs and offsets, dictionary-backed repeated
+  strings, a bounded AnyValue nesting depth, and Arrow capacity checks, but
+  `ConversionOptions` exposes no Profiles-specific profile, sample, dictionary,
+  list-element, or retained-memory limits.
+- Impact: conversion still allocates proportional to a request that passes the
+  receiver's encoded-byte limit, and embedders can invoke conversion without a
+  transport admission limit.
+- Local direction: keep the step-6 encoder fail-fast for representational
+  limits and avoid repeated-string amplification.
+- Upstream framing: add configurable conversion/admission limits before
+  Profiles transport is enabled in step 9.
+
 ## Review Policy
 
 New findings should record evidence, practical Profiles impact, whether they

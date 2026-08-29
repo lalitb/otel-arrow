@@ -3,10 +3,14 @@
 
 //! Round-trip testing utilities for OTLP <-> OTAP conversions.
 //!
-//! This module provides encoding, decoding, and round-trip testing helpers
-//! for all three telemetry signal types (logs, traces, metrics).
+//! This module provides encoding and decoding helpers for all four telemetry
+//! signal types. Full Profiles round-trip support is added with OTAP-to-OTLP
+//! conversion.
 
-use crate::encode::{encode_logs_otap_batch, encode_metrics_otap_batch, encode_spans_otap_batch};
+use crate::encode::{
+    encode_logs_otap_batch, encode_metrics_otap_batch, encode_profiles_otap_batch,
+    encode_spans_otap_batch,
+};
 use crate::otap::OtapArrowRecords;
 use crate::otlp::OtlpProtoBytes;
 use crate::payload::OtapPayload;
@@ -15,6 +19,7 @@ use crate::proto::opentelemetry::logs::v1::{LogRecord, LogsData, ResourceLogs, S
 use crate::proto::opentelemetry::metrics::v1::{
     Metric, MetricsData, ResourceMetrics, ScopeMetrics,
 };
+use crate::proto::opentelemetry::profiles::v1development::ProfilesData;
 use crate::proto::opentelemetry::trace::v1::{ResourceSpans, ScopeSpans, Span, TracesData};
 use crate::testing::equiv::assert_equivalent;
 use crate::{ConversionOptions, TryIntoWithOptions};
@@ -27,8 +32,8 @@ pub fn otlp_to_otap(msg: &OtlpProtoMessage) -> OtapArrowRecords {
         OtlpProtoMessage::Logs(logs) => encode_logs(logs),
         OtlpProtoMessage::Metrics(metrics) => encode_metrics(metrics),
         OtlpProtoMessage::Traces(traces) => encode_traces(traces),
-        OtlpProtoMessage::Profiles(_) => {
-            panic!("Profiles OTLP to OTAP conversion is not supported yet")
+        OtlpProtoMessage::Profiles(profiles) => {
+            encode_profiles_otap_batch(profiles).expect("encode Profiles")
         }
     }
 }
@@ -63,8 +68,9 @@ pub fn otlp_bytes_to_message(msg: OtlpProtoBytes) -> OtlpProtoMessage {
             let td = TracesData::decode(b).expect("decode should not fail");
             OtlpProtoMessage::Traces(td)
         }
-        OtlpProtoBytes::ExportProfilesRequest(_) => {
-            panic!("Profiles OTLP byte decoding is not supported by this test helper yet")
+        OtlpProtoBytes::ExportProfilesRequest(b) => {
+            let profiles = ProfilesData::decode(b).expect("decode should not fail");
+            OtlpProtoMessage::Profiles(profiles)
         }
     }
 }
