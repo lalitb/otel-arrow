@@ -1892,7 +1892,9 @@ mod tests {
         }))
         .unwrap();
         config.start_at = StartAt::Beginning;
-        config.discovery.poll_interval = Duration::from_millis(10);
+        config.discovery.reconcile_interval = Duration::from_millis(100);
+        config.discovery.reconcile_jitter_percent = 0;
+        config.reader.eof_reprobe_interval = Duration::from_millis(10);
         config.limits.max_tracked_files = 1;
         config.limits.max_pending_candidates = 1;
         config.limits.max_open_files = 1;
@@ -2224,7 +2226,9 @@ mod tests {
             let total_files_u32 =
                 u32::try_from(total_files).expect("tracked file population fits u32");
             config.start_at = StartAt::Beginning;
-            config.discovery.poll_interval = Duration::from_millis(50);
+            config.discovery.reconcile_interval = Duration::from_millis(100);
+            config.discovery.reconcile_jitter_percent = 0;
+            config.reader.eof_reprobe_interval = Duration::from_millis(50);
             config.identity.fingerprint_bytes = 32;
             config.on_decode_error = OnDecodeError::PreserveRaw;
             config.framing.max_line_bytes =

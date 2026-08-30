@@ -19,7 +19,9 @@ use super::admission::AdmissionController;
 use super::{
     DiscoveredCandidate, DiscoveryError, DiscoveryIssue, ReconciliationBatch, RevocationReason,
 };
-use crate::receivers::filelog_receiver::config::{RuntimeConfig, glob_literal_prefix};
+use crate::receivers::filelog_receiver::config::{
+    RuntimeConfig, glob_literal_prefix, reconciliation_delay_bounds_ns,
+};
 use crate::receivers::filelog_receiver::identity::IdentityError;
 use crate::receivers::filelog_receiver::identity::platform::{
     encode_advisory_path, open_candidate_at_cancellable,
@@ -50,6 +52,46 @@ enum StableCandidateObservation {
     Revoked(crate::receivers::filelog_receiver::checkpoint::Locator),
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReconciliationSchedule {
+    pub(super) minimum_delay_ns: u64,
+    pub(super) maximum_delay_ns: u64,
+}
+
+impl ReconciliationSchedule {
+    fn from_runtime(config: &RuntimeConfig) -> Self {
+        let (minimum_delay_ns, maximum_delay_ns) = reconciliation_delay_bounds_ns(
+            config.discovery.reconcile_interval,
+            config.discovery.reconcile_jitter_percent,
+        )
+        .expect("validated reconciliation delay bounds remain representable");
+        Self {
+            minimum_delay_ns,
+            maximum_delay_ns,
+        }
+    }
+
+    pub(crate) fn delay_for_sample(self, sample: u64) -> Result<Duration, DiscoveryError> {
+        let width = self
+            .maximum_delay_ns
+            .checked_sub(self.minimum_delay_ns)
+            .and_then(|spread| spread.checked_add(1))
+            .ok_or(DiscoveryError::ScheduleOverflow {
+                field: "discovery reconciliation jitter range",
+            })?;
+        let selected = self.minimum_delay_ns.checked_add(sample % width).ok_or(
+            DiscoveryError::ScheduleOverflow {
+                field: "discovery reconciliation jitter selection",
+            },
+        )?;
+        Ok(Duration::from_nanos(selected))
+    }
+
+    pub(crate) fn next_delay(self) -> Result<Duration, DiscoveryError> {
+        self.delay_for_sample(rand::random())
+    }
+}
+
 /// Fully compiled and bounded filesystem-discovery plan.
 #[derive(Debug, Clone)]
 pub(crate) struct DiscoveryPlan {
@@ -62,7 +104,7 @@ pub(crate) struct DiscoveryPlan {
     fingerprint_bytes: u16,
     ignored_header_bytes: u32,
     ignore_older_than: Duration,
-    poll_interval: Duration,
+    reconciliation_schedule: ReconciliationSchedule,
     max_pending_candidates: usize,
     max_tracked_files: usize,
     max_candidate_events: usize,
@@ -144,7 +186,7 @@ impl DiscoveryPlan {
             ignored_header_bytes: u32::try_from(config.identity.ignored_header_bytes)
                 .expect("validated ignored_header_bytes fits u32"),
             ignore_older_than: config.ignore_older_than,
-            poll_interval: config.discovery.poll_interval,
+            reconciliation_schedule: ReconciliationSchedule::from_runtime(config),
             max_pending_candidates,
             max_tracked_files,
             max_candidate_events,
@@ -152,8 +194,8 @@ impl DiscoveryPlan {
         })
     }
 
-    pub(crate) fn poll_interval(&self) -> Duration {
-        self.poll_interval
+    pub(crate) fn reconciliation_schedule(&self) -> ReconciliationSchedule {
+        self.reconciliation_schedule
     }
 
     pub(crate) fn max_pending_candidates(&self) -> usize {

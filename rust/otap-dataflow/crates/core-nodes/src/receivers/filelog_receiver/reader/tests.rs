@@ -9,6 +9,7 @@ use tempfile::tempdir;
 
 use super::*;
 use crate::receivers::filelog_receiver::checkpoint::AdvisoryPath;
+use crate::receivers::filelog_receiver::config::{Config, RuntimeConfig};
 use crate::receivers::filelog_receiver::identity::matcher::IdentityMatch;
 use crate::receivers::filelog_receiver::identity::platform::open_candidate;
 
@@ -34,6 +35,26 @@ fn settings_with_fingerprint(
         fingerprint_bytes,
         ..settings(max_readers, max_open_files, turn_bytes)
     }
+}
+
+/// Scenario: discovery reconciles once per day while admitted EOF readers
+/// re-probe every 10 milliseconds.
+/// Guarantees: `ReaderSettings` consumes only
+/// `reader.eof_reprobe_interval`; discovery cadence cannot round EOF probes
+/// up or trigger directory traversal.
+#[test]
+fn eof_reprobe_cadence_is_independent_from_reconciliation() {
+    let mut config: Config = serde_json::from_value(serde_json::json!({
+        "include": ["app.log"],
+        "checkpoint": { "id": "reader-cadence" }
+    }))
+    .unwrap();
+    config.discovery.reconcile_interval = Duration::from_secs(24 * 60 * 60);
+    config.reader.eof_reprobe_interval = Duration::from_millis(10);
+    let runtime = RuntimeConfig::from_config(config, "reader-cadence").unwrap();
+
+    let settings = ReaderSettings::from_runtime(&runtime);
+    assert_eq!(settings.eof_probe_interval, Duration::from_millis(10));
 }
 
 fn file_id(seed: u8) -> FileId {

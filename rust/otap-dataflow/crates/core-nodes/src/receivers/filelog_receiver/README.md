@@ -74,7 +74,10 @@ config:
   max_recursion_depth: 64
   start_at: end
   discovery:
-    poll_interval: 5s
+    reconcile_interval: 5s
+    reconcile_jitter_percent: 10
+  reader:
+    eof_reprobe_interval: 250ms
   ignore_older_than: 0s
   identity:
     fingerprint_bytes: 1000
@@ -135,6 +138,12 @@ Important policy values are:
 | `framing.max_log_size_behavior` | `split`, `truncate` | Emits bounded fragments or a bounded truncated record and discards through the line boundary. |
 | `rotation.on_truncate` | `fail`, `read_new` | Durably quarantines detectable truncation or explicitly resets to a new file epoch. |
 | `on_nack` | `fail`, `drop_and_continue` | Fails the receiver or durably advances under an explicit loss policy after terminal delivery failure. |
+
+`discovery.reconcile_interval` is independently jittered after each completed
+scan by `discovery.reconcile_jitter_percent`. `reader.eof_reprobe_interval`
+rechecks only an admitted reader's validated handle and never triggers
+filesystem traversal. Reconciliation accepts `100ms..=24h` with `0..=25`
+percent jitter; EOF reprobe accepts `10ms..=1h`.
 
 `checkpoint.compact_after_bytes` bounds the complete WAL, including its
 56-byte header. It must be at least 16,777,312 bytes so a fresh WAL can hold

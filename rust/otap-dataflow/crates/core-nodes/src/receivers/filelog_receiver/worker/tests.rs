@@ -75,7 +75,9 @@ fn runtime_config_with(
     }))
     .unwrap();
     config.start_at = crate::receivers::filelog_receiver::StartAt::Beginning;
-    config.discovery.poll_interval = Duration::from_millis(10);
+    config.discovery.reconcile_interval = Duration::from_millis(100);
+    config.discovery.reconcile_jitter_percent = 0;
+    config.reader.eof_reprobe_interval = Duration::from_millis(10);
     config.limits.max_tracked_files = 4;
     config.limits.max_pending_candidates = 4;
     config.limits.max_open_files = 4;
@@ -2922,12 +2924,12 @@ async fn exact_bound_rotation_tail_finalizes_in_its_ack_transaction() {
 }
 
 #[cfg(unix)]
-/// Scenario: the EOF discovery cadence is much longer than `rotate_wait`
+/// Scenario: the EOF reprobe cadence is much longer than `rotate_wait`
 /// after a late write to a removed file.
 /// Guarantees: finalization runs at the rotation deadline rather than the
 /// next ordinary EOF probe, leaving the old identity finalized before stop.
 #[tokio::test]
-async fn rotate_wait_is_not_rounded_up_to_discovery_poll_interval() {
+async fn rotate_wait_is_not_rounded_up_to_eof_reprobe_interval() {
     let directory = tempdir().unwrap();
     let source = directory.path().join("deadline.log");
     let rotated = directory.path().join("deadline.log.1");
@@ -2935,7 +2937,7 @@ async fn rotate_wait_is_not_rounded_up_to_discovery_poll_interval() {
     let mut late_writer = OpenOptions::new().append(true).open(&source).unwrap();
     let namespace = directory.path().join("checkpoint");
     let mut runtime = runtime_config(source.to_str().unwrap(), &namespace, 1);
-    runtime.discovery.poll_interval = Duration::from_millis(500);
+    runtime.reader.eof_reprobe_interval = Duration::from_millis(500);
     runtime.rotation.rotate_wait = Duration::from_millis(40);
     let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
     let worker = spawn_worker(runtime.clone(), event_tx).unwrap();
@@ -3769,7 +3771,7 @@ fn idle_retention_deadline_reclaims_quiet_namespace() {
     let missing = directory.path().join("missing.log");
     let config = runtime_config_with(missing.to_str().unwrap(), &namespace, 1, |config| {
         config.checkpoint.retention = Duration::from_millis(1);
-        config.discovery.poll_interval = Duration::from_secs(60);
+        config.discovery.reconcile_interval = Duration::from_secs(60);
     });
     let file_id = FileId::from_bytes([105; 16]);
     let mut seeded = CheckpointStore::open(StoreOptions::from_runtime_config(&config)).unwrap();

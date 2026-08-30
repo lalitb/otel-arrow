@@ -18,7 +18,7 @@
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use globset::{GlobBuilder, GlobMatcher};
 use regex::Regex;
@@ -88,8 +88,22 @@ const DEFAULT_FINGERPRINT_BYTES: u64 = 1000;
 const DEFAULT_IGNORED_HEADER_BYTES: u64 = 0;
 /// Default `max_recursion_depth`.
 const DEFAULT_MAX_RECURSION_DEPTH: u32 = 64;
-/// Default `discovery.poll_interval`.
-const DEFAULT_DISCOVERY_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Minimum `discovery.reconcile_interval`.
+const MIN_RECONCILE_INTERVAL: Duration = Duration::from_millis(100);
+/// Maximum `discovery.reconcile_interval`.
+const MAX_RECONCILE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Default `discovery.reconcile_interval`.
+const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+/// Default `discovery.reconcile_jitter_percent`.
+const DEFAULT_RECONCILE_JITTER_PERCENT: u8 = 10;
+/// Maximum `discovery.reconcile_jitter_percent`.
+const MAX_RECONCILE_JITTER_PERCENT: u8 = 25;
+/// Minimum `reader.eof_reprobe_interval`.
+const MIN_EOF_REPROBE_INTERVAL: Duration = Duration::from_millis(10);
+/// Maximum `reader.eof_reprobe_interval`.
+const MAX_EOF_REPROBE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Default `reader.eof_reprobe_interval`.
+const DEFAULT_EOF_REPROBE_INTERVAL: Duration = Duration::from_millis(250);
 /// Default `ignore_older_than` (0 disables the filter).
 const DEFAULT_IGNORE_OLDER_THAN: Duration = Duration::ZERO;
 /// Maximum total include-plus-exclude glob count.
@@ -349,24 +363,57 @@ pub enum OnNack {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiscoveryConfig {
-    /// Periodic glob reconciliation interval.
+    /// Base delay between completed full reconciliation passes.
     #[serde(
-        default = "DiscoveryConfig::default_poll_interval",
+        default = "DiscoveryConfig::default_reconcile_interval",
         with = "humantime_serde"
     )]
-    pub poll_interval: Duration,
+    pub reconcile_interval: Duration,
+    /// Per-pass symmetric jitter percentage.
+    #[serde(default = "DiscoveryConfig::default_reconcile_jitter_percent")]
+    pub reconcile_jitter_percent: u8,
 }
 
 impl DiscoveryConfig {
-    const fn default_poll_interval() -> Duration {
-        DEFAULT_DISCOVERY_POLL_INTERVAL
+    const fn default_reconcile_interval() -> Duration {
+        DEFAULT_RECONCILE_INTERVAL
+    }
+    const fn default_reconcile_jitter_percent() -> u8 {
+        DEFAULT_RECONCILE_JITTER_PERCENT
     }
 }
 
 impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
-            poll_interval: Self::default_poll_interval(),
+            reconcile_interval: Self::default_reconcile_interval(),
+            reconcile_jitter_percent: Self::default_reconcile_jitter_percent(),
+        }
+    }
+}
+
+/// Admitted-reader scheduling cadence.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReaderConfig {
+    /// Delay before reprobing one validated handle at temporary EOF.
+    #[serde(
+        default = "ReaderConfig::default_eof_reprobe_interval",
+        with = "humantime_serde"
+    )]
+    pub eof_reprobe_interval: Duration,
+}
+
+impl ReaderConfig {
+    const fn default_eof_reprobe_interval() -> Duration {
+        DEFAULT_EOF_REPROBE_INTERVAL
+    }
+}
+
+impl Default for ReaderConfig {
+    fn default() -> Self {
+        Self {
+            eof_reprobe_interval: Self::default_eof_reprobe_interval(),
         }
     }
 }
@@ -775,6 +822,9 @@ pub struct Config {
     /// Discovery scan cadence.
     #[serde(default)]
     pub discovery: DiscoveryConfig,
+    /// Admitted-reader scheduling cadence.
+    #[serde(default)]
+    pub reader: ReaderConfig,
     /// Skip admission of a candidate whose modification time is older than
     /// this. Zero disables the filter.
     #[serde(
@@ -845,6 +895,7 @@ impl Default for Config {
             max_recursion_depth: Self::default_max_recursion_depth(),
             start_at: StartAt::default(),
             discovery: DiscoveryConfig::default(),
+            reader: ReaderConfig::default(),
             ignore_older_than: Self::default_ignore_older_than(),
             identity: IdentityConfig::default(),
             encoding: Encoding::default(),
@@ -1061,6 +1112,8 @@ pub(crate) struct RuntimeConfig {
     pub(crate) start_at: StartAt,
     /// Discovery scan cadence.
     pub(crate) discovery: DiscoveryConfig,
+    /// Admitted-reader scheduling cadence.
+    pub(crate) reader: ReaderConfig,
     /// Admission age filter; zero disables it.
     pub(crate) ignore_older_than: Duration,
     /// File identity matching configuration.
@@ -1154,6 +1207,7 @@ impl RuntimeConfig {
             max_recursion_depth,
             start_at,
             discovery,
+            reader,
             ignore_older_than,
             identity,
             encoding,
@@ -1176,6 +1230,7 @@ impl RuntimeConfig {
             )));
         }
         let discovery = validate_discovery(discovery)?;
+        let reader = validate_reader(reader)?;
         if drain_timeout.is_zero() {
             return Err(invalid("drain_timeout must be greater than zero"));
         }
@@ -1205,6 +1260,7 @@ impl RuntimeConfig {
             max_recursion_depth,
             start_at,
             discovery,
+            reader,
             ignore_older_than,
             identity,
             encoding,
@@ -1300,18 +1356,67 @@ fn validate_identity(
     Ok(identity)
 }
 
-/// Validates `discovery.poll_interval`. Unlike `ignore_older_than`,
-/// `force_flush_period`, `checkpoint.sync_interval`, and
-/// `checkpoint.retention`, the discovery cadence has no documented "zero
-/// disables" meaning: a zero poll interval would mean the scanner never
-/// reconciles new or removed files.
 fn validate_discovery(
     discovery: DiscoveryConfig,
 ) -> Result<DiscoveryConfig, otap_df_config::error::Error> {
-    if discovery.poll_interval.is_zero() {
-        return Err(invalid("discovery.poll_interval must be greater than zero"));
+    if !(MIN_RECONCILE_INTERVAL..=MAX_RECONCILE_INTERVAL).contains(&discovery.reconcile_interval) {
+        return Err(invalid(
+            "discovery.reconcile_interval must be in 100ms..=24h",
+        ));
+    }
+    if discovery.reconcile_jitter_percent > MAX_RECONCILE_JITTER_PERCENT {
+        return Err(invalid(
+            "discovery.reconcile_jitter_percent must be in 0..=25",
+        ));
+    }
+    let Some((_, maximum_delay_ns)) = reconciliation_delay_bounds_ns(
+        discovery.reconcile_interval,
+        discovery.reconcile_jitter_percent,
+    ) else {
+        return Err(invalid(
+            "discovery reconciliation jitter arithmetic overflows u64 nanoseconds",
+        ));
+    };
+    if Instant::now()
+        .checked_add(Duration::from_nanos(maximum_delay_ns))
+        .is_none()
+    {
+        return Err(invalid(
+            "discovery reconciliation deadline exceeds the host clock domain",
+        ));
     }
     Ok(discovery)
+}
+
+fn validate_reader(reader: ReaderConfig) -> Result<ReaderConfig, otap_df_config::error::Error> {
+    if !(MIN_EOF_REPROBE_INTERVAL..=MAX_EOF_REPROBE_INTERVAL).contains(&reader.eof_reprobe_interval)
+    {
+        return Err(invalid("reader.eof_reprobe_interval must be in 10ms..=1h"));
+    }
+    if u64::try_from(reader.eof_reprobe_interval.as_nanos()).is_err()
+        || Instant::now()
+            .checked_add(reader.eof_reprobe_interval)
+            .is_none()
+    {
+        return Err(invalid(
+            "reader.eof_reprobe_interval exceeds the host clock domain",
+        ));
+    }
+    Ok(reader)
+}
+
+pub(crate) fn reconciliation_delay_bounds_ns(
+    interval: Duration,
+    jitter_percent: u8,
+) -> Option<(u64, u64)> {
+    let base_ns = u64::try_from(interval.as_nanos()).ok()?;
+    let spread_ns = base_ns
+        .checked_mul(u64::from(jitter_percent))?
+        .checked_div(100)?;
+    Some((
+        base_ns.checked_sub(spread_ns)?,
+        base_ns.checked_add(spread_ns)?,
+    ))
 }
 
 fn validate_limits(limits: LimitsConfig) -> Result<LimitsConfig, otap_df_config::error::Error> {
@@ -2335,7 +2440,9 @@ mod tests {
         assert!(!cfg.follow_symlinks);
         assert_eq!(cfg.max_recursion_depth, 64);
         assert_eq!(cfg.start_at, StartAt::End);
-        assert_eq!(cfg.discovery.poll_interval, Duration::from_secs(5));
+        assert_eq!(cfg.discovery.reconcile_interval, Duration::from_secs(5));
+        assert_eq!(cfg.discovery.reconcile_jitter_percent, 10);
+        assert_eq!(cfg.reader.eof_reprobe_interval, Duration::from_millis(250));
         assert_eq!(cfg.ignore_older_than, Duration::ZERO);
         assert_eq!(cfg.identity.fingerprint_bytes, 1000);
         assert_eq!(cfg.identity.ignored_header_bytes, 0);
@@ -2569,17 +2676,85 @@ mod tests {
         assert!(error.to_string().contains("1..="));
     }
 
-    /// Scenario: `discovery.poll_interval` is set to zero.
-    /// Guarantees: a zero poll interval is rejected; unlike
-    /// `force_flush_period`, `ignore_older_than`, `checkpoint.sync_interval`,
-    /// and `checkpoint.retention`, it has no documented "zero disables"
-    /// meaning -- a zero interval would mean discovery never reconciles.
+    /// Scenario: reconciliation and EOF intervals are exercised exactly at
+    /// their inclusive bounds and one step outside, with jitter at 0, 25,
+    /// and 26 percent.
+    /// Guarantees: only `100ms..=24h`, `10ms..=1h`, and jitter `0..=25` are
+    /// accepted before any worker or discovery thread starts.
     #[test]
-    fn discovery_poll_interval_must_be_nonzero() {
+    fn discovery_and_reader_cadence_bounds_are_exact() {
         let mut cfg = minimal_config();
-        cfg.discovery.poll_interval = Duration::ZERO;
-        let err = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
-        assert!(err.to_string().contains("poll_interval"));
+        cfg.discovery.reconcile_interval = MIN_RECONCILE_INTERVAL;
+        cfg.discovery.reconcile_jitter_percent = 0;
+        cfg.reader.eof_reprobe_interval = MIN_EOF_REPROBE_INTERVAL;
+        assert!(RuntimeConfig::from_config(cfg, "node-1").is_ok());
+
+        let mut cfg = minimal_config();
+        cfg.discovery.reconcile_interval = MAX_RECONCILE_INTERVAL;
+        cfg.discovery.reconcile_jitter_percent = MAX_RECONCILE_JITTER_PERCENT;
+        cfg.reader.eof_reprobe_interval = MAX_EOF_REPROBE_INTERVAL;
+        assert!(RuntimeConfig::from_config(cfg, "node-1").is_ok());
+
+        let mut cfg = minimal_config();
+        cfg.discovery.reconcile_interval = MIN_RECONCILE_INTERVAL - Duration::from_nanos(1);
+        let error = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
+        assert!(error.to_string().contains("100ms..=24h"), "{error}");
+
+        let mut cfg = minimal_config();
+        cfg.discovery.reconcile_interval = MAX_RECONCILE_INTERVAL
+            .checked_add(Duration::from_nanos(1))
+            .unwrap();
+        let error = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
+        assert!(error.to_string().contains("100ms..=24h"), "{error}");
+
+        let mut cfg = minimal_config();
+        cfg.discovery.reconcile_jitter_percent = MAX_RECONCILE_JITTER_PERCENT + 1;
+        let error = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
+        assert!(error.to_string().contains("0..=25"), "{error}");
+
+        let mut cfg = minimal_config();
+        cfg.reader.eof_reprobe_interval = MIN_EOF_REPROBE_INTERVAL - Duration::from_nanos(1);
+        let error = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
+        assert!(error.to_string().contains("10ms..=1h"), "{error}");
+
+        let mut cfg = minimal_config();
+        cfg.reader.eof_reprobe_interval = MAX_EOF_REPROBE_INTERVAL
+            .checked_add(Duration::from_nanos(1))
+            .unwrap();
+        let error = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
+        assert!(error.to_string().contains("10ms..=1h"), "{error}");
+    }
+
+    /// Scenario: a config uses the superseded filelog
+    /// `discovery.poll_interval` field.
+    /// Guarantees: the unreleased implementation accepts only the
+    /// authoritative `reconcile_interval` shape and reports the old key as
+    /// unknown rather than silently coupling discovery and EOF cadence.
+    #[test]
+    fn superseded_discovery_poll_interval_is_rejected() {
+        let error = serde_json::from_value::<Config>(serde_json::json!({
+            "include": ["app.log"],
+            "discovery": { "poll_interval": "5s" }
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("poll_interval"), "{error}");
+    }
+
+    /// Scenario: checked reconciliation jitter arithmetic is evaluated at
+    /// zero jitter, the default 10 percent, and an unrepresentable duration.
+    /// Guarantees: exact floor-based symmetric bounds are derived without
+    /// saturation and overflow is reported as `None`.
+    #[test]
+    fn reconciliation_jitter_bounds_use_checked_nanoseconds() {
+        assert_eq!(
+            reconciliation_delay_bounds_ns(Duration::from_secs(5), 0),
+            Some((5_000_000_000, 5_000_000_000))
+        );
+        assert_eq!(
+            reconciliation_delay_bounds_ns(Duration::from_secs(5), 10),
+            Some((4_500_000_000, 5_500_000_000))
+        );
+        assert_eq!(reconciliation_delay_bounds_ns(Duration::MAX, 25), None);
     }
 
     /// Scenario: `drain_timeout` is set to zero.

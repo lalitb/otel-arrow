@@ -316,11 +316,12 @@ The Phase 3 protocol may replace the Phase 1 candidate-to-reader adapter without
 changing byte reading, framing, or the logical Ack-gated progress model. It will change
 the reader-facing ownership messages and checkpoint implementation.
 
-The Phase 1 implementation is a dedicated **discovery thread** running glob reconciliation
-(include minus exclude, `ignore_older_than` filter) on `poll_interval`. Running
-discovery on its own thread keeps three stall classes off the read path: slow directory
-scans (large or network-mounted directories), fingerprint computation bursts (startup,
-rotation storms), and `stat` storms. Discovery output invariants:
+The Phase 1 implementation is a dedicated **discovery thread** running glob
+reconciliation (include minus exclude, `ignore_older_than` filter) on the
+independently jittered `discovery.reconcile_interval`. Running discovery on its
+own thread keeps three stall classes off the read path: slow directory scans
+(large or network-mounted directories), fingerprint computation bursts
+(startup, rotation storms), and `stat` storms. Discovery output invariants:
 
 - **One event stream, ordered.** Candidate events are delivered over a single bounded
   channel, so a `Removed` event cannot be overtaken by a later `Observed` event for the
@@ -359,11 +360,12 @@ complete.
 Rapid file growth remains bounded by `max_read_bytes_per_turn`, record and batch bounds,
 and downstream backpressure. When downstream is blocked, the receiver stops reading and
 leaves unread bytes in the file rather than buffering the growing file in memory. The
-expected Phase 1 discovery latency, while admission capacity is available and no earlier
-candidate overflow is pending, is one configured `poll_interval` plus scan and
-candidate-handoff time. Discovery scan duration and candidate-channel delay are
-measured so operators can detect when that expectation is not met. Phase 2 notifications
-may improve latency but do not change the correctness mechanism.
+expected Phase 1 discovery latency, while admission capacity is available and
+no earlier candidate overflow is pending, is one sampled reconciliation delay
+within the configured jitter range plus scan and candidate-handoff time.
+Discovery scan duration and candidate-channel delay are measured so operators
+can detect when that expectation is not met. Phase 2 notifications may improve
+latency but do not change the correctness mechanism.
 
 Lifecycle shutdown sets a direct cooperative cancellation signal in addition to using
 the bounded command channel. Discovery checks it between traversal entries, path
@@ -775,9 +777,10 @@ Reader scheduling within the worker:
 - `max_open_files` bounds resident tail-reader handles. Discovery closes its first
   stability observation before opening the second and therefore adds at most one
   transient probe handle outside that resident pool.
-- A reader that observes EOF is re-probed at `discovery.poll_interval` unless an earlier
-  framing or lifecycle deadline applies. It is not continuously requeued, so EOF files
-  cannot spin or crowd ready files out of the round-robin schedule.
+- A reader that observes EOF is re-probed at
+  `reader.eof_reprobe_interval` unless an earlier framing or lifecycle
+  deadline applies. It is not continuously requeued, so EOF files cannot spin
+  or crowd ready files out of the round-robin schedule.
 - Only readers holding one of those open-file slots retain in-memory decoding, physical
   line, or multiline buffers. Closing a reader discards any uncommitted framing buffers;
   reopening starts at the durable committed offset and reconstructs them from source
@@ -2363,7 +2366,10 @@ receivers:
       max_recursion_depth: 64
       start_at: end                            # beginning | end; checkpoint wins
       discovery:
-        poll_interval: 5s
+        reconcile_interval: 5s
+        reconcile_jitter_percent: 10
+      reader:
+        eof_reprobe_interval: 250ms
       ignore_older_than: 0s                    # 0 = disabled
       identity:
         fingerprint_bytes: 1000                # min 16

@@ -156,7 +156,7 @@ fn discovery_loop(
     message_tx: SyncSender<DiscoveryMessage>,
     shutdown_requested: Arc<AtomicBool>,
 ) {
-    let poll_interval = plan.poll_interval();
+    let reconciliation_schedule = plan.reconciliation_schedule();
     let mut scanner =
         FilesystemScanner::with_shutdown_signal(plan, Arc::clone(&shutdown_requested));
     loop {
@@ -168,6 +168,7 @@ fn discovery_loop(
                 break;
             }
         };
+        let completed_at = batch.completed_at;
         let scan_requested = match send_batch_interruptibly(
             batch,
             &mut admission,
@@ -186,13 +187,26 @@ fn discovery_loop(
             continue;
         }
 
-        let deadline = Instant::now().checked_add(poll_interval);
+        let delay = match reconciliation_schedule.next_delay() {
+            Ok(delay) => delay,
+            Err(error) => {
+                send_failure(error, &command_rx, &message_tx, &shutdown_requested);
+                break;
+            }
+        };
+        let deadline = match reconciliation_deadline(completed_at, delay) {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                send_failure(error, &command_rx, &message_tx, &shutdown_requested);
+                break;
+            }
+        };
         loop {
             if shutdown_requested.load(Ordering::Acquire) {
                 let _ = message_tx.try_send(DiscoveryMessage::Stopped);
                 return;
             }
-            let Some(wait) = next_poll_wait(deadline, Instant::now()) else {
+            let Some(wait) = next_reconciliation_wait(deadline, Instant::now()) else {
                 break;
             };
             match command_rx.recv_timeout(wait) {
@@ -215,17 +229,19 @@ fn discovery_loop(
     let _ = message_tx.try_send(DiscoveryMessage::Stopped);
 }
 
-fn next_poll_wait(deadline: Option<Instant>, now: Instant) -> Option<Duration> {
-    match deadline {
-        Some(deadline) => {
-            let remaining = deadline.checked_duration_since(now)?;
-            if remaining.is_zero() {
-                None
-            } else {
-                Some(remaining.min(SHUTDOWN_SIGNAL_POLL))
-            }
-        }
-        None => Some(SHUTDOWN_SIGNAL_POLL),
+fn reconciliation_deadline(now: Instant, delay: Duration) -> Result<Instant, DiscoveryError> {
+    now.checked_add(delay)
+        .ok_or(DiscoveryError::ScheduleOverflow {
+            field: "discovery reconciliation deadline",
+        })
+}
+
+fn next_reconciliation_wait(deadline: Instant, now: Instant) -> Option<Duration> {
+    let remaining = deadline.checked_duration_since(now)?;
+    if remaining.is_zero() {
+        None
+    } else {
+        Some(remaining.min(SHUTDOWN_SIGNAL_POLL))
     }
 }
 
@@ -399,16 +415,29 @@ mod tests {
         sender.join().unwrap();
     }
 
-    /// Scenario: an accepted poll interval is too large for
-    /// `Instant::checked_add` to produce a deadline.
-    /// Guarantees: an unrepresentable deadline waits in bounded,
-    /// command-responsive slices instead of becoming a zero-delay rescan
-    /// loop.
+    /// Scenario: a reconciliation delay cannot be added to the current
+    /// monotonic clock domain.
+    /// Guarantees: scheduling fails with a typed terminal error instead of
+    /// wrapping or entering a zero-delay rescan loop.
     #[test]
-    fn unrepresentable_poll_deadline_does_not_expire_immediately() {
-        assert_eq!(
-            next_poll_wait(None, Instant::now()),
-            Some(SHUTDOWN_SIGNAL_POLL)
-        );
+    fn unrepresentable_reconciliation_deadline_fails_closed() {
+        assert!(matches!(
+            reconciliation_deadline(Instant::now(), Duration::MAX),
+            Err(DiscoveryError::ScheduleOverflow {
+                field: "discovery reconciliation deadline"
+            })
+        ));
+    }
+
+    /// Scenario: batch handoff completes after the delay measured from the
+    /// scan's own completion time has already elapsed.
+    /// Guarantees: the next pass is immediately due instead of adding a
+    /// second full interval after channel backpressure.
+    #[test]
+    fn reconciliation_delay_is_anchored_to_scan_completion() {
+        let now = Instant::now();
+        let completed_at = now.checked_sub(Duration::from_secs(10)).unwrap();
+        let deadline = reconciliation_deadline(completed_at, Duration::from_secs(5)).unwrap();
+        assert_eq!(next_reconciliation_wait(deadline, now), None);
     }
 }

@@ -195,7 +195,11 @@ fn filelog_pipeline_config(
             Some(json!({
                 "include": [include_glob.to_string_lossy()],
                 "start_at": "beginning",
-                "discovery": { "poll_interval": "50ms" },
+                "discovery": {
+                    "reconcile_interval": "100ms",
+                    "reconcile_jitter_percent": 0
+                },
+                "reader": { "eof_reprobe_interval": "50ms" },
                 "batch": { "max_flush_period": "100ms" },
                 "retry": {
                     "max_attempts": 100,

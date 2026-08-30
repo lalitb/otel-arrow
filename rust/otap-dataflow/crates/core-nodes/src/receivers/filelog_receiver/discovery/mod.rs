@@ -302,6 +302,13 @@ pub(crate) enum DiscoveryError {
         /// Counter that could not advance.
         counter: &'static str,
     },
+    /// Checked reconciliation schedule arithmetic exceeded its
+    /// representation or the host `Instant` domain.
+    #[error("filelog discovery schedule overflowed for {field}")]
+    ScheduleOverflow {
+        /// Schedule field or operation that overflowed.
+        field: &'static str,
+    },
     /// Reader feedback did not correspond to a live discovery entry.
     #[error("invalid filelog discovery feedback for locator {locator:?}: {reason}")]
     InvalidFeedback {

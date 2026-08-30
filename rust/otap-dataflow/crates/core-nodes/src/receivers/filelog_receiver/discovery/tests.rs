@@ -10,7 +10,9 @@ use std::time::{Duration, Instant, SystemTime};
 use tempfile::TempDir;
 
 use super::admission::AdmissionController;
-use super::scanner::{DiscoveryPlan, FilesystemScanner, validate_candidate_path_stability};
+use super::scanner::{
+    DiscoveryPlan, FilesystemScanner, ReconciliationSchedule, validate_candidate_path_stability,
+};
 use super::source::{spawn_discovery, spawn_discovery_with_shutdown_signal};
 use super::*;
 use crate::receivers::filelog_receiver::checkpoint::primitives::{
@@ -74,7 +76,8 @@ fn runtime_config(root: &Path, include: Vec<String>, exclude: Vec<String>) -> Ru
     config.limits.max_tracked_files = 16;
     config.limits.max_pending_candidates = 8;
     config.limits.max_open_files = 4;
-    config.discovery.poll_interval = Duration::from_secs(60);
+    config.discovery.reconcile_interval = Duration::from_secs(60);
+    config.discovery.reconcile_jitter_percent = 0;
     let mut runtime = RuntimeConfig::from_config(config, "discovery-test").unwrap();
     runtime.checkpoint_namespace_dir = root.join(".checkpoint");
     runtime
@@ -90,6 +93,39 @@ fn scanner_and_admission(config: &RuntimeConfig) -> (FilesystemScanner, Admissio
     )
     .unwrap();
     (FilesystemScanner::new(plan), admission)
+}
+
+/// Scenario: a 5-second reconciliation interval is sampled with zero and
+/// 10-percent jitter at the deterministic lower, middle, and upper samples.
+/// Guarantees: zero jitter is exact, nonzero jitter uses the inclusive
+/// floor-based range, and selection never escapes the validated bounds.
+#[test]
+fn reconciliation_schedule_samples_exact_inclusive_bounds() {
+    let exact = ReconciliationSchedule {
+        minimum_delay_ns: 5_000_000_000,
+        maximum_delay_ns: 5_000_000_000,
+    };
+    assert_eq!(
+        exact.delay_for_sample(u64::MAX).unwrap(),
+        Duration::from_secs(5)
+    );
+
+    let jittered = ReconciliationSchedule {
+        minimum_delay_ns: 4_500_000_000,
+        maximum_delay_ns: 5_500_000_000,
+    };
+    assert_eq!(
+        jittered.delay_for_sample(0).unwrap(),
+        Duration::from_millis(4_500)
+    );
+    assert_eq!(
+        jittered.delay_for_sample(500_000_000).unwrap(),
+        Duration::from_secs(5)
+    );
+    assert_eq!(
+        jittered.delay_for_sample(1_000_000_000).unwrap(),
+        Duration::from_millis(5_500)
+    );
 }
 
 fn observed_candidates(batch: &ReconciliationBatch) -> Vec<&DiscoveredCandidate> {

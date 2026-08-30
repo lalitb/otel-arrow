@@ -58,7 +58,7 @@ impl ReaderSettings {
             max_open_files: config.limits.max_open_files as usize,
             max_read_bytes_per_turn: usize::try_from(config.limits.max_read_bytes_per_turn)
                 .expect("validated max_read_bytes_per_turn fits usize"),
-            eof_probe_interval: config.discovery.poll_interval,
+            eof_probe_interval: config.reader.eof_reprobe_interval,
             fingerprint_bytes: u16::try_from(config.identity.fingerprint_bytes)
                 .expect("validated fingerprint_bytes fits u16"),
             ignored_header_bytes: u32::try_from(config.identity.ignored_header_bytes)
