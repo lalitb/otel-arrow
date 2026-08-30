@@ -10,6 +10,7 @@
 //! `docs/filelog-checkpoint-format.md`.
 
 use super::apply::CheckpointTable;
+use super::current_marker;
 use super::error::{ApplyError, DecodeError, EncodeError};
 use super::primitives::{
     AdvisoryPath, CommittedFrontierGuard, FINGERPRINT_MAX_BYTES, FileId, FramingResume,
@@ -200,6 +201,47 @@ fn structural_maximum_fingerprint_operation_decodes_boundedly() {
     };
     assert_eq!(update.expected_fingerprint.len(), FINGERPRINT_MAX_BYTES);
     assert_eq!(update.new_fingerprint.len(), FINGERPRINT_MAX_BYTES);
+}
+
+/// Scenario: decoding and re-encoding the independently generated
+/// generation-7 `CURRENT` fixture.
+/// Guarantees: the fixed marker bytes select exactly generation 7 and the
+/// Rust encoder reproduces the independent 24-byte fixture byte-for-byte.
+#[test]
+fn current_marker_matches_independent_vector() {
+    assert_eq!(
+        current_marker::decode_current_marker(CURRENT_GENERATION_7).unwrap(),
+        7
+    );
+    assert_eq!(
+        current_marker::encode_current_marker(7),
+        CURRENT_GENERATION_7
+    );
+}
+
+/// Scenario: independently generated generation-0 snapshot and WAL fixtures
+/// contain no records or transactions beyond their required headers/footer.
+/// Guarantees: both decode as empty authoritative artifacts and Rust
+/// re-encoding reproduces the exact independent bytes.
+#[test]
+fn empty_snapshot_and_wal_header_match_independent_vectors() {
+    let snapshot =
+        snapshot::decode_snapshot(SNAPSHOT_EMPTY_GENERATION_0, &TEST_NAMESPACE_DIGEST).unwrap();
+    assert_eq!(snapshot.generation, 0);
+    assert!(snapshot.records.is_empty());
+    assert_eq!(
+        snapshot::encode_snapshot(0, TEST_NAMESPACE_ID, &[]).unwrap(),
+        SNAPSHOT_EMPTY_GENERATION_0
+    );
+
+    let wal = wal::decode_wal(WAL_HEADER_GENERATION_0, &TEST_NAMESPACE_DIGEST).unwrap();
+    assert_eq!(wal.generation, 0);
+    assert!(wal.transactions.is_empty());
+    assert_eq!(wal.torn_tail_bytes, 0);
+    assert_eq!(
+        wal::encode_wal(0, TEST_NAMESPACE_ID, &[]).unwrap(),
+        WAL_HEADER_GENERATION_0
+    );
 }
 
 /// Scenario: decoding the checked-in two-record snapshot golden vector.
