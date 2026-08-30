@@ -181,6 +181,7 @@ pub(crate) const ATTR_KEY_FRAGMENT_SOURCE_START: &str = "otel_arrow.filelog.frag
 pub(crate) const ATTR_KEY_FRAGMENT_SOURCE_END: &str = "otel_arrow.filelog.fragment.source.end";
 pub(crate) const ATTR_KEY_RECORD_TRUNCATED: &str = "otel_arrow.filelog.record.truncated";
 pub(crate) const ATTR_KEY_FLUSH_REASON: &str = "otel_arrow.filelog.flush.reason";
+pub(crate) const ATTR_KEY_TERMINAL_UNTERMINATED: &str = "otel.arrow.filelog.terminal_unterminated";
 pub(crate) const ATTR_KEY_DECODE_ERROR_POLICY: &str = "otel_arrow.filelog.decode.error.policy";
 pub(crate) const ATTR_KEY_DECODE_ERROR_COUNT: &str = "otel_arrow.filelog.decode.error_count";
 
@@ -1003,7 +1004,7 @@ pub(crate) fn configured_logical_record_size(
     oversize_behavior: MaxLogSizeBehavior,
     decode_policy: OnDecodeError,
 ) -> Result<u64, LogicalSizeError> {
-    const MAX_ATTRIBUTES: usize = 14;
+    const MAX_ATTRIBUTES: usize = 15;
     const EMPTY: LogicalAttributeSize = LogicalAttributeSize {
         key_bytes: 0,
         value_bytes: 0,
@@ -1066,6 +1067,7 @@ pub(crate) fn configured_logical_record_size(
         }
     }
     push(ATTR_KEY_FLUSH_REASON, "oversize_line_boundary".len() as u64)?;
+    push(ATTR_KEY_TERMINAL_UNTERMINATED, logical_bool_value_len(true))?;
     match decode_policy {
         OnDecodeError::PreserveRaw => {
             push(ATTR_KEY_DECODE_ERROR_POLICY, "preserve_raw".len() as u64)?;
@@ -3764,6 +3766,8 @@ mod tests {
             )
             .unwrap(),
             LogicalAttributeSize::new(ATTR_KEY_FLUSH_REASON, "oversize_line_boundary".len() as u64)
+                .unwrap(),
+            LogicalAttributeSize::new(ATTR_KEY_TERMINAL_UNTERMINATED, logical_bool_value_len(true))
                 .unwrap(),
             LogicalAttributeSize::new(ATTR_KEY_DECODE_ERROR_POLICY, "preserve_raw".len() as u64)
                 .unwrap(),

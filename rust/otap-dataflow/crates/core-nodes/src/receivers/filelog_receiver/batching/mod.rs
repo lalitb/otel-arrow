@@ -32,10 +32,10 @@ use super::config::{
     ATTR_KEY_FRAGMENT_ID, ATTR_KEY_FRAGMENT_INDEX, ATTR_KEY_FRAGMENT_LAST,
     ATTR_KEY_FRAGMENT_SOURCE_END, ATTR_KEY_FRAGMENT_SOURCE_START, ATTR_KEY_LOG_FILE_NAME,
     ATTR_KEY_LOG_FILE_PATH, ATTR_KEY_PATH_ENCODING, ATTR_KEY_PATH_RESOLVED, ATTR_KEY_RECORD_NUMBER,
-    ATTR_KEY_RECORD_OFFSET, ATTR_KEY_RECORD_TRUNCATED, ENCODED_PATH_DISCRIMINATOR,
-    ENCODED_PATH_PREFIX, LogicalAttributeSize, LogicalSizeError, MetadataConfig, RuntimeConfig,
-    checked_logical_record_size, logical_bool_value_len, logical_int_value_len,
-    logical_string_value_len,
+    ATTR_KEY_RECORD_OFFSET, ATTR_KEY_RECORD_TRUNCATED, ATTR_KEY_TERMINAL_UNTERMINATED,
+    ENCODED_PATH_DISCRIMINATOR, ENCODED_PATH_PREFIX, LogicalAttributeSize, LogicalSizeError,
+    MetadataConfig, RuntimeConfig, checked_logical_record_size, logical_bool_value_len,
+    logical_int_value_len, logical_string_value_len,
 };
 use super::framing::{
     DecodeOutcome, FlushReason, FragmentMetadata, FramedBody, FramedRecord, fragment_id,
@@ -135,6 +135,37 @@ pub(crate) struct ProgressDelta {
 }
 
 impl ProgressDelta {
+    /// Builds recordless clean progress used only to finalize framing-only
+    /// source bytes, such as a stripped BOM at permanent EOF.
+    pub(crate) fn terminal_empty_finalization(
+        file_id: FileId,
+        base: ProgressBase,
+        final_offset: u64,
+        final_window: CommittedFrontierWindow,
+        last_seen_time_unix_nano: u64,
+    ) -> Result<Self, BatchError> {
+        if final_offset <= base.committed_offset
+            || base.framing_resume != FramingResume::Clean
+            || final_window.end_offset() != final_offset
+        {
+            return Err(BatchError::InvalidProgress {
+                file_id,
+                reason: "terminal empty progress requires an advancing clean frontier window",
+            });
+        }
+        Ok(Self {
+            file_id,
+            expected_file_epoch: base.file_epoch,
+            expected_committed_offset: base.committed_offset,
+            expected_framing_resume: base.framing_resume,
+            final_offset,
+            final_framing_resume: FramingResume::Clean,
+            final_guard_source: DeltaGuardSource::Window(final_window),
+            last_seen_time_unix_nano,
+            finalize: true,
+        })
+    }
+
     /// Durable identity updated by this delta.
     pub(crate) const fn file_id(&self) -> FileId {
         self.file_id
@@ -1281,6 +1312,13 @@ fn prepare_attributes(
             ATTR_KEY_FLUSH_REASON,
             PreparedValue::StaticString(flush_reason_value(reason)),
         )?;
+        if reason == FlushReason::Rotation {
+            push_attribute(
+                &mut attributes,
+                ATTR_KEY_TERMINAL_UNTERMINATED,
+                PreparedValue::Bool(true),
+            )?;
+        }
     }
     match record.framed.decode_outcome {
         DecodeOutcome::Clean => {}

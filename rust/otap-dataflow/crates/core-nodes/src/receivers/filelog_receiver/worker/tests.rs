@@ -31,6 +31,8 @@ use crate::receivers::filelog_receiver::checkpoint::primitives::{
 };
 use crate::receivers::filelog_receiver::checkpoint::store::fault::FaultPoint;
 use crate::receivers::filelog_receiver::checkpoint::wal::{RegisterFile, UpdateProgress};
+#[cfg(unix)]
+use crate::receivers::filelog_receiver::config::ATTR_KEY_TERMINAL_UNTERMINATED;
 use crate::receivers::filelog_receiver::config::{
     ATTR_KEY_FLUSH_REASON, ATTR_KEY_FRAGMENT_ID, ATTR_KEY_FRAGMENT_INDEX, ATTR_KEY_FRAGMENT_LAST,
     ATTR_KEY_LOG_FILE_NAME, Config, OnDecodeError,
@@ -197,6 +199,16 @@ fn framed_record_telemetry_uses_exact_bounded_categories() {
             split: true,
         },
     );
+    record_framed_telemetry(
+        &telemetry,
+        FramedTelemetry {
+            decode_outcome: DecodeOutcome::Clean,
+            flush_reason: Some(FlushReason::Rotation),
+            truncated: false,
+            discarded_source_bytes: 0,
+            split: false,
+        },
+    );
 
     assert_eq!(
         telemetry.take_counter_for_test(WorkerCounter::DecodeReplaceRecords),
@@ -232,6 +244,14 @@ fn framed_record_telemetry_uses_exact_bounded_categories() {
     );
     assert_eq!(
         telemetry.take_counter_for_test(WorkerCounter::FlushTimeout),
+        1
+    );
+    assert_eq!(
+        telemetry.take_counter_for_test(WorkerCounter::FlushRotation),
+        1
+    );
+    assert_eq!(
+        telemetry.take_counter_for_test(WorkerCounter::TerminalUnterminatedRecords),
         1
     );
     assert_eq!(
@@ -2076,7 +2096,8 @@ async fn truncate_transitions_retry_at_wal_fault_boundary() {
 /// Scenario: `read_new` detects copy-truncate after another file evicts the
 /// affected reader's descriptor under `max_open_files: 1`.
 /// Guarantees: the reset is synced, the same locator reopens from offset
-/// zero at the next epoch, and collection continues without a worker failure.
+/// zero at the next epoch, retains the stable replacement prefix observed
+/// during the copy-truncate window, and collection continues.
 #[tokio::test]
 async fn read_new_reopens_a_present_nonresident_reader() {
     let directory = tempdir().unwrap();
@@ -2135,7 +2156,7 @@ async fn read_new_reopens_a_present_nonresident_reader() {
         .map(|(_, record)| record)
         .expect("one reader must advance to the replacement epoch");
     assert_eq!(reset.committed_offset, 4);
-    assert_eq!(reset.fingerprint, b"new\n");
+    assert!(b"new\n".starts_with(&reset.fingerprint));
 }
 
 /// Scenario: a present file's descriptor is evicted, then move/create
@@ -2765,12 +2786,13 @@ fn registration_rotation_and_compaction_storm_preserves_every_identity() {
 }
 
 #[cfg(unix)]
-/// Scenario: a removed file ends with an unterminated tail while partial
-/// flushing is disabled and its retained descriptor reaches stable EOF.
-/// Guarantees: rotation emits no empty or tail record, advances no offset,
-/// and directly finalizes only the already-durable zero frontier.
+/// Scenario: a removed file ends with an unterminated tail while ordinary
+/// idle flushing is disabled and its retained descriptor reaches permanent
+/// rotation EOF.
+/// Guarantees: D17 emits one marked terminal record, and matching Ack commits
+/// its tail and finalization atomically.
 #[tokio::test]
-async fn rotation_drops_disabled_unterminated_tail_without_advancing_progress() {
+async fn rotation_emits_disabled_unterminated_tail_with_terminal_evidence() {
     let directory = tempdir().unwrap();
     let source = directory.path().join("tail.log");
     let rotated = directory.path().join("tail.log.1");
@@ -2793,20 +2815,245 @@ async fn rotation_drops_disabled_unterminated_tail_without_advancing_progress() 
         .unwrap();
     receive_commit(&mut events).await.3.unwrap();
     let mut writer = OpenOptions::new().append(true).open(&source).unwrap();
+    writer.write_all(&[b't', 0xe2]).unwrap();
+    writer.flush().unwrap();
+    std::fs::rename(&source, &rotated).unwrap();
+    let mut terminal = receive_batch(&mut events).await;
+    let request = decode_worker_records(&mut terminal.records);
+    let log = only_log(&request);
+    assert_eq!(log_body_bytes(log), &[b't', 0xe2]);
+    assert!(matches!(
+        log_attr(log, ATTR_KEY_TERMINAL_UNTERMINATED),
+        Some(Value::BoolValue(true))
+    ));
+    worker
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: terminal.batch_id,
+            attempt: terminal.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    receive_commit(&mut events).await.3.unwrap();
+    stop_worker(worker, &mut events).await.unwrap();
+
+    let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
+    let record = store.table().iter().next().unwrap().1;
+    assert_eq!(record.committed_offset, 8);
+    assert_eq!(record.lifecycle_state, LifecycleState::RotatedFinalized);
+}
+
+#[cfg(unix)]
+/// Scenario: a removed UTF-8 file contains only a valid stripped BOM when
+/// permanent rotation EOF is confirmed.
+/// Guarantees: the worker emits no empty record, durably advances through the
+/// BOM with a real guard window, and releases the finalized identity.
+#[tokio::test]
+async fn bom_only_rotation_finalizes_without_fabricated_record() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("bom-only.log");
+    let rotated = directory.path().join("bom-only.log.1");
+    std::fs::write(&source, [0xef, 0xbb, 0xbf]).unwrap();
+    let namespace = directory.path().join("checkpoint");
+    let mut runtime = runtime_config(source.to_str().unwrap(), &namespace, 1);
+    runtime.framing.force_flush_period = Duration::ZERO;
+    runtime.rotation.rotate_wait = Duration::from_millis(30);
+    let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+    let worker = spawn_worker(runtime.clone(), event_tx).unwrap();
+
+    wait_for_worker_counter(&worker.telemetry, WorkerCounter::SourceBytesRead, 3).await;
+    std::fs::rename(&source, &rotated).unwrap();
+    wait_for_worker_counter(&worker.telemetry, WorkerCounter::RotationFinalizations, 1).await;
+    assert!(events.try_recv().is_err());
+    stop_worker(worker, &mut events).await.unwrap();
+
+    let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
+    let record = store.table().iter().next().unwrap().1;
+    assert_eq!(record.committed_offset, 3);
+    assert_eq!(record.lifecycle_state, LifecycleState::RotatedFinalized);
+    assert_eq!(
+        record.committed_frontier_guard,
+        CommittedFrontierGuard::compute(3, &[0xef, 0xbb, 0xbf]).unwrap()
+    );
+}
+
+#[cfg(unix)]
+/// Scenario: one complete line already owns an open-batch delta when
+/// permanent rotation EOF makes a later unterminated tail eligible.
+/// Guarantees: the earlier line seals and reaches matching Ack before D17
+/// emits the terminal tail in a second batch.
+#[tokio::test]
+async fn terminal_rotation_waits_for_preexisting_file_delta_ack() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("ordered-tail.log");
+    let rotated = directory.path().join("ordered-tail.log.1");
+    std::fs::write(&source, b"line1\n").unwrap();
+    let namespace = directory.path().join("checkpoint");
+    let mut runtime = runtime_config(source.to_str().unwrap(), &namespace, 10);
+    runtime.framing.force_flush_period = Duration::ZERO;
+    runtime.rotation.rotate_wait = Duration::from_millis(30);
+    let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+    let worker = spawn_worker(runtime.clone(), event_tx).unwrap();
+
+    wait_for_worker_counter(&worker.telemetry, WorkerCounter::SourceBytesRead, 6).await;
+    let mut writer = OpenOptions::new().append(true).open(&source).unwrap();
     writer.write_all(b"tail").unwrap();
     writer.flush().unwrap();
     std::fs::rename(&source, &rotated).unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), events.recv())
-            .await
-            .is_err()
-    );
+
+    let mut first = receive_batch(&mut events).await;
+    let request = decode_worker_records(&mut first.records);
+    let log = only_log(&request);
+    assert_eq!(log_body_bytes(log), b"line1");
+    assert!(log_attr(log, ATTR_KEY_TERMINAL_UNTERMINATED).is_none());
+    worker
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: first.batch_id,
+            attempt: first.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    receive_commit(&mut events).await.3.unwrap();
+
+    let mut terminal = receive_batch(&mut events).await;
+    let request = decode_worker_records(&mut terminal.records);
+    let log = only_log(&request);
+    assert_eq!(log_body_bytes(log), b"tail");
+    assert!(matches!(
+        log_attr(log, ATTR_KEY_TERMINAL_UNTERMINATED),
+        Some(Value::BoolValue(true))
+    ));
+    worker
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: terminal.batch_id,
+            attempt: terminal.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    receive_commit(&mut events).await.3.unwrap();
+    stop_worker(worker, &mut events).await.unwrap();
+
+    let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
+    let record = store.table().iter().next().unwrap().1;
+    assert_eq!(record.committed_offset, 10);
+    assert_eq!(record.lifecycle_state, LifecycleState::RotatedFinalized);
+}
+
+#[cfg(unix)]
+/// Scenario: live EOF idle timeout reaches an incomplete UTF-8 scalar under
+/// decode-fail while an earlier complete record is already durable.
+/// Guarantees: the worker quarantines at the last applied offset, emits no
+/// malformed-unit progress, and exercises the due-framer failure path.
+#[tokio::test]
+async fn idle_incomplete_decode_fail_quarantines_without_progress() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("idle-fail.log");
+    std::fs::write(&source, b"ready\n").unwrap();
+    let namespace = directory.path().join("checkpoint");
+    let mut runtime = runtime_config(source.to_str().unwrap(), &namespace, 1);
+    runtime.on_decode_error = OnDecodeError::Fail;
+    runtime.framing.force_flush_period = Duration::from_millis(20);
+    let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+    let worker = spawn_worker(runtime.clone(), event_tx).unwrap();
+
+    let ready = receive_batch(&mut events).await;
+    worker
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: ready.batch_id,
+            attempt: ready.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    receive_commit(&mut events).await.3.unwrap();
+    let mut writer = OpenOptions::new().append(true).open(&source).unwrap();
+    writer.write_all(&[0xe2]).unwrap();
+    writer.flush().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while worker
+        .telemetry
+        .gauge_for_test(WorkerGauge::FilesQuarantined)
+        == 0
+    {
+        assert!(
+            Instant::now() < deadline,
+            "idle decode fail did not quarantine"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert!(events.try_recv().is_err());
     stop_worker(worker, &mut events).await.unwrap();
 
     let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
     let record = store.table().iter().next().unwrap().1;
     assert_eq!(record.committed_offset, 6);
-    assert_eq!(record.lifecycle_state, LifecycleState::RotatedFinalized);
+    assert_eq!(record.lifecycle_state, LifecycleState::Quarantined);
+    assert_eq!(
+        record.quarantine_evidence.as_ref().unwrap().reason_code,
+        QUARANTINE_REASON_DECODE
+    );
+}
+
+#[cfg(unix)]
+/// Scenario: permanent rotation EOF reaches an incomplete UTF-8 scalar under
+/// decode-fail after an earlier complete record is durable.
+/// Guarantees: D17 quarantines without advancing over the terminal byte and
+/// never also writes `RotatedFinalized`.
+#[tokio::test]
+async fn permanent_incomplete_decode_fail_quarantines_instead_of_finalizing() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("rotation-fail.log");
+    let rotated = directory.path().join("rotation-fail.log.1");
+    std::fs::write(&source, b"ready\n").unwrap();
+    let namespace = directory.path().join("checkpoint");
+    let mut runtime = runtime_config(source.to_str().unwrap(), &namespace, 1);
+    runtime.on_decode_error = OnDecodeError::Fail;
+    runtime.framing.force_flush_period = Duration::ZERO;
+    runtime.rotation.rotate_wait = Duration::from_millis(30);
+    let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+    let worker = spawn_worker(runtime.clone(), event_tx).unwrap();
+
+    let ready = receive_batch(&mut events).await;
+    worker
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: ready.batch_id,
+            attempt: ready.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    receive_commit(&mut events).await.3.unwrap();
+    let mut writer = OpenOptions::new().append(true).open(&source).unwrap();
+    writer.write_all(&[0xe2]).unwrap();
+    writer.flush().unwrap();
+    std::fs::rename(&source, &rotated).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while worker
+        .telemetry
+        .gauge_for_test(WorkerGauge::FilesQuarantined)
+        == 0
+    {
+        assert!(
+            Instant::now() < deadline,
+            "permanent decode fail did not quarantine"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert!(events.try_recv().is_err());
+    stop_worker(worker, &mut events).await.unwrap();
+
+    let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
+    let record = store.table().iter().next().unwrap().1;
+    assert_eq!(record.committed_offset, 6);
+    assert_eq!(record.lifecycle_state, LifecycleState::Quarantined);
+    assert_eq!(
+        record.quarantine_evidence.as_ref().unwrap().reason_code,
+        QUARANTINE_REASON_DECODE
+    );
 }
 
 #[cfg(unix)]
@@ -4091,22 +4338,23 @@ fn forced_shutdown_after_blocked_poll_suppresses_decode_quarantine() {
     assert!(record.quarantine_evidence.is_none());
 }
 
-/// Scenario: two files each hold a drain-flushable unterminated record while
-/// batch.max_records permits only one record per batch.
-/// Guarantees: drain snapshots both provisional frontiers, emits two
-/// separately Ack-gated batches in deterministic bounded replay, and reports
-/// Drained only after both file offsets are durable.
+/// Scenario: two files have satisfied idle deadlines at drain start while
+/// `batch.max_records` permits only one record in the retained batch.
+/// Guarantees: the first eligible record remains Ack-gated, while replay does
+/// not rearm the second file's already-consumed idle deadline or fabricate a
+/// second drain flush; its bytes remain uncommitted for restart/carry-over.
 #[test]
-fn drain_replays_flushable_records_across_multiple_batches() {
+fn drain_does_not_rearm_idle_deadline_after_batch_replay() {
     let directory = tempdir().unwrap();
     std::fs::write(directory.path().join("a.log"), b"partial-a").unwrap();
     std::fs::write(directory.path().join("b.log"), b"partial-b").unwrap();
     let pattern = directory.path().join("*.log");
-    let runtime_config = runtime_config(
+    let mut runtime_config = runtime_config(
         pattern.to_str().unwrap(),
         &directory.path().join("checkpoint"),
         1,
     );
+    runtime_config.framing.force_flush_period = Duration::from_millis(10);
     let mut runtime = WorkerRuntime::new(runtime_config).unwrap();
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
     let (_command_tx, command_rx) = sync_channel(4);
@@ -4156,6 +4404,10 @@ fn drain_replays_flushable_records_across_multiple_batches() {
         }
         let ready = runtime.framers.len() == 2
             && runtime
+                .framers
+                .values()
+                .all(|active| active.framer.deadline().is_some())
+            && runtime
                 .readers_ref()
                 .unwrap()
                 .frontiers()
@@ -4167,6 +4419,15 @@ fn drain_replays_flushable_records_across_multiple_batches() {
             Instant::now() < deadline,
             "worker did not buffer both tails"
         );
+    }
+    let flush_deadline = runtime
+        .framers
+        .values()
+        .filter_map(|active| active.framer.deadline())
+        .max()
+        .expect("both EOF-gated deadlines are armed");
+    while Instant::now() < flush_deadline {
+        std::thread::yield_now();
     }
 
     runtime.drain_requested = true;
@@ -4187,22 +4448,6 @@ fn drain_replays_flushable_records_across_multiple_batches() {
 
     assert_eq!(
         runtime.drive_drain(&event_tx, &command_rx).unwrap(),
-        LoopControl::Continue
-    );
-    let second = match event_rx.try_recv().unwrap() {
-        WorkerEvent::Batch(batch) => batch,
-        other => panic!("expected second drain batch, got {other:?}"),
-    };
-    assert_eq!(second.record_count, 1);
-    assert_ne!(first.batch_id, second.batch_id);
-    assert!(
-        runtime
-            .commit_retained(second.batch_id, second.attempt)
-            .unwrap()
-    );
-
-    assert_eq!(
-        runtime.drive_drain(&event_tx, &command_rx).unwrap(),
         LoopControl::Shutdown
     );
     assert!(runtime.drain_complete);
@@ -4210,13 +4455,14 @@ fn drain_replays_flushable_records_across_multiple_batches() {
         event_rx.try_recv(),
         Err(tokio::sync::mpsc::error::TryRecvError::Empty)
     ));
-    assert!(
-        runtime
-            .store
-            .table()
-            .iter()
-            .all(|(_, record)| record.committed_offset == 9)
-    );
+    let committed: Vec<u64> = runtime
+        .store
+        .table()
+        .iter()
+        .map(|(_, record)| record.committed_offset)
+        .collect();
+    assert_eq!(committed.iter().filter(|offset| **offset == 9).count(), 1);
+    assert_eq!(committed.iter().filter(|offset| **offset == 0).count(), 1);
     runtime.shutdown_resources().unwrap();
 }
 

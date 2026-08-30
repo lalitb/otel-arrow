@@ -378,7 +378,8 @@ fn clean_default_projection_omits_every_conditional_attribute() {
 
 /// Scenario: each framing flush reason is projected independently.
 /// Guarantees: the public String values are exactly `max_lines`, `timeout`,
-/// `oversize_line_boundary`, `rotation`, and `drain`.
+/// `oversize_line_boundary`, `rotation`, and `drain`, and only permanent
+/// rotation carries terminal-unterminated evidence.
 #[test]
 fn flush_reasons_use_frozen_string_values() {
     let cases = [
@@ -397,6 +398,14 @@ fn flush_reasons_use_frozen_string_values() {
         let request = decode(&batch.finish().unwrap());
         let log = &request.resource_logs[0].scope_logs[0].log_records[0];
         assert_eq!(string_attr(log, ATTR_KEY_FLUSH_REASON), Some(expected));
+        if reason == FlushReason::Rotation {
+            assert!(matches!(
+                attr(log, ATTR_KEY_TERMINAL_UNTERMINATED),
+                Some(Value::BoolValue(true))
+            ));
+        } else {
+            assert!(attr(log, ATTR_KEY_TERMINAL_UNTERMINATED).is_none());
+        }
     }
 }
 

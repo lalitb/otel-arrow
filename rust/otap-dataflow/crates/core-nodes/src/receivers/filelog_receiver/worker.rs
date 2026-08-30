@@ -22,7 +22,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use super::batching::{
     BatchAppendOutcome, BatchError, FinalizationOutcome, LogicalBatch, OpenBatch, ProgressBase,
-    ProgressFrontier, RecordInput, RecordNumberTable,
+    ProgressDelta, ProgressFrontier, RecordInput, RecordNumberTable,
 };
 use super::checkpoint::primitives::{
     FileId, FramingResume, LifecycleState, Locator, QUARANTINE_REASON_DECODE,
@@ -2528,7 +2528,13 @@ impl WorkerRuntime {
             active.framer.observe_eof(now)?;
             loop {
                 let ready_at = Instant::now();
-                let step = active.framer.poll_timeout(ready_at)?;
+                let step = match active.framer.poll_timeout(ready_at) {
+                    Ok(step) => step,
+                    Err(error) => {
+                        return self
+                            .handle_terminal_framer_error(file_id, error, event_tx, command_rx);
+                    }
+                };
                 self.observe_framer_counters(&mut active.framer);
                 let produced = step.output.is_some();
                 if let Some(record) = step.output {
@@ -2550,10 +2556,32 @@ impl WorkerRuntime {
             return Ok(LoopControl::Continue);
         }
 
+        if self
+            .open_batch
+            .as_ref()
+            .ok_or(WorkerError::MissingOpenBatch {
+                operation: "checking pre-terminal rotation progress",
+            })?
+            .progress_frontier(file_id)
+            .is_some()
+        {
+            if let Some(active) = active.take() {
+                self.put_framer(file_id, active)?;
+            }
+            return self.seal_open_batch(event_tx, command_rx);
+        }
+
+        let mut terminal_pending = false;
         if let Some(active) = active.as_mut() {
             loop {
                 let ready_at = Instant::now();
-                let step = active.framer.flush_rotation(ready_at)?;
+                let step = match active.framer.flush_rotation(ready_at) {
+                    Ok(step) => step,
+                    Err(error) => {
+                        return self
+                            .handle_terminal_framer_error(file_id, error, event_tx, command_rx);
+                    }
+                };
                 self.observe_framer_counters(&mut active.framer);
                 let produced = step.output.is_some();
                 if let Some(record) = step.output {
@@ -2563,15 +2591,7 @@ impl WorkerRuntime {
                             return self.seal_open_batch(event_tx, command_rx);
                         }
                         AppendControl::SealAfter => {
-                            let remaining = if step.pending {
-                                active.framer.flush_rotation(Instant::now())?
-                            } else {
-                                super::framing::FlushStep {
-                                    output: None,
-                                    pending: false,
-                                }
-                            };
-                            if remaining.output.is_some() || remaining.pending {
+                            if step.pending {
                                 // Seal rewind reconstructs any lookahead output
                                 // from the first uncommitted source boundary.
                                 return self.seal_open_batch(event_tx, command_rx);
@@ -2581,32 +2601,72 @@ impl WorkerRuntime {
                     }
                 }
                 if !produced {
-                    if step.pending
-                        && let Some(start) = active.framer.pending_source_start()
-                    {
-                        let dropped = active
-                            .framer
-                            .next_expected_input_offset()
-                            .checked_sub(start)
-                            .ok_or(WorkerError::Inconsistent {
-                                reason: "rotation pending range regressed",
-                            })?;
-                        self.telemetry
-                            .add(WorkerCounter::PartialBytesDropped, dropped);
-                        if let Some(suppressed) = self.health_event(HealthEventCategory::Partial) {
-                            otel_warn!(
-                                "filelog_receiver.rotation_partial_bytes_dropped",
-                                dropped_bytes = dropped,
-                                suppressed_events = suppressed
-                            );
-                        }
-                    }
+                    terminal_pending = step.pending;
                     break;
                 }
             }
         }
+        if terminal_pending {
+            let mut active = active.take().ok_or(WorkerError::Inconsistent {
+                reason: "terminal pending state lost its active framer",
+            })?;
+            if let Some((final_offset, final_window)) =
+                active.framer.take_terminal_empty_frontier()?
+            {
+                let base = current_progress(&self.store, file_id)?;
+                let delta = ProgressDelta::terminal_empty_finalization(
+                    file_id,
+                    base,
+                    final_offset,
+                    final_window,
+                    unix_nanos()?.1,
+                )?;
+                if !self.commit_direct_progress(&delta)? {
+                    return Ok(LoopControl::Shutdown);
+                }
+                return Ok(LoopControl::Continue);
+            }
+            self.put_framer(file_id, active)?;
+            return Ok(LoopControl::Continue);
+        }
 
         self.finalize_removed_file(file_id, event_tx, command_rx)
+    }
+
+    fn handle_terminal_framer_error(
+        &mut self,
+        file_id: FileId,
+        error: FramerError,
+        event_tx: &tokio_mpsc::Sender<WorkerEvent>,
+        command_rx: &Receiver<WorkerCommand>,
+    ) -> Result<LoopControl, WorkerError> {
+        self.observe_framer_error(&error);
+        let FramerError::Decode(DecodeError::FatalMalformed { range, .. }) = error else {
+            return Err(WorkerError::Framer(error));
+        };
+        self.discard_framer(file_id);
+        if self.cancellation_requested() {
+            return Ok(LoopControl::Shutdown);
+        }
+        if self.open_batch_record_count()? != 0 {
+            if self
+                .pending_decode_quarantine
+                .replace(PendingDecodeQuarantine {
+                    file_id,
+                    observed_size: range.end,
+                })
+                .is_some()
+            {
+                return Err(WorkerError::Inconsistent {
+                    reason: "multiple terminal decode quarantines overlap one retained batch",
+                });
+            }
+            return self.seal_open_batch(event_tx, command_rx);
+        }
+        if !self.quarantine_decode_failure(file_id, range.end)? {
+            return Ok(LoopControl::Shutdown);
+        }
+        Ok(LoopControl::Continue)
     }
 
     fn rotation_finalization_due(
@@ -2720,7 +2780,14 @@ impl WorkerRuntime {
         })?;
         loop {
             let ready_at = Instant::now();
-            let step = active.framer.poll_timeout(ready_at)?;
+            let step = match active.framer.poll_timeout(ready_at) {
+                Ok(step) => step,
+                Err(error) => {
+                    return self
+                        .handle_terminal_framer_error(file_id, error, event_tx, command_rx)
+                        .map(Some);
+                }
+            };
             self.observe_framer_counters(&mut active.framer);
             let produced = step.output.is_some();
             if let Some(record) = step.output {
@@ -2896,6 +2963,7 @@ fn record_framed_telemetry(telemetry: &WorkerTelemetryBridge, framed: FramedTele
         }
         Some(FlushReason::Rotation) => {
             telemetry.add(WorkerCounter::FlushRotation, 1);
+            telemetry.add(WorkerCounter::TerminalUnterminatedRecords, 1);
         }
         Some(FlushReason::Drain) => {
             telemetry.add(WorkerCounter::FlushDrain, 1);
@@ -3252,7 +3320,13 @@ impl WorkerRuntime {
             };
             loop {
                 let ready_at = Instant::now();
-                let step = active.framer.flush_drain(ready_at)?;
+                let step = match active.framer.flush_drain(ready_at) {
+                    Ok(step) => step,
+                    Err(error) => {
+                        return self
+                            .handle_terminal_framer_error(file_id, error, event_tx, command_rx);
+                    }
+                };
                 self.observe_framer_counters(&mut active.framer);
                 let produced = step.output.is_some();
                 if let Some(record) = step.output {
@@ -4056,10 +4130,7 @@ impl WorkerRuntime {
     ///
     /// Stage 12 decides when finalization is valid; Stage 11 provides only
     /// this narrow, directly testable durability primitive.
-    fn commit_direct_progress(
-        &mut self,
-        delta: &super::batching::ProgressDelta,
-    ) -> Result<bool, WorkerError> {
+    fn commit_direct_progress(&mut self, delta: &ProgressDelta) -> Result<bool, WorkerError> {
         if delta.finalize() {
             self.readers_ref()?
                 .preflight_release_finalized(delta.file_id())?;
@@ -4221,7 +4292,7 @@ fn current_progress(store: &CheckpointStore, file_id: FileId) -> Result<Progress
 
 fn persist_direct_progress(
     store: &mut CheckpointStore,
-    delta: &super::batching::ProgressDelta,
+    delta: &ProgressDelta,
 ) -> Result<(), WorkerError> {
     let update = delta.to_update_progress(current_progress(store, delta.file_id())?)?;
     let mut updates = reserved_vec(1, "direct checkpoint progress update")?;

@@ -873,20 +873,78 @@ impl Framer {
         })
     }
 
-    /// Applies the rotation partial-flush hook.
+    /// Applies confirmed permanent-rotation EOF.
     ///
-    /// When partial flushing is disabled, recoverable state is reported as
-    /// pending and is neither committed nor dropped.
+    /// Complete decoder events remain source-ordered. One incomplete encoded
+    /// unit is resolved by the configured decode policy, then any nonempty
+    /// pending frame becomes terminally eligible with `Rotation` evidence.
     pub(crate) fn flush_rotation(&mut self, now: Instant) -> Result<FlushStep, FramerError> {
-        self.flush_hook(now, FlushReason::Rotation)
+        loop {
+            let step = self.step_internal(&[], now, false)?;
+            if step.output.is_some() {
+                return Ok(FlushStep {
+                    output: step.output,
+                    pending: step.pending,
+                });
+            }
+            if let Some(event) = self.decoder.finish_incomplete_unit()? {
+                if let Some(output) = self.process_decode_event(event)? {
+                    return Ok(FlushStep {
+                        output: Some(output),
+                        pending: self.has_pending(),
+                    });
+                }
+                continue;
+            }
+            let output = self.flush_partial(FlushReason::Rotation)?;
+            if output.is_some() {
+                self.deadline = None;
+            }
+            return Ok(FlushStep {
+                output,
+                pending: self.has_pending(),
+            });
+        }
     }
 
     /// Applies the receiver-drain partial-flush hook.
     ///
-    /// When partial flushing is disabled, recoverable state is reported as
-    /// pending and is neither committed nor dropped.
+    /// Drain may use the configured idle rule only when EOF already armed a
+    /// deadline and that deadline is due. Otherwise recoverable state remains
+    /// pending and will be rewound without fabricated completion.
     pub(crate) fn flush_drain(&mut self, now: Instant) -> Result<FlushStep, FramerError> {
-        self.flush_hook(now, FlushReason::Drain)
+        loop {
+            let step = self.step_internal(&[], now, false)?;
+            if step.output.is_some() {
+                return Ok(FlushStep {
+                    output: step.output,
+                    pending: step.pending,
+                });
+            }
+            if self.deadline.is_none_or(|deadline| now < deadline) {
+                return Ok(FlushStep {
+                    output: None,
+                    pending: self.has_pending(),
+                });
+            }
+            if let Some(event) = self.decoder.finish_incomplete_unit()? {
+                if let Some(output) = self.process_decode_event(event)? {
+                    return Ok(FlushStep {
+                        output: Some(output),
+                        pending: self.has_pending(),
+                    });
+                }
+                continue;
+            }
+            let output = self.flush_partial(FlushReason::Drain)?;
+            if output.is_some() {
+                self.deadline = None;
+            }
+            return Ok(FlushStep {
+                output,
+                pending: self.has_pending(),
+            });
+        }
     }
 
     /// Returns the source offset expected for the next caller-owned byte.
@@ -899,6 +957,33 @@ impl Framer {
     #[must_use]
     pub(crate) fn pending_source_start(&self) -> Option<u64> {
         self.has_pending().then_some(self.next_frame_start)
+    }
+
+    /// Consumes framing-only source progress at permanent EOF without
+    /// fabricating a record.
+    ///
+    /// The only version-1 case is a fully stripped BOM followed by no record
+    /// content. The returned window lets the worker durably advance and
+    /// finalize that clean frontier directly.
+    pub(crate) fn take_terminal_empty_frontier(
+        &mut self,
+    ) -> Result<Option<(u64, CommittedFrontierWindow)>, FramerError> {
+        let delivered = self.decoder.highest_delivered_source_boundary();
+        if self.next_frame_start == delivered {
+            return Ok(None);
+        }
+        if !self.line.is_empty()
+            || self.record.is_some()
+            || self.complete_line.is_some()
+            || self.pending_unit.is_some()
+            || self.oversize.is_some()
+            || self.decoder.earliest_uncommittable_offset().is_some()
+        {
+            return Ok(None);
+        }
+        let window = self.checkpoint_window_at(delivered)?;
+        self.next_frame_start = delivered;
+        Ok(Some((delivered, window)))
     }
 
     /// Returns the bounded cumulative count of complete start-mode lines
@@ -953,6 +1038,11 @@ impl Framer {
                     }
                     continue;
                 }
+                if let Some(event) = self.decoder.finish_incomplete_unit()?
+                    && let Some(output) = self.process_decode_event(event)?
+                {
+                    return Ok(self.step_result(consumed, Some(output)));
+                }
                 if let Some(output) = self.flush_partial(FlushReason::Timeout)? {
                     if self.oversize.is_none() {
                         self.deadline = None;
@@ -996,30 +1086,6 @@ impl Framer {
                 });
             }
         }
-    }
-
-    fn flush_hook(&mut self, now: Instant, reason: FlushReason) -> Result<FlushStep, FramerError> {
-        let step = self.step_internal(&[], now, false)?;
-        if step.output.is_some() {
-            return Ok(FlushStep {
-                output: step.output,
-                pending: step.pending,
-            });
-        }
-        if self.force_flush_period.is_zero() {
-            return Ok(FlushStep {
-                output: None,
-                pending: self.has_pending(),
-            });
-        }
-        let output = self.flush_partial(reason)?;
-        if output.is_some() {
-            self.deadline = None;
-        }
-        Ok(FlushStep {
-            output,
-            pending: self.has_pending(),
-        })
     }
 
     fn step_result(&self, consumed: usize, output: Option<FramedRecord>) -> FramerStep {

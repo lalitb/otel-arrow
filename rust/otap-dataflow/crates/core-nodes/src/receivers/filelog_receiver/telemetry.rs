@@ -269,9 +269,10 @@ pub struct FilelogReceiverMetrics {
     /// Recoverable partial source bytes present at drain.
     #[metric(name = "partial.bytes.pending_drain", unit = "By")]
     pub partial_bytes_pending_drain: Counter<u64>,
-    /// Unterminated source bytes dropped during rotation finalization.
-    #[metric(name = "partial.bytes.dropped", unit = "By")]
-    pub partial_bytes_dropped: Counter<u64>,
+    /// Records emitted only because permanent rotation EOF established a
+    /// terminal boundary.
+    #[metric(name = "terminal.unterminated.records", unit = "{record}")]
+    pub terminal_unterminated_records: Counter<u64>,
     /// Current recoverable partial source bytes.
     #[metric(name = "partial.bytes.pending", unit = "By")]
     pub partial_bytes_pending: Gauge<u64>,
@@ -400,7 +401,7 @@ pub(super) enum WorkerCounter {
     SourceBytesDiscarded,
     SplitFragments,
     PartialBytesPendingDrain,
-    PartialBytesDropped,
+    TerminalUnterminatedRecords,
     PatternFallback,
     FlushMaxLines,
     FlushTimeout,
@@ -562,7 +563,7 @@ impl WorkerTelemetryBridge {
         drain!(SourceBytesDiscarded, source_bytes_discarded);
         drain!(SplitFragments, split_fragments);
         drain!(PartialBytesPendingDrain, partial_bytes_pending_drain);
-        drain!(PartialBytesDropped, partial_bytes_dropped);
+        drain!(TerminalUnterminatedRecords, terminal_unterminated_records);
         drain!(PatternFallback, pattern_fallback);
         drain!(FlushMaxLines, flush_max_lines);
         drain!(FlushTimeout, flush_timeout);

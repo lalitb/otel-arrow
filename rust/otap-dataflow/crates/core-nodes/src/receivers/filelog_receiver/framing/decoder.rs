@@ -242,6 +242,78 @@ impl StreamDecoder {
         self.pending_source_start()
     }
 
+    /// Applies the configured decode policy to the one incomplete source
+    /// unit remaining at an explicit idle or permanent-EOF boundary.
+    ///
+    /// Ordinary live EOF never calls this method. The returned event owns the
+    /// complete pending source range and advances `delivered_boundary` only
+    /// under preserve/replace; fail policy leaves the decoder state intact
+    /// and returns the exact fatal range.
+    pub fn finish_incomplete_unit(&mut self) -> Result<Option<DecodeEvent>, DecodeError> {
+        let pending = if let Some(probe) = self.bom_probe.as_ref() {
+            (!probe.as_slice().is_empty()).then(|| {
+                (
+                    SourceRange {
+                        start: probe.start,
+                        end: self.next_input_offset,
+                    },
+                    SourceBytes::from_slice(probe.as_slice()),
+                )
+            })
+        } else {
+            match &self.state {
+                DecoderState::Utf8(state) if state.len != 0 => Some((
+                    SourceRange {
+                        start: state.start,
+                        end: self.next_input_offset,
+                    },
+                    SourceBytes::from_slice(&state.bytes[..usize::from(state.len)]),
+                )),
+                DecoderState::Utf16(state) => match (state.high, state.odd) {
+                    (Some(high), Some((_, odd))) => Some((
+                        SourceRange {
+                            start: high.start,
+                            end: self.next_input_offset,
+                        },
+                        SourceBytes::from_pair(&high.bytes, &[odd]),
+                    )),
+                    (Some(high), None) => Some((
+                        SourceRange {
+                            start: high.start,
+                            end: high.end,
+                        },
+                        SourceBytes::from_slice(&high.bytes),
+                    )),
+                    (None, Some((start, odd))) => Some((
+                        SourceRange {
+                            start,
+                            end: self.next_input_offset,
+                        },
+                        SourceBytes::from_slice(&[odd]),
+                    )),
+                    (None, None) => None,
+                },
+                DecoderState::Utf8(_) | DecoderState::Ascii | DecoderState::Raw => None,
+            }
+        };
+        let Some((range, source)) = pending else {
+            return Ok(None);
+        };
+        let event = malformed_event(self.policy, range, source)?;
+        self.bom_probe = None;
+        match &mut self.state {
+            DecoderState::Utf8(state) => state.len = 0,
+            DecoderState::Utf16(state) => {
+                state.odd = None;
+                state.high = None;
+                state.queued = None;
+            }
+            DecoderState::Ascii | DecoderState::Raw => {}
+        }
+        self.delivered_boundary = range.end;
+        Ok(Some(event))
+    }
+
     fn next_inner(
         &mut self,
         input: &[u8],

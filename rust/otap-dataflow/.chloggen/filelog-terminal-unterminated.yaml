@@ -1,0 +1,17 @@
+# One of 'breaking', 'deprecation', 'new_component', 'enhancement', 'bug_fix'
+change_type: bug_fix
+
+# The broad Rust component affected by this change.
+component: pipeline
+
+# A brief description of the user-visible change.
+note: Preserve unterminated filelog records at confirmed permanent rotation EOF.
+
+# Tracking issue for the Phase 1 filelog receiver.
+issues: [2844]
+
+# Additional operator-facing context.
+subtext: |
+  Idle timeout applies decode policy to incomplete units. Permanent rotation
+  emits terminal evidence with Ack-gated progress or quarantines without progress.
+  The terminal-record metric replaces the obsolete partial-bytes-dropped metric.

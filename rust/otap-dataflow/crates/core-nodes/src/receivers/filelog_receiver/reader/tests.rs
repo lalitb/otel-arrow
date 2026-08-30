@@ -2375,3 +2375,46 @@ fn reopen_reports_truncation_when_size_is_below_known_continuation_end() {
     ));
     table.shutdown().unwrap();
 }
+
+/// Scenario: a resident continuation with known end 10 reads through offset
+/// 7, then the source is truncated to that temporary EOF.
+/// Guarantees: EOF metadata revalidation reports truncation because the
+/// durable record end is missing, rather than allowing D17 to emit a false
+/// final fragment.
+#[test]
+fn resident_eof_reports_truncation_below_known_continuation_end() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("continuation-live-truncated.log");
+    std::fs::write(&path, b"abcdefghij").unwrap();
+    let mut table = ReaderTable::new(settings(1, 1, 10)).unwrap();
+    let mut identity = resolved_with_guard(91, 4, guard_for_prefix(b"abcd"));
+    identity.framing_resume = FramingResume::Continuation {
+        record_start_offset: 0,
+        record_end_offset: 10,
+        next_fragment_index: 1,
+    };
+    table.insert(candidate(&path), identity).unwrap();
+
+    let turn = data(table.poll(Instant::now()).unwrap());
+    assert_eq!(turn.source_offset(), 4);
+    table
+        .complete_turn(turn, 3, TurnDisposition::Ready)
+        .unwrap();
+    OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(7)
+        .unwrap();
+
+    assert!(matches!(
+        table.poll(Instant::now()).unwrap(),
+        ReaderPoll::Truncated {
+            committed_offset: 4,
+            read_offset: 7,
+            observed_size: 7,
+            ..
+        }
+    ));
+    table.shutdown().unwrap();
+}

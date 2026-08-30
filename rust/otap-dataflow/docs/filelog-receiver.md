@@ -918,11 +918,12 @@ Invariants and constraints:
   it before framing continues. A resumed continuation with no newly observed source
   bytes remains pending and cannot fabricate an empty final fragment. Without partial
   flush, EOF plus `rotate_wait` remains only an inactivity heuristic: a process may
-  retain the renamed FD and write again later, so the receiver cannot prove the line is
-  terminal. On rotation finalization any unflushed partial bytes are counted as
-  `filelog.partial_bytes_dropped`; the checkpoint remains at the previous complete
-  boundary. At drain, recoverable buffered bytes are reported as pending, not dropped,
-  so restart can resume if the source still exists.
+  retain the renamed FD and write again later. At confirmed permanent rotation EOF,
+  D17 emits a nonempty pending frame with
+  `otel.arrow.filelog.terminal_unterminated = true`; progress and finalization remain
+  Ack-gated. Decode-fail quarantines without advancing over malformed terminal input.
+  At drain, recoverable buffered bytes are reported as pending, so restart can resume
+  if the source still exists.
 - Idle flush is the only sanctioned way to commit a mid-line offset with `clean` resume
   on a non-terminal file; bounded split fragments may commit a mid-line
   `continuation`. Idle flush trades latency for a documented slow-writer split risk and
@@ -1179,6 +1180,7 @@ The complete log-attribute contract is:
 | `otel_arrow.filelog.fragment.source.end` | String | Split fragment; decimal half-open `body_source_range.end` |
 | `otel_arrow.filelog.record.truncated` | Bool | Truncated record only; exactly `true` |
 | `otel_arrow.filelog.flush.reason` | String | When present; exactly `max_lines`, `timeout`, `oversize_line_boundary`, `rotation`, or `drain` |
+| `otel.arrow.filelog.terminal_unterminated` | Bool | Exactly `true` only when confirmed permanent rotation EOF established the boundary |
 | `otel_arrow.filelog.decode.error.policy` | String | Malformed emitted record only; exactly `replace` or `preserve_raw` |
 | `otel_arrow.filelog.decode.error_count` | String | With decode policy evidence; decimal malformed-unit count |
 
@@ -1711,7 +1713,7 @@ strings never become metric dimensions. Instrument suffixes and semantics are:
 | Discovery and admission | `files.discovered`, `files.eligible`, `discovery.observed`, `discovery.updated`, `discovery.removed`, `discovery.scans`, `discovery.scan.errors`, `discovery.scan.duration.total`, `candidates.overflowed`, `candidates.overflow.scans`, `candidates.admission.delay.total`, `candidates.admissions`, `files.tracked.saturation`, `files.descriptor.saturation` | `files.tracked`, `files.pending`, `files.open`, `files.descriptor_blocked`, `files.removed_waiting`, `files.quarantined`, `candidates.oldest.age`, `candidates.overflow.persistence`, `files.tracked.saturated`, `files.descriptor.saturated` |
 | Identity and ownership | `identity.registrations`, `identity.resets`, `identity.recovery_mismatches`, `identity.matches.exact_locator`, `identity.matches.unique_fingerprint`, `ownership.namespace_lock.wait.duration.total`, `ownership.namespace_lock.waits`, `ownership.namespace_lock.contentions`, `ownership.namespace_lock.failures`, `ownership.runtime_lease.wait.duration.total`, `ownership.runtime_lease.waits`, `ownership.runtime_lease.contentions`, `ownership.runtime_lease.failures` | -- |
 | Rotation and truncation | `rotation.move_create`, `rotation.finalizations`, `rotation.late_writes`, `rotation.descriptor_unavailable`, `rotation.copytruncate.detected`, `rotation.copytruncate.fail`, `rotation.copytruncate.read_new` | -- |
-| Framing and loss | `decode.replace.records`, `decode.replace.units`, `decode.preserve_raw.records`, `decode.preserve_raw.units`, `decode.failures`, `records.truncated`, `records.split_fragments`, `bytes.discarded`, `partial.bytes.pending_drain`, `partial.bytes.dropped`, `multiline.pattern_fallback`, `flush.max_lines`, `flush.timeout`, `flush.oversize_line_boundary`, `flush.rotation`, `flush.drain`, `source.bytes.read` | `partial.bytes.pending` |
+| Framing and loss | `decode.replace.records`, `decode.replace.units`, `decode.preserve_raw.records`, `decode.preserve_raw.units`, `decode.failures`, `records.truncated`, `records.split_fragments`, `bytes.discarded`, `partial.bytes.pending_drain`, `terminal.unterminated.records`, `multiline.pattern_fallback`, `flush.max_lines`, `flush.timeout`, `flush.oversize_line_boundary`, `flush.rotation`, `flush.drain`, `source.bytes.read` | `partial.bytes.pending` |
 | Quarantine | `quarantine.decode`, `quarantine.truncate`, `quarantine.recovery_mismatch`, `quarantine.descriptor_unavailable`, `quarantine.other`, `quarantine.recovery.reset_to_beginning`, `quarantine.recovery.reset_to_end`, `quarantine.recovery.keep_failed`, `quarantine.recovery.remove` | -- |
 
 `records.emitted` and both emitted-byte counters count every successful downstream

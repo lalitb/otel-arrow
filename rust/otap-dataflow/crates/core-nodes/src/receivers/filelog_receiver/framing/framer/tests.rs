@@ -445,7 +445,13 @@ fn start_pattern_exact_bound_precedes_partial_lifecycle_flushes() {
                         .output
                 }
                 FlushReason::Rotation => framer.flush_rotation(now).unwrap().output,
-                FlushReason::Drain => framer.flush_drain(now).unwrap().output,
+                FlushReason::Drain => {
+                    framer.observe_eof(now).unwrap();
+                    framer
+                        .flush_drain(now + settings.flush_period)
+                        .unwrap()
+                        .output
+                }
                 FlushReason::MaxLines | FlushReason::OversizeLineBoundary => {
                     unreachable!("only lifecycle reasons are in the test table")
                 }
@@ -603,10 +609,42 @@ fn disabled_partial_flush_reports_pending_on_drain() {
     assert_eq!(framer.pending_source_start(), Some(0));
 }
 
-/// Scenario: Timeout occurs after a complete byte and an incomplete UTF-8 scalar prefix were consumed.
-/// Guarantees: EOF-gated timeout stops the checkpoint before the incomplete scalar, which begins the next Clean record when completed.
+/// Scenario: drain observes an EOF-gated idle rule immediately before and at
+/// its deadline with an incomplete UTF-8 scalar pending.
+/// Guarantees: early drain emits nothing, while a satisfied deadline applies
+/// preserve-raw to the complete range and marks the ordinary drain reason.
 #[test]
-fn timeout_never_commits_incomplete_decoder_unit() {
+fn drain_flushes_incomplete_unit_only_after_idle_deadline() {
+    let start = Instant::now();
+    let settings = TestSettings::default();
+    let mut framer = framer(&settings, start);
+    assert!(feed(&mut framer, &[b'a', 0xe2], start).is_empty());
+    framer.observe_eof(start).unwrap();
+
+    let early = framer
+        .flush_drain(start + settings.flush_period - Duration::from_nanos(1))
+        .unwrap();
+    assert!(early.output.is_none());
+    assert!(early.pending);
+
+    let due = framer.flush_drain(start + settings.flush_period).unwrap();
+    let output = due.output.expect("satisfied idle rule must flush");
+    assert_eq!(bytes(&output), &[b'a', 0xe2]);
+    assert_eq!(output.checkpoint_end, 2);
+    assert_eq!(output.flush_reason, Some(FlushReason::Drain));
+    assert_eq!(
+        output.decode_outcome,
+        DecodeOutcome::PreserveRaw { count: 1 }
+    );
+    assert!(!due.pending);
+}
+
+/// Scenario: EOF-gated idle timeout follows a complete byte with an
+/// incomplete UTF-8 scalar under `preserve_raw`.
+/// Guarantees: the complete pending source range is emitted byte-for-byte as
+/// one malformed record and becomes clean Ack-gated progress.
+#[test]
+fn timeout_preserve_raw_emits_complete_incomplete_source_range() {
     let start = Instant::now();
     let mut framer = framer(&TestSettings::default(), start);
     assert!(feed(&mut framer, &[b'a', 0xe2, 0x82], start).is_empty());
@@ -616,32 +654,33 @@ fn timeout_never_commits_incomplete_decoder_unit() {
         .poll_timeout(start + Duration::from_millis(10))
         .unwrap()
         .output
-        .expect("complete prefix must flush");
-    assert_eq!(text(&first), "a");
-    assert_eq!(first.checkpoint_end, 1);
+        .expect("complete pending range must flush");
+    assert_eq!(bytes(&first), &[b'a', 0xe2, 0x82]);
+    assert_eq!(
+        first.body_source_range,
+        super::SourceRange { start: 0, end: 3 }
+    );
+    assert_eq!(
+        first.frame_source_range,
+        super::SourceRange { start: 0, end: 3 }
+    );
+    assert_eq!(first.checkpoint_end, 3);
+    assert_eq!(
+        first.decode_outcome,
+        DecodeOutcome::PreserveRaw { count: 1 }
+    );
+    assert_eq!(first.flush_reason, Some(FlushReason::Timeout));
+    assert_eq!(first.resulting_resume, FramingResume::Clean);
     assert_eq!(framer.next_expected_input_offset(), 3);
-
-    let second = feed(
-        &mut framer,
-        &[0xac, b'\n'],
-        start + Duration::from_millis(11),
-    );
-    assert_eq!(second.len(), 1);
-    assert_eq!(text(&second[0]), "\u{20ac}");
-    assert_eq!(
-        second[0].body_source_range,
-        super::SourceRange { start: 1, end: 4 }
-    );
-    assert_eq!(
-        second[0].frame_source_range,
-        super::SourceRange { start: 1, end: 5 }
-    );
+    assert_eq!(framer.pending_source_start(), None);
 }
 
-/// Scenario: EOF-gated timeout sees only an incomplete encoded scalar and has no complete body prefix.
-/// Guarantees: Polling reports pending without output and disarms the expired deadline until another EOF observation.
+/// Scenario: EOF-gated timeout sees only an incomplete UTF-8 scalar under
+/// `preserve_raw`.
+/// Guarantees: the exact bytes emit once, progress covers the complete
+/// source range, and the expired deadline disarms without busy polling.
 #[test]
-fn timeout_with_only_incomplete_unit_does_not_busy_poll() {
+fn timeout_with_only_incomplete_unit_emits_once() {
     let start = Instant::now();
     let mut framer = framer(&TestSettings::default(), start);
     assert!(feed(&mut framer, &[0xe2, 0x82], start).is_empty());
@@ -650,9 +689,86 @@ fn timeout_with_only_incomplete_unit_does_not_busy_poll() {
     let poll = framer
         .poll_timeout(start + Duration::from_millis(10))
         .unwrap();
-    assert!(poll.output.is_none());
-    assert!(poll.pending);
+    let output = poll.output.expect("incomplete unit must emit");
+    assert_eq!(bytes(&output), &[0xe2, 0x82]);
+    assert_eq!(output.checkpoint_end, 2);
+    assert_eq!(
+        output.decode_outcome,
+        DecodeOutcome::PreserveRaw { count: 1 }
+    );
+    assert!(!poll.pending);
     assert_eq!(framer.deadline(), None);
+    let repeated = framer
+        .poll_timeout(start + Duration::from_millis(20))
+        .unwrap();
+    assert!(repeated.output.is_none());
+    assert!(!repeated.pending);
+}
+
+/// Scenario: EOF-gated idle timeout reaches incomplete UTF-8, UTF-16, and
+/// BOM source units under `replace`.
+/// Guarantees: each exact incomplete source range contributes one U+FFFD,
+/// includes any decoded prefix in source order, and advances cleanly only
+/// through the complete pending range.
+#[test]
+fn timeout_replace_emits_one_replacement_for_each_incomplete_unit() {
+    let start = Instant::now();
+    for (encoding, input, expected) in [
+        (Encoding::Utf8, vec![b'a', 0xe2], "a\u{fffd}"),
+        (Encoding::Utf16Le, vec![b'a', 0, 0, 0xd8], "a\u{fffd}"),
+        (Encoding::Utf16Le, vec![b'a', 0, 0xff], "a\u{fffd}"),
+        (Encoding::Utf16Le, vec![0, 0xd8, 0xff], "\u{fffd}"),
+        (Encoding::Utf8, vec![0xef, 0xbb], "\u{fffd}"),
+    ] {
+        let settings = TestSettings {
+            encoding,
+            policy: OnDecodeError::Replace,
+            ..TestSettings::default()
+        };
+        let mut framer = framer(&settings, start);
+        assert!(feed(&mut framer, &input, start).is_empty());
+        framer.observe_eof(start).unwrap();
+        let output = framer
+            .poll_timeout(start + settings.flush_period)
+            .unwrap()
+            .output
+            .expect("replace policy must emit");
+        assert_eq!(text(&output), expected);
+        assert_eq!(output.body_source_range.start, 0);
+        assert_eq!(output.body_source_range.end, input.len() as u64);
+        assert_eq!(output.checkpoint_end, input.len() as u64);
+        assert_eq!(
+            output.decode_outcome,
+            DecodeOutcome::Replacements { count: 1 }
+        );
+        assert_eq!(output.resulting_resume, FramingResume::Clean);
+    }
+}
+
+/// Scenario: EOF-gated idle timeout reaches an incomplete UTF-8 scalar under
+/// `on_decode_error: fail`.
+/// Guarantees: no prefix of the logical record emits and the fatal error
+/// identifies the exact uncommittable source range.
+#[test]
+fn timeout_fail_rejects_incomplete_unit_without_progress() {
+    let start = Instant::now();
+    let settings = TestSettings {
+        policy: OnDecodeError::Fail,
+        ..TestSettings::default()
+    };
+    let mut framer = framer(&settings, start);
+    assert!(feed(&mut framer, &[b'a', 0xe2], start).is_empty());
+    framer.observe_eof(start).unwrap();
+    let error = framer
+        .poll_timeout(start + settings.flush_period)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        FramerError::Decode(super::DecodeError::FatalMalformed {
+            range: super::SourceRange { start: 1, end: 2 },
+            ..
+        })
+    ));
     assert_eq!(framer.pending_source_start(), Some(0));
 }
 
@@ -1541,29 +1657,135 @@ fn fail_policy_still_checks_discarded_truncate_tail() {
     ));
 }
 
-/// Scenario: Rotation and drain hooks see enabled partial flushing on separate partial records.
-/// Guarantees: Each hook emits a reason-marked Clean record at the latest complete decoder boundary.
+/// Scenario: confirmed permanent rotation EOF sees an unterminated record
+/// with ordinary idle flushing disabled, while drain sees a separate enabled
+/// partial record.
+/// Guarantees: D17 emits the rotation record with terminal evidence regardless
+/// of idle configuration, while drain retains its ordinary configured hook.
 #[test]
-fn rotation_and_drain_hooks_flush_when_enabled() {
+fn permanent_rotation_is_independent_from_idle_and_drain_flush() {
     let now = Instant::now();
-    let mut framer = framer(&TestSettings::default(), now);
-    assert!(feed(&mut framer, b"one", now).is_empty());
-    let rotation = framer
+    let disabled = TestSettings {
+        flush_period: Duration::ZERO,
+        ..TestSettings::default()
+    };
+    let mut rotation_framer = framer(&disabled, now);
+    assert!(feed(&mut rotation_framer, b"one", now).is_empty());
+    let rotation = rotation_framer
         .flush_rotation(now)
         .unwrap()
         .output
         .expect("rotation must flush");
     assert_eq!(rotation.flush_reason, Some(FlushReason::Rotation));
     assert_eq!(rotation.resulting_resume, FramingResume::Clean);
+    assert_eq!(text(&rotation), "one");
 
-    assert!(feed(&mut framer, b"two", now).is_empty());
-    let drain = framer
-        .flush_drain(now)
+    let mut drain_framer = framer(&TestSettings::default(), now);
+    assert!(feed(&mut drain_framer, b"two", now).is_empty());
+    drain_framer.observe_eof(now).unwrap();
+    let drain = drain_framer
+        .flush_drain(now + Duration::from_millis(10))
         .unwrap()
         .output
         .expect("drain must flush");
     assert_eq!(drain.flush_reason, Some(FlushReason::Drain));
     assert_eq!(text(&drain), "two");
+}
+
+/// Scenario: confirmed permanent EOF reaches an incomplete UTF-8 scalar with
+/// idle flush disabled under preserve, replace, and fail policies.
+/// Guarantees: preserve emits exact bytes, replace emits one U+FFFD, and fail
+/// returns the exact malformed range without authorizing progress.
+#[test]
+fn permanent_rotation_applies_decode_policy_to_incomplete_unit() {
+    let now = Instant::now();
+    for policy in [OnDecodeError::PreserveRaw, OnDecodeError::Replace] {
+        let settings = TestSettings {
+            policy,
+            flush_period: Duration::ZERO,
+            ..TestSettings::default()
+        };
+        let mut framer = framer(&settings, now);
+        assert!(feed(&mut framer, &[b'a', 0xe2], now).is_empty());
+        let output = framer
+            .flush_rotation(now)
+            .unwrap()
+            .output
+            .expect("permanent EOF must emit");
+        match policy {
+            OnDecodeError::PreserveRaw => assert_eq!(bytes(&output), &[b'a', 0xe2]),
+            OnDecodeError::Replace => assert_eq!(text(&output), "a\u{fffd}"),
+            OnDecodeError::Fail => unreachable!("fail is asserted separately"),
+        }
+        assert_eq!(output.checkpoint_end, 2);
+        assert_eq!(output.flush_reason, Some(FlushReason::Rotation));
+        assert_eq!(output.resulting_resume, FramingResume::Clean);
+    }
+
+    let settings = TestSettings {
+        policy: OnDecodeError::Fail,
+        flush_period: Duration::ZERO,
+        ..TestSettings::default()
+    };
+    let mut framer = framer(&settings, now);
+    assert!(feed(&mut framer, &[b'a', 0xe2], now).is_empty());
+    let error = framer.flush_rotation(now).unwrap_err();
+    assert!(matches!(
+        error,
+        FramerError::Decode(super::DecodeError::FatalMalformed {
+            range: super::SourceRange { start: 1, end: 2 },
+            ..
+        })
+    ));
+    assert_eq!(framer.pending_source_start(), Some(0));
+}
+
+/// Scenario: a resumed split continuation with known end 10 is defensively
+/// asked to handle permanent EOF after receiving only bytes `[4, 6)`.
+/// Guarantees: the framer cannot fabricate a short final fragment; the reader
+/// layer must classify the missing known end as truncation.
+#[test]
+fn permanent_rotation_does_not_shorten_known_continuation_end() {
+    let now = Instant::now();
+    let settings = TestSettings {
+        flush_period: Duration::ZERO,
+        ..TestSettings::default()
+    };
+    let mut framer =
+        resumed_framer_with_end(&settings, 4, 0, 10, 1, now).expect("continuation constructs");
+    assert!(feed(&mut framer, b"ab", now).is_empty());
+    let step = framer.flush_rotation(now).unwrap();
+    assert!(step.output.is_none());
+    assert!(step.pending);
+    assert_eq!(framer.pending_source_start(), Some(4));
+}
+
+/// Scenario: a UTF-8 stream contains only a valid BOM when permanent
+/// rotation EOF is confirmed.
+/// Guarantees: no empty log record is fabricated, while the exact BOM
+/// frontier and committed-frontier window become available for recordless
+/// finalization.
+#[test]
+fn permanent_rotation_exposes_bom_only_clean_frontier() {
+    let now = Instant::now();
+    let settings = TestSettings {
+        flush_period: Duration::ZERO,
+        ..TestSettings::default()
+    };
+    let mut framer = framer(&settings, now);
+    assert!(feed(&mut framer, &[0xef, 0xbb, 0xbf], now).is_empty());
+    let step = framer.flush_rotation(now).unwrap();
+    assert!(step.output.is_none());
+    assert!(step.pending);
+
+    let (offset, window) = framer
+        .take_terminal_empty_frontier()
+        .unwrap()
+        .expect("stripped BOM must expose clean progress");
+    assert_eq!(offset, 3);
+    assert_eq!(window.end_offset(), 3);
+    assert_eq!(window.bytes(), &[0xef, 0xbb, 0xbf]);
+    assert_eq!(framer.pending_source_start(), None);
 }
 
 /// Scenario: a Framer is constructed at restart with a real, distinguishable

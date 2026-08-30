@@ -234,6 +234,12 @@ handle open, captures compatible late writes through EOF plus `rotate_wait`,
 and independently admits the replacement file. Writes arriving after
 finalization can be missed.
 
+At confirmed permanent rotation EOF, a nonempty unterminated frame is emitted
+with `otel.arrow.filelog.terminal_unterminated = true`, even when ordinary idle
+flush is disabled. Its progress and finalization remain behind matching
+aggregate Ack. Incomplete input under `on_decode_error: fail` is quarantined
+without advancing over the malformed unit.
+
 Copy-truncate detection is best effort. A truncate-and-regrow cycle completed
 between observations can be indistinguishable from an append, and bytes
 destroyed before capture or recovery are unrecoverable. Prefer move/create
@@ -264,7 +270,7 @@ High-signal operating metrics include:
 | `receiver.filelog.files.descriptor.saturation` | `{event}` | Reads that encountered descriptor saturation. |
 | `receiver.filelog.rotation.copytruncate.detected` | `{rotation}` | Observable copy-truncate transitions. |
 | `receiver.filelog.partial.bytes.pending` | `By` | Current uncommitted partial source bytes. |
-| `receiver.filelog.partial.bytes.dropped` | `By` | Unterminated source bytes intentionally left uncommitted. |
+| `receiver.filelog.terminal.unterminated.records` | `{record}` | Records emitted only because permanent rotation EOF established a boundary. |
 | `receiver.filelog.health_events.suppressed` | `{event}` | Repeated detailed events withheld by the rate limiter. |
 
 The complete instrument catalog and averaging rules for total-duration
@@ -287,7 +293,6 @@ include:
 | `filelog_receiver.copytruncate_quarantined` | `warn` | Detectable truncation was quarantined under `fail`. |
 | `filelog_receiver.copytruncate_reset` | `warn` | Detectable truncation reset to a new epoch under `read_new`. |
 | `filelog_receiver.decode_quarantined` | `warn` | A decode failure was durably quarantined. |
-| `filelog_receiver.rotation_partial_bytes_dropped` | `warn` | Rotation finalized with unterminated bytes left uncommitted. |
 | `filelog_receiver.drain_timeout` | `warn` | Drain ended with unacknowledged work and no progress advance. |
 | `filelog_receiver.terminal_failure` | `warn` | The receiver returned a terminal error. |
 

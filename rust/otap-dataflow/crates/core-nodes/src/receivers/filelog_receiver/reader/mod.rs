@@ -1356,7 +1356,18 @@ impl ReaderTable {
                     })?;
                 !observed_fingerprint.starts_with(&reader.durable_fingerprint)
             };
-            if observed_size < source_offset || fingerprint_mismatch {
+            let known_continuation_end = self.readers.get(&file_id).and_then(|reader| match reader
+                .framing_resume
+            {
+                FramingResume::Continuation {
+                    record_end_offset, ..
+                } if record_end_offset != 0 => Some(record_end_offset),
+                _ => None,
+            });
+            if observed_size < source_offset
+                || known_continuation_end.is_some_and(|end| observed_size < end)
+                || fingerprint_mismatch
+            {
                 return Ok(ReaderPoll::Truncated {
                     file_id,
                     file_epoch,
