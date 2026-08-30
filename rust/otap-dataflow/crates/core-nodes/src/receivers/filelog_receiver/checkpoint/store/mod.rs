@@ -2393,7 +2393,7 @@ impl CheckpointStore {
         .map(|outcome| vec![outcome])
     }
 
-    /// Updates advisory metadata (locator, last-seen time, advisory path).
+    /// Updates guarded last-seen time and advisory path metadata.
     pub fn update_metadata(
         &mut self,
         updates: Vec<UpdateMetadata>,
@@ -2428,8 +2428,8 @@ impl CheckpointStore {
         )
     }
 
-    /// Applies an operator-authorized quarantine reset. The audit reason is
-    /// mandatory and must be non-empty.
+    /// Applies an operator-authorized quarantine reset. Exact namespace,
+    /// replacement fingerprint, and non-empty audit evidence are mandatory.
     pub fn reset_quarantined_file(
         &mut self,
         reset: ResetQuarantinedFile,
@@ -2440,17 +2440,6 @@ impl CheckpointStore {
             });
         }
         self.append(vec![Operation::ResetQuarantinedFile(reset)])
-    }
-
-    /// Appends caller-constructed removals.
-    ///
-    /// A `removal_reason` of [`REASON_CODE_RESERVED`] is refused, as it is
-    /// on every other path that can encode one.
-    pub fn remove_files(
-        &mut self,
-        removals: Vec<RemoveFile>,
-    ) -> Result<Vec<AppendOutcome>, StoreError> {
-        self.append_batched(removals.into_iter().map(Operation::RemoveFile).collect())
     }
 
     /// The records ordinary retention would remove: those whose last-seen
@@ -2486,52 +2475,35 @@ impl CheckpointStore {
         candidates
     }
 
-    /// Removes every record ordinary retention selects, in synced,
-    /// bounded transactions, and returns how many were removed.
+    /// Removes every record ordinary retention selects through one filtered
+    /// compaction and returns how many were removed.
     ///
-    /// Quarantined records are never removed here, both because
-    /// [`Self::retention_candidates`] excludes them and because the format's
-    /// replay rules reject a non-administrative removal of a quarantined
-    /// record.
+    /// Quarantined records are never removed because
+    /// [`Self::retention_candidates`] excludes them. Retention never encodes
+    /// `remove_file`; the complete vetted set becomes authoritative only when
+    /// the replacement `CURRENT` publication is durable.
     pub fn remove_expired(
         &mut self,
         eligible_absent: &HashSet<FileId>,
         now_unix_nano: u64,
         retention: Duration,
-        removal_reason: u16,
     ) -> Result<usize, StoreError> {
         self.ensure_not_unusable("remove expired checkpoint records")?;
-        // Checked before the table is scanned as well as inside `append`,
-        // so a reserved reason code is refused even when retention selects
-        // nothing and no transaction would be built at all.
-        reject_reserved_reason_code("remove_file.removal_reason", removal_reason)?;
         let candidates = self.retention_candidates(eligible_absent, now_unix_nano, retention);
         if candidates.is_empty() {
             self.ensure_usable("remove expired checkpoint records")?;
             return Ok(0);
         }
-        let mut removals = Vec::with_capacity(candidates.len());
-        for file_id in candidates {
-            let Some(record) = self.table.get(&file_id) else {
-                continue;
-            };
-            removals.push(Operation::RemoveFile(RemoveFile {
-                file_id,
-                expected_file_epoch: record.file_epoch,
-                expected_prior_state: record.lifecycle_state,
-                removal_reason,
-                removal_time_unix_nano: now_unix_nano,
-                administrative: false,
-                namespace_id: None,
-                audit_reason: None,
-            }));
-        }
+        let removals: HashSet<FileId> = candidates.into_iter().collect();
         let removed = removals.len();
-        if removed == 0 {
-            self.ensure_usable("remove expired checkpoint records")?;
-            return Ok(0);
-        }
-        let _outcomes = self.append_batched(removals)?;
+        let records = self
+            .table
+            .snapshot_records()
+            .into_iter()
+            .filter(|record| !removals.contains(&record.file_id))
+            .collect();
+        self.compact_replacing_table_cancellable(Some(records), &mut || false)?
+            .expect("non-cancellable retention compaction cannot be cancelled");
         Ok(removed)
     }
 
@@ -2683,6 +2655,14 @@ impl CheckpointStore {
         &mut self,
         cancelled: &mut impl FnMut() -> bool,
     ) -> Result<Option<()>, StoreError> {
+        self.compact_replacing_table_cancellable(None, cancelled)
+    }
+
+    fn compact_replacing_table_cancellable(
+        &mut self,
+        replacement_records: Option<Vec<SnapshotRecord>>,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<Option<()>, StoreError> {
         if cancelled() {
             return Ok(None);
         }
@@ -2721,7 +2701,8 @@ impl CheckpointStore {
             return Ok(None);
         };
 
-        let records = self.table.snapshot_records();
+        let replace_table = replacement_records.is_some();
+        let records = replacement_records.unwrap_or_else(|| self.table.snapshot_records());
         if cancelled() {
             return Ok(None);
         }
@@ -2757,8 +2738,13 @@ impl CheckpointStore {
             }
             return Err(failure.error);
         }
-        self._namespace
-            .verify("revalidate the checkpoint namespace after compaction publication")?;
+        if let Err(error) = self
+            ._namespace
+            .verify("revalidate the checkpoint namespace after compaction publication")
+        {
+            self.unusable = Some("the namespace changed after CURRENT publication");
+            return Err(error);
+        }
 
         // Replacing the handle closes the previous generation's WAL, which
         // Windows requires before that file can be removed by cleanup.
@@ -2771,6 +2757,10 @@ impl CheckpointStore {
         self.unsynced_transactions = 0;
         self.last_sync = Instant::now();
         self.retired_generations.push(previous);
+        if replace_table {
+            self.table = CheckpointTable::from_snapshot_records(records)
+                .expect("filtered records from a valid table remain reachable");
+        }
         if cancelled_after_publish {
             Ok(None)
         } else {
@@ -3169,11 +3159,23 @@ impl CheckpointStore {
                     )?;
                     validate("new update fingerprint", op.file_id, &op.new_fingerprint)?;
                 }
+                Operation::ResetAfterTruncate(op) => {
+                    validate(
+                        "truncate reset fingerprint",
+                        op.file_id,
+                        &op.new_fingerprint,
+                    )?;
+                }
+                Operation::ResetQuarantinedFile(op) => {
+                    validate(
+                        "quarantine reset fingerprint",
+                        op.file_id,
+                        &op.new_fingerprint,
+                    )?;
+                }
                 Operation::UpdateProgress(_)
-                | Operation::ResetAfterTruncate(_)
                 | Operation::UpdateMetadata(_)
                 | Operation::QuarantineFile(_)
-                | Operation::ResetQuarantinedFile(_)
                 | Operation::RemoveFile(_) => {}
             }
         }

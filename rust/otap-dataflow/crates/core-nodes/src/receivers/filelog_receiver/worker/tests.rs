@@ -1631,6 +1631,102 @@ async fn read_new_resets_epoch_before_reading_replacement_stream() {
     assert_eq!((unchanged.file_epoch, unchanged.committed_offset), (2, 4));
 }
 
+/// Scenario: finalized history and its active replacement share one reused
+/// locator, then discovery emits an `Updated` event for the replacement.
+/// Guarantees: truncation detection consults only the sole live locator claim
+/// and does not reject valid retained `RotatedFinalized` history.
+#[test]
+fn updated_reused_locator_ignores_finalized_history() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("reused.log");
+    std::fs::write(&source, b"new\n").unwrap();
+    let runtime_config = runtime_config(
+        source.to_str().unwrap(),
+        &directory.path().join("checkpoint"),
+        1,
+    );
+    let mut runtime = WorkerRuntime::new(runtime_config).unwrap();
+    runtime.readers.take().unwrap().shutdown().unwrap();
+
+    let resolved_path = std::fs::canonicalize(&source).unwrap();
+    let evidence = open_candidate(&source, false, 16, 0).unwrap().evidence;
+    let old_file_id = FileId::from_bytes([94; 16]);
+    let new_file_id = FileId::from_bytes([95; 16]);
+    let registration = |file_id| RegisterFile {
+        file_id,
+        file_epoch: 1,
+        committed_offset: 0,
+        committed_frontier_guard: CommittedFrontierGuard::empty(),
+        fingerprint: evidence.fingerprint.clone(),
+        ignored_header_bytes: 0,
+        locator: evidence.locator,
+        framing_profile_version: FRAMING_PROFILE_VERSION,
+        framing_profile_digest: runtime.config.framing_profile_digest,
+        framing_resume: FramingResume::Clean,
+        last_seen_time_unix_nano: 1,
+        advisory_path: evidence.advisory_path.clone(),
+    };
+    let _registered = runtime
+        .store
+        .register_files(vec![registration(old_file_id)])
+        .unwrap();
+    let _finalized = runtime
+        .store
+        .commit_progress(vec![UpdateProgress {
+            file_id: old_file_id,
+            expected_committed_offset: 0,
+            expected_file_epoch: 1,
+            new_committed_offset: 0,
+            new_committed_frontier_guard: CommittedFrontierGuard::empty(),
+            new_framing_resume: FramingResume::Clean,
+            new_last_seen_time_unix_nano: 2,
+            finalize: true,
+        }])
+        .unwrap();
+    let _replacement = runtime
+        .store
+        .register_files(vec![registration(new_file_id)])
+        .unwrap();
+
+    let candidate = DiscoveredCandidate {
+        matched_path: source,
+        resolved_path,
+        evidence: evidence.clone(),
+        modified: None,
+    };
+    let mut readers = ReaderTable::new(ReaderSettings::from_runtime(&runtime.config)).unwrap();
+    readers
+        .insert(
+            candidate.clone(),
+            ResolvedIdentity {
+                file_id: new_file_id,
+                file_epoch: 1,
+                committed_offset: 0,
+                framing_resume: FramingResume::Clean,
+                lifecycle_state: LifecycleState::Active,
+                matched_by: IdentityMatch::RecoveryMismatch,
+                committed_frontier_guard: CommittedFrontierGuard::empty(),
+                advisory_path: evidence.advisory_path,
+            },
+        )
+        .unwrap();
+    runtime.readers = Some(readers);
+
+    runtime
+        .detect_updated_truncations(&[CandidateEvent::Updated(candidate)])
+        .unwrap();
+    assert!(runtime.detected_truncations.is_empty());
+    assert_eq!(
+        runtime
+            .store
+            .table()
+            .get(&old_file_id)
+            .unwrap()
+            .lifecycle_state,
+        LifecycleState::RotatedFinalized
+    );
+}
+
 /// Scenario: truncate-fail quarantine is durably synced, then injected reader
 /// cleanup fails before the quarantined reader can be released.
 /// Guarantees: the truncate outcome, quarantine action, and durable population

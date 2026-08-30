@@ -270,9 +270,15 @@ dfctl filelog checkpoint reset beginning \
   --checkpoint-id app-logs \
   --file-id 00112233445566778899aabbccddeeff \
   --expected-epoch 3 \
+  --source-path /var/log/app.log \
   --reason "replay quarantined source" \
   --acknowledge-duplicates
 ```
+
+Both reset actions open the operator-selected path, require its handle-derived
+locator to match quarantine, and atomically install fingerprint evidence from
+that same validated handle. Symlinks and Windows reparse points are rejected
+unless `--follow-symlinks` is explicitly set.
 
 Reset to the stable current EOF only after accepting loss of undelivered bytes
 before that offset:
@@ -288,10 +294,8 @@ dfctl filelog checkpoint reset end \
   --acknowledge-loss
 ```
 
-The reset-to-end path must resolve to the immutable locator stored in
-quarantine. The tool samples stable EOF and the real trailing checkpoint guard
-from one handle. It does not search advisory aliases. Symlinks and Windows
-reparse points are rejected unless `--follow-symlinks` is explicitly set.
+Reset-to-end additionally samples stable EOF and the real trailing checkpoint
+guard from the same handle. Neither reset searches advisory aliases.
 
 Record an audited decision without changing operational quarantine state:
 

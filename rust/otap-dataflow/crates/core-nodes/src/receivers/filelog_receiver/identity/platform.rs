@@ -22,12 +22,19 @@ pub(crate) struct OpenedCandidate {
     pub(crate) evidence: CandidateEvidence,
 }
 
-/// Stable EOF evidence sampled from one exact-locator regular-file handle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Stable reset evidence sampled from one exact-locator regular-file handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StableEofEvidence {
     pub(crate) locator: Locator,
     pub(crate) offset: u64,
     pub(crate) committed_frontier_guard: CommittedFrontierGuard,
+    pub(crate) fingerprint: Vec<u8>,
+}
+
+/// Replacement-stream fingerprint sampled from one exact-locator handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StableFingerprintEvidence {
+    pub(crate) fingerprint: Vec<u8>,
 }
 
 struct OpenedLocator {
@@ -243,8 +250,44 @@ pub(crate) fn open_stable_eof(
     open_path: &Path,
     follow_symlinks: bool,
     expected_locator: Locator,
+    fingerprint_bytes: u16,
+    ignored_header_bytes: u32,
 ) -> Result<StableEofEvidence, IdentityError> {
-    open_stable_eof_inner(open_path, follow_symlinks, expected_locator, || {})
+    open_stable_eof_inner(
+        open_path,
+        follow_symlinks,
+        expected_locator,
+        fingerprint_bytes,
+        ignored_header_bytes,
+        || {},
+    )
+}
+
+/// Opens an operator-selected reset-to-beginning source, proves its exact
+/// locator, and collects bounded append-compatible fingerprint evidence.
+pub(crate) fn open_stable_fingerprint(
+    open_path: &Path,
+    follow_symlinks: bool,
+    expected_locator: Locator,
+    fingerprint_bytes: u16,
+    ignored_header_bytes: u32,
+) -> Result<StableFingerprintEvidence, IdentityError> {
+    let opened = open_candidate(
+        open_path,
+        follow_symlinks,
+        fingerprint_bytes,
+        ignored_header_bytes,
+    )?;
+    if opened.evidence.locator != expected_locator {
+        return Err(IdentityError::ReopenLocatorMismatch {
+            path: open_path.to_path_buf(),
+            expected: expected_locator,
+            found: opened.evidence.locator,
+        });
+    }
+    Ok(StableFingerprintEvidence {
+        fingerprint: opened.evidence.fingerprint,
+    })
 }
 
 #[cfg(test)]
@@ -252,12 +295,16 @@ pub(crate) fn open_stable_eof_with_hook(
     open_path: &Path,
     follow_symlinks: bool,
     expected_locator: Locator,
+    fingerprint_bytes: u16,
+    ignored_header_bytes: u32,
     after_first_sample: impl FnOnce(),
 ) -> Result<StableEofEvidence, IdentityError> {
     open_stable_eof_inner(
         open_path,
         follow_symlinks,
         expected_locator,
+        fingerprint_bytes,
+        ignored_header_bytes,
         after_first_sample,
     )
 }
@@ -266,6 +313,8 @@ fn open_stable_eof_inner(
     open_path: &Path,
     follow_symlinks: bool,
     expected_locator: Locator,
+    fingerprint_bytes: u16,
+    ignored_header_bytes: u32,
     after_first_sample: impl FnOnce(),
 ) -> Result<StableEofEvidence, IdentityError> {
     let file = open_read_only(open_path, follow_symlinks).map_err(|source| {
@@ -302,6 +351,28 @@ fn open_stable_eof_inner(
         });
     }
     let offset = first_metadata.len();
+    let first_fingerprint = read_fingerprint_cancellable(
+        &file,
+        u64::from(ignored_header_bytes),
+        usize::from(fingerprint_bytes),
+        &mut || false,
+    )
+    .map_err(|source| IdentityError::Io {
+        operation: "read administrative reset fingerprint",
+        path: open_path.to_path_buf(),
+        source,
+    })?
+    .expect("non-cancellable reset fingerprint read cannot be cancelled");
+    if !fingerprint_length_is_consistent(
+        first_fingerprint.len(),
+        offset,
+        fingerprint_bytes,
+        ignored_header_bytes,
+    ) {
+        return Err(IdentityError::CandidateChangedDuringIdentity {
+            path: open_path.to_path_buf(),
+        });
+    }
     let window_len = offset.min(u64::from(COMMITTED_FRONTIER_GUARD_WINDOW_BYTES)) as usize;
     let window_offset = offset - window_len as u64;
     let first_window =
@@ -331,6 +402,30 @@ fn open_stable_eof_inner(
     if !second_metadata.is_file()
         || second_metadata.len() != offset
         || second_locator != first_locator
+    {
+        return Err(IdentityError::CandidateChangedDuringIdentity {
+            path: open_path.to_path_buf(),
+        });
+    }
+    let second_fingerprint = read_fingerprint_cancellable(
+        &file,
+        u64::from(ignored_header_bytes),
+        usize::from(fingerprint_bytes),
+        &mut || false,
+    )
+    .map_err(|source| IdentityError::Io {
+        operation: "reread administrative reset fingerprint",
+        path: open_path.to_path_buf(),
+        source,
+    })?
+    .expect("non-cancellable reset fingerprint reread cannot be cancelled");
+    if second_fingerprint != first_fingerprint
+        || !fingerprint_length_is_consistent(
+            second_fingerprint.len(),
+            offset,
+            fingerprint_bytes,
+            ignored_header_bytes,
+        )
     {
         return Err(IdentityError::CandidateChangedDuringIdentity {
             path: open_path.to_path_buf(),
@@ -381,6 +476,7 @@ fn open_stable_eof_inner(
         locator: first_locator,
         offset,
         committed_frontier_guard,
+        fingerprint: second_fingerprint,
     })
 }
 

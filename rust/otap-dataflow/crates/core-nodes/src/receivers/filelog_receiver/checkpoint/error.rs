@@ -160,6 +160,14 @@ pub enum DecodeError {
         /// The transaction's sequence number.
         sequence: u64,
     },
+    /// A progress-only transaction named one `file_id` more than once.
+    #[error("transaction {sequence} contains duplicate update_progress for {file_id:?}")]
+    DuplicateProgressFileId {
+        /// The transaction's sequence number.
+        sequence: u64,
+        /// The repeated progress key.
+        file_id: FileId,
+    },
     /// A transaction's encoded body exceeded `WAL_MAX_TX_BODY_BYTES`
     /// (16 MiB), or its declared `body_len` was outside
     /// `TX_MIN_BODY_BYTES..=WAL_MAX_TX_BODY_BYTES`.
@@ -260,6 +268,14 @@ pub enum EncodeError {
         /// The field name.
         field: &'static str,
     },
+    /// A constructed field value has no valid v1 wire representation.
+    #[error("field {field} has an invalid value: {reason}")]
+    InvalidFieldValue {
+        /// The invalid field.
+        field: &'static str,
+        /// A short explanation of the v1 restriction.
+        reason: &'static str,
+    },
     /// A quarantine or removal reason used a value this version reserves and
     /// forbids encoders from producing.
     #[error("field {field} uses reserved reason code {reason_code:#06x}")]
@@ -293,6 +309,14 @@ pub enum EncodeError {
     MixedTransactionClass {
         /// The transaction's sequence number.
         sequence: u64,
+    },
+    /// A progress-only transaction named one `file_id` more than once.
+    #[error("transaction {sequence} contains duplicate update_progress for {file_id:?}")]
+    DuplicateProgressFileId {
+        /// The transaction's sequence number.
+        sequence: u64,
+        /// The repeated progress key.
+        file_id: FileId,
     },
     /// A transaction's encoded body exceeded `WAL_MAX_TX_BODY_BYTES`
     /// (16 MiB) (mirrors `DecodeError::TransactionBodyTooLarge`).
@@ -411,10 +435,11 @@ pub enum ApplyError {
         /// The reason code actually found.
         reason_code: u16,
     },
-    /// `remove_file` administrative removal of a quarantined record named a
-    /// `namespace_id` that does not match the namespace the WAL actually
-    /// belongs to.
-    #[error("remove_file for {file_id:?} named namespace {named:?}, expected {actual:?}")]
+    /// An administrative reset/removal named a `namespace_id` that does not
+    /// match the namespace the WAL actually belongs to.
+    #[error(
+        "administrative operation for {file_id:?} named namespace {named:?}, expected {actual:?}"
+    )]
     NamespaceMismatch {
         /// The file identity involved.
         file_id: FileId,
@@ -425,10 +450,9 @@ pub enum ApplyError {
     },
     /// A table record was in state `Quarantined` but carried no
     /// `quarantine_evidence`. This should be unreachable through
-    /// `decode_snapshot`/`encode_snapshot` and normal replay (both enforce
-    /// the invariant), but a table can also be seeded directly through
-    /// `CheckpointTable::from_snapshot_records`; replay checks the
-    /// invariant explicitly here rather than trusting an internal panic.
+    /// `decode_snapshot`/`encode_snapshot`, direct table seeding, and normal
+    /// replay. Replay still checks explicitly rather than trusting an
+    /// internal panic if future construction paths change.
     #[error("{operation} found {file_id:?} in state Quarantined with no quarantine_evidence")]
     MissingQuarantineEvidence {
         /// The operation name that encountered the inconsistent record.
@@ -456,5 +480,21 @@ pub enum ApplyError {
     KeepFailedStateChange {
         /// The file identity involved.
         file_id: FileId,
+    },
+    /// A progress-only transaction named one `file_id` more than once.
+    #[error("transaction contains duplicate update_progress for {file_id:?}")]
+    DuplicateProgressFileId {
+        /// The repeated progress key.
+        file_id: FileId,
+    },
+    /// Two live records would claim the same exact runtime locator.
+    #[error(
+        "one live locator would be claimed by both {existing_file_id:?} and {conflicting_file_id:?}"
+    )]
+    LiveLocatorConflict {
+        /// Existing or first staged claimant.
+        existing_file_id: FileId,
+        /// Later staged claimant.
+        conflicting_file_id: FileId,
     },
 }

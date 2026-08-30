@@ -467,7 +467,7 @@ fn curated_examples(path: &[String]) -> Vec<String> {
             "filelog checkpoint backup --state-dir ./state --checkpoint-id app-logs --destination ./checkpoint-evidence",
         )],
         ["filelog", "checkpoint", "reset", "beginning"] => vec![command_example(
-            "filelog checkpoint reset beginning --state-dir ./state --checkpoint-id app-logs --file-id 00112233445566778899aabbccddeeff --expected-epoch 1 --reason replay --acknowledge-duplicates",
+            "filelog checkpoint reset beginning --state-dir ./state --checkpoint-id app-logs --file-id 00112233445566778899aabbccddeeff --expected-epoch 1 --source-path ./app.log --reason replay --acknowledge-duplicates",
         )],
         ["filelog", "checkpoint", "reset", "end"] => vec![command_example(
             "filelog checkpoint reset end --state-dir ./state --checkpoint-id app-logs --file-id 00112233445566778899aabbccddeeff --expected-epoch 1 --source-path ./app.log --reason skip --acknowledge-loss",

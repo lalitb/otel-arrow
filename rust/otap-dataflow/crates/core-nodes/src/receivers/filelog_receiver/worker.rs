@@ -30,7 +30,7 @@ use super::checkpoint::primitives::{
 };
 use super::checkpoint::store::error::StoreError;
 use super::checkpoint::store::{CheckpointStore, StoreOptions, StoreStats};
-use super::checkpoint::wal::{Operation, QuarantineFile, ResetAfterTruncate, UpdateFingerprint};
+use super::checkpoint::wal::{Operation, QuarantineFile, ResetAfterTruncate};
 use super::config::{OnTruncate, RuntimeConfig};
 use super::discovery::scanner::DiscoveryPlan;
 use super::discovery::source::{
@@ -1696,29 +1696,11 @@ impl WorkerRuntime {
                 Err(error) => return Err(WorkerError::Reader(error)),
             };
 
-            let matching_records = self
-                .store
-                .table()
-                .iter()
-                .filter(|(_, record)| record.locator == locator)
-                .count();
-            if matching_records != 1 {
+            if self.store.table().live_file_id_for_locator(locator) != Some(file_id) {
                 return Err(WorkerError::UnsupportedUpdatedIdentity {
                     locator,
                     file_id,
-                    reason: "runtime locator does not have exactly one durable record",
-                });
-            }
-            if self
-                .store
-                .table()
-                .get(&file_id)
-                .is_none_or(|record| record.locator != locator)
-            {
-                return Err(WorkerError::UnsupportedUpdatedIdentity {
-                    locator,
-                    file_id,
-                    reason: "reader association does not match the durable locator record",
+                    reason: "reader association does not match the sole live locator record",
                 });
             }
             if quarantined {
@@ -1890,16 +1872,7 @@ impl WorkerRuntime {
                         reason: "file epoch overflowed during truncate reset",
                     },
                 )?;
-                let expected_fingerprint = self
-                    .store
-                    .table()
-                    .get(&truncation.file_id)
-                    .ok_or(WorkerError::MissingCheckpointRecord {
-                        file_id: truncation.file_id,
-                    })?
-                    .fingerprint
-                    .clone();
-                let mut operations = reserved_vec(2, "truncate reset transaction")?;
+                let mut operations = reserved_vec(1, "truncate reset transaction")?;
                 operations.push(Operation::ResetAfterTruncate(ResetAfterTruncate {
                     file_id: truncation.file_id,
                     expected_active_epoch: truncation.expected_file_epoch,
@@ -1907,14 +1880,9 @@ impl WorkerRuntime {
                     resulting_epoch,
                     new_committed_offset: 0,
                     new_framing_resume: FramingResume::Clean,
+                    new_fingerprint: truncation.observed_fingerprint.clone(),
                     reset_time_unix_nano,
                     reason_code: TRUNCATE_RESET_REASON_READ_NEW,
-                }));
-                operations.push(Operation::UpdateFingerprint(UpdateFingerprint {
-                    file_id: truncation.file_id,
-                    expected_file_epoch: resulting_epoch,
-                    expected_fingerprint,
-                    new_fingerprint: truncation.observed_fingerprint.clone(),
                 }));
                 if self.cancellation_requested() {
                     return Ok(false);

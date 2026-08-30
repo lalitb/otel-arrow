@@ -12,7 +12,8 @@
 use super::apply::CheckpointTable;
 use super::error::{ApplyError, DecodeError, EncodeError};
 use super::primitives::{
-    AdvisoryPath, CommittedFrontierGuard, FileId, FramingResume, LifecycleState, Locator,
+    AdvisoryPath, CommittedFrontierGuard, FINGERPRINT_MAX_BYTES, FileId, FramingResume,
+    LifecycleState, Locator, MAX_OPERATION_FRAME_BYTES, MAX_OPERATION_PAYLOAD_BYTES,
     REASON_CODE_RESERVED, TRUNCATE_RESET_REASON_READ_NEW, WAL_MAX_NON_PROGRESS_OPS_PER_TX,
     WAL_MAX_OPS_PER_TX, crc32c,
 };
@@ -121,6 +122,86 @@ fn insert_bytes_and_refresh(frame: &mut Vec<u8>, at: usize, extra: &[u8]) {
     refresh_frame_crc32c(frame);
 }
 
+/// Scenario: every operation whose v1 payload gained fields is independently
+/// encoded and decoded with nondefault evidence.
+/// Guarantees: truncate fingerprints, metadata guards, and quarantine-reset
+/// fingerprint/namespace/action-time fields preserve exact wire order.
+#[test]
+fn hardened_operation_payloads_round_trip_exact_fields() {
+    let operations = [
+        Operation::ResetAfterTruncate(ResetAfterTruncate {
+            file_id: FileId([201; 16]),
+            expected_active_epoch: 7,
+            observed_truncated_size: 11,
+            resulting_epoch: 8,
+            new_committed_offset: 0,
+            new_framing_resume: FramingResume::Clean,
+            new_fingerprint: b"truncate-fingerprint".to_vec(),
+            reset_time_unix_nano: 12,
+            reason_code: TRUNCATE_RESET_REASON_READ_NEW,
+        }),
+        Operation::UpdateMetadata(UpdateMetadata {
+            file_id: FileId([202; 16]),
+            expected_prior_state: LifecycleState::Quarantined,
+            expected_file_epoch: 9,
+            last_seen_time_unix_nano: 13,
+            advisory_path: Some(AdvisoryPath::from_unix_bytes(b"/new/path").unwrap()),
+        }),
+        Operation::ResetQuarantinedFile(ResetQuarantinedFile {
+            file_id: FileId([203; 16]),
+            expected_quarantine_epoch: 10,
+            action: ResetQuarantineAction::ResetToEnd,
+            resulting_epoch: 11,
+            resulting_offset: 4096,
+            new_committed_frontier_guard: zero_guard(4096),
+            new_framing_resume: FramingResume::Clean,
+            new_fingerprint: b"reset-fingerprint".to_vec(),
+            action_time_unix_nano: 14,
+            namespace_id: NAMESPACE.to_owned(),
+            audit_reason: "operator approved".to_owned(),
+        }),
+    ];
+
+    for operation in operations {
+        let encoded = operation.encode().unwrap();
+        let (decoded, consumed) = Operation::decode(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, operation);
+    }
+}
+
+/// Scenario: a checksum-valid `update_fingerprint` payload carries two
+/// maximum-length equal values, the structural allocation ceiling but not a
+/// semantically valid strict extension.
+/// Guarantees: bounded decoding accepts exactly the structural maximum while
+/// semantic replay remains responsible for rejecting the equal-length update.
+#[test]
+fn structural_maximum_fingerprint_operation_decodes_boundedly() {
+    let mut payload = Vec::with_capacity(MAX_OPERATION_PAYLOAD_BYTES as usize);
+    payload.push(0x04);
+    payload.extend_from_slice(&[204; 16]);
+    payload.extend_from_slice(&1u32.to_be_bytes());
+    payload.extend_from_slice(&(FINGERPRINT_MAX_BYTES as u16).to_be_bytes());
+    payload.extend(std::iter::repeat_n(0x5A, FINGERPRINT_MAX_BYTES));
+    payload.extend_from_slice(&(FINGERPRINT_MAX_BYTES as u16).to_be_bytes());
+    payload.extend(std::iter::repeat_n(0x5A, FINGERPRINT_MAX_BYTES));
+    assert_eq!(payload.len() as u64, MAX_OPERATION_PAYLOAD_BYTES);
+
+    let mut frame = Vec::with_capacity(MAX_OPERATION_FRAME_BYTES as usize);
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    let crc = crc32c(&frame);
+    frame.extend_from_slice(&crc.to_be_bytes());
+    assert_eq!(frame.len() as u64, MAX_OPERATION_FRAME_BYTES);
+    let (decoded, consumed) = Operation::decode(&frame).unwrap();
+    assert_eq!(consumed, frame.len());
+    let Operation::UpdateFingerprint(update) = decoded else {
+        panic!("structural maximum decoded as the wrong operation");
+    };
+    assert_eq!(update.expected_fingerprint.len(), FINGERPRINT_MAX_BYTES);
+    assert_eq!(update.new_fingerprint.len(), FINGERPRINT_MAX_BYTES);
+}
+
 /// Scenario: decoding the checked-in two-record snapshot golden vector.
 /// Guarantees: both records decode with exactly the field values the vector
 /// was independently constructed with (identity, progress, framing,
@@ -210,6 +291,38 @@ fn snapshot_round_trips_through_own_encoder() {
             .unwrap();
     let decoded_again = snapshot::decode_snapshot(&re_encoded, &TEST_NAMESPACE_DIGEST).unwrap();
     assert_eq!(original, decoded_again);
+}
+
+/// Scenario: decoding and re-encoding the independently generated snapshot
+/// fixture for the third reachable lifecycle.
+/// Guarantees: `RotatedFinalized` state has clean framing and no quarantine
+/// evidence, preserves its historical locator, and reproduces the exact
+/// reference bytes.
+#[test]
+fn rotated_finalized_snapshot_matches_independent_vector() {
+    let contents =
+        snapshot::decode_snapshot(SNAPSHOT_ROTATED_FINALIZED, &TEST_NAMESPACE_DIGEST).unwrap();
+    assert_eq!(contents.generation, 9);
+    assert_eq!(contents.records.len(), 1);
+    let record = &contents.records[0];
+    assert_eq!(record.file_id, FileId(ROTATED_FILE_ID));
+    assert_eq!(record.file_epoch, 3);
+    assert_eq!(record.committed_offset, 4);
+    assert_eq!(
+        record.committed_frontier_guard,
+        CommittedFrontierGuard::compute(4, b"abc\n").unwrap()
+    );
+    assert_eq!(record.fingerprint, b"done");
+    assert_eq!(record.locator, Locator::PosixDevIno { dev: 7, ino: 43 });
+    assert_eq!(record.framing_resume, FramingResume::Clean);
+    assert_eq!(record.lifecycle_state, LifecycleState::RotatedFinalized);
+    assert!(record.quarantine_evidence.is_none());
+    assert_eq!(record.last_seen_time_unix_nano, 1234);
+    assert_eq!(record.advisory_path, AdvisoryPath::unavailable());
+    assert_eq!(
+        snapshot::encode_snapshot(9, TEST_NAMESPACE_ID, &contents.records).unwrap(),
+        SNAPSHOT_ROTATED_FINALIZED
+    );
 }
 
 /// Scenario: a snapshot header whose `format_version` is `2`, which this
@@ -306,6 +419,161 @@ fn replay_wal_valid_two_tx_updates_table() {
     let record = table.get(&FileId(WAL_VECTOR_FILE_ID)).unwrap();
     assert_eq!(record.committed_offset, 4096);
     assert_eq!(record.lifecycle_state, LifecycleState::Active);
+}
+
+/// Scenario: the independently generated generation-5 WAL contains one
+/// complete transaction for every v1 operation in semantic replay order.
+/// Guarantees: all exact payload fields decode, Rust re-encoding reproduces
+/// the reference bytes, `keep_failed` preserves operational state, and the
+/// final administrative removal leaves the table empty.
+#[test]
+fn all_operations_wal_matches_independent_vector_and_replays() {
+    let contents = wal::decode_wal(WAL_ALL_OPERATIONS, &TEST_NAMESPACE_DIGEST).unwrap();
+    assert_eq!(contents.generation, 5);
+    assert_eq!(contents.torn_tail_bytes, 0);
+    assert_eq!(contents.transactions.len(), 8);
+    for (index, transaction) in contents.transactions.iter().enumerate() {
+        assert_eq!(transaction.sequence, index as u64 + 1);
+        assert_eq!(transaction.operations.len(), 1);
+    }
+    assert!(matches!(
+        contents.transactions[0].operations[0],
+        Operation::RegisterFile(_)
+    ));
+    assert!(matches!(
+        contents.transactions[1].operations[0],
+        Operation::UpdateProgress(_)
+    ));
+    assert!(matches!(
+        contents.transactions[2].operations[0],
+        Operation::UpdateFingerprint(_)
+    ));
+    assert!(matches!(
+        contents.transactions[3].operations[0],
+        Operation::UpdateMetadata(_)
+    ));
+    assert!(matches!(
+        contents.transactions[4].operations[0],
+        Operation::ResetAfterTruncate(_)
+    ));
+    assert!(matches!(
+        contents.transactions[5].operations[0],
+        Operation::QuarantineFile(_)
+    ));
+    assert!(matches!(
+        contents.transactions[6].operations[0],
+        Operation::ResetQuarantinedFile(_)
+    ));
+    assert!(matches!(
+        contents.transactions[7].operations[0],
+        Operation::RemoveFile(_)
+    ));
+
+    let Operation::UpdateMetadata(metadata) = &contents.transactions[3].operations[0] else {
+        unreachable!("operation kind checked above");
+    };
+    assert_eq!(metadata.expected_prior_state, LifecycleState::Active);
+    assert_eq!(metadata.expected_file_epoch, 1);
+    assert_eq!(
+        metadata.advisory_path,
+        Some(AdvisoryPath::from_unix_bytes(b"/var/log/new.log").unwrap())
+    );
+    let Operation::ResetAfterTruncate(reset) = &contents.transactions[4].operations[0] else {
+        unreachable!("operation kind checked above");
+    };
+    assert_eq!(reset.new_fingerprint, b"new");
+    let Operation::ResetQuarantinedFile(reset) = &contents.transactions[6].operations[0] else {
+        unreachable!("operation kind checked above");
+    };
+    assert_eq!(reset.action, ResetQuarantineAction::KeepFailed);
+    assert_eq!(reset.new_fingerprint, b"new");
+    assert_eq!(reset.action_time_unix_nano, 105);
+    assert_eq!(reset.namespace_id, TEST_NAMESPACE_ID);
+    assert_eq!(reset.audit_reason, "keep failed");
+    assert_eq!(
+        wal::encode_wal(5, TEST_NAMESPACE_ID, &contents.transactions).unwrap(),
+        WAL_ALL_OPERATIONS
+    );
+
+    let mut table = CheckpointTable::new();
+    table
+        .replay(&contents.transactions[..7], TEST_NAMESPACE_ID)
+        .unwrap();
+    let preserved = table.get(&FileId(WAL_VECTOR_FILE_ID)).unwrap();
+    assert_eq!(preserved.lifecycle_state, LifecycleState::Quarantined);
+    assert_eq!(preserved.file_epoch, 2);
+    assert_eq!(preserved.committed_offset, 0);
+    assert_eq!(preserved.committed_frontier_guard, zero_guard(0));
+    assert_eq!(preserved.framing_resume, FramingResume::Clean);
+    assert_eq!(preserved.fingerprint, b"new");
+    assert_eq!(preserved.last_seen_time_unix_nano, 103);
+    assert_eq!(
+        preserved.advisory_path,
+        AdvisoryPath::from_unix_bytes(b"/var/log/new.log").unwrap()
+    );
+
+    table
+        .apply_transaction(&contents.transactions[7], TEST_NAMESPACE_ID)
+        .unwrap();
+    assert!(table.is_empty());
+}
+
+/// Scenario: the independent all-operation fixture's `keep_failed`
+/// fingerprint is changed without changing any frame length, and all enclosing
+/// CRCs are recomputed.
+/// Guarantees: the structurally valid WAL decodes, replay rejects the
+/// operational mutation as `KeepFailedStateChange`, and quarantine state from
+/// the preceding transactions remains unchanged.
+#[test]
+fn independent_keep_failed_mutation_fails_closed() {
+    let mut wal_bytes = WAL_ALL_OPERATIONS.to_vec();
+    let mut transaction_start = WAL_HEADER_LEN;
+    for sequence in 1..7 {
+        let body_len = u32::from_be_bytes(
+            wal_bytes[transaction_start + 20..transaction_start + 24]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        transaction_start += 36 + body_len + 4;
+        assert_eq!(
+            u64::from_be_bytes(
+                wal_bytes[transaction_start + 12..transaction_start + 20]
+                    .try_into()
+                    .unwrap()
+            ),
+            sequence + 1
+        );
+    }
+    let body_len = u32::from_be_bytes(
+        wal_bytes[transaction_start + 20..transaction_start + 24]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let operation_start = transaction_start + 36;
+    let operation_len = u32::from_be_bytes(
+        wal_bytes[operation_start..operation_start + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let fingerprint_start = operation_start + 4 + 69 + 2;
+    wal_bytes[fingerprint_start] = b'x';
+    let operation_crc_at = operation_start + 4 + operation_len;
+    let operation_crc = crc32c(&wal_bytes[operation_start..operation_crc_at]);
+    wal_bytes[operation_crc_at..operation_crc_at + 4].copy_from_slice(&operation_crc.to_be_bytes());
+    let transaction_crc_at = transaction_start + 36 + body_len;
+    let transaction_crc = crc32c(&wal_bytes[transaction_start..transaction_crc_at]);
+    wal_bytes[transaction_crc_at..transaction_crc_at + 4]
+        .copy_from_slice(&transaction_crc.to_be_bytes());
+
+    let contents = wal::decode_wal(&wal_bytes, &TEST_NAMESPACE_DIGEST).unwrap();
+    let mut table = CheckpointTable::new();
+    let error = table
+        .replay(&contents.transactions[..7], TEST_NAMESPACE_ID)
+        .unwrap_err();
+    assert!(matches!(error, ApplyError::KeepFailedStateChange { .. }));
+    let record = table.get(&FileId(WAL_VECTOR_FILE_ID)).unwrap();
+    assert_eq!(record.lifecycle_state, LifecycleState::Quarantined);
+    assert_eq!(record.fingerprint, b"new");
 }
 
 /// Scenario: a WAL whose final transaction is structurally incomplete (a
@@ -762,6 +1030,247 @@ fn zero_delta_finalization_accepts_already_clean_state() {
     assert_eq!(record.last_seen_time_unix_nano, 2);
 }
 
+/// Scenario: advancing progress remains inside a known split record, reaches
+/// its end, and then starts a later continuation.
+/// Guarantees: replay requires the same continuation coordinates with a
+/// strictly increasing fragment index before the known end, permits `Clean`
+/// at the end, and refuses a later continuation that starts before it.
+#[test]
+fn advancing_progress_enforces_known_continuation_transitions() {
+    let file_id = FileId([96; 16]);
+    let mut table = CheckpointTable::new();
+    table
+        .apply_transaction(
+            &Transaction {
+                sequence: 1,
+                operations: vec![Operation::RegisterFile(sample_register(file_id))],
+            },
+            NAMESPACE,
+        )
+        .unwrap();
+    table
+        .apply_transaction(
+            &Transaction {
+                sequence: 2,
+                operations: vec![Operation::UpdateProgress(UpdateProgress {
+                    file_id,
+                    expected_committed_offset: 0,
+                    expected_file_epoch: 1,
+                    new_committed_offset: 10,
+                    new_committed_frontier_guard: zero_guard(10),
+                    new_framing_resume: FramingResume::Continuation {
+                        record_start_offset: 0,
+                        record_end_offset: 20,
+                        next_fragment_index: 1,
+                    },
+                    new_last_seen_time_unix_nano: 2,
+                    finalize: false,
+                })],
+            },
+            NAMESPACE,
+        )
+        .unwrap();
+    let before = table.get(&file_id).unwrap().clone();
+
+    for invalid_resume in [
+        FramingResume::Clean,
+        FramingResume::Continuation {
+            record_start_offset: 0,
+            record_end_offset: 20,
+            next_fragment_index: 1,
+        },
+        FramingResume::Continuation {
+            record_start_offset: 1,
+            record_end_offset: 20,
+            next_fragment_index: 2,
+        },
+    ] {
+        let error = table
+            .apply_transaction(
+                &Transaction {
+                    sequence: 3,
+                    operations: vec![Operation::UpdateProgress(UpdateProgress {
+                        file_id,
+                        expected_committed_offset: 10,
+                        expected_file_epoch: 1,
+                        new_committed_offset: 15,
+                        new_committed_frontier_guard: zero_guard(15),
+                        new_framing_resume: invalid_resume,
+                        new_last_seen_time_unix_nano: 3,
+                        finalize: false,
+                    })],
+                },
+                NAMESPACE,
+            )
+            .unwrap_err();
+        assert!(matches!(error, ApplyError::ImpossibleTransition { .. }));
+        assert_eq!(table.get(&file_id), Some(&before));
+    }
+
+    table
+        .apply_transaction(
+            &Transaction {
+                sequence: 3,
+                operations: vec![Operation::UpdateProgress(UpdateProgress {
+                    file_id,
+                    expected_committed_offset: 10,
+                    expected_file_epoch: 1,
+                    new_committed_offset: 15,
+                    new_committed_frontier_guard: zero_guard(15),
+                    new_framing_resume: FramingResume::Continuation {
+                        record_start_offset: 0,
+                        record_end_offset: 20,
+                        next_fragment_index: 2,
+                    },
+                    new_last_seen_time_unix_nano: 3,
+                    finalize: false,
+                })],
+            },
+            NAMESPACE,
+        )
+        .unwrap();
+    table
+        .apply_transaction(
+            &Transaction {
+                sequence: 4,
+                operations: vec![Operation::UpdateProgress(UpdateProgress {
+                    file_id,
+                    expected_committed_offset: 15,
+                    expected_file_epoch: 1,
+                    new_committed_offset: 20,
+                    new_committed_frontier_guard: zero_guard(20),
+                    new_framing_resume: FramingResume::Clean,
+                    new_last_seen_time_unix_nano: 4,
+                    finalize: false,
+                })],
+            },
+            NAMESPACE,
+        )
+        .unwrap();
+    let error = table
+        .apply_transaction(
+            &Transaction {
+                sequence: 5,
+                operations: vec![Operation::UpdateProgress(UpdateProgress {
+                    file_id,
+                    expected_committed_offset: 20,
+                    expected_file_epoch: 1,
+                    new_committed_offset: 25,
+                    new_committed_frontier_guard: zero_guard(25),
+                    new_framing_resume: FramingResume::Continuation {
+                        record_start_offset: 19,
+                        record_end_offset: 30,
+                        next_fragment_index: 1,
+                    },
+                    new_last_seen_time_unix_nano: 5,
+                    finalize: false,
+                })],
+            },
+            NAMESPACE,
+        )
+        .unwrap_err();
+    assert!(matches!(error, ApplyError::ImpossibleTransition { .. }));
+    assert_eq!(table.get(&file_id).unwrap().committed_offset, 20);
+}
+
+/// Scenario: progress advances an open-ended scan-to-LF continuation.
+/// Guarantees: replay permits only an advanced instance of the same scan,
+/// `Clean` after the runtime proves a boundary, or a later continuation that
+/// starts at or after the prior committed offset.
+#[test]
+fn advancing_progress_enforces_open_ended_continuation_transitions() {
+    let file_id = FileId([97; 16]);
+    let mut table = CheckpointTable::from_snapshot_records(vec![SnapshotRecord {
+        file_id,
+        file_epoch: 1,
+        committed_offset: 10,
+        committed_frontier_guard: zero_guard(10),
+        fingerprint: b"fp".to_vec(),
+        ignored_header_bytes: 0,
+        locator: Locator::PosixDevIno { dev: 1, ino: 2 },
+        framing_profile_version: 1,
+        framing_profile_digest: sample_digest(),
+        framing_resume: FramingResume::Continuation {
+            record_start_offset: 0,
+            record_end_offset: 0,
+            next_fragment_index: 1,
+        },
+        lifecycle_state: LifecycleState::Active,
+        quarantine_evidence: None,
+        last_seen_time_unix_nano: 1,
+        advisory_path: AdvisoryPath::unavailable(),
+    }])
+    .unwrap();
+    let error = table
+        .apply_transaction(
+            &Transaction {
+                sequence: 2,
+                operations: vec![Operation::UpdateProgress(UpdateProgress {
+                    file_id,
+                    expected_committed_offset: 10,
+                    expected_file_epoch: 1,
+                    new_committed_offset: 15,
+                    new_committed_frontier_guard: zero_guard(15),
+                    new_framing_resume: FramingResume::Continuation {
+                        record_start_offset: 5,
+                        record_end_offset: 0,
+                        next_fragment_index: 2,
+                    },
+                    new_last_seen_time_unix_nano: 2,
+                    finalize: false,
+                })],
+            },
+            NAMESPACE,
+        )
+        .unwrap_err();
+    assert!(matches!(error, ApplyError::ImpossibleTransition { .. }));
+
+    table
+        .apply_transaction(
+            &Transaction {
+                sequence: 2,
+                operations: vec![Operation::UpdateProgress(UpdateProgress {
+                    file_id,
+                    expected_committed_offset: 10,
+                    expected_file_epoch: 1,
+                    new_committed_offset: 15,
+                    new_committed_frontier_guard: zero_guard(15),
+                    new_framing_resume: FramingResume::Continuation {
+                        record_start_offset: 0,
+                        record_end_offset: 0,
+                        next_fragment_index: 2,
+                    },
+                    new_last_seen_time_unix_nano: 2,
+                    finalize: false,
+                })],
+            },
+            NAMESPACE,
+        )
+        .unwrap();
+    table
+        .apply_transaction(
+            &Transaction {
+                sequence: 3,
+                operations: vec![Operation::UpdateProgress(UpdateProgress {
+                    file_id,
+                    expected_committed_offset: 15,
+                    expected_file_epoch: 1,
+                    new_committed_offset: 16,
+                    new_committed_frontier_guard: zero_guard(16),
+                    new_framing_resume: FramingResume::Clean,
+                    new_last_seen_time_unix_nano: 3,
+                    finalize: false,
+                })],
+            },
+            NAMESPACE,
+        )
+        .unwrap();
+    assert_eq!(
+        table.get(&file_id).unwrap().framing_resume,
+        FramingResume::Clean
+    );
+}
+
 /// Scenario: `update_progress` with `finalize = true` transitions a record
 /// to `RotatedFinalized`; a subsequent `update_progress` is then replayed
 /// against that finalized record.
@@ -853,6 +1362,7 @@ fn reset_after_truncate_increments_epoch_and_resets_offset() {
         resulting_epoch: 2,
         new_committed_offset: 0,
         new_framing_resume: FramingResume::Clean,
+        new_fingerprint: b"replacement".to_vec(),
         reset_time_unix_nano: 99,
         reason_code: TRUNCATE_RESET_REASON_READ_NEW,
     });
@@ -868,6 +1378,7 @@ fn reset_after_truncate_increments_epoch_and_resets_offset() {
     let record = table.get(&file_id).unwrap();
     assert_eq!(record.file_epoch, 2);
     assert_eq!(record.committed_offset, 0);
+    assert_eq!(record.fingerprint, b"replacement");
     assert_eq!(record.lifecycle_state, LifecycleState::Active);
 }
 
@@ -896,6 +1407,7 @@ fn reset_after_truncate_rejects_invalid_reason_code() {
         resulting_epoch: 2,
         new_committed_offset: 0,
         new_framing_resume: FramingResume::Clean,
+        new_fingerprint: b"replacement".to_vec(),
         reset_time_unix_nano: 99,
         reason_code: 0x0002, // not TRUNCATE_RESET_REASON_READ_NEW
     });
@@ -946,6 +1458,74 @@ fn update_fingerprint_requires_matching_expected_bytes() {
     assert!(matches!(err, ApplyError::ImpossibleTransition { .. }));
 }
 
+/// Scenario: same-epoch fingerprint updates attempt a no-op, shrink,
+/// conflicting replacement, and a strict prefix extension.
+/// Guarantees: only the strict same-stream extension is applied; every
+/// rejected update leaves the original fingerprint unchanged.
+#[test]
+fn update_fingerprint_requires_strict_prefix_extension() {
+    let file_id = FileId([98; 16]);
+    assert!(matches!(
+        Operation::UpdateFingerprint(UpdateFingerprint {
+            file_id,
+            expected_file_epoch: 1,
+            expected_fingerprint: b"fp".to_vec(),
+            new_fingerprint: b"fp".to_vec(),
+        })
+        .encode()
+        .unwrap_err(),
+        EncodeError::InvalidFieldValue {
+            field: "update_fingerprint.new_fingerprint",
+            ..
+        }
+    ));
+    let mut table = CheckpointTable::new();
+    table
+        .apply_transaction(
+            &Transaction {
+                sequence: 1,
+                operations: vec![Operation::RegisterFile(sample_register(file_id))],
+            },
+            NAMESPACE,
+        )
+        .unwrap();
+
+    for new_fingerprint in [b"fp".to_vec(), b"f".to_vec(), b"fxp".to_vec()] {
+        let error = table
+            .apply_transaction(
+                &Transaction {
+                    sequence: 2,
+                    operations: vec![Operation::UpdateFingerprint(UpdateFingerprint {
+                        file_id,
+                        expected_file_epoch: 1,
+                        expected_fingerprint: b"fp".to_vec(),
+                        new_fingerprint,
+                    })],
+                },
+                NAMESPACE,
+            )
+            .unwrap_err();
+        assert!(matches!(error, ApplyError::ImpossibleTransition { .. }));
+        assert_eq!(table.get(&file_id).unwrap().fingerprint, b"fp");
+    }
+
+    table
+        .apply_transaction(
+            &Transaction {
+                sequence: 2,
+                operations: vec![Operation::UpdateFingerprint(UpdateFingerprint {
+                    file_id,
+                    expected_file_epoch: 1,
+                    expected_fingerprint: b"fp".to_vec(),
+                    new_fingerprint: b"fp-more".to_vec(),
+                })],
+            },
+            NAMESPACE,
+        )
+        .unwrap();
+    assert_eq!(table.get(&file_id).unwrap().fingerprint, b"fp-more");
+}
+
 /// Scenario: `update_metadata` is replayed against a `Quarantined` record.
 /// Guarantees: `update_metadata` never carries a locator field on the wire
 /// (the locator is immutable for a `file_id`), so the quarantined record's
@@ -988,6 +1568,8 @@ fn update_metadata_leaves_quarantine_locator_immutable() {
 
     let update = Operation::UpdateMetadata(UpdateMetadata {
         file_id,
+        expected_prior_state: LifecycleState::Quarantined,
+        expected_file_epoch: 1,
         last_seen_time_unix_nano: 42,
         advisory_path: Some(AdvisoryPath::from_unix_bytes(b"/new/path.log").unwrap()),
     });
@@ -1009,6 +1591,66 @@ fn update_metadata_leaves_quarantine_locator_immutable() {
         AdvisoryPath::from_unix_bytes(b"/new/path.log").unwrap()
     );
     assert_eq!(record.last_seen_time_unix_nano, 42);
+}
+
+/// Scenario: metadata updates carry a stale lifecycle or epoch across a
+/// quarantine transition.
+/// Guarantees: both guards are checked before advisory metadata changes and
+/// the current quarantined record remains byte-identical on failure.
+#[test]
+fn update_metadata_requires_matching_lifecycle_and_epoch() {
+    let file_id = FileId([99; 16]);
+    let mut table = CheckpointTable::new();
+    table
+        .apply_transaction(
+            &Transaction {
+                sequence: 1,
+                operations: vec![Operation::RegisterFile(sample_register(file_id))],
+            },
+            NAMESPACE,
+        )
+        .unwrap();
+    table
+        .apply_transaction(
+            &Transaction {
+                sequence: 2,
+                operations: vec![Operation::QuarantineFile(QuarantineFile {
+                    file_id,
+                    expected_file_epoch: 1,
+                    reason_code: 1,
+                    locator: Locator::PosixDevIno { dev: 1, ino: 2 },
+                    observed_size: 1,
+                    quarantine_epoch: 1,
+                    quarantine_time_unix_nano: 2,
+                })],
+            },
+            NAMESPACE,
+        )
+        .unwrap();
+    let before = table.get(&file_id).unwrap().clone();
+
+    for (expected_prior_state, expected_file_epoch) in [
+        (LifecycleState::Active, 1),
+        (LifecycleState::Quarantined, 2),
+    ] {
+        let error = table
+            .apply_transaction(
+                &Transaction {
+                    sequence: 3,
+                    operations: vec![Operation::UpdateMetadata(UpdateMetadata {
+                        file_id,
+                        expected_prior_state,
+                        expected_file_epoch,
+                        last_seen_time_unix_nano: 99,
+                        advisory_path: Some(AdvisoryPath::unavailable()),
+                    })],
+                },
+                NAMESPACE,
+            )
+            .unwrap_err();
+        assert!(matches!(error, ApplyError::ImpossibleTransition { .. }));
+        assert_eq!(table.get(&file_id), Some(&before));
+    }
 }
 
 /// Scenario: `quarantine_file` is applied against an `Active` record whose
@@ -1159,7 +1801,9 @@ fn reset_quarantined_file_reset_to_beginning_returns_active_at_zero() {
                     resulting_offset: 0,
                     new_committed_frontier_guard: zero_guard(0),
                     new_framing_resume: FramingResume::Clean,
-                    reset_time_unix_nano: 7,
+                    new_fingerprint: b"replacement".to_vec(),
+                    action_time_unix_nano: 7,
+                    namespace_id: NAMESPACE.to_owned(),
                     audit_reason: "operator approved".to_owned(),
                 })],
             },
@@ -1170,6 +1814,7 @@ fn reset_quarantined_file_reset_to_beginning_returns_active_at_zero() {
     assert_eq!(record.lifecycle_state, LifecycleState::Active);
     assert_eq!(record.file_epoch, 2);
     assert_eq!(record.committed_offset, 0);
+    assert_eq!(record.fingerprint, b"replacement");
     assert!(record.quarantine_evidence.is_none());
 }
 
@@ -1216,7 +1861,9 @@ fn reset_quarantined_file_keep_failed_requires_unchanged_fields() {
         resulting_offset: 999, // differs from the stored committed_offset (0)
         new_committed_frontier_guard: zero_guard(999),
         new_framing_resume: FramingResume::Clean,
-        reset_time_unix_nano: 7,
+        new_fingerprint: b"fp".to_vec(),
+        action_time_unix_nano: 7,
+        namespace_id: NAMESPACE.to_owned(),
         audit_reason: "operator declined".to_owned(),
     });
     let err = table
@@ -1229,6 +1876,129 @@ fn reset_quarantined_file_keep_failed_requires_unchanged_fields() {
         )
         .unwrap_err();
     assert!(matches!(err, ApplyError::ImpossibleTransition { .. }));
+}
+
+/// Scenario: `keep_failed` carries a replacement fingerprint that differs
+/// from the quarantined record while every offset/epoch field still matches.
+/// Guarantees: audit-only quarantine retention cannot change fingerprint or
+/// any other operational state.
+#[test]
+fn reset_quarantined_file_keep_failed_preserves_fingerprint() {
+    let file_id = FileId([100; 16]);
+    let mut table = CheckpointTable::new();
+    table
+        .apply_transaction(
+            &Transaction {
+                sequence: 1,
+                operations: vec![Operation::RegisterFile(sample_register(file_id))],
+            },
+            NAMESPACE,
+        )
+        .unwrap();
+    table
+        .apply_transaction(
+            &Transaction {
+                sequence: 2,
+                operations: vec![Operation::QuarantineFile(QuarantineFile {
+                    file_id,
+                    expected_file_epoch: 1,
+                    reason_code: 1,
+                    locator: Locator::PosixDevIno { dev: 1, ino: 2 },
+                    observed_size: 1,
+                    quarantine_epoch: 1,
+                    quarantine_time_unix_nano: 2,
+                })],
+            },
+            NAMESPACE,
+        )
+        .unwrap();
+    let before = table.get(&file_id).unwrap().clone();
+    let error = table
+        .apply_transaction(
+            &Transaction {
+                sequence: 3,
+                operations: vec![Operation::ResetQuarantinedFile(ResetQuarantinedFile {
+                    file_id,
+                    expected_quarantine_epoch: 1,
+                    action: ResetQuarantineAction::KeepFailed,
+                    resulting_epoch: 1,
+                    resulting_offset: 0,
+                    new_committed_frontier_guard: CommittedFrontierGuard::empty(),
+                    new_framing_resume: FramingResume::Clean,
+                    new_fingerprint: b"different".to_vec(),
+                    action_time_unix_nano: 3,
+                    namespace_id: NAMESPACE.to_owned(),
+                    audit_reason: "retain".to_owned(),
+                })],
+            },
+            NAMESPACE,
+        )
+        .unwrap_err();
+    assert!(matches!(error, ApplyError::KeepFailedStateChange { .. }));
+    assert_eq!(table.get(&file_id), Some(&before));
+}
+
+/// Scenario: a quarantine reset names the wrong namespace for an existing
+/// record and for an absent `file_id`.
+/// Guarantees: namespace validation runs before record lookup or idempotency,
+/// and neither operation changes the table.
+#[test]
+fn reset_quarantined_file_validates_namespace_before_lookup() {
+    let file_id = FileId([101; 16]);
+    let mut table = CheckpointTable::new();
+    table
+        .apply_transaction(
+            &Transaction {
+                sequence: 1,
+                operations: vec![Operation::RegisterFile(sample_register(file_id))],
+            },
+            NAMESPACE,
+        )
+        .unwrap();
+    table
+        .apply_transaction(
+            &Transaction {
+                sequence: 2,
+                operations: vec![Operation::QuarantineFile(QuarantineFile {
+                    file_id,
+                    expected_file_epoch: 1,
+                    reason_code: 1,
+                    locator: Locator::PosixDevIno { dev: 1, ino: 2 },
+                    observed_size: 1,
+                    quarantine_epoch: 1,
+                    quarantine_time_unix_nano: 2,
+                })],
+            },
+            NAMESPACE,
+        )
+        .unwrap();
+    let before = table.clone();
+
+    for target in [file_id, FileId([102; 16])] {
+        let error = table
+            .apply_transaction(
+                &Transaction {
+                    sequence: 3,
+                    operations: vec![Operation::ResetQuarantinedFile(ResetQuarantinedFile {
+                        file_id: target,
+                        expected_quarantine_epoch: 1,
+                        action: ResetQuarantineAction::KeepFailed,
+                        resulting_epoch: 1,
+                        resulting_offset: 0,
+                        new_committed_frontier_guard: CommittedFrontierGuard::empty(),
+                        new_framing_resume: FramingResume::Clean,
+                        new_fingerprint: b"fp".to_vec(),
+                        action_time_unix_nano: 3,
+                        namespace_id: "wrong".to_owned(),
+                        audit_reason: "retain".to_owned(),
+                    })],
+                },
+                NAMESPACE,
+            )
+            .unwrap_err();
+        assert!(matches!(error, ApplyError::NamespaceMismatch { .. }));
+        assert_eq!(table, before);
+    }
 }
 
 /// Scenario: `reset_quarantined_file` naming
@@ -1273,6 +2043,7 @@ fn reset_quarantined_file_epoch_overflow_fails_closed() {
     {
         let records = table.snapshot_records();
         let mut record = records.into_iter().find(|r| r.file_id == file_id).unwrap();
+        record.file_epoch = u32::MAX;
         record.quarantine_evidence = Some(QuarantineEvidence {
             reason_code: 0x0001,
             observed_size: 1,
@@ -1290,7 +2061,9 @@ fn reset_quarantined_file_epoch_overflow_fails_closed() {
         resulting_offset: 0,
         new_committed_frontier_guard: zero_guard(0),
         new_framing_resume: FramingResume::Clean,
-        reset_time_unix_nano: 7,
+        new_fingerprint: b"replacement".to_vec(),
+        action_time_unix_nano: 7,
+        namespace_id: NAMESPACE.to_owned(),
         audit_reason: "operator approved".to_owned(),
     });
     let err = table
@@ -1305,10 +2078,10 @@ fn reset_quarantined_file_epoch_overflow_fails_closed() {
     assert!(matches!(err, ApplyError::EpochOverflow { .. }));
 }
 
-/// Scenario: an administrative `remove_file` naming a `namespace_id` that
-/// does not match the namespace passed to `apply_transaction`.
-/// Guarantees: removing a quarantined record requires the exact checkpoint
-/// namespace; a mismatch fails closed rather than removing the record.
+/// Scenario: administrative `remove_file` names the wrong namespace for an
+/// existing quarantined record and an absent `file_id`.
+/// Guarantees: exact namespace validation precedes lookup and absent-target
+/// idempotency, so neither mismatch removes state.
 #[test]
 fn remove_file_administrative_namespace_mismatch_fails_closed() {
     let file_id = FileId([15; 16]);
@@ -1355,6 +2128,28 @@ fn remove_file_administrative_namespace_mismatch_fails_closed() {
             &Transaction {
                 sequence: 3,
                 operations: vec![remove],
+            },
+            NAMESPACE,
+        )
+        .unwrap_err();
+    assert!(matches!(err, ApplyError::NamespaceMismatch { .. }));
+    assert!(table.get(&file_id).is_some());
+
+    let absent = Operation::RemoveFile(RemoveFile {
+        file_id: FileId([200; 16]),
+        expected_file_epoch: 1,
+        expected_prior_state: LifecycleState::Quarantined,
+        removal_reason: 1,
+        removal_time_unix_nano: 9,
+        administrative: true,
+        namespace_id: Some("wrong-namespace".to_owned()),
+        audit_reason: Some("operator cleanup".to_owned()),
+    });
+    let err = table
+        .apply_transaction(
+            &Transaction {
+                sequence: 3,
+                operations: vec![absent],
             },
             NAMESPACE,
         )
@@ -1419,6 +2214,116 @@ fn remove_file_ordinary_retention_cannot_remove_quarantined_state() {
     assert!(matches!(err, ApplyError::ImpossibleTransition { .. }));
 }
 
+/// Scenario: a non-administrative removal is attempted alone, then paired
+/// atomically with one new registration for the removed record's exact
+/// locator.
+/// Guarantees: lone/absent removal fails closed, while the exact supersede
+/// transaction transfers the single live locator claim without exposing a
+/// duplicate or deleting unrelated state.
+#[test]
+fn non_administrative_remove_requires_exact_locator_supersede() {
+    let old_file_id = FileId([103; 16]);
+    let new_file_id = FileId([104; 16]);
+    let locator = Locator::PosixDevIno { dev: 7, ino: 9 };
+    let mut old_register = sample_register(old_file_id);
+    old_register.locator = locator;
+    let mut table = CheckpointTable::new();
+    table
+        .apply_transaction(
+            &Transaction {
+                sequence: 1,
+                operations: vec![Operation::RegisterFile(old_register)],
+            },
+            NAMESPACE,
+        )
+        .unwrap();
+    let removal = Operation::RemoveFile(RemoveFile {
+        file_id: old_file_id,
+        expected_file_epoch: 1,
+        expected_prior_state: LifecycleState::Active,
+        removal_reason: 1,
+        removal_time_unix_nano: 2,
+        administrative: false,
+        namespace_id: None,
+        audit_reason: None,
+    });
+
+    let error = table
+        .apply_transaction(
+            &Transaction {
+                sequence: 2,
+                operations: vec![removal.clone()],
+            },
+            NAMESPACE,
+        )
+        .unwrap_err();
+    assert!(matches!(error, ApplyError::ImpossibleTransition { .. }));
+    assert!(table.get(&old_file_id).is_some());
+
+    let mut replacement = sample_register(new_file_id);
+    replacement.locator = locator;
+    replacement.fingerprint = b"replacement".to_vec();
+    let remove_replacement = Operation::RemoveFile(RemoveFile {
+        file_id: new_file_id,
+        expected_file_epoch: 1,
+        expected_prior_state: LifecycleState::Active,
+        removal_reason: 2,
+        removal_time_unix_nano: 2,
+        administrative: true,
+        namespace_id: Some(NAMESPACE.to_owned()),
+        audit_reason: Some("remove replacement".to_owned()),
+    });
+    let error = table
+        .apply_transaction(
+            &Transaction {
+                sequence: 2,
+                operations: vec![
+                    Operation::RegisterFile(replacement.clone()),
+                    removal.clone(),
+                    remove_replacement,
+                ],
+            },
+            NAMESPACE,
+        )
+        .unwrap_err();
+    assert!(matches!(error, ApplyError::ImpossibleTransition { .. }));
+    assert!(table.get(&old_file_id).is_some());
+    assert!(table.get(&new_file_id).is_none());
+
+    table
+        .apply_transaction(
+            &Transaction {
+                sequence: 2,
+                operations: vec![Operation::RegisterFile(replacement), removal],
+            },
+            NAMESPACE,
+        )
+        .unwrap();
+    assert!(table.get(&old_file_id).is_none());
+    assert_eq!(table.get(&new_file_id).unwrap().fingerprint, b"replacement");
+
+    let absent_removal = Operation::RemoveFile(RemoveFile {
+        file_id: old_file_id,
+        expected_file_epoch: 1,
+        expected_prior_state: LifecycleState::Active,
+        removal_reason: 1,
+        removal_time_unix_nano: 3,
+        administrative: false,
+        namespace_id: None,
+        audit_reason: None,
+    });
+    let error = table
+        .apply_transaction(
+            &Transaction {
+                sequence: 3,
+                operations: vec![absent_removal],
+            },
+            NAMESPACE,
+        )
+        .unwrap_err();
+    assert!(matches!(error, ApplyError::ImpossibleTransition { .. }));
+}
+
 /// Scenario: an administrative `remove_file` naming the correct namespace
 /// targets a `Quarantined` record.
 /// Guarantees: this is the only path that can remove quarantined state, and
@@ -1475,10 +2380,10 @@ fn remove_file_administrative_removes_quarantined_with_matching_namespace() {
     assert!(table.get(&file_id).is_none());
 }
 
-/// Scenario: `remove_file` is replayed twice against the same `file_id`; the
-/// second replay runs after the record is already absent.
-/// Guarantees: replaying `remove_file` against an already absent `file_id`
-/// is idempotent (succeeds as a no-op) rather than failing.
+/// Scenario: an administrative `remove_file` is replayed twice against the
+/// same `file_id`; the second replay runs after the record is already absent.
+/// Guarantees: namespace-validated administrative replay against an absent
+/// `file_id` is idempotent rather than failing.
 #[test]
 fn remove_file_replay_against_absent_file_id_is_idempotent() {
     let file_id = FileId([18; 16]);
@@ -1499,9 +2404,9 @@ fn remove_file_replay_against_absent_file_id_is_idempotent() {
             expected_prior_state: LifecycleState::Active,
             removal_reason: 0x0001,
             removal_time_unix_nano: 9,
-            administrative: false,
-            namespace_id: None,
-            audit_reason: None,
+            administrative: true,
+            namespace_id: Some(NAMESPACE.to_owned()),
+            audit_reason: Some("operator removal".to_owned()),
         })
     };
     table
@@ -1698,7 +2603,9 @@ fn unknown_reset_quarantine_action_fails_closed() {
         resulting_offset: 0,
         new_committed_frontier_guard: zero_guard(0),
         new_framing_resume: FramingResume::Clean,
-        reset_time_unix_nano: 1,
+        new_fingerprint: b"replacement".to_vec(),
+        action_time_unix_nano: 1,
+        namespace_id: NAMESPACE.to_owned(),
         audit_reason: "operator approved".to_owned(),
     };
     let mut frame = Operation::ResetQuarantinedFile(op).encode().unwrap();
@@ -1810,19 +2717,62 @@ fn wal_header_nonzero_flags_fails_closed() {
 fn update_metadata_reserved_presence_bit_fails_closed() {
     let op = UpdateMetadata {
         file_id: FileId([108; 16]),
+        expected_prior_state: LifecycleState::Active,
+        expected_file_epoch: 1,
         last_seen_time_unix_nano: 1,
         advisory_path: None,
     };
     let mut frame = Operation::UpdateMetadata(op).encode().unwrap();
-    // presence follows op_code(1) + file_id(16) in the payload, plus the
-    // 4-byte op_len prefix: frame offset 21.
-    frame[21] = 0x04;
+    // presence follows op_code(1) + file_id(16) + expected_prior_state(1)
+    // + expected_file_epoch(4), plus the 4-byte op_len prefix.
+    frame[26] = 0x04;
     refresh_frame_crc32c(&mut frame);
     let err = Operation::decode(&frame).unwrap_err();
     assert!(matches!(
         err,
         DecodeError::ReservedFieldNonZero {
             field: "update_metadata.presence_flags",
+            ..
+        }
+    ));
+}
+
+/// Scenario: `update_metadata.expected_prior_state` is constructed or decoded
+/// as `RotatedFinalized`, which v1 does not permit for metadata mutation.
+/// Guarantees: the encoder and decoder both fail at the structural boundary
+/// rather than producing a metadata operation that replay could reinterpret.
+#[test]
+fn update_metadata_rejects_finalized_expected_state() {
+    let operation = Operation::UpdateMetadata(UpdateMetadata {
+        file_id: FileId([112; 16]),
+        expected_prior_state: LifecycleState::RotatedFinalized,
+        expected_file_epoch: 1,
+        last_seen_time_unix_nano: 1,
+        advisory_path: None,
+    });
+    assert!(matches!(
+        operation.encode().unwrap_err(),
+        EncodeError::InvalidFieldValue {
+            field: "update_metadata.expected_prior_state",
+            ..
+        }
+    ));
+
+    let mut frame = Operation::UpdateMetadata(UpdateMetadata {
+        file_id: FileId([112; 16]),
+        expected_prior_state: LifecycleState::Active,
+        expected_file_epoch: 1,
+        last_seen_time_unix_nano: 1,
+        advisory_path: None,
+    })
+    .encode()
+    .unwrap();
+    frame[21] = LifecycleState::RotatedFinalized.to_wire();
+    refresh_frame_crc32c(&mut frame);
+    assert!(matches!(
+        Operation::decode(&frame).unwrap_err(),
+        DecodeError::UnknownDiscriminant {
+            field: "update_metadata.expected_prior_state",
             ..
         }
     ));
@@ -1899,6 +2849,71 @@ fn transaction_encode_rejects_too_many_non_progress_operations() {
             op_count: found,
             max,
         } if found == op_count && max == WAL_MAX_NON_PROGRESS_OPS_PER_TX
+    ));
+}
+
+/// Scenario: a progress-only transaction repeats one `file_id`, both through
+/// the typed encoder and in a checksum-valid hand-crafted WAL frame.
+/// Guarantees: duplicate progress keys fail at encode and decode boundaries
+/// before any transaction can reach table application.
+#[test]
+fn progress_transaction_rejects_duplicate_file_ids() {
+    let progress = |file_id| {
+        Operation::UpdateProgress(UpdateProgress {
+            file_id,
+            expected_committed_offset: 0,
+            expected_file_epoch: 1,
+            new_committed_offset: 1,
+            new_committed_frontier_guard: zero_guard(1),
+            new_framing_resume: FramingResume::Clean,
+            new_last_seen_time_unix_nano: 1,
+            finalize: false,
+        })
+    };
+    let duplicate_id = FileId([109; 16]);
+    let error = Transaction {
+        sequence: 1,
+        operations: vec![progress(duplicate_id), progress(duplicate_id)],
+    }
+    .encode()
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        EncodeError::DuplicateProgressFileId {
+            sequence: 1,
+            file_id,
+        } if file_id == duplicate_id
+    ));
+
+    let first_id = FileId([110; 16]);
+    let mut transaction = Transaction {
+        sequence: 1,
+        operations: vec![progress(first_id), progress(FileId([111; 16]))],
+    }
+    .encode()
+    .unwrap();
+    let first_op_len = u32::from_be_bytes(transaction[36..40].try_into().unwrap()) as usize;
+    let second_start = 36 + 4 + first_op_len + 4;
+    transaction[second_start + 5..second_start + 21].copy_from_slice(&first_id.0);
+    let second_op_len = u32::from_be_bytes(
+        transaction[second_start..second_start + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let second_crc_at = second_start + 4 + second_op_len;
+    let second_crc = crc32c(&transaction[second_start..second_crc_at]);
+    transaction[second_crc_at..second_crc_at + 4].copy_from_slice(&second_crc.to_be_bytes());
+    refresh_frame_crc32c(&mut transaction);
+
+    let mut wal = wal::encode_wal(1, TEST_NAMESPACE_ID, &[]).unwrap();
+    wal.extend_from_slice(&transaction);
+    let error = wal::decode_wal(&wal, &TEST_NAMESPACE_DIGEST).unwrap_err();
+    assert!(matches!(
+        error,
+        DecodeError::DuplicateProgressFileId {
+            sequence: 1,
+            file_id,
+        } if file_id == first_id
     ));
 }
 
@@ -2093,21 +3108,62 @@ fn reset_quarantined_file_empty_audit_reason_fails_closed() {
         resulting_offset: 0,
         new_committed_frontier_guard: zero_guard(0),
         new_framing_resume: FramingResume::Clean,
-        reset_time_unix_nano: 1,
+        new_fingerprint: b"fp".to_vec(),
+        action_time_unix_nano: 1,
+        namespace_id: NAMESPACE.to_owned(),
         audit_reason: "operator note".to_owned(),
     };
     let mut frame = Operation::ResetQuarantinedFile(op).encode().unwrap();
-    // audit_reason_len follows op_code(1) + file_id(16) +
-    // expected_quarantine_epoch(4) + action(1) + resulting_epoch(4) +
-    // resulting_offset(8) + new_committed_frontier_guard(34) +
-    // new_framing_resume(1, Clean) + reset_time_unix_nano(8) = 77 in the
-    // payload, plus the 4-byte op_len prefix: frame offset 81.
-    zero_out_var_field(&mut frame, 81);
+    let audit_reason_len = "operator note".len();
+    let audit_reason_offset = frame.len() - 4 - audit_reason_len - 2;
+    zero_out_var_field(&mut frame, audit_reason_offset);
     let err = Operation::decode(&frame).unwrap_err();
     assert!(matches!(
         err,
         DecodeError::EmptyRequiredField {
             field: "reset_quarantined_file.audit_reason",
+        }
+    ));
+}
+
+/// Scenario: a quarantine reset omits its mandatory raw checkpoint namespace
+/// ID through the typed encoder and a hand-crafted checksum-valid frame.
+/// Guarantees: both boundaries reject the empty namespace before replay can
+/// look up a coincidentally matching `file_id`.
+#[test]
+fn reset_quarantined_file_requires_nonempty_namespace_id() {
+    let mut operation = ResetQuarantinedFile {
+        file_id: FileId([118; 16]),
+        expected_quarantine_epoch: 1,
+        action: ResetQuarantineAction::KeepFailed,
+        resulting_epoch: 1,
+        resulting_offset: 0,
+        new_committed_frontier_guard: zero_guard(0),
+        new_framing_resume: FramingResume::Clean,
+        new_fingerprint: b"fp".to_vec(),
+        action_time_unix_nano: 1,
+        namespace_id: String::new(),
+        audit_reason: "operator note".to_owned(),
+    };
+    assert!(matches!(
+        Operation::ResetQuarantinedFile(operation.clone())
+            .encode()
+            .unwrap_err(),
+        EncodeError::RequiredFieldEmpty {
+            field: "reset_quarantined_file.namespace_id",
+        }
+    ));
+
+    operation.namespace_id = NAMESPACE.to_owned();
+    let namespace_len = operation.namespace_id.len();
+    let audit_reason_len = operation.audit_reason.len();
+    let mut frame = Operation::ResetQuarantinedFile(operation).encode().unwrap();
+    let namespace_offset = frame.len() - 4 - (2 + audit_reason_len) - (2 + namespace_len);
+    zero_out_var_field(&mut frame, namespace_offset);
+    assert!(matches!(
+        Operation::decode(&frame).unwrap_err(),
+        DecodeError::EmptyRequiredField {
+            field: "reset_quarantined_file.namespace_id",
         }
     ));
 }
@@ -2302,18 +3358,12 @@ fn apply_transaction_rolls_back_all_operations_on_later_failure() {
     assert!(table.is_empty());
 }
 
-/// Scenario: within one transaction, two `update_progress` operations
-/// target the *same* `file_id`; the first (staged) advance succeeds, but
-/// the second reuses a stale `expected_committed_offset` that only matches
-/// the record's state *before* this transaction, not the value the first
-/// operation just staged.
-/// Guarantees: the second operation is validated against the first
-/// operation's staged (in-transaction) effect and fails; the transaction
-/// as a whole is then rejected and neither operation's effect persists --
-/// exact all-or-none semantics even when multiple operations touch the
-/// same key within a single bounded scratch map.
+/// Scenario: one progress-only transaction contains two updates for the same
+/// `file_id`.
+/// Guarantees: the duplicate progress key fails before staged application and
+/// the complete table remains unchanged.
 #[test]
-fn apply_transaction_rolls_back_multiple_operations_on_same_file_id() {
+fn apply_transaction_rejects_duplicate_progress_keys() {
     let file_id = FileId([125; 16]);
     let mut table = CheckpointTable::new();
     table
@@ -2355,7 +3405,10 @@ fn apply_transaction_rolls_back_multiple_operations_on_same_file_id() {
             NAMESPACE,
         )
         .unwrap_err();
-    assert!(matches!(err, ApplyError::ImpossibleTransition { .. }));
+    assert!(matches!(
+        err,
+        ApplyError::DuplicateProgressFileId { file_id: found } if found == file_id
+    ));
     assert_eq!(
         table.get(&file_id).unwrap().committed_offset,
         0,
@@ -2380,6 +3433,62 @@ fn encode_snapshot_rejects_duplicate_file_id() {
     second.committed_offset = 999; // differs, but the key is what matters
     let err = snapshot::encode_snapshot(1, TEST_NAMESPACE_ID, &[first, second]).unwrap_err();
     assert!(matches!(err, EncodeError::DuplicateFileId { file_id: found } if found == file_id));
+}
+
+/// Scenario: two distinct snapshot records claim the same locator while both
+/// are live, including a checksum-valid byte stream crafted from an otherwise
+/// valid Active plus RotatedFinalized pair.
+/// Guarantees: snapshot encoding, direct table seeding, and byte decoding all
+/// reject the duplicate live locator before WAL replay.
+#[test]
+fn snapshot_and_table_reject_duplicate_live_locators() {
+    let first_file_id = FileId([131; 16]);
+    let second_file_id = FileId([132; 16]);
+    let first = sample_snapshot_record(first_file_id);
+    let second = sample_snapshot_record(second_file_id);
+    let error =
+        snapshot::encode_snapshot(1, NAMESPACE, &[first.clone(), second.clone()]).unwrap_err();
+    assert!(matches!(
+        error,
+        EncodeError::InvalidSnapshotState {
+            file_id: found,
+            ..
+        } if found == second_file_id
+    ));
+    let error =
+        CheckpointTable::from_snapshot_records(vec![first.clone(), second.clone()]).unwrap_err();
+    assert!(matches!(
+        error,
+        DecodeError::InvalidSnapshotState {
+            file_id: found,
+            ..
+        } if found == second_file_id
+    ));
+
+    let mut finalized = second;
+    finalized.lifecycle_state = LifecycleState::RotatedFinalized;
+    let mut encoded =
+        snapshot::encode_snapshot(1, NAMESPACE, &[first, finalized]).expect("pair is valid");
+    let first_len = u32::from_be_bytes(encoded[60..64].try_into().unwrap()) as usize;
+    let second_start = 60 + 4 + first_len + 4;
+    let second_len =
+        u32::from_be_bytes(encoded[second_start..second_start + 4].try_into().unwrap()) as usize;
+    // With the minimal fixture, lifecycle follows 120 payload bytes.
+    encoded[second_start + 4 + 120] = LifecycleState::Active.to_wire();
+    let second_crc_at = second_start + 4 + second_len;
+    let second_crc = crc32c(&encoded[second_start..second_crc_at]);
+    encoded[second_crc_at..second_crc_at + 4].copy_from_slice(&second_crc.to_be_bytes());
+
+    let error =
+        snapshot::decode_snapshot(&encoded, &super::primitives::namespace_digest(NAMESPACE))
+            .unwrap_err();
+    assert!(matches!(
+        error,
+        DecodeError::InvalidSnapshotState {
+            file_id: found,
+            ..
+        } if found == second_file_id
+    ));
 }
 
 /// Scenario: a hand-assembled snapshot byte stream (header + two identical
@@ -2554,47 +3663,22 @@ fn remove_operation_encoder_rejects_reserved_reason() {
     ));
 }
 
-/// Scenario: a table is seeded (via `from_snapshot_records`, bypassing the
-/// byte-level codec's own invariant enforcement) with a record marked
-/// `Quarantined` but carrying no `quarantine_evidence`; a `quarantine_file`
-/// replay is then applied against that same `file_id`.
-/// Guarantees: replay fails closed with
-/// `ApplyError::MissingQuarantineEvidence` instead of panicking on an
-/// internal `.expect()`; this invariant hole can only be reached through a
-/// directly-seeded table, never through this codec's own
-/// `decode_snapshot`/`encode_snapshot` round trip, but replay checks it
-/// explicitly rather than trusting the table's construction path.
+/// Scenario: a caller seeds `CheckpointTable` directly with a record marked
+/// `Quarantined` but carrying no quarantine evidence.
+/// Guarantees: direct table construction enforces the same reachable-state
+/// invariant as snapshot decoding and fails closed before replay.
 #[test]
-fn apply_against_inconsistent_quarantined_record_fails_closed_not_panicking() {
+fn direct_table_seed_rejects_inconsistent_quarantined_record() {
     let file_id = FileId([135; 16]);
     let mut record = sample_snapshot_record(file_id);
     record.lifecycle_state = LifecycleState::Quarantined;
     record.quarantine_evidence = None; // inconsistent, bypassing encode_snapshot's check
-    let mut table = CheckpointTable::from_snapshot_records(vec![record]).unwrap();
-
-    let quarantine_again = Operation::QuarantineFile(QuarantineFile {
-        file_id,
-        expected_file_epoch: 1,
-        reason_code: 1,
-        locator: Locator::PosixDevIno { dev: 1, ino: 2 },
-        observed_size: 1,
-        quarantine_epoch: 1,
-        quarantine_time_unix_nano: 1,
-    });
-    let err = table
-        .apply_transaction(
-            &Transaction {
-                sequence: 1,
-                operations: vec![quarantine_again],
-            },
-            NAMESPACE,
-        )
-        .unwrap_err();
+    let err = CheckpointTable::from_snapshot_records(vec![record]).unwrap_err();
     assert!(matches!(
         err,
-        ApplyError::MissingQuarantineEvidence {
-            operation: "quarantine_file",
+        DecodeError::InvalidSnapshotState {
             file_id: found,
+            ..
         } if found == file_id
     ));
 }

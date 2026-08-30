@@ -12,7 +12,8 @@ use super::error::{DecodeError, EncodeError};
 use super::primitives::{
     AdvisoryPath, ByteReader, ByteWriter, COMMITTED_FRONTIER_GUARD_WINDOW_BYTES,
     CommittedFrontierGuard, FINGERPRINT_MAX_BYTES, FileId, FramingResume, LifecycleState, Locator,
-    SNAPSHOT_FOOTER_MAGIC, SNAPSHOT_MAGIC, crc32c, namespace_digest, quarantine_reason_is_reserved,
+    REASON_CODE_RESERVED, SNAPSHOT_FOOTER_MAGIC, SNAPSHOT_MAGIC, crc32c, namespace_digest,
+    quarantine_reason_is_reserved,
 };
 
 /// Fixed width of the snapshot header, in bytes.
@@ -76,7 +77,7 @@ impl SnapshotRecord {
     /// this record must satisfy regardless of whether it is being encoded
     /// or was just decoded. A CRC-valid record failing this check is
     /// `InvalidSnapshotState`, never a candidate for repair.
-    fn validate_reachable_state(&self) -> Result<(), &'static str> {
+    pub(crate) fn validate_reachable_state(&self) -> Result<(), &'static str> {
         if self.file_epoch < 1 {
             return Err("file_epoch must be >= 1");
         }
@@ -88,6 +89,15 @@ impl SnapshotRecord {
         }
         if matches!(self.locator, Locator::Unspecified) {
             return Err("locator must be a recognized non-Unspecified kind");
+        }
+        if self.fingerprint.len() > FINGERPRINT_MAX_BYTES {
+            return Err("fingerprint length exceeds the version-1 maximum");
+        }
+        if u64::from(self.ignored_header_bytes)
+            .checked_add(self.fingerprint.len() as u64)
+            .is_none()
+        {
+            return Err("ignored_header_bytes + fingerprint_len must fit u64");
         }
         if self.framing_profile_version == 0 {
             return Err("framing_profile_version must be nonzero");
@@ -105,25 +115,26 @@ impl SnapshotRecord {
                 return Err("FramingResume::Continuation violates its reachable-state invariant");
             }
         }
-        if self.lifecycle_state == LifecycleState::RotatedFinalized {
-            if self.quarantine_evidence.is_some() {
-                return Err("RotatedFinalized record must not carry quarantine_evidence");
+        match (self.lifecycle_state, &self.quarantine_evidence) {
+            (LifecycleState::Active, None) => {}
+            (LifecycleState::RotatedFinalized, None) => {
+                if self.framing_resume != FramingResume::Clean {
+                    return Err("RotatedFinalized record must have FramingResume::Clean");
+                }
             }
-            if self.framing_resume != FramingResume::Clean {
-                return Err("RotatedFinalized record must have FramingResume::Clean");
+            (LifecycleState::Quarantined, Some(evidence)) => {
+                if evidence.reason_code == REASON_CODE_RESERVED {
+                    return Err("Quarantined record requires nonzero reason_code");
+                }
+                if evidence.quarantine_epoch != self.file_epoch {
+                    return Err("Quarantined record requires quarantine_epoch == file_epoch");
+                }
             }
-        }
-        // Quarantine-evidence presence-vs-lifecycle-state agreement is
-        // enforced by the caller (`encode_payload`'s
-        // `MissingQuarantineEvidence`/`UnexpectedQuarantineEvidence`, and
-        // `decode_payload`, which only ever reads evidence when
-        // `lifecycle_state == Quarantined`); this only validates evidence
-        // *content* once it is known to be present.
-        if let Some(evidence) = &self.quarantine_evidence {
-            if self.lifecycle_state == LifecycleState::Quarantined
-                && evidence.quarantine_epoch != self.file_epoch
-            {
-                return Err("Quarantined record requires quarantine_epoch == file_epoch");
+            (LifecycleState::Quarantined, None) => {
+                return Err("Quarantined record must carry quarantine_evidence");
+            }
+            (LifecycleState::Active | LifecycleState::RotatedFinalized, Some(_)) => {
+                return Err("non-Quarantined record must not carry quarantine_evidence");
             }
         }
         Ok(())
@@ -303,10 +314,22 @@ pub fn encode_snapshot(
     // `file_id` is not a well-formed table and must never be written, not
     // just rejected on the way back in.
     let mut seen_file_ids = std::collections::HashSet::with_capacity(records.len());
+    let mut live_locators = std::collections::HashMap::with_capacity(records.len());
     for record in records {
         if !seen_file_ids.insert(record.file_id) {
             return Err(EncodeError::DuplicateFileId {
                 file_id: record.file_id,
+            });
+        }
+        if record.lifecycle_state != LifecycleState::RotatedFinalized
+            && !matches!(record.locator, Locator::Unspecified)
+            && live_locators
+                .insert(record.locator, record.file_id)
+                .is_some()
+        {
+            return Err(EncodeError::InvalidSnapshotState {
+                file_id: record.file_id,
+                reason: "another live record claims the same locator",
             });
         }
     }
@@ -441,6 +464,8 @@ pub fn decode_snapshot(
     let mut records = Vec::with_capacity(record_count.min(1 << 16) as usize);
     let mut seen_file_ids =
         std::collections::HashSet::with_capacity(record_count.min(1 << 16) as usize);
+    let mut live_locators =
+        std::collections::HashMap::with_capacity(record_count.min(1 << 16) as usize);
     let mut cursor = SNAPSHOT_HEADER_LEN;
     let mut total_record_bytes: u64 = 0;
     for _ in 0..record_count {
@@ -453,6 +478,17 @@ pub fn decode_snapshot(
             return Err(DecodeError::DuplicateFileId {
                 file_id: record.file_id,
                 context: "snapshot",
+            });
+        }
+        if record.lifecycle_state != LifecycleState::RotatedFinalized
+            && !matches!(record.locator, Locator::Unspecified)
+            && live_locators
+                .insert(record.locator, record.file_id)
+                .is_some()
+        {
+            return Err(DecodeError::InvalidSnapshotState {
+                file_id: record.file_id,
+                reason: "another live record claims the same locator",
             });
         }
         cursor += consumed;

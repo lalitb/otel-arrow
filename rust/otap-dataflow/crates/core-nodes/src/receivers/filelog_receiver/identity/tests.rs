@@ -616,8 +616,9 @@ fn same_locator_mismatch_retirement_keeps_later_exact_locator_lookups_unambiguou
 
 /// Scenario: an empty finalized identity's locator is later reused by a new
 /// nonempty file whose fingerprint necessarily extends the empty prefix.
-/// Guarantees: finalized state is never resumed; the old record is retired
-/// atomically and the reused locator receives a new mismatch identity.
+/// Guarantees: finalized state is never resumed and no longer owns a live
+/// locator claim; its history remains while the reused locator receives a new
+/// mismatch identity.
 #[test]
 fn finalized_locator_reuse_never_resumes_the_old_identity() {
     let (_directory, mut store, _options) = test_store(8);
@@ -652,7 +653,11 @@ fn finalized_locator_reuse_never_resumes_the_old_identity() {
     assert_ne!(resolved[0].file_id, old_id);
     assert_eq!(resolved[0].matched_by, IdentityMatch::RecoveryMismatch);
     assert_eq!(resolved[0].committed_offset, 0);
-    assert!(store.table().get(&old_id).is_none());
+    assert_eq!(
+        store.table().get(&old_id).unwrap().lifecycle_state,
+        LifecycleState::RotatedFinalized
+    );
+    assert_eq!(store.table().len(), 2);
     assert_eq!(
         store
             .table()

@@ -21,6 +21,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use super::super::error::DecodeError;
 use super::super::primitives::{
     ADVISORY_PATH_STORED_MAX_BYTES, AdvisoryPath, ByteReader, CommittedFrontierGuard,
     FINGERPRINT_MAX_BYTES, FileId, FramingResume, LifecycleState, Locator, NAMESPACE_ID_MAX_BYTES,
@@ -246,7 +247,9 @@ fn quarantine_removal_rejects_a_record_that_is_now_active() {
             resulting_offset: 0,
             new_committed_frontier_guard: zero_guard(0),
             new_framing_resume: FramingResume::Clean,
-            reset_time_unix_nano: 4_000,
+            new_fingerprint: vec![1; 8],
+            action_time_unix_nano: 4_000,
+            namespace_id: NAMESPACE_ID.to_owned(),
             audit_reason: "release".to_owned(),
         })
         .expect("resets");
@@ -288,6 +291,10 @@ fn distinct_registrations(count: usize) -> Vec<RegisterFile> {
     (0..count)
         .map(|index| RegisterFile {
             file_id: wide_file_id(index as u64),
+            locator: Locator::PosixDevIno {
+                dev: 7,
+                ino: index as u64 + 1,
+            },
             ..registration(1)
         })
         .collect()
@@ -984,7 +991,7 @@ fn widest_registration(index: u64) -> RegisterFile {
         // The widest locator variant; `register_file` must still carry the
         // clean resume state and epoch 1 that replay requires.
         locator: Locator::WindowsVolumeFileId {
-            volume_serial: u64::MAX,
+            volume_serial: index,
             file_id: [0xAB; 16],
         },
         fingerprint: vec![0x5A; 16],
@@ -1370,6 +1377,10 @@ fn registrations_batch_into_bounded_synced_transactions() {
             let mut bytes = [0u8; 16];
             bytes[0..8].copy_from_slice(&(index as u64).to_be_bytes());
             register.file_id = FileId(bytes);
+            register.locator = Locator::PosixDevIno {
+                dev: 7,
+                ino: index as u64 + 1,
+            };
             register
         })
         .collect();
@@ -1745,6 +1756,7 @@ fn required_operations_sync_immediately_despite_the_interval() {
             resulting_epoch: 2,
             new_committed_offset: 0,
             new_framing_resume: FramingResume::Clean,
+            new_fingerprint: vec![9; 8],
             reset_time_unix_nano: 4_000,
             reason_code: TRUNCATE_RESET_REASON_READ_NEW,
         })
@@ -1769,7 +1781,9 @@ fn required_operations_sync_immediately_despite_the_interval() {
             resulting_offset: 0,
             new_committed_frontier_guard: zero_guard(0),
             new_framing_resume: FramingResume::Clean,
-            reset_time_unix_nano: 5_000,
+            new_fingerprint: vec![2; 8],
+            action_time_unix_nano: 5_000,
+            namespace_id: NAMESPACE_ID.to_owned(),
             audit_reason: "operator released quarantine".to_owned(),
         })
         .expect("quarantine reset succeeds");
@@ -1816,6 +1830,11 @@ fn every_quarantine_reset_action_survives_reopen_and_compaction() {
         let _quarantined = store
             .quarantine_files(vec![quarantine(1)])
             .expect("quarantines");
+        let new_fingerprint = if remains_quarantined {
+            vec![1; 8]
+        } else {
+            vec![9; 8]
+        };
 
         let outcome = store
             .reset_quarantined_file(ResetQuarantinedFile {
@@ -1826,7 +1845,9 @@ fn every_quarantine_reset_action_survives_reopen_and_compaction() {
                 resulting_offset,
                 new_committed_frontier_guard: zero_guard(resulting_offset),
                 new_framing_resume: FramingResume::Clean,
-                reset_time_unix_nano: 5_000,
+                new_fingerprint: new_fingerprint.clone(),
+                action_time_unix_nano: 5_000,
+                namespace_id: NAMESPACE_ID.to_owned(),
                 audit_reason: format!("operator selected {name}"),
             })
             .expect("the administrative decision succeeds");
@@ -1845,6 +1866,7 @@ fn every_quarantine_reset_action_survives_reopen_and_compaction() {
             remains_quarantined
         );
         assert_eq!(record.quarantine_evidence.is_some(), remains_quarantined);
+        assert_eq!(record.fingerprint, new_fingerprint);
 
         reopened.compact().expect("the recovered state compacts");
         drop(reopened);
@@ -1860,6 +1882,7 @@ fn every_quarantine_reset_action_survives_reopen_and_compaction() {
             remains_quarantined
         );
         assert_eq!(record.quarantine_evidence.is_some(), remains_quarantined);
+        assert_eq!(record.fingerprint, new_fingerprint);
     }
 }
 
@@ -1885,7 +1908,9 @@ fn administrative_operations_require_an_audit_reason() {
             resulting_offset: 0,
             new_committed_frontier_guard: zero_guard(0),
             new_framing_resume: FramingResume::Clean,
-            reset_time_unix_nano: 5_000,
+            new_fingerprint: vec![1; 8],
+            action_time_unix_nano: 5_000,
+            namespace_id: NAMESPACE_ID.to_owned(),
             audit_reason: String::new(),
         })
         .expect_err("an empty audit reason is refused");
@@ -2799,9 +2824,15 @@ fn retention_never_removes_a_quarantined_record() {
     assert_eq!(candidates, vec![file_id(1), file_id(3)]);
 
     let removed = store
-        .remove_expired(&eligible_absent, now, retention, 0x0007)
+        .remove_expired(&eligible_absent, now, retention)
         .expect("retention removal succeeds");
     assert_eq!(removed, 2);
+    assert_eq!(store.generation(), 1);
+    assert_eq!(store.stats().wal_transactions, 0);
+    assert_eq!(
+        fs::metadata(path.join(wal_file_name(1))).unwrap().len(),
+        WAL_HEADER_LEN as u64
+    );
     assert!(store.table().get(&file_id(1)).is_none());
     assert!(store.table().get(&file_id(3)).is_none());
     let quarantined = store.table().get(&file_id(2)).expect("quarantine survives");
@@ -2824,6 +2855,86 @@ fn retention_never_removes_a_quarantined_record() {
 
     let reopened = open(&path);
     assert_eq!(reopened.table().len(), 0);
+}
+
+/// Scenario: a vetted retention set contains more records than one
+/// non-progress WAL transaction can carry.
+/// Guarantees: one filtered compaction removes the complete set atomically,
+/// publishes a fresh empty WAL, and never emits partial `remove_file` chunks.
+#[test]
+fn retention_large_set_uses_one_filtered_compaction() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    let count = usize::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX) + 7;
+    let registrations: Vec<RegisterFile> = (0..count as u64).map(widest_registration).collect();
+    let eligible: HashSet<FileId> = registrations
+        .iter()
+        .map(|registration| registration.file_id)
+        .collect();
+    let mut store = open(&path);
+    let _outcomes = store.register_files(registrations).unwrap();
+
+    let removed = store
+        .remove_expired(&eligible, 10_000_000_000, Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(removed, count);
+    assert!(store.table().is_empty());
+    assert_eq!(store.generation(), 1);
+    assert_eq!(store.stats().wal_transactions, 0);
+    assert_eq!(
+        fs::metadata(path.join(wal_file_name(1))).unwrap().len(),
+        WAL_HEADER_LEN as u64
+    );
+    drop(store);
+
+    let reopened = open(&path);
+    assert!(reopened.table().is_empty());
+    assert_eq!(reopened.generation(), 1);
+}
+
+/// Scenario: filtered retention compaction fails at every snapshot, WAL,
+/// marker, and directory-sync publication boundary.
+/// Guarantees: restart selects either the complete original table or the
+/// complete filtered table according to `CURRENT`, never a partially removed
+/// set.
+#[test]
+fn retention_filtered_compaction_recovers_all_or_none_after_faults() {
+    for point in FaultPoint::PUBLICATION {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("namespace");
+        let mut seeded = open(&path);
+        let _registered = seeded
+            .register_files(vec![registration(1), registration(2)])
+            .unwrap();
+        drop(seeded);
+
+        let mut store =
+            CheckpointStore::open_with_fault(options(&path), point).expect("namespace reopens");
+        let error = store
+            .remove_expired(
+                &HashSet::from([file_id(1)]),
+                10_000_000_000,
+                Duration::from_secs(1),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::InjectedFault { point: fired } if fired == point
+        ));
+        drop(store);
+
+        let marker_replaced = matches!(
+            point,
+            FaultPoint::AfterMarkerPublish
+                | FaultPoint::BeforeMarkerDirSync
+                | FaultPoint::AfterMarkerDirSync
+        );
+        let reopened = open(&path);
+        assert_eq!(reopened.generation(), u64::from(marker_replaced));
+        assert_eq!(reopened.table().len(), if marker_replaced { 1 } else { 2 });
+        assert_eq!(reopened.table().get(&file_id(1)).is_none(), marker_replaced);
+        assert!(reopened.table().get(&file_id(2)).is_some());
+    }
 }
 
 /// Scenario: pipeline drain after a progress transaction whose sync the
@@ -3942,6 +4053,77 @@ fn configured_fingerprint_limit_is_enforced_on_write_and_recovery() {
     ));
 }
 
+/// Scenario: truncate and quarantine resets carry replacement fingerprints
+/// wider than the configured identity evidence window.
+/// Guarantees: both reset paths fail before WAL append or table mutation, so
+/// epoch-changing operations cannot bypass configured recovery admission.
+#[test]
+fn configured_fingerprint_limit_applies_to_every_reset() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    let mut store = CheckpointStore::open(StoreOptions {
+        fingerprint_bytes: 8,
+        ..options(&path)
+    })
+    .unwrap();
+    let _registered = store
+        .register_files(vec![registration(1), registration(2)])
+        .unwrap();
+    let _quarantined = store.quarantine_files(vec![quarantine(2)]).unwrap();
+    let before = store.table().clone();
+    let sequence_before = store.stats().next_sequence;
+
+    let error = store
+        .reset_after_truncate(ResetAfterTruncate {
+            file_id: file_id(1),
+            expected_active_epoch: 1,
+            observed_truncated_size: 0,
+            resulting_epoch: 2,
+            new_committed_offset: 0,
+            new_framing_resume: FramingResume::Clean,
+            new_fingerprint: vec![1; 9],
+            reset_time_unix_nano: 3,
+            reason_code: TRUNCATE_RESET_REASON_READ_NEW,
+        })
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::FingerprintExceedsConfiguredMaximum {
+            context: "truncate reset fingerprint",
+            len: 9,
+            max: 8,
+            ..
+        }
+    ));
+
+    let error = store
+        .reset_quarantined_file(ResetQuarantinedFile {
+            file_id: file_id(2),
+            expected_quarantine_epoch: 1,
+            action: ResetQuarantineAction::ResetToBeginning,
+            resulting_epoch: 2,
+            resulting_offset: 0,
+            new_committed_frontier_guard: CommittedFrontierGuard::empty(),
+            new_framing_resume: FramingResume::Clean,
+            new_fingerprint: vec![2; 9],
+            action_time_unix_nano: 3,
+            namespace_id: NAMESPACE_ID.to_owned(),
+            audit_reason: "release".to_owned(),
+        })
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::FingerprintExceedsConfiguredMaximum {
+            context: "quarantine reset fingerprint",
+            len: 9,
+            max: 8,
+            ..
+        }
+    ));
+    assert_eq!(store.table(), &before);
+    assert_eq!(store.stats().next_sequence, sequence_before);
+}
+
 /// Scenario: Windows compacts an already initialized namespace, replacing
 /// an existing `CURRENT` marker, then reopens it.
 /// Guarantees: the Windows publication path uses supported replacement
@@ -4180,7 +4362,7 @@ fn compaction_requires_retired_generation_cleanup() {
 }
 
 /// Scenario: each reason value reserved from version-1 encoder output is
-/// supplied through every public quarantine or removal path.
+/// supplied through every public quarantine or administrative removal path.
 /// Guarantees: quarantine rejects `0x0000` and `0x0004`, removal rejects
 /// `0x0000`, and no refusal advances durable or in-memory state.
 #[test]
@@ -4230,26 +4412,11 @@ fn reserved_reason_codes_are_refused_on_every_public_path() {
     };
     expect_removal_field(
         store
-            .remove_files(vec![removal(1, REASON_CODE_RESERVED)])
-            .expect_err("remove_files refuses the reserved code"),
-    );
-    expect_removal_field(
-        store
             .append(vec![Operation::RemoveFile(removal(
                 1,
                 REASON_CODE_RESERVED,
             ))])
             .expect_err("append refuses the reserved code"),
-    );
-    expect_removal_field(
-        store
-            .remove_expired(
-                &HashSet::new(),
-                10_000_000_000,
-                Duration::from_secs(1),
-                REASON_CODE_RESERVED,
-            )
-            .expect_err("remove_expired refuses the reserved code"),
     );
     // Refused even where the record is absent, which would otherwise be
     // reported as the format's idempotent no-op.
@@ -4278,16 +4445,13 @@ fn reserved_reason_codes_are_refused_on_every_public_path() {
     assert_eq!(store.stats().next_sequence, sequence_before);
     assert_eq!(store.table().len(), 2);
 
-    // A non-reserved code on the same paths still works.
-    let _removed = store
-        .remove_files(vec![removal(1, 0x0007)])
-        .expect("a valid removal reason is accepted");
+    // A non-reserved administrative code still works.
     let outcome = store
         .remove_quarantined_file(file_id(2), 0x0008, 10_000_000_000, "purge".to_owned())
         .expect("a valid administrative removal is accepted")
         .expect("the record was present");
     assert!(outcome.synced);
-    assert_eq!(store.table().len(), 0);
+    assert_eq!(store.table().len(), 1);
 }
 
 /// Scenario: a checksum-valid WAL contains a quarantine using `0x0000` or
@@ -4360,11 +4524,11 @@ fn recovered_wal_rejects_every_reserved_reason_code() {
     }
 }
 
-/// Scenario: a checksum-valid snapshot contains `0x0000` or `0x0004`
+/// Scenario: a checksum-valid snapshot contains zero or encoder-reserved
 /// quarantine evidence and its WAL immediately resets or removes that record.
-/// Guarantees: snapshot decoding accepts the opaque reason structurally, but
-/// store recovery rejects the reserved encoder value before replay can erase
-/// the evidence.
+/// Guarantees: zero violates the snapshot reachable-state invariant, while
+/// `0x0004` remains structurally opaque but is rejected by store policy before
+/// replay can erase the evidence.
 #[test]
 fn recovered_snapshot_rejects_reserved_reason_before_wal_can_erase_it() {
     let reset = Operation::ResetQuarantinedFile(ResetQuarantinedFile {
@@ -4375,7 +4539,9 @@ fn recovered_snapshot_rejects_reserved_reason_before_wal_can_erase_it() {
         resulting_offset: 0,
         new_committed_frontier_guard: zero_guard(0),
         new_framing_resume: FramingResume::Clean,
-        reset_time_unix_nano: 4_000,
+        new_fingerprint: vec![1; 8],
+        action_time_unix_nano: 4_000,
+        namespace_id: NAMESPACE_ID.to_owned(),
         audit_reason: "operator reset".to_owned(),
     });
     let removal = Operation::RemoveFile(RemoveFile {
@@ -4430,15 +4596,28 @@ fn recovered_snapshot_rejects_reserved_reason_before_wal_can_erase_it() {
 
         let error = CheckpointStore::open(options(&path))
             .expect_err("the snapshot's reserved code fails recovery");
-        assert!(matches!(
-            error,
-            StoreError::ReservedReasonCodeRecovered {
-                file_id: found,
-                field: "quarantine_file.reason_code",
-                reason_code,
-                ..
-            } if found == file_id(1) && reason_code == reserved_reason
-        ));
+        if reserved_reason == REASON_CODE_RESERVED {
+            assert!(matches!(
+                error,
+                StoreError::Decode {
+                    source: DecodeError::InvalidSnapshotState {
+                        file_id: found,
+                        ..
+                    },
+                    ..
+                } if found == file_id(1)
+            ));
+        } else {
+            assert!(matches!(
+                error,
+                StoreError::ReservedReasonCodeRecovered {
+                    file_id: found,
+                    field: "quarantine_file.reason_code",
+                    reason_code,
+                    ..
+                } if found == file_id(1) && reason_code == reserved_reason
+            ));
+        }
     }
 }
 

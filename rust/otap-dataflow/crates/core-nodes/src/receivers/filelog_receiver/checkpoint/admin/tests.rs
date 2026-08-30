@@ -1077,9 +1077,17 @@ fn seed_quarantined_source(
     record
 }
 
-fn beginning_request(seed: u8, epoch: u32, reason: &str) -> ResetToBeginningRequest {
+fn beginning_request(
+    seed: u8,
+    epoch: u32,
+    source_path: &Path,
+    follow_symlinks: bool,
+    reason: &str,
+) -> ResetToBeginningRequest {
     ResetToBeginningRequest {
         target: mutation_target(seed, epoch),
+        source_path: source_path.to_path_buf(),
+        follow_symlinks,
         audit: mutation_audit(reason, 4_000),
     }
 }
@@ -1109,8 +1117,8 @@ fn end_request(
 /// Scenario: a quarantined continuation is reset to the beginning through
 /// the high-level administration API.
 /// Guarantees: the API increments the epoch, installs offset zero, the empty
-/// guard, and Clean resume, reports duplicate risk, syncs before success,
-/// retains the lock, and survives a fresh store reopen.
+/// guard, Clean resume, and same-handle replacement fingerprint; reports
+/// duplicate risk, syncs before success, retains the lock, and survives reopen.
 #[test]
 fn reset_to_beginning_is_audited_synced_and_durable() {
     let root = tempfile::tempdir().unwrap();
@@ -1132,7 +1140,13 @@ fn reset_to_beginning_is_audited_synced_and_durable() {
 
     let mut session = CheckpointAdminSession::open(store_options.clone()).unwrap();
     let result = session
-        .reset_to_beginning(beginning_request(1, 1, "replay this source"))
+        .reset_to_beginning(beginning_request(
+            1,
+            1,
+            &source,
+            false,
+            "replay this source",
+        ))
         .unwrap();
     assert_eq!(result.namespace_id, "reset-beginning");
     assert_eq!(result.file_id, hex::encode([1; 16]));
@@ -1164,7 +1178,44 @@ fn reset_to_beginning_is_audited_synced_and_durable() {
         CommittedFrontierGuard::empty()
     );
     assert_eq!(record.framing_resume, FramingResume::Clean);
+    assert_eq!(record.fingerprint, vec![b'a'; 128]);
     assert!(record.quarantine_evidence.is_none());
+}
+
+/// Scenario: reset-to-beginning is pointed at a different locator and a
+/// missing path while the quarantined source still exists.
+/// Guarantees: replacement fingerprint sampling never trusts advisory aliases,
+/// and every source-validation failure leaves the WAL unchanged.
+#[test]
+fn reset_to_beginning_requires_the_exact_current_source() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.log");
+    let wrong = root.path().join("wrong.log");
+    fs::write(&source, b"source").unwrap();
+    fs::write(&wrong, b"wrong").unwrap();
+    let missing = root.path().join("missing.log");
+    let store_options = options(&root.path().join("state"), "beginning-source");
+    let _ = seed_quarantined_source(
+        &store_options,
+        &source,
+        20,
+        0,
+        FramingResume::Clean,
+        AdvisoryPath::unavailable(),
+    );
+    let wal_path = store_options.namespace_dir.join(wal_file_name(0));
+    let before = fs::read(&wal_path).unwrap();
+    let mut session = CheckpointAdminSession::open(store_options).unwrap();
+
+    assert!(matches!(
+        session.reset_to_beginning(beginning_request(20, 1, &wrong, false, "wrong source",)),
+        Err(CheckpointAdminError::ResetSourceLocatorMismatch { .. })
+    ));
+    assert!(matches!(
+        session.reset_to_beginning(beginning_request(20, 1, &missing, false, "missing source",)),
+        Err(CheckpointAdminError::ResetSourceIo { .. })
+    ));
+    assert_eq!(fs::read(wal_path).unwrap(), before);
 }
 
 /// Scenario: an operator records keep-failed for a quarantined record with
@@ -1379,9 +1430,9 @@ fn remove_quarantined_is_exact_audited_and_durable() {
 
 /// Scenario: reset-to-end samples a regular file longer than the 64-byte
 /// committed-frontier window through its immutable quarantine locator.
-/// Guarantees: EOF and the digest of exactly the final 64 raw bytes from the
-/// same handle are committed, reported without raw content, synced, and
-/// recovered after restart.
+/// Guarantees: fingerprint, EOF, and the digest of exactly the final 64 raw
+/// bytes from the same handle are committed, reported without raw content,
+/// synced, and recovered after restart.
 #[test]
 fn reset_to_end_commits_exact_locator_eof_and_real_guard() {
     let root = tempfile::tempdir().unwrap();
@@ -1426,6 +1477,7 @@ fn reset_to_end_commits_exact_locator_eof_and_real_guard() {
     assert_eq!(record.committed_offset, 150);
     assert_eq!(record.committed_frontier_guard, expected_guard);
     assert_eq!(record.framing_resume, FramingResume::Clean);
+    assert_eq!(record.fingerprint, bytes);
     assert_eq!(record.lifecycle_state, LifecycleState::Active);
 }
 
@@ -1456,7 +1508,7 @@ fn invalid_mutation_requests_leave_the_wal_unchanged() {
         "AA000000000000000000000000000000".to_owned(),
         "gg000000000000000000000000000000".to_owned(),
     ] {
-        let mut request = beginning_request(5, 1, "valid audit");
+        let mut request = beginning_request(5, 1, &source, false, "valid audit");
         request.target.file_id = invalid;
         assert!(matches!(
             session.reset_to_beginning(request),
@@ -1464,20 +1516,20 @@ fn invalid_mutation_requests_leave_the_wal_unchanged() {
         ));
     }
 
-    let mut empty_audit = beginning_request(5, 1, "");
+    let mut empty_audit = beginning_request(5, 1, &source, false, "");
     empty_audit.audit.reason.clear();
     assert!(matches!(
         session.reset_to_beginning(empty_audit),
         Err(CheckpointAdminError::AuditReasonRequired { .. })
     ));
-    let mut oversized = beginning_request(5, 1, "oversized");
+    let mut oversized = beginning_request(5, 1, &source, false, "oversized");
     oversized.audit.reason = "x".repeat(AUDIT_REASON_MAX_BYTES + 1);
     assert!(matches!(
         session.reset_to_beginning(oversized),
         Err(CheckpointAdminError::AuditReasonTooLong { .. })
     ));
     assert!(matches!(
-        session.reset_to_beginning(beginning_request(5, 2, "stale epoch")),
+        session.reset_to_beginning(beginning_request(5, 2, &source, false, "stale epoch",)),
         Err(CheckpointAdminError::QuarantineEpochMismatch { .. })
     ));
     assert!(matches!(
@@ -1521,7 +1573,7 @@ fn mutation_rejects_a_record_that_is_not_quarantined() {
 
     let mut session = CheckpointAdminSession::open(store_options).unwrap();
     assert!(matches!(
-        session.reset_to_beginning(beginning_request(6, 1, "wrong state")),
+        session.reset_to_beginning(beginning_request(6, 1, root.path(), false, "wrong state",)),
         Err(CheckpointAdminError::ExpectedQuarantine {
             state: CheckpointLifecycleReport::Active,
             ..
@@ -1574,7 +1626,13 @@ fn reset_to_beginning_rejects_epoch_overflow_without_append() {
 
     let mut session = CheckpointAdminSession::open(store_options).unwrap();
     assert!(matches!(
-        session.reset_to_beginning(beginning_request(7, u32::MAX, "overflow")),
+        session.reset_to_beginning(beginning_request(
+            7,
+            u32::MAX,
+            root.path(),
+            false,
+            "overflow",
+        )),
         Err(CheckpointAdminError::FileEpochOverflow { .. })
     ));
     assert_eq!(fs::read(wal_path).unwrap(), before);

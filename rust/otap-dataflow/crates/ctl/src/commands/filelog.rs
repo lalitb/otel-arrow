@@ -156,6 +156,8 @@ fn backup(args: CheckpointBackupArgs) -> Result<EvidenceBackupManifest, CliError
 fn reset_to_beginning(args: CheckpointResetBeginningArgs) -> Result<FileMutationResult, CliError> {
     let request = ResetToBeginningRequest {
         target: target(args.target),
+        source_path: args.source_path,
+        follow_symlinks: args.follow_symlinks,
         audit: audit(args.audit)?,
     };
     let mut session =
@@ -501,9 +503,11 @@ mod tests {
     use crate::Cli;
     use clap::Parser;
     use otap_df_core_nodes::receivers::filelog_receiver::checkpoint::CheckpointStore;
+    #[cfg(unix)]
+    use otap_df_core_nodes::receivers::filelog_receiver::checkpoint::primitives::LifecycleState;
     use otap_df_core_nodes::receivers::filelog_receiver::checkpoint::primitives::{
         AdvisoryPath, CommittedFrontierGuard, FRAMING_PROFILE_VERSION, FileId, FramingResume,
-        LifecycleState, Locator,
+        Locator,
     };
     use otap_df_core_nodes::receivers::filelog_receiver::checkpoint::store::layout::wal_file_name;
     use otap_df_core_nodes::receivers::filelog_receiver::checkpoint::wal::{
@@ -769,13 +773,23 @@ mod tests {
     /// Scenario: reset-to-beginning is invoked with exact file and epoch
     /// evidence plus explicit duplicate acknowledgement.
     /// Guarantees: the CLI durably returns the record to Active at offset zero
-    /// with an incremented epoch.
+    /// with an incremented epoch and replacement-stream fingerprint evidence.
+    #[cfg(unix)]
     #[tokio::test]
     async fn reset_to_beginning_requires_ack_and_commits_zero() {
+        use std::os::unix::fs::MetadataExt as _;
+
         let root = tempdir().unwrap();
         let state_dir = root.path().join("state");
+        let source = root.path().join("source.log");
+        fs::write(&source, [9; 16]).unwrap();
+        let metadata = fs::metadata(&source).unwrap();
+        let locator = Locator::PosixDevIno {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        };
         let checkpoint_id = "offline-beginning";
-        let options = seed_quarantine(&state_dir, checkpoint_id, 4, synthetic_locator(4), 10);
+        let options = seed_quarantine(&state_dir, checkpoint_id, 4, locator, metadata.len());
         let file_id = file_id_hex(4);
         let cli = Cli::try_parse_from([
             "dfctl",
@@ -791,6 +805,8 @@ mod tests {
             &file_id,
             "--expected-epoch",
             "1",
+            "--source-path",
+            cli_path(&source),
             "--reason",
             "replay source",
             "--acknowledge-duplicates",
@@ -806,6 +822,7 @@ mod tests {
         assert_eq!(record.lifecycle_state, LifecycleState::Active);
         assert_eq!(record.file_epoch, 2);
         assert_eq!(record.committed_offset, 0);
+        assert_eq!(record.fingerprint, vec![9; 16]);
     }
 
     /// Scenario: reset-to-end targets the exact quarantined Unix file and

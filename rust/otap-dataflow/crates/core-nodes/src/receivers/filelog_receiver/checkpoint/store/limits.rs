@@ -159,11 +159,17 @@ const UPDATE_PROGRESS_BYTES: u64 = OPERATION_HEADER_BYTES
     + FRAMING_RESUME_MAX_BYTES
     + 8
     + 1;
-/// `reset_after_truncate`, which carries no variable-length field and no
-/// wire-level guard (the resulting guard is always the format-defined
-/// empty guard, so it is not carried redundantly).
-const RESET_AFTER_TRUNCATE_BYTES: u64 =
-    OPERATION_HEADER_BYTES + 4 + 8 + 4 + 8 + FRAMING_RESUME_MAX_BYTES + 8 + 2;
+/// `reset_after_truncate` without its replacement fingerprint. The resulting
+/// guard is always the format-defined empty guard and is not carried.
+const RESET_AFTER_TRUNCATE_BYTES: u64 = OPERATION_HEADER_BYTES
+    + 4
+    + 8
+    + 4
+    + 8
+    + FRAMING_RESUME_MAX_BYTES
+    + VAR_LEN_PREFIX_BYTES
+    + 8
+    + 2;
 /// `update_fingerprint` without its two fingerprint values.
 const UPDATE_FINGERPRINT_FIXED_BYTES: u64 =
     OPERATION_HEADER_BYTES + 4 + VAR_LEN_PREFIX_BYTES + VAR_LEN_PREFIX_BYTES;
@@ -172,12 +178,15 @@ const UPDATE_FINGERPRINT_FIXED_BYTES: u64 =
 /// a `file_id`.
 const UPDATE_METADATA_BYTES: u64 = OPERATION_HEADER_BYTES
     + 1
+    + 4
+    + 1
     + 8
     + ADVISORY_PATH_FIXED_BYTES as u64
     + ADVISORY_PATH_STORED_MAX_BYTES as u64;
 /// `quarantine_file`, which carries no variable-length field.
 const QUARANTINE_FILE_BYTES: u64 = OPERATION_HEADER_BYTES + 4 + 2 + LOCATOR_MAX_BYTES + 8 + 4 + 8;
-/// `reset_quarantined_file` with the audit reason at its maximum.
+/// `reset_quarantined_file` without its replacement fingerprint, with
+/// namespace ID and audit reason at their maxima.
 const RESET_QUARANTINED_FILE_BYTES: u64 = OPERATION_HEADER_BYTES
     + 4
     + 1
@@ -185,7 +194,10 @@ const RESET_QUARANTINED_FILE_BYTES: u64 = OPERATION_HEADER_BYTES
     + 8
     + COMMITTED_FRONTIER_GUARD_BYTES
     + FRAMING_RESUME_MAX_BYTES
+    + VAR_LEN_PREFIX_BYTES
     + 8
+    + VAR_LEN_PREFIX_BYTES
+    + NAMESPACE_ID_MAX_BYTES as u64
     + VAR_LEN_PREFIX_BYTES
     + AUDIT_REASON_MAX_BYTES as u64;
 /// Administrative `remove_file` with the namespace id and audit reason at
@@ -421,17 +433,27 @@ pub fn operation_bytes(fingerprint_bytes: u64) -> Result<u64, LimitsError> {
         WAL_REMEDY,
         &[
             UPDATE_FINGERPRINT_FIXED_BYTES,
-            fingerprint_bytes,
+            fingerprint_bytes.saturating_sub(1),
             fingerprint_bytes,
         ],
     )?;
+    let reset_after_truncate = sum(
+        WAL_ARTIFACT,
+        WAL_REMEDY,
+        &[RESET_AFTER_TRUNCATE_BYTES, fingerprint_bytes],
+    )?;
+    let reset_quarantined_file = sum(
+        WAL_ARTIFACT,
+        WAL_REMEDY,
+        &[RESET_QUARANTINED_FILE_BYTES, fingerprint_bytes],
+    )?;
     let widest = [
         register_file,
-        RESET_AFTER_TRUNCATE_BYTES,
+        reset_after_truncate,
         update_fingerprint,
         UPDATE_METADATA_BYTES,
         QUARANTINE_FILE_BYTES,
-        RESET_QUARANTINED_FILE_BYTES,
+        reset_quarantined_file,
         REMOVE_FILE_BYTES,
     ]
     .into_iter()
@@ -532,7 +554,8 @@ mod tests {
     use crate::receivers::filelog_receiver::checkpoint::primitives::{
         AdvisoryPath, CommittedFrontierGuard, FileId, FramingResume, LifecycleState, Locator,
         MAX_OPERATION_FRAME_BYTES, MAX_OPERATION_PAYLOAD_BYTES, MAX_PROGRESS_TX_BODY_BYTES,
-        MAX_PROGRESS_TX_FRAME_BYTES, REGISTER_FILE_MAX_OP_PAYLOAD_BYTES,
+        MAX_PROGRESS_TX_FRAME_BYTES, MAX_VALID_UPDATE_FINGERPRINT_FRAME_BYTES,
+        MAX_VALID_UPDATE_FINGERPRINT_PAYLOAD_BYTES, REGISTER_FILE_MAX_OP_PAYLOAD_BYTES,
         SNAPSHOT_MAX_RECORD_FRAME_BYTES, SNAPSHOT_MAX_RECORD_PAYLOAD_BYTES, TX_MIN_BODY_BYTES,
         TX_MIN_FRAME_BYTES, UPDATE_PROGRESS_MAX_OP_FRAME_BYTES,
         UPDATE_PROGRESS_MAX_OP_PAYLOAD_BYTES, WAL_MAX_TX_FRAME_BYTES,
@@ -603,6 +626,7 @@ mod tests {
     fn widest_operations(fingerprint_bytes: u64) -> Vec<Operation> {
         let file_id = FileId([2; 16]);
         let fingerprint = vec![0x5A; fingerprint_bytes as usize];
+        let expected_fingerprint = fingerprint[..fingerprint.len().saturating_sub(1)].to_vec();
         vec![
             Operation::RegisterFile(RegisterFile {
                 file_id,
@@ -639,17 +663,20 @@ mod tests {
                 resulting_epoch: 2,
                 new_committed_offset: 0,
                 new_framing_resume: WIDEST_RESUME,
+                new_fingerprint: fingerprint.clone(),
                 reset_time_unix_nano: u64::MAX,
                 reason_code: 0x0001,
             }),
             Operation::UpdateFingerprint(UpdateFingerprint {
                 file_id,
                 expected_file_epoch: 1,
-                expected_fingerprint: fingerprint.clone(),
-                new_fingerprint: fingerprint,
+                expected_fingerprint,
+                new_fingerprint: fingerprint.clone(),
             }),
             Operation::UpdateMetadata(UpdateMetadata {
                 file_id,
+                expected_prior_state: LifecycleState::Quarantined,
+                expected_file_epoch: 1,
                 last_seen_time_unix_nano: u64::MAX,
                 advisory_path: Some(
                     AdvisoryPath::from_unix_bytes(&vec![b'p'; ADVISORY_PATH_STORED_MAX_BYTES])
@@ -673,7 +700,9 @@ mod tests {
                 resulting_offset: u64::MAX,
                 new_committed_frontier_guard: widest_guard(),
                 new_framing_resume: WIDEST_RESUME,
-                reset_time_unix_nano: u64::MAX,
+                new_fingerprint: fingerprint,
+                action_time_unix_nano: u64::MAX,
+                namespace_id: "n".repeat(NAMESPACE_ID_MAX_BYTES),
                 audit_reason: "a".repeat(AUDIT_REASON_MAX_BYTES),
             }),
             Operation::RemoveFile(RemoveFile {
@@ -721,6 +750,10 @@ mod tests {
             .map(|index| {
                 let mut record = widest_snapshot_record(fingerprint_bytes);
                 record.file_id = FileId([index; 16]);
+                record.locator = Locator::WindowsVolumeFileId {
+                    volume_serial: u64::from(index),
+                    file_id: [0xAB; 16],
+                };
                 record
             })
             .collect();
@@ -788,7 +821,15 @@ mod tests {
             .into_iter()
             .find(|operation| matches!(operation, Operation::UpdateProgress(_)))
             .expect("widest_operations includes update_progress");
-        let progress_operations = vec![widest_progress; WAL_MAX_OPS_PER_TX as usize];
+        let progress_operations = (0..WAL_MAX_OPS_PER_TX)
+            .map(|index| {
+                let Operation::UpdateProgress(mut progress) = widest_progress.clone() else {
+                    unreachable!("the selected fixture is update_progress");
+                };
+                progress.file_id = FileId((u128::from(index) + 1).to_be_bytes());
+                Operation::UpdateProgress(progress)
+            })
+            .collect();
         let progress_tx = Transaction {
             sequence: 2,
             operations: progress_operations,
@@ -926,12 +967,9 @@ mod tests {
 
     /// Scenario: every non-progress operation is built at its widest legal
     /// shape with a maximum fingerprint window and independently encoded.
-    /// Guarantees: the widest one's frame and payload lengths equal the
-    /// authoritative `MAX_OPERATION_FRAME_BYTES` /
-    /// `MAX_OPERATION_PAYLOAD_BYTES` constants (dominated by
-    /// `update_fingerprint` at this fingerprint width), and the
-    /// `register_file` operation alone matches
-    /// `REGISTER_FILE_MAX_OP_PAYLOAD_BYTES`.
+    /// Guarantees: the widest encoder output equals the maximum-valid
+    /// fingerprint-extension constants (one byte below the structural decode
+    /// ceiling), and `register_file` matches its published payload maximum.
     #[test]
     fn operation_constants_match_the_widest_encoded_operation() {
         let operations = widest_operations(FINGERPRINT_MAX_BYTES as u64);
@@ -941,10 +979,10 @@ mod tests {
             .map(|operation| operation.encode().expect("the operation encodes").len() as u64)
             .max()
             .expect("there are seven non-progress operations");
-        assert_eq!(widest_encoded, MAX_OPERATION_FRAME_BYTES);
+        assert_eq!(widest_encoded, MAX_VALID_UPDATE_FINGERPRINT_FRAME_BYTES);
         assert_eq!(
             widest_encoded - FRAME_OVERHEAD_BYTES,
-            MAX_OPERATION_PAYLOAD_BYTES
+            MAX_VALID_UPDATE_FINGERPRINT_PAYLOAD_BYTES
         );
 
         let register_file_encoded = operations
@@ -956,6 +994,42 @@ mod tests {
         assert_eq!(
             register_file_encoded.len() as u64 - FRAME_OVERHEAD_BYTES,
             REGISTER_FILE_MAX_OP_PAYLOAD_BYTES
+        );
+    }
+
+    /// Scenario: a strict fingerprint extension grows a 65,534-byte prefix
+    /// to the format's 65,535-byte field maximum.
+    /// Guarantees: the maximum-valid payload/frame constants match real
+    /// encoder output and remain one byte below the structural equal-maximum
+    /// allocation ceiling.
+    #[test]
+    fn maximum_valid_fingerprint_extension_constants_match_codec() {
+        let expected = vec![0x5A; FINGERPRINT_MAX_BYTES - 1];
+        let mut new_fingerprint = expected.clone();
+        new_fingerprint.push(0xA5);
+        let encoded = Operation::UpdateFingerprint(UpdateFingerprint {
+            file_id: FileId([8; 16]),
+            expected_file_epoch: 1,
+            expected_fingerprint: expected,
+            new_fingerprint,
+        })
+        .encode()
+        .unwrap();
+        assert_eq!(
+            encoded.len() as u64,
+            MAX_VALID_UPDATE_FINGERPRINT_FRAME_BYTES
+        );
+        assert_eq!(
+            encoded.len() as u64 - FRAME_OVERHEAD_BYTES,
+            MAX_VALID_UPDATE_FINGERPRINT_PAYLOAD_BYTES
+        );
+        assert_eq!(
+            MAX_VALID_UPDATE_FINGERPRINT_FRAME_BYTES + 1,
+            MAX_OPERATION_FRAME_BYTES
+        );
+        assert_eq!(
+            MAX_VALID_UPDATE_FINGERPRINT_PAYLOAD_BYTES + 1,
+            MAX_OPERATION_PAYLOAD_BYTES
         );
     }
 
@@ -986,7 +1060,15 @@ mod tests {
 
         let progress_tx = Transaction {
             sequence: 1,
-            operations: vec![widest_progress; WAL_MAX_OPS_PER_TX as usize],
+            operations: (0..WAL_MAX_OPS_PER_TX)
+                .map(|index| {
+                    let Operation::UpdateProgress(mut progress) = widest_progress.clone() else {
+                        unreachable!("the selected fixture is update_progress");
+                    };
+                    progress.file_id = FileId((u128::from(index) + 1).to_be_bytes());
+                    Operation::UpdateProgress(progress)
+                })
+                .collect(),
         };
         let encoded_tx = progress_tx
             .encode()
@@ -998,23 +1080,23 @@ mod tests {
         );
     }
 
-    /// Scenario: a minimal `update_metadata` operation (`presence_flags`
-    /// clear, no advisory path) is wrapped in its own transaction and
-    /// independently encoded.
+    /// Scenario: a minimal strict `update_fingerprint` operation extends an
+    /// empty fingerprint by one byte and is wrapped in its own transaction.
     /// Guarantees: the operation's frame length equals `TX_MIN_BODY_BYTES`
     /// and the assembled transaction's frame length equals
     /// `TX_MIN_FRAME_BYTES` exactly -- the smallest legal transaction this
     /// format allows.
     #[test]
     fn minimal_transaction_matches_tx_min_constants() {
-        let minimal_operation = Operation::UpdateMetadata(UpdateMetadata {
+        let minimal_operation = Operation::UpdateFingerprint(UpdateFingerprint {
             file_id: FileId([9; 16]),
-            last_seen_time_unix_nano: 0,
-            advisory_path: None,
+            expected_file_epoch: 1,
+            expected_fingerprint: Vec::new(),
+            new_fingerprint: vec![1],
         });
         let encoded_operation = minimal_operation
             .encode()
-            .expect("a minimal update_metadata encodes");
+            .expect("a minimal update_fingerprint encodes");
         assert_eq!(encoded_operation.len() as u64, u64::from(TX_MIN_BODY_BYTES));
 
         let tx = Transaction {

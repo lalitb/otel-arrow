@@ -535,14 +535,10 @@ fn plan_with_source_mode(
         .take(candidates.len())
         .collect();
     let mut recovery_evidence = vec![false; candidates.len()];
-    // Non-quarantined records (`Active` or `RotatedFinalized`) found at a
-    // candidate's own exact locator that cannot be resumed: a locator is
-    // reused by exactly one real object at a time, so at most one of these
-    // may ever legitimately remain once the new identity below is durable.
-    // Retiring them in the same atomic group is what keeps INV-ID1 -- one
-    // `file_id` per concurrently claimed locator -- true going forward,
-    // rather than leaving a stale record that makes every later exact-locator
-    // lookup for this locator ambiguous.
+    // Active records found at a candidate's exact locator that cannot be
+    // resumed are retired atomically with the replacement registration.
+    // RotatedFinalized history has no live locator claim and remains eligible
+    // for ordinary filtered-compaction retention.
     let mut stale_locator_records: Vec<Vec<(FileId, u32, LifecycleState)>> =
         vec![Vec::new(); candidates.len()];
 
@@ -553,23 +549,21 @@ fn plan_with_source_mode(
         let Some(group) = records_by_locator.get(&candidate.locator) else {
             continue;
         };
-        if group.len() != 1 {
-            if group
-                .iter()
-                .any(|record| record.lifecycle_state == LifecycleState::Quarantined)
-            {
-                return Err(IdentityError::AmbiguousQuarantinedLocator {
-                    locator: candidate.locator,
-                });
-            }
+        let mut live_records = group.iter().copied().filter(|record| {
+            matches!(
+                record.lifecycle_state,
+                LifecycleState::Active | LifecycleState::Quarantined
+            )
+        });
+        let Some(record) = live_records.next() else {
             recovery_evidence[index] = true;
-            stale_locator_records[index] = group
-                .iter()
-                .map(|record| (record.file_id, record.file_epoch, record.lifecycle_state))
-                .collect();
             continue;
+        };
+        if live_records.next().is_some() {
+            return Err(IdentityError::InvalidEvidence {
+                reason: "checkpoint table contains duplicate live locator claims",
+            });
         }
-        let record = group[0];
         if record.lifecycle_state == LifecycleState::Quarantined {
             plans[index] = Some(plan_existing(
                 candidate,
@@ -581,11 +575,6 @@ fn plan_with_source_mode(
             continue;
         }
         recovery_evidence[index] = true;
-        if record.lifecycle_state == LifecycleState::RotatedFinalized {
-            stale_locator_records[index] =
-                vec![(record.file_id, record.file_epoch, record.lifecycle_state)];
-            continue;
-        }
         if !candidate.fingerprint.starts_with(&record.fingerprint)
             || record.committed_offset > candidate.size
         {
@@ -907,6 +896,8 @@ fn plan_existing(
     {
         operations.push(Operation::UpdateMetadata(UpdateMetadata {
             file_id: record.file_id,
+            expected_prior_state: record.lifecycle_state,
+            expected_file_epoch: record.file_epoch,
             last_seen_time_unix_nano: now_unix_nano,
             advisory_path: apply_path_update.then(|| candidate.advisory_path.clone()),
         }));

@@ -112,10 +112,9 @@ pub const SNAPSHOT_MAX_RECORD_PAYLOAD_BYTES: u64 = 69854;
 /// [`SNAPSHOT_MAX_RECORD_PAYLOAD_BYTES`] plus its `record_len` prefix and
 /// `record_crc32c` suffix.
 pub const SNAPSHOT_MAX_RECORD_FRAME_BYTES: u64 = 69862;
-/// Minimum encoded transaction body: one minimal `update_metadata`
-/// operation frame (`op_code`, `file_id`, `presence_flags` clear,
-/// `last_seen_time_unix_nano`, no advisory path) with its `op_len` prefix
-/// and `op_crc32c` suffix.
+/// Minimum encoded transaction body: one strict `update_fingerprint`
+/// operation frame extending an empty fingerprint by one byte, with its
+/// `op_len` prefix and `op_crc32c` suffix.
 pub const TX_MIN_BODY_BYTES: u32 = 34;
 /// [`TX_MIN_BODY_BYTES`] plus the fixed transaction envelope header and
 /// trailing frame CRC.
@@ -127,6 +126,12 @@ pub const MAX_OPERATION_PAYLOAD_BYTES: u64 = 131095;
 /// [`MAX_OPERATION_PAYLOAD_BYTES`] plus its `op_len` prefix and `op_crc32c`
 /// suffix.
 pub const MAX_OPERATION_FRAME_BYTES: u64 = 131103;
+/// Maximum semantically valid `update_fingerprint` payload: a 65,534-byte
+/// expected prefix strictly extended to the 65,535-byte format maximum.
+pub const MAX_VALID_UPDATE_FINGERPRINT_PAYLOAD_BYTES: u64 = 131094;
+/// [`MAX_VALID_UPDATE_FINGERPRINT_PAYLOAD_BYTES`] plus its `op_len` prefix
+/// and `op_crc32c` suffix.
+pub const MAX_VALID_UPDATE_FINGERPRINT_FRAME_BYTES: u64 = 131102;
 /// Maximum encoded payload of a `register_file` operation: maximum
 /// committed-frontier guard, locator, maximum fingerprint, the required
 /// `Clean` framing resume, and maximum (truncated) advisory path.

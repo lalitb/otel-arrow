@@ -13,5 +13,5 @@ issues: [2844]
 # Additional operator-facing context.
 subtext: |
   Mutations require exclusive ownership and audited reasons. Per-file actions
-  require exact file and epoch evidence. Corrupt or missing authority can be
-  validated and backed up, but cannot be replaced.
+  require exact file, epoch, and replacement-source evidence. Corrupt or
+  missing authority can be validated and backed up, but cannot be replaced.

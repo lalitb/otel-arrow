@@ -10,7 +10,7 @@
 //! already produced by [`super::wal`]; it performs no filesystem I/O, no
 //! locking, and no OS-specific locator lookups.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::error::{ApplyError, DecodeError};
 use super::primitives::{CommittedFrontierGuard, FileId, FramingResume, LifecycleState, Locator};
@@ -69,6 +69,98 @@ fn validate_framing_resume(
     Ok(())
 }
 
+fn is_live(record: &TableRecord) -> bool {
+    matches!(
+        record.lifecycle_state,
+        LifecycleState::Active | LifecycleState::Quarantined
+    )
+}
+
+fn validate_progress_resume_transition(
+    file_id: FileId,
+    expected_offset: u64,
+    stored: FramingResume,
+    new_offset: u64,
+    new: FramingResume,
+) -> Result<(), ApplyError> {
+    if new_offset == expected_offset {
+        return Ok(());
+    }
+    let invalid = |reason| {
+        Err(ApplyError::ImpossibleTransition {
+            operation: "update_progress",
+            file_id,
+            reason,
+        })
+    };
+    match stored {
+        FramingResume::Clean => {
+            if let FramingResume::Continuation {
+                record_start_offset,
+                ..
+            } = new
+                && record_start_offset < expected_offset
+            {
+                return invalid(
+                    "a continuation entered from Clean must start at or after the prior offset",
+                );
+            }
+        }
+        FramingResume::Continuation {
+            record_start_offset,
+            record_end_offset,
+            next_fragment_index,
+        } => {
+            if record_end_offset != 0 {
+                if new_offset < record_end_offset {
+                    match new {
+                        FramingResume::Continuation {
+                            record_start_offset: new_start,
+                            record_end_offset: new_end,
+                            next_fragment_index: new_index,
+                        } if new_start == record_start_offset
+                            && new_end == record_end_offset
+                            && new_index > next_fragment_index => {}
+                        _ => {
+                            return invalid(
+                                "progress before a known record end must advance the same continuation",
+                            );
+                        }
+                    }
+                } else if let FramingResume::Continuation {
+                    record_start_offset,
+                    ..
+                } = new
+                    && record_start_offset < record_end_offset
+                {
+                    return invalid(
+                        "a continuation after a completed record must start at or after its end",
+                    );
+                }
+            } else {
+                match new {
+                    FramingResume::Clean => {}
+                    FramingResume::Continuation {
+                        record_start_offset: new_start,
+                        record_end_offset: 0,
+                        next_fragment_index: new_index,
+                    } if new_start == record_start_offset && new_index > next_fragment_index => {}
+                    FramingResume::Continuation {
+                        record_start_offset: new_start,
+                        ..
+                    } if new_start >= expected_offset => {}
+                    FramingResume::Continuation { .. } => {
+                        return invalid(
+                            "an unresolved scan continuation must advance in place or start later",
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// One in-memory checkpoint record. Identical in shape to
 /// [`SnapshotRecord`]: applying every durable operation for a `file_id`
 /// produces exactly the record a snapshot would persist for it, so the two
@@ -81,6 +173,7 @@ pub type TableRecord = SnapshotRecord;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CheckpointTable {
     records: HashMap<FileId, TableRecord>,
+    live_locators: HashMap<Locator, FileId>,
     quarantined_records: usize,
 }
 
@@ -98,20 +191,35 @@ impl CheckpointTable {
 
     /// Seeds a table from a decoded snapshot's records (the recovery base).
     ///
-    /// Fails closed with [`DecodeError::DuplicateFileId`] if two records
-    /// share a `file_id`: `file_id` is the record key and must uniquely
-    /// identify a record, whether the records came from this codec's own
-    /// `decode_snapshot` (which already rejects this at the byte level) or
-    /// were constructed directly by a caller bypassing the byte codec
-    /// entirely.
+    /// Enforces every per-record reachable-state invariant, unique `file_id`
+    /// keys, and one live claimant per locator, matching snapshot decoding
+    /// even for a caller that bypasses the byte codec.
     pub fn from_snapshot_records(records: Vec<SnapshotRecord>) -> Result<Self, DecodeError> {
         let mut table = Self::new();
         for record in records {
             let file_id = record.file_id;
+            record
+                .validate_reachable_state()
+                .map_err(|reason| DecodeError::InvalidSnapshotState { file_id, reason })?;
             if table.records.insert(file_id, record).is_some() {
                 return Err(DecodeError::DuplicateFileId {
                     file_id,
                     context: "from_snapshot_records",
+                });
+            }
+            let record = table
+                .records
+                .get(&file_id)
+                .expect("the record was inserted above");
+            if is_live(record)
+                && table
+                    .live_locators
+                    .insert(record.locator, file_id)
+                    .is_some()
+            {
+                return Err(DecodeError::InvalidSnapshotState {
+                    file_id,
+                    reason: "another live record claims the same locator",
                 });
             }
         }
@@ -156,6 +264,12 @@ impl CheckpointTable {
         self.records.iter()
     }
 
+    /// Returns the sole live (`Active` or `Quarantined`) claimant for a
+    /// locator. `RotatedFinalized` history does not participate.
+    pub(crate) fn live_file_id_for_locator(&self, locator: Locator) -> Option<FileId> {
+        self.live_locators.get(&locator).copied()
+    }
+
     /// Returns every record, ordered by `file_id`, suitable for deterministic
     /// snapshot encoding.
     #[must_use]
@@ -172,6 +286,17 @@ impl CheckpointTable {
         operations: &[Operation],
         namespace_id: &str,
     ) -> Result<StagedOperations, ApplyError> {
+        let mut progress_file_ids = HashSet::new();
+        for operation in operations {
+            if matches!(operation, Operation::UpdateProgress(_))
+                && !progress_file_ids.insert(operation.file_id())
+            {
+                return Err(ApplyError::DuplicateProgressFileId {
+                    file_id: operation.file_id(),
+                });
+            }
+        }
+        self.validate_non_administrative_removals(operations)?;
         let mut touched: HashMap<FileId, Option<TableRecord>> = HashMap::new();
         for operation in operations {
             let file_id = operation.file_id();
@@ -182,11 +307,163 @@ impl CheckpointTable {
         for operation in operations {
             Self::apply_operation(&mut touched, operation, namespace_id)?;
         }
+        for (&file_id, record) in &touched {
+            if let Some(record) = record
+                && let Err(reason) = record.validate_reachable_state()
+            {
+                return Err(ApplyError::ImpossibleTransition {
+                    operation: "transaction",
+                    file_id,
+                    reason,
+                });
+            }
+        }
+        self.validate_staged_non_administrative_replacements(operations, &touched)?;
+        self.validate_staged_live_locators(&touched)?;
         Ok(StagedOperations { touched })
+    }
+
+    fn validate_non_administrative_removals(
+        &self,
+        operations: &[Operation],
+    ) -> Result<(), ApplyError> {
+        for operation in operations {
+            let Operation::RemoveFile(removal) = operation else {
+                continue;
+            };
+            if removal.administrative {
+                continue;
+            }
+            let existing =
+                self.records
+                    .get(&removal.file_id)
+                    .ok_or(ApplyError::ImpossibleTransition {
+                        operation: "remove_file",
+                        file_id: removal.file_id,
+                        reason: "non-administrative removal requires an existing record",
+                    })?;
+            if existing.lifecycle_state != LifecycleState::Active
+                || removal.expected_prior_state != LifecycleState::Active
+                || existing.file_epoch != removal.expected_file_epoch
+            {
+                return Err(ApplyError::ImpossibleTransition {
+                    operation: "remove_file",
+                    file_id: removal.file_id,
+                    reason: "non-administrative removal requires matching Active state and epoch",
+                });
+            }
+            let mut replacements = operations.iter().filter_map(|candidate| {
+                let Operation::RegisterFile(register) = candidate else {
+                    return None;
+                };
+                (register.file_id != removal.file_id && register.locator == existing.locator)
+                    .then_some(register.file_id)
+            });
+            let replacement = replacements.next();
+            if replacement.is_none() || replacements.next().is_some() {
+                return Err(ApplyError::ImpossibleTransition {
+                    operation: "remove_file",
+                    file_id: removal.file_id,
+                    reason: "non-administrative removal requires exactly one same-locator replacement registration",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_staged_non_administrative_replacements(
+        &self,
+        operations: &[Operation],
+        touched: &HashMap<FileId, Option<TableRecord>>,
+    ) -> Result<(), ApplyError> {
+        for operation in operations {
+            let Operation::RemoveFile(removal) = operation else {
+                continue;
+            };
+            if removal.administrative {
+                continue;
+            }
+            let Some(existing) = self.records.get(&removal.file_id) else {
+                return Err(ApplyError::ImpossibleTransition {
+                    operation: "remove_file",
+                    file_id: removal.file_id,
+                    reason: "non-administrative removal lost its existing-record proof",
+                });
+            };
+            let Some(replacement_file_id) = operations.iter().find_map(|candidate| {
+                let Operation::RegisterFile(register) = candidate else {
+                    return None;
+                };
+                (register.file_id != removal.file_id && register.locator == existing.locator)
+                    .then_some(register.file_id)
+            }) else {
+                return Err(ApplyError::ImpossibleTransition {
+                    operation: "remove_file",
+                    file_id: removal.file_id,
+                    reason: "non-administrative removal lost its replacement proof",
+                });
+            };
+            let replacement = touched.get(&replacement_file_id).and_then(Option::as_ref);
+            if replacement
+                .is_none_or(|record| !is_live(record) || record.locator != existing.locator)
+            {
+                return Err(ApplyError::ImpossibleTransition {
+                    operation: "remove_file",
+                    file_id: removal.file_id,
+                    reason: "the exact-locator replacement must remain live after the transaction",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_staged_live_locators(
+        &self,
+        touched: &HashMap<FileId, Option<TableRecord>>,
+    ) -> Result<(), ApplyError> {
+        let mut staged_claims = HashMap::with_capacity(touched.len());
+        for (&file_id, record) in touched {
+            let Some(record) = record.as_ref().filter(|record| is_live(record)) else {
+                continue;
+            };
+            if let Some(first_file_id) = staged_claims.insert(record.locator, file_id) {
+                return Err(ApplyError::LiveLocatorConflict {
+                    existing_file_id: first_file_id,
+                    conflicting_file_id: file_id,
+                });
+            }
+        }
+        for (locator, &file_id) in &staged_claims {
+            let Some(&existing_file_id) = self.live_locators.get(locator) else {
+                continue;
+            };
+            if existing_file_id == file_id {
+                continue;
+            }
+            let existing_claim_survives = touched.get(&existing_file_id).is_none_or(|record| {
+                record
+                    .as_ref()
+                    .is_some_and(|record| is_live(record) && record.locator == *locator)
+            });
+            if existing_claim_survives {
+                return Err(ApplyError::LiveLocatorConflict {
+                    existing_file_id,
+                    conflicting_file_id: file_id,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Commits scratch state already validated against this unchanged table.
     pub(crate) fn commit_staged(&mut self, staged: StagedOperations) {
+        for file_id in staged.touched.keys() {
+            if let Some(record) = self.records.get(file_id).filter(|record| is_live(record)) {
+                let removed = self.live_locators.remove(&record.locator);
+                debug_assert_eq!(removed, Some(*file_id));
+            }
+        }
+
         for (file_id, record) in staged.touched {
             let old_quarantined = self
                 .records
@@ -212,6 +489,10 @@ impl CheckpointTable {
             }
             match record {
                 Some(record) => {
+                    if is_live(&record) {
+                        let replaced = self.live_locators.insert(record.locator, file_id);
+                        debug_assert!(replaced.is_none());
+                    }
                     let _ = self.records.insert(file_id, record);
                 }
                 None => {
@@ -499,6 +780,13 @@ impl CheckpointTable {
                     op.new_committed_offset,
                     &op.new_framing_resume,
                 )?;
+                validate_progress_resume_transition(
+                    op.file_id,
+                    op.expected_committed_offset,
+                    record.framing_resume,
+                    op.new_committed_offset,
+                    op.new_framing_resume,
+                )?;
                 record.committed_offset = op.new_committed_offset;
                 record.committed_frontier_guard = op.new_committed_frontier_guard;
                 record.framing_resume = op.new_framing_resume;
@@ -567,6 +855,7 @@ impl CheckpointTable {
                 record.committed_offset = 0;
                 record.committed_frontier_guard = CommittedFrontierGuard::empty();
                 record.framing_resume = FramingResume::Clean;
+                record.fingerprint = op.new_fingerprint.clone();
                 record.last_seen_time_unix_nano = op.reset_time_unix_nano;
             }
             Operation::UpdateFingerprint(op) => {
@@ -598,6 +887,15 @@ impl CheckpointTable {
                         reason: "expected_fingerprint does not match stored fingerprint",
                     });
                 }
+                if op.new_fingerprint.len() <= op.expected_fingerprint.len()
+                    || !op.new_fingerprint.starts_with(&op.expected_fingerprint)
+                {
+                    return Err(ApplyError::ImpossibleTransition {
+                        operation: "update_fingerprint",
+                        file_id: op.file_id,
+                        reason: "new_fingerprint must strictly extend the expected prefix",
+                    });
+                }
                 record.fingerprint = op.new_fingerprint.clone();
             }
             Operation::UpdateMetadata(op) => {
@@ -608,6 +906,15 @@ impl CheckpointTable {
                         reason: "no record for file_id",
                     },
                 )?;
+                if record.lifecycle_state != op.expected_prior_state
+                    || record.file_epoch != op.expected_file_epoch
+                {
+                    return Err(ApplyError::ImpossibleTransition {
+                        operation: "update_metadata",
+                        file_id: op.file_id,
+                        reason: "expected lifecycle state or file_epoch mismatch",
+                    });
+                }
                 match record.lifecycle_state {
                     LifecycleState::Active | LifecycleState::Quarantined => {
                         // The locator is immutable for a `file_id`:
@@ -674,7 +981,9 @@ impl CheckpointTable {
                                     file_id: op.file_id,
                                 },
                             )?;
-                            let identical = existing.locator == op.locator
+                            let identical = existing.file_epoch == op.expected_file_epoch
+                                && op.quarantine_epoch == op.expected_file_epoch
+                                && existing.locator == op.locator
                                 && evidence.quarantine_epoch == op.quarantine_epoch
                                 && evidence.reason_code == op.reason_code
                                 && evidence.observed_size == op.observed_size
@@ -711,10 +1020,19 @@ impl CheckpointTable {
                 });
             }
             Operation::ResetQuarantinedFile(op) => {
+                if op.namespace_id != namespace_id {
+                    return Err(ApplyError::NamespaceMismatch {
+                        file_id: op.file_id,
+                        named: op.namespace_id.clone(),
+                        actual: namespace_id.to_owned(),
+                    });
+                }
                 let record_slot = Self::slot(table, op.file_id);
                 let committed_offset;
                 let stored_guard;
                 let stored_framing_resume;
+                let stored_fingerprint;
+                let stored_file_epoch;
                 {
                     let existing =
                         record_slot
@@ -747,10 +1065,14 @@ impl CheckpointTable {
                     committed_offset = existing.committed_offset;
                     stored_guard = existing.committed_frontier_guard;
                     stored_framing_resume = existing.framing_resume;
+                    stored_fingerprint = existing.fingerprint.clone();
+                    stored_file_epoch = existing.file_epoch;
                 }
                 match op.action {
                     ResetQuarantineAction::KeepFailed => {
-                        if op.resulting_epoch != op.expected_quarantine_epoch {
+                        if op.resulting_epoch != op.expected_quarantine_epoch
+                            || op.resulting_epoch != stored_file_epoch
+                        {
                             return Err(ApplyError::ImpossibleTransition {
                                 operation: "reset_quarantined_file",
                                 file_id: op.file_id,
@@ -766,6 +1088,7 @@ impl CheckpointTable {
                         }
                         if op.new_committed_frontier_guard != stored_guard
                             || op.new_framing_resume != stored_framing_resume
+                            || op.new_fingerprint != stored_fingerprint
                         {
                             return Err(ApplyError::KeepFailedStateChange {
                                 file_id: op.file_id,
@@ -840,7 +1163,8 @@ impl CheckpointTable {
                 record.committed_offset = op.resulting_offset;
                 record.committed_frontier_guard = op.new_committed_frontier_guard;
                 record.framing_resume = FramingResume::Clean;
-                record.last_seen_time_unix_nano = op.reset_time_unix_nano;
+                record.fingerprint = op.new_fingerprint.clone();
+                record.last_seen_time_unix_nano = op.action_time_unix_nano;
                 record.quarantine_evidence = None;
             }
             Operation::RemoveFile(op) => {
@@ -860,7 +1184,14 @@ impl CheckpointTable {
                 }
                 let record_slot = Self::slot(table, op.file_id);
                 let existing = match record_slot.as_ref() {
-                    None => return Ok(()), // Idempotent: already absent.
+                    None if op.administrative => return Ok(()),
+                    None => {
+                        return Err(ApplyError::ImpossibleTransition {
+                            operation: "remove_file",
+                            file_id: op.file_id,
+                            reason: "non-administrative removal target is absent",
+                        });
+                    }
                     Some(existing) => existing,
                 };
                 if existing.lifecycle_state != op.expected_prior_state {
@@ -877,6 +1208,15 @@ impl CheckpointTable {
                                 operation: "remove_file",
                                 file_id: op.file_id,
                                 reason: "expected_file_epoch mismatch",
+                            });
+                        }
+                        if existing.lifecycle_state == LifecycleState::RotatedFinalized
+                            && !op.administrative
+                        {
+                            return Err(ApplyError::ImpossibleTransition {
+                                operation: "remove_file",
+                                file_id: op.file_id,
+                                reason: "non-administrative removal cannot remove RotatedFinalized state",
                             });
                         }
                     }

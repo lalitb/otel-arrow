@@ -93,6 +93,8 @@ pub struct ResetAfterTruncate {
     /// The resulting framing-resume state; MUST be `Clean` (validated at
     /// apply time).
     pub new_framing_resume: FramingResume,
+    /// Replacement-stream fingerprint evidence installed with the new epoch.
+    pub new_fingerprint: Vec<u8>,
     /// Reset timestamp, in Unix nanoseconds.
     pub reset_time_unix_nano: u64,
     /// Opaque reason code; MUST equal `TRUNCATE_RESET_REASON_READ_NEW`
@@ -122,6 +124,10 @@ pub struct UpdateFingerprint {
 pub struct UpdateMetadata {
     /// The file identity this update applies to.
     pub file_id: FileId,
+    /// The lifecycle state the caller expects is currently stored.
+    pub expected_prior_state: LifecycleState,
+    /// The file epoch the caller expects is currently stored.
+    pub expected_file_epoch: u32,
     /// The new last-seen timestamp, in Unix nanoseconds (always applied to
     /// an `Active` record; applied to a `Quarantined` record as well).
     pub last_seen_time_unix_nano: u64,
@@ -204,8 +210,13 @@ pub struct ResetQuarantinedFile {
     /// The resulting framing-resume state; MUST be `Clean` for either reset
     /// action (validated at apply time).
     pub new_framing_resume: FramingResume,
-    /// Reset timestamp, in Unix nanoseconds.
-    pub reset_time_unix_nano: u64,
+    /// Replacement-stream fingerprint evidence. `keep_failed` repeats the
+    /// stored fingerprint exactly.
+    pub new_fingerprint: Vec<u8>,
+    /// Administrative action timestamp, in Unix nanoseconds.
+    pub action_time_unix_nano: u64,
+    /// Exact raw checkpoint namespace ID selected by the caller.
+    pub namespace_id: String,
     /// Mandatory, non-empty operator audit reason.
     pub audit_reason: String,
 }
@@ -326,10 +337,23 @@ impl Operation {
                 out.write_u32(op.resulting_epoch);
                 out.write_u64(op.new_committed_offset);
                 op.new_framing_resume.write(&mut out);
+                out.write_var_bytes(
+                    "reset_after_truncate.new_fingerprint",
+                    &op.new_fingerprint,
+                    FINGERPRINT_MAX_BYTES,
+                )?;
                 out.write_u64(op.reset_time_unix_nano);
                 out.write_u16(op.reason_code);
             }
             Operation::UpdateFingerprint(op) => {
+                if op.new_fingerprint.len() <= op.expected_fingerprint.len()
+                    || !op.new_fingerprint.starts_with(&op.expected_fingerprint)
+                {
+                    return Err(EncodeError::InvalidFieldValue {
+                        field: "update_fingerprint.new_fingerprint",
+                        reason: "must strictly extend expected_fingerprint",
+                    });
+                }
                 out.write_u8(OP_UPDATE_FINGERPRINT);
                 out.write_bytes(&op.file_id.0);
                 out.write_u32(op.expected_file_epoch);
@@ -347,6 +371,18 @@ impl Operation {
             Operation::UpdateMetadata(op) => {
                 out.write_u8(OP_UPDATE_METADATA);
                 out.write_bytes(&op.file_id.0);
+                match op.expected_prior_state {
+                    LifecycleState::Active | LifecycleState::Quarantined => {
+                        out.write_u8(op.expected_prior_state.to_wire());
+                    }
+                    LifecycleState::RotatedFinalized => {
+                        return Err(EncodeError::InvalidFieldValue {
+                            field: "update_metadata.expected_prior_state",
+                            reason: "must be Active or Quarantined",
+                        });
+                    }
+                }
+                out.write_u32(op.expected_file_epoch);
                 let mut presence = 0u8;
                 if op.advisory_path.is_some() {
                     presence |= METADATA_PATH_PRESENT;
@@ -374,6 +410,11 @@ impl Operation {
                 out.write_u64(op.quarantine_time_unix_nano);
             }
             Operation::ResetQuarantinedFile(op) => {
+                if op.namespace_id.is_empty() {
+                    return Err(EncodeError::RequiredFieldEmpty {
+                        field: "reset_quarantined_file.namespace_id",
+                    });
+                }
                 if op.audit_reason.is_empty() {
                     return Err(EncodeError::RequiredFieldEmpty {
                         field: "reset_quarantined_file.audit_reason",
@@ -387,7 +428,17 @@ impl Operation {
                 out.write_u64(op.resulting_offset);
                 op.new_committed_frontier_guard.write(&mut out);
                 op.new_framing_resume.write(&mut out);
-                out.write_u64(op.reset_time_unix_nano);
+                out.write_var_bytes(
+                    "reset_quarantined_file.new_fingerprint",
+                    &op.new_fingerprint,
+                    FINGERPRINT_MAX_BYTES,
+                )?;
+                out.write_u64(op.action_time_unix_nano);
+                out.write_var_bytes(
+                    "reset_quarantined_file.namespace_id",
+                    op.namespace_id.as_bytes(),
+                    NAMESPACE_ID_MAX_BYTES,
+                )?;
                 out.write_var_bytes(
                     "reset_quarantined_file.audit_reason",
                     op.audit_reason.as_bytes(),
@@ -524,6 +575,12 @@ impl Operation {
                 let resulting_epoch = input.read_u32()?;
                 let new_committed_offset = input.read_u64()?;
                 let new_framing_resume = FramingResume::read(&mut input)?;
+                let new_fingerprint = input
+                    .read_var_bytes(
+                        "reset_after_truncate.new_fingerprint",
+                        FINGERPRINT_MAX_BYTES,
+                    )?
+                    .to_vec();
                 let reset_time_unix_nano = input.read_u64()?;
                 let reason_code = input.read_u16()?;
                 Operation::ResetAfterTruncate(ResetAfterTruncate {
@@ -533,6 +590,7 @@ impl Operation {
                     resulting_epoch,
                     new_committed_offset,
                     new_framing_resume,
+                    new_fingerprint,
                     reset_time_unix_nano,
                     reason_code,
                 })
@@ -556,6 +614,17 @@ impl Operation {
                 })
             }
             OP_UPDATE_METADATA => {
+                let expected_prior_state = match input.read_u8()? {
+                    0x01 => LifecycleState::Active,
+                    0x03 => LifecycleState::Quarantined,
+                    other => {
+                        return Err(DecodeError::UnknownDiscriminant {
+                            field: "update_metadata.expected_prior_state",
+                            value: other as u32,
+                        });
+                    }
+                };
+                let expected_file_epoch = input.read_u32()?;
                 let presence = input.read_u8()?;
                 if presence & METADATA_PRESENCE_RESERVED_MASK != 0 {
                     return Err(DecodeError::ReservedFieldNonZero {
@@ -571,6 +640,8 @@ impl Operation {
                 };
                 Operation::UpdateMetadata(UpdateMetadata {
                     file_id,
+                    expected_prior_state,
+                    expected_file_epoch,
                     last_seen_time_unix_nano,
                     advisory_path,
                 })
@@ -599,7 +670,22 @@ impl Operation {
                 let resulting_offset = input.read_u64()?;
                 let new_committed_frontier_guard = CommittedFrontierGuard::read(&mut input)?;
                 let new_framing_resume = FramingResume::read(&mut input)?;
-                let reset_time_unix_nano = input.read_u64()?;
+                let new_fingerprint = input
+                    .read_var_bytes(
+                        "reset_quarantined_file.new_fingerprint",
+                        FINGERPRINT_MAX_BYTES,
+                    )?
+                    .to_vec();
+                let action_time_unix_nano = input.read_u64()?;
+                let namespace_id = input.read_var_string(
+                    "reset_quarantined_file.namespace_id",
+                    NAMESPACE_ID_MAX_BYTES,
+                )?;
+                if namespace_id.is_empty() {
+                    return Err(DecodeError::EmptyRequiredField {
+                        field: "reset_quarantined_file.namespace_id",
+                    });
+                }
                 let audit_reason = input.read_var_string(
                     "reset_quarantined_file.audit_reason",
                     AUDIT_REASON_MAX_BYTES,
@@ -617,7 +703,9 @@ impl Operation {
                     resulting_offset,
                     new_committed_frontier_guard,
                     new_framing_resume,
-                    reset_time_unix_nano,
+                    new_fingerprint,
+                    action_time_unix_nano,
+                    namespace_id: namespace_id.to_owned(),
                     audit_reason: audit_reason.to_owned(),
                 })
             }
@@ -811,6 +899,18 @@ impl Transaction {
                 max: class.max_ops(),
             });
         }
+        if class == TransactionClass::ProgressOnly {
+            let mut file_ids = std::collections::HashSet::with_capacity(self.operations.len());
+            for operation in &self.operations {
+                let file_id = operation.file_id();
+                if !file_ids.insert(file_id) {
+                    return Err(EncodeError::DuplicateProgressFileId {
+                        sequence: self.sequence,
+                        file_id,
+                    });
+                }
+            }
+        }
         Ok(class)
     }
 
@@ -897,6 +997,15 @@ impl Transaction {
                 op_count,
                 max: class.max_ops(),
             });
+        }
+        if class == TransactionClass::ProgressOnly {
+            let mut file_ids = std::collections::HashSet::with_capacity(operations.len());
+            for operation in &operations {
+                let file_id = operation.file_id();
+                if !file_ids.insert(file_id) {
+                    return Err(DecodeError::DuplicateProgressFileId { sequence, file_id });
+                }
+            }
         }
         Ok(Transaction {
             sequence,

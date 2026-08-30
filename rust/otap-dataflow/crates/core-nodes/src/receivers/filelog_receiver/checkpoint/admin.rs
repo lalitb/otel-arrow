@@ -44,7 +44,9 @@ use super::store::lock::NamespaceLock;
 use super::store::{CheckpointStore, LoadedGeneration, MARKER_READ_MAX_BYTES, StoreOptions};
 use super::wal::{Operation, RemoveFile, ResetQuarantineAction, ResetQuarantinedFile};
 use crate::receivers::filelog_receiver::identity::IdentityError;
-use crate::receivers::filelog_receiver::identity::platform::{StableEofEvidence, open_stable_eof};
+use crate::receivers::filelog_receiver::identity::platform::{
+    StableEofEvidence, open_stable_eof, open_stable_fingerprint,
+};
 
 /// File name of the machine-readable evidence-backup manifest.
 pub const EVIDENCE_BACKUP_MANIFEST_FILE_NAME: &str = "manifest.json";
@@ -580,11 +582,16 @@ pub struct QuarantinedFileTarget {
     pub expected_quarantine_epoch: u32,
 }
 
-/// Request to release a quarantine at source offset zero.
+/// Request to release a quarantine at source offset zero after validating
+/// replacement-stream fingerprint evidence from an exact-locator handle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResetToBeginningRequest {
     /// Exact quarantined record and expected evidence.
     pub target: QuarantinedFileTarget,
+    /// Exact source path selected by the operator for this call.
+    pub source_path: PathBuf,
+    /// Whether the final path component may be a symlink or reparse point.
+    pub follow_symlinks: bool,
     /// Bounded operator audit metadata.
     pub audit: AuditMetadata,
 }
@@ -1019,6 +1026,16 @@ impl CheckpointAdminSession {
                 epoch: old.file_epoch,
             }
         })?;
+        let fingerprint_bytes = u16::try_from(self.options.fingerprint_bytes)
+            .expect("validated checkpoint fingerprint_bytes fits u16");
+        let source = open_stable_fingerprint(
+            &request.source_path,
+            request.follow_symlinks,
+            old.locator,
+            fingerprint_bytes,
+            old.ignored_header_bytes,
+        )
+        .map_err(|error| map_reset_source_error(&file_id_hex, &request.source_path, error))?;
         let operation = ResetQuarantinedFile {
             file_id,
             expected_quarantine_epoch: request.target.expected_quarantine_epoch,
@@ -1027,7 +1044,9 @@ impl CheckpointAdminSession {
             resulting_offset: 0,
             new_committed_frontier_guard: CommittedFrontierGuard::empty(),
             new_framing_resume: FramingResume::Clean,
-            reset_time_unix_nano: request.audit.action_time_unix_nano,
+            new_fingerprint: source.fingerprint.clone(),
+            action_time_unix_nano: request.audit.action_time_unix_nano,
+            namespace_id: self.options.namespace_id.clone(),
             audit_reason: request.audit.reason.clone(),
         };
         let outcome = {
@@ -1047,6 +1066,7 @@ impl CheckpointAdminSession {
             || new.committed_offset != 0
             || new.committed_frontier_guard != CommittedFrontierGuard::empty()
             || new.framing_resume != FramingResume::Clean
+            || new.fingerprint != source.fingerprint
         {
             self.mark_unusable("a reset-to-beginning result did not match its durable operation");
             return Err(CheckpointAdminError::AuthorityStateChanged);
@@ -1081,7 +1101,9 @@ impl CheckpointAdminSession {
             resulting_offset: old.committed_offset,
             new_committed_frontier_guard: old.committed_frontier_guard,
             new_framing_resume: old.framing_resume,
-            reset_time_unix_nano: request.audit.action_time_unix_nano,
+            new_fingerprint: old.fingerprint.clone(),
+            action_time_unix_nano: request.audit.action_time_unix_nano,
+            namespace_id: self.options.namespace_id.clone(),
             audit_reason: request.audit.reason.clone(),
         };
         let outcome = {
@@ -1183,14 +1205,19 @@ impl CheckpointAdminSession {
         request: ResetToEndRequest,
         after_first_sample: impl FnOnce(),
     ) -> Result<FileMutationResult, CheckpointAdminError> {
-        self.reset_to_end_sampled(request, |path, follow_symlinks, locator| {
-            crate::receivers::filelog_receiver::identity::platform::open_stable_eof_with_hook(
-                path,
-                follow_symlinks,
-                locator,
-                after_first_sample,
-            )
-        })
+        self.reset_to_end_sampled(
+            request,
+            |path, follow_symlinks, locator, fingerprint_bytes, ignored_header_bytes| {
+                crate::receivers::filelog_receiver::identity::platform::open_stable_eof_with_hook(
+                    path,
+                    follow_symlinks,
+                    locator,
+                    fingerprint_bytes,
+                    ignored_header_bytes,
+                    after_first_sample,
+                )
+            },
+        )
     }
 
     fn reset_to_end_sampled(
@@ -1200,6 +1227,8 @@ impl CheckpointAdminSession {
             &Path,
             bool,
             super::primitives::Locator,
+            u16,
+            u32,
         ) -> Result<StableEofEvidence, IdentityError>,
     ) -> Result<FileMutationResult, CheckpointAdminError> {
         validate_audit("reset_to_end", &request.audit)?;
@@ -1211,8 +1240,15 @@ impl CheckpointAdminSession {
                 epoch: old.file_epoch,
             }
         })?;
-        let source = sample(&request.source_path, request.follow_symlinks, old.locator)
-            .map_err(|error| map_reset_source_error(&file_id_hex, &request.source_path, error))?;
+        let source = sample(
+            &request.source_path,
+            request.follow_symlinks,
+            old.locator,
+            u16::try_from(self.options.fingerprint_bytes)
+                .expect("validated checkpoint fingerprint_bytes fits u16"),
+            old.ignored_header_bytes,
+        )
+        .map_err(|error| map_reset_source_error(&file_id_hex, &request.source_path, error))?;
         let source_report = ResetToEndEvidenceReport {
             source_path: native_path_report(&request.source_path)?,
             follow_symlinks: request.follow_symlinks,
@@ -1228,7 +1264,9 @@ impl CheckpointAdminSession {
             resulting_offset: source.offset,
             new_committed_frontier_guard: source.committed_frontier_guard,
             new_framing_resume: FramingResume::Clean,
-            reset_time_unix_nano: request.audit.action_time_unix_nano,
+            new_fingerprint: source.fingerprint.clone(),
+            action_time_unix_nano: request.audit.action_time_unix_nano,
+            namespace_id: self.options.namespace_id.clone(),
             audit_reason: request.audit.reason.clone(),
         };
         let outcome = {
@@ -1248,6 +1286,7 @@ impl CheckpointAdminSession {
             || new.committed_offset != source.offset
             || new.committed_frontier_guard != source.committed_frontier_guard
             || new.framing_resume != FramingResume::Clean
+            || new.fingerprint != source.fingerprint
         {
             self.mark_unusable("a reset-to-end result did not match its durable operation");
             return Err(CheckpointAdminError::AuthorityStateChanged);

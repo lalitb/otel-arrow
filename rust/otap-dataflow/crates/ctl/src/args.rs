@@ -626,6 +626,14 @@ pub struct CheckpointResetBeginningArgs {
     #[command(flatten)]
     pub target: CheckpointTargetArgs,
 
+    /// Exact current source path selected by the operator.
+    #[arg(long, value_name = "PATH")]
+    pub source_path: PathBuf,
+
+    /// Permit the final source path component to be a symlink or reparse point.
+    #[arg(long, default_value_t = false)]
+    pub follow_symlinks: bool,
+
     #[command(flatten)]
     pub audit: CheckpointAuditArgs,
 
