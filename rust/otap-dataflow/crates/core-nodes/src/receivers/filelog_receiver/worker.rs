@@ -493,6 +493,10 @@ struct ObservedStoreStats {
     quarantine_reset_end: u64,
     quarantine_keep_failed: u64,
     quarantine_removals: u64,
+    preappend_compactions: u64,
+    preappend_compaction_duration_ns: u64,
+    preappend_cleanup_generations: u64,
+    preappend_cleanup_failures: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3296,10 +3300,7 @@ impl WorkerRuntime {
                         })
                     })
             }
-            Ok(_) => self
-                .store
-                .compact_if_due_cancellable(|| shutdown_requested.load(Ordering::Acquire))
-                .map(|compacted| compacted.map(|_| ())),
+            Ok(_) => Ok(Some(())),
         };
         let result = match result {
             Ok(Some(())) => Ok(()),
@@ -3493,6 +3494,13 @@ impl WorkerRuntime {
         delta!(quarantine_reset_end, QuarantineResetEnd);
         delta!(quarantine_keep_failed, QuarantineKeepFailed);
         delta!(quarantine_removals, QuarantineRemove);
+        delta!(preappend_compactions, CheckpointCompactions);
+        delta!(
+            preappend_compaction_duration_ns,
+            CheckpointCompactionDurationNs
+        );
+        delta!(preappend_cleanup_generations, CheckpointCleanupGenerations);
+        delta!(preappend_cleanup_failures, CheckpointCleanupFailures);
         if !self.observed_store.namespace_lock_observed {
             self.telemetry.add(
                 WorkerCounter::NamespaceLockWaitNs,

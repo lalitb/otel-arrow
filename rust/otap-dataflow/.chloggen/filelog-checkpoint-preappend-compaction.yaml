@@ -1,0 +1,16 @@
+# One of 'breaking', 'deprecation', 'new_component', 'enhancement', 'bug_fix'
+change_type: bug_fix
+
+# The broad Rust component affected by this change.
+component: pipeline
+
+# A brief description of the user-visible change.
+note: Compact filelog checkpoint WALs before configured byte or transaction limits are exceeded.
+
+# Tracking issue for the Phase 1 filelog receiver.
+issues: [2844]
+
+# Additional operator-facing context.
+subtext: |
+  The byte limit includes the 56-byte WAL header and must be at least
+  16,777,312 bytes. Appends that land exactly on either limit remain valid.

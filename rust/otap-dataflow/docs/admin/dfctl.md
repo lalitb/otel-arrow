@@ -341,6 +341,7 @@ normative receiver defaults. If the namespace used nondefault values, pass the
 matching overrides:
 
 - `--compact-after-bytes`;
+- `--compact-after-transactions`;
 - `--max-tracked-files`;
 - `--fingerprint-bytes`;
 - `--ownership-timeout`.
@@ -348,6 +349,11 @@ matching overrides:
 Supplying smaller bounds can correctly refuse an artifact that the original
 receiver configuration accepted. Do not increase bounds merely to bypass a
 corruption or unsafe-filesystem error.
+
+`--compact-after-bytes` is the complete-WAL threshold, including the 56-byte
+header, and must be at least 16,777,312 bytes. Use
+`--compact-after-transactions` when the receiver used a nondefault transaction
+threshold.
 
 Offline mutations support `human`, `json`, `yaml`, and `agent-json`. They are
 finite operations, so `--output ndjson` is rejected.

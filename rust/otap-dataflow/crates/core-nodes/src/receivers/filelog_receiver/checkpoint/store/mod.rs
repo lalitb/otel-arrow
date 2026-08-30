@@ -64,7 +64,8 @@
 //! can decode them, so each needs a size cap. Those caps are not separate
 //! knobs a caller can set inconsistently: [`StoreOptions`] carries the
 //! receiver's own `checkpoint.compact_after_bytes`,
-//! `limits.max_tracked_files`, and `identity.fingerprint_bytes`, and
+//! `checkpoint.compact_after_transactions`, `limits.max_tracked_files`, and
+//! `identity.fingerprint_bytes`, and
 //! [`limits::StoreLimits::derive`] turns them into the worst-case sizes
 //! this configuration can legally write:
 //!
@@ -72,21 +73,20 @@
 //!   `max_tracked_files` worst-case records (a record whose fingerprint is
 //!   the configured maximum, whose advisory path is the format's maximum,
 //!   and which carries quarantine evidence);
-//! - the WAL cap is the WAL header plus `compact_after_bytes` plus one
-//!   maximal transaction, which is what a WAL can reach if a caller
-//!   compacts as soon as [`CheckpointStore::compaction_due`] reports it.
+//! - the WAL cap is the tighter of the complete-WAL byte threshold and the
+//!   header plus the transaction threshold times one maximum transaction.
 //!
-//! Both write paths enforce exactly those caps: an append that would push
-//! the live WAL past its cap is refused before the in-memory table
-//! advances (compact and retry), and a compaction whose encoded snapshot
-//! exceeds its cap is refused before any byte is written, leaving the
-//! current generation authoritative. A namespace can therefore never be
-//! left holding an artifact its own configuration cannot read back.
+//! Both write paths enforce exactly those caps: an append compacts before its
+//! prospective byte or transaction count would exceed a configured threshold,
+//! and a compaction whose encoded snapshot exceeds its cap is refused before
+//! any byte is written, leaving the current generation authoritative. A
+//! namespace can therefore never be left holding an artifact its own
+//! configuration cannot read back.
 //!
 //! The caps travel with the configuration, not with the files: shrinking
-//! `max_tracked_files`, `fingerprint_bytes`, or `compact_after_bytes`
-//! below what a namespace already holds makes the next open fail closed
-//! with [`StoreError::FileTooLarge`] rather than truncate durable state.
+//! `max_tracked_files`, `fingerprint_bytes`, `compact_after_bytes`, or
+//! `compact_after_transactions` below what a namespace already holds makes
+//! the next open fail closed rather than truncate durable state.
 
 pub mod error;
 pub mod fault;
@@ -167,8 +167,8 @@ pub struct StoreOptions {
     /// post-crash duplicate window; it never creates a loss window, because
     /// progress is only ever recorded for already-acknowledged data.
     pub sync_interval: Duration,
-    /// Compact once the live WAL body, excluding its fixed header, reaches
-    /// this many bytes and contains at least one transaction.
+    /// Compact before an append would make the complete WAL, including its
+    /// fixed header, exceed this many bytes.
     pub compact_after_bytes: u64,
     /// Compact once the live WAL reaches this many transactions.
     pub compact_after_transactions: u32,
@@ -255,6 +255,7 @@ impl StoreOptions {
     pub fn limits(&self) -> Result<StoreLimits, StoreError> {
         StoreLimits::derive(
             self.compact_after_bytes,
+            self.compact_after_transactions,
             self.max_tracked_files,
             self.fingerprint_bytes,
         )
@@ -376,6 +377,14 @@ pub struct StoreStats {
     pub quarantine_keep_failed: u64,
     /// Durable administrative removals targeting quarantined state.
     pub quarantine_removals: u64,
+    /// Compactions performed synchronously before an append.
+    pub preappend_compactions: u64,
+    /// Time spent in successful pre-append cleanup plus compaction.
+    pub preappend_compaction_duration_ns: u64,
+    /// Retired generations cleaned before a required pre-append compaction.
+    pub preappend_cleanup_generations: u64,
+    /// Failed retired-cleanup attempts before required pre-append compaction.
+    pub preappend_cleanup_failures: u64,
 }
 
 /// Whether a transaction must be synced before the call returns.
@@ -649,7 +658,7 @@ fn reject_reserved_quarantine_reason_code(
 /// Called from [`CheckpointStore::append`], which every public append path
 /// funnels through, so no caller-facing entry point -- including the
 /// caller-constructed [`CheckpointStore::quarantine_files`],
-/// [`CheckpointStore::remove_files`], and raw
+/// [`CheckpointStore::remove_quarantined_file`], and raw
 /// [`CheckpointStore::append`] -- can persist a reserved reason code.
 fn reject_reserved_reason_codes(operations: &[Operation]) -> Result<(), StoreError> {
     for operation in operations {
@@ -713,6 +722,10 @@ pub struct CheckpointStore {
     quarantine_reset_end: u64,
     quarantine_keep_failed: u64,
     quarantine_removals: u64,
+    preappend_compactions: u64,
+    preappend_compaction_duration_ns: u64,
+    preappend_cleanup_generations: u64,
+    preappend_cleanup_failures: u64,
     faults: FaultPlan,
     pending_wal_append: Option<PendingWalAppend>,
     unusable: Option<&'static str>,
@@ -863,6 +876,10 @@ impl CheckpointStore {
             quarantine_reset_end: 0,
             quarantine_keep_failed: 0,
             quarantine_removals: 0,
+            preappend_compactions: 0,
+            preappend_compaction_duration_ns: 0,
+            preappend_cleanup_generations: 0,
+            preappend_cleanup_failures: 0,
             faults,
             pending_wal_append: None,
             unusable: None,
@@ -1083,6 +1100,10 @@ impl CheckpointStore {
             quarantine_reset_end: 0,
             quarantine_keep_failed: 0,
             quarantine_removals: 0,
+            preappend_compactions: 0,
+            preappend_compaction_duration_ns: 0,
+            preappend_cleanup_generations: 0,
+            preappend_cleanup_failures: 0,
             faults,
             pending_wal_append: None,
             unusable: None,
@@ -1625,6 +1646,20 @@ impl CheckpointStore {
                     break;
                 }
                 TransactionScan::Complete(transaction, consumed) => {
+                    let recovered_transactions = u64::try_from(transactions_replayed)
+                        .unwrap_or(u64::MAX)
+                        .checked_add(1)
+                        .ok_or(StoreError::CounterOverflow {
+                            counter: "replayed WAL transaction",
+                            value: u64::MAX,
+                        })?;
+                    if recovered_transactions > limits.max_wal_transactions {
+                        return Err(StoreError::RecoveredWalTransactionsExceedMaximum {
+                            path: wal_path.clone(),
+                            transactions: recovered_transactions,
+                            max: limits.max_wal_transactions,
+                        });
+                    }
                     expected_sequence =
                         expected_sequence
                             .checked_add(1)
@@ -2081,15 +2116,64 @@ impl CheckpointStore {
             quarantine_reset_end: self.quarantine_reset_end,
             quarantine_keep_failed: self.quarantine_keep_failed,
             quarantine_removals: self.quarantine_removals,
+            preappend_compactions: self.preappend_compactions,
+            preappend_compaction_duration_ns: self.preappend_compaction_duration_ns,
+            preappend_cleanup_generations: self.preappend_cleanup_generations,
+            preappend_cleanup_failures: self.preappend_cleanup_failures,
         }
     }
 
     /// Whether a compaction threshold is met.
     #[must_use]
     pub fn compaction_due(&self) -> bool {
-        (self.wal_transactions > 0
-            && self.wal_bytes.saturating_sub(WAL_HEADER_LEN as u64) >= self.compact_after_bytes)
+        self.wal_bytes >= self.compact_after_bytes
             || self.wal_transactions >= u64::from(self.compact_after_transactions)
+    }
+
+    fn projected_wal_state(&self, transaction_bytes: u64) -> Result<(u64, u64), StoreError> {
+        let wal_bytes = self.wal_bytes.checked_add(transaction_bytes).ok_or(
+            StoreError::AccountingOverflow {
+                bytes: self.wal_bytes,
+            },
+        )?;
+        let wal_transactions =
+            self.wal_transactions
+                .checked_add(1)
+                .ok_or(StoreError::CounterOverflow {
+                    counter: "WAL transactions",
+                    value: self.wal_transactions,
+                })?;
+        Ok((wal_bytes, wal_transactions))
+    }
+
+    fn append_requires_compaction(&self, transaction_bytes: u64) -> Result<bool, StoreError> {
+        let (wal_bytes, wal_transactions) = self.projected_wal_state(transaction_bytes)?;
+        Ok(wal_bytes > self.compact_after_bytes
+            || wal_transactions > u64::from(self.compact_after_transactions))
+    }
+
+    fn compact_before_append(&mut self) -> Result<(), StoreError> {
+        let started = Instant::now();
+        if !self.retired_generations.is_empty() {
+            match self.cleanup_retired_generations() {
+                Ok(cleaned) => {
+                    self.preappend_cleanup_generations = self
+                        .preappend_cleanup_generations
+                        .saturating_add(u64::try_from(cleaned).unwrap_or(u64::MAX));
+                }
+                Err(error) => {
+                    self.preappend_cleanup_failures =
+                        self.preappend_cleanup_failures.saturating_add(1);
+                    return Err(error);
+                }
+            }
+        }
+        self.compact()?;
+        self.preappend_compactions = self.preappend_compactions.saturating_add(1);
+        self.preappend_compaction_duration_ns = self
+            .preappend_compaction_duration_ns
+            .saturating_add(duration_nanos(started.elapsed()));
+        Ok(())
     }
 
     /// Appends one atomic transaction carrying `operations`.
@@ -2163,28 +2247,16 @@ impl CheckpointStore {
         self.ensure_fingerprint_capacity(&operations)?;
         self.ensure_tracked_capacity(&operations)?;
         let policy = sync_policy_for(&operations);
-        self.ensure_append_counters()?;
         let operation_count = operations.len();
-        let transaction = Transaction {
+        let mut transaction = Transaction {
             sequence: self.next_sequence,
             operations,
         };
-        let _next_sequence =
-            transaction
-                .sequence
-                .checked_add(1)
-                .ok_or(StoreError::SequenceOverflow {
-                    sequence: transaction.sequence,
-                })?;
-        let bytes = transaction.encode().map_err(|source| StoreError::Encode {
+        let mut bytes = transaction.encode().map_err(|source| StoreError::Encode {
             artifact: "WAL transaction",
             generation: self.generation,
             source,
         })?;
-        // Checked before the in-memory table advances: a transaction the
-        // WAL has no room for must leave the store exactly as it was, so
-        // the caller can compact and retry it unchanged.
-        self.ensure_wal_capacity(bytes.len() as u64)?;
         let staged = self
             .table
             .stage_operations(&transaction.operations, &self.namespace_id)
@@ -2193,6 +2265,30 @@ impl CheckpointStore {
                 path: self.wal_path.clone(),
                 source,
             })?;
+        let requires_compaction = self.pending_wal_append.is_none()
+            && self.append_requires_compaction(bytes.len() as u64)?;
+        self.ensure_append_counters(requires_compaction)?;
+        if requires_compaction {
+            self.compact_before_append()?;
+            transaction.sequence = self.next_sequence;
+            bytes = transaction.encode().map_err(|source| StoreError::Encode {
+                artifact: "WAL transaction",
+                generation: self.generation,
+                source,
+            })?;
+            if self.append_requires_compaction(bytes.len() as u64)? {
+                return Err(StoreError::TransactionExceedsCompactionThreshold {
+                    path: self.wal_path.clone(),
+                    transaction_bytes: bytes.len() as u64,
+                    compact_after_bytes: self.compact_after_bytes,
+                    compact_after_transactions: self.compact_after_transactions,
+                });
+            }
+        }
+        // The prospective configured thresholds are enforced above. This
+        // independent recovery-cap guard remains fail-closed if accounting
+        // or a hand-built option ever violates that relationship.
+        self.ensure_wal_capacity(bytes.len() as u64)?;
         let started = Instant::now();
         let result = self.write_transaction(
             &transaction,
@@ -2975,14 +3071,73 @@ impl CheckpointStore {
         let mut projected_wal_transactions = self.wal_transactions;
         let mut projected_unsynced_transactions = self.unsynced_transactions;
         let mut projected_syncs = self.syncs;
+        let mut projected_generation = self.generation;
         for chunk in transactions {
-            projected_wal_transactions =
-                projected_wal_transactions
-                    .checked_add(1)
-                    .ok_or(StoreError::CounterOverflow {
-                        counter: "WAL transactions",
-                        value: projected_wal_transactions,
-                    })?;
+            let mut transaction = Transaction {
+                sequence,
+                operations: chunk.to_vec(),
+            };
+            let mut encoded = transaction.encode().map_err(|source| StoreError::Encode {
+                artifact: "WAL transaction",
+                generation: self.generation,
+                source,
+            })?;
+            let mut transaction_bytes = encoded.len() as u64;
+            let mut prospective_wal_bytes = projected_wal_bytes
+                .checked_add(transaction_bytes)
+                .ok_or(StoreError::AccountingOverflow {
+                    bytes: projected_wal_bytes,
+                })?;
+            let mut prospective_wal_transactions = projected_wal_transactions
+                .checked_add(1)
+                .ok_or(StoreError::CounterOverflow {
+                    counter: "WAL transactions",
+                    value: projected_wal_transactions,
+                })?;
+            if prospective_wal_bytes > self.compact_after_bytes
+                || prospective_wal_transactions > u64::from(self.compact_after_transactions)
+            {
+                projected_generation =
+                    projected_generation
+                        .checked_add(1)
+                        .ok_or(StoreError::GenerationOverflow {
+                            generation: projected_generation,
+                        })?;
+                if projected_unsynced_transactions > 0 {
+                    projected_syncs =
+                        projected_syncs
+                            .checked_add(1)
+                            .ok_or(StoreError::CounterOverflow {
+                                counter: "WAL syncs",
+                                value: projected_syncs,
+                            })?;
+                }
+                projected_wal_bytes = WAL_HEADER_LEN as u64;
+                projected_unsynced_transactions = 0;
+                transaction.sequence = 1;
+                encoded = transaction.encode().map_err(|source| StoreError::Encode {
+                    artifact: "WAL transaction",
+                    generation: self.generation,
+                    source,
+                })?;
+                transaction_bytes = encoded.len() as u64;
+                prospective_wal_bytes = projected_wal_bytes.checked_add(transaction_bytes).ok_or(
+                    StoreError::AccountingOverflow {
+                        bytes: projected_wal_bytes,
+                    },
+                )?;
+                prospective_wal_transactions = 1;
+                if prospective_wal_bytes > self.compact_after_bytes
+                    || prospective_wal_transactions > u64::from(self.compact_after_transactions)
+                {
+                    return Err(StoreError::TransactionExceedsCompactionThreshold {
+                        path: self.wal_path.clone(),
+                        transaction_bytes,
+                        compact_after_bytes: self.compact_after_bytes,
+                        compact_after_transactions: self.compact_after_transactions,
+                    });
+                }
+            }
             projected_unsynced_transactions = projected_unsynced_transactions
                 .checked_add(1)
                 .ok_or(StoreError::CounterOverflow {
@@ -3003,29 +3158,18 @@ impl CheckpointStore {
             if self.should_sync(sync_policy_for(chunk)) {
                 projected_unsynced_transactions = 0;
             }
-            let transaction = Transaction {
-                sequence,
-                operations: chunk.to_vec(),
-            };
-            sequence = sequence
+            sequence = transaction
+                .sequence
                 .checked_add(1)
-                .ok_or(StoreError::SequenceOverflow { sequence })?;
-            let encoded = transaction.encode().map_err(|source| StoreError::Encode {
-                artifact: "WAL transaction",
-                generation: self.generation,
-                source,
-            })?;
-            let transaction_bytes = encoded.len() as u64;
-            let wal_bytes_before = projected_wal_bytes;
-            projected_wal_bytes = projected_wal_bytes.checked_add(transaction_bytes).ok_or(
-                StoreError::AccountingOverflow {
-                    bytes: projected_wal_bytes,
-                },
-            )?;
+                .ok_or(StoreError::SequenceOverflow {
+                    sequence: transaction.sequence,
+                })?;
+            projected_wal_bytes = prospective_wal_bytes;
+            projected_wal_transactions = prospective_wal_transactions;
             if projected_wal_bytes > self.limits.max_wal_bytes {
                 return Err(StoreError::WalWouldExceedMaximum {
                     path: self.wal_path.clone(),
-                    wal_bytes: wal_bytes_before,
+                    wal_bytes: projected_wal_bytes - transaction_bytes,
                     transaction_bytes,
                     max: self.limits.max_wal_bytes,
                 });
@@ -3034,28 +3178,55 @@ impl CheckpointStore {
         Ok(())
     }
 
-    fn ensure_append_counters(&self) -> Result<(), StoreError> {
-        let _wal_transactions =
+    fn ensure_append_counters(&self, requires_compaction: bool) -> Result<(), StoreError> {
+        if requires_compaction {
+            let _next_generation =
+                self.generation
+                    .checked_add(1)
+                    .ok_or(StoreError::GenerationOverflow {
+                        generation: self.generation,
+                    })?;
+        }
+        let wal_transactions = if requires_compaction {
+            0
+        } else {
             self.wal_transactions
+        };
+        let unsynced_transactions = if requires_compaction {
+            0
+        } else {
+            self.unsynced_transactions
+        };
+        let sequence = if requires_compaction {
+            1
+        } else {
+            self.next_sequence
+        };
+        let _wal_transactions =
+            wal_transactions
                 .checked_add(1)
                 .ok_or(StoreError::CounterOverflow {
                     counter: "WAL transactions",
-                    value: self.wal_transactions,
+                    value: wal_transactions,
                 })?;
         let _unsynced_transactions =
-            self.unsynced_transactions
+            unsynced_transactions
                 .checked_add(1)
                 .ok_or(StoreError::CounterOverflow {
                     counter: "unsynced WAL transactions",
-                    value: self.unsynced_transactions,
+                    value: unsynced_transactions,
                 })?;
+        let syncs_required = 1 + u64::from(requires_compaction && self.unsynced_transactions > 0);
         let _syncs = self
             .syncs
-            .checked_add(1)
+            .checked_add(syncs_required)
             .ok_or(StoreError::CounterOverflow {
                 counter: "WAL syncs",
                 value: self.syncs,
             })?;
+        let _next_sequence = sequence
+            .checked_add(1)
+            .ok_or(StoreError::SequenceOverflow { sequence })?;
         Ok(())
     }
 
@@ -3070,10 +3241,11 @@ impl CheckpointStore {
     /// while the WAL filled, and finally find even the removals that would
     /// shrink the table refused for want of WAL space.
     ///
-    /// A transaction is measured by the registrations it carries for
-    /// records that are not already tracked. Removals in the same
-    /// transaction deliberately do not create headroom, which keeps this an
-    /// upper bound on the table the transaction can produce.
+    /// A transaction is measured by registrations for records not already
+    /// tracked. The one exception is a validated non-administrative
+    /// exact-locator supersede pair: its matching removal and replacement
+    /// registration consume one existing slot atomically and have zero net
+    /// growth.
     ///
     /// Recovery separately rejects a namespace that already exceeds the
     /// configured population. Shrinking this limit is an explicit state
@@ -3104,8 +3276,35 @@ impl CheckpointStore {
         if registrations.is_empty() {
             return Ok(());
         }
+        let mut supersede_replacements = HashSet::new();
+        for operation in operations {
+            let Operation::RemoveFile(removal) = operation else {
+                continue;
+            };
+            if removal.administrative {
+                continue;
+            }
+            let Some(existing) = table.get(&removal.file_id) else {
+                continue;
+            };
+            if let Some(replacement) = operations.iter().find_map(|candidate| {
+                let Operation::RegisterFile(register) = candidate else {
+                    return None;
+                };
+                (registrations.contains(&register.file_id)
+                    && register.file_id != removal.file_id
+                    && register.locator == existing.locator)
+                    .then_some(register.file_id)
+            }) {
+                let _ = supersede_replacements.insert(replacement);
+            }
+        }
+        let additional = registrations
+            .len()
+            .checked_sub(supersede_replacements.len())
+            .expect("supersede replacements are a subset of new registrations");
         let tracked = table.len();
-        let exhausted = match (tracked as u64).checked_add(registrations.len() as u64) {
+        let exhausted = match (tracked as u64).checked_add(additional as u64) {
             Some(projected) => projected > u64::from(max_tracked_files),
             // A population that is not even representable is past any
             // configured maximum.
@@ -3115,7 +3314,7 @@ impl CheckpointStore {
             return Err(StoreError::TrackedFilesExhausted {
                 dir: namespace_dir.to_path_buf(),
                 tracked,
-                registrations: registrations.len(),
+                registrations: additional,
                 max: max_tracked_files,
             });
         }

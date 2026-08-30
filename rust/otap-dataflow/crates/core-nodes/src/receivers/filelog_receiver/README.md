@@ -136,6 +136,11 @@ Important policy values are:
 | `rotation.on_truncate` | `fail`, `read_new` | Durably quarantines detectable truncation or explicitly resets to a new file epoch. |
 | `on_nack` | `fail`, `drop_and_continue` | Fails the receiver or durably advances under an explicit loss policy after terminal delivery failure. |
 
+`checkpoint.compact_after_bytes` bounds the complete WAL, including its
+56-byte header. It must be at least 16,777,312 bytes so a fresh WAL can hold
+one maximum version-1 transaction. The store compacts before an append would
+exceed either the byte or transaction threshold; equality is accepted.
+
 Set at most one of `framing.multiline.line_start_pattern` and
 `framing.multiline.line_end_pattern`. Patterns use the versioned `re2-v1`
 profile. A zero `force_flush_period` disables idle partial-record flushing.

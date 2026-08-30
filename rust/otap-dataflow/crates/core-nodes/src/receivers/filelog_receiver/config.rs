@@ -646,8 +646,8 @@ pub struct CheckpointConfig {
         with = "humantime_serde"
     )]
     pub sync_interval: Duration,
-    /// Compact once the progress-log body, excluding its fixed header,
-    /// reaches this many bytes and contains at least one transaction.
+    /// Compact before an append would make the complete WAL, including its
+    /// fixed header, exceed this many bytes.
     #[serde(
         default = "CheckpointConfig::default_compact_after_bytes",
         deserialize_with = "deserialize_byte_size"
@@ -2054,12 +2054,13 @@ fn validate_checkpoint_bounds(
         ));
     }
     // The durable checkpoint store derives its artifact and combined
-    // recovery-working-set caps from exactly these three knobs, and enforces
+    // recovery-working-set caps from exactly these four knobs, and enforces
     // the same artifact caps when it writes. Running the derivation here
     // rejects an unrecoverable configuration at build time, with the knobs
     // to reduce, rather than at the first compaction or reopen.
     let _store_limits = StoreLimits::derive(
         checkpoint.compact_after_bytes,
+        checkpoint.compact_after_transactions,
         limits.max_tracked_files,
         identity.fingerprint_bytes,
     )
@@ -3354,7 +3355,7 @@ mod tests {
         cfg.limits.max_open_files = 2_048;
         cfg.limits.max_tracked_files = 2_048;
         cfg.limits.max_pending_candidates = 4_192;
-        cfg.checkpoint.compact_after_bytes = 1;
+        cfg.checkpoint.compact_after_bytes = store_limits::minimum_compact_after_bytes().unwrap();
 
         let error = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
         assert!(
@@ -3754,17 +3755,40 @@ mod tests {
         assert!(RuntimeConfig::from_config(cfg, "node-1").is_err());
     }
 
+    /// Scenario: the complete-WAL byte threshold is exactly the header plus
+    /// one maximum transaction, then one byte smaller.
+    /// Guarantees: the exact minimum validates and the smaller value is
+    /// rejected before namespace creation with a specific threshold error.
+    #[test]
+    fn checkpoint_byte_threshold_must_fit_one_maximum_transaction() {
+        let minimum = store_limits::minimum_compact_after_bytes().unwrap();
+        let mut cfg = minimal_config();
+        cfg.checkpoint.compact_after_bytes = minimum;
+        assert!(RuntimeConfig::from_config(cfg, "node-1").is_ok());
+
+        let mut cfg = minimal_config();
+        cfg.checkpoint.compact_after_bytes = minimum - 1;
+        let error = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
+        assert!(
+            error.to_string().contains("smaller than the minimum"),
+            "{error}"
+        );
+    }
+
     /// The exact remedies the store's size formulas attach to a bound that
     /// cannot be honored, asserted verbatim so a rejection always names the
     /// knob an operator has to change.
-    const WAL_REMEDY: &str = "reduce checkpoint.compact_after_bytes or identity.fingerprint_bytes";
+    const WAL_REMEDY: &str =
+        "reduce checkpoint.compact_after_bytes or checkpoint.compact_after_transactions";
     const RECOVERY_REMEDY: &str = "reduce limits.max_tracked_files, \
                                    checkpoint.compact_after_bytes, or \
+                                   checkpoint.compact_after_transactions, or \
                                    identity.fingerprint_bytes";
 
     /// Scenario: the checkpoint size knobs that jointly determine artifact
     /// sizes and recovery memory -- `compact_after_bytes`,
-    /// `limits.max_tracked_files`, and `identity.fingerprint_bytes` -- are
+    /// `compact_after_transactions`, `limits.max_tracked_files`, and
+    /// `identity.fingerprint_bytes` -- are
     /// validated at their defaults, at the combined recovery-working-set
     /// boundary, and one step beyond each.
     /// Guarantees: config validation runs the durable store's own checked
@@ -3775,6 +3799,7 @@ mod tests {
     fn checkpoint_size_bounds_must_stay_recoverable() {
         let defaults = StoreLimits::derive(
             DEFAULT_COMPACT_AFTER_BYTES,
+            DEFAULT_COMPACT_AFTER_TRANSACTIONS,
             DEFAULT_MAX_TRACKED_FILES,
             DEFAULT_FINGERPRINT_BYTES,
         )
@@ -3794,6 +3819,7 @@ mod tests {
             |candidate| {
                 StoreLimits::derive(
                     DEFAULT_COMPACT_AFTER_BYTES,
+                    DEFAULT_COMPACT_AFTER_TRANSACTIONS,
                     candidate as u32,
                     DEFAULT_FINGERPRINT_BYTES,
                 )
@@ -3825,6 +3851,7 @@ mod tests {
             |candidate| {
                 StoreLimits::derive(
                     candidate,
+                    DEFAULT_COMPACT_AFTER_TRANSACTIONS,
                     DEFAULT_MAX_TRACKED_FILES,
                     DEFAULT_FINGERPRINT_BYTES,
                 )
@@ -3847,12 +3874,14 @@ mod tests {
         );
         assert!(err.to_string().contains(RECOVERY_REMEDY), "{err}");
 
-        // Nothing saturates: an unrepresentable worst case is an error, not
-        // a clamped bound that would claim it fits.
+        // Nothing saturates: the transaction threshold still bounds the WAL
+        // when the byte threshold is maximal, and the resulting artifact is
+        // rejected against the fixed ceiling.
         let mut cfg = minimal_config();
         cfg.checkpoint.compact_after_bytes = u64::MAX;
         let err = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
-        assert!(err.to_string().contains("overflows u64"), "{err}");
+        assert!(err.to_string().contains("checkpoint WAL size"), "{err}");
+        assert!(err.to_string().contains("exceeding"), "{err}");
         assert!(err.to_string().contains(WAL_REMEDY), "{err}");
 
         // Find the widest fingerprint window whose complete recovery
@@ -3865,6 +3894,7 @@ mod tests {
             |candidate| {
                 StoreLimits::derive(
                     DEFAULT_COMPACT_AFTER_BYTES,
+                    DEFAULT_COMPACT_AFTER_TRANSACTIONS,
                     DEFAULT_MAX_TRACKED_FILES,
                     candidate,
                 )

@@ -10,10 +10,9 @@
 //! same configuration can legally write would let a namespace become
 //! unreadable by the very store that wrote it. Every cap here is therefore
 //! derived from the receiver's own configuration -- `compact_after_bytes`,
-//! `limits.max_tracked_files`, and `identity.fingerprint_bytes` -- plus the
-//! format's own field maximums (advisory path, audit reason, namespace id,
-//! operations per transaction), so the write side and the read side are two
-//! views of one formula.
+//! `compact_after_transactions`, `limits.max_tracked_files`, and
+//! `identity.fingerprint_bytes` -- plus the format's own field maximums, so
+//! the write side and the read side are two views of one formula.
 //!
 //! Every field width below mirrors `docs/filelog-checkpoint-format.md` and
 //! the encoders in [`super::super::snapshot`] and [`super::super::wal`]. The
@@ -30,8 +29,8 @@
 use super::super::primitives::{
     ADVISORY_PATH_FIXED_BYTES, ADVISORY_PATH_STORED_MAX_BYTES, AUDIT_REASON_MAX_BYTES,
     COMMITTED_FRONTIER_GUARD_LEN, FINGERPRINT_MAX_BYTES, NAMESPACE_ID_MAX_BYTES,
-    TX_FRAME_CRC_BYTES, TX_HEADER_BYTES, WAL_MAX_NON_PROGRESS_OPS_PER_TX, WAL_MAX_OPS_PER_TX,
-    WAL_MAX_TX_BODY_BYTES,
+    TX_FRAME_CRC_BYTES, TX_HEADER_BYTES, TX_MIN_FRAME_BYTES, WAL_MAX_NON_PROGRESS_OPS_PER_TX,
+    WAL_MAX_OPS_PER_TX, WAL_MAX_TX_BODY_BYTES, WAL_MAX_TX_FRAME_BYTES,
 };
 use super::super::snapshot::{SNAPSHOT_FOOTER_LEN, SNAPSHOT_HEADER_LEN};
 use super::super::wal::WAL_HEADER_LEN;
@@ -66,11 +65,13 @@ const WAL_ARTIFACT: &str = "checkpoint WAL";
 /// Actionable remedy for a snapshot bound that cannot be honored.
 const SNAPSHOT_REMEDY: &str = "reduce limits.max_tracked_files or identity.fingerprint_bytes";
 /// Actionable remedy for a WAL bound that cannot be honored.
-const WAL_REMEDY: &str = "reduce checkpoint.compact_after_bytes or identity.fingerprint_bytes";
+const WAL_REMEDY: &str =
+    "reduce checkpoint.compact_after_bytes or checkpoint.compact_after_transactions";
 /// Actionable remedy for a combined recovery working set that cannot be
 /// honored.
 const RECOVERY_REMEDY: &str = "reduce limits.max_tracked_files, \
                                checkpoint.compact_after_bytes, or \
+                               checkpoint.compact_after_transactions, or \
                                identity.fingerprint_bytes";
 
 /// `record_len` + `record_crc32c` around a snapshot record payload, and
@@ -273,6 +274,22 @@ pub enum LimitsError {
         /// The format's maximum.
         max: u64,
     },
+    /// The byte threshold cannot hold a fresh WAL header plus one maximum
+    /// version-1 transaction.
+    #[error(
+        "checkpoint.compact_after_bytes ({configured}) is smaller than the minimum {minimum} \
+         required for the WAL header plus one maximum transaction"
+    )]
+    CompactAfterBytesTooSmall {
+        /// Configured complete-WAL threshold.
+        configured: u64,
+        /// Minimum valid threshold.
+        minimum: u64,
+    },
+    /// The transaction threshold must leave room for at least one
+    /// transaction in a fresh WAL.
+    #[error("checkpoint.compact_after_transactions must be greater than zero")]
+    CompactAfterTransactionsZero,
 }
 
 /// The worst-case durable sizes one configuration implies.
@@ -288,8 +305,9 @@ pub struct StoreLimits {
     /// Largest WAL file this configuration can produce while compaction is
     /// honored, and therefore the largest one recovery will read.
     pub max_wal_bytes: u64,
-    /// Largest single WAL transaction the format allows for this
-    /// configuration.
+    /// Largest number of complete transactions recovery will accept.
+    pub max_wal_transactions: u64,
+    /// Hard largest single WAL transaction the format permits.
     pub max_transaction_bytes: u64,
     /// Largest single snapshot record this configuration can produce.
     pub max_snapshot_record_bytes: u64,
@@ -298,12 +316,13 @@ pub struct StoreLimits {
 }
 
 impl StoreLimits {
-    /// Derives every bound from the three configuration knobs that govern
+    /// Derives every bound from the four configuration knobs that govern
     /// durable size, and validates each artifact bound against
     /// [`ARTIFACT_BYTES_CEILING`] and the combined recovery estimate against
     /// [`RECOVERY_WORKING_BYTES_CEILING`].
     pub fn derive(
         compact_after_bytes: u64,
+        compact_after_transactions: u32,
         max_tracked_files: u32,
         fingerprint_bytes: u64,
     ) -> Result<Self, LimitsError> {
@@ -313,10 +332,13 @@ impl StoreLimits {
                 max: FINGERPRINT_MAX_BYTES as u64,
             });
         }
+        validate_compaction_thresholds(compact_after_bytes, compact_after_transactions)?;
         let max_snapshot_record_bytes = snapshot_record_bytes(fingerprint_bytes)?;
         let max_snapshot_bytes = snapshot_bytes(max_tracked_files, fingerprint_bytes)?;
-        let max_transaction_bytes = transaction_bytes(fingerprint_bytes)?;
-        let max_wal_bytes = wal_bytes(compact_after_bytes, fingerprint_bytes)?;
+        let max_transaction_bytes = WAL_MAX_TX_FRAME_BYTES;
+        let max_wal_bytes = wal_bytes(compact_after_bytes, compact_after_transactions)?;
+        let max_wal_transactions =
+            wal_transactions(compact_after_bytes, compact_after_transactions)?;
         within_ceiling(SNAPSHOT_ARTIFACT, max_snapshot_bytes, SNAPSHOT_REMEDY)?;
         within_ceiling(WAL_ARTIFACT, max_wal_bytes, WAL_REMEDY)?;
         let max_recovery_working_bytes =
@@ -331,6 +353,7 @@ impl StoreLimits {
         Ok(Self {
             max_snapshot_bytes,
             max_wal_bytes,
+            max_wal_transactions,
             max_transaction_bytes,
             max_snapshot_record_bytes,
             max_recovery_working_bytes,
@@ -505,21 +528,64 @@ pub fn transaction_bytes(fingerprint_bytes: u64) -> Result<u64, LimitsError> {
     )
 }
 
-/// The largest WAL file a store that honors its compaction threshold can
-/// produce.
-///
-/// Compaction becomes byte-due once the live WAL body reaches
-/// `compact_after_bytes`, so the largest WAL a caller can leave behind is
-/// one whose body was still just under the threshold and then took one
-/// maximal transaction. The fixed header is accounted separately and never
-/// makes an empty WAL due.
-pub fn wal_bytes(compact_after_bytes: u64, fingerprint_bytes: u64) -> Result<u64, LimitsError> {
-    let transaction = transaction_bytes(fingerprint_bytes)?;
+/// Conservative maximum complete WAL length under interacting byte and
+/// transaction thresholds.
+pub fn wal_bytes(
+    compact_after_bytes: u64,
+    compact_after_transactions: u32,
+) -> Result<u64, LimitsError> {
+    validate_compaction_thresholds(compact_after_bytes, compact_after_transactions)?;
+    let count_bound = (WAL_HEADER_LEN as u64)
+        .checked_add(
+            u64::from(compact_after_transactions)
+                .checked_mul(WAL_MAX_TX_FRAME_BYTES)
+                .ok_or(LimitsError::Overflow {
+                    artifact: WAL_ARTIFACT,
+                    remedy: WAL_REMEDY,
+                })?,
+        )
+        .ok_or(LimitsError::Overflow {
+            artifact: WAL_ARTIFACT,
+            remedy: WAL_REMEDY,
+        })?;
+    Ok(compact_after_bytes.min(count_bound))
+}
+
+/// Conservative maximum complete transaction count under interacting byte
+/// and transaction thresholds.
+pub fn wal_transactions(
+    compact_after_bytes: u64,
+    compact_after_transactions: u32,
+) -> Result<u64, LimitsError> {
+    validate_compaction_thresholds(compact_after_bytes, compact_after_transactions)?;
+    let body_bytes = compact_after_bytes - WAL_HEADER_LEN as u64;
+    Ok(u64::from(compact_after_transactions).min(body_bytes / u64::from(TX_MIN_FRAME_BYTES)))
+}
+
+/// Minimum valid complete-WAL byte threshold.
+pub fn minimum_compact_after_bytes() -> Result<u64, LimitsError> {
     sum(
         WAL_ARTIFACT,
         WAL_REMEDY,
-        &[WAL_HEADER_LEN as u64, compact_after_bytes, transaction],
+        &[WAL_HEADER_LEN as u64, WAL_MAX_TX_FRAME_BYTES],
     )
+}
+
+fn validate_compaction_thresholds(
+    compact_after_bytes: u64,
+    compact_after_transactions: u32,
+) -> Result<(), LimitsError> {
+    let minimum = minimum_compact_after_bytes()?;
+    if compact_after_bytes < minimum {
+        return Err(LimitsError::CompactAfterBytesTooSmall {
+            configured: compact_after_bytes,
+            minimum,
+        });
+    }
+    if compact_after_transactions == 0 {
+        return Err(LimitsError::CompactAfterTransactionsZero);
+    }
+    Ok(())
 }
 
 fn sum(artifact: &'static str, remedy: &'static str, parts: &[u64]) -> Result<u64, LimitsError> {
@@ -844,16 +910,12 @@ mod tests {
             non_progress_encoded.len().max(progress_encoded.len()) as u64
         );
 
-        let compact_after_bytes = 4_096u64;
+        let compact_after_bytes = minimum_compact_after_bytes().unwrap();
         let wal = encode_wal(0, TEST_NAMESPACE_ID, &[non_progress_tx]).expect("the WAL encodes");
-        let wal_bound =
-            wal_bytes(compact_after_bytes, fingerprint_bytes).expect("the bound is representable");
-        assert_eq!(
-            wal_bound,
-            WAL_HEADER_LEN as u64 + compact_after_bytes + bound
-        );
+        let wal_bound = wal_bytes(compact_after_bytes, 10_000).expect("the bound is representable");
+        assert_eq!(wal_bound, compact_after_bytes);
         assert!(
-            (wal.len() as u64) < wal_bound,
+            (wal.len() as u64) <= wal_bound,
             "a maximal transaction must fit under the WAL bound"
         );
     }
@@ -894,57 +956,96 @@ mod tests {
     /// an unrepresentable artifact fits.
     #[test]
     fn derived_bounds_are_checked_and_ceiling_enforced() {
-        let defaults = StoreLimits::derive(64 * 1024 * 1024, 10_000, 1_000)
+        let defaults = StoreLimits::derive(64 * 1024 * 1024, 10_000, 10_000, 1_000)
             .expect("the default configuration is representable");
         assert!(defaults.max_snapshot_bytes <= ARTIFACT_BYTES_CEILING);
         assert!(defaults.max_wal_bytes <= ARTIFACT_BYTES_CEILING);
         assert!(defaults.max_recovery_working_bytes <= RECOVERY_WORKING_BYTES_CEILING);
-        assert!(defaults.max_transaction_bytes < defaults.max_wal_bytes);
+        assert_eq!(defaults.max_transaction_bytes, WAL_MAX_TX_FRAME_BYTES);
+        assert_eq!(defaults.max_wal_bytes, 64 * 1024 * 1024);
+        assert_eq!(defaults.max_wal_transactions, 10_000);
         assert!(defaults.max_snapshot_record_bytes < defaults.max_snapshot_bytes);
         assert!(
             (49 * 1024 * 1024..=51 * 1024 * 1024).contains(&defaults.max_snapshot_bytes),
             "the documented default snapshot estimate changed: {} bytes",
             defaults.max_snapshot_bytes
         );
-        // The WAL bound dropped from the pre-Stage-2A estimate now that a
-        // transaction's worst case is the wider of two bounded classes
-        // (256 non-progress operations, or 4096 progress operations, each
-        // additionally capped by the 16 MiB hard transaction-body limit)
-        // rather than `WAL_MAX_OPS_PER_TX` copies of the single widest
-        // operation across all eight kinds.
-        assert!(
-            (64 * 1024 * 1024..=66 * 1024 * 1024).contains(&defaults.max_wal_bytes),
-            "the documented default WAL estimate changed: {} bytes",
-            defaults.max_wal_bytes
-        );
+        assert!(matches!(
+            StoreLimits::derive(
+                minimum_compact_after_bytes().unwrap() - 1,
+                10_000,
+                10_000,
+                1_000,
+            ),
+            Err(LimitsError::CompactAfterBytesTooSmall { .. })
+        ));
+        assert!(matches!(
+            StoreLimits::derive(64 * 1024 * 1024, 0, 10_000, 1_000),
+            Err(LimitsError::CompactAfterTransactionsZero)
+        ));
 
         assert!(matches!(
-            StoreLimits::derive(64 * 1024 * 1024, 10_000, FINGERPRINT_MAX_BYTES as u64 + 1),
+            StoreLimits::derive(
+                64 * 1024 * 1024,
+                10_000,
+                10_000,
+                FINGERPRINT_MAX_BYTES as u64 + 1,
+            ),
             Err(LimitsError::FingerprintUnrepresentable { .. })
         ));
         assert!(matches!(
-            StoreLimits::derive(64 * 1024 * 1024, u32::MAX, 1_000),
+            StoreLimits::derive(64 * 1024 * 1024, 10_000, u32::MAX, 1_000),
             Err(LimitsError::ExceedsCeiling {
                 artifact: SNAPSHOT_ARTIFACT,
                 ..
             })
         ));
         assert!(matches!(
-            StoreLimits::derive(u64::MAX, 10_000, 1_000),
-            Err(LimitsError::Overflow {
-                artifact: WAL_ARTIFACT,
-                ..
-            })
-        ));
-        assert!(matches!(
-            StoreLimits::derive(ARTIFACT_BYTES_CEILING, 10_000, 1_000),
+            StoreLimits::derive(u64::MAX, 10_000, 10_000, 1_000),
             Err(LimitsError::ExceedsCeiling { .. })
                 | Err(LimitsError::RecoveryExceedsCeiling { .. })
         ));
         assert!(matches!(
-            StoreLimits::derive(64 * 1024 * 1024, 10_000, FINGERPRINT_MAX_BYTES as u64),
+            StoreLimits::derive(ARTIFACT_BYTES_CEILING, 10_000, 10_000, 1_000),
+            Err(LimitsError::ExceedsCeiling { .. })
+                | Err(LimitsError::RecoveryExceedsCeiling { .. })
+        ));
+        assert!(matches!(
+            StoreLimits::derive(
+                64 * 1024 * 1024,
+                10_000,
+                10_000,
+                FINGERPRINT_MAX_BYTES as u64,
+            ),
             Err(LimitsError::RecoveryExceedsCeiling { .. })
         ));
+    }
+
+    /// Scenario: byte and transaction thresholds bind independently at their
+    /// checked conservative maxima.
+    /// Guarantees: WAL bytes and complete transaction count use the exact
+    /// minimum of both configured limits, including the 56-byte header and
+    /// 74-byte minimum transaction frame.
+    #[test]
+    fn interacting_wal_bounds_select_the_tighter_threshold() {
+        let byte_threshold = minimum_compact_after_bytes().unwrap();
+        assert_eq!(wal_bytes(byte_threshold, u32::MAX).unwrap(), byte_threshold);
+        assert_eq!(
+            wal_transactions(byte_threshold, u32::MAX).unwrap(),
+            (byte_threshold - WAL_HEADER_LEN as u64) / u64::from(TX_MIN_FRAME_BYTES)
+        );
+
+        let transaction_threshold = 2u32;
+        let expected_bytes =
+            WAL_HEADER_LEN as u64 + u64::from(transaction_threshold) * WAL_MAX_TX_FRAME_BYTES;
+        assert_eq!(
+            wal_bytes(64 * 1024 * 1024, transaction_threshold).unwrap(),
+            expected_bytes
+        );
+        assert_eq!(
+            wal_transactions(64 * 1024 * 1024, transaction_threshold).unwrap(),
+            u64::from(transaction_threshold)
+        );
     }
 
     /// Scenario: the widest snapshot record (maximum fingerprint,

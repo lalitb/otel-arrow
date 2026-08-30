@@ -572,6 +572,31 @@ fn exact_locator_mismatch_and_offset_beyond_size_never_resume() {
     assert_eq!(store.table().len(), 2);
 }
 
+/// Scenario: the durable table is full and its sole Active record has an
+/// exact-locator recovery mismatch that requires atomic supersede.
+/// Guarantees: the matching remove/register pair has zero net tracked growth,
+/// so replacement succeeds without exceeding capacity or retaining two live
+/// locator claims.
+#[test]
+fn exact_locator_supersede_reuses_full_tracked_slot() {
+    let (_directory, mut store, _options) = test_store(1);
+    let old_file_id = FileId::from_bytes([53; 16]);
+    register(&mut store, old_file_id, locator(53), 0, b"old!", b"path");
+
+    let resolved = resolve_and_persist(
+        &mut store,
+        &[evidence(locator(53), 4, b"new!", b"path")],
+        &no_live_locators(),
+        &settings(),
+        7,
+    )
+    .unwrap();
+    assert_ne!(resolved[0].file_id, old_file_id);
+    assert_eq!(resolved[0].matched_by, IdentityMatch::RecoveryMismatch);
+    assert!(store.table().get(&old_file_id).is_none());
+    assert_eq!(store.table().len(), 1);
+}
+
 /// Scenario: a same-locator recovery mismatch under `on_recovery_mismatch:
 /// beginning` durably retires the stale old record, then a later
 /// reconciliation observes that same locator again with content matching

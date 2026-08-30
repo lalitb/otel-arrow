@@ -226,6 +226,24 @@ pub enum StoreError {
         /// The largest WAL this configuration can recover.
         max: u64,
     },
+    /// A transaction could not fit even after compaction reset the WAL to
+    /// its header and transaction count to zero. Configuration validation
+    /// normally makes this unreachable.
+    #[error(
+        "checkpoint transaction of {transaction_bytes} bytes cannot fit the configured fresh WAL \
+         at {path}: byte threshold {compact_after_bytes}, transaction threshold \
+         {compact_after_transactions}"
+    )]
+    TransactionExceedsCompactionThreshold {
+        /// Live WAL path.
+        path: PathBuf,
+        /// Encoded transaction frame bytes.
+        transaction_bytes: u64,
+        /// Complete-WAL byte threshold.
+        compact_after_bytes: u64,
+        /// Complete-transaction threshold.
+        compact_after_transactions: u32,
+    },
     /// A caller supplied more operations than one WAL transaction may carry.
     #[error(
         "transaction carries {operations} operations, exceeding the \
@@ -275,6 +293,20 @@ pub enum StoreError {
         tracked: usize,
         /// The configured population maximum.
         max: u32,
+    },
+    /// Recovery found more complete WAL transactions than the interacting
+    /// configured thresholds permit.
+    #[error(
+        "checkpoint WAL at {path} contains {transactions} complete transactions, exceeding the \
+         configured recovery maximum {max}"
+    )]
+    RecoveredWalTransactionsExceedMaximum {
+        /// Selected WAL artifact.
+        path: PathBuf,
+        /// Complete transactions encountered.
+        transactions: u64,
+        /// Maximum admitted by byte/count thresholds.
+        max: u64,
     },
     /// More recognized generations were present than recovery is willing
     /// to retain in memory or on disk.

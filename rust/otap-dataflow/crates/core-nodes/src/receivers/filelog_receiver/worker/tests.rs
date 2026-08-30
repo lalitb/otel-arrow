@@ -236,6 +236,71 @@ fn framed_record_telemetry_uses_exact_bounded_categories() {
     );
 }
 
+/// Scenario: a store append reaches its transaction threshold and compacts
+/// synchronously before the next progress transaction.
+/// Guarantees: publishing store deltas reports the automatic compaction and
+/// duration through the existing bounded worker telemetry counters.
+#[test]
+fn preappend_compaction_is_reported_through_store_deltas() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("telemetry.log");
+    std::fs::write(&source, b"line\n").unwrap();
+    let mut config = runtime_config(
+        source.to_str().unwrap(),
+        &directory.path().join("checkpoint"),
+        1,
+    );
+    config.checkpoint.compact_after_transactions = 1;
+    let mut runtime = WorkerRuntime::new(config).unwrap();
+    let file_id = FileId::from_bytes([90; 16]);
+    let _registered = runtime
+        .store
+        .register_files(vec![RegisterFile {
+            file_id,
+            file_epoch: 1,
+            committed_offset: 0,
+            committed_frontier_guard: CommittedFrontierGuard::empty(),
+            fingerprint: b"line\n".to_vec(),
+            ignored_header_bytes: 0,
+            locator: Locator::PosixDevIno { dev: 7, ino: 90 },
+            framing_profile_version: FRAMING_PROFILE_VERSION,
+            framing_profile_digest: runtime.config.framing_profile_digest,
+            framing_resume: FramingResume::Clean,
+            last_seen_time_unix_nano: 1,
+            advisory_path: AdvisoryPath::unavailable(),
+        }])
+        .unwrap();
+    let _progressed = runtime
+        .store
+        .commit_progress(vec![UpdateProgress {
+            file_id,
+            expected_committed_offset: 0,
+            expected_file_epoch: 1,
+            new_committed_offset: 1,
+            new_committed_frontier_guard: zero_guard(1),
+            new_framing_resume: FramingResume::Clean,
+            new_last_seen_time_unix_nano: 2,
+            finalize: false,
+        }])
+        .unwrap();
+
+    let compaction_duration = runtime.store.stats().preappend_compaction_duration_ns;
+    runtime.publish_store_observations();
+    assert_eq!(
+        runtime
+            .telemetry
+            .counter_for_test(WorkerCounter::CheckpointCompactions),
+        1
+    );
+    assert_eq!(
+        runtime
+            .telemetry
+            .counter_for_test(WorkerCounter::CheckpointCompactionDurationNs),
+        compaction_duration
+    );
+    runtime.shutdown_resources().unwrap();
+}
+
 async fn receive_batch(events: &mut tokio::sync::mpsc::Receiver<WorkerEvent>) -> WorkerBatch {
     receive_batch_with_timeout(events, Duration::from_secs(5)).await
 }
@@ -1316,13 +1381,12 @@ async fn checkpoint_fault_commits_on_the_exact_bounded_retry() {
     }
 }
 
-/// Scenario: the first post-registration compaction attempt fails at a safe
-/// pre-write boundary and the fault plan then permits a retry.
-/// Guarantees: the worker pauses source work, retries checkpoint maintenance
-/// within the configured failure budget, and emits the source batch instead
-/// of terminating after the first compaction error.
+/// Scenario: an Ack-owned progress transaction requires pre-append compaction,
+/// which fails once before snapshot write and then succeeds on exact retry.
+/// Guarantees: the first CommitResult reports failure without releasing the
+/// retained batch; the matching retry compacts, appends, and commits once.
 #[tokio::test]
-async fn checkpoint_maintenance_failure_retries_before_source_progress() {
+async fn preappend_compaction_failure_preserves_retained_batch_for_retry() {
     let directory = tempdir().unwrap();
     let source = directory.path().join("maintenance.log");
     std::fs::write(&source, b"line\n").unwrap();
@@ -1330,6 +1394,7 @@ async fn checkpoint_maintenance_failure_retries_before_source_progress() {
     let mut runtime = runtime_config(source.to_str().unwrap(), &namespace, 1);
     runtime.checkpoint.compact_after_transactions = 1;
     runtime.checkpoint.max_consecutive_failures = 3;
+    let store_options = StoreOptions::from_runtime_config(&runtime);
     let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
     let worker =
         spawn_worker_with_store_fault(runtime, event_tx, FaultPoint::BeforeSnapshotWrite, 1)
@@ -1337,7 +1402,41 @@ async fn checkpoint_maintenance_failure_retries_before_source_progress() {
 
     let batch = receive_batch(&mut events).await;
     assert_eq!(batch.record_count, 1);
+    worker
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: batch.batch_id,
+            attempt: batch.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    let (batch_id, attempt, _, result) = receive_commit(&mut events).await;
+    assert_eq!((batch_id, attempt), (batch.batch_id, batch.attempt));
+    assert!(result.is_err());
+
+    worker
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: batch.batch_id,
+            attempt: batch.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    let (batch_id, attempt, _, result) = receive_commit(&mut events).await;
+    assert_eq!((batch_id, attempt), (batch.batch_id, batch.attempt));
+    result.unwrap();
+    assert_eq!(
+        worker
+            .telemetry
+            .counter_for_test(WorkerCounter::CheckpointCompactions),
+        1
+    );
     stop_worker(worker, &mut events).await.unwrap();
+
+    let store = CheckpointStore::open(store_options).unwrap();
+    assert_eq!(store.generation(), 1);
+    assert_eq!(store.table().iter().next().unwrap().1.committed_offset, 5);
+    assert_eq!(store.recovery().transactions_replayed, 1);
 }
 
 /// Scenario: a due interval sync fails while one retired generation is

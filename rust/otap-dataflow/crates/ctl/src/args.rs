@@ -528,6 +528,14 @@ pub struct CheckpointNamespaceArgs {
     )]
     pub compact_after_bytes: Option<u64>,
 
+    /// Match a nondefault receiver `checkpoint.compact_after_transactions`.
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u32).range(1..),
+        value_name = "COUNT"
+    )]
+    pub compact_after_transactions: Option<u32>,
+
     /// Match a nondefault receiver `limits.max_tracked_files` value.
     #[arg(
         long,
@@ -1758,7 +1766,9 @@ mod tests {
             "--ownership-timeout",
             "5s",
             "--compact-after-bytes",
-            "4096",
+            "16777312",
+            "--compact-after-transactions",
+            "50",
             "--max-tracked-files",
             "25",
             "--fingerprint-bytes",
@@ -1784,7 +1794,8 @@ mod tests {
                     args.namespace.ownership_timeout,
                     Some(Duration::from_secs(5))
                 );
-                assert_eq!(args.namespace.compact_after_bytes, Some(4096));
+                assert_eq!(args.namespace.compact_after_bytes, Some(16_777_312));
+                assert_eq!(args.namespace.compact_after_transactions, Some(50));
                 assert_eq!(args.namespace.max_tracked_files, Some(25));
                 assert_eq!(args.namespace.fingerprint_bytes, Some(64));
                 assert_eq!(args.output.output, ReadOutput::Json);

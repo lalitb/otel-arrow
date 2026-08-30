@@ -40,7 +40,10 @@ use super::layout::{
     MAX_GENERATIONS_ON_DISK, MAX_TEMP_FILES, OWNERSHIP_LOCK_FILE_NAME, PublicationRole,
     snapshot_file_name, temp_file_name, wal_file_name,
 };
-use super::limits::{ARTIFACT_BYTES_CEILING, RECOVERY_WORKING_BYTES_CEILING, StoreLimits};
+use super::limits::{
+    ARTIFACT_BYTES_CEILING, RECOVERY_WORKING_BYTES_CEILING, StoreLimits,
+    minimum_compact_after_bytes,
+};
 use super::{AtomicGroupAppendOutcome, CheckpointStore, StoreOptions};
 
 /// Test-only zero-filled window guard: a deterministic, obviously-fake
@@ -585,6 +588,107 @@ fn append_counter_overflow_is_preflighted_before_mutation() {
     assert!(store.table().is_empty());
     assert_eq!(store.wal_bytes, before.wal_bytes);
     assert_eq!(store.next_sequence, before.next_sequence);
+}
+
+/// Scenario: pre-append compaction would first sync one deferred transaction,
+/// then an immediate registration append would require another sync while the
+/// sync counter has room for only one.
+/// Guarantees: batched preflight accounts for both syncs and rejects before
+/// `CURRENT`, the WAL, or the table changes.
+#[test]
+fn compaction_and_append_sync_overflow_is_preflighted_before_publication() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    let mut store = CheckpointStore::open(StoreOptions {
+        compact_after_transactions: 2,
+        sync_interval: NEVER_ELAPSES,
+        ..options(&path)
+    })
+    .unwrap();
+    let _registered = store.register_files(vec![registration(1)]).unwrap();
+    let _progressed = store.commit_progress(vec![progress(1, 0, 1)]).unwrap();
+    assert_eq!(store.stats().wal_transactions, 2);
+    assert_eq!(store.stats().unsynced_transactions, 1);
+    store.syncs = u64::MAX - 1;
+    let marker_before = fs::read(path.join(CURRENT_FILE_NAME)).unwrap();
+    let wal_before = fs::read(path.join(wal_file_name(0))).unwrap();
+    let table_before = store.table().clone();
+
+    let error = store.register_files(vec![registration(2)]).unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::CounterOverflow {
+            counter: "WAL syncs",
+            ..
+        }
+    ));
+    assert_eq!(store.generation(), 0);
+    assert_eq!(store.syncs, u64::MAX - 1);
+    assert_eq!(store.stats().preappend_compactions, 0);
+    assert_eq!(store.table(), &table_before);
+    assert_eq!(
+        fs::read(path.join(CURRENT_FILE_NAME)).unwrap(),
+        marker_before
+    );
+    assert_eq!(fs::read(path.join(wal_file_name(0))).unwrap(), wal_before);
+
+    let error = store
+        .append(vec![Operation::RegisterFile(registration(2))])
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::CounterOverflow {
+            counter: "WAL syncs",
+            ..
+        }
+    ));
+    assert_eq!(store.generation(), 0);
+    assert_eq!(store.table(), &table_before);
+}
+
+/// Scenario: a three-chunk batch at a one-transaction threshold starts from
+/// projected generation `u64::MAX - 1`.
+/// Guarantees: preflight detects the second required generation increment
+/// before the first chunk writes any WAL bytes or table state.
+#[test]
+fn batched_preflight_rejects_generation_overflow_before_first_chunk() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    let count = usize::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX) * 2 + 1;
+    let mut store = CheckpointStore::open(StoreOptions {
+        compact_after_transactions: 1,
+        max_tracked_files: count as u32,
+        ..options(&path)
+    })
+    .unwrap();
+    store.generation = u64::MAX - 1;
+    let wal_before = fs::read(path.join(wal_file_name(0))).unwrap();
+
+    let error = store
+        .register_files(distinct_registrations(count))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::GenerationOverflow {
+            generation: u64::MAX
+        }
+    ));
+    assert!(store.table().is_empty());
+    assert_eq!(store.stats().wal_transactions, 0);
+    assert_eq!(fs::read(path.join(wal_file_name(0))).unwrap(), wal_before);
+
+    store.generation = u64::MAX;
+    store.wal_transactions = 1;
+    let error = store
+        .append(vec![Operation::RegisterFile(registration(1))])
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::GenerationOverflow {
+            generation: u64::MAX
+        }
+    ));
+    assert!(store.table().is_empty());
 }
 
 /// Scenario: an existing Unix namespace and ownership lock have permissive
@@ -1554,45 +1658,51 @@ fn invalid_later_batched_operation_is_rejected_before_the_first_chunk() {
     assert_eq!(store.stats().next_sequence, before.next_sequence);
 }
 
-/// Scenario: a two-transaction registration batch fits the tracked-file
-/// limit but only its first maximal transaction fits the configured WAL
-/// budget.
-/// Guarantees: WAL capacity is projected across every chunk before the
-/// first write, so rejecting the second chunk cannot leave a partially
-/// committed caller batch.
+/// Scenario: a registration batch spans three transaction-count-limited WAL
+/// generations.
+/// Guarantees: deterministic preflight models sequence resets, each later
+/// chunk compacts before append, the second compaction first cleans the prior
+/// retired generation, and every registration becomes durable.
 #[test]
-fn batched_wal_capacity_is_preflighted_across_all_chunks() {
+fn batched_preflight_models_multiple_preappend_compactions() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("namespace");
-    let count = usize::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX) + 128;
+    let count = usize::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX) * 2 + 1;
     let mut store = CheckpointStore::open(StoreOptions {
-        compact_after_bytes: 1,
+        compact_after_transactions: 1,
         fingerprint_bytes: 16,
         max_tracked_files: count as u32,
         ..options(&path)
     })
     .expect("namespace opens");
-    let before = store.stats();
     let registrations: Vec<RegisterFile> = (0..count as u64).map(widest_registration).collect();
 
-    let error = store
-        .register_files(registrations)
-        .expect_err("the complete batch exceeds the WAL cap");
-    match error {
-        StoreError::WalWouldExceedMaximum {
-            wal_bytes,
-            transaction_bytes,
-            max,
-            ..
-        } => {
-            assert!(wal_bytes > before.wal_bytes);
-            assert!(wal_bytes + transaction_bytes > max);
-        }
-        other => panic!("expected a WAL capacity refusal, got {other:?}"),
-    }
-    assert!(store.table().is_empty());
-    assert_eq!(store.stats().wal_bytes, before.wal_bytes);
-    assert_eq!(store.stats().next_sequence, before.next_sequence);
+    let outcomes = store.register_files(registrations).unwrap();
+    assert_eq!(outcomes.len(), 3);
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|outcome| outcome.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 1, 1]
+    );
+    assert_eq!(store.table().len(), count);
+    assert_eq!(store.generation(), 2);
+    assert_eq!(store.stats().wal_transactions, 1);
+    assert_eq!(store.stats().preappend_compactions, 2);
+    assert_eq!(store.stats().preappend_cleanup_generations, 1);
+    assert_eq!(store.retired_generations(), [1]);
+    drop(store);
+
+    let reopened = CheckpointStore::open(StoreOptions {
+        compact_after_transactions: 1,
+        fingerprint_bytes: 16,
+        max_tracked_files: count as u32,
+        ..options(&path)
+    })
+    .unwrap();
+    assert_eq!(reopened.generation(), 2);
+    assert_eq!(reopened.table().len(), count);
 }
 
 /// Scenario: Ack-driven progress under a zero sync interval and under an
@@ -2263,6 +2373,83 @@ fn quarantined_removal_retries_the_pending_exact_append() {
     assert!(outcome.synced);
     assert!(store.table().is_empty());
     assert_eq!(store.stats().wal_transactions, 3);
+}
+
+/// Scenario: a complete append is uncertain in generation zero, then a
+/// test-only threshold reduction would otherwise require compaction before
+/// its exact retry.
+/// Guarantees: pending transaction reconciliation takes precedence over
+/// compaction and commits the original sequence in the original generation.
+#[test]
+fn pending_append_is_reconciled_before_compaction_decision() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    let configured = || StoreOptions {
+        compact_after_transactions: 2,
+        ..options(&path)
+    };
+    let mut seeded = CheckpointStore::open(configured()).unwrap();
+    let _registered = seeded.register_files(vec![registration(1)]).unwrap();
+    drop(seeded);
+
+    let mut store =
+        CheckpointStore::open_with_fault(configured(), FaultPoint::AfterWalTransactionWrite)
+            .unwrap();
+    assert!(matches!(
+        store.register_files(vec![registration(2)]).unwrap_err(),
+        StoreError::InjectedFault {
+            point: FaultPoint::AfterWalTransactionWrite
+        }
+    ));
+    assert!(store.has_pending_wal_append());
+    store.compact_after_transactions = 1;
+
+    let outcomes = store.register_files(vec![registration(2)]).unwrap();
+    assert_eq!(outcomes[0].sequence, 2);
+    assert_eq!(store.generation(), 0);
+    assert_eq!(store.stats().preappend_compactions, 0);
+    assert_eq!(store.table().len(), 2);
+}
+
+/// Scenario: a second required pre-append compaction first encounters a
+/// retired-generation cleanup fault.
+/// Guarantees: the WAL stays at its threshold without appending, cleanup
+/// failure is counted, and an exact retry cleans, compacts, and appends once.
+#[test]
+fn preappend_compaction_waits_for_retired_cleanup() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    let configured = || StoreOptions {
+        compact_after_transactions: 1,
+        ..options(&path)
+    };
+    let mut store = CheckpointStore::open(configured()).unwrap();
+    let _first = store.register_files(vec![registration(1)]).unwrap();
+    let _second = store.register_files(vec![registration(2)]).unwrap();
+    assert_eq!(store.generation(), 1);
+    assert_eq!(store.retired_generations(), [0]);
+    assert_eq!(store.stats().wal_transactions, 1);
+
+    store.faults = FaultPlan::armed(FaultPoint::BeforeRetiredGenerationRemoval);
+    let error = store.register_files(vec![registration(3)]).unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::InjectedFault {
+            point: FaultPoint::BeforeRetiredGenerationRemoval
+        }
+    ));
+    assert_eq!(store.generation(), 1);
+    assert_eq!(store.stats().wal_transactions, 1);
+    assert_eq!(store.stats().preappend_cleanup_failures, 1);
+    assert_eq!(store.table().len(), 2);
+
+    let outcomes = store.register_files(vec![registration(3)]).unwrap();
+    assert_eq!(outcomes[0].sequence, 1);
+    assert_eq!(store.generation(), 2);
+    assert_eq!(store.stats().wal_transactions, 1);
+    assert_eq!(store.stats().preappend_compactions, 2);
+    assert_eq!(store.stats().preappend_cleanup_generations, 1);
+    assert_eq!(store.table().len(), 3);
 }
 
 /// Scenario: opening a WAL with a three-byte torn tail fails immediately
@@ -3405,10 +3592,10 @@ fn invalid_transactions_are_refused_before_they_are_written() {
     assert_eq!(committed_offset(&reopened, 1), 0);
 }
 
-/// Scenario: a namespace configured to compact after two transactions.
-/// Guarantees: the store reports the threshold as met through the append
-/// outcome and `compaction_due`, and `compact_if_due` then publishes a new
-/// generation whose WAL starts empty while the recovered table is unchanged.
+/// Scenario: a namespace reaches exactly two transactions, then receives a
+/// third append.
+/// Guarantees: equality stays in the current WAL; the third append compacts
+/// first and becomes sequence one in the next generation.
 #[test]
 fn compaction_threshold_triggers_a_new_generation() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3428,34 +3615,77 @@ fn compaction_threshold_triggers_a_new_generation() {
         .expect("progress succeeds");
     assert!(progressed[0].compaction_due);
     assert!(store.compaction_due());
-
-    assert!(store.compact_if_due().expect("compaction succeeds"));
+    assert_eq!(store.generation(), 0);
+    let progressed = store
+        .commit_progress(vec![progress(1, 256, 512)])
+        .expect("third transaction succeeds after pre-append compaction");
     assert_eq!(store.generation(), 1);
-    assert_eq!(store.stats().wal_transactions, 0);
+    assert_eq!(progressed[0].sequence, 1);
+    assert_eq!(store.stats().wal_transactions, 1);
+    assert_eq!(store.stats().preappend_compactions, 1);
     assert!(!store.compaction_due());
     assert!(!store.compact_if_due().expect("no compaction is due"));
-    assert_eq!(committed_offset(&store, 1), 256);
+    assert_eq!(committed_offset(&store, 1), 512);
     drop(store);
 
     let reopened = open(&path);
     assert_eq!(reopened.generation(), 1);
     assert_eq!(reopened.recovery().snapshot_records, 1);
-    assert_eq!(reopened.recovery().transactions_replayed, 0);
-    assert_eq!(committed_offset(&reopened, 1), 256);
+    assert_eq!(reopened.recovery().transactions_replayed, 1);
+    assert_eq!(committed_offset(&reopened, 1), 512);
 }
 
-/// Scenario: byte-driven compaction is configured at one byte on a fresh
-/// WAL, then after its first transaction and again immediately after
-/// compaction.
-/// Guarantees: the fixed 24-byte WAL header never triggers compaction by
-/// itself, while the first transaction crosses the one-byte body threshold
-/// and transaction-count threshold behavior remains independent.
+/// Scenario: a transaction-count-triggered pre-append compaction fails at
+/// every publication boundary.
+/// Guarantees: the triggering transaction is never appended; restart selects
+/// the complete old or compacted generation containing only preexisting state.
+#[test]
+fn preappend_compaction_fault_never_appends_triggering_transaction() {
+    for point in FaultPoint::PUBLICATION {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("namespace");
+        let configured = || StoreOptions {
+            compact_after_transactions: 1,
+            ..options(&path)
+        };
+        let mut seeded = CheckpointStore::open(configured()).unwrap();
+        let _registered = seeded.register_files(vec![registration(1)]).unwrap();
+        drop(seeded);
+
+        let mut store = CheckpointStore::open_with_fault(configured(), point).unwrap();
+        let error = store.register_files(vec![registration(2)]).unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::InjectedFault { point: fired } if fired == point
+        ));
+        assert!(store.table().get(&file_id(1)).is_some());
+        assert!(store.table().get(&file_id(2)).is_none());
+        drop(store);
+
+        let marker_replaced = matches!(
+            point,
+            FaultPoint::AfterMarkerPublish
+                | FaultPoint::BeforeMarkerDirSync
+                | FaultPoint::AfterMarkerDirSync
+        );
+        let reopened = CheckpointStore::open(configured()).unwrap();
+        assert_eq!(reopened.generation(), u64::from(marker_replaced));
+        assert!(reopened.table().get(&file_id(1)).is_some());
+        assert!(reopened.table().get(&file_id(2)).is_none());
+    }
+}
+
+/// Scenario: the complete-WAL byte threshold is tested immediately below and
+/// exactly at one prospective transaction boundary.
+/// Guarantees: the 56-byte header participates in arithmetic, equality is
+/// accepted, and one additional byte requires pre-append compaction.
 #[test]
 fn byte_compaction_threshold_ignores_an_empty_wal_header() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("namespace");
+    let compact_after_bytes = minimum_compact_after_bytes().unwrap();
     let mut store = CheckpointStore::open(StoreOptions {
-        compact_after_bytes: 1,
+        compact_after_bytes,
         compact_after_transactions: u32::MAX,
         ..options(&path)
     })
@@ -3465,22 +3695,18 @@ fn byte_compaction_threshold_ignores_an_empty_wal_header() {
     assert!(!store.compaction_due());
     assert!(!store.compact_if_due().expect("empty WAL is not due"));
 
-    let registered = store
-        .register_files(vec![registration(1)])
-        .expect("first transaction appends");
-    assert!(registered[0].compaction_due);
-    assert!(store.compaction_due());
-
-    store.compact().expect("compaction succeeds");
-    assert_eq!(store.stats().wal_transactions, 0);
-    assert_eq!(store.stats().wal_bytes, WAL_HEADER_LEN as u64);
-    assert!(!store.compaction_due());
-    assert!(!store.compact_if_due().expect("new empty WAL is not due"));
-
-    let progressed = store
-        .commit_progress(vec![progress(1, 0, 1)])
-        .expect("the new WAL's first transaction appends");
-    assert!(progressed[0].compaction_due);
+    let transaction_bytes = Transaction {
+        sequence: 1,
+        operations: vec![Operation::RegisterFile(registration(1))],
+    }
+    .encode()
+    .unwrap()
+    .len() as u64;
+    store.wal_bytes = compact_after_bytes - transaction_bytes;
+    assert!(!store.append_requires_compaction(transaction_bytes).unwrap());
+    store.wal_bytes += 1;
+    assert!(store.append_requires_compaction(transaction_bytes).unwrap());
+    store.wal_bytes = compact_after_bytes;
     assert!(store.compaction_due());
 }
 
@@ -3532,6 +3758,7 @@ fn store_limits_are_derived_from_the_configured_bounds() {
     let defaults = options(&path);
     let expected = StoreLimits::derive(
         defaults.compact_after_bytes,
+        defaults.compact_after_transactions,
         defaults.max_tracked_files,
         defaults.fingerprint_bytes,
     )
@@ -3540,13 +3767,31 @@ fn store_limits_are_derived_from_the_configured_bounds() {
     assert_eq!(store.limits(), expected);
     assert!(expected.max_snapshot_bytes <= ARTIFACT_BYTES_CEILING);
     assert!(expected.max_wal_bytes <= ARTIFACT_BYTES_CEILING);
-    // The WAL cap must leave room for one maximal transaction on top of the
-    // compaction threshold, or a caller that compacts exactly when due
-    // could still be unable to write.
-    assert!(
-        expected.max_wal_bytes >= defaults.compact_after_bytes + expected.max_transaction_bytes
+    assert_eq!(expected.max_wal_bytes, defaults.compact_after_bytes);
+    assert_eq!(
+        expected.max_transaction_bytes + WAL_HEADER_LEN as u64,
+        minimum_compact_after_bytes().unwrap()
+    );
+    assert_eq!(
+        expected.max_wal_transactions,
+        u64::from(defaults.compact_after_transactions)
     );
     drop(store);
+
+    let too_small = dir.path().join("too-small-wal");
+    let refused = CheckpointStore::open(StoreOptions {
+        compact_after_bytes: minimum_compact_after_bytes().unwrap() - 1,
+        ..options(&too_small)
+    })
+    .expect_err("a byte threshold smaller than one fresh transaction is refused");
+    assert!(matches!(
+        refused,
+        StoreError::ResourceBounds {
+            source: super::limits::LimitsError::CompactAfterBytesTooSmall { .. },
+            ..
+        }
+    ));
+    assert!(!too_small.exists(), "the namespace must not be created");
 
     let unbounded = dir.path().join("unbounded");
     let refused = CheckpointStore::open(StoreOptions {
@@ -3567,171 +3812,119 @@ fn store_limits_are_derived_from_the_configured_bounds() {
     assert!(!unbounded_wal.exists(), "the namespace must not be created");
 }
 
-/// Scenario: progress transactions are appended one at a time until the WAL
-/// body, excluding its fixed header, crosses a small compaction threshold.
-/// Guarantees: exactly one transaction takes the WAL body from under the
-/// threshold to at or over it, the WAL never leaves the recovery cap, and
-/// compacting at that point starts an empty WAL whose state reopens intact.
+/// Scenario: test-only accounting places a valid WAL one byte past the point
+/// where the next progress transaction would fit its complete-WAL threshold.
+/// Guarantees: append compacts first, writes sequence one to a fresh bounded
+/// WAL, and recovery observes the complete updated state.
 #[test]
 fn crossing_the_compaction_threshold_keeps_the_wal_within_its_recovery_cap() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("namespace");
+    let compact_after_bytes = minimum_compact_after_bytes().unwrap();
     let mut store = CheckpointStore::open(StoreOptions {
-        compact_after_bytes: 4_096,
+        compact_after_bytes,
         compact_after_transactions: u32::MAX,
         sync_interval: NEVER_ELAPSES,
         ..options(&path)
     })
     .expect("namespace opens");
-    let limits = store.limits();
     let _registered = store
         .register_files(vec![registration(1)])
         .expect("registers");
-
-    let mut offset = 0u64;
-    let mut crossings = 0usize;
-    while !store.compaction_due() {
-        let before = store.stats().wal_bytes;
-        let before_body = before - WAL_HEADER_LEN as u64;
-        assert!(
-            before_body < 4_096,
-            "the loop must stop at the body threshold"
-        );
-        let outcomes = store
-            .commit_progress(vec![progress(1, offset, offset + 64)])
-            .expect("progress succeeds");
-        offset += 64;
-        let after = store.stats().wal_bytes;
-        let after_body = after - WAL_HEADER_LEN as u64;
-        if after_body >= 4_096 {
-            crossings += 1;
-            assert!(outcomes[0].compaction_due);
-        }
-        assert!(
-            after <= limits.max_wal_bytes,
-            "the WAL grew past the cap recovery reads it back with"
-        );
-    }
-    assert_eq!(crossings, 1, "the threshold must be crossed exactly once");
-
-    assert!(store.compact_if_due().expect("compaction succeeds"));
-    assert_eq!(store.generation(), 1);
-    assert_eq!(store.stats().wal_transactions, 0);
-    assert_eq!(committed_offset(&store, 1), offset);
-    drop(store);
-
-    let reopened = open(&path);
-    assert_eq!(reopened.generation(), 1);
-    assert_eq!(committed_offset(&reopened, 1), offset);
-}
-
-/// Scenario: a store whose compaction threshold is the smallest legal one,
-/// asked to append a maximal transaction to a WAL that has been filled to
-/// the point where one no longer fits, then again after compaction.
-/// Guarantees: an append that would push the WAL past the largest WAL this
-/// configuration can recover is refused with the in-memory table and the
-/// WAL untouched, compaction frees the whole budget so the identical
-/// transaction then succeeds, and a WAL filled to that legal maximum still
-/// reopens and replays completely.
-#[test]
-fn an_append_past_the_wal_cap_is_refused_and_succeeds_after_compaction() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().join("namespace");
-    // The smallest legal threshold: compaction is due immediately, so the
-    // only WAL budget a maximal transaction ever has is the one a freshly
-    // compacted generation gives it.
-    let bounded = || StoreOptions {
-        compact_after_bytes: 1,
-        fingerprint_bytes: 16,
-        max_tracked_files: u32::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX) + 128,
-        ..options(&path)
-    };
-    let mut store = CheckpointStore::open(bounded()).expect("namespace opens");
-    let limits = store.limits();
-
-    let maximal: Vec<RegisterFile> = (0..u64::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX))
-        .map(widest_registration)
-        .collect();
-    let maximal_bytes = Transaction {
-        sequence: 1,
-        operations: maximal
-            .clone()
-            .into_iter()
-            .map(Operation::RegisterFile)
-            .collect(),
+    let update = progress(1, 0, 64);
+    let transaction_bytes = Transaction {
+        sequence: store.stats().next_sequence,
+        operations: vec![Operation::UpdateProgress(update.clone())],
     }
     .encode()
-    .expect("the maximal transaction encodes")
+    .unwrap()
     .len() as u64;
-    assert!(maximal_bytes <= limits.max_transaction_bytes);
-
-    // Fill the WAL until one maximal transaction no longer fits within the
-    // cap, using the store's own accounting rather than a hard-coded size.
-    let mut filler = u64::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX);
-    while store.stats().wal_bytes + maximal_bytes <= limits.max_wal_bytes {
-        let _registered = store
-            .register_files(vec![widest_registration(filler)])
-            .expect("registers");
-        filler += 1;
-    }
-    let filled = store.table().len();
-    let bytes_before = store.stats().wal_bytes;
-    let sequence_before = store.stats().next_sequence;
-
-    let refused = store
-        .append(
-            maximal
-                .clone()
-                .into_iter()
-                .map(Operation::RegisterFile)
-                .collect(),
-        )
-        .expect_err("the WAL has no room for a maximal transaction");
-    match refused {
-        StoreError::WalWouldExceedMaximum {
-            wal_bytes,
-            transaction_bytes,
-            max,
-            ..
-        } => {
-            assert_eq!(wal_bytes, bytes_before);
-            assert_eq!(transaction_bytes, maximal_bytes);
-            assert_eq!(max, limits.max_wal_bytes);
-        }
-        other => panic!("expected a WAL capacity refusal, got {other:?}"),
-    }
-    // Nothing advanced: the same transaction can be retried unchanged.
-    assert_eq!(store.stats().wal_bytes, bytes_before);
-    assert_eq!(store.stats().next_sequence, sequence_before);
-    assert_eq!(store.table().len(), filled);
-
-    store.compact().expect("compaction succeeds");
-    let outcomes = store.register_files(maximal).expect("registers");
-    assert_eq!(outcomes.len(), 1);
-    assert_eq!(
-        outcomes[0].operations,
-        usize::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX)
-    );
-    let wal_bytes = store.stats().wal_bytes;
-    assert!(wal_bytes <= limits.max_wal_bytes);
-    assert_eq!(
-        wal_bytes,
-        fs::metadata(path.join(wal_file_name(1)))
-            .expect("wal metadata")
-            .len()
-    );
-    let tracked = store.table().len();
-    assert_eq!(
-        tracked,
-        filled + usize::from(WAL_MAX_NON_PROGRESS_OPS_PER_TX)
-    );
+    store.wal_bytes = compact_after_bytes - transaction_bytes + 1;
+    let outcomes = store.commit_progress(vec![update]).unwrap();
+    assert_eq!(store.generation(), 1);
+    assert_eq!(outcomes[0].sequence, 1);
+    assert_eq!(store.stats().wal_transactions, 1);
+    assert_eq!(store.stats().preappend_compactions, 1);
+    assert!(store.stats().wal_bytes <= compact_after_bytes);
+    assert_eq!(committed_offset(&store, 1), 64);
     drop(store);
 
-    let reopened =
-        CheckpointStore::open(bounded()).expect("a WAL filled to its legal maximum reopens");
-    assert_eq!(reopened.table().len(), tracked);
-    assert_eq!(reopened.recovery().transactions_replayed, 1);
-    assert_eq!(reopened.recovery().torn_tail_bytes, 0);
+    let reopened = CheckpointStore::open(StoreOptions {
+        compact_after_bytes,
+        compact_after_transactions: u32::MAX,
+        sync_interval: NEVER_ELAPSES,
+        ..options(&path)
+    })
+    .unwrap();
+    assert_eq!(reopened.generation(), 1);
+    assert_eq!(committed_offset(&reopened, 1), 64);
+}
+
+/// Scenario: an invalid progress operation is submitted when its encoded
+/// transaction would require pre-append compaction.
+/// Guarantees: deterministic replay validation fails before compaction, so
+/// invalid input cannot publish a new generation as a side effect.
+#[test]
+fn invalid_append_is_rejected_before_required_compaction() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    let compact_after_bytes = minimum_compact_after_bytes().unwrap();
+    let mut store = CheckpointStore::open(StoreOptions {
+        compact_after_bytes,
+        ..options(&path)
+    })
+    .unwrap();
+    let _registered = store.register_files(vec![registration(1)]).unwrap();
+    let stale = progress(1, 99, 100);
+    let transaction_bytes = Transaction {
+        sequence: store.stats().next_sequence,
+        operations: vec![Operation::UpdateProgress(stale.clone())],
+    }
+    .encode()
+    .unwrap()
+    .len() as u64;
+    store.wal_bytes = compact_after_bytes - transaction_bytes + 1;
+    let generation_before = store.generation();
+    let table_before = store.table().clone();
+
+    let error = store.commit_progress(vec![stale]).unwrap_err();
+    assert!(matches!(error, StoreError::Apply { .. }));
+    assert_eq!(store.generation(), generation_before);
+    assert_eq!(store.stats().preappend_compactions, 0);
+    assert_eq!(store.table(), &table_before);
+}
+
+/// Scenario: a valid two-transaction WAL is reopened with a transaction
+/// threshold of one while its byte length remains below the derived byte cap.
+/// Guarantees: recovery enforces the interacting transaction-count maximum
+/// independently of artifact length and never replays the extra transaction.
+#[test]
+fn recovery_rejects_wal_past_transaction_threshold() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    let mut store = CheckpointStore::open(StoreOptions {
+        compact_after_transactions: 2,
+        ..options(&path)
+    })
+    .unwrap();
+    let _registered = store.register_files(vec![registration(1)]).unwrap();
+    let _progressed = store.commit_progress(vec![progress(1, 0, 64)]).unwrap();
+    assert_eq!(store.stats().wal_transactions, 2);
+    drop(store);
+
+    let error = CheckpointStore::open(StoreOptions {
+        compact_after_transactions: 1,
+        ..options(&path)
+    })
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::RecoveredWalTransactionsExceedMaximum {
+            transactions: 2,
+            max: 1,
+            ..
+        }
+    ));
 }
 
 /// Scenario: a namespace whose WAL, and one whose snapshot, is larger than
@@ -4750,11 +4943,10 @@ fn checkpoint_recovery_stress_reports_latency_and_peak_memory() {
 
 /// Scenario: store options built with `StoreOptions::from_runtime_config`
 /// from validated receiver configurations -- the shipped defaults, the
-/// largest recoverable fingerprint window and tracked-file
-/// population, and the largest recoverable compaction threshold -- each
-/// used to create, write to, and reopen a namespace.
-/// Guarantees: options carry the resolved namespace identity and all three
-/// size knobs from one validated configuration, and every configuration
+/// largest recoverable fingerprint window and tracked-file population, the
+/// largest recoverable byte threshold, and the largest transaction threshold.
+/// Guarantees: options carry the resolved namespace identity and all four
+/// durable-size knobs from one validated configuration, and every configuration
 /// that validates can create a namespace, write to it, and recover it, so
 /// no legal configuration -- including each size boundary -- produces a
 /// namespace its own store cannot reopen.
@@ -4763,12 +4955,14 @@ fn every_legal_configuration_creates_a_namespace_that_reopens() {
     let default_tracked_files = LimitsConfig::default().max_tracked_files;
     let default_fingerprint_bytes = IdentityConfig::default().fingerprint_bytes;
     let default_compact_after_bytes = CheckpointConfig::default().compact_after_bytes;
+    let default_compact_after_transactions = CheckpointConfig::default().compact_after_transactions;
     let boundary_files = u32::try_from(largest_accepted(
         u64::from(default_tracked_files),
         u64::from(u32::MAX),
         |candidate| {
             StoreLimits::derive(
                 default_compact_after_bytes,
+                default_compact_after_transactions,
                 candidate as u32,
                 default_fingerprint_bytes,
             )
@@ -4780,7 +4974,13 @@ fn every_legal_configuration_creates_a_namespace_that_reopens() {
         default_compact_after_bytes,
         ARTIFACT_BYTES_CEILING,
         |candidate| {
-            StoreLimits::derive(candidate, default_tracked_files, default_fingerprint_bytes).is_ok()
+            StoreLimits::derive(
+                candidate,
+                default_compact_after_transactions,
+                default_tracked_files,
+                default_fingerprint_bytes,
+            )
+            .is_ok()
         },
     );
     let boundary_fingerprint = largest_accepted(
@@ -4789,6 +4989,7 @@ fn every_legal_configuration_creates_a_namespace_that_reopens() {
         |candidate| {
             StoreLimits::derive(
                 default_compact_after_bytes,
+                default_compact_after_transactions,
                 default_tracked_files,
                 candidate,
             )
@@ -4820,6 +5021,12 @@ fn every_legal_configuration_creates_a_namespace_that_reopens() {
                 config.checkpoint.compact_after_bytes = boundary_bytes;
             }),
         ),
+        (
+            "largest-transaction-threshold",
+            Box::new(|config: &mut Config| {
+                config.checkpoint.compact_after_transactions = u32::MAX;
+            }),
+        ),
     ];
 
     let dir = tempfile::tempdir().expect("temp dir");
@@ -4846,6 +5053,10 @@ fn every_legal_configuration_creates_a_namespace_that_reopens() {
         assert_eq!(
             options.compact_after_bytes,
             runtime.checkpoint.compact_after_bytes
+        );
+        assert_eq!(
+            options.compact_after_transactions,
+            runtime.checkpoint.compact_after_transactions
         );
         assert_eq!(options.max_tracked_files, runtime.limits.max_tracked_files);
         assert_eq!(

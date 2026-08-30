@@ -226,6 +226,9 @@ fn store_options(args: CheckpointNamespaceArgs) -> Result<StoreOptions, CliError
     if let Some(compact_after_bytes) = args.compact_after_bytes {
         options.compact_after_bytes = compact_after_bytes;
     }
+    if let Some(compact_after_transactions) = args.compact_after_transactions {
+        options.compact_after_transactions = compact_after_transactions;
+    }
     if let Some(max_tracked_files) = args.max_tracked_files {
         options.max_tracked_files = max_tracked_files;
     }
