@@ -23,11 +23,11 @@
 //! [`store`] blocks and must run on the receiver's dedicated
 //! read/checkpoint OS thread, never in async code.
 //!
-//! [`admin`] provides exclusive synchronous inspection, evidence backup,
-//! audited quarantine mutations, and explicit whole-namespace reset for an
-//! existing namespace, including a backup/reset-only path for corrupt
-//! authority. It reuses the store's bounded recovery, append, and
-//! generation-publication paths while retaining one namespace lock.
+//! [`admin`] provides exclusive synchronous inspection, evidence backup, and
+//! audited per-file quarantine mutations for an existing namespace. Invalid
+//! authority can be validated and backed up, but it cannot be replaced. The
+//! administration paths retain one namespace lock and reuse bounded store
+//! validation and append behavior.
 //!
 //! Locators are represented purely as normalized data ([`primitives::Locator`])
 //! with no OS FFI, so this module and its tests compile and run identically
@@ -51,13 +51,12 @@ mod tests;
 
 pub use admin::{
     AdvisoryPathKindReport, AdvisoryPathReport, AuditMetadata, CheckpointAdminError,
-    CheckpointAdminSession, CheckpointInspectionReport, CheckpointLifecycleReport,
-    CheckpointNamespaceResetSession, CommittedFrontierGuardReport, DataEffect,
+    CheckpointAdminSession, CheckpointEvidenceSession, CheckpointInspectionReport,
+    CheckpointLifecycleReport, CommittedFrontierGuardReport, DataEffect,
     EVIDENCE_BACKUP_MANIFEST_FILE_NAME, EVIDENCE_BACKUP_MANIFEST_VERSION, EvidenceArtifact,
     EvidenceArtifactRole, EvidenceBackupManifest, ExpectedQuarantineState, FileMutationResult,
     FramingResumeReport, KeepFailedRequest, LocatorReport, NAMESPACE_VALIDATION_DETAIL_MAX_BYTES,
     NamespaceAuthorityFailureKind, NamespaceAuthorityFailureReport, NamespaceAuthorityReport,
-    NamespaceResetConsequence, NamespaceResetReport, NamespaceResetRequest, NamespaceResetResult,
     NamespaceValidationReport, NativePathKindReport, NativePathReport, QuarantineInspectionReport,
     QuarantineMutationAction, QuarantinedFileTarget, RemovalConsequence, RemoveQuarantinedRequest,
     ResetToBeginningRequest, ResetToEndEvidenceReport, ResetToEndRequest,

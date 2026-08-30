@@ -136,7 +136,7 @@ dfctl commands
 dfctl schemas [schema-name]
 dfctl config view
 dfctl filelog checkpoint inspect|validate|backup
-dfctl filelog checkpoint reset beginning|end|keep-failed|namespace
+dfctl filelog checkpoint reset beginning|end|keep-failed
 dfctl filelog checkpoint remove
 dfctl engine status|livez|readyz
 dfctl groups describe|status|shutdown
@@ -318,25 +318,17 @@ dfctl filelog checkpoint remove \
   --acknowledge-duplicate-or-loss
 ```
 
-### Whole-namespace reset
+### Corrupt or missing authority
 
-Whole-namespace reset works for valid, missing-authority, and corrupt
-namespaces. It always creates and verifies a new evidence backup before
-publishing a complete empty authority:
+`validate` and `backup` remain available when `CURRENT` is missing or corrupt,
+or when its selected generation cannot be validated. They retain the exclusive
+namespace lock while reporting and copying bounded evidence.
 
-```bash
-dfctl filelog checkpoint reset namespace \
-  --state-dir /var/lib/otel-arrow \
-  --checkpoint-id app-logs \
-  --backup-destination ./app-logs-reset-evidence \
-  --acknowledge duplicate-possible \
-  --reason "replace corrupt checkpoint authority"
-```
-
-Use `--acknowledge loss-accepted` instead when later registration is
-intentionally expected to skip existing source bytes. Reset never salvages a
-corrupt WAL prefix, never repoints `CURRENT` to an older generation, and never
-edits checkpoint bytes in place.
+`inspect` and every per-file mutation require valid authority. `dfctl` does not
+provide a whole-namespace reset, delete, recreate, salvage, or rollback command.
+Do not manually repoint `CURRENT` or edit checkpoint artifacts in place.
+Preserve an evidence backup and use only a separately reviewed crash-safe
+recovery procedure.
 
 ### Nondefault recovery bounds
 

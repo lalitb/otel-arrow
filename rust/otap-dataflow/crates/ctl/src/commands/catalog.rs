@@ -475,9 +475,6 @@ fn curated_examples(path: &[String]) -> Vec<String> {
         ["filelog", "checkpoint", "reset", "keep-failed"] => vec![command_example(
             "filelog checkpoint reset keep-failed --state-dir ./state --checkpoint-id app-logs --file-id 00112233445566778899aabbccddeeff --expected-epoch 1 --reason investigate",
         )],
-        ["filelog", "checkpoint", "reset", "namespace"] => vec![command_example(
-            "filelog checkpoint reset namespace --state-dir ./state --checkpoint-id app-logs --backup-destination ./checkpoint-evidence --acknowledge duplicate-possible --reason rebuild",
-        )],
         ["filelog", "checkpoint", "remove"] => vec![command_example(
             "filelog checkpoint remove --state-dir ./state --checkpoint-id app-logs --file-id 00112233445566778899aabbccddeeff --expected-epoch 1 --removal-reason-code 8 --reason remove --acknowledge-duplicate-or-loss",
         )],
@@ -648,7 +645,6 @@ fn is_mutation(path: &[String]) -> bool {
             | ["filelog", "checkpoint", "reset", "beginning"]
             | ["filelog", "checkpoint", "reset", "end"]
             | ["filelog", "checkpoint", "reset", "keep-failed"]
-            | ["filelog", "checkpoint", "reset", "namespace"]
             | ["filelog", "checkpoint", "remove"]
             | ["groups", "shutdown"]
             | ["pipelines", "reconfigure"]
@@ -729,7 +725,6 @@ fn safety(path: &[String]) -> SafetyLevel {
     {
         ["filelog", "checkpoint", "reset", "beginning"]
         | ["filelog", "checkpoint", "reset", "end"]
-        | ["filelog", "checkpoint", "reset", "namespace"]
         | ["filelog", "checkpoint", "remove"] => SafetyLevel::Destructive,
         ["filelog", "checkpoint", "reset", "keep-failed"] => SafetyLevel::HighImpact,
         ["filelog", "checkpoint", "backup"] => SafetyLevel::LowImpact,
@@ -1289,8 +1284,8 @@ mod tests {
         let reset = catalog
             .commands
             .iter()
-            .find(|command| command.path == ["filelog", "checkpoint", "reset", "namespace"])
-            .expect("filelog namespace reset command");
+            .find(|command| command.path == ["filelog", "checkpoint", "reset", "beginning"])
+            .expect("filelog reset-to-beginning command");
 
         assert!(!validate.requires_admin_client);
         assert!(!validate.mutation);
@@ -1323,7 +1318,7 @@ mod tests {
             reset
                 .examples
                 .iter()
-                .any(|example| { example.contains("--acknowledge duplicate-possible") })
+                .any(|example| { example.contains("--acknowledge-duplicates") })
         );
 
         let remove = catalog
@@ -1353,7 +1348,6 @@ mod tests {
                         "<EPOCH>" => "1",
                         "<TEXT>" => "reason",
                         "<PATH>" => "source.log",
-                        "<CONSEQUENCE>" => "duplicate-possible",
                         "<CODE>" => "8",
                         other => other,
                     })

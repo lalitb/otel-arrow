@@ -1852,231 +1852,14 @@ fn reset_to_end_rejects_fifo_and_nonregular_sources_without_append() {
     assert_eq!(fs::read(wal_path).unwrap(), before);
 }
 
-/// Scenario: a populated generation 1, a retained generation 0, and a
-/// recognized generation-9 temporary artifact are reset after keep-failed
-/// converts the session to append mode.
-/// Guarantees: a verified new backup is required, generation 10 is
-/// published empty, every old artifact remains as evidence, the same lock is
-/// retained, the live session switches authority, and restart selects 10.
+/// Scenario: the selected generation has a structurally complete WAL with a
+/// corrupt transaction checksum, so ordinary administration fails closed.
+/// Guarantees: exclusive evidence administration reports the bounded failure,
+/// preserves an exact backup, and never replaces or mutates corrupt authority.
 #[test]
-fn namespace_reset_backs_up_and_publishes_above_every_recognized_generation() {
+fn corrupt_authority_can_be_validated_and_backed_up_without_replacement() {
     let root = tempfile::tempdir().unwrap();
-    let source = root.path().join("source.log");
-    fs::write(&source, vec![b'r'; 96]).unwrap();
-    let store_options = options(&root.path().join("state"), "namespace-reset");
-    let _ = seed_quarantined_source(
-        &store_options,
-        &source,
-        13,
-        0,
-        FramingResume::Clean,
-        AdvisoryPath::unavailable(),
-    );
-    let mut store = CheckpointStore::open(store_options.clone()).unwrap();
-    store.compact().unwrap();
-    assert_eq!(store.generation(), 1);
-    drop(store);
-    let future_temp = store_options
-        .namespace_dir
-        .join(temp_file_name(&wal_file_name(9), PublicationRole::Compact));
-    fs::write(&future_temp, b"recognized future evidence").unwrap();
-    let old_names = directory_names(&store_options.namespace_dir);
-
-    let mut session = CheckpointAdminSession::open(store_options.clone()).unwrap();
-    let _ = session
-        .keep_failed(keep_request(13, 1, "confirm still blocked"))
-        .unwrap();
-    let backup = root.path().join("reset-evidence");
-    let result = session
-        .reset_namespace(NamespaceResetRequest {
-            backup_destination: backup.clone(),
-            consequence: NamespaceResetConsequence::AcknowledgeDuplicatePossible,
-            audit: mutation_audit("discard complete namespace", 6_000),
-        })
-        .unwrap();
-    assert_eq!(result.reset_report.old_generation, Some(1));
-    assert_eq!(result.reset_report.new_generation, 10);
-    assert_eq!(
-        result.reset_report.retained_evidence_generations,
-        vec![0, 1, 9]
-    );
-    assert_eq!(
-        result.reset_report.data_effect,
-        DataEffect::DuplicatePossible
-    );
-    assert_eq!(result.reset_report.old_tracked_file_count, Some(1));
-    assert_eq!(result.reset_report.old_quarantine_count, Some(1));
-    assert_eq!(result.reset_report.new_tracked_file_count, 0);
-    assert_eq!(result.reset_report.new_quarantine_count, 0);
-    assert_eq!(session.validation().selected_generation, 10);
-    assert_eq!(session.validation().tracked_file_count, 0);
-    assert_eq!(
-        serde_json::from_slice::<NamespaceResetResult>(&serde_json::to_vec(&result).unwrap())
-            .unwrap(),
-        result
-    );
-    for old_name in old_names {
-        assert!(
-            store_options.namespace_dir.join(old_name).exists(),
-            "pre-reset artifact was removed"
-        );
-    }
-    assert!(future_temp.exists());
-    assert!(
-        store_options
-            .namespace_dir
-            .join(snapshot_file_name(10))
-            .is_file()
-    );
-    assert!(
-        store_options
-            .namespace_dir
-            .join(wal_file_name(10))
-            .is_file()
-    );
-    assert!(backup.join(EVIDENCE_BACKUP_MANIFEST_FILE_NAME).is_file());
-    assert!(matches!(
-        CheckpointStore::open(store_options.clone()),
-        Err(StoreError::NamespaceLocked { .. })
-    ));
-    session.release().unwrap();
-
-    let reopened = CheckpointStore::open(store_options).unwrap();
-    assert_eq!(reopened.generation(), 10);
-    assert!(reopened.table().is_empty());
-}
-
-/// Scenario: an untouched read-only administration session resets an empty
-/// generation 0 namespace with explicit loss acknowledgement.
-/// Guarantees: the non-append session path publishes generation 1, updates
-/// its live inspection to the new empty authority, and returns the verified
-/// backup and loss consequence before releasing the retained lock.
-#[test]
-fn namespace_reset_from_read_only_session_updates_live_authority() {
-    let root = tempfile::tempdir().unwrap();
-    let store_options = options(&root.path().join("state"), "read-only-reset");
-    drop(CheckpointStore::open(store_options.clone()).unwrap());
-
-    let mut session = CheckpointAdminSession::open(store_options.clone()).unwrap();
-    let result = session
-        .reset_namespace(NamespaceResetRequest {
-            backup_destination: root.path().join("read-only-reset-evidence"),
-            consequence: NamespaceResetConsequence::AcknowledgeLossAccepted,
-            audit: mutation_audit("replace empty authority", 8_000),
-        })
-        .unwrap();
-    assert_eq!(result.reset_report.old_generation, Some(0));
-    assert_eq!(result.reset_report.new_generation, 1);
-    assert_eq!(result.reset_report.data_effect, DataEffect::LossAccepted);
-    assert_eq!(session.validation().selected_generation, 1);
-    assert_eq!(session.validation().tracked_file_count, 0);
-    assert!(matches!(
-        CheckpointStore::open(store_options.clone()),
-        Err(StoreError::NamespaceLocked { .. })
-    ));
-    session.release().unwrap();
-
-    let reopened = CheckpointStore::open(store_options).unwrap();
-    assert_eq!(reopened.generation(), 1);
-    assert!(reopened.table().is_empty());
-}
-
-/// Scenario: whole-namespace reset is given an existing backup destination,
-/// an empty audit reason, a recognized u64::MAX generation artifact, and a
-/// full bounded final-generation inventory.
-/// Guarantees: backup creation and explicit audit are hard preconditions,
-/// generation arithmetic and recoverable generation count are checked, and
-/// none of the failures repoints CURRENT or appends to the authoritative WAL.
-#[test]
-fn namespace_reset_requires_new_backup_audit_and_nonoverflowing_generation() {
-    let root = tempfile::tempdir().unwrap();
-    let store_options = options(&root.path().join("state"), "reset-preconditions");
-    drop(CheckpointStore::open(store_options.clone()).unwrap());
-    let current_path = store_options.namespace_dir.join(CURRENT_FILE_NAME);
-    let current_before = fs::read(&current_path).unwrap();
-    let wal_path = store_options.namespace_dir.join(wal_file_name(0));
-    let wal_before = fs::read(&wal_path).unwrap();
-    let existing_backup = root.path().join("existing-backup");
-    fs::create_dir(&existing_backup).unwrap();
-
-    let mut session = CheckpointAdminSession::open(store_options.clone()).unwrap();
-    assert!(matches!(
-        session.reset_namespace(NamespaceResetRequest {
-            backup_destination: existing_backup,
-            consequence: NamespaceResetConsequence::AcknowledgeLossAccepted,
-            audit: mutation_audit("reset", 1),
-        }),
-        Err(CheckpointAdminError::BackupDestinationExists { .. })
-    ));
-    assert!(matches!(
-        session.reset_namespace(NamespaceResetRequest {
-            backup_destination: root.path().join("empty-audit-backup"),
-            consequence: NamespaceResetConsequence::AcknowledgeLossAccepted,
-            audit: mutation_audit("", 1),
-        }),
-        Err(CheckpointAdminError::AuditReasonRequired { .. })
-    ));
-    let max_artifact = store_options.namespace_dir.join(temp_file_name(
-        &wal_file_name(u64::MAX),
-        PublicationRole::Compact,
-    ));
-    fs::write(&max_artifact, b"max generation evidence").unwrap();
-    let overflow_backup = root.path().join("overflow-backup");
-    assert!(matches!(
-        session.reset_namespace(NamespaceResetRequest {
-            backup_destination: overflow_backup.clone(),
-            consequence: NamespaceResetConsequence::AcknowledgeLossAccepted,
-            audit: mutation_audit("overflow check", 2),
-        }),
-        Err(CheckpointAdminError::Store(
-            StoreError::GenerationOverflow {
-                generation: u64::MAX
-            }
-        ))
-    ));
-    assert!(!overflow_backup.exists());
-    fs::remove_file(max_artifact).unwrap();
-    for generation in [1, 2] {
-        fs::write(
-            store_options
-                .namespace_dir
-                .join(snapshot_file_name(generation)),
-            b"retained snapshot evidence",
-        )
-        .unwrap();
-        fs::write(
-            store_options.namespace_dir.join(wal_file_name(generation)),
-            b"retained WAL evidence",
-        )
-        .unwrap();
-    }
-    let capacity_backup = root.path().join("generation-capacity-backup");
-    assert!(matches!(
-        session.reset_namespace(NamespaceResetRequest {
-            backup_destination: capacity_backup.clone(),
-            consequence: NamespaceResetConsequence::AcknowledgeLossAccepted,
-            audit: mutation_audit("bounded generation inventory", 3),
-        }),
-        Err(CheckpointAdminError::NamespaceResetGenerationCapacity {
-            generations: MAX_GENERATIONS_ON_DISK,
-            max: MAX_GENERATIONS_ON_DISK,
-        })
-    ));
-    assert!(!capacity_backup.exists());
-    assert_eq!(fs::read(current_path).unwrap(), current_before);
-    assert_eq!(fs::read(wal_path).unwrap(), wal_before);
-}
-
-/// Scenario: a structurally complete authoritative WAL has a corrupted
-/// transaction checksum, so ordinary administration and runtime recovery
-/// both fail closed.
-/// Guarantees: the namespace-reset session retains exclusive ownership,
-/// records the selected-generation validation failure, backs up the exact
-/// corrupt bytes, and publishes only a higher complete empty authority.
-#[test]
-fn corrupt_namespace_can_be_backed_up_and_reset_without_salvage() {
-    let root = tempfile::tempdir().unwrap();
-    let store_options = options(&root.path().join("state"), "corrupt-reset");
+    let store_options = options(&root.path().join("state"), "corrupt-evidence");
     let mut store = CheckpointStore::open(store_options.clone()).unwrap();
     let _ = store
         .register_files(vec![registration(31, AdvisoryPath::unavailable())])
@@ -2085,12 +1868,12 @@ fn corrupt_namespace_can_be_backed_up_and_reset_without_salvage() {
 
     let wal_path = store_options.namespace_dir.join(wal_file_name(0));
     let mut corrupt_wal = fs::read(&wal_path).unwrap();
-    let last = corrupt_wal.last_mut().unwrap();
-    *last ^= 0x80;
+    *corrupt_wal.last_mut().unwrap() ^= 0x80;
     fs::write(&wal_path, &corrupt_wal).unwrap();
     assert!(CheckpointAdminSession::open(store_options.clone()).is_err());
+    let source_before = filesystem_state(&store_options.namespace_dir);
 
-    let mut session = CheckpointNamespaceResetSession::open(store_options.clone()).unwrap();
+    let session = CheckpointEvidenceSession::open(store_options.clone()).unwrap();
     assert!(matches!(
         session.authority(),
         NamespaceAuthorityReport::Invalid {
@@ -2102,21 +1885,19 @@ fn corrupt_namespace_can_be_backed_up_and_reset_without_salvage() {
             }
         }
     ));
+    assert_eq!(
+        filesystem_state(&store_options.namespace_dir),
+        source_before
+    );
     assert!(matches!(
         CheckpointStore::open(store_options.clone()),
         Err(StoreError::NamespaceLocked { .. })
     ));
 
-    let backup = root.path().join("corrupt-evidence");
-    let result = session
-        .reset_namespace(NamespaceResetRequest {
-            backup_destination: backup.clone(),
-            consequence: NamespaceResetConsequence::AcknowledgeDuplicatePossible,
-            audit: mutation_audit("discard corrupt authority", 9_000),
-        })
-        .unwrap();
+    let backup = root.path().join("corrupt-backup");
+    let manifest = session.backup(&backup).unwrap();
     assert!(matches!(
-        &result.backup_manifest.authority,
+        manifest.authority,
         NamespaceAuthorityReport::Invalid {
             failure: NamespaceAuthorityFailureReport {
                 kind: NamespaceAuthorityFailureKind::SelectedGenerationInvalid,
@@ -2129,32 +1910,38 @@ fn corrupt_namespace_can_be_backed_up_and_reset_without_salvage() {
         fs::read(backup.join(wal_file_name(0))).unwrap(),
         corrupt_wal
     );
-    assert_eq!(result.reset_report.old_generation, Some(0));
-    assert_eq!(result.reset_report.old_tracked_file_count, None);
-    assert_eq!(result.reset_report.old_quarantine_count, None);
-    assert_eq!(result.reset_report.new_generation, 1);
-    assert_eq!(result.reset_report.retained_evidence_generations, vec![0]);
-    assert!(matches!(
-        session.authority(),
-        NamespaceAuthorityReport::Valid { validation }
-            if validation.selected_generation == 1 && validation.tracked_file_count == 0
-    ));
+    assert_eq!(
+        filesystem_state(&store_options.namespace_dir),
+        source_before
+    );
     session.release().unwrap();
 
-    let reopened = CheckpointStore::open(store_options).unwrap();
-    assert_eq!(reopened.generation(), 1);
-    assert!(reopened.table().is_empty());
+    let reopened = CheckpointEvidenceSession::open(store_options.clone()).unwrap();
+    assert!(matches!(
+        reopened.authority(),
+        NamespaceAuthorityReport::Invalid {
+            failure: NamespaceAuthorityFailureReport {
+                kind: NamespaceAuthorityFailureKind::SelectedGenerationInvalid,
+                selected_generation: Some(0),
+                ..
+            }
+        }
+    ));
+    reopened.release().unwrap();
+    assert_eq!(
+        filesystem_state(&store_options.namespace_dir),
+        source_before
+    );
 }
 
 /// Scenario: durable generation zero contains state but its authoritative
 /// `CURRENT` marker is missing.
-/// Guarantees: the namespace-reset session reports the authority gap,
-/// preserves every surviving recognized artifact without inventing a
-/// selected generation, and publishes a higher complete empty authority.
+/// Guarantees: exclusive evidence administration records the authority gap,
+/// backs up every surviving artifact, and neither invents nor publishes authority.
 #[test]
-fn missing_current_namespace_can_be_backed_up_and_reset() {
+fn missing_current_can_be_validated_and_backed_up_without_replacement() {
     let root = tempfile::tempdir().unwrap();
-    let store_options = options(&root.path().join("state"), "missing-current-reset");
+    let store_options = options(&root.path().join("state"), "missing-current-evidence");
     let mut store = CheckpointStore::open(store_options.clone()).unwrap();
     let _ = store
         .register_files(vec![registration(32, AdvisoryPath::unavailable())])
@@ -2162,8 +1949,9 @@ fn missing_current_namespace_can_be_backed_up_and_reset() {
     drop(store);
     fs::remove_file(store_options.namespace_dir.join(CURRENT_FILE_NAME)).unwrap();
     assert!(CheckpointAdminSession::open(store_options.clone()).is_err());
+    let source_before = filesystem_state(&store_options.namespace_dir);
 
-    let mut session = CheckpointNamespaceResetSession::open(store_options.clone()).unwrap();
+    let session = CheckpointEvidenceSession::open(store_options.clone()).unwrap();
     assert!(matches!(
         session.authority(),
         NamespaceAuthorityReport::Invalid {
@@ -2174,19 +1962,20 @@ fn missing_current_namespace_can_be_backed_up_and_reset() {
             }
         }
     ));
-    let backup = root.path().join("missing-current-evidence");
-    let result = session
-        .reset_namespace(NamespaceResetRequest {
-            backup_destination: backup.clone(),
-            consequence: NamespaceResetConsequence::AcknowledgeLossAccepted,
-            audit: mutation_audit("replace authority gap", 10_000),
-        })
-        .unwrap();
-    assert_eq!(result.reset_report.old_generation, None);
-    assert_eq!(result.reset_report.new_generation, 1);
+    let backup = root.path().join("missing-current-backup");
+    let manifest = session.backup(&backup).unwrap();
+    assert!(matches!(
+        manifest.authority,
+        NamespaceAuthorityReport::Invalid {
+            failure: NamespaceAuthorityFailureReport {
+                kind: NamespaceAuthorityFailureKind::MissingCurrent,
+                selected_generation: None,
+                ..
+            }
+        }
+    ));
     assert!(
-        !result
-            .backup_manifest
+        !manifest
             .artifacts
             .iter()
             .any(|artifact| artifact.role == EvidenceArtifactRole::Current)
@@ -2194,30 +1983,44 @@ fn missing_current_namespace_can_be_backed_up_and_reset() {
     assert!(backup.join(snapshot_file_name(0)).is_file());
     assert!(backup.join(wal_file_name(0)).is_file());
     assert!(!backup.join(CURRENT_FILE_NAME).exists());
+    assert_eq!(
+        filesystem_state(&store_options.namespace_dir),
+        source_before
+    );
     session.release().unwrap();
 
-    let reopened = CheckpointStore::open(store_options).unwrap();
-    assert_eq!(reopened.generation(), 1);
-    assert!(reopened.table().is_empty());
+    let reopened = CheckpointEvidenceSession::open(store_options.clone()).unwrap();
+    assert!(matches!(
+        reopened.authority(),
+        NamespaceAuthorityReport::Invalid {
+            failure: NamespaceAuthorityFailureReport {
+                kind: NamespaceAuthorityFailureKind::MissingCurrent,
+                selected_generation: None,
+                ..
+            }
+        }
+    ));
+    reopened.release().unwrap();
+    assert_eq!(
+        filesystem_state(&store_options.namespace_dir),
+        source_before
+    );
 }
 
 /// Scenario: valid `CURRENT` bytes name a missing generation above every
 /// surviving recognized artifact.
-/// Guarantees: recovery records the decoded generation, publishes strictly
-/// above it, and reports only generations with actual retained artifacts as
-/// evidence.
+/// Guarantees: validation retains the decoded generation in bounded evidence,
+/// backup preserves only real artifacts, and `CURRENT` remains unchanged.
 #[test]
-fn missing_selected_generation_reset_stays_monotonic_without_invented_evidence() {
+fn missing_selected_generation_can_be_backed_up_without_replacement() {
     let root = tempfile::tempdir().unwrap();
-    let store_options = options(&root.path().join("state"), "missing-selected-reset");
+    let store_options = options(&root.path().join("state"), "missing-selected-evidence");
     drop(CheckpointStore::open(store_options.clone()).unwrap());
-    fs::write(
-        store_options.namespace_dir.join(CURRENT_FILE_NAME),
-        encode_current_marker(99),
-    )
-    .unwrap();
+    let marker = encode_current_marker(99);
+    fs::write(store_options.namespace_dir.join(CURRENT_FILE_NAME), &marker).unwrap();
+    let source_before = filesystem_state(&store_options.namespace_dir);
 
-    let mut session = CheckpointNamespaceResetSession::open(store_options.clone()).unwrap();
+    let session = CheckpointEvidenceSession::open(store_options.clone()).unwrap();
     assert!(matches!(
         session.authority(),
         NamespaceAuthorityReport::Invalid {
@@ -2228,290 +2031,41 @@ fn missing_selected_generation_reset_stays_monotonic_without_invented_evidence()
             }
         }
     ));
-    let result = session
-        .reset_namespace(NamespaceResetRequest {
-            backup_destination: root.path().join("missing-selected-evidence"),
-            consequence: NamespaceResetConsequence::AcknowledgeDuplicatePossible,
-            audit: mutation_audit("replace missing selected generation", 11_000),
-        })
-        .unwrap();
-    assert_eq!(result.reset_report.old_generation, Some(99));
-    assert_eq!(result.reset_report.new_generation, 100);
-    assert_eq!(result.reset_report.retained_evidence_generations, vec![0]);
+    let backup = root.path().join("missing-selected-backup");
+    let manifest = session.backup(&backup).unwrap();
+    assert!(matches!(
+        manifest.authority,
+        NamespaceAuthorityReport::Invalid {
+            failure: NamespaceAuthorityFailureReport {
+                kind: NamespaceAuthorityFailureKind::SelectedGenerationInvalid,
+                selected_generation: Some(99),
+                ..
+            }
+        }
+    ));
+    assert!(backup.join(snapshot_file_name(0)).is_file());
+    assert!(backup.join(wal_file_name(0)).is_file());
+    assert_eq!(fs::read(backup.join(CURRENT_FILE_NAME)).unwrap(), marker);
+    assert_eq!(
+        filesystem_state(&store_options.namespace_dir),
+        source_before
+    );
     session.release().unwrap();
 
-    let reopened = CheckpointStore::open(store_options).unwrap();
-    assert_eq!(reopened.generation(), 100);
-    assert!(reopened.table().is_empty());
-}
-
-/// Scenario: whole-namespace reset fails at each snapshot, WAL, marker, and
-/// directory-sync publication boundary.
-/// Guarantees: reopening selects generation 1 with the complete old table or
-/// generation 2 with the complete new empty table, never retained generation
-/// 0 or a mixed pair; marker-uncertain live sessions refuse further work.
-#[test]
-fn namespace_reset_faults_recover_only_old_or_new_complete_authority() {
-    for point in FaultPoint::PUBLICATION {
-        let root = tempfile::tempdir().unwrap();
-        let source = root.path().join("source.log");
-        fs::write(&source, vec![b'p'; 96]).unwrap();
-        let store_options = options(
-            &root.path().join("state"),
-            &format!("reset-fault-{}", point.as_str()),
-        );
-        let _ = seed_quarantined_source(
-            &store_options,
-            &source,
-            14,
-            0,
-            FramingResume::Clean,
-            AdvisoryPath::unavailable(),
-        );
-        let mut store = CheckpointStore::open(store_options.clone()).unwrap();
-        store.compact().unwrap();
-        assert_eq!(store.generation(), 1);
-        drop(store);
-
-        let mut session =
-            CheckpointAdminSession::open_with_fault(store_options.clone(), point).unwrap();
-        let error = session
-            .reset_namespace(NamespaceResetRequest {
-                backup_destination: root.path().join("fault-evidence"),
-                consequence: NamespaceResetConsequence::AcknowledgeDuplicatePossible,
-                audit: mutation_audit("fault injection", 7_000),
-            })
-            .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                CheckpointAdminError::Store(StoreError::InjectedFault { point: fired })
-                    if fired == point
-            ),
-            "unexpected reset fault at {point}: {error:?}"
-        );
-        assert!(matches!(
-            CheckpointStore::open(store_options.clone()),
-            Err(StoreError::NamespaceLocked { .. })
-        ));
-        let marker_changed = matches!(
-            point,
-            FaultPoint::AfterMarkerPublish
-                | FaultPoint::BeforeMarkerDirSync
-                | FaultPoint::AfterMarkerDirSync
-        );
-        if marker_changed {
-            assert!(matches!(
-                session.backup(root.path().join("must-reopen")),
-                Err(CheckpointAdminError::Store(StoreError::Unusable { .. }))
-            ));
-        }
-        session.release().unwrap();
-
-        let reopened = CheckpointStore::open(store_options).unwrap();
-        assert_eq!(
-            reopened.generation(),
-            if marker_changed { 2 } else { 1 },
-            "wrong authority after reset fault at {point}"
-        );
-        assert_eq!(
-            reopened.table().len(),
-            if marker_changed { 0 } else { 1 },
-            "mixed or rolled-back table after reset fault at {point}"
-        );
-        assert_ne!(reopened.generation(), 0);
-    }
-}
-
-/// Scenario: reset of a corrupt selected generation fails at each
-/// publication boundary.
-/// Guarantees: failures before `CURRENT` replacement leave the corrupt old
-/// authority selected, failures after replacement select the complete new
-/// empty authority, and marker-uncertain sessions refuse further work.
-#[test]
-fn corrupt_namespace_reset_faults_never_publish_mixed_authority() {
-    for point in FaultPoint::PUBLICATION {
-        let root = tempfile::tempdir().unwrap();
-        let store_options = options(
-            &root.path().join("state"),
-            &format!("corrupt-reset-fault-{}", point.as_str()),
-        );
-        let mut store = CheckpointStore::open(store_options.clone()).unwrap();
-        let _ = store
-            .register_files(vec![registration(41, AdvisoryPath::unavailable())])
-            .unwrap();
-        drop(store);
-        let wal_path = store_options.namespace_dir.join(wal_file_name(0));
-        let mut bytes = fs::read(&wal_path).unwrap();
-        *bytes.last_mut().unwrap() ^= 0x40;
-        fs::write(&wal_path, bytes).unwrap();
-
-        let mut session =
-            CheckpointNamespaceResetSession::open_with_fault(store_options.clone(), point).unwrap();
-        let error = session
-            .reset_namespace(NamespaceResetRequest {
-                backup_destination: root.path().join("fault-evidence"),
-                consequence: NamespaceResetConsequence::AcknowledgeDuplicatePossible,
-                audit: mutation_audit("fault corrupt reset", 12_000),
-            })
-            .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                CheckpointAdminError::Store(StoreError::InjectedFault { point: fired })
-                    if fired == point
-            ),
-            "unexpected corrupt reset fault at {point}: {error:?}"
-        );
-        let marker_changed = matches!(
-            point,
-            FaultPoint::AfterMarkerPublish
-                | FaultPoint::BeforeMarkerDirSync
-                | FaultPoint::AfterMarkerDirSync
-        );
-        if marker_changed {
-            assert!(matches!(
-                session.backup(root.path().join("must-reopen")),
-                Err(CheckpointAdminError::Store(StoreError::Unusable { .. }))
-            ));
-        }
-        session.release().unwrap();
-
-        let reopened = CheckpointStore::open(store_options);
-        if marker_changed {
-            let reopened = reopened.unwrap();
-            assert_eq!(reopened.generation(), 1);
-            assert!(reopened.table().is_empty());
-        } else {
-            assert!(reopened.is_err());
-        }
-    }
-}
-
-/// Scenario: a corrupt namespace already retains two final generations, and
-/// a reset fails after publishing the empty snapshot for the only remaining
-/// bounded generation slot.
-/// Guarantees: a fresh reset session verifies and resumes that higher empty
-/// staging generation after a new evidence backup instead of exceeding the
-/// generation bound or becoming permanently unable to recover.
-#[test]
-fn corrupt_namespace_reset_resumes_empty_staging_at_generation_capacity() {
-    let root = tempfile::tempdir().unwrap();
-    let store_options = options(&root.path().join("state"), "resume-reset-staging");
-    let mut store = CheckpointStore::open(store_options.clone()).unwrap();
-    let _ = store
-        .register_files(vec![registration(51, AdvisoryPath::unavailable())])
-        .unwrap();
-    store.compact().unwrap();
-    assert_eq!(store.generation(), 1);
-    drop(store);
-    let wal_path = store_options.namespace_dir.join(wal_file_name(1));
-    let mut bytes = fs::read(&wal_path).unwrap();
-    *bytes.last_mut().unwrap() ^= 0x20;
-    fs::write(&wal_path, bytes).unwrap();
-
-    let mut interrupted = CheckpointNamespaceResetSession::open_with_fault(
-        store_options.clone(),
-        FaultPoint::AfterSnapshotPublish,
-    )
-    .unwrap();
+    let reopened = CheckpointEvidenceSession::open(store_options.clone()).unwrap();
     assert!(matches!(
-        interrupted.reset_namespace(NamespaceResetRequest {
-            backup_destination: root.path().join("first-reset-evidence"),
-            consequence: NamespaceResetConsequence::AcknowledgeDuplicatePossible,
-            audit: mutation_audit("first reset attempt", 13_000),
-        }),
-        Err(CheckpointAdminError::Store(StoreError::InjectedFault {
-            point: FaultPoint::AfterSnapshotPublish,
-        }))
+        reopened.authority(),
+        NamespaceAuthorityReport::Invalid {
+            failure: NamespaceAuthorityFailureReport {
+                kind: NamespaceAuthorityFailureKind::SelectedGenerationInvalid,
+                selected_generation: Some(99),
+                ..
+            }
+        }
     ));
-    interrupted.release().unwrap();
-    assert!(
-        store_options
-            .namespace_dir
-            .join(snapshot_file_name(2))
-            .is_file()
-    );
-    assert!(!store_options.namespace_dir.join(wal_file_name(2)).is_file());
-
-    let mut resumed = CheckpointNamespaceResetSession::open(store_options.clone()).unwrap();
-    let result = resumed
-        .reset_namespace(NamespaceResetRequest {
-            backup_destination: root.path().join("resumed-reset-evidence"),
-            consequence: NamespaceResetConsequence::AcknowledgeDuplicatePossible,
-            audit: mutation_audit("resume reset staging", 14_000),
-        })
-        .unwrap();
-    assert_eq!(result.reset_report.new_generation, 2);
+    reopened.release().unwrap();
     assert_eq!(
-        result.reset_report.retained_evidence_generations,
-        vec![0, 1, 2]
+        filesystem_state(&store_options.namespace_dir),
+        source_before
     );
-    resumed.release().unwrap();
-
-    let reopened = CheckpointStore::open(store_options).unwrap();
-    assert_eq!(reopened.generation(), 2);
-    assert!(reopened.table().is_empty());
-}
-
-/// Scenario: corrupt-namespace reset reaches a complete empty staging
-/// generation, then fails after writing or syncing `CURRENT.compact.tmp`.
-/// Guarantees: a fresh backup-gated reset validates and removes that exact
-/// marker temporary, syncs cleanup, and publishes the same generation.
-#[test]
-fn corrupt_namespace_reset_resumes_after_marker_temporary_faults() {
-    for point in [FaultPoint::AfterMarkerWrite, FaultPoint::AfterMarkerSync] {
-        let root = tempfile::tempdir().unwrap();
-        let store_options = options(&root.path().join("state"), "resume-reset-marker");
-        let mut store = CheckpointStore::open(store_options.clone()).unwrap();
-        let _ = store
-            .register_files(vec![registration(52, AdvisoryPath::unavailable())])
-            .unwrap();
-        store.compact().unwrap();
-        drop(store);
-        let wal_path = store_options.namespace_dir.join(wal_file_name(1));
-        let mut bytes = fs::read(&wal_path).unwrap();
-        *bytes.last_mut().unwrap() ^= 0x40;
-        fs::write(&wal_path, bytes).unwrap();
-
-        let mut interrupted =
-            CheckpointNamespaceResetSession::open_with_fault(store_options.clone(), point).unwrap();
-        assert!(
-            interrupted
-                .reset_namespace(NamespaceResetRequest {
-                    backup_destination: root.path().join("first-reset-evidence"),
-                    consequence: NamespaceResetConsequence::AcknowledgeDuplicatePossible,
-                    audit: mutation_audit("first marker attempt", 15_000),
-                })
-                .is_err()
-        );
-        interrupted.release().unwrap();
-        assert!(
-            store_options
-                .namespace_dir
-                .join(CURRENT_COMPACT_TEMP_FILE_NAME)
-                .is_file()
-        );
-
-        let mut resumed = CheckpointNamespaceResetSession::open(store_options.clone()).unwrap();
-        let result = resumed
-            .reset_namespace(NamespaceResetRequest {
-                backup_destination: root.path().join("resumed-reset-evidence"),
-                consequence: NamespaceResetConsequence::AcknowledgeDuplicatePossible,
-                audit: mutation_audit("resume marker staging", 16_000),
-            })
-            .unwrap();
-        assert_eq!(result.reset_report.new_generation, 2);
-        resumed.release().unwrap();
-        assert!(
-            !store_options
-                .namespace_dir
-                .join(CURRENT_COMPACT_TEMP_FILE_NAME)
-                .exists()
-        );
-
-        let reopened = CheckpointStore::open(store_options).unwrap();
-        assert_eq!(reopened.generation(), 2);
-        assert!(reopened.table().is_empty());
-    }
 }

@@ -327,9 +327,6 @@ fn apply_filelog_agent_output_default(args: &mut FilelogArgs) {
                 CheckpointResetCommand::KeepFailed(args) => {
                     args.output.output = FilelogMutationOutput::AgentJson;
                 }
-                CheckpointResetCommand::Namespace(args) => {
-                    args.output.output = FilelogMutationOutput::AgentJson;
-                }
             },
             FilelogCheckpointCommand::Remove(args) => {
                 args.output.output = FilelogMutationOutput::AgentJson;
@@ -502,7 +499,7 @@ pub enum FilelogCheckpointCommand {
     Validate(CheckpointValidateArgs),
     /// Create and verify a bounded evidence backup.
     Backup(CheckpointBackupArgs),
-    /// Apply an audited per-file or whole-namespace reset.
+    /// Apply an audited per-file reset.
     Reset(CheckpointResetArgs),
     /// Remove one exact quarantined record.
     Remove(CheckpointRemoveArgs),
@@ -618,8 +615,6 @@ pub enum CheckpointResetCommand {
     End(CheckpointResetEndArgs),
     /// Append an audit decision while preserving quarantine exactly.
     KeepFailed(CheckpointKeepFailedArgs),
-    /// Back up and replace the complete namespace authority.
-    Namespace(CheckpointResetNamespaceArgs),
 }
 
 /// Arguments for reset-to-beginning.
@@ -678,34 +673,6 @@ pub struct CheckpointKeepFailedArgs {
 
     #[command(flatten)]
     pub target: CheckpointTargetArgs,
-
-    #[command(flatten)]
-    pub audit: CheckpointAuditArgs,
-
-    #[command(flatten)]
-    pub output: FilelogMutationOutputArgs,
-}
-
-/// Explicit consequence selected for a whole-namespace reset.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-pub enum CheckpointNamespaceResetAcknowledgement {
-    DuplicatePossible,
-    LossAccepted,
-}
-
-/// Arguments for backup-gated whole-namespace reset.
-#[derive(Args, Debug, Clone)]
-pub struct CheckpointResetNamespaceArgs {
-    #[command(flatten)]
-    pub namespace: CheckpointNamespaceArgs,
-
-    /// New create-only evidence-backup directory required before publication.
-    #[arg(long, value_name = "DIR")]
-    pub backup_destination: PathBuf,
-
-    /// Explicitly select the duplicate or loss consequence being accepted.
-    #[arg(long, value_enum, value_name = "CONSEQUENCE")]
-    pub acknowledge: CheckpointNamespaceResetAcknowledgement,
 
     #[command(flatten)]
     pub audit: CheckpointAuditArgs,
@@ -1883,48 +1850,6 @@ mod tests {
                 assert!(args.acknowledge_duplicate_or_loss);
                 assert_eq!(args.output.output, FilelogMutationOutput::AgentJson);
             }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    /// Scenario: whole-namespace reset selects the duplicate consequence
-    /// explicitly.
-    /// Guarantees: clap maps the kebab-case acknowledgement value to the typed
-    /// reset choice used by the core API.
-    #[test]
-    fn filelog_namespace_reset_parses_consequence() {
-        let cli = Cli::try_parse_from([
-            "dfctl",
-            "filelog",
-            "checkpoint",
-            "reset",
-            "namespace",
-            "--state-dir",
-            "state",
-            "--checkpoint-id",
-            "app-logs",
-            "--backup-destination",
-            "evidence",
-            "--acknowledge",
-            "duplicate-possible",
-            "--reason",
-            "rebuild",
-        ])
-        .expect("namespace reset should parse");
-
-        match cli.command {
-            Command::Filelog(FilelogArgs {
-                command:
-                    FilelogCommand::Checkpoint(FilelogCheckpointArgs {
-                        command:
-                            FilelogCheckpointCommand::Reset(CheckpointResetArgs {
-                                command: CheckpointResetCommand::Namespace(args),
-                            }),
-                    }),
-            }) => assert_eq!(
-                args.acknowledge,
-                CheckpointNamespaceResetAcknowledgement::DuplicatePossible
-            ),
             other => panic!("unexpected command: {other:?}"),
         }
     }

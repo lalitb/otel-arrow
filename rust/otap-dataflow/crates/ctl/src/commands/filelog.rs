@@ -10,10 +10,9 @@
 
 use crate::args::{
     CheckpointAuditArgs, CheckpointBackupArgs, CheckpointInspectArgs, CheckpointNamespaceArgs,
-    CheckpointNamespaceResetAcknowledgement, CheckpointRemoveArgs, CheckpointResetBeginningArgs,
-    CheckpointResetCommand, CheckpointResetEndArgs, CheckpointResetNamespaceArgs,
-    CheckpointTargetArgs, CheckpointValidateArgs, FilelogArgs, FilelogCheckpointCommand,
-    FilelogCommand,
+    CheckpointRemoveArgs, CheckpointResetBeginningArgs, CheckpointResetCommand,
+    CheckpointResetEndArgs, CheckpointTargetArgs, CheckpointValidateArgs, FilelogArgs,
+    FilelogCheckpointCommand, FilelogCommand,
 };
 use crate::commands::output::{
     validate_mutation_output_mode, write_mutation_command_output, write_read_command_output,
@@ -21,12 +20,11 @@ use crate::commands::output::{
 use crate::error::CliError;
 use crate::style::{HumanStyle, terminal_safe};
 use otap_df_core_nodes::receivers::filelog_receiver::checkpoint::{
-    AuditMetadata, CheckpointAdminError, CheckpointAdminSession, CheckpointInspectionReport,
-    CheckpointNamespaceResetSession, EvidenceBackupManifest, ExpectedQuarantineState,
+    AuditMetadata, CheckpointAdminError, CheckpointAdminSession, CheckpointEvidenceSession,
+    CheckpointInspectionReport, EvidenceBackupManifest, ExpectedQuarantineState,
     FileMutationResult, KeepFailedRequest, NamespaceAuthorityFailureKind, NamespaceAuthorityReport,
-    NamespaceResetConsequence, NamespaceResetRequest, NamespaceResetResult, QuarantinedFileTarget,
-    RemovalConsequence, RemoveQuarantinedRequest, ResetToBeginningRequest, ResetToEndRequest,
-    StoreError, StoreOptions,
+    QuarantinedFileTarget, RemovalConsequence, RemoveQuarantinedRequest, ResetToBeginningRequest,
+    ResetToEndRequest, StoreError, StoreOptions,
 };
 use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -99,17 +97,6 @@ pub(crate) async fn run(
                         Ok(render_file_mutation(&human_style, &result))
                     })
                 }
-                CheckpointResetCommand::Namespace(args) => {
-                    let output = args.output.output.into();
-                    validate_mutation_output_mode(output, false)?;
-                    let result = run_blocking("reset filelog checkpoint namespace", move || {
-                        reset_namespace(args)
-                    })
-                    .await?;
-                    write_mutation_command_output(stdout, output, "completed", &result, || {
-                        Ok(render_namespace_reset(&human_style, &result))
-                    })
-                }
             },
             FilelogCheckpointCommand::Remove(args) => {
                 let output = args.output.output.into();
@@ -151,7 +138,7 @@ fn inspect(args: CheckpointInspectArgs) -> Result<CheckpointInspectionReport, Cl
 }
 
 fn validate(args: CheckpointValidateArgs) -> Result<NamespaceAuthorityReport, CliError> {
-    let session = CheckpointNamespaceResetSession::open(store_options(args.namespace)?)
+    let session = CheckpointEvidenceSession::open(store_options(args.namespace)?)
         .map_err(checkpoint_error)?;
     let authority = session.authority().clone();
     session.release().map_err(checkpoint_error)?;
@@ -159,7 +146,7 @@ fn validate(args: CheckpointValidateArgs) -> Result<NamespaceAuthorityReport, Cl
 }
 
 fn backup(args: CheckpointBackupArgs) -> Result<EvidenceBackupManifest, CliError> {
-    let session = CheckpointNamespaceResetSession::open(store_options(args.namespace)?)
+    let session = CheckpointEvidenceSession::open(store_options(args.namespace)?)
         .map_err(checkpoint_error)?;
     let manifest = session.backup(args.destination).map_err(checkpoint_error)?;
     session.release().map_err(checkpoint_error)?;
@@ -220,27 +207,6 @@ fn remove(args: CheckpointRemoveArgs) -> Result<FileMutationResult, CliError> {
     let result = session
         .remove_quarantined(request)
         .map_err(checkpoint_error)?;
-    session.release().map_err(checkpoint_error)?;
-    Ok(result)
-}
-
-fn reset_namespace(args: CheckpointResetNamespaceArgs) -> Result<NamespaceResetResult, CliError> {
-    let consequence = match args.acknowledge {
-        CheckpointNamespaceResetAcknowledgement::DuplicatePossible => {
-            NamespaceResetConsequence::AcknowledgeDuplicatePossible
-        }
-        CheckpointNamespaceResetAcknowledgement::LossAccepted => {
-            NamespaceResetConsequence::AcknowledgeLossAccepted
-        }
-    };
-    let request = NamespaceResetRequest {
-        backup_destination: args.backup_destination,
-        consequence,
-        audit: audit(args.audit)?,
-    };
-    let mut session = CheckpointNamespaceResetSession::open(store_options(args.namespace)?)
-        .map_err(checkpoint_error)?;
-    let result = session.reset_namespace(request).map_err(checkpoint_error)?;
     session.release().map_err(checkpoint_error)?;
     Ok(result)
 }
@@ -320,10 +286,7 @@ fn checkpoint_error(error: CheckpointAdminError) -> CliError {
         | CheckpointAdminError::ResetSourceLocatorMismatch { .. }
         | CheckpointAdminError::ResetSourceChanged { .. }
         | CheckpointAdminError::ResetSourceUnsupported { .. }
-        | CheckpointAdminError::ResetSourceValidation { .. }
-        | CheckpointAdminError::NamespaceResetGenerationCapacity { .. } => {
-            CliError::invalid_request(message)
-        }
+        | CheckpointAdminError::ResetSourceValidation { .. } => CliError::invalid_request(message),
         CheckpointAdminError::Store(StoreError::NamespaceLocked { .. }) => {
             CliError::invalid_request(message)
         }
@@ -521,39 +484,6 @@ fn render_file_mutation(style: &HumanStyle, result: &FileMutationResult) -> Stri
     rendered
 }
 
-fn render_namespace_reset(style: &HumanStyle, result: &NamespaceResetResult) -> String {
-    let report = &result.reset_report;
-    format!(
-        "{}\n{}: {}\n{}: {:?}\n{}: {:?}\n{}: {:?} -> {}\n{}: {:?} -> {}\n{}: {:?} -> {}\n{}: {:?}\n{}: {:?}\n{}: {}\n{}: {}\n{}: {}",
-        style.header("filelog checkpoint namespace reset"),
-        style.label("checkpoint_id"),
-        terminal_safe(&report.namespace_id),
-        style.label("namespace_path"),
-        report.namespace_path,
-        style.label("backup_destination"),
-        report.backup_destination,
-        style.label("generation"),
-        report.old_generation,
-        report.new_generation,
-        style.label("tracked_files"),
-        report.old_tracked_file_count,
-        report.new_tracked_file_count,
-        style.label("quarantines"),
-        report.old_quarantine_count,
-        report.new_quarantine_count,
-        style.label("retained_evidence_generations"),
-        report.retained_evidence_generations,
-        style.label("data_effect"),
-        report.data_effect,
-        style.label("consequence"),
-        terminal_safe(&report.consequence),
-        style.label("audit_reason"),
-        terminal_safe(&report.audit.reason),
-        style.label("action_time_unix_nano"),
-        report.audit.action_time_unix_nano,
-    )
-}
-
 fn authority_failure_kind(kind: NamespaceAuthorityFailureKind) -> &'static str {
     match kind {
         NamespaceAuthorityFailureKind::MissingCurrent => "missing_current",
@@ -745,64 +675,6 @@ mod tests {
         assert_eq!(error.exit_code(), 4);
         assert!(stdout.is_empty());
         drop(store);
-    }
-
-    /// Scenario: a corrupt checkpoint namespace is reset through the offline
-    /// CLI after an explicit duplicate acknowledgement and create-only backup.
-    /// Guarantees: machine output uses the shared mutation envelope, the
-    /// corrupt evidence is retained, and restart selects a higher empty
-    /// authority without salvage.
-    #[tokio::test]
-    async fn corrupt_namespace_reset_is_backup_gated_and_restartable() {
-        let root = tempdir().unwrap();
-        let state_dir = root.path().join("state");
-        let checkpoint_id = "offline-reset";
-        let options = test_store_options(&state_dir, checkpoint_id);
-        let mut store = CheckpointStore::open(options.clone()).unwrap();
-        let _ = store
-            .register_files(vec![registration(2, synthetic_locator(2))])
-            .unwrap();
-        drop(store);
-        let wal_path = options.namespace_dir.join(wal_file_name(0));
-        let mut corrupt_wal = fs::read(&wal_path).unwrap();
-        *corrupt_wal.last_mut().unwrap() ^= 0x40;
-        fs::write(&wal_path, &corrupt_wal).unwrap();
-        let destination = root.path().join("reset-evidence");
-
-        let cli = Cli::try_parse_from([
-            "dfctl",
-            "filelog",
-            "checkpoint",
-            "reset",
-            "namespace",
-            "--state-dir",
-            cli_path(&state_dir),
-            "--checkpoint-id",
-            checkpoint_id,
-            "--backup-destination",
-            cli_path(&destination),
-            "--acknowledge",
-            "duplicate-possible",
-            "--reason",
-            "rebuild corrupt checkpoint",
-            "--output",
-            "json",
-        ])
-        .unwrap();
-        let mut stdout = Vec::new();
-        crate::run(cli, &mut stdout).await.unwrap();
-        let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
-        assert_eq!(output["outcome"], "completed");
-        assert_eq!(output["data"]["reset_report"]["old_generation"], 0);
-        assert_eq!(output["data"]["reset_report"]["new_generation"], 1);
-        assert_eq!(
-            fs::read(destination.join(wal_file_name(0))).unwrap(),
-            corrupt_wal
-        );
-
-        let reopened = CheckpointStore::open(options).unwrap();
-        assert_eq!(reopened.generation(), 1);
-        assert!(reopened.table().is_empty());
     }
 
     /// Scenario: an operator inspects a quarantine, records keep-failed, and

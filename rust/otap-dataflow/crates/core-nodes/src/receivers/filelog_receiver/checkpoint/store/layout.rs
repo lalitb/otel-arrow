@@ -55,7 +55,7 @@ const COMPACT_TEMP_EXTENSION: &str = ".compact.tmp";
 pub(crate) enum PublicationRole {
     /// First-generation namespace creation.
     Create,
-    /// Later-generation compaction or explicit namespace reset.
+    /// Later-generation compaction.
     Compact,
 }
 
