@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use super::{
     CandidateEvent, DiscoveredCandidate, DiscoveryError, DiscoveryFeedback, DiscoveryIssue,
-    DiscoveryStats, ReconciliationBatch, RevocationReason,
+    DiscoveryRelease, DiscoveryStats, ReconciliationBatch, RevocationReason,
 };
 use crate::receivers::filelog_receiver::checkpoint::{AdvisoryPath, Locator};
 
@@ -131,6 +131,10 @@ pub(crate) struct AdmissionController {
     /// here instead and swapped in when the heap is drained.
     selected_min_candidates: HashMap<Locator, DiscoveredCandidate>,
     denied_locators: HashSet<Locator>,
+    /// Stable presence evidence retained only for this reconciliation. Its
+    /// fixed bound is sufficient for every durable record; overflow makes
+    /// the inventory incomplete rather than risking a false absence.
+    present_locators: HashSet<Locator>,
     denial_overflowed: bool,
     events: Vec<CandidateEvent>,
     stats: Option<DiscoveryStats>,
@@ -198,6 +202,7 @@ impl AdmissionController {
             selected_locators: HashSet::new(),
             selected_min_candidates: HashMap::new(),
             denied_locators: HashSet::with_capacity(max_denied_locators),
+            present_locators: HashSet::with_capacity(max_live_entries),
             denial_overflowed: false,
             events: Vec::new(),
             stats: None,
@@ -240,6 +245,7 @@ impl AdmissionController {
         self.selected_locators.clear();
         self.selected_min_candidates.clear();
         self.denied_locators.clear();
+        self.present_locators.clear();
         self.denial_overflowed = false;
         self.rebind_claims.clear();
         self.rebind_conflicts.clear();
@@ -319,6 +325,7 @@ impl AdmissionController {
             });
         }
         let locator = candidate.evidence.locator;
+        self.record_presence(locator)?;
         if self.denied_locators.contains(&locator) {
             return Ok(());
         }
@@ -443,6 +450,7 @@ impl AdmissionController {
                 found: generation,
             });
         }
+        self.record_presence(locator)?;
         if !self.denied_locators.contains(&locator) && !self.denial_overflowed {
             if self.denied_locators.len() >= self.max_denied_locators {
                 self.denial_overflowed = true;
@@ -498,6 +506,7 @@ impl AdmissionController {
             })?;
         let mut batch = self.finish_scan_at(clock())?;
         let completed_at = clock();
+        batch.completed_at = completed_at;
         batch.stats.scan_duration = completed_at.saturating_duration_since(started_at);
         batch.stats.oldest_pending_age = self
             .pending
@@ -612,8 +621,11 @@ impl AdmissionController {
         self.scan_started = None;
         Ok(ReconciliationBatch {
             events: std::mem::take(&mut self.events),
+            present_locators: std::mem::take(&mut self.present_locators),
             inventory,
             stats,
+            started_at,
+            completed_at: finished_at,
             recognized_replacements: std::mem::take(&mut self.recognized_replacements),
         })
     }
@@ -623,33 +635,27 @@ impl AdmissionController {
         feedback: DiscoveryFeedback,
     ) -> Result<(), DiscoveryError> {
         let mut named = HashSet::new();
-        for (locator, requires_inflight, requires_absence, requires_revocation) in feedback
+        for (locator, requires_inflight, requires_absence) in feedback
             .durable
             .iter()
-            .map(|ack| (&ack.locator, true, false, false))
+            .map(|ack| (&ack.locator, true, false))
             .chain(
                 feedback
                     .rejected
                     .iter()
-                    .map(|locator| (locator, false, false, false)),
+                    .map(|locator| (locator, false, false)),
             )
             .chain(
                 feedback
                     .deferred
                     .iter()
-                    .map(|locator| (locator, true, false, false)),
+                    .map(|locator| (locator, true, false)),
             )
             .chain(
                 feedback
                     .finalized
                     .iter()
-                    .map(|locator| (locator, false, true, false)),
-            )
-            .chain(
-                feedback
-                    .revoked
-                    .iter()
-                    .map(|locator| (locator, false, false, true)),
+                    .map(|locator| (locator, false, true)),
             )
         {
             if !named.insert(*locator) {
@@ -676,16 +682,38 @@ impl AdmissionController {
                     reason: "locator has not emitted a removal transition",
                 });
             }
-            if requires_revocation && (!entry.revoked || !entry.revocation_inflight) {
-                return Err(DiscoveryError::InvalidFeedback {
-                    locator: *locator,
-                    reason: "locator has no in-flight revocation transition",
-                });
-            }
             if requires_absence && entry.revoked {
                 return Err(DiscoveryError::InvalidFeedback {
                     locator: *locator,
                     reason: "revoked locator cannot be finalized as ordinary removal",
+                });
+            }
+        }
+        for release in &feedback.released {
+            let locator = release.locator();
+            if !named.insert(locator) {
+                return Err(DiscoveryError::InvalidFeedback {
+                    locator,
+                    reason: "one feedback transaction names the locator more than once",
+                });
+            }
+            if matches!(release, DiscoveryRelease::Revoked(_))
+                && !self
+                    .tracked
+                    .get(&locator)
+                    .is_some_and(|entry| entry.revoked && entry.revocation_inflight)
+            {
+                return Err(DiscoveryError::InvalidFeedback {
+                    locator,
+                    reason: "locator has no in-flight revocation transition",
+                });
+            }
+            if let DiscoveryRelease::RetentionRemoved(removal) = release
+                && removal.reconciliation_generation > self.generation
+            {
+                return Err(DiscoveryError::InvalidFeedback {
+                    locator,
+                    reason: "retention removal names a future reconciliation generation",
                 });
             }
         }
@@ -809,32 +837,56 @@ impl AdmissionController {
                         })?;
             }
         }
-        for locator in feedback.revoked {
-            let durable = self
-                .tracked
-                .get(&locator)
-                .expect("feedback was preflighted")
-                .durable;
-            if durable {
-                self.tracked
-                    .get_mut(&locator)
-                    .expect("feedback was preflighted")
-                    .revocation_inflight = false;
-            } else {
-                // A non-durable revoked locator's tracked entry is removed
-                // entirely, which also clears any recognized-replacement
-                // flag it carried rather than letting it survive onto a
-                // later, unrelated observation of the same locator.
-                let entry = self
-                    .tracked
-                    .remove(&locator)
-                    .expect("feedback was preflighted");
-                if entry.inflight_candidate.is_some() {
-                    self.inflight_count = self.inflight_count.checked_sub(1).ok_or(
-                        DiscoveryError::CounterOverflow {
-                            counter: "in-flight candidate evidence",
-                        },
-                    )?;
+        for release in feedback.released {
+            match release {
+                DiscoveryRelease::Revoked(locator) => {
+                    let durable = self
+                        .tracked
+                        .get(&locator)
+                        .expect("feedback was preflighted")
+                        .durable;
+                    if durable {
+                        self.tracked
+                            .get_mut(&locator)
+                            .expect("feedback was preflighted")
+                            .revocation_inflight = false;
+                    } else {
+                        // A non-durable revoked locator's tracked entry is
+                        // removed entirely, including any replacement flag.
+                        let entry = self
+                            .tracked
+                            .remove(&locator)
+                            .expect("feedback was preflighted");
+                        if entry.inflight_candidate.is_some() {
+                            self.inflight_count = self.inflight_count.checked_sub(1).ok_or(
+                                DiscoveryError::CounterOverflow {
+                                    counter: "in-flight candidate evidence",
+                                },
+                            )?;
+                        }
+                    }
+                }
+                DiscoveryRelease::RetentionRemoved(removal) => {
+                    let locator = removal.locator;
+                    if self.pending.get(&locator).is_some_and(|entry| {
+                        entry.seen_generation > removal.reconciliation_generation
+                    }) || self.tracked.get(&locator).is_some_and(|entry| {
+                        entry.seen_generation > removal.reconciliation_generation
+                    }) {
+                        continue;
+                    }
+                    let _ = self.pending.remove(&locator);
+                    if self
+                        .tracked
+                        .remove(&locator)
+                        .is_some_and(|entry| entry.inflight_candidate.is_some())
+                    {
+                        self.inflight_count = self.inflight_count.checked_sub(1).ok_or(
+                            DiscoveryError::CounterOverflow {
+                                counter: "in-flight candidate evidence",
+                            },
+                        )?;
+                    }
                 }
             }
         }
@@ -1227,6 +1279,18 @@ impl AdmissionController {
                 .ok_or(DiscoveryError::CounterOverflow {
                     counter: "eligible discovery candidates",
                 })?;
+        Ok(())
+    }
+
+    fn record_presence(&mut self, locator: Locator) -> Result<(), DiscoveryError> {
+        if self.present_locators.contains(&locator) {
+            return Ok(());
+        }
+        if self.present_locators.len() >= self.max_live_entries {
+            return self.mark_incomplete_overflow();
+        }
+        let inserted = self.present_locators.insert(locator);
+        debug_assert!(inserted);
         Ok(())
     }
 

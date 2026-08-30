@@ -2053,6 +2053,11 @@ fn validate_checkpoint_bounds(
             "checkpoint.max_consecutive_failures must be greater than zero",
         ));
     }
+    if u64::try_from(checkpoint.retention.as_nanos()).is_err() {
+        return Err(invalid(
+            "checkpoint.retention must be zero or fit positive u64 nanoseconds",
+        ));
+    }
     // The durable checkpoint store derives its artifact and combined
     // recovery-working-set caps from exactly these four knobs, and enforces
     // the same artifact caps when it writes. Running the derivation here
@@ -3771,6 +3776,34 @@ mod tests {
         let error = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
         assert!(
             error.to_string().contains("smaller than the minimum"),
+            "{error}"
+        );
+    }
+
+    /// Scenario: checkpoint retention is zero, the largest duration
+    /// representable as u64 nanoseconds, then one nanosecond larger.
+    /// Guarantees: disabled and exactly representable retention validate,
+    /// while an interval that cannot participate in checked runtime deadline
+    /// arithmetic is rejected before namespace creation.
+    #[test]
+    fn checkpoint_retention_must_fit_u64_nanoseconds() {
+        let mut cfg = minimal_config();
+        cfg.checkpoint.retention = Duration::ZERO;
+        assert!(RuntimeConfig::from_config(cfg, "node-1").is_ok());
+
+        let mut cfg = minimal_config();
+        cfg.checkpoint.retention = Duration::from_nanos(u64::MAX);
+        assert!(RuntimeConfig::from_config(cfg, "node-1").is_ok());
+
+        let mut cfg = minimal_config();
+        cfg.checkpoint.retention = Duration::from_nanos(u64::MAX)
+            .checked_add(Duration::from_nanos(1))
+            .unwrap();
+        let error = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("retention must be zero or fit positive u64 nanoseconds"),
             "{error}"
         );
     }

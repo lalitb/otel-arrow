@@ -2296,6 +2296,11 @@ impl ReaderTable {
         })
     }
 
+    /// Whether one logical reader still owns `file_id`.
+    pub(crate) fn contains_file(&self, file_id: FileId) -> bool {
+        self.readers.contains_key(&file_id)
+    }
+
     /// Returns one logical reader's current frontier without allocation.
     pub(crate) fn frontier(&self, file_id: FileId) -> Result<ReaderFrontier, ReaderError> {
         let reader = self

@@ -189,11 +189,11 @@ fn file_id(seed: u8) -> FileId {
     FileId([seed; 16])
 }
 
-/// Scenario: old records include one active file that the runtime still
-/// owns, one absent finalized file, and one absent quarantine.
-/// Guarantees: age alone never makes a record removable; the caller-vetted
-/// absent/open/in-flight set gates retention, and quarantine remains immune
-/// even when it is in that set.
+/// Scenario: a runtime-vetted set names one finalized record together with a
+/// quarantined record whose persisted last-seen time is equally old.
+/// Guarantees: durable wall-clock age does not select retention, and the
+/// store rejects the complete invalid set rather than partially removing the
+/// non-quarantined record.
 #[test]
 fn retention_requires_runtime_vetted_absence() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -209,10 +209,25 @@ fn retention_requires_runtime_vetted_absence() {
     finalize.finalize = true;
     let _finalized = store.commit_progress(vec![finalize]).expect("finalizes");
 
-    let eligible_absent = HashSet::from([file_id(2), file_id(3)]);
-    let candidates =
-        store.retention_candidates(&eligible_absent, 10_000_000_000, Duration::from_secs(1));
-    assert_eq!(candidates, vec![file_id(3)]);
+    let invalid = HashSet::from([file_id(2), file_id(3)]);
+    let error = store.remove_vetted_retention_records(&invalid).unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::RetentionCandidateQuarantined {
+            file_id: quarantined
+        } if quarantined == file_id(2)
+    ));
+    assert_eq!(store.table().len(), 3);
+
+    let missing = HashSet::from([file_id(3), file_id(9)]);
+    let error = store.remove_vetted_retention_records(&missing).unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::RetentionCandidateMissing {
+            file_id: absent
+        } if absent == file_id(9)
+    ));
+    assert_eq!(store.table().len(), 3);
 }
 
 /// Scenario: a quarantine-only administrative removal targets an active
@@ -3004,14 +3019,19 @@ fn retention_never_removes_a_quarantined_record() {
         LifecycleState::RotatedFinalized
     );
 
-    let now = 10_000_000_000u64;
-    let retention = Duration::from_secs(1);
     let eligible_absent = HashSet::from([file_id(1), file_id(2), file_id(3)]);
-    let candidates = store.retention_candidates(&eligible_absent, now, retention);
-    assert_eq!(candidates, vec![file_id(1), file_id(3)]);
-
+    let error = store
+        .remove_vetted_retention_records(&eligible_absent)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::RetentionCandidateQuarantined {
+            file_id: quarantined
+        } if quarantined == file_id(2)
+    ));
+    let vetted = HashSet::from([file_id(1), file_id(3)]);
     let removed = store
-        .remove_expired(&eligible_absent, now, retention)
+        .remove_vetted_retention_records(&vetted)
         .expect("retention removal succeeds");
     assert_eq!(removed, 2);
     assert_eq!(store.generation(), 1);
@@ -3025,15 +3045,13 @@ fn retention_never_removes_a_quarantined_record() {
     let quarantined = store.table().get(&file_id(2)).expect("quarantine survives");
     assert_eq!(quarantined.lifecycle_state, LifecycleState::Quarantined);
 
-    // Zero retention means indefinite retention and selects nothing.
-    assert!(
-        store
-            .retention_candidates(&eligible_absent, now, Duration::ZERO)
-            .is_empty()
-    );
-
     let outcome = store
-        .remove_quarantined_file(file_id(2), 0x0008, now, "operator purge".to_owned())
+        .remove_quarantined_file(
+            file_id(2),
+            0x0008,
+            10_000_000_000,
+            "operator purge".to_owned(),
+        )
         .expect("administrative removal succeeds")
         .expect("the record was present");
     assert!(outcome.synced);
@@ -3061,9 +3079,7 @@ fn retention_large_set_uses_one_filtered_compaction() {
     let mut store = open(&path);
     let _outcomes = store.register_files(registrations).unwrap();
 
-    let removed = store
-        .remove_expired(&eligible, 10_000_000_000, Duration::from_secs(1))
-        .unwrap();
+    let removed = store.remove_vetted_retention_records(&eligible).unwrap();
     assert_eq!(removed, count);
     assert!(store.table().is_empty());
     assert_eq!(store.generation(), 1);
@@ -3098,11 +3114,7 @@ fn retention_filtered_compaction_recovers_all_or_none_after_faults() {
         let mut store =
             CheckpointStore::open_with_fault(options(&path), point).expect("namespace reopens");
         let error = store
-            .remove_expired(
-                &HashSet::from([file_id(1)]),
-                10_000_000_000,
-                Duration::from_secs(1),
-            )
+            .remove_vetted_retention_records(&HashSet::from([file_id(1)]))
             .unwrap_err();
         assert!(matches!(
             error,

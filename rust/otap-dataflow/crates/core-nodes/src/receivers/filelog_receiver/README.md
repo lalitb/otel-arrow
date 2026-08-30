@@ -141,6 +141,13 @@ Important policy values are:
 one maximum version-1 transaction. The store compacts before an append would
 exceed either the byte or transaction threshold; equality is accepted.
 
+`checkpoint.retention` uses continuous runtime-proven absence, not the
+persisted last-seen timestamp. The first complete reconciliation that proves a
+record absent starts a monotonic interval; restart, an incomplete scan, or
+source reappearance resets that proof. An idle worker wakes at the checked
+deadline and revalidates before one atomic filtered compaction. Quarantined and
+runtime-owned records are not removed.
+
 Set at most one of `framing.multiline.line_start_pattern` and
 `framing.multiline.line_end_pattern`. Patterns use the versioned `re2-v1`
 profile. A zero `force_flush_period` disables idle partial-record flushing.

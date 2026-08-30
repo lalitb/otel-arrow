@@ -808,6 +808,7 @@ fn ignore_older_than_applies_only_to_initial_admission() {
     let mut admission = AdmissionController::new(1, 1, 1, 16).unwrap();
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
     let mut candidate = fake_candidate(1);
+    let locator = candidate.evidence.locator;
     candidate.modified = Some(SystemTime::UNIX_EPOCH);
 
     let generation = admission.begin_scan(now).unwrap();
@@ -816,6 +817,7 @@ fn ignore_older_than_applies_only_to_initial_admission() {
         .unwrap();
     let skipped = admission.finish_scan().unwrap();
     assert!(skipped.events.is_empty());
+    assert_eq!(skipped.present_locators, HashSet::from([locator]));
 
     candidate.modified = Some(now);
     let generation = admission.begin_scan(now).unwrap();
@@ -835,7 +837,198 @@ fn ignore_older_than_applies_only_to_initial_admission() {
         .unwrap();
     let retained = admission.finish_scan().unwrap();
     assert!(retained.events.is_empty());
+    assert_eq!(retained.present_locators, HashSet::from([locator]));
     assert_eq!(admission.tracked_locators().len(), 1);
+}
+
+/// Scenario: a previously unknown locator is observed only through an
+/// excluded path during an otherwise complete reconciliation.
+/// Guarantees: policy revocation still contributes bounded presence evidence,
+/// so exclusion cannot be mistaken for continuous runtime absence.
+#[test]
+fn excluded_unknown_locator_remains_presence_evidence() {
+    let mut admission = AdmissionController::new(1, 1, 1, 16).unwrap();
+    let locator = Locator::PosixDevIno { dev: 8, ino: 81 };
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe_revoked(generation, locator, RevocationReason::ExcludedByPolicy)
+        .unwrap();
+
+    let batch = admission.finish_scan().unwrap();
+    assert!(batch.stats.complete);
+    assert_eq!(batch.present_locators, HashSet::from([locator]));
+    assert!(batch.events.is_empty());
+}
+
+/// Scenario: a durable locator disappears, runtime retention removes its
+/// checkpoint record, and the same locator is observed again later.
+/// Guarantees: retention feedback drops discovery continuity state, so the
+/// returning source is emitted as a fresh observation rather than an update
+/// that could inherit the removed association.
+#[test]
+fn retention_feedback_forgets_removed_durable_locator() {
+    let mut admission = AdmissionController::new(1, 1, 1, 16).unwrap();
+    let candidate = fake_candidate(82);
+    let locator = candidate.evidence.locator;
+
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe(generation, candidate.clone(), Duration::ZERO)
+        .unwrap();
+    let first = admission.finish_scan().unwrap();
+    admission.apply_feedback(durable_feedback(&first)).unwrap();
+
+    let _generation = admission.begin_scan(SystemTime::now()).unwrap();
+    let removed = admission.finish_scan().unwrap();
+    assert!(matches!(
+        removed.events.as_slice(),
+        [CandidateEvent::Removed {
+            locator: removed_locator
+        }] if *removed_locator == locator
+    ));
+    admission
+        .apply_feedback(DiscoveryFeedback {
+            released: vec![DiscoveryRelease::RetentionRemoved(RetentionRemovalAck {
+                locator,
+                reconciliation_generation: removed.stats.generation,
+            })],
+            ..DiscoveryFeedback::default()
+        })
+        .unwrap();
+    assert!(admission.tracked_locators().is_empty());
+
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe(generation, candidate, Duration::ZERO)
+        .unwrap();
+    let returned = admission.finish_scan().unwrap();
+    assert!(matches!(
+        returned.events.as_slice(),
+        [CandidateEvent::Observed(observed)] if observed.evidence.locator == locator
+    ));
+}
+
+/// Scenario: one feedback transaction both acknowledges a candidate as
+/// durable and claims retention removed the same locator.
+/// Guarantees: contradictory duplicate ownership feedback is rejected before
+/// either transition mutates discovery state.
+#[test]
+fn retention_feedback_cannot_duplicate_another_outcome() {
+    let mut admission = AdmissionController::new(1, 1, 1, 16).unwrap();
+    let candidate = fake_candidate(83);
+    let locator = candidate.evidence.locator;
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe(generation, candidate, Duration::ZERO)
+        .unwrap();
+    let batch = admission.finish_scan().unwrap();
+    let mut feedback = durable_feedback(&batch);
+    feedback
+        .released
+        .push(DiscoveryRelease::RetentionRemoved(RetentionRemovalAck {
+            locator,
+            reconciliation_generation: batch.stats.generation,
+        }));
+
+    let error = admission.apply_feedback(feedback).unwrap_err();
+    assert!(matches!(
+        error,
+        DiscoveryError::InvalidFeedback {
+            locator: duplicate,
+            reason: "one feedback transaction names the locator more than once"
+        } if duplicate == locator
+    ));
+    assert_eq!(admission.tracked_locators(), HashSet::from([locator]));
+}
+
+/// Scenario: retention feedback from complete generation G arrives after
+/// generation G+1 has already emitted a fresh observation for that locator.
+/// Guarantees: stale cleanup is a no-op for the newer association, and its
+/// ordinary durable acknowledgement remains valid.
+#[test]
+fn stale_retention_feedback_preserves_newer_observation() {
+    let mut admission = AdmissionController::new(1, 1, 1, 16).unwrap();
+    let _generation = admission.begin_scan(SystemTime::now()).unwrap();
+    let absent = admission.finish_scan().unwrap();
+
+    let candidate = fake_candidate(84);
+    let locator = candidate.evidence.locator;
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    admission
+        .observe(generation, candidate, Duration::ZERO)
+        .unwrap();
+    let returned = admission.finish_scan().unwrap();
+    assert!(matches!(
+        returned.events.as_slice(),
+        [CandidateEvent::Observed(observed)] if observed.evidence.locator == locator
+    ));
+
+    admission
+        .apply_feedback(DiscoveryFeedback {
+            released: vec![DiscoveryRelease::RetentionRemoved(RetentionRemovalAck {
+                locator,
+                reconciliation_generation: absent.stats.generation,
+            })],
+            ..DiscoveryFeedback::default()
+        })
+        .unwrap();
+    assert_eq!(admission.tracked_locators(), HashSet::from([locator]));
+    admission
+        .apply_feedback(durable_feedback(&returned))
+        .unwrap();
+    assert_eq!(admission.tracked_locators(), HashSet::from([locator]));
+}
+
+/// Scenario: retention feedback claims absence from a reconciliation
+/// generation discovery has not reached.
+/// Guarantees: the internal protocol rejects future authority rather than
+/// deleting current or pending continuity state.
+#[test]
+fn retention_feedback_rejects_future_generation() {
+    let mut admission = AdmissionController::new(1, 1, 1, 16).unwrap();
+    let _generation = admission.begin_scan(SystemTime::now()).unwrap();
+    let batch = admission.finish_scan().unwrap();
+    let locator = Locator::PosixDevIno { dev: 12, ino: 1 };
+
+    let error = admission
+        .apply_feedback(DiscoveryFeedback {
+            released: vec![DiscoveryRelease::RetentionRemoved(RetentionRemovalAck {
+                locator,
+                reconciliation_generation: batch.stats.generation + 1,
+            })],
+            ..DiscoveryFeedback::default()
+        })
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        DiscoveryError::InvalidFeedback {
+            locator: rejected,
+            reason: "retention removal names a future reconciliation generation"
+        } if rejected == locator
+    ));
+}
+
+/// Scenario: more distinct excluded/ignored presence observations arrive
+/// than the fixed tracked-plus-event evidence bound can retain.
+/// Guarantees: the pass becomes incomplete instead of dropping a locator and
+/// later treating that missing evidence as proof of absence.
+#[test]
+fn presence_evidence_overflow_marks_inventory_incomplete() {
+    let mut admission = AdmissionController::new(1, 1, 1, 16).unwrap();
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+    for ino in 1..=3 {
+        admission
+            .observe_revoked(
+                generation,
+                Locator::PosixDevIno { dev: 11, ino },
+                RevocationReason::ExcludedByPolicy,
+            )
+            .unwrap();
+    }
+
+    let batch = admission.finish_scan().unwrap();
+    assert!(!batch.stats.complete);
+    assert_eq!(batch.present_locators.len(), 2);
 }
 
 /// Scenario: an admitted file disappears after durable feedback and remains
@@ -931,7 +1124,7 @@ fn excluded_move_revokes_then_reeligibility_updates_same_locator() {
     assert!(revoked.stats.complete);
     admission
         .apply_feedback(DiscoveryFeedback {
-            revoked: vec![locator],
+            released: vec![DiscoveryRelease::Revoked(locator)],
             ..DiscoveryFeedback::default()
         })
         .unwrap();
@@ -1088,7 +1281,7 @@ fn excluded_alias_wins_over_eligible_alias_in_either_order() {
     ));
     admission
         .apply_feedback(DiscoveryFeedback {
-            revoked: vec![locator],
+            released: vec![DiscoveryRelease::Revoked(locator)],
             ..DiscoveryFeedback::default()
         })
         .unwrap();
@@ -1185,7 +1378,7 @@ fn revocation_releases_a_candidate_deferred_before_durability() {
         .unwrap();
     admission
         .apply_feedback(DiscoveryFeedback {
-            revoked: vec![locator],
+            released: vec![DiscoveryRelease::Revoked(locator)],
             ..DiscoveryFeedback::default()
         })
         .unwrap();
@@ -1958,7 +2151,7 @@ fn revocation_preserves_binding_and_reinclusion_does_not_reselect() {
     ));
     admission
         .apply_feedback(DiscoveryFeedback {
-            revoked: vec![locator],
+            released: vec![DiscoveryRelease::Revoked(locator)],
             ..DiscoveryFeedback::default()
         })
         .unwrap();

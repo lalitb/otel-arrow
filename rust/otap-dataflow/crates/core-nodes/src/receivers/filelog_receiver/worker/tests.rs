@@ -35,9 +35,12 @@ use crate::receivers::filelog_receiver::config::{
     ATTR_KEY_FLUSH_REASON, ATTR_KEY_FRAGMENT_ID, ATTR_KEY_FRAGMENT_INDEX, ATTR_KEY_FRAGMENT_LAST,
     ATTR_KEY_LOG_FILE_NAME, Config, OnDecodeError,
 };
-use crate::receivers::filelog_receiver::discovery::DiscoveredCandidate;
+use crate::receivers::filelog_receiver::discovery::admission::AdmissionController;
 use crate::receivers::filelog_receiver::discovery::scanner::DiscoveryPlan;
 use crate::receivers::filelog_receiver::discovery::source::spawn_discovery;
+use crate::receivers::filelog_receiver::discovery::{
+    DiscoveredCandidate, DiscoveryIssue, RevocationReason,
+};
 use crate::receivers::filelog_receiver::identity::matcher::{IdentityMatch, ResolvedIdentity};
 use crate::receivers::filelog_receiver::identity::platform::open_candidate;
 
@@ -83,6 +86,41 @@ fn runtime_config_with(
     let mut runtime = RuntimeConfig::from_config(config, "").unwrap();
     runtime.checkpoint_namespace_dir = namespace_dir.to_path_buf();
     runtime
+}
+
+fn retention_inventory_at(
+    completed_at: Instant,
+    present_locators: &[Locator],
+    complete: bool,
+) -> ReconciliationBatch {
+    retention_inventory_between(completed_at, completed_at, present_locators, complete)
+}
+
+fn retention_inventory_between(
+    started_at: Instant,
+    completed_at: Instant,
+    present_locators: &[Locator],
+    complete: bool,
+) -> ReconciliationBatch {
+    let mut admission = AdmissionController::new(8, 8, 8, 16).unwrap();
+    let generation = admission
+        .begin_scan_at(SystemTime::UNIX_EPOCH, started_at)
+        .unwrap();
+    for &locator in present_locators {
+        admission
+            .observe_revoked(generation, locator, RevocationReason::ExcludedByPolicy)
+            .unwrap();
+    }
+    if !complete {
+        admission
+            .record_issue(DiscoveryIssue::Io {
+                operation: "exercise incomplete retention inventory",
+                path: std::path::PathBuf::from("incomplete"),
+                source: std::io::Error::other("synthetic scan failure"),
+            })
+            .unwrap();
+    }
+    admission.finish_scan_at(completed_at).unwrap()
 }
 
 fn decode_worker_records(records: &mut OtapArrowRecords) -> ExportLogsServiceRequest {
@@ -3307,6 +3345,554 @@ fn paused_source_deadlines_do_not_zero_the_command_wait() {
 
     assert_eq!(runtime.next_wait(None), Duration::ZERO);
     assert!(runtime.next_maintenance_wait() > Duration::ZERO);
+    runtime.shutdown_resources().unwrap();
+}
+
+/// Scenario: recovery loads an Active record with a persisted last-seen value
+/// far older than retention before any complete runtime inventory exists.
+/// Guarantees: durable wall-clock metadata never starts retention; the first
+/// complete absent inventory starts a fresh monotonic interval.
+#[test]
+fn retention_starts_at_first_complete_runtime_absence() {
+    let directory = tempdir().unwrap();
+    let namespace = directory.path().join("checkpoint");
+    let config = runtime_config_with(
+        directory.path().join("missing.log").to_str().unwrap(),
+        &namespace,
+        1,
+        |config| config.checkpoint.retention = Duration::from_secs(10),
+    );
+    let mut runtime = WorkerRuntime::new(config).unwrap();
+    let file_id = FileId::from_bytes([101; 16]);
+    let locator = Locator::PosixDevIno { dev: 10, ino: 1 };
+    let _registered = runtime
+        .store
+        .register_files(vec![RegisterFile {
+            file_id,
+            file_epoch: 1,
+            committed_offset: 0,
+            committed_frontier_guard: CommittedFrontierGuard::empty(),
+            fingerprint: Vec::new(),
+            ignored_header_bytes: 0,
+            locator,
+            framing_profile_version: FRAMING_PROFILE_VERSION,
+            framing_profile_digest: runtime.config.framing_profile_digest,
+            framing_resume: FramingResume::Clean,
+            last_seen_time_unix_nano: 1,
+            advisory_path: AdvisoryPath::unavailable(),
+        }])
+        .unwrap();
+
+    assert!(runtime.absence_since.is_empty());
+    assert_eq!(runtime.retention_deadline, None);
+
+    let first_complete = Instant::now();
+    let batch = retention_inventory_at(first_complete, &[], true);
+    runtime.observe_retention_inventory(&batch);
+    runtime.refresh_retention_schedule(first_complete).unwrap();
+    assert_eq!(runtime.absence_since.get(&file_id), Some(&first_complete));
+    assert_eq!(
+        runtime.retention_deadline,
+        first_complete.checked_add(Duration::from_secs(10))
+    );
+    runtime.shutdown_resources().unwrap();
+}
+
+/// Scenario: checkpoint retention is explicitly disabled while a complete
+/// inventory repeatedly proves one durable record absent.
+/// Guarantees: zero retention keeps no runtime absence state, arms no
+/// maintenance deadline, and never removes the record.
+#[test]
+fn zero_retention_disables_runtime_absence_and_removal() {
+    let directory = tempdir().unwrap();
+    let namespace = directory.path().join("checkpoint");
+    let config = runtime_config_with(
+        directory.path().join("missing.log").to_str().unwrap(),
+        &namespace,
+        1,
+        |config| config.checkpoint.retention = Duration::ZERO,
+    );
+    let mut runtime = WorkerRuntime::new(config).unwrap();
+    let file_id = FileId::from_bytes([109; 16]);
+    let _registered = runtime
+        .store
+        .register_files(vec![RegisterFile {
+            file_id,
+            file_epoch: 1,
+            committed_offset: 0,
+            committed_frontier_guard: CommittedFrontierGuard::empty(),
+            fingerprint: Vec::new(),
+            ignored_header_bytes: 0,
+            locator: Locator::PosixDevIno { dev: 10, ino: 9 },
+            framing_profile_version: FRAMING_PROFILE_VERSION,
+            framing_profile_digest: runtime.config.framing_profile_digest,
+            framing_resume: FramingResume::Clean,
+            last_seen_time_unix_nano: 1,
+            advisory_path: AdvisoryPath::unavailable(),
+        }])
+        .unwrap();
+
+    let now = Instant::now();
+    runtime.observe_retention_inventory(&retention_inventory_at(now, &[], true));
+    runtime.refresh_retention_schedule(now).unwrap();
+    assert!(runtime.absence_since.is_empty());
+    assert_eq!(runtime.retention_deadline, None);
+    assert!(runtime.store.table().get(&file_id).is_some());
+    runtime.shutdown_resources().unwrap();
+}
+
+/// Scenario: a record is absent in one complete pass, then discovery becomes
+/// incomplete, later proves absence again, and finally observes the source.
+/// Guarantees: incomplete evidence and presence each clear runtime absence;
+/// a later absent pass starts a new full interval rather than resuming age.
+#[test]
+fn retention_absence_resets_on_incomplete_or_present_inventory() {
+    let directory = tempdir().unwrap();
+    let namespace = directory.path().join("checkpoint");
+    let config = runtime_config_with(
+        directory.path().join("missing.log").to_str().unwrap(),
+        &namespace,
+        1,
+        |config| config.checkpoint.retention = Duration::from_secs(10),
+    );
+    let mut runtime = WorkerRuntime::new(config).unwrap();
+    let file_id = FileId::from_bytes([102; 16]);
+    let locator = Locator::PosixDevIno { dev: 10, ino: 2 };
+    let _registered = runtime
+        .store
+        .register_files(vec![RegisterFile {
+            file_id,
+            file_epoch: 1,
+            committed_offset: 0,
+            committed_frontier_guard: CommittedFrontierGuard::empty(),
+            fingerprint: Vec::new(),
+            ignored_header_bytes: 0,
+            locator,
+            framing_profile_version: FRAMING_PROFILE_VERSION,
+            framing_profile_digest: runtime.config.framing_profile_digest,
+            framing_resume: FramingResume::Clean,
+            last_seen_time_unix_nano: 1,
+            advisory_path: AdvisoryPath::unavailable(),
+        }])
+        .unwrap();
+
+    let first = Instant::now();
+    runtime.observe_retention_inventory(&retention_inventory_at(first, &[], true));
+    assert_eq!(runtime.absence_since.get(&file_id), Some(&first));
+
+    let incomplete = first.checked_add(Duration::from_secs(1)).unwrap();
+    runtime.observe_retention_inventory(&retention_inventory_at(incomplete, &[], false));
+    assert!(runtime.absence_since.is_empty());
+    assert_eq!(runtime.retention_deadline, None);
+
+    let restarted = first.checked_add(Duration::from_secs(2)).unwrap();
+    runtime.observe_retention_inventory(&retention_inventory_at(restarted, &[], true));
+    assert_eq!(runtime.absence_since.get(&file_id), Some(&restarted));
+
+    let present = first.checked_add(Duration::from_secs(3)).unwrap();
+    runtime.observe_retention_inventory(&retention_inventory_at(present, &[locator], true));
+    assert!(runtime.absence_since.is_empty());
+    runtime.shutdown_resources().unwrap();
+}
+
+/// Scenario: a finalized record is already age-eligible while a
+/// rotation-finalization veto remains, then that last veto clears.
+/// Guarantees: the expired deadline is parked without a zero-wait loop and
+/// clearing the veto immediately rearms the original elapsed deadline.
+#[test]
+fn retention_parks_age_eligible_veto_until_transition() {
+    let directory = tempdir().unwrap();
+    let namespace = directory.path().join("checkpoint");
+    let config = runtime_config_with(
+        directory.path().join("missing.log").to_str().unwrap(),
+        &namespace,
+        1,
+        |config| config.checkpoint.retention = Duration::from_secs(1),
+    );
+    let mut runtime = WorkerRuntime::new(config).unwrap();
+    let file_id = FileId::from_bytes([103; 16]);
+    let locator = Locator::PosixDevIno { dev: 10, ino: 3 };
+    let _registered = runtime
+        .store
+        .register_files(vec![RegisterFile {
+            file_id,
+            file_epoch: 1,
+            committed_offset: 0,
+            committed_frontier_guard: CommittedFrontierGuard::empty(),
+            fingerprint: Vec::new(),
+            ignored_header_bytes: 0,
+            locator,
+            framing_profile_version: FRAMING_PROFILE_VERSION,
+            framing_profile_digest: runtime.config.framing_profile_digest,
+            framing_resume: FramingResume::Clean,
+            last_seen_time_unix_nano: 1,
+            advisory_path: AdvisoryPath::unavailable(),
+        }])
+        .unwrap();
+    let finalize = UpdateProgress {
+        file_id,
+        expected_committed_offset: 0,
+        expected_file_epoch: 1,
+        new_committed_offset: 0,
+        new_committed_frontier_guard: CommittedFrontierGuard::empty(),
+        new_framing_resume: FramingResume::Clean,
+        new_last_seen_time_unix_nano: 2,
+        finalize: true,
+    };
+    let _finalized = runtime.store.commit_progress(vec![finalize]).unwrap();
+
+    let now = Instant::now();
+    let absent_since = now.checked_sub(Duration::from_secs(2)).unwrap();
+    runtime.observe_retention_inventory(&retention_inventory_at(absent_since, &[], true));
+    let _ = runtime.rotation_waits.insert(
+        file_id,
+        RotationWait {
+            stable_since: absent_since,
+            deadline: absent_since,
+        },
+    );
+    runtime.retention_schedule_dirty = true;
+    runtime.refresh_retention_schedule(now).unwrap();
+    assert_eq!(runtime.retention_deadline, None);
+
+    let _ = runtime.rotation_waits.remove(&file_id);
+    runtime.retention_schedule_dirty = true;
+    runtime.refresh_retention_schedule(now).unwrap();
+    assert_eq!(
+        runtime.retention_deadline,
+        absent_since.checked_add(Duration::from_secs(1))
+    );
+    assert_eq!(runtime.next_wait(None), Duration::ZERO);
+    runtime.shutdown_resources().unwrap();
+}
+
+/// Scenario: an absent Active record reaches its monotonic deadline, a fresh
+/// complete scan revalidates it, and a later identical pass has no work.
+/// Guarantees: one filtered compaction removes the record and queues
+/// discovery continuity cleanup; an empty vetted set publishes no identical
+/// generation.
+#[test]
+fn revalidated_retention_compacts_once_and_disarms() {
+    let directory = tempdir().unwrap();
+    let namespace = directory.path().join("checkpoint");
+    let config = runtime_config_with(
+        directory.path().join("missing.log").to_str().unwrap(),
+        &namespace,
+        1,
+        |config| config.checkpoint.retention = Duration::from_secs(1),
+    );
+    let mut runtime = WorkerRuntime::new(config).unwrap();
+    let file_id = FileId::from_bytes([104; 16]);
+    let locator = Locator::PosixDevIno { dev: 10, ino: 4 };
+    let _registered = runtime
+        .store
+        .register_files(vec![RegisterFile {
+            file_id,
+            file_epoch: 1,
+            committed_offset: 0,
+            committed_frontier_guard: CommittedFrontierGuard::empty(),
+            fingerprint: Vec::new(),
+            ignored_header_bytes: 0,
+            locator,
+            framing_profile_version: FRAMING_PROFILE_VERSION,
+            framing_profile_digest: runtime.config.framing_profile_digest,
+            framing_resume: FramingResume::Clean,
+            last_seen_time_unix_nano: 1,
+            advisory_path: AdvisoryPath::unavailable(),
+        }])
+        .unwrap();
+
+    let first = Instant::now();
+    runtime.observe_retention_inventory(&retention_inventory_at(first, &[], true));
+    let requested_at = first.checked_add(Duration::from_secs(1)).unwrap();
+    runtime.retention_revalidation_requested_at = Some(requested_at);
+    let stale_completed_at = requested_at
+        .checked_add(Duration::from_millis(500))
+        .unwrap();
+    let stale = retention_inventory_between(first, stale_completed_at, &[], true);
+    runtime.observe_retention_inventory(&stale);
+    let mut stale_feedback = DiscoveryFeedback::default();
+    assert!(
+        runtime
+            .apply_revalidated_retention(
+                &mut stale_feedback,
+                stale.started_at,
+                stale.stats.generation,
+                stale_completed_at,
+            )
+            .unwrap()
+    );
+    assert!(runtime.store.table().get(&file_id).is_some());
+    assert_eq!(runtime.store.generation(), 0);
+    assert!(stale_feedback.released.is_empty());
+
+    let completed_at = requested_at.checked_add(Duration::from_secs(1)).unwrap();
+    let revalidated = retention_inventory_at(completed_at, &[], true);
+    runtime.observe_retention_inventory(&revalidated);
+    let mut feedback = DiscoveryFeedback::default();
+    assert!(
+        runtime
+            .apply_revalidated_retention(
+                &mut feedback,
+                revalidated.started_at,
+                revalidated.stats.generation,
+                completed_at,
+            )
+            .unwrap()
+    );
+    assert!(runtime.store.table().get(&file_id).is_none());
+    assert_eq!(runtime.store.generation(), 1);
+    assert_eq!(
+        feedback.released,
+        vec![DiscoveryRelease::RetentionRemoved(RetentionRemovalAck {
+            locator,
+            reconciliation_generation: revalidated.stats.generation,
+        })]
+    );
+    assert_eq!(runtime.retention_deadline, None);
+
+    runtime.retention_revalidation_requested_at = Some(completed_at);
+    let second = completed_at.checked_add(Duration::from_secs(1)).unwrap();
+    let second_inventory = retention_inventory_at(second, &[], true);
+    runtime.observe_retention_inventory(&second_inventory);
+    let mut feedback = DiscoveryFeedback::default();
+    assert!(
+        runtime
+            .apply_revalidated_retention(
+                &mut feedback,
+                second_inventory.started_at,
+                second_inventory.stats.generation,
+                second,
+            )
+            .unwrap()
+    );
+    assert_eq!(runtime.store.generation(), 1);
+    assert!(feedback.released.is_empty());
+    runtime.shutdown_resources().unwrap();
+}
+
+/// Scenario: identity persistence has just crossed its WAL transaction limit,
+/// leaving one retired generation before an unrelated record becomes
+/// retention-eligible in the same reconciliation.
+/// Guarantees: retention cleans the retired generation before filtered
+/// compaction instead of retrying a deterministic prerequisite until the
+/// one-attempt checkpoint failure budget is exhausted.
+#[test]
+fn retention_cleans_preappend_generation_before_filtered_compaction() {
+    let directory = tempdir().unwrap();
+    let namespace = directory.path().join("checkpoint");
+    let config = runtime_config_with(
+        directory.path().join("missing.log").to_str().unwrap(),
+        &namespace,
+        1,
+        |config| {
+            config.checkpoint.retention = Duration::from_secs(1);
+            config.checkpoint.compact_after_transactions = 1;
+            config.checkpoint.max_consecutive_failures = 1;
+        },
+    );
+    let mut runtime = WorkerRuntime::new(config).unwrap();
+    let expired_file_id = FileId::from_bytes([107; 16]);
+    let retained_file_id = FileId::from_bytes([108; 16]);
+    let expired_locator = Locator::PosixDevIno { dev: 10, ino: 7 };
+    let retained_locator = Locator::PosixDevIno { dev: 10, ino: 8 };
+    let registration = |file_id, locator| RegisterFile {
+        file_id,
+        file_epoch: 1,
+        committed_offset: 0,
+        committed_frontier_guard: CommittedFrontierGuard::empty(),
+        fingerprint: Vec::new(),
+        ignored_header_bytes: 0,
+        locator,
+        framing_profile_version: FRAMING_PROFILE_VERSION,
+        framing_profile_digest: runtime.config.framing_profile_digest,
+        framing_resume: FramingResume::Clean,
+        last_seen_time_unix_nano: 1,
+        advisory_path: AdvisoryPath::unavailable(),
+    };
+    let _first = runtime
+        .store
+        .register_files(vec![registration(expired_file_id, expired_locator)])
+        .unwrap();
+    let _second = runtime
+        .store
+        .register_files(vec![registration(retained_file_id, retained_locator)])
+        .unwrap();
+    assert_eq!(runtime.store.generation(), 1);
+    assert_eq!(runtime.store.retired_generations(), [0]);
+
+    let absent_since = Instant::now().checked_sub(Duration::from_secs(2)).unwrap();
+    runtime.observe_retention_inventory(&retention_inventory_at(
+        absent_since,
+        &[retained_locator],
+        true,
+    ));
+    runtime.retention_revalidation_requested_at = Some(absent_since);
+    let revalidated = retention_inventory_at(Instant::now(), &[retained_locator], true);
+    runtime.observe_retention_inventory(&revalidated);
+    let mut feedback = DiscoveryFeedback::default();
+    assert!(
+        runtime
+            .apply_revalidated_retention(
+                &mut feedback,
+                revalidated.started_at,
+                revalidated.stats.generation,
+                Instant::now(),
+            )
+            .unwrap()
+    );
+
+    assert!(runtime.store.table().get(&expired_file_id).is_none());
+    assert!(runtime.store.table().get(&retained_file_id).is_some());
+    assert_eq!(runtime.store.generation(), 2);
+    assert_eq!(runtime.store.retired_generations(), [1]);
+    assert_eq!(runtime.checkpoint_maintenance_failures, 0);
+    assert_eq!(
+        feedback.released,
+        vec![DiscoveryRelease::RetentionRemoved(RetentionRemovalAck {
+            locator: expired_locator,
+            reconciliation_generation: revalidated.stats.generation,
+        })]
+    );
+    runtime.shutdown_resources().unwrap();
+}
+
+/// Scenario: a quiet namespace starts with one absent durable Active record,
+/// no WAL threshold is due, and no source or delivery traffic occurs.
+/// Guarantees: the monotonic retention deadline requests a fresh complete
+/// scan and the worker removes the record through one filtered compaction
+/// without relying on another checkpoint append.
+#[test]
+fn idle_retention_deadline_reclaims_quiet_namespace() {
+    let directory = tempdir().unwrap();
+    let namespace = directory.path().join("checkpoint");
+    let missing = directory.path().join("missing.log");
+    let config = runtime_config_with(missing.to_str().unwrap(), &namespace, 1, |config| {
+        config.checkpoint.retention = Duration::from_millis(1);
+        config.discovery.poll_interval = Duration::from_secs(60);
+    });
+    let file_id = FileId::from_bytes([105; 16]);
+    let mut seeded = CheckpointStore::open(StoreOptions::from_runtime_config(&config)).unwrap();
+    let _registered = seeded
+        .register_files(vec![RegisterFile {
+            file_id,
+            file_epoch: 1,
+            committed_offset: 0,
+            committed_frontier_guard: CommittedFrontierGuard::empty(),
+            fingerprint: Vec::new(),
+            ignored_header_bytes: 0,
+            locator: Locator::PosixDevIno { dev: 10, ino: 5 },
+            framing_profile_version: FRAMING_PROFILE_VERSION,
+            framing_profile_digest: config.framing_profile_digest,
+            framing_resume: FramingResume::Clean,
+            last_seen_time_unix_nano: 1,
+            advisory_path: AdvisoryPath::unavailable(),
+        }])
+        .unwrap();
+    drop(seeded);
+
+    let mut runtime = WorkerRuntime::new(config).unwrap();
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+    let (_command_tx, command_rx) = sync_channel(1);
+    let deadline = Instant::now().checked_add(Duration::from_secs(2)).unwrap();
+    while runtime.store.table().get(&file_id).is_some() {
+        assert_eq!(
+            runtime
+                .process_discovery_message(&event_tx, &command_rx)
+                .unwrap(),
+            LoopControl::Continue
+        );
+        runtime.maintain_store().unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "idle retention did not reclaim the absent record"
+        );
+        std::thread::yield_now();
+    }
+
+    assert_eq!(runtime.store.generation(), 1);
+    assert_eq!(
+        runtime
+            .telemetry
+            .counter_for_test(WorkerCounter::CheckpointCompactions),
+        1
+    );
+    assert_eq!(runtime.retention_deadline, None);
+    assert_eq!(runtime.retention_revalidation_requested_at, None);
+    runtime.shutdown_resources().unwrap();
+}
+
+/// Scenario: a freshly revalidated retention set reaches the configured
+/// checkpoint failure bound at the first filtered-snapshot write.
+/// Guarantees: the worker surfaces the store failure with no discovery
+/// forget feedback, while the original generation and record remain live.
+#[test]
+fn retention_compaction_failure_preserves_record_and_feedback() {
+    let directory = tempdir().unwrap();
+    let namespace = directory.path().join("checkpoint");
+    let config = runtime_config_with(
+        directory.path().join("missing.log").to_str().unwrap(),
+        &namespace,
+        1,
+        |config| {
+            config.checkpoint.retention = Duration::from_secs(1);
+            config.checkpoint.max_consecutive_failures = 1;
+        },
+    );
+    let file_id = FileId::from_bytes([106; 16]);
+    let locator = Locator::PosixDevIno { dev: 10, ino: 6 };
+    let mut seeded = CheckpointStore::open(StoreOptions::from_runtime_config(&config)).unwrap();
+    let _registered = seeded
+        .register_files(vec![RegisterFile {
+            file_id,
+            file_epoch: 1,
+            committed_offset: 0,
+            committed_frontier_guard: CommittedFrontierGuard::empty(),
+            fingerprint: Vec::new(),
+            ignored_header_bytes: 0,
+            locator,
+            framing_profile_version: FRAMING_PROFILE_VERSION,
+            framing_profile_digest: config.framing_profile_digest,
+            framing_resume: FramingResume::Clean,
+            last_seen_time_unix_nano: 1,
+            advisory_path: AdvisoryPath::unavailable(),
+        }])
+        .unwrap();
+    drop(seeded);
+
+    let mut runtime = WorkerRuntime::new_with_store_fault_and_telemetry(
+        config,
+        FaultPoint::BeforeSnapshotWrite,
+        0,
+        Arc::new(WorkerTelemetryBridge::default()),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+
+    let absent_since = Instant::now().checked_sub(Duration::from_secs(2)).unwrap();
+    runtime.observe_retention_inventory(&retention_inventory_at(absent_since, &[], true));
+    runtime.retention_revalidation_requested_at = Some(absent_since);
+    let completed_at = Instant::now();
+    let revalidated = retention_inventory_at(completed_at, &[], true);
+    runtime.observe_retention_inventory(&revalidated);
+    let mut feedback = DiscoveryFeedback::default();
+    let error = runtime
+        .apply_revalidated_retention(
+            &mut feedback,
+            revalidated.started_at,
+            revalidated.stats.generation,
+            completed_at,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        WorkerError::Store(StoreError::InjectedFault {
+            point: FaultPoint::BeforeSnapshotWrite
+        })
+    ));
+    assert!(feedback.released.is_empty());
+    assert_eq!(runtime.store.generation(), 0);
+    assert!(runtime.store.table().get(&file_id).is_some());
     runtime.shutdown_resources().unwrap();
 }
 

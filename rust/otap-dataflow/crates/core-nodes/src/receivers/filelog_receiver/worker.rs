@@ -37,8 +37,8 @@ use super::discovery::source::{
     DiscoveryHandle, FeedbackSendError, spawn_discovery_with_shutdown_signal,
 };
 use super::discovery::{
-    CandidateEvent, DiscoveryError, DiscoveryFeedback, DiscoveryMessage, DurableAck,
-    ReconciliationBatch,
+    CandidateEvent, DiscoveryError, DiscoveryFeedback, DiscoveryMessage, DiscoveryRelease,
+    DurableAck, ReconciliationBatch, RetentionRemovalAck,
 };
 use super::framing::{DecodeError, DecodeOutcome, FlushReason, FramedRecord, Framer, FramerError};
 use super::identity::CandidateEvidence;
@@ -222,6 +222,10 @@ pub(super) enum WorkerError {
     RotationDeadlineOverflow { file_id: FileId },
     #[error("filelog reconciliation retry deadline overflowed")]
     ReconciliationRetryDeadlineOverflow,
+    #[error("filelog retention deadline overflowed for {file_id:?}")]
+    RetentionDeadlineOverflow { file_id: FileId },
+    #[error("filelog retention scan retry deadline overflowed")]
+    RetentionScanRetryDeadlineOverflow,
     #[error(
         "filelog drain frontier {end_offset} for {file_id:?} is no longer readable at source offset {source_offset}"
     )]
@@ -289,6 +293,13 @@ struct RetainedBatch {
     batch_id: u64,
     attempt: u32,
     logical: LogicalBatch,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RetentionCandidate {
+    file_id: FileId,
+    locator: Locator,
+    lifecycle_state: LifecycleState,
 }
 
 struct TurnFailure {
@@ -460,6 +471,12 @@ struct WorkerRuntime {
     checkpoint_commit_failed: bool,
     checkpoint_maintenance_failures: u32,
     maintenance_retry_pending: bool,
+    absence_since: HashMap<FileId, Instant>,
+    retention_candidates: HashSet<FileId>,
+    retention_removals: Vec<RetentionCandidate>,
+    retention_deadline: Option<Instant>,
+    retention_revalidation_requested_at: Option<Instant>,
+    retention_schedule_dirty: bool,
     next_batch_id: u64,
     drain_requested: bool,
     drain_complete: bool,
@@ -616,6 +633,21 @@ impl WorkerRuntime {
                 resource: "drain frontier table",
                 source,
             })?;
+        let mut absence_since = HashMap::new();
+        absence_since
+            .try_reserve(max_readers)
+            .map_err(|source| WorkerError::AllocationFailed {
+                resource: "retention absence table",
+                source,
+            })?;
+        let mut retention_candidates = HashSet::new();
+        retention_candidates
+            .try_reserve(max_readers)
+            .map_err(|source| WorkerError::AllocationFailed {
+                resource: "retention candidate set",
+                source,
+            })?;
+        let retention_removals = reserved_vec(max_readers, "retention removal batch")?;
 
         if shutdown_requested.load(Ordering::Acquire) {
             return Err(WorkerError::StartupCancelled);
@@ -661,6 +693,12 @@ impl WorkerRuntime {
             checkpoint_commit_failed: false,
             checkpoint_maintenance_failures: 0,
             maintenance_retry_pending: false,
+            absence_since,
+            retention_candidates,
+            retention_removals,
+            retention_deadline: None,
+            retention_revalidation_requested_at: None,
+            retention_schedule_dirty: false,
             next_batch_id: 1,
             drain_requested: false,
             drain_complete: false,
@@ -921,6 +959,7 @@ impl WorkerRuntime {
             WorkerCommand::Shutdown => Ok(LoopControl::Shutdown),
             WorkerCommand::Drain => {
                 self.drain_requested = true;
+                self.retention_schedule_dirty = true;
                 Ok(LoopControl::Continue)
             }
             WorkerCommand::Commit {
@@ -1155,6 +1194,13 @@ impl WorkerRuntime {
         if self.cancellation_requested() {
             return Ok(LoopControl::Shutdown);
         }
+        self.observe_retention_inventory(&batch);
+        let retention_revalidation_ready = batch.stats.complete
+            && self
+                .retention_revalidation_requested_at
+                .is_some_and(|requested_at| batch.started_at >= requested_at);
+        let reconciliation_started_at = batch.started_at;
+        let reconciliation_generation = batch.stats.generation;
         if self.freeze_policy_revocations(&batch.events)? {
             self.defer_reconciliation(batch, None)?;
             return self.seal_open_batch(event_tx, command_rx);
@@ -1404,15 +1450,20 @@ impl WorkerRuntime {
                                 }
                             }
                             Err(ReaderError::UnknownLocator { .. }) => {
-                                let detached_file_id = *self
-                                    .inactive_locators
-                                    .get(&locator)
-                                    .ok_or(WorkerError::Inconsistent {
-                                        reason: "re-eligible locator has no detached durable identity",
-                                    })?;
-                                if detached_file_id != identity.file_id {
+                                let detached_file_id =
+                                    self.inactive_locators.get(&locator).copied();
+                                if detached_file_id
+                                    .is_some_and(|file_id| file_id != identity.file_id)
+                                {
                                     return Err(WorkerError::Inconsistent {
                                         reason: "re-eligible locator changed detached durable identity",
+                                    });
+                                }
+                                if detached_file_id.is_none()
+                                    && identity.matched_by == IdentityMatch::ExactLocator
+                                {
+                                    return Err(WorkerError::Inconsistent {
+                                        reason: "re-eligible exact locator has no detached durable identity",
                                     });
                                 }
                                 let insert_result = self.readers_mut()?.insert(candidate, identity);
@@ -1421,8 +1472,10 @@ impl WorkerRuntime {
                                     self.observe_reader_error(&error);
                                     return Err(WorkerError::Reader(error));
                                 }
-                                let removed = self.inactive_locators.remove(&locator);
-                                debug_assert_eq!(removed, Some(detached_file_id));
+                                if let Some(detached_file_id) = detached_file_id {
+                                    let removed = self.inactive_locators.remove(&locator);
+                                    debug_assert_eq!(removed, Some(detached_file_id));
+                                }
                             }
                             Err(error) => return Err(WorkerError::Reader(error)),
                         }
@@ -1497,11 +1550,11 @@ impl WorkerRuntime {
                                 let _ = self.record_numbers.remove(file_id);
                                 self.remove_drain_file(file_id);
                                 self.remember_inactive_locator(locator, file_id)?;
-                                feedback.revoked.push(locator);
+                                feedback.released.push(DiscoveryRelease::Revoked(locator));
                             }
                         }
                         Err(ReaderError::UnknownLocator { .. }) => {
-                            feedback.revoked.push(locator);
+                            feedback.released.push(DiscoveryRelease::Revoked(locator));
                         }
                         Err(error) => return Err(WorkerError::Reader(error)),
                     }
@@ -1512,6 +1565,17 @@ impl WorkerRuntime {
             return Err(WorkerError::Inconsistent {
                 reason: "identity resolution returned unused candidates",
             });
+        }
+        self.retention_schedule_dirty = true;
+        if retention_revalidation_ready
+            && !self.apply_revalidated_retention(
+                &mut feedback,
+                reconciliation_started_at,
+                reconciliation_generation,
+                Instant::now(),
+            )?
+        {
+            return Ok(LoopControl::Shutdown);
         }
         self.publish_observations();
         self.send_feedback_interruptibly(feedback, command_rx)
@@ -1869,6 +1933,7 @@ impl WorkerRuntime {
                 } else {
                     self.queue_finalization_feedback(truncation.locator)?;
                 }
+                self.retention_schedule_dirty = true;
             }
             OnTruncate::ReadNew => {
                 let resulting_epoch = truncation.expected_file_epoch.checked_add(1).ok_or(
@@ -1996,6 +2061,7 @@ impl WorkerRuntime {
         self.discard_framer(file_id);
         let _ = self.rotation_waits.remove(&file_id);
         self.remove_drain_file(file_id);
+        self.retention_schedule_dirty = true;
         Ok(Some(locator))
     }
 
@@ -2367,6 +2433,7 @@ impl WorkerRuntime {
         } else {
             self.queue_finalization_feedback(locator)?;
         }
+        self.retention_schedule_dirty = true;
         Ok(true)
     }
 
@@ -2991,9 +3058,16 @@ impl WorkerRuntime {
             return Err(error);
         }
 
+        let retention_veto_clears = retained
+            .logical
+            .deltas()
+            .iter()
+            .any(|delta| delta.finalize() && self.absence_since.contains_key(&delta.file_id()));
         let result = self.commit_logical_batch(&retained.logical);
         if !matches!(result, Ok(true)) {
             self.retained = Some(retained);
+        } else if retention_veto_clears {
+            self.retention_schedule_dirty = true;
         }
         result
     }
@@ -3318,9 +3392,313 @@ impl WorkerRuntime {
             cleaned_generations,
             result.is_err() && cleanup_attempted,
         );
-        let _completed = self.observe_checkpoint_operation(result, "maintain checkpoint state")?;
+        let completed = self.observe_checkpoint_operation(result, "maintain checkpoint state")?;
         self.publish_store_observations();
+        if completed {
+            if self.store.generation() != generation_before {
+                self.retention_schedule_dirty = true;
+            }
+            let now = Instant::now();
+            self.refresh_retention_schedule(now)?;
+            self.request_due_retention_revalidation(now)?;
+        }
         Ok(())
+    }
+
+    fn observe_retention_inventory(&mut self, batch: &ReconciliationBatch) {
+        if self.config.checkpoint.retention.is_zero() {
+            self.absence_since.clear();
+            self.retention_deadline = None;
+            self.retention_revalidation_requested_at = None;
+            self.retention_schedule_dirty = false;
+            return;
+        }
+        if !batch.stats.complete {
+            self.absence_since.clear();
+            self.retention_deadline = None;
+            self.retention_schedule_dirty = false;
+            if self
+                .retention_revalidation_requested_at
+                .is_some_and(|requested_at| batch.completed_at >= requested_at)
+            {
+                self.retention_revalidation_requested_at = None;
+            }
+            return;
+        }
+
+        let present_locators = &batch.present_locators;
+        let table = self.store.table();
+        self.absence_since.retain(|file_id, _| {
+            table
+                .get(file_id)
+                .is_some_and(|record| match record.lifecycle_state {
+                    LifecycleState::Active => !present_locators.contains(&record.locator),
+                    LifecycleState::RotatedFinalized => true,
+                    LifecycleState::Quarantined => false,
+                })
+        });
+        for (file_id, record) in table.iter() {
+            let absent = match record.lifecycle_state {
+                LifecycleState::Active => !present_locators.contains(&record.locator),
+                LifecycleState::RotatedFinalized => true,
+                LifecycleState::Quarantined => false,
+            };
+            if absent {
+                let _ = self
+                    .absence_since
+                    .entry(*file_id)
+                    .or_insert(batch.completed_at);
+            } else {
+                let _ = self.absence_since.remove(file_id);
+            }
+        }
+        self.retention_schedule_dirty = true;
+    }
+
+    fn retention_vetoed(&self, file_id: FileId) -> bool {
+        if self.drain_requested {
+            return true;
+        }
+        if self
+            .readers
+            .as_ref()
+            .is_some_and(|readers| readers.contains_file(file_id))
+            || self.framers.contains_key(&file_id)
+            || self.rotation_waits.contains_key(&file_id)
+            || self
+                .open_batch
+                .as_ref()
+                .is_some_and(|batch| batch.contains_file(file_id))
+            || self
+                .retained
+                .as_ref()
+                .is_some_and(|retained| retained.logical.contains_file(file_id))
+            || self
+                .pending_decode_quarantine
+                .is_some_and(|pending| pending.file_id == file_id)
+            || self
+                .detected_truncations
+                .iter()
+                .any(|truncation| truncation.file_id == file_id)
+        {
+            return true;
+        }
+        let Some(record) = self.store.table().get(&file_id) else {
+            return false;
+        };
+        self.pending_finalizations.contains(&record.locator)
+    }
+
+    fn refresh_retention_schedule(&mut self, _now: Instant) -> Result<(), WorkerError> {
+        if !self.retention_schedule_dirty {
+            return Ok(());
+        }
+        if self.config.checkpoint.retention.is_zero() || self.drain_requested {
+            self.retention_deadline = None;
+            self.retention_schedule_dirty = false;
+            return Ok(());
+        }
+        if self.retention_revalidation_requested_at.is_some() {
+            self.retention_deadline = None;
+            self.retention_schedule_dirty = false;
+            return Ok(());
+        }
+
+        let table = self.store.table();
+        self.absence_since.retain(|file_id, _| {
+            table
+                .get(file_id)
+                .is_some_and(|record| record.lifecycle_state != LifecycleState::Quarantined)
+        });
+        let mut earliest = None;
+        for (&file_id, &absence_since) in &self.absence_since {
+            let deadline = absence_since
+                .checked_add(self.config.checkpoint.retention)
+                .ok_or(WorkerError::RetentionDeadlineOverflow { file_id })?;
+            if self.retention_vetoed(file_id) {
+                continue;
+            }
+            earliest = Some(earliest.map_or(deadline, |current: Instant| current.min(deadline)));
+        }
+        self.retention_deadline = earliest;
+        self.retention_schedule_dirty = false;
+        Ok(())
+    }
+
+    fn request_due_retention_revalidation(&mut self, now: Instant) -> Result<(), WorkerError> {
+        if self.drain_requested
+            || self.retention_revalidation_requested_at.is_some()
+            || self
+                .retention_deadline
+                .is_none_or(|deadline| deadline > now)
+        {
+            return Ok(());
+        }
+        let discovery = self.discovery.as_ref().ok_or(WorkerError::Inconsistent {
+            reason: "discovery handle is missing",
+        })?;
+        match discovery.scan_now() {
+            Ok(()) => {
+                self.retention_revalidation_requested_at = Some(now);
+                self.retention_deadline = None;
+            }
+            Err(DiscoveryError::ChannelFull { channel: "command" }) => {
+                self.retention_deadline = Some(
+                    now.checked_add(COMMAND_POLL_INTERVAL)
+                        .ok_or(WorkerError::RetentionScanRetryDeadlineOverflow)?,
+                );
+            }
+            Err(error) => return Err(WorkerError::Discovery(error)),
+        }
+        Ok(())
+    }
+
+    fn apply_revalidated_retention(
+        &mut self,
+        feedback: &mut DiscoveryFeedback,
+        started_at: Instant,
+        reconciliation_generation: u64,
+        now: Instant,
+    ) -> Result<bool, WorkerError> {
+        let Some(requested_at) = self.retention_revalidation_requested_at else {
+            return Ok(true);
+        };
+        if started_at < requested_at {
+            return Ok(true);
+        }
+
+        self.retention_candidates.clear();
+        self.retention_removals.clear();
+        for (&file_id, &absence_since) in &self.absence_since {
+            let deadline = absence_since
+                .checked_add(self.config.checkpoint.retention)
+                .ok_or(WorkerError::RetentionDeadlineOverflow { file_id })?;
+            if deadline > now || self.retention_vetoed(file_id) {
+                continue;
+            }
+            let Some(record) = self.store.table().get(&file_id) else {
+                continue;
+            };
+            if record.lifecycle_state == LifecycleState::Quarantined {
+                continue;
+            }
+            let inserted = self.retention_candidates.insert(file_id);
+            debug_assert!(inserted);
+            self.retention_removals.push(RetentionCandidate {
+                file_id,
+                locator: record.locator,
+                lifecycle_state: record.lifecycle_state,
+            });
+        }
+
+        if self.retention_candidates.is_empty() {
+            self.retention_revalidation_requested_at = None;
+            self.retention_schedule_dirty = true;
+            return Ok(true);
+        }
+
+        let active_removals = self
+            .retention_removals
+            .iter()
+            .filter(|removal| {
+                removal.lifecycle_state == LifecycleState::Active
+                    && !feedback.finalized.contains(&removal.locator)
+            })
+            .count();
+        feedback
+            .released
+            .try_reserve_exact(active_removals)
+            .map_err(|source| WorkerError::AllocationFailed {
+                resource: "retention discovery feedback",
+                source,
+            })?;
+
+        let generation_before = self.store.generation();
+        let started = Instant::now();
+        let candidates = std::mem::take(&mut self.retention_candidates);
+        let shutdown_requested = Arc::clone(&self.shutdown_requested);
+        let cleanup = if self.store.retired_generations().is_empty() {
+            Ok(Some(Some(0)))
+        } else {
+            self.retry_direct_checkpoint_operation(
+                "clean retired generations before checkpoint retention",
+                |runtime| {
+                    runtime
+                        .store
+                        .cleanup_retired_generations_cancellable(|| {
+                            shutdown_requested.load(Ordering::Acquire)
+                        })
+                        .map_err(WorkerError::Store)
+                },
+            )
+        };
+        let cleaned_generations = match cleanup {
+            Ok(Some(Some(cleaned))) => cleaned,
+            Ok(Some(None)) | Ok(None) => {
+                self.retention_candidates = candidates;
+                return Ok(false);
+            }
+            Err(error) => {
+                self.retention_candidates = candidates;
+                self.telemetry
+                    .add(WorkerCounter::CheckpointCleanupFailures, 1);
+                return Err(error);
+            }
+        };
+        let result = self.retry_direct_checkpoint_operation(
+            "remove runtime-vetted checkpoint retention records",
+            |runtime| {
+                runtime
+                    .store
+                    .remove_vetted_retention_records_cancellable(&candidates, &mut || {
+                        shutdown_requested.load(Ordering::Acquire)
+                    })
+                    .map_err(WorkerError::Store)
+            },
+        );
+        self.retention_candidates = candidates;
+        let Some(removed) = result? else {
+            return Ok(false);
+        };
+        let Some(removed) = removed else {
+            return Ok(false);
+        };
+        if removed != self.retention_candidates.len() {
+            return Err(WorkerError::Inconsistent {
+                reason: "retention compaction removed a different record count",
+            });
+        }
+        record_checkpoint_maintenance_telemetry(
+            &self.telemetry,
+            generation_before,
+            self.store.generation(),
+            started.elapsed(),
+            cleaned_generations,
+            false,
+        );
+
+        for removal in &self.retention_removals {
+            let _ = self.absence_since.remove(&removal.file_id);
+            let _ = self.record_numbers.remove(removal.file_id);
+            if removal.lifecycle_state == LifecycleState::Active
+                && !feedback.finalized.contains(&removal.locator)
+            {
+                feedback
+                    .released
+                    .push(DiscoveryRelease::RetentionRemoved(RetentionRemovalAck {
+                        locator: removal.locator,
+                        reconciliation_generation,
+                    }));
+            }
+        }
+        self.inactive_locators
+            .retain(|_, file_id| !self.retention_candidates.contains(file_id));
+        self.retention_candidates.clear();
+        self.retention_removals.clear();
+        self.retention_revalidation_requested_at = None;
+        self.retention_schedule_dirty = true;
+        self.refresh_retention_schedule(now)?;
+        Ok(true)
     }
 
     fn observe_checkpoint_operation(
@@ -3538,6 +3916,7 @@ impl WorkerRuntime {
         for deadline in [
             reader_deadline,
             self.pending_reconciliation_retry_at,
+            self.retention_deadline,
             self.store.next_sync_deadline(),
             self.open_batch.as_ref().and_then(OpenBatch::deadline),
             self.framers
@@ -3556,10 +3935,11 @@ impl WorkerRuntime {
 
     fn next_maintenance_wait(&self) -> Duration {
         let now = Instant::now();
-        self.store
-            .next_sync_deadline()
-            .map_or(COMMAND_POLL_INTERVAL, |deadline| {
-                COMMAND_POLL_INTERVAL.min(deadline.saturating_duration_since(now))
+        [self.store.next_sync_deadline(), self.retention_deadline]
+            .into_iter()
+            .flatten()
+            .fold(COMMAND_POLL_INTERVAL, |wait, deadline| {
+                wait.min(deadline.saturating_duration_since(now))
             })
     }
 
@@ -3707,6 +4087,7 @@ impl WorkerRuntime {
             let _ = self.record_numbers.remove(delta.file_id());
             self.remove_drain_file(delta.file_id());
             record_rotation_finalization_telemetry(&self.telemetry);
+            self.retention_schedule_dirty = true;
         }
         self.publish_observations();
         Ok(true)
@@ -3786,7 +4167,7 @@ fn feedback_with_capacity(capacity: usize) -> Result<DiscoveryFeedback, WorkerEr
         rejected: reserved_vec(capacity, "discovery rejected feedback")?,
         deferred: reserved_vec(capacity, "discovery deferred feedback")?,
         finalized: reserved_vec(capacity, "discovery finalized feedback")?,
-        revoked: reserved_vec(capacity, "discovery revocation feedback")?,
+        released: reserved_vec(capacity, "discovery release feedback")?,
     })
 }
 

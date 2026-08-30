@@ -308,6 +308,19 @@ pub enum StoreError {
         /// Maximum admitted by byte/count thresholds.
         max: u64,
     },
+    /// Runtime retention named a record that is not present in the live
+    /// checkpoint table.
+    #[error("runtime-vetted checkpoint retention record {file_id:?} is not tracked")]
+    RetentionCandidateMissing {
+        /// Missing durable identity.
+        file_id: FileId,
+    },
+    /// Runtime retention attempted to remove durable quarantine.
+    #[error("runtime-vetted checkpoint retention record {file_id:?} is quarantined")]
+    RetentionCandidateQuarantined {
+        /// Quarantined durable identity.
+        file_id: FileId,
+    },
     /// More recognized generations were present than recovery is willing
     /// to retain in memory or on disk.
     #[error(

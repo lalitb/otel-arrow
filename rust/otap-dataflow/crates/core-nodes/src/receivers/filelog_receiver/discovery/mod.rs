@@ -14,7 +14,7 @@ pub(crate) mod source;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use thiserror::Error;
 
@@ -153,10 +153,17 @@ impl DiscoveryStats {
 pub(crate) struct ReconciliationBatch {
     /// Candidate transitions in scan order, with removals last.
     pub(crate) events: Vec<CandidateEvent>,
+    /// Stable locators observed present during this pass, including sources
+    /// excluded by policy or ignored by the initial-age filter.
+    pub(crate) present_locators: HashSet<Locator>,
     /// Complete or explicitly incomplete identity-matching inventory.
     pub(crate) inventory: CandidateInventory,
     /// Bounded scan and admission evidence.
     pub(crate) stats: DiscoveryStats,
+    /// Monotonic time when traversal for this pass began.
+    pub(crate) started_at: Instant,
+    /// Monotonic completion time for absence-retention evidence.
+    pub(crate) completed_at: Instant,
     /// Locators this pass actually emitted a `CandidateEvent` for while
     /// recognized as a validated move/create replacement for a
     /// distinguished matched-path binding that rebounded away from its
@@ -184,6 +191,33 @@ pub(crate) struct DurableAck {
     pub(crate) advisory_path: AdvisoryPath,
 }
 
+/// Discovery continuity cleanup for one runtime-vetted retention removal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RetentionRemovalAck {
+    /// Locator whose durable Active association was removed.
+    pub(crate) locator: Locator,
+    /// Exact complete reconciliation generation that proved it absent.
+    pub(crate) reconciliation_generation: u64,
+}
+
+/// Runtime release outcome applied to discovery continuity state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiscoveryRelease {
+    /// Policy revocation stopped local reading but preserved durable state.
+    Revoked(Locator),
+    /// Runtime-vetted retention removed the durable Active association.
+    RetentionRemoved(RetentionRemovalAck),
+}
+
+impl DiscoveryRelease {
+    const fn locator(&self) -> Locator {
+        match self {
+            Self::Revoked(locator) => *locator,
+            Self::RetentionRemoved(removal) => removal.locator,
+        }
+    }
+}
+
 /// Read-worker feedback applied before a later reconciliation pass.
 #[derive(Debug, Default)]
 pub(crate) struct DiscoveryFeedback {
@@ -196,9 +230,8 @@ pub(crate) struct DiscoveryFeedback {
     pub(crate) deferred: Vec<Locator>,
     /// Locators whose logical reader and runtime lease are fully finalized.
     pub(crate) finalized: Vec<Locator>,
-    /// Locators whose policy revocation has stopped and released runtime
-    /// reading while leaving their durable checkpoint lifecycle active.
-    pub(crate) revoked: Vec<Locator>,
+    /// Policy-revoked or retention-removed locator release outcomes.
+    pub(crate) released: Vec<DiscoveryRelease>,
 }
 
 /// Messages emitted by the dedicated discovery thread.

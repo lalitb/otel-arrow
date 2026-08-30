@@ -620,6 +620,11 @@ impl OpenBatch {
         })
     }
 
+    /// Whether the open batch owns unresolved progress for `file_id`.
+    pub(crate) fn contains_file(&self, file_id: FileId) -> bool {
+        self.delta_index.contains_key(&file_id)
+    }
+
     /// Whether a sparse nonempty batch must flush at `now`.
     pub(crate) fn is_flush_due(&self, now: Instant) -> bool {
         self.record_count != 0 && self.deadline.is_some_and(|deadline| now >= deadline)
@@ -993,6 +998,11 @@ impl LogicalBatch {
     /// Borrow the Ack delta set.
     pub(crate) fn deltas(&self) -> &[ProgressDelta] {
         &self.deltas
+    }
+
+    /// Whether the retained batch owns unresolved progress for `file_id`.
+    pub(crate) fn contains_file(&self, file_id: FileId) -> bool {
+        self.deltas.iter().any(|delta| delta.file_id == file_id)
     }
 
     /// Clone the shared delta allocation for completion correlation.

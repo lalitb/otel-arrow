@@ -2538,69 +2538,66 @@ impl CheckpointStore {
         self.append(vec![Operation::ResetQuarantinedFile(reset)])
     }
 
-    /// The records ordinary retention would remove: those whose last-seen
-    /// time is at least `retention` older than `now_unix_nano`.
+    /// Removes one complete runtime-vetted retention set through one filtered
+    /// compaction and returns how many records were removed.
     ///
-    /// A quarantined record is never included, whatever its age: quarantine
-    /// is exempt from ordinary retention and can only be removed by an
-    /// explicit administrative operation. A zero `retention` means
-    /// indefinite retention and selects nothing.
-    #[must_use]
-    pub fn retention_candidates(
-        &self,
-        eligible_absent: &HashSet<FileId>,
-        now_unix_nano: u64,
-        retention: Duration,
-    ) -> Vec<FileId> {
-        if retention.is_zero() {
-            return Vec::new();
-        }
-        let retention_nanos = retention.as_nanos();
-        let Some(cutoff) = u128::from(now_unix_nano).checked_sub(retention_nanos) else {
-            return Vec::new();
-        };
-        let mut candidates: Vec<FileId> = self
-            .table
-            .iter()
-            .filter(|(file_id, _)| eligible_absent.contains(file_id))
-            .filter(|(_, record)| record.lifecycle_state != LifecycleState::Quarantined)
-            .filter(|(_, record)| u128::from(record.last_seen_time_unix_nano) <= cutoff)
-            .map(|(file_id, _)| *file_id)
-            .collect();
-        candidates.sort_unstable();
-        candidates
-    }
-
-    /// Removes every record ordinary retention selects through one filtered
-    /// compaction and returns how many were removed.
-    ///
-    /// Quarantined records are never removed because
-    /// [`Self::retention_candidates`] excludes them. Retention never encodes
+    /// The worker, not durable wall-clock metadata, proves continuous
+    /// monotonic absence and every runtime veto before calling this method.
+    /// This boundary independently rejects missing or quarantined records so
+    /// an invalid set cannot publish a partial subset. Retention never encodes
     /// `remove_file`; the complete vetted set becomes authoritative only when
     /// the replacement `CURRENT` publication is durable.
-    pub fn remove_expired(
+    #[cfg(test)]
+    fn remove_vetted_retention_records(
         &mut self,
-        eligible_absent: &HashSet<FileId>,
-        now_unix_nano: u64,
-        retention: Duration,
+        vetted: &HashSet<FileId>,
     ) -> Result<usize, StoreError> {
+        self.remove_vetted_retention_records_cancellable(vetted, &mut || false)
+            .map(|removed| removed.expect("non-cancellable retention cannot be cancelled"))
+    }
+
+    pub(crate) fn remove_vetted_retention_records_cancellable(
+        &mut self,
+        vetted: &HashSet<FileId>,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<Option<usize>, StoreError> {
         self.ensure_not_unusable("remove expired checkpoint records")?;
-        let candidates = self.retention_candidates(eligible_absent, now_unix_nano, retention);
-        if candidates.is_empty() {
-            self.ensure_usable("remove expired checkpoint records")?;
-            return Ok(0);
+        if cancelled() {
+            return Ok(None);
         }
-        let removals: HashSet<FileId> = candidates.into_iter().collect();
-        let removed = removals.len();
+        if vetted.is_empty() {
+            self.ensure_usable("remove expired checkpoint records")?;
+            return Ok(Some(0));
+        }
+        if let Some(file_id) = vetted
+            .iter()
+            .copied()
+            .filter(|file_id| self.table.get(file_id).is_none())
+            .min()
+        {
+            return Err(StoreError::RetentionCandidateMissing { file_id });
+        }
+        if let Some(file_id) = vetted
+            .iter()
+            .copied()
+            .filter(|file_id| {
+                self.table
+                    .get(file_id)
+                    .is_some_and(|record| record.lifecycle_state == LifecycleState::Quarantined)
+            })
+            .min()
+        {
+            return Err(StoreError::RetentionCandidateQuarantined { file_id });
+        }
+        let removed = vetted.len();
         let records = self
             .table
             .snapshot_records()
             .into_iter()
-            .filter(|record| !removals.contains(&record.file_id))
+            .filter(|record| !vetted.contains(&record.file_id))
             .collect();
-        self.compact_replacing_table_cancellable(Some(records), &mut || false)?
-            .expect("non-cancellable retention compaction cannot be cancelled");
-        Ok(removed)
+        self.compact_replacing_table_cancellable(Some(records), cancelled)
+            .map(|compacted| compacted.map(|()| removed))
     }
 
     /// Removes a quarantined record through the only path the format allows:
