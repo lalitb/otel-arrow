@@ -1695,7 +1695,7 @@ concurrency does not provide failure isolation.
 | Non-retryable Nack / retries exhausted | `on_nack`: terminal (default) or drop-and-continue with counter |
 | Truncation detected under `fail` | Sync durable per-file quarantine before reporting; preserve it across restart until an explicit audited reset |
 | Truncation detected under explicit `read_new` | Reset epoch, offset, and framing state; accept unrecoverable loss if the process crashes after source destruction |
-| Rotation finalizes with an unterminated line | Do not emit it; count partial bytes left uncommitted and document possible capture loss |
+| Confirmed permanent rotation EOF has an unterminated frame | Emit under `preserve_raw`/`replace` with terminal evidence and Ack-gated progress; quarantine under decode `fail` without malformed-unit progress |
 | Downstream channel closed | Terminal error |
 
 ## Self-telemetry
