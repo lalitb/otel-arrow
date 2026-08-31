@@ -2394,6 +2394,7 @@ impl CheckpointStore {
     /// remains in one transaction. A filesystem failure may persist an
     /// earlier complete transaction; it can never persist only part of one
     /// atomic group.
+    #[cfg(test)]
     pub(crate) fn append_atomic_groups(
         &mut self,
         groups: Vec<Vec<Operation>>,
@@ -2412,6 +2413,7 @@ impl CheckpointStore {
     /// Cancellation can leave a complete durable transaction prefix, but
     /// never a partial caller-defined atomic group. Recovery safely resumes
     /// from that prefix without treating the entire plan as applied.
+    #[cfg(test)]
     pub(crate) fn append_atomic_groups_cancellable(
         &mut self,
         groups: Vec<Vec<Operation>>,

@@ -1770,11 +1770,8 @@ fn map_reset_source_error(
         },
         IdentityError::InvalidEvidence { .. }
         | IdentityError::InvalidAdvisoryPath { .. }
-        | IdentityError::ReopenFingerprintMismatch { .. }
-        | IdentityError::ReopenOffsetBeyondSize { .. }
         | IdentityError::ReopenFrontierGuardMismatch { .. }
         | IdentityError::DuplicateCandidateLocator { .. }
-        | IdentityError::AmbiguousQuarantinedLocator { .. }
         | IdentityError::IncompatibleProfile { .. }
         | IdentityError::FileIdCollisionLimit { .. }
         | IdentityError::Store(_) => CheckpointAdminError::ResetSourceValidation {
@@ -1832,29 +1829,6 @@ fn with_verified_source<T>(
     let result = operation();
     verify_source_binding(namespace, lock)?;
     result
-}
-
-impl NamespaceAuthorityReport {
-    fn selected_generation(&self) -> Option<u64> {
-        match self {
-            Self::Valid { validation } => Some(validation.selected_generation),
-            Self::Invalid { failure } => failure.selected_generation,
-        }
-    }
-
-    fn tracked_file_count(&self) -> Option<u64> {
-        match self {
-            Self::Valid { validation } => Some(validation.tracked_file_count),
-            Self::Invalid { .. } => None,
-        }
-    }
-
-    fn quarantine_count(&self) -> Option<u64> {
-        match self {
-            Self::Valid { validation } => Some(validation.quarantine_count),
-            Self::Invalid { .. } => None,
-        }
-    }
 }
 
 fn probe_namespace_authority(

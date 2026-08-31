@@ -77,26 +77,6 @@ pub(crate) enum IdentityError {
         /// Locator extracted from the reopened handle.
         found: Locator,
     },
-    /// Reopening a logical reader found matching evidence that no longer
-    /// extends the durable prefix.
-    #[error("filelog reader reopen fingerprint no longer extends durable evidence at {path}")]
-    ReopenFingerprintMismatch {
-        /// Reader path used for the reopen.
-        path: PathBuf,
-    },
-    /// Reopening a logical reader found a source shorter than its durable
-    /// checkpoint frontier.
-    #[error(
-        "filelog reader reopen at {path} found size {size}, below committed offset {committed_offset}"
-    )]
-    ReopenOffsetBeyondSize {
-        /// Reader path used for the reopen.
-        path: PathBuf,
-        /// Durable source-byte frontier.
-        committed_offset: u64,
-        /// Size observed from the reopened handle.
-        size: u64,
-    },
     /// Reopening a logical reader read a committed-frontier window that
     /// does not match the durably recorded guard: the size and fingerprint
     /// prefix are unchanged, but the raw bytes immediately preceding the
@@ -109,6 +89,13 @@ pub(crate) enum IdentityError {
         path: PathBuf,
     },
     /// The current target cannot provide a supported native locator.
+    #[cfg_attr(
+        any(unix, windows),
+        allow(
+            dead_code,
+            reason = "constructed only by unsupported-platform cfg implementations"
+        )
+    )]
     #[error("filelog handle identity is unsupported on this platform: {path}")]
     UnsupportedPlatform {
         /// Candidate path.
@@ -137,14 +124,6 @@ pub(crate) enum IdentityError {
     #[error("filelog candidate batch contains duplicate runtime locator {locator:?}")]
     DuplicateCandidateLocator {
         /// Duplicated locator.
-        locator: Locator,
-    },
-    /// Corrupt or conflicting durable records claim one quarantined locator.
-    #[error(
-        "multiple checkpoint records claim quarantined runtime locator {locator:?}; recovery cannot safely select one"
-    )]
-    AmbiguousQuarantinedLocator {
-        /// Conflicting locator.
         locator: Locator,
     },
     /// A matching checkpoint uses an incompatible resumption profile.

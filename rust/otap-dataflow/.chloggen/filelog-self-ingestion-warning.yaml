@@ -1,0 +1,6 @@
+change_type: enhancement
+component: observability
+note: "Warn at startup when a filelog include can match the checkpoint namespace CURRENT marker."
+issues: [3939]
+subtext: |
+  The namespace remains excluded. Review colocated engine output for self-ingestion risk. The event has fixed fields; exact telemetry names remain provisional.

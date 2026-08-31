@@ -404,6 +404,7 @@ pub(crate) enum DiscoveryError {
     #[error("filelog discovery shutdown was requested")]
     ShutdownRequested,
     /// The dedicated discovery thread panicked.
+    #[cfg(test)]
     #[error("filelog discovery thread panicked")]
     ThreadPanicked,
 }

@@ -370,7 +370,7 @@ impl BoundedTraversal {
         path
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn retained_frame_capacity(&self) -> usize {
         self.frames.capacity()
     }
@@ -570,6 +570,13 @@ struct NativeEntry {
 }
 
 #[derive(Debug)]
+#[cfg_attr(
+    windows,
+    allow(
+        dead_code,
+        reason = "entry-local issues are constructed only by the POSIX traversal backend"
+    )
+)]
 enum PlatformEntryIssue {
     Io {
         operation: &'static str,
@@ -599,6 +606,13 @@ impl NativeEntry {
         }
     }
 
+    #[cfg_attr(
+        windows,
+        allow(
+            dead_code,
+            reason = "entry-local issues are constructed only by the POSIX traversal backend"
+        )
+    )]
     fn with_issue(
         name: OsString,
         locator: Locator,
@@ -797,12 +811,12 @@ pub(super) fn peak_directory_handles() -> usize {
     PEAK_DIRECTORY_HANDLES.with(std::cell::Cell::get)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn current_directory_handles() -> usize {
     OPEN_DIRECTORY_HANDLES.with(std::cell::Cell::get)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn fail_next_directory_open(error: io::Error) {
     NEXT_DIRECTORY_OPEN_ERROR.with(|next| {
         *next.borrow_mut() = Some(error);

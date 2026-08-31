@@ -11,13 +11,15 @@ use thiserror::Error;
 use super::decoder::{
     DecodeError, DecodeEvent, DecodedValue, SourceBytes, SourceRange, StreamDecoder,
 };
+#[cfg(test)]
+use crate::receivers::filelog_receiver::config::peak_framer_payload_bytes;
 use crate::receivers::filelog_receiver::{
     Encoding, MaxLogSizeBehavior, OnDecodeError,
     checkpoint::{
         CommittedFrontierWindow, FileId, FramingResume,
         primitives::COMMITTED_FRONTIER_GUARD_WINDOW_BYTES,
     },
-    config::{CompiledMultilinePattern, RuntimeConfig, peak_framer_payload_bytes},
+    config::{CompiledMultilinePattern, RuntimeConfig},
 };
 
 const FRAGMENT_ID_DOMAIN: &[u8] = b"otel-arrow-filelog-fragment-v1\0";
@@ -110,6 +112,7 @@ pub(crate) struct FramedRecord {
 impl FramedRecord {
     /// Returns the contiguous checkpoint delta owned by this output.
     #[must_use]
+    #[cfg(test)]
     pub(crate) const fn owned_progress_range(&self) -> SourceRange {
         self.frame_source_range
     }
@@ -991,6 +994,7 @@ impl Framer {
     ///
     /// The telemetry-oriented counter saturates at `u64::MAX`.
     #[must_use]
+    #[cfg(test)]
     pub(crate) const fn pattern_not_matched_count(&self) -> u64 {
         self.pattern_not_matched
     }
@@ -1001,6 +1005,7 @@ impl Framer {
     }
 
     /// Returns the conservative peak payload-allocation formula.
+    #[cfg(test)]
     pub(crate) fn peak_payload_capacity_bound(&self) -> Result<usize, FramerError> {
         let copies = if self.payload_kind.keeps_source_shadow() {
             2

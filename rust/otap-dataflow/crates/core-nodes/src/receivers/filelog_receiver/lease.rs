@@ -445,6 +445,7 @@ impl RuntimeLeaseRegistry {
         Ok(state)
     }
 
+    #[cfg(test)]
     fn ensure_healthy(&self) -> Result<(), LeaseError> {
         drop(self.lock_state()?);
         Ok(())
@@ -663,6 +664,7 @@ impl ReceiverLeaseScope {
 
     /// Fails closed if any release, cleanup, or mutex operation discovered
     /// that process-local single-reader enforcement is no longer reliable.
+    #[cfg(test)]
     pub(crate) fn ensure_healthy(&self) -> Result<(), LeaseError> {
         self.token()?.registry.ensure_healthy()
     }
@@ -726,6 +728,7 @@ pub(crate) struct RuntimeFileLease {
 impl RuntimeFileLease {
     /// The normalized runtime locator protected by this lease.
     #[must_use]
+    #[cfg(test)]
     pub(crate) const fn locator(&self) -> Locator {
         self.locator
     }

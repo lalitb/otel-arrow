@@ -176,6 +176,7 @@ impl EnvironmentalBackoff {
         Some(Self { failures, retry_at })
     }
 
+    #[cfg(test)]
     pub(crate) const fn failures(self) -> u8 {
         self.failures
     }

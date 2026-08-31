@@ -144,10 +144,6 @@ pub(super) enum WorkerError {
     Batch(#[from] BatchError),
     #[error(transparent)]
     Store(#[from] StoreError),
-    #[error("filelog worker event channel closed")]
-    EventChannelClosed,
-    #[error("filelog worker command channel disconnected")]
-    CommandChannelDisconnected,
     #[error("filelog discovery feedback channel disconnected")]
     DiscoveryFeedbackDisconnected,
     #[error("filelog discovery thread stopped before worker shutdown")]
@@ -551,6 +547,7 @@ impl WorkerRuntime {
         self.shutdown_requested.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     fn new(config: RuntimeConfig) -> Result<Self, WorkerError> {
         Self::new_with_telemetry(
             config,
@@ -695,6 +692,7 @@ impl WorkerRuntime {
         }
         let identity_settings = IdentitySettings::from_runtime(&config);
         let discovery_plan = DiscoveryPlan::from_runtime(&config)?;
+        let likely_self_ingestion = discovery_plan.likely_self_ingestion();
         if shutdown_requested.load(Ordering::Acquire) {
             return Err(WorkerError::StartupCancelled);
         }
@@ -716,6 +714,12 @@ impl WorkerRuntime {
         if shutdown_requested.load(Ordering::Acquire) {
             drop(discovery);
             return Err(WorkerError::StartupCancelled);
+        }
+        if likely_self_ingestion {
+            otel_warn!(
+                "filelog_receiver.self_ingestion_risk",
+                checkpoint_namespace_excluded = true
+            );
         }
 
         let mut worker = Self {

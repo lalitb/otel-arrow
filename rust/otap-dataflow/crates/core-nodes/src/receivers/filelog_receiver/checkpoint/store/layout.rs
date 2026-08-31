@@ -133,18 +133,6 @@ impl GenerationFiles {
     pub const fn is_complete(self) -> bool {
         self.snapshot && self.wal
     }
-
-    /// The missing member of an incomplete pair, for diagnostics.
-    #[must_use]
-    pub(crate) const fn missing(self) -> &'static str {
-        if !self.snapshot {
-            "the snapshot file"
-        } else if !self.wal {
-            "the WAL file"
-        } else {
-            "nothing"
-        }
-    }
 }
 
 /// Parses a generation number exactly as the format specifies it: ASCII

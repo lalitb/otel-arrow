@@ -68,26 +68,6 @@ pub(crate) fn open_candidate(
     )
 }
 
-/// Opens a resolved target while retaining the matched path as advisory
-/// evidence.
-pub(crate) fn open_candidate_at(
-    open_path: &Path,
-    advisory_path: &Path,
-    follow_symlinks: bool,
-    fingerprint_bytes: u16,
-    ignored_header_bytes: u32,
-) -> Result<OpenedCandidate, IdentityError> {
-    open_candidate_at_cancellable(
-        open_path,
-        advisory_path,
-        follow_symlinks,
-        fingerprint_bytes,
-        ignored_header_bytes,
-        || false,
-    )
-    .map(|opened| opened.expect("non-cancellable candidate open cannot be cancelled"))
-}
-
 pub(crate) fn open_candidate_at_cancellable(
     open_path: &Path,
     advisory_path: &Path,
@@ -553,33 +533,6 @@ pub(crate) enum ReopenCandidate {
     Truncated(OpenedCandidate),
 }
 
-/// Reopens an existing logical reader, validates the exact locator, and
-/// classifies durable fingerprint or source-frontier incompatibility as
-/// observable truncation while retaining the verified handle.
-pub(crate) fn reopen_candidate_at(
-    open_path: &Path,
-    advisory_path: &Path,
-    follow_symlinks: bool,
-    fingerprint_bytes: u16,
-    ignored_header_bytes: u32,
-    expected_locator: Locator,
-    durable_fingerprint: &[u8],
-    required_offset: u64,
-) -> Result<ReopenCandidate, IdentityError> {
-    reopen_candidate_at_cancellable(
-        open_path,
-        advisory_path,
-        follow_symlinks,
-        fingerprint_bytes,
-        ignored_header_bytes,
-        expected_locator,
-        durable_fingerprint,
-        required_offset,
-        || false,
-    )
-    .map(|opened| opened.expect("non-cancellable candidate reopen cannot be cancelled"))
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn reopen_candidate_at_cancellable(
     open_path: &Path,
@@ -619,24 +572,6 @@ pub(crate) fn reopen_candidate_at_cancellable(
         return Ok(Some(ReopenCandidate::Truncated(opened)));
     }
     Ok(Some(ReopenCandidate::Compatible(opened)))
-}
-
-pub(crate) fn collect_consistent_fingerprint(
-    file: &File,
-    path: &Path,
-    fingerprint_bytes: u16,
-    ignored_header_bytes: u32,
-) -> Result<(Vec<u8>, u64), IdentityError> {
-    collect_consistent_fingerprint_cancellable(
-        file,
-        path,
-        fingerprint_bytes,
-        ignored_header_bytes,
-        &mut || false,
-    )
-    .map(|observation| {
-        observation.expect("non-cancellable fingerprint collection cannot be cancelled")
-    })
 }
 
 /// Reads the exact real committed-frontier window ending at `size` from

@@ -209,6 +209,7 @@ impl ProgressDelta {
     }
 
     /// Greatest last-seen timestamp represented by merged records.
+    #[cfg(test)]
     pub(crate) const fn last_seen_time_unix_nano(&self) -> u64 {
         self.last_seen_time_unix_nano
     }
@@ -641,6 +642,7 @@ impl OpenBatch {
     }
 
     /// Exact shared logical-size sum for projected records.
+    #[cfg(test)]
     pub(crate) const fn logical_bytes(&self) -> u64 {
         self.logical_bytes
     }
@@ -1095,6 +1097,7 @@ pub(crate) struct LogicalBatch {
 
 impl LogicalBatch {
     /// Borrow the canonical OTAP records.
+    #[cfg(test)]
     pub(crate) const fn records(&self) -> &OtapArrowRecords {
         &self.records
     }
@@ -1115,6 +1118,7 @@ impl LogicalBatch {
     }
 
     /// Clone the shared delta allocation for completion correlation.
+    #[cfg(test)]
     pub(crate) fn shared_deltas(&self) -> Arc<[ProgressDelta]> {
         Arc::clone(&self.deltas)
     }

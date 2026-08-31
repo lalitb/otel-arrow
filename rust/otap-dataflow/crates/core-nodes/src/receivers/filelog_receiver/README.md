@@ -5,8 +5,8 @@
 ## Metadata
 
 - Type: `receiver:filelog` (`urn:otel:receiver:filelog`)
-- Feature gate: Default
-- Stability: Experimental
+- Build inventory: Default
+- Stability: Experimental reference implementation
 
 ## Overview
 
@@ -19,6 +19,21 @@ unacknowledged bytes.
 Phase 1 is a single-instance source. It serializes one checkpoint namespace and
 prevents overlapping file ownership inside one engine process, but it does not
 coordinate independent engine processes or provide distributed fencing.
+
+## Implementation and Qualification Status
+
+The factory is present in the default core-node inventory. Inventory and build
+availability are not production enablement or qualification claims.
+
+| Platform | Native implementation | Current evidence | Production status |
+| --- | --- | --- | --- |
+| Linux | Implemented | Primary functional, compile, and fault-injection target | Linux-first qualification is still incomplete |
+| macOS | Implemented | Portable format and source contracts; no current runtime qualification | Not production-qualified or enabled by this feasibility work |
+| Windows | Implemented | Portable format vectors and compile-only evidence on the current host | Not production-qualified or enabled by this feasibility work |
+
+No platform is production-qualified by this feasibility branch. A distribution
+may enable the receiver for production only after completing the applicable
+release, filesystem, crash-durability, resource, and operations gates.
 
 ## Getting Started
 
@@ -44,7 +59,8 @@ printf 'second line\n' >> /tmp/otel-arrow-filelog/app.log
 ```
 
 The console exporter Acks each printed batch. The receiver then advances the
-durable checkpoint under `.otap-state/filelog/filelog-console/`.
+durable checkpoint under
+`.otap-state/filelog/@v1/66696c656c6f672d636f6e736f6c65/`.
 
 ## Configuration
 
@@ -133,7 +149,7 @@ Important policy values are:
 | `on_decode_error` | `preserve_raw`, `replace`, `fail` | Preserves exact malformed bytes, substitutes invalid units, or quarantines the file. |
 | `framing.max_log_size_behavior` | `split`, `truncate` | Emits bounded fragments or a bounded truncated record and discards through the line boundary. |
 | `rotation.on_truncate` | `fail`, `read_new` | Durably quarantines detectable truncation or explicitly resets to a new file epoch. |
-| `on_nack` | `fail`, `drop_and_continue` | Fails the receiver or durably advances under an explicit loss policy after terminal delivery failure. |
+| `on_nack` | `fail`, `drop_and_continue` | Fails without progress, or intentionally loses the retained batch and durably advances only after terminal retry exhaustion. |
 
 Complete, untruncated paths that convert losslessly to text emit
 `log.file.path` and `log.file.name`. Non-text or over-bound paths omit those
@@ -181,11 +197,16 @@ Capture, delivery, and recovery are separate:
 - A record that cannot enter a nonempty batch is retained byte-for-byte and
   emitted as the next batch after its predecessor resolves, before any source
   read. Source rewrite, truncation, rename, or removal cannot substitute it.
-- Only a matching Ack or `drop_and_continue` advances durable progress.
+- A matching aggregate Ack is the normal progress authority.
+  `drop_and_continue` is the explicit configured exception: only after retry
+  exhaustion does it intentionally lose the retained batch and durably advance.
 - Drain emits an eligible carry-over after its predecessor. Direct shutdown
   releases unsent in-memory state without synthesizing progress.
 - A crash before progress is durable replays from the prior checkpoint and can
   produce duplicates.
+
+The at-least-once delivery claim applies only when no intentional-loss policy is
+selected. `drop_and_continue` explicitly opts out of that claim.
 
 The receiver does not persist the in-flight Arrow batch and is not a durable
 telemetry spool. When downstream is full, it stops reading; unread data remains
@@ -226,15 +247,23 @@ transaction length declared by its header.
 
 Quarantine is durable and is not removed by ordinary retention. Restarting or
 changing `rotation.on_truncate` does not clear an existing quarantine.
-Phase 1 contains audited reset, keep-failed, and removal store operations, but
-does not expose a live operator state-management API. A distribution that
-exposes those operations must target the exact file ID and preserve the audit
-reason. As a whole-receiver fallback, an operator may stop the receiver and
-archive the complete namespace before starting from a new namespace, accepting
-the duplicate or skip behavior selected by `start_at`.
+The offline `dfctl filelog checkpoint` surface provides bounded inspection,
+validation, evidence backup, and audited per-file reset, keep-failed, and
+removal operations. It does not expose live mutation while the receiver owns
+the namespace.
+
+There is no whole-namespace reset command or supported whole-namespace reset
+procedure. A checkpoint backup preserves evidence; completing a backup does not
+authorize deleting, replacing, or recreating a missing or corrupt namespace.
+That remains fail closed until a separate crash-safe reset design is approved
+and implemented. Selecting a different `checkpoint.id` creates a distinct
+namespace with explicit replay or skip consequences; it is not reset
+authorization or an in-place migration.
 
 The exact durable format is specified in
 [`docs/filelog-checkpoint-format.md`](../../../../../docs/filelog-checkpoint-format.md).
+Offline commands and their required acknowledgements are documented in the
+[dfctl administration guide](../../../../../docs/admin/dfctl.md#offline-filelog-checkpoint-administration).
 
 ## Rotation
 
@@ -303,9 +332,11 @@ High-signal operating metrics include:
 | `receiver.filelog.terminal.unterminated.records` | `{record}` | Records emitted only because permanent rotation EOF established a boundary. |
 | `receiver.filelog.health_events.suppressed` | `{event}` | Repeated detailed events withheld by the rate limiter. |
 
-The complete instrument catalog and averaging rules for total-duration
-counters are in the
-[self-telemetry design](../../../../../docs/filelog-receiver.md#self-telemetry).
+The semantic inventory, cardinality contract, and averaging rules for
+total-duration counters are in the
+[Phase 1 conformance specification](../../../../../docs/filelog-receiver-phase1-conformance.md#telemetry-and-health-events).
+The names in this table describe the current implementation, not a stable
+public telemetry contract.
 
 `checkpoint.records.removed` covers receiver-owned retention compaction.
 Offline administrative removal has no live receiver metric owner and remains
@@ -319,6 +350,7 @@ include:
 | Event | Severity | Description |
 | --- | --- | --- |
 | `filelog_receiver.start` | `info` | Receiver startup began. |
+| `filelog_receiver.self_ingestion_risk` | `warn` | An include can match the receiver checkpoint namespace's `CURRENT` marker; the namespace remains excluded and colocated output should be reviewed. |
 | `filelog_receiver.drain_ingress` | `info` | Ingress drain began. |
 | `filelog_receiver.downstream_backpressure` | `warn` | The downstream channel was full. |
 | `filelog_receiver.batch_retry` | `info` | A retained batch entered bounded retry. |
@@ -341,10 +373,15 @@ spooled by the receiver.
 
 ## Limits
 
-- Linux, macOS, and Windows local regular files are supported. SMB, NFS, and
-  other network-filesystem source semantics are not guaranteed.
-- Put `engine.state_dir` on a local filesystem. Namespace locking on NFS is
-  unsupported for concurrent-rollout safety.
+- The source contract covers host-local regular files on local filesystems with
+  stable native locator, rename, unlink, and open-handle semantics. FIFO,
+  socket, device, and other non-regular candidates are rejected.
+- SMB, NFS, network shares, distributed filesystems, and filesystems with weak
+  or unstable nonlocal locator semantics are outside Phase 1 source support and
+  qualification.
+- Put `engine.state_dir` on a trusted host-local filesystem. Network filesystem
+  locking and publication semantics are unsupported for checkpoint authority
+  and concurrent-rollout safety.
 - Run the source pipeline with one core. Use `receiver:filelog` followed by a
   topic exporter to fan out to multicore downstream processing.
 - Phase 1 supports one receiver-wide retained batch plus one carry-over
@@ -401,7 +438,10 @@ spooled by the receiver.
 ## Related Docs
 
 - [Runnable console example](../../../../../configs/filelog-console.yaml)
-- [Filelog architecture and complete telemetry](../../../../../docs/filelog-receiver.md)
-- [Checkpoint format](../../../../../docs/filelog-checkpoint-format.md)
+- [Filelog architecture](../../../../../docs/filelog-receiver.md)
+- [Phase 1 behavioral specification](../../../../../docs/filelog-receiver-phase1-spec.md)
+- [Phase 1 conformance and telemetry semantics](../../../../../docs/filelog-receiver-phase1-conformance.md)
+- [Checkpoint byte format](../../../../../docs/filelog-checkpoint-format.md)
+- [Offline checkpoint administration](../../../../../docs/admin/dfctl.md#offline-filelog-checkpoint-administration)
 - [Configuration model](../../../../../docs/configuration-model.md)
 - [Core node catalog](../../../README.md)

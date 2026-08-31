@@ -229,17 +229,6 @@ pub(crate) enum ReaderError {
         #[source]
         source: std::io::Error,
     },
-    /// Inspecting an open source handle after EOF failed.
-    #[error("could not inspect filelog source {path} for {file_id:?}: {source}")]
-    Metadata {
-        /// Durable identity being inspected.
-        file_id: FileId,
-        /// Advisory path for diagnostics only.
-        path: PathBuf,
-        /// Operating-system metadata failure.
-        #[source]
-        source: std::io::Error,
-    },
     /// Internal bounded indexes no longer agree.
     #[error("filelog reader table integrity check failed: {reason}")]
     Inconsistent {
@@ -393,6 +382,10 @@ pub(crate) enum ReaderPoll {
     /// The file changed while EOF fingerprint evidence was sampled.
     EvidenceUnstable {
         /// Durable identity whose observation must be retried.
+        #[allow(
+            dead_code,
+            reason = "diagnostic and test callers correlate the poll outcome while production aggregates it"
+        )]
         file_id: FileId,
         /// Earliest automatic retry.
         next_probe: Instant,
@@ -401,6 +394,10 @@ pub(crate) enum ReaderPoll {
     /// bounded retry without changing durable or lifecycle state.
     EnvironmentalBackoff {
         /// Durable identity retaining its reader state.
+        #[allow(
+            dead_code,
+            reason = "diagnostic and test callers correlate the poll outcome while production aggregates it"
+        )]
         file_id: FileId,
         /// Operation that could not proceed.
         operation: EnvironmentalOperation,
@@ -416,6 +413,10 @@ pub(crate) enum ReaderPoll {
     /// removed handles are pinned for late writes.
     DescriptorCapacityBlocked {
         /// Closed reader waiting for a slot.
+        #[allow(
+            dead_code,
+            reason = "diagnostic and test callers correlate the poll outcome while production aggregates it"
+        )]
         file_id: FileId,
     },
     /// A removed reader no longer has the native handle needed for reliable
@@ -508,6 +509,10 @@ pub(crate) struct ReaderRecordContext<'a> {
     /// Operator-facing path that matched discovery.
     pub(crate) matched_path: &'a Path,
     /// Canonical target path opened by discovery.
+    #[allow(
+        dead_code,
+        reason = "retained for identity diagnostics while OTAP projection intentionally uses the matched path"
+    )]
     pub(crate) resolved_path: &'a Path,
 }
 
@@ -756,9 +761,6 @@ fn environmental_reader_error(
         ReaderError::Read { source, .. } => {
             Some((EnvironmentalOperation::Read, classify_io_error(source)))
         }
-        ReaderError::Metadata { source, .. } => {
-            Some((EnvironmentalOperation::Inspect, classify_io_error(source)))
-        }
         ReaderError::Identity(IdentityError::Io { source, .. }) => {
             Some((EnvironmentalOperation::Inspect, classify_io_error(source)))
         }
@@ -769,23 +771,11 @@ fn environmental_reader_error(
 impl ReaderTable {
     /// Creates a bounded table and reserves its one shared source-read
     /// buffer before any file can be admitted.
+    #[cfg(test)]
     pub(crate) fn new(settings: ReaderSettings) -> Result<Self, ReaderError> {
         Self::new_with_shutdown_signal_and_pressure(
             settings,
             Arc::new(AtomicBool::new(false)),
-            Arc::new(DescriptorPressure::default()),
-        )
-    }
-
-    /// Creates a bounded table that observes the worker's out-of-band
-    /// lifecycle cancellation signal between source operations.
-    pub(crate) fn new_with_shutdown_signal(
-        settings: ReaderSettings,
-        shutdown_requested: Arc<AtomicBool>,
-    ) -> Result<Self, ReaderError> {
-        Self::new_with_shutdown_signal_and_pressure(
-            settings,
-            shutdown_requested,
             Arc::new(DescriptorPressure::default()),
         )
     }
@@ -2096,11 +2086,13 @@ impl ReaderTable {
     ///
     /// Readers admitted while a batch was retained were never marked and
     /// remain in their existing scheduling state.
+    #[cfg(test)]
     pub(crate) fn resume_after_batch_commit(&mut self) -> Result<(), ReaderError> {
         self.finish_batch_commit(true)
     }
 
     /// Clears the exact batch-pause population, optionally making it ready.
+    #[cfg(test)]
     pub(crate) fn finish_batch_commit(&mut self, resume: bool) -> Result<(), ReaderError> {
         self.preflight_batch_commit()?;
         self.finish_preflighted_batch_commit(resume);
@@ -2530,12 +2522,6 @@ impl ReaderTable {
                 u64::try_from(now.saturating_duration_since(*since).as_nanos()).unwrap_or(u64::MAX)
             }),
         }
-    }
-
-    /// Current resident descriptor count without scanning reader entries.
-    #[must_use]
-    pub(crate) const fn open_file_count(&self) -> usize {
-        self.open_count
     }
 
     /// Active receiver-global descriptor-pressure deadline, if new

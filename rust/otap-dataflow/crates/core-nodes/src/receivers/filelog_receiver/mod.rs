@@ -1,51 +1,34 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Filelog receiver (Phase 1, under construction).
+//! Phase 1 filelog receiver.
 //!
-//! This module currently ships the following Phase 1 implementation-plan
-//! deliverables:
+//! This module owns the bounded local-file capture path:
 //!
-//! - Stage 2: the exact version-1 durable checkpoint byte format and its
-//!   codec, specified in
-//!   [`docs/filelog-checkpoint-format.md`](../../../../../../docs/filelog-checkpoint-format.md)
-//!   and referenced from
-//!   [`docs/filelog-receiver.md`](../../../../../../docs/filelog-receiver.md)
-//!   Appendix B.
-//! - The user-facing configuration schema, its validation into a
-//!   runtime-ready form, and the shared logical-record-size function,
-//!   specified in `docs/filelog-receiver.md` Appendix C.
-//! - This stage: the durable, file-backed checkpoint store built on that
-//!   codec ([`checkpoint::store`]) -- namespace ownership locking,
-//!   generation selection and recovery, WAL appends and sync policy,
-//!   atomic compaction, and retention -- specified in
-//!   `docs/filelog-receiver.md` Appendix B.
-//! - The process-local runtime-locator lease registry ([`lease`]), which
-//!   gives each receiver a preallocated, bounded ownership scope and prevents
-//!   two filelog readers in one engine process from controlling the same live
-//!   file.
-//! - Secure handle-based identity evidence plus durable recovery matching
-//!   ([`identity`]), including exact-locator-only reconnect, start/mismatch
-//!   policy, and atomic registration.
-//! - Bounded periodic filesystem discovery and admission ([`discovery`]),
-//!   including compiled include/exclude globs, resolved-target safety,
-//!   incomplete-inventory fail-closed behavior, overflow fairness, and a
-//!   dedicated cancellable OS thread with bounded channels.
-//! - Fair, bounded logical-reader scheduling ([`reader`]), including
-//!   source-byte read turns, least-recently-served descriptor rotation,
-//!   exact identity revalidation on reopen, and runtime leases that survive
-//!   temporary descriptor closure.
-//! - Constant-state source decoding and bounded newline/multiline framing
-//!   ([`framing`]), including exact source-byte evidence, EOF-gated partial
-//!   flushes, split/truncate policies, and durable fragment continuation.
-//! - Exact OTAP projection and bounded open-batch construction
-//!   ([`batching`]), including shared logical sizing, contiguous Ack deltas,
-//!   recordless finalization, and transactional worker-local record numbers.
+//! - [`config`] validates the public schema, cross-field relationships, and
+//!   conservative resource-admission models.
+//! - [`checkpoint`] owns the version-1 durable format, namespace locking,
+//!   recovery, WAL transactions, compaction, retention, and offline
+//!   per-file administration.
+//! - [`lease`], [`identity`], and [`discovery`] own process-local source
+//!   exclusion, handle-derived identity, bounded traversal, and admission.
+//! - [`reader`], [`framing`], and [`batching`] own fair source turns,
+//!   constant-state decoding/framing, exact provenance, and bounded batches.
+//! - [`delivery`], [`worker`], and [`runtime`] own one retained batch,
+//!   Ack/Nack retry, checkpoint authorization, backpressure, drain, and
+//!   shutdown.
+//! - [`telemetry`] owns fixed-cardinality receiver observations; exact public
+//!   instrument names remain provisional.
 //!
-//! - Stage 11: the dedicated read/checkpoint worker, one retained
-//!   receiver-wide batch, Ack/Nack retry and commit protocol, interruptible
-//!   backpressure/drain lifecycle, and local receiver factory.
-#![allow(dead_code)] // Phase 1 internals intentionally land before the receiver factory.
+//! The dataflow engine, not this module, owns aggregate fan-out completion.
+//! Downstream processors own application timestamp parsing and other semantic
+//! interpretation.
+//!
+//! The accepted design is split into the
+//! [architecture](../../../../../docs/filelog-receiver.md),
+//! [Phase 1 behavioral specification](../../../../../docs/filelog-receiver-phase1-spec.md),
+//! [Phase 1 conformance specification](../../../../../docs/filelog-receiver-phase1-conformance.md),
+//! and [checkpoint format](../../../../../docs/filelog-checkpoint-format.md).
 
 use std::sync::Arc;
 

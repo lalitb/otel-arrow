@@ -903,10 +903,12 @@ impl AdmissionController {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn tracked_locators(&self) -> HashSet<Locator> {
         self.tracked.keys().copied().collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn pending_len(&self) -> usize {
         self.pending.len()
     }

@@ -79,6 +79,7 @@ impl DiscoveryHandle {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn recv_timeout(
         &self,
         timeout: Duration,
@@ -110,11 +111,13 @@ impl Drop for DiscoveryHandle {
 
 /// Spawns one fixed blocking thread so filesystem stalls cannot consume the
 /// async runtime's shared blocking pool.
+#[cfg(test)]
 pub(crate) fn spawn_discovery(plan: DiscoveryPlan) -> Result<DiscoveryHandle, DiscoveryError> {
     spawn_discovery_with_shutdown_signal(plan, Arc::new(AtomicBool::new(false)))
 }
 
 /// Spawns discovery with a cancellation signal shared by its owning worker.
+#[cfg(test)]
 pub(crate) fn spawn_discovery_with_shutdown_signal(
     plan: DiscoveryPlan,
     shutdown_requested: Arc<AtomicBool>,

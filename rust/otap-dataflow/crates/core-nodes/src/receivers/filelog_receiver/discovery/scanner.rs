@@ -237,7 +237,7 @@ impl DiscoveryPlan {
     }
 
     /// Reports the best-effort operator warning condition where an include
-    /// can match an artifact under the checkpoint namespace.
+    /// can match the checkpoint namespace's `CURRENT` marker.
     pub(crate) fn likely_self_ingestion(&self) -> bool {
         self.likely_self_ingestion
     }
@@ -308,6 +308,7 @@ impl CandidateSamplingGate {
 }
 
 impl FilesystemScanner {
+    #[cfg(test)]
     pub(crate) fn new(plan: DiscoveryPlan) -> Self {
         Self::with_shutdown_signal_and_pressure(
             plan,
@@ -316,6 +317,7 @@ impl FilesystemScanner {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn with_shutdown_signal(
         plan: DiscoveryPlan,
         shutdown_requested: Arc<AtomicBool>,
@@ -351,10 +353,6 @@ impl FilesystemScanner {
             #[cfg(test)]
             next_candidate_resolution_gate: Mutex::new(None),
         }
-    }
-
-    pub(crate) fn plan(&self) -> &DiscoveryPlan {
-        &self.plan
     }
 
     #[cfg(test)]
@@ -1404,17 +1402,6 @@ impl FilesystemScanner {
                 modified,
             },
         )))
-    }
-
-    fn path_is_excluded(
-        &self,
-        matched_path: &Path,
-        resolved_path: &Path,
-        resolved_excludes: &[ResolvedExclude],
-        checkpoint_namespace: Option<&Path>,
-    ) -> bool {
-        self.path_matches_user_exclude(matched_path, resolved_path, resolved_excludes)
-            || self.path_is_checkpoint_excluded(matched_path, resolved_path, checkpoint_namespace)
     }
 
     fn path_matches_user_exclude(

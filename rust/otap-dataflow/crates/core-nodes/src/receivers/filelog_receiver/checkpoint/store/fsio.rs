@@ -73,6 +73,10 @@ enum FileIdentity {
 #[derive(Debug)]
 pub(crate) struct DirectoryPathBinding {
     path: PathBuf,
+    #[allow(
+        dead_code,
+        reason = "the retained open handle pins the verified directory for the binding lifetime"
+    )]
     handle: File,
     identity: FileIdentity,
 }
@@ -127,6 +131,10 @@ impl PreparedNamespace {
 #[derive(Debug)]
 pub(crate) struct CheckpointFilePathBinding {
     path: PathBuf,
+    #[allow(
+        dead_code,
+        reason = "the retained open handle pins the verified checkpoint artifact for the binding lifetime"
+    )]
     handle: File,
     identity: FileIdentity,
 }
@@ -732,17 +740,6 @@ fn secure_namespace_dir_cancellable(
         })?;
     }
     Ok(Some(()))
-}
-
-/// Validates that an existing namespace is a real directory without
-/// creating it or changing its metadata.
-pub(crate) fn validate_existing_namespace_dir(dir: &Path) -> Result<(), StoreError> {
-    validate_directory_path_cancellable(
-        dir,
-        "inspect the checkpoint namespace directory",
-        &mut || false,
-    )
-    .map(|validated| validated.expect("non-cancellable directory validation cannot cancel"))
 }
 
 fn validate_namespace_dir_cancellable(
@@ -1684,6 +1681,7 @@ pub(crate) fn read_file_bounded_cancellable_with_mode(
 
 /// Reads at most `max + 1` bytes so growth after metadata inspection is
 /// detected rather than decoded as a silently truncated artifact.
+#[cfg(test)]
 pub(super) fn read_bounded_contents(
     file: File,
     capacity: usize,

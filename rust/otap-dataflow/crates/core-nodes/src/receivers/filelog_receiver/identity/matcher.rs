@@ -55,6 +55,7 @@ pub(crate) struct CandidateInventory {
 impl CandidateInventory {
     /// Reports whether fingerprint multiplicities cover the complete
     /// reconciliation population.
+    #[cfg(test)]
     pub(crate) fn is_complete(&self) -> bool {
         self.fingerprint_counts_complete
     }
@@ -304,6 +305,7 @@ impl FileIdSource for RandomFileIdSource {
 /// behavior (`docs/filelog-receiver-phase1-spec.md`, "Discovery and
 /// matching").
 enum ConfirmedPathBindings<'a> {
+    #[cfg(test)]
     All,
     Only(&'a HashSet<Locator>),
 }
@@ -311,6 +313,7 @@ enum ConfirmedPathBindings<'a> {
 impl ConfirmedPathBindings<'_> {
     fn contains(&self, locator: Locator) -> bool {
         match self {
+            #[cfg(test)]
             ConfirmedPathBindings::All => true,
             ConfirmedPathBindings::Only(set) => set.contains(&locator),
         }
@@ -319,6 +322,7 @@ impl ConfirmedPathBindings<'_> {
 
 /// Resolves a bounded candidate batch and persists every registration or
 /// matching-evidence update before returning it to a reader.
+#[cfg(test)]
 pub(crate) fn resolve_and_persist(
     store: &mut CheckpointStore,
     candidates: &[CandidateEvidence],
@@ -345,6 +349,7 @@ pub(crate) fn resolve_and_persist(
 /// `confirmed_path_bindings` names locators for which discovery's forwarded
 /// candidate path is a validated distinguished-binding decision, safe to
 /// persist over an existing durable record's `advisory_path`.
+#[cfg(test)]
 pub(crate) fn resolve_and_persist_with_admission(
     store: &mut CheckpointStore,
     candidates: &[CandidateEvidence],
@@ -373,6 +378,7 @@ pub(crate) fn resolve_and_persist_with_admission(
 /// when cancellation becomes visible immediately before persistence. See
 /// [`resolve_and_persist_with_admission`] for `recognized_replacements` and
 /// `confirmed_path_bindings`.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_and_persist_with_admission_cancellable(
     store: &mut CheckpointStore,
@@ -424,6 +430,7 @@ pub(crate) fn plan_with_admission(
     )
 }
 
+#[cfg(test)]
 pub(super) fn resolve_and_persist_with_source(
     store: &mut CheckpointStore,
     candidates: &[CandidateEvidence],
@@ -457,6 +464,7 @@ pub(super) fn resolve_and_persist_with_source(
         .collect()
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn resolve_with_source_mode(
     store: &mut CheckpointStore,

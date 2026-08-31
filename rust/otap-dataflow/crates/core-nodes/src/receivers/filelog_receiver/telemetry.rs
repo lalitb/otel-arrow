@@ -791,7 +791,6 @@ pub(super) enum HealthEventCategory {
     PinnedRotation,
     AdvisoryPath,
     Compatibility,
-    Partial,
     Source,
 }
 
@@ -823,7 +822,6 @@ impl HealthEventCategory {
             Self::PinnedRotation => "pinned_rotation",
             Self::AdvisoryPath => "advisory_path",
             Self::Compatibility => "compatibility",
-            Self::Partial => "partial",
             Self::Source => "source",
         }
     }
@@ -850,7 +848,6 @@ impl Default for HealthEventLimiter {
 }
 
 impl HealthEventLimiter {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) const fn new(interval: Duration) -> Self {
         Self {
             interval,
