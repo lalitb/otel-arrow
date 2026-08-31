@@ -3,8 +3,15 @@
 
 //! Validation test module to validate the encoding/decoding process for otlp messages
 
+// Keep component crates linked so their distributed-slice registrations are
+// visible to OTAP_PIPELINE_FACTORY in programmatic validation scenarios.
+use otel_arrow_dfe_core_nodes as _;
+use otel_arrow_dfe_dev_nodes as _;
+
 /// Docker container configuration for validation scenarios
 pub mod container;
+/// pinned OpenTelemetry eBPF profiler container support
+pub mod ebpf_profiler;
 /// validate the encode_decoding of otlp messages
 pub mod encode_decode;
 /// error definitions for the validation test
@@ -66,6 +73,55 @@ mod tests {
             )
             .run()
             .expect("logs otlp-to-otlp validation failed");
+    }
+
+    /// Scenario: Profiles traverse OTLP ingestion, graph-aware processing, durable storage, and OTAP.
+    /// Guarantees: The complete bounded pipeline preserves Profiles semantics and message roots.
+    #[test]
+    fn validation_profiles_end_to_end() {
+        let buffer_dir = tempfile::tempdir().expect("create Profiles buffer directory");
+        let buffer_path = buffer_dir
+            .path()
+            .join("buffer")
+            .to_string_lossy()
+            .into_owned();
+
+        Scenario::new()
+            .pipeline(
+                Pipeline::from_file_with_vars(
+                    "./validation_pipelines/profiles-end-to-end.yaml",
+                    &[("BUFFER_PATH", buffer_path.as_str())],
+                )
+                .expect("failed to read Profiles pipeline yaml"),
+            )
+            .add_generator(
+                "traffic_gen",
+                Generator::profiles()
+                    .fixed_count(24)
+                    .max_batch_size(4)
+                    .otlp_grpc("receiver")
+                    .core_range(1, 1)
+                    .static_signals(),
+            )
+            .add_capture(
+                "validate",
+                Capture::default()
+                    .otap_grpc("exporter")
+                    .validate(vec![
+                        ValidationInstructions::Equivalence,
+                        ValidationInstructions::ProfilesCount {
+                            min_profiles: Some(24),
+                            max_profiles: Some(24),
+                            min_samples: Some(192),
+                            max_samples: Some(192),
+                        },
+                    ])
+                    .control_streams(["traffic_gen"])
+                    .core_range(2, 2),
+            )
+            .expect_within(60)
+            .run()
+            .expect("Profiles end-to-end validation failed");
     }
 
     #[test]

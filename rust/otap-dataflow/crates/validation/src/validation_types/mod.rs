@@ -5,6 +5,7 @@
 
 pub mod attributes;
 mod batch;
+mod profiles;
 mod signal_dropped;
 pub mod transport_headers;
 
@@ -16,6 +17,7 @@ use batch::{validate_batch_bytes, validate_batch_items};
 use otel_arrow_dfe_config::transport_headers::TransportHeaders;
 use otel_arrow_dfe_pdata::proto::OtlpProtoMessage;
 use otel_arrow_dfe_pdata::testing::equiv::validate_equivalent;
+use profiles::validate_profile_counts;
 use serde::{Deserialize, Serialize};
 use signal_dropped::validate_signal_drop;
 use std::time::Duration;
@@ -61,6 +63,21 @@ pub enum ValidationInstructions {
         /// allow messages to get released after a certain time
         #[serde(with = "humantime_serde::option")]
         timeout: Option<Duration>,
+    },
+    /// Check total Profiles roots and samples across captured messages.
+    ProfilesCount {
+        /// Minimum number of profile roots.
+        #[serde(default)]
+        min_profiles: Option<usize>,
+        /// Maximum number of profile roots.
+        #[serde(default)]
+        max_profiles: Option<usize>,
+        /// Minimum number of samples nested under the profile roots.
+        #[serde(default)]
+        min_samples: Option<usize>,
+        /// Maximum number of samples nested under the profile roots.
+        #[serde(default)]
+        max_samples: Option<usize>,
     },
     /// Forbid specific attribute keys in selected domains.
     AttributeDeny {
@@ -127,6 +144,18 @@ impl ValidationInstructions {
                 max_bytes,
                 timeout,
             } => validate_batch_bytes(suv_with_duration, min_bytes, max_bytes, timeout),
+            ValidationInstructions::ProfilesCount {
+                min_profiles,
+                max_profiles,
+                min_samples,
+                max_samples,
+            } => validate_profile_counts(
+                suv_msgs,
+                *min_profiles,
+                *max_profiles,
+                *min_samples,
+                *max_samples,
+            ),
             ValidationInstructions::AttributeDeny { domains, keys } => {
                 validate_deny_keys(suv_msgs, domains, keys)
             }

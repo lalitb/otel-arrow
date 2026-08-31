@@ -11,12 +11,14 @@ use otel_arrow_dfe_config::engine::OtelDataflowSpec;
 use otel_arrow_dfe_controller::Controller;
 use otel_arrow_dfe_otap::OTAP_PIPELINE_FACTORY;
 use std::collections::HashMap;
+use std::sync::mpsc;
 use tokio::time::{Duration, sleep};
 
 const LOADGEN_METRIC_SET: &str = "receiver.traffic_generator";
 const LOADGEN_METRIC_NAME_LOGS: &str = "logs.produced";
 const LOADGEN_METRIC_NAME_METRICS: &str = "metrics.produced";
 const LOADGEN_TRACE_NAME_SPANS: &str = "spans.produced";
+const LOADGEN_METRIC_NAME_PROFILES: &str = "profiles.produced";
 const VALIDATION_METRIC_SET: &str = "exporter.validation";
 const VALIDATION_METRIC_NAME: &str = "valid";
 const VALIDATION_FINISHED_METRIC_NAME: &str = "finished";
@@ -31,13 +33,30 @@ pub(crate) async fn run_pipelines_with_timeout(
     metrics_poll: Duration,
 ) -> Result<(), ValidationError> {
     let pipeline_simulator = PipelineSimulator::new(rendered_group.as_str())?;
-    let _pipeline_handle = std::thread::spawn(move || pipeline_simulator.run());
+    let (pipeline_result_tx, pipeline_result_rx) = mpsc::sync_channel(1);
+    let _pipeline_handle = std::thread::spawn(move || {
+        let _ = pipeline_result_tx.send(pipeline_simulator.run());
+    });
     let admin_client = admin_client(&admin_base)?;
 
-    wait_for_ready(&admin_client, ready_max_attempts, ready_backoff).await?;
+    wait_for_ready(
+        &admin_client,
+        ready_max_attempts,
+        ready_backoff,
+        Some(&pipeline_result_rx),
+    )
+    .await?;
     tokio::time::timeout(timeout, async {
-        wait_for_loadgen(&admin_client, &expected_generator_signals, metrics_poll).await?;
-        let result = wait_for_validation_finished(&admin_client, metrics_poll).await;
+        wait_for_loadgen(
+            &admin_client,
+            &expected_generator_signals,
+            metrics_poll,
+            Some(&pipeline_result_rx),
+        )
+        .await?;
+        let result =
+            wait_for_validation_finished(&admin_client, metrics_poll, Some(&pipeline_result_rx))
+                .await;
         shutdown_pipeline(&admin_client).await?;
         result
     })
@@ -56,10 +75,12 @@ impl PipelineSimulator {
         Ok(Self { engine_config })
     }
 
-    fn run(&self) {
+    fn run(&self) -> Result<(), String> {
         let controller = Controller::new(&OTAP_PIPELINE_FACTORY);
         let engine_config = self.engine_config.clone();
-        let _ = controller.run_till_shutdown(engine_config);
+        controller
+            .run_till_shutdown(engine_config)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -67,9 +88,11 @@ async fn wait_for_ready(
     client: &AdminClient,
     max_retry: usize,
     retry_cooldown: Duration,
+    pipeline_result: Option<&mpsc::Receiver<Result<(), String>>>,
 ) -> Result<(), ValidationError> {
     let mut last_error: Option<String> = None;
     for _attempt in 0..max_retry {
+        check_pipeline_result(pipeline_result)?;
         match client.engine().readyz().await {
             Ok(resp) if resp.status == ProbeStatus::Ok => return Ok(()),
             Ok(resp) => {
@@ -111,8 +134,10 @@ async fn wait_for_loadgen(
     client: &AdminClient,
     expected_generator_signals: &HashMap<String, u64>,
     metrics_poll: Duration,
+    pipeline_result: Option<&mpsc::Receiver<Result<(), String>>>,
 ) -> Result<(), ValidationError> {
     loop {
+        check_pipeline_result(pipeline_result)?;
         let snapshot = fetch_metrics(client).await?;
         if loadgen_reached_limit(&snapshot, expected_generator_signals) {
             return Ok(());
@@ -127,8 +152,10 @@ async fn wait_for_loadgen(
 async fn wait_for_validation_finished(
     client: &AdminClient,
     metrics_poll: Duration,
+    pipeline_result: Option<&mpsc::Receiver<Result<(), String>>>,
 ) -> Result<(), ValidationError> {
     loop {
+        check_pipeline_result(pipeline_result)?;
         let snapshot = fetch_metrics(client).await?;
         match validation_finished_and_passed(&snapshot) {
             ValidationPollResult::NotFinished => {
@@ -141,6 +168,26 @@ async fn wait_for_validation_finished(
                 )));
             }
         }
+    }
+}
+
+fn check_pipeline_result(
+    pipeline_result: Option<&mpsc::Receiver<Result<(), String>>>,
+) -> Result<(), ValidationError> {
+    let Some(pipeline_result) = pipeline_result else {
+        return Ok(());
+    };
+    match pipeline_result.try_recv() {
+        Ok(Ok(())) => Err(ValidationError::Validation(
+            "pipeline exited before validation completed".to_string(),
+        )),
+        Ok(Err(error)) => Err(ValidationError::Validation(format!(
+            "pipeline failed before validation completed: {error}"
+        ))),
+        Err(mpsc::TryRecvError::Empty) => Ok(()),
+        Err(mpsc::TryRecvError::Disconnected) => Err(ValidationError::Validation(
+            "pipeline result channel closed before validation completed".to_string(),
+        )),
     }
 }
 
@@ -217,7 +264,8 @@ fn loadgen_reached_limit(
     iter.all(|(set, label)| {
         let loadgen_signals_produced = metric_value(set, LOADGEN_METRIC_NAME_LOGS).unwrap_or(0)
             + metric_value(set, LOADGEN_METRIC_NAME_METRICS).unwrap_or(0)
-            + metric_value(set, LOADGEN_TRACE_NAME_SPANS).unwrap_or(0);
+            + metric_value(set, LOADGEN_TRACE_NAME_SPANS).unwrap_or(0)
+            + metric_value(set, LOADGEN_METRIC_NAME_PROFILES).unwrap_or(0);
         loadgen_signals_produced >= *expected_per_gen.get(&label).unwrap_or(&0u64)
     })
 }
@@ -326,6 +374,36 @@ mod tests {
         let mut expected = HashMap::new();
         _ = expected.insert("genA".into(), 5);
         assert!(!loadgen_reached_limit(&snap, &expected));
+    }
+
+    /// Scenario: A controller exits with a startup error before validation can observe readiness.
+    /// Guarantees: The original controller error is surfaced instead of degrading to a timeout.
+    #[test]
+    fn pipeline_startup_error_is_preserved() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(Err("unknown component".to_string())).unwrap();
+
+        let error = check_pipeline_result(Some(&rx)).expect_err("pipeline failure should surface");
+        assert!(
+            error
+                .to_string()
+                .contains("pipeline failed before validation completed: unknown component")
+        );
+    }
+
+    /// Scenario: A controller exits successfully before the validation exporter finishes.
+    /// Guarantees: Premature clean exits are not mistaken for completed validation.
+    #[test]
+    fn premature_pipeline_exit_is_rejected() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(Ok(())).unwrap();
+
+        let error = check_pipeline_result(Some(&rx)).expect_err("early exit should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("pipeline exited before validation completed")
+        );
     }
 
     fn validation_set(valid: u64, finished: u64, node_id: &str) -> Vec<MetricSetSnapshot> {
@@ -486,7 +564,7 @@ mod tests {
             .await;
 
         let client = admin_client(&server.uri()).expect("client should build");
-        wait_for_ready(&client, 1, Duration::from_millis(1))
+        wait_for_ready(&client, 1, Duration::from_millis(1), None)
             .await
             .expect("readyz should pass");
         let snapshot = fetch_metrics(&client).await.expect("metrics should decode");

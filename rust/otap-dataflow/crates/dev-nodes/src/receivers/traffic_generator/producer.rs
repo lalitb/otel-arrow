@@ -50,6 +50,11 @@ impl TrafficProducer {
         // Build the concrete SignalGenerator based on the data source.
         let mut generator: Box<dyn SignalGenerator> = match config.data_source() {
             DataSource::SemanticConventions => {
+                if traffic_config.profile_weight > 0 {
+                    return Err(GenerateError::Configuration(
+                        "Profiles generation requires data_source: synthetic".to_string(),
+                    ));
+                }
                 let registry = config
                     .get_registry()
                     .map_err(GenerateError::Configuration)?
@@ -61,6 +66,7 @@ impl TrafficProducer {
                 let rotation = build_rotation_table(&entries);
                 Box::new(SyntheticGenerator {
                     idx: 0,
+                    next_profile_id: 1,
                     entries,
                     rotation,
                     log_body_size_bytes: traffic_config.log_body_size_bytes(),
@@ -238,12 +244,16 @@ impl<'a> ExactSizeIterator for TrafficRun<'a> {
 }
 
 fn create_shape(cfg: &TrafficConfig) -> TrafficShape {
-    let total_weight = cfg.log_weight + cfg.trace_weight + cfg.metric_weight;
+    let total_weight = u64::from(cfg.log_weight)
+        + u64::from(cfg.trace_weight)
+        + u64::from(cfg.metric_weight)
+        + u64::from(cfg.profile_weight);
     assert!(total_weight > 0);
 
     let log_percent = signal_percent(cfg.log_weight, total_weight);
     let metric_percent = signal_percent(cfg.metric_weight, total_weight);
     let trace_percent = signal_percent(cfg.trace_weight, total_weight);
+    let profile_percent = signal_percent(cfg.profile_weight, total_weight);
 
     // When signals_per_second is None (uncapped / saturation mode), use a high
     // target so the shape contains enough batches to keep the open-loop sender
@@ -257,25 +267,28 @@ fn create_shape(cfg: &TrafficConfig) -> TrafficShape {
         Some(max) => (max as usize).min(cfg.max_batch_size.saturating_mul(1024)),
         None => cfg.max_batch_size.saturating_mul(1024),
     };
-    let signals_per_second = cfg.signals_per_second.unwrap_or(uncapped_target) as u32;
+    let signals_per_second = cfg.signals_per_second.unwrap_or(uncapped_target);
     let logs_per_second = signal_per_second(signals_per_second, log_percent);
     let metrics_per_second = signal_per_second(signals_per_second, metric_percent);
     let traces_per_second = signal_per_second(signals_per_second, trace_percent);
-    let total_per_second = logs_per_second + metrics_per_second + traces_per_second;
+    let profiles_per_second = signal_per_second(signals_per_second, profile_percent);
+    let total_per_second =
+        logs_per_second + metrics_per_second + traces_per_second + profiles_per_second;
 
-    // At this point total_per_second is within 3 of signals_per_second as we
-    // could have clamped down at most 3 times and up at most 3 times.
+    // At this point total_per_second is within 4 of signals_per_second as we
+    // could have clamped down at most 4 times and up at most 4 times.
     let mut per_second = [
         (SignalType::Logs, logs_per_second),
         (SignalType::Metrics, metrics_per_second),
         (SignalType::Traces, traces_per_second),
+        (SignalType::Profiles, profiles_per_second),
     ];
     per_second.sort_unstable_by_key(|x| x.1);
     per_second.reverse();
 
     // Add the extras to each signal, prioritizing the signals with the
     // highest share.
-    let deficit = signals_per_second as i64 - total_per_second as i64;
+    let deficit = signals_per_second.saturating_sub(total_per_second);
     if deficit >= 1 {
         per_second[0].1 += 1
     }
@@ -288,27 +301,37 @@ fn create_shape(cfg: &TrafficConfig) -> TrafficShape {
         per_second[2].1 += 1
     }
 
-    // Figure out approximately how to interweave the three signals so that we get
+    if deficit >= 4 {
+        per_second[3].1 += 1
+    }
+
+    // Figure out approximately how to interweave the four signals so that we get
     // roughly even distribution of each's total payload within a given second
-    let ratio1 = per_second[0].1 / per_second[2].1.max(1);
-    let ratio2 = per_second[1].1 / per_second[2].1.max(1);
-    let ratio3 = per_second[2].1 / per_second[2].1.max(1);
+    let smallest_nonzero = per_second
+        .iter()
+        .filter_map(|(_, count)| (*count > 0).then_some(*count))
+        .min()
+        .unwrap_or(1);
+    let ratios = per_second.map(|(_, count)| count / smallest_nonzero);
 
     let shape1 = get_traffic_shape(cfg.max_batch_size, per_second[0]);
     let shape2 = get_traffic_shape(cfg.max_batch_size, per_second[1]);
     let shape3 = get_traffic_shape(cfg.max_batch_size, per_second[2]);
+    let shape4 = get_traffic_shape(cfg.max_batch_size, per_second[3]);
 
     let mut shape1_i = shape1.iter();
     let mut shape2_i = shape2.iter();
     let mut shape3_i = shape3.iter();
+    let mut shape4_i = shape4.iter();
 
     let mut result = Vec::new();
     loop {
         let before = result.len();
 
-        result.extend(shape1_i.by_ref().take(ratio1));
-        result.extend(shape2_i.by_ref().take(ratio2));
-        result.extend(shape3_i.by_ref().take(ratio3));
+        result.extend(shape1_i.by_ref().take(ratios[0]));
+        result.extend(shape2_i.by_ref().take(ratios[1]));
+        result.extend(shape3_i.by_ref().take(ratios[2]));
+        result.extend(shape4_i.by_ref().take(ratios[3]));
 
         let after = result.len();
         if before == after {
@@ -319,6 +342,7 @@ fn create_shape(cfg: &TrafficConfig) -> TrafficShape {
     assert!(shape1_i.next().is_none());
     assert!(shape2_i.next().is_none());
     assert!(shape3_i.next().is_none());
+    assert!(shape4_i.next().is_none());
 
     result
 }
@@ -338,8 +362,8 @@ fn get_traffic_shape(max_batch_size: usize, per_second: (SignalType, usize)) -> 
     result
 }
 
-fn signal_per_second(signals_per_second: u32, signal_percent: f32) -> usize {
-    let mut signals = (signal_percent * signals_per_second as f32).floor() as usize;
+fn signal_per_second(signals_per_second: usize, signal_percent: f64) -> usize {
+    let mut signals = (signal_percent * signals_per_second as f64).floor() as usize;
     if signal_percent > 0.0 && signals == 0 {
         signals = 1
     }
@@ -347,8 +371,8 @@ fn signal_per_second(signals_per_second: u32, signal_percent: f32) -> usize {
     signals
 }
 
-fn signal_percent(signal_weight: u32, total_weight: u32) -> f32 {
-    signal_weight as f32 / total_weight as f32
+fn signal_percent(signal_weight: u32, total_weight: u64) -> f64 {
+    f64::from(signal_weight) / total_weight as f64
 }
 
 fn create_fresh_payloads(
@@ -370,9 +394,7 @@ fn generate_signal(
         SignalType::Traces => generator.generate_traces(count),
         SignalType::Metrics => generator.generate_metrics(count),
         SignalType::Logs => generator.generate_logs(count),
-        SignalType::Profiles => Err(GenerateError::Configuration(
-            "Profiles traffic generation is not supported".to_string(),
-        )),
+        SignalType::Profiles => generator.generate_profiles(count),
     }
 }
 
@@ -451,6 +473,8 @@ pub trait SignalGenerator {
     fn generate_metrics(&mut self, count: usize) -> GenerateResult;
     /// Generate a traces payload containing `count` spans.
     fn generate_traces(&mut self, count: usize) -> GenerateResult;
+    /// Generate a Profiles payload containing `count` profile roots.
+    fn generate_profiles(&mut self, count: usize) -> GenerateResult;
 }
 
 /// Signal generator backed by the Weaver semantic conventions registry.
@@ -479,6 +503,12 @@ impl SignalGenerator for WeaverGenerator {
         let payload = OtlpProtoMessage::Traces(payload);
         Ok(payload.try_into()?)
     }
+
+    fn generate_profiles(&mut self, _count: usize) -> GenerateResult {
+        Err(GenerateError::Configuration(
+            "Profiles generation requires data_source: synthetic".to_string(),
+        ))
+    }
 }
 
 /// Signal generator that produces signals from hardcoded synthetic templates.
@@ -487,6 +517,7 @@ impl SignalGenerator for WeaverGenerator {
 /// round-robin table built from the configured [`ResourceAttributeSet`] entries.
 pub struct SyntheticGenerator {
     idx: usize,
+    next_profile_id: u64,
     entries: Vec<ResourceAttributeSet>,
     rotation: Vec<usize>,
     /// Target log body size in bytes (None = default body)
@@ -556,6 +587,22 @@ impl SignalGenerator for SyntheticGenerator {
         self.idx += 1;
         Ok(payload.try_into()?)
     }
+
+    fn generate_profiles(&mut self, count: usize) -> GenerateResult {
+        let attrs = self.attrs_for_batch();
+        let count_u64 = u64::try_from(count).map_err(|_| {
+            GenerateError::Configuration("Profiles batch count exceeds u64".to_string())
+        })?;
+        let next_profile_id = self.next_profile_id.checked_add(count_u64).ok_or_else(|| {
+            GenerateError::Configuration("Profiles profile ID sequence exhausted".to_string())
+        })?;
+        let payload = synthetic_signal::static_otlp_profiles(count, self.next_profile_id, attrs);
+        let payload = OtlpProtoMessage::Profiles(payload);
+
+        self.next_profile_id = next_profile_id;
+        self.idx += 1;
+        Ok(payload.try_into()?)
+    }
 }
 
 #[cfg(test)]
@@ -567,6 +614,7 @@ mod tests {
     fn synthetic_generator() -> SyntheticGenerator {
         SyntheticGenerator {
             idx: 0,
+            next_profile_id: 1,
             entries: Vec::new(),
             rotation: Vec::new(),
             log_body_size_bytes: None,
@@ -632,6 +680,63 @@ mod tests {
             (48..=52).contains(&trace_total),
             "traces should get ~50 signals, got {trace_total}"
         );
+    }
+
+    /// Scenario: Existing logs, metrics, and traces are enabled while Profiles are disabled.
+    /// Guarantees: Adding the fourth signal does not collapse three-signal batch interleaving.
+    #[test]
+    fn test_create_shape_preserves_three_signal_interleaving() {
+        let cfg = TrafficConfig::new(Some(30), None, 5, 1, 1, 1);
+        let shape = create_shape(&cfg);
+
+        assert_eq!(shape.len(), 6);
+        assert_ne!(shape[0].0, shape[1].0);
+        assert_ne!(shape[0].0, shape[2].0);
+        assert_ne!(shape[1].0, shape[2].0);
+        assert_eq!(shape[0].0, shape[3].0);
+        assert_eq!(shape[1].0, shape[4].0);
+        assert_eq!(shape[2].0, shape[5].0);
+    }
+
+    /// Scenario: Profiles are the only configured traffic signal.
+    /// Guarantees: Shape creation and synthetic generation emit the requested Profiles count.
+    #[test]
+    fn test_create_shape_and_generate_profiles() {
+        let mut cfg = TrafficConfig::new(Some(12), None, 5, 0, 0, 0);
+        cfg.profile_weight = 100;
+
+        let shape = create_shape(&cfg);
+        assert_eq!(shape.iter().map(|(_, count)| count).sum::<usize>(), 12);
+        assert!(
+            shape
+                .iter()
+                .all(|(signal, count)| *signal == SignalType::Profiles && *count <= 5)
+        );
+
+        let mut generator = synthetic_generator();
+        let mut payload =
+            generate_signal(&mut generator, SignalType::Profiles, 3).expect("generate Profiles");
+        assert_eq!(payload.signal_type(), SignalType::Profiles);
+        assert_eq!(payload.num_items(), 3);
+    }
+
+    /// Scenario: Every signal uses the maximum representable configuration weight.
+    /// Guarantees: Mixed-signal shape calculation does not overflow its weight sum.
+    #[test]
+    fn test_create_shape_accepts_maximum_weights() {
+        let mut cfg = TrafficConfig::new(Some(100), None, 25, u32::MAX, u32::MAX, u32::MAX);
+        cfg.profile_weight = u32::MAX;
+
+        let shape = create_shape(&cfg);
+        assert_eq!(shape.iter().map(|(_, count)| count).sum::<usize>(), 100);
+        for signal in [
+            SignalType::Logs,
+            SignalType::Metrics,
+            SignalType::Traces,
+            SignalType::Profiles,
+        ] {
+            assert!(shape.iter().any(|(candidate, _)| *candidate == signal));
+        }
     }
 
     #[test]
@@ -775,6 +880,7 @@ mod tests {
 
         let mut generator = SyntheticGenerator {
             idx: 0,
+            next_profile_id: 1,
             entries,
             rotation,
             log_body_size_bytes: None,

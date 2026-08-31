@@ -183,6 +183,11 @@ pub struct TrafficConfig {
     /// Relative weight for log signal production (0 disables logs).
     #[serde(default = "default_weight")]
     pub log_weight: u32,
+    /// Relative weight for Profiles signal production (0 disables Profiles).
+    ///
+    /// Profiles generation is available with `data_source: synthetic`.
+    #[serde(default = "default_weight")]
+    pub profile_weight: u32,
 
     /// Target size of each log record body in bytes (Synthetic data source only).
     /// When set, pre-generates a pool of 50 distinct body strings of this size;
@@ -360,6 +365,7 @@ impl TrafficConfig {
             metric_weight,
             trace_weight,
             log_weight,
+            profile_weight: 0,
             log_body_size_bytes: None,
             num_log_attributes: None,
             use_trace_context: false,
@@ -421,10 +427,17 @@ impl TrafficConfig {
     /// Currently checks that at least one signal weight is non-zero so the
     /// producer has something to generate.
     pub fn validate(&self) -> Result<(), otel_arrow_dfe_config::error::Error> {
-        if self.metric_weight + self.trace_weight + self.log_weight == 0 {
+        if [
+            self.metric_weight,
+            self.trace_weight,
+            self.log_weight,
+            self.profile_weight,
+        ]
+        .into_iter()
+        .all(|weight| weight == 0)
+        {
             return Err(otel_arrow_dfe_config::error::Error::InvalidUserConfig {
-                error: "at least one of metric_weight, trace_weight, or log_weight must be > 0"
-                    .to_string(),
+                error: "at least one signal weight must be > 0".to_string(),
             });
         }
         Ok(())
@@ -795,6 +808,8 @@ mod tests {
         );
     }
 
+    /// Scenario: Any single signal weight enables traffic production.
+    /// Guarantees: Profiles-only configurations are accepted alongside existing signals.
     #[test]
     fn validate_accepts_at_least_one_nonzero_weight() {
         let cfg = super::TrafficConfig::new(Some(10), None, 100, 0, 0, 1);
@@ -806,7 +821,17 @@ mod tests {
         let cfg = super::TrafficConfig::new(Some(10), None, 100, 0, 1, 0);
         cfg.validate().expect("one non-zero weight should pass");
 
+        let mut cfg = super::TrafficConfig::new(Some(10), None, 100, 0, 0, 0);
+        cfg.profile_weight = 1;
+        cfg.validate()
+            .expect("Profiles-only non-zero weight should pass");
+
         let cfg = super::TrafficConfig::new(Some(10), None, 100, 1, 1, 1);
         cfg.validate().expect("all non-zero weights should pass");
+
+        let mut cfg = super::TrafficConfig::new(Some(10), None, 100, u32::MAX, u32::MAX, u32::MAX);
+        cfg.profile_weight = u32::MAX;
+        cfg.validate()
+            .expect("maximum signal weights should not overflow");
     }
 }

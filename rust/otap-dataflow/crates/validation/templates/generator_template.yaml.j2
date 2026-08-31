@@ -11,6 +11,7 @@
 {% set metric_weight = metric_weight | default(0) -%}
 {% set trace_weight = trace_weight | default(0) -%}
 {% set log_weight = log_weight | default(100) -%}
+{% set profile_weight = profile_weight | default(0) -%}
 {% set suv_port = suv_port | default(4317) -%}
 {% set generator_label = generator_label | default("traffic_generator") -%}
 {% set generator_core_start = generator_core_start | default(2) -%}
@@ -46,6 +47,7 @@
           metric_weight: {{ metric_weight }}
           trace_weight: {{ trace_weight }}
           log_weight: {{ log_weight }}
+          profile_weight: {{ profile_weight }}
 {% if transport_headers %}
         transport_headers:
 {% for key, value in transport_headers | items %}

@@ -25,10 +25,8 @@ impl OtelProtoSimulator {
         let mut otap_message = match proto_message {
             OtlpProtoMessage::Logs(_)
             | OtlpProtoMessage::Metrics(_)
-            | OtlpProtoMessage::Traces(_) => otlp_to_otap(proto_message),
-            OtlpProtoMessage::Profiles(_) => {
-                return Err("Profiles encode/decode validation is not supported yet".to_string());
-            }
+            | OtlpProtoMessage::Traces(_)
+            | OtlpProtoMessage::Profiles(_) => otlp_to_otap(proto_message),
         };
         // convert to batch arrow records
         // converg batch arrow records
@@ -51,9 +49,9 @@ impl OtelProtoSimulator {
             OtlpProtoMessage::Traces(_) => {
                 OtapArrowRecords::Traces(from_record_messages(records).map_err(|e| e.to_string())?)
             }
-            OtlpProtoMessage::Profiles(_) => {
-                return Err("Profiles encode/decode validation is not supported yet".to_string());
-            }
+            OtlpProtoMessage::Profiles(_) => OtapArrowRecords::Profiles(
+                from_record_messages(records).map_err(|e| e.to_string())?,
+            ),
         };
         Ok(otap_to_otlp(&otap_message))
     }
@@ -75,6 +73,9 @@ mod test {
         semconv_otlp_logs, semconv_otlp_metrics, semconv_otlp_traces,
     };
     use otel_arrow_dfe_pdata::testing::equiv::assert_equivalent;
+    use otel_arrow_dfe_pdata::testing::profiles::{
+        ProfilesDatasetKind, profiles_dataset, representative_profiles_datasets,
+    };
     use weaver_common::result::WResult;
     use weaver_common::vdir::VirtualDirectoryPath;
     use weaver_forge::registry::ResolvedRegistry;
@@ -122,7 +123,8 @@ mod test {
         .expect("can get resolved registry from official semantic convention repo")
     }
 
-    // validate the encoding and decoding
+    /// Scenario: Semantic-convention logs, metrics, and traces cross Producer and Consumer.
+    /// Guarantees: Existing signal round trips remain semantically equivalent.
     #[test]
     fn validate_encode_decode() {
         let mut otel_proto_simulator = OtelProtoSimulator::default();
@@ -151,5 +153,32 @@ mod test {
                 .expect("failed to encode deocde proto");
             assert_equivalent(&[traces], &[traces_output]);
         }
+    }
+
+    /// Scenario: Representative Profiles workloads cross Producer and Consumer boundaries.
+    /// Guarantees: Every supported Profiles shape remains semantically equivalent after round trip.
+    #[test]
+    fn validate_profiles_encode_decode() {
+        let mut simulator = OtelProtoSimulator::default();
+        for (kind, profiles) in representative_profiles_datasets() {
+            let input = OtlpProtoMessage::Profiles(profiles);
+            let output = simulator.simulate_proto(&input).unwrap_or_else(|error| {
+                panic!("{} Profiles round trip failed: {error}", kind.as_str())
+            });
+            assert_equivalent(&[input], &[output]);
+        }
+    }
+
+    /// Scenario: Several Profiles roots share samples, stacks, and symbol dictionaries.
+    /// Guarantees: Validation preserves root boundaries and shared graph semantics.
+    #[test]
+    fn validate_shared_profiles_graph() {
+        let mut simulator = OtelProtoSimulator::default();
+        let input =
+            OtlpProtoMessage::Profiles(profiles_dataset(ProfilesDatasetKind::Cpu, 3, 8, 12));
+        let output = simulator
+            .simulate_proto(&input)
+            .expect("shared Profiles graph should round trip");
+        assert_equivalent(&[input], &[output]);
     }
 }

@@ -1,0 +1,24 @@
+receivers:
+  profiling:
+    samples_per_second: 19
+    reporter_interval: 1s
+    reporter_jitter: 0
+    filter_min_process_age: 0s
+    max_rpc_msg_size: 33554432
+
+exporters:
+  otlp:
+    endpoint: "${env:OTEL_EXPORTER_OTLP_ENDPOINT}"
+    compression: gzip
+    tls:
+      insecure: true
+
+service:
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    profiles:
+      receivers: [profiling]
+      processors: []
+      exporters: [otlp]

@@ -320,6 +320,90 @@ before being proposed upstream.
 - Upstream framing: every graph validator must operate on canonical logical IDs,
   never transport deltas.
 
+### PA-021: Profiler request sizes exceed the normal OTLP receiver default
+
+- Status: `resolved-local`
+- Area: OTLP Profiles ingress and deployment configuration
+- Evidence: the eBPF profiler and Collector distribution allow gRPC messages up
+  to 32 MiB, while the local OTLP receiver defaults to 4 MiB.
+- Impact: a valid high-cardinality host profile can be rejected before Profiles
+  conversion or graph validation begins.
+- Local direction: configure the eBPF pipeline receiver for a finite 32 MiB
+  decoding limit and retain conversion expansion checks behind that boundary.
+- Upstream framing: profiling deployment examples must align exporter and
+  receiver message limits without removing bounded admission.
+
+### PA-022: The upstream profiler has no unprivileged reporter or replay mode
+
+- Status: `open`
+- Area: eBPF integration testing
+- Evidence: the profiler requires Linux 5.10 or newer, host PID visibility,
+  tracefs, eBPF/perf capabilities, and unconfined syscall policies before its
+  reporter starts. It has no packaged mode that emits Profiles without loading
+  eBPF.
+- Impact: the real integration cannot run on ordinary unprivileged CI workers,
+  non-Linux hosts, or Docker environments without host integration.
+- Local direction: keep deterministic Profiles generation in normal CI and run
+  the pinned real-profiler smoke only on explicitly approved hosts.
+- Upstream framing: add a reporter-level replay or synthetic source that uses
+  the production export path without requiring kernel attachment.
+
+### PA-023: Profiler artifacts and captures require separate distribution review
+
+- Status: `open`
+- Area: licensing, provenance, and profile-data privacy
+- Evidence: the profiler code is Apache-2.0, its embedded eBPF object is
+  GPL-2.0, and real captures can disclose host process, executable, and source
+  information.
+- Impact: vendoring binaries, image layers, coredumps, or unsanitized captures
+  would add licensing and privacy obligations unrelated to the Rust code.
+- Local direction: reference a digest-pinned official image at runtime, profile
+  only an in-repository workload, and do not persist or check in the output.
+- Upstream framing: publish redistributable sanitized fixtures with provenance,
+  expected semantics, and explicit license review.
+
+### PA-024: Validation scenarios discarded controller startup failures
+
+- Status: `resolved-local`
+- Area: validation harness, cross-cutting
+- Evidence: `PipelineSimulator::run` ignored the result of
+  `Controller::run_till_shutdown`, leaving the readiness poll as the only
+  observable failure path.
+- Impact: an unknown component or invalid runtime configuration appeared as a
+  delayed readiness timeout for every signal instead of the original error.
+- Local direction: return the controller result through a bounded channel and
+  check it during readiness, generation, and validation polling.
+- Upstream framing: programmatic harnesses must preserve background runtime
+  failures and distinguish startup exit from readiness timeout.
+
+### PA-025: OTLP receiver concurrency was multiplied by signal services
+
+- Status: `resolved-local`
+- Area: OTLP receiver admission, cross-cutting
+- Evidence: independently constructed logs, metrics, traces, and Profiles
+  services could each admit up to the configured concurrency value.
+- Impact: aggregate receiver work and memory could exceed the operator's
+  configured bound as more signal services were enabled.
+- Local direction: share one receiver-wide admission gate across every OTLP
+  service and protocol path.
+- Upstream framing: define concurrency limits at the receiver boundary and test
+  aggregate mixed-signal admission.
+
+### PA-026: OTAP status handling lost generic failure semantics
+
+- Status: `resolved-local`
+- Area: OTAP ACK/NACK transport, cross-cutting
+- Evidence: downstream batch status codes were not consistently classified as
+  retryable or permanent, and malformed BARs could fail without a correlated
+  `INVALID_ARGUMENT` status.
+- Impact: all signals could be retried after permanent rejection or wait for a
+  response that no longer corresponded to the submitted batch.
+- Local direction: preserve status-code retryability, emit permanent NACKs for
+  non-retryable failures, and correlate malformed-batch rejection.
+- Upstream framing: continue the generic status propagation work tracked by
+  [open-telemetry/otel-arrow#1921](https://github.com/open-telemetry/otel-arrow/issues/1921)
+  rather than treating Profiles as a special case.
+
 ## Review Policy
 
 New findings should record evidence, practical Profiles impact, whether they

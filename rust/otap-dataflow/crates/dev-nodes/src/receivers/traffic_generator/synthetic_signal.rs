@@ -19,6 +19,10 @@ use otel_arrow_dfe_pdata::proto::opentelemetry::{
         ScopeMetrics, Sum, Summary, SummaryDataPoint, exponential_histogram_data_point::Buckets,
         summary_data_point::ValueAtQuantile,
     },
+    profiles::v1development::{
+        Function, KeyValueAndUnit, Line, Link, Location, Mapping, Profile, ProfilesData,
+        ProfilesDictionary, ResourceProfiles, Sample, ScopeProfiles, Stack, ValueType,
+    },
     resource::v1::Resource,
     trace::v1::{ResourceSpans, ScopeSpans, Span, TracesData, span::SpanKind},
 };
@@ -1118,9 +1122,192 @@ fn static_logs(
         .collect()
 }
 
+const PROFILE_STACK_DEPTH: usize = 16;
+const PROFILE_SAMPLES_PER_PROFILE: usize = 8;
+const PROFILE_SOURCE_ATTRIBUTE_INDEX: i32 = 1;
+
+/// Generates ProfilesData with a bounded eBPF-like shared stack and symbol graph.
+#[must_use]
+pub fn static_otlp_profiles(
+    signal_count: usize,
+    profile_id_start: u64,
+    extra_attrs: Option<&HashMap<String, String>>,
+) -> ProfilesData {
+    let mut string_table = vec![
+        String::new(),
+        "cpu".to_string(),
+        "nanoseconds".to_string(),
+        "period".to_string(),
+        "load-generator".to_string(),
+        "profile.source".to_string(),
+    ];
+    let mut function_table = vec![Function::default()];
+    let mut location_table = vec![Location::default()];
+
+    for depth in 0..PROFILE_STACK_DEPTH {
+        let name_index =
+            i32::try_from(string_table.len()).expect("profile fixture remains bounded");
+        string_table.push(format!("synthetic_work_{depth}"));
+        let filename_index =
+            i32::try_from(string_table.len()).expect("profile fixture remains bounded");
+        string_table.push(format!("synthetic_workload_{depth}.rs"));
+
+        function_table.push(Function {
+            name_strindex: name_index,
+            filename_strindex: filename_index,
+            start_line: i64::try_from(depth + 1).expect("profile fixture remains bounded"),
+            ..Default::default()
+        });
+        location_table.push(Location {
+            mapping_index: 1,
+            address: 0x1000 + u64::try_from(depth).expect("profile fixture remains bounded") * 16,
+            lines: vec![Line {
+                function_index: i32::try_from(depth + 1).expect("profile fixture remains bounded"),
+                line: i64::try_from(depth + 1).expect("profile fixture remains bounded"),
+                column: 1,
+            }],
+            attribute_indices: vec![PROFILE_SOURCE_ATTRIBUTE_INDEX],
+        });
+    }
+
+    let captured_at = current_time();
+    let profiles = (0..signal_count)
+        .map(|profile_index| {
+            let samples = (0..PROFILE_SAMPLES_PER_PROFILE)
+                .map(|sample_index| Sample {
+                    stack_index: 1,
+                    attribute_indices: vec![PROFILE_SOURCE_ATTRIBUTE_INDEX],
+                    link_index: 1,
+                    values: vec![
+                        i64::try_from(sample_index + 1).expect("profile fixture remains bounded")
+                            * 10,
+                    ],
+                    timestamps_unix_nano: Vec::new(),
+                })
+                .collect();
+            let mut profile_id = vec![0; 16];
+            profile_id[..8].copy_from_slice(&captured_at.to_be_bytes());
+            let profile_sequence = profile_id_start
+                .checked_add(u64::try_from(profile_index).expect("profile fixture remains bounded"))
+                .expect("profile ID range is validated by the caller");
+            profile_id[8..].copy_from_slice(&profile_sequence.to_be_bytes());
+            Profile {
+                sample_type: Some(ValueType {
+                    type_strindex: 1,
+                    unit_strindex: 2,
+                }),
+                samples,
+                time_unix_nano: captured_at
+                    + u64::try_from(profile_index).expect("profile fixture remains bounded"),
+                duration_nano: 1_000_000_000,
+                period_type: Some(ValueType {
+                    type_strindex: 3,
+                    unit_strindex: 2,
+                }),
+                period: 10_000_000,
+                profile_id,
+                attribute_indices: vec![PROFILE_SOURCE_ATTRIBUTE_INDEX],
+                ..Default::default()
+            }
+        })
+        .collect();
+
+    ProfilesData {
+        resource_profiles: vec![ResourceProfiles {
+            resource: Some(Resource {
+                attributes: build_resource_attributes(extra_attrs),
+                ..Default::default()
+            }),
+            scope_profiles: vec![ScopeProfiles {
+                scope: Some(InstrumentationScope {
+                    name: "otel-arrow.synthetic-profiler".to_string(),
+                    version: "1.0.0".to_string(),
+                    ..Default::default()
+                }),
+                profiles,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        dictionary: Some(ProfilesDictionary {
+            mapping_table: vec![
+                Mapping::default(),
+                Mapping {
+                    memory_start: 0x1000,
+                    memory_limit: 0x2000,
+                    filename_strindex: 4,
+                    attribute_indices: vec![PROFILE_SOURCE_ATTRIBUTE_INDEX],
+                    ..Default::default()
+                },
+            ],
+            location_table,
+            function_table,
+            link_table: vec![
+                Link::default(),
+                Link {
+                    trace_id: vec![1; 16],
+                    span_id: vec![2; 8],
+                },
+            ],
+            string_table,
+            attribute_table: vec![
+                KeyValueAndUnit::default(),
+                KeyValueAndUnit {
+                    key_strindex: 5,
+                    value: Some(AnyValue::new_string("ebpf-synthetic")),
+                    unit_strindex: 0,
+                },
+            ],
+            stack_table: vec![
+                Stack::default(),
+                Stack {
+                    location_indices: (1..=PROFILE_STACK_DEPTH)
+                        .map(|index| i32::try_from(index).expect("profile fixture remains bounded"))
+                        .collect(),
+                },
+            ],
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scenario: Synthetic Profiles model an eBPF batch with shared graph tables.
+    /// Guarantees: Requested profile roots, bounded samples, stacks, symbols, and source tags exist.
+    #[test]
+    fn test_static_profiles() {
+        let profiles = static_otlp_profiles(3, 1, None);
+        let dictionary = profiles.dictionary.as_ref().expect("dictionary");
+        let roots = &profiles.resource_profiles[0].scope_profiles[0].profiles;
+
+        assert_eq!(roots.len(), 3);
+        assert!(
+            roots
+                .iter()
+                .all(|profile| profile.samples.len() == PROFILE_SAMPLES_PER_PROFILE)
+        );
+        assert_eq!(dictionary.stack_table.len(), 2);
+        assert_eq!(dictionary.location_table.len(), PROFILE_STACK_DEPTH + 1);
+        assert_eq!(dictionary.function_table.len(), PROFILE_STACK_DEPTH + 1);
+        assert_eq!(
+            dictionary.attribute_table[PROFILE_SOURCE_ATTRIBUTE_INDEX as usize].key_strindex,
+            5
+        );
+    }
+
+    /// Scenario: Consecutive generated Profiles batches use distinct sequence ranges.
+    /// Guarantees: Profile IDs do not depend solely on host clock resolution.
+    #[test]
+    fn test_static_profiles_use_caller_sequence() {
+        let first = static_otlp_profiles(1, 1, None);
+        let second = static_otlp_profiles(1, 2, None);
+        let first_id = &first.resource_profiles[0].scope_profiles[0].profiles[0].profile_id;
+        let second_id = &second.resource_profiles[0].scope_profiles[0].profiles[0].profile_id;
+
+        assert_ne!(&first_id[8..], &second_id[8..]);
+    }
 
     #[test]
     fn test_static_traces() {

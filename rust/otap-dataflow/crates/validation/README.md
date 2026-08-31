@@ -38,7 +38,7 @@ e.g. `receiver`, `exporter`.
    ```rust
    use otel_arrow_dfe_validation::traffic::Generator;
 
-   let generator = Generator::logs()                // logs(), metrics(), traces()
+   let generator = Generator::logs()                // logs(), metrics(), traces(), profiles()
        .fixed_count(500)                           // total signals to emit
        .max_batch_size(50)                         // optional
        .otlp_grpc("receiver")                      // or .otap_grpc()
@@ -171,7 +171,7 @@ e.g. `receiver`, `exporter`.
                                       // tells the generator which receiver to send signals to
   ```
 
-- `Generator::logs()`, `metrics()`, `traces()` - constructors for signal type
+- `Generator::logs()`, `metrics()`, `traces()`, `profiles()` - signal constructors
 - `fixed_count(usize)` - sets max signals to emit before completion
   - default: 2000
 - `max_batch_size(usize)` - controls batch size
@@ -184,6 +184,7 @@ e.g. `receiver`, `exporter`.
       - OTLP -> OTLP or OTAP -> OTAP
 - `static_signals()` / `semantic_signals()` - choose data source
   - default: static
+  - Profiles require `static_signals()`
 - `core_range(start, end)` - set the core range to use for pipeline
   - default: 2-2
 - `with_tls(TlsConfig)` - enable TLS on the generator's exporter
@@ -427,6 +428,9 @@ fewer signals within optional ratio bounds.
 count per message; `min/max` optional; `timeout` optional
 - `BatchBytes { min_bytes, max_bytes, timeout }`: bounds encoded message size;
 `min/max` optional; `timeout` optional
+- `ProfilesCount { min_profiles, max_profiles, min_samples, max_samples }`:
+  bounds total profile roots and nested samples across captured Profiles
+  messages
 - `AttributeDeny { domains, keys }`: specified keys must not appear.
   - `domains` accepts `AttributeDomain::Resource`, `Scope`, or `Signal`
 - `AttributeRequireKey { domains, keys }`: specified keys must appear.
@@ -610,6 +614,12 @@ let localstack = ContainerConfig::new("localstack/localstack", "3.4")
     `PipelineContainerConnection` referencing the same internal port
 - `.entrypoint(cmd)` - override the container's entrypoint
   - optional
+- `.command(args)` - override arguments passed to the image entrypoint
+- `.privileged(enabled)` - enable or disable Docker privileged mode
+- `.cap_add(capability)` - add a Linux capability
+- `.bind_mount(host_path, container_path, read_only)` - add a bind mount
+- `.host_pid(enabled)` / `.host_network(enabled)` - share host namespaces
+- `.security_opt(option)` - add a Docker security option
 - `.wait_for_nothing()` - do not wait for any readiness condition (default)
 - `.wait_for_log(message)` - wait for the given message to appear on stdout or
   stderr before considering the container ready
@@ -630,6 +640,10 @@ let localstack = ContainerConfig::new("localstack/localstack", "3.4")
 - `.wait_for_exit()` - wait for the container to exit (any exit code)
 - `.wait_for_exit_with_code(expected_code)` - wait for the container to exit
   with the specified exit code
+
+The `ebpf_profiler` module provides a pinned container configuration using
+these advanced settings. The complete environment-gated workflow is documented
+in [Profiles eBPF Integration](../../docs/profiles-ebpf-integration.md).
 
 ##### Templated environment variables
 

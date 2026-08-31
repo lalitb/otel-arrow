@@ -29,6 +29,7 @@ config:
     metric_weight: 0
     trace_weight: 0
     log_weight: 1
+    profile_weight: 0
     log_body_size_bytes: 1024
 ```
 
@@ -67,6 +68,8 @@ config:
     metric_weight: 0
     trace_weight: 0
     log_weight: 1
+    # Profiles are available only with data_source: synthetic.
+    profile_weight: 0
     log_body_size_bytes: 1024
 ```
 
@@ -136,6 +139,7 @@ runtime metric sets may also be attached by the pipeline telemetry policy.
 | `receiver.traffic_generator.logs_produced` | `{log}` | Number of logs generated. |
 | `receiver.traffic_generator.spans_produced` | `{span}` | Number of spans generated. |
 | `receiver.traffic_generator.metrics_produced` | `{metric}` | Number of metrics generated. |
+| `receiver.traffic_generator.profiles_produced` | `{profile}` | Number of profile roots generated. |
 | `receiver.traffic_generator.completion.pending` | `{batch}` | Number of subscribed batches waiting for Ack/Nack completion. |
 | `receiver.traffic_generator.completion.acks` | `{batch}` | Number of Ack completions received for generated batches. |
 | `receiver.traffic_generator.completion.nacks` | `{batch}` | Number of Nack completions received for generated batches. |
@@ -169,6 +173,7 @@ runtime metric sets may also be attached by the pipeline telemetry policy.
 - This receiver is available only with the `dev-tools` feature.
 - `semantic_conventions` data source requires access to the configured registry
   path at startup.
+- Profiles generation requires `data_source: synthetic`.
 - `pre_generated` mode repeats timestamps and IDs from pregenerated batches.
 - `production_mode: open` can produce as fast as the runtime allows.
 

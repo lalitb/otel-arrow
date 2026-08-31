@@ -24,6 +24,9 @@ pub struct TrafficGeneratorReceiverMetrics {
     /// Number of metrics generated.
     #[metric(unit = "{metric}")]
     pub metrics_produced: Counter<u64>,
+    /// Number of profile roots generated.
+    #[metric(unit = "{profile}")]
+    pub profiles_produced: Counter<u64>,
     /// Number of subscribed batches waiting for Ack/Nack completion.
     #[metric(name = "completion.pending", unit = "{batch}")]
     pub completion_pending: Gauge<u64>,

@@ -456,9 +456,8 @@ impl TrafficGeneratorReceiver {
                             self.metrics.logs_bytes_produced.add(bytes as u64);
                         }
                     }
-                    // The producer returns a typed error before it can emit Profiles.
                     otel_arrow_dfe_config::SignalType::Profiles => {
-                        unreachable!("traffic generator cannot produce Profiles")
+                        self.metrics.profiles_produced.add(count)
                     }
                 };
                 Ok(Ok(count))

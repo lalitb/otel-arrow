@@ -470,6 +470,7 @@ impl Scenario {
                     metric_weight => generator.metric_weight,
                     trace_weight => generator.trace_weight,
                     log_weight => generator.log_weight,
+                    profile_weight => generator.profile_weight,
                     suv_port => generator.suv_port,
                     generator_core_start => generator.core_start,
                     generator_core_end => generator.core_end,

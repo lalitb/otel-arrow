@@ -8,12 +8,9 @@ Each branch is stacked on the preceding branch.
 
 ## Current Status
 
-- Steps 1 through 8 are implemented and committed on their corresponding local
-  stack branches.
+- Steps 1 through 11 are implemented on their corresponding stacked branches.
 - All stack branches are rebased onto upstream commit `80d38834` from August
   28, 2026.
-- Steps 1 through 9 are implemented and committed on their corresponding local
-  stack branches.
 - Step 10 is implemented on the current branch with native sample filtering,
   explicit graph compaction and dense ID remapping, whole-owner attribute
   rename/delete operations, global function-filename redaction, and bounded
@@ -30,7 +27,9 @@ Each branch is stacked on the preceding branch.
   no Profiles Arrow codec or receiver/exporter implementation.
 - Generic query transformations, selection-local resource/scope mutation, and
   Profiles insert/upsert/update/hash remain explicit unsupported paths.
-- Step 11 has not started.
+- Step 11 adds deterministic Profiles generation and semantic validation plus
+  an environment-gated real OpenTelemetry eBPF profiler smoke test. See
+  [Profiles eBPF Integration](../rust/otap-dataflow/docs/profiles-ebpf-integration.md).
 
 1. `profiles/01-otap-data-model-design`
    - Define the Profiles OTAP data model, processing semantics, validation
@@ -83,6 +82,11 @@ Each branch is stacked on the preceding branch.
 11. `profiles/11-ebpf-profiler-integration`
     - Connect the eBPF profiler to the Profiles pipeline and verify the complete
       collection, transport, processing, buffering, and export path.
+    - Status: implemented. Normal CI uses deterministic Profiles through OTLP,
+      graph-aware processing, durable buffering, OTAP transport, canonical
+      reconstruction, and semantic equivalence. A pinned Collector
+      `0.159.0` smoke test exercises the real profiler on approved Linux hosts
+      with Docker and the required eBPF privileges.
 
 The branch names after step 3 are provisional and may be adjusted when each
 change is started. Schema or protocol discoveries may also require inserting a

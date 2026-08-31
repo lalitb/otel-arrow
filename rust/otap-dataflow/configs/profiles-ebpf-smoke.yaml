@@ -1,0 +1,100 @@
+# End-to-end OTAP Profiles pipeline for the OpenTelemetry eBPF profiler smoke test.
+#
+# Run it through tools/profiles/run-ebpf-smoke.sh. The source pipeline receives
+# OTLP Profiles, canonicalizes and compacts the graph, persists it, reconstructs
+# canonical OTLP, and exports it to the local sink pipeline.
+
+version: otel_dataflow/v1
+engine:
+  http_admin:
+    bind_address: "127.0.0.1:${env:OTEL_ARROW_EBPF_ADMIN_PORT:-18080}"
+  telemetry:
+    reporting_interval: 1s
+    logs:
+      level: info
+
+groups:
+  profiles_smoke:
+    pipelines:
+      source:
+        policies:
+          resources:
+            core_allocation:
+              type: core_set
+              set:
+                - start: 0
+                  end: 0
+          channel_capacity:
+            control:
+              node: 100
+              pipeline: 100
+            pdata: 128
+
+        nodes:
+          source_receiver:
+            type: receiver:otlp
+            config:
+              protocols:
+                grpc:
+                  listening_addr: "127.0.0.1:${env:OTEL_ARROW_EBPF_INGEST_PORT:-14317}"
+                  max_decoding_message_size: "32MiB"
+
+          profiles_filter:
+            type: processor:filter
+            config:
+              profiles:
+                compact: true
+                dense_ids: true
+
+          durable_buffer:
+            type: processor:durable_buffer
+            config:
+              path: "${env:OTEL_ARROW_EBPF_BUFFER_PATH:-/tmp/otel-arrow-profiles-ebpf-smoke/buffer}"
+              poll_interval: 10ms
+              retention_size_cap: "192 MiB"
+              size_cap_policy: backpressure
+              max_segment_open_duration: 250ms
+
+          otlp_exporter:
+            type: exporter:otlp_grpc
+            config:
+              grpc_endpoint: "http://127.0.0.1:${env:OTEL_ARROW_EBPF_SINK_PORT:-14318}"
+              compression_method: gzip
+
+        connections:
+          - from: source_receiver
+            to: profiles_filter
+          - from: profiles_filter
+            to: durable_buffer
+          - from: durable_buffer
+            to: otlp_exporter
+
+      sink:
+        policies:
+          resources:
+            core_allocation:
+              type: core_set
+              set:
+                - start: 1
+                  end: 1
+          channel_capacity:
+            control:
+              node: 100
+              pipeline: 100
+            pdata: 128
+
+        nodes:
+          sink_receiver:
+            type: receiver:otlp
+            config:
+              protocols:
+                grpc:
+                  listening_addr: "127.0.0.1:${env:OTEL_ARROW_EBPF_SINK_PORT:-14318}"
+                  max_decoding_message_size: "32MiB"
+
+          sink:
+            type: exporter:noop
+
+        connections:
+          - from: sink_receiver
+            to: sink

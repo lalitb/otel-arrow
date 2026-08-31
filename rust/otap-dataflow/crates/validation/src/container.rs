@@ -15,11 +15,11 @@ use crate::template::render_jinja;
 use minijinja::context;
 use std::collections::HashMap;
 use std::time::Duration;
-use testcontainers::core::IntoContainerPort;
 use testcontainers::core::WaitFor;
 use testcontainers::core::wait::{
     ExitWaitStrategy, HealthWaitStrategy, HttpWaitStrategy, LogWaitStrategy,
 };
+use testcontainers::core::{AccessMode, IntoContainerPort, Mount};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
@@ -55,6 +55,8 @@ pub struct ContainerConfig {
     pub(crate) env_vars: Vec<(String, String)>,
     /// Optional entrypoint override
     pub(crate) entrypoint: Option<String>,
+    /// Optional command and arguments passed to the image entrypoint.
+    pub(crate) command: Vec<String>,
     /// Fixed host-to-container port mappings keyed by container port,
     /// with host port as the value. Populated by the framework during
     /// config wiring for container connections.
@@ -65,6 +67,18 @@ pub struct ContainerConfig {
     /// Condition to wait for before considering the container ready.
     /// Defaults to [`WaitFor::Nothing`].
     pub(crate) wait_for: WaitFor,
+    /// Whether Docker should start the container in privileged mode.
+    pub(crate) privileged: bool,
+    /// Linux capabilities to add to the container.
+    pub(crate) cap_add: Vec<String>,
+    /// Bind mounts applied when the container starts.
+    pub(crate) mounts: Vec<Mount>,
+    /// Whether the container should share the host PID namespace.
+    pub(crate) host_pid: bool,
+    /// Whether the container should share the host network namespace.
+    pub(crate) host_network: bool,
+    /// Docker security options such as `seccomp=unconfined`.
+    pub(crate) security_opts: Vec<String>,
 }
 
 impl ContainerConfig {
@@ -76,9 +90,16 @@ impl ContainerConfig {
             tag: tag.into(),
             env_vars: Vec::new(),
             entrypoint: None,
+            command: Vec::new(),
             mapped_ports: HashMap::new(),
             templated_env_vars: None,
             wait_for: WaitFor::Nothing,
+            privileged: false,
+            cap_add: Vec::new(),
+            mounts: Vec::new(),
+            host_pid: false,
+            host_network: false,
+            security_opts: Vec::new(),
         }
     }
 
@@ -93,6 +114,70 @@ impl ContainerConfig {
     #[must_use]
     pub fn entrypoint(mut self, entrypoint: impl Into<String>) -> Self {
         self.entrypoint = Some(entrypoint.into());
+        self
+    }
+
+    /// Override the command and arguments passed to the image entrypoint.
+    #[must_use]
+    pub fn command<I, S>(mut self, command: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.command = command.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Configure Docker privileged mode.
+    #[must_use]
+    pub const fn privileged(mut self, privileged: bool) -> Self {
+        self.privileged = privileged;
+        self
+    }
+
+    /// Add a Linux capability to the container.
+    #[must_use]
+    pub fn cap_add(mut self, capability: impl Into<String>) -> Self {
+        self.cap_add.push(capability.into());
+        self
+    }
+
+    /// Bind-mount a host path into the container.
+    #[must_use]
+    pub fn bind_mount(
+        mut self,
+        host_path: impl Into<String>,
+        container_path: impl Into<String>,
+        read_only: bool,
+    ) -> Self {
+        let access_mode = if read_only {
+            AccessMode::ReadOnly
+        } else {
+            AccessMode::ReadWrite
+        };
+        self.mounts
+            .push(Mount::bind_mount(host_path, container_path).with_access_mode(access_mode));
+        self
+    }
+
+    /// Share the host PID namespace with the container.
+    #[must_use]
+    pub const fn host_pid(mut self, enabled: bool) -> Self {
+        self.host_pid = enabled;
+        self
+    }
+
+    /// Share the host network namespace with the container.
+    #[must_use]
+    pub const fn host_network(mut self, enabled: bool) -> Self {
+        self.host_network = enabled;
+        self
+    }
+
+    /// Add a Docker security option such as `seccomp=unconfined`.
+    #[must_use]
+    pub fn security_opt(mut self, option: impl Into<String>) -> Self {
+        self.security_opts.push(option.into());
         self
     }
 
@@ -276,6 +361,10 @@ impl ContainerConfig {
 
         // Convert to ContainerRequest for settings that consume the image.
         let mut request = testcontainers::core::ContainerRequest::from(image);
+        request = request.with_privileged(self.privileged);
+        if !self.command.is_empty() {
+            request = request.with_cmd(self.command);
+        }
 
         // Apply host-to-container port mappings set during config wiring.
         for (&container_port, &host_port) in &self.mapped_ports {
@@ -284,6 +373,29 @@ impl ContainerConfig {
 
         for (key, value) in &self.env_vars {
             request = request.with_env_var(key, value);
+        }
+        for capability in self.cap_add {
+            request = request.with_cap_add(capability);
+        }
+        for mount in self.mounts {
+            request = request.with_mount(mount);
+        }
+
+        if self.host_pid || self.host_network || !self.security_opts.is_empty() {
+            let host_pid = self.host_pid;
+            let host_network = self.host_network;
+            let security_opts = self.security_opts;
+            request = request.with_host_config_modifier(move |host_config| {
+                if host_pid {
+                    host_config.pid_mode = Some("host".to_string());
+                }
+                if host_network {
+                    host_config.network_mode = Some("host".to_string());
+                }
+                if !security_opts.is_empty() {
+                    host_config.security_opt = Some(security_opts.clone());
+                }
+            });
         }
 
         request.start().await.map_err(|e| {
@@ -306,9 +418,16 @@ mod tests {
         assert_eq!(config.tag, "7.2.4");
         assert!(config.env_vars.is_empty());
         assert!(config.entrypoint.is_none());
+        assert!(config.command.is_empty());
         assert!(config.mapped_ports.is_empty());
         assert!(config.templated_env_vars.is_none());
         assert!(matches!(config.wait_for, WaitFor::Nothing));
+        assert!(!config.privileged);
+        assert!(config.cap_add.is_empty());
+        assert!(config.mounts.is_empty());
+        assert!(!config.host_pid);
+        assert!(!config.host_network);
+        assert!(config.security_opts.is_empty());
     }
 
     #[test]
@@ -316,11 +435,26 @@ mod tests {
         let config = ContainerConfig::new("kafka", "7.5.0")
             .env("FOO", "bar")
             .env("BAZ", "qux")
-            .entrypoint("/bin/sh");
+            .entrypoint("/bin/sh")
+            .command(["-c", "echo ready"])
+            .privileged(true)
+            .cap_add("BPF")
+            .bind_mount("/sys/kernel/tracing", "/sys/kernel/tracing", true)
+            .host_pid(true)
+            .host_network(true)
+            .security_opt("seccomp=unconfined");
 
         assert_eq!(config.env_vars.len(), 2);
         assert_eq!(config.env_vars[0], ("FOO".into(), "bar".into()));
         assert_eq!(config.entrypoint, Some("/bin/sh".into()));
+        assert_eq!(config.command, vec!["-c", "echo ready"]);
+        assert!(config.privileged);
+        assert_eq!(config.cap_add, vec!["BPF"]);
+        assert_eq!(config.mounts.len(), 1);
+        assert_eq!(config.mounts[0].access_mode(), AccessMode::ReadOnly);
+        assert!(config.host_pid);
+        assert!(config.host_network);
+        assert_eq!(config.security_opts, vec!["seccomp=unconfined"]);
     }
 
     #[test]

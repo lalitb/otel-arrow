@@ -1,0 +1,7 @@
+change_type: enhancement
+component: pipeline
+note: "Add deterministic validation and a pinned eBPF profiler smoke path for end-to-end OTAP Profiles."
+issues: [2303]
+subtext: >-
+  Covers OTLP collection, graph-aware processing, durable buffering, OTAP
+  transport, canonical reconstruction, and approved-host eBPF collection.

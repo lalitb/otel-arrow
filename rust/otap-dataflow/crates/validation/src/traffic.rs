@@ -219,6 +219,8 @@ pub struct Generator {
     pub(crate) trace_weight: u32,
     /// Weight for log generation (0-100).
     pub(crate) log_weight: u32,
+    /// Weight for Profiles generation (0-100).
+    pub(crate) profile_weight: u32,
     /// static vs semantic messages
     pub(crate) data_source: DataSource,
 
@@ -279,6 +281,7 @@ impl Generator {
             log_weight: 100,
             metric_weight: 0,
             trace_weight: 0,
+            profile_weight: 0,
             ..Generator::default()
         }
     }
@@ -290,6 +293,7 @@ impl Generator {
             log_weight: 0,
             metric_weight: 100,
             trace_weight: 0,
+            profile_weight: 0,
             ..Generator::default()
         }
     }
@@ -301,6 +305,19 @@ impl Generator {
             log_weight: 0,
             metric_weight: 0,
             trace_weight: 100,
+            profile_weight: 0,
+            ..Generator::default()
+        }
+    }
+
+    /// Emit only Profiles.
+    #[must_use]
+    pub fn profiles() -> Self {
+        Generator {
+            log_weight: 0,
+            metric_weight: 0,
+            trace_weight: 0,
+            profile_weight: 100,
             ..Generator::default()
         }
     }
@@ -413,6 +430,7 @@ impl Default for Generator {
             metric_weight: DEFAULT_WEIGHT_ZERO,
             trace_weight: DEFAULT_WEIGHT_ZERO,
             log_weight: DEFAULT_LOG_WEIGHT,
+            profile_weight: DEFAULT_WEIGHT_ZERO,
             data_source: DataSource::Synthetic,
             tls: None,
             transport_headers: HashMap::new(),
@@ -545,6 +563,7 @@ mod tests {
         assert_eq!(g.metric_weight, 0);
         assert_eq!(g.trace_weight, 0);
         assert_eq!(g.log_weight, 100);
+        assert_eq!(g.profile_weight, 0);
         assert_eq!(g.data_source, DataSource::Synthetic);
         assert_eq!(g.core_start, 2);
         assert_eq!(g.core_end, 2);
@@ -574,12 +593,19 @@ mod tests {
         assert_eq!(g.suv_exporter_type, MessageType::Otlp);
     }
 
+    /// Scenario: Signal-specific constructors select exactly one traffic weight.
+    /// Guarantees: Profiles and all existing signal helpers remain mutually exclusive.
     #[test]
     fn generator_signal_weights_helpers() {
         let logs = Generator::logs();
         assert_eq!(
-            (logs.log_weight, logs.metric_weight, logs.trace_weight),
-            (100, 0, 0)
+            (
+                logs.log_weight,
+                logs.metric_weight,
+                logs.trace_weight,
+                logs.profile_weight
+            ),
+            (100, 0, 0, 0)
         );
 
         let metrics = Generator::metrics();
@@ -587,15 +613,32 @@ mod tests {
             (
                 metrics.log_weight,
                 metrics.metric_weight,
-                metrics.trace_weight
+                metrics.trace_weight,
+                metrics.profile_weight
             ),
-            (0, 100, 0)
+            (0, 100, 0, 0)
         );
 
         let traces = Generator::traces();
         assert_eq!(
-            (traces.log_weight, traces.metric_weight, traces.trace_weight),
-            (0, 0, 100)
+            (
+                traces.log_weight,
+                traces.metric_weight,
+                traces.trace_weight,
+                traces.profile_weight
+            ),
+            (0, 0, 100, 0)
+        );
+
+        let profiles = Generator::profiles();
+        assert_eq!(
+            (
+                profiles.log_weight,
+                profiles.metric_weight,
+                profiles.trace_weight,
+                profiles.profile_weight
+            ),
+            (0, 0, 0, 100)
         );
     }
 
