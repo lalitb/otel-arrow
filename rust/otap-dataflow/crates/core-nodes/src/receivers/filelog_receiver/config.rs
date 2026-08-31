@@ -26,10 +26,12 @@ use regex::Regex;
 use super::checkpoint::framing_profile;
 use super::checkpoint::namespace::{CheckpointNamespace, CheckpointNamespaceError};
 use super::checkpoint::primitives::{
-    ADVISORY_PATH_STORED_MAX_BYTES, FINGERPRINT_MAX_BYTES, FINGERPRINT_PROFILE_VERSION,
-    FRAMING_PATTERN_MAX_BYTES,
+    ADVISORY_PATH_FIXED_BYTES, ADVISORY_PATH_STORED_MAX_BYTES, COMMITTED_FRONTIER_GUARD_LEN,
+    FINGERPRINT_MAX_BYTES, FINGERPRINT_PROFILE_VERSION, FRAMING_PATTERN_MAX_BYTES,
+    MAX_PROGRESS_TX_FRAME_BYTES, TX_FRAME_CRC_BYTES, TX_HEADER_BYTES,
+    UPDATE_PROGRESS_MAX_OP_FRAME_BYTES, WAL_MAX_OPS_PER_TX,
 };
-use super::checkpoint::store::limits::StoreLimits;
+use super::checkpoint::store::limits::{RECOVERY_WORKING_BYTES_CEILING, StoreLimits};
 
 /// URN for the filelog receiver.
 pub const FILELOG_RECEIVER_URN: &str = "urn:otel:receiver:filelog";
@@ -49,6 +51,9 @@ const MULTILINE_REGEX_SIZE_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 const MULTILINE_REGEX_DFA_SIZE_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 /// Conservative process-memory ceiling for one identity reconciliation pass.
 const IDENTITY_RECONCILIATION_BYTES_CEILING: u64 = 1024 * 1024 * 1024;
+/// Complete modeled `AdvisoryPath` value: fixed fields plus retained bytes.
+const ADVISORY_PATH_MODELED_BYTES: u64 =
+    ADVISORY_PATH_FIXED_BYTES as u64 + ADVISORY_PATH_STORED_MAX_BYTES as u64;
 /// One worker-owned inventory, one inventory in the bounded event channel,
 /// and one inventory under construction can coexist.
 const DISCOVERY_MAX_SIMULTANEOUS_INVENTORIES: u64 = 3;
@@ -76,6 +81,24 @@ const IDENTITY_RECORD_INDEX_OVERHEAD_BYTES: u64 = 384;
 /// Conservative discovery-map, live-locator inventory, and removal-event
 /// storage per tracked locator while one earlier batch occupies the channel.
 const DISCOVERY_TRACKED_OVERHEAD_BYTES: u64 = 1024;
+/// Resource terms whose bounded populations do not yet have a reviewed byte
+/// coefficient. They are reported explicitly and excluded from numeric
+/// subtotals rather than assigned an invented RSS value.
+const RESOURCE_ADMISSION_UNMEASURED_TERMS: [&str; 6] = [
+    "checkpoint runtime maintenance scratch: checkpoint.compact_after_bytes, checkpoint.compact_after_transactions, limits.max_tracked_files (base table and progress frame already modeled)",
+    "decoder and fixed framer object state: limits.max_open_files, framing.max_line_bytes, framing.max_record_bytes (payload and resident population already modeled)",
+    "bounded channel and queue storage: fixed internal capacities (inventory and Arrow payloads already modeled)",
+    "incremental per-receiver lease registry state: limits.max_tracked_files (reader guard already modeled; process registry shared)",
+    "Arrow and allocator/library overhead: batch.max_records, batch.max_bytes (logical retained and carry-over bytes already modeled)",
+    "fixed worker/runtime state and excess native path storage: discovery patterns and limits.* (variable modeled payloads excluded)",
+];
+/// Stable bounded text emitted with the startup admission report.
+const RESOURCE_ADMISSION_UNMEASURED_TERMS_TEXT: &str = "checkpoint runtime maintenance scratch: checkpoint.compact_after_bytes, checkpoint.compact_after_transactions, limits.max_tracked_files (base table and progress frame already modeled); \
+     decoder and fixed framer object state: limits.max_open_files, framing.max_line_bytes, framing.max_record_bytes (payload and resident population already modeled); \
+     bounded channel and queue storage: fixed internal capacities (inventory and Arrow payloads already modeled); \
+     incremental per-receiver lease registry state: limits.max_tracked_files (reader guard already modeled; process registry shared); \
+     Arrow and allocator/library overhead: batch.max_records, batch.max_bytes (logical retained and carry-over bytes already modeled); \
+     fixed worker/runtime state and excess native path storage: discovery patterns and limits.* (variable modeled payloads excluded)";
 
 /// Maximum accepted `identity.ignored_header_bytes`: the checkpoint codec
 /// stores `ignored_header_bytes` as a `u32`, so a value larger than this can
@@ -1067,6 +1090,61 @@ pub(crate) struct DescriptorBudget {
     pub(crate) warning: bool,
 }
 
+/// One numerically modeled resource-admission term.
+///
+/// `named_provisional_ceiling_bytes` is `Some` only where the authoritative
+/// conformance design defines a startup rejection threshold. A `None` value
+/// means the term is still checked for representability but is not compared
+/// with an invented ceiling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ResourceAdmissionTerm {
+    pub(crate) bytes: u64,
+    pub(crate) named_provisional_ceiling_bytes: Option<u64>,
+}
+
+/// Integrated resource-admission evidence retained by the validated config.
+///
+/// The numeric values are conservative modeled subtotals, not exact heap or
+/// RSS measurements. Recovery and steady runtime are separate phases so the
+/// checkpoint recovery peak is not double-counted with state allocated only
+/// after recovery. Terms requiring representative measurement remain named
+/// by [`Self::unmeasured_terms`] and are intentionally absent from the numeric
+/// subtotals.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ResourceAdmissionReport {
+    pub(crate) candidate_identity_state: ResourceAdmissionTerm,
+    pub(crate) reader_state: ResourceAdmissionTerm,
+    pub(crate) framer_payload_per_reader: ResourceAdmissionTerm,
+    pub(crate) framer_payload: ResourceAdmissionTerm,
+    pub(crate) retained_batch: ResourceAdmissionTerm,
+    pub(crate) carry_over: ResourceAdmissionTerm,
+    pub(crate) checkpoint_recovery: ResourceAdmissionTerm,
+    pub(crate) regex_program_cache: ResourceAdmissionTerm,
+    pub(crate) checkpoint_limits: StoreLimits,
+    pub(crate) numeric_recovery_subtotal_bytes: u64,
+    pub(crate) numeric_runtime_subtotal_bytes: u64,
+    pub(crate) numeric_peak_subtotal_bytes: u64,
+}
+
+impl ResourceAdmissionReport {
+    /// Bounded terms that still require implementation-specific measurement
+    /// before a complete RSS ceiling can be claimed.
+    pub(crate) const fn unmeasured_terms(&self) -> &'static [&'static str] {
+        &RESOURCE_ADMISSION_UNMEASURED_TERMS
+    }
+
+    /// Stable bounded rendering of [`Self::unmeasured_terms`] for startup
+    /// diagnostics.
+    pub(crate) const fn unmeasured_terms_text(&self) -> &'static str {
+        RESOURCE_ADMISSION_UNMEASURED_TERMS_TEXT
+    }
+
+    /// No reviewed universal RSS ceiling exists for the complete aggregate.
+    pub(crate) const fn complete_rss_ceiling_bytes(&self) -> Option<u64> {
+        None
+    }
+}
+
 /// Validated, runtime-ready form of the filelog receiver configuration.
 ///
 /// Parsing produces this from [`Config`] once; a later runtime stage
@@ -1108,6 +1186,8 @@ pub(crate) struct RuntimeConfig {
     pub(crate) limits: LimitsConfig,
     /// Receiver-local descriptor budget and process soft-limit comparison.
     pub(crate) descriptor_budget: DescriptorBudget,
+    /// Checked integrated resource-admission evidence.
+    pub(crate) resource_admission: ResourceAdmissionReport,
     /// Worker -> async batch shaping.
     pub(crate) batch: BatchConfig,
     /// Move/create and copy-truncate rotation handling.
@@ -1214,16 +1294,27 @@ impl RuntimeConfig {
             return Err(invalid("drain_timeout must be greater than zero"));
         }
         let limits = validate_limits(limits)?;
-        let (framing, framing_profile_digest, compiled_multiline_pattern) =
-            validate_framing(framing, encoding, on_decode_error, &identity)?;
+        let (
+            framing,
+            framing_profile_digest,
+            compiled_multiline_pattern,
+            framer_payload_per_reader_bytes,
+        ) = validate_framing(framing, encoding, on_decode_error, &identity)?;
         let batch = validate_batch(batch, &framing, on_decode_error)?;
         let rotation = validate_rotation(rotation)?;
         let retry = validate_retry(retry)?;
 
         let checkpoint_id = resolve_checkpoint_id(checkpoint.id.as_deref(), default_checkpoint_id)?;
         let checkpoint_namespace_dir = checkpoint_namespace_dir(&checkpoint_id);
-        validate_checkpoint_bounds(&checkpoint, &limits, &identity)?;
-        validate_identity_reconciliation_bounds(&identity, &limits)?;
+        let checkpoint_limits = validate_checkpoint_bounds(&checkpoint, &limits, &identity)?;
+        let resource_admission = validate_resource_admission(
+            &identity,
+            &limits,
+            &batch,
+            checkpoint_limits,
+            framer_payload_per_reader_bytes,
+            compiled_multiline_pattern.is_some(),
+        )?;
         let descriptor_budget = validate_descriptor_budget(limits.max_open_files)?;
 
         validate_discovery_pattern_population(&include, &exclude)?;
@@ -1248,6 +1339,7 @@ impl RuntimeConfig {
             framing,
             limits,
             descriptor_budget,
+            resource_admission,
             batch,
             rotation,
             checkpoint,
@@ -1503,10 +1595,10 @@ fn process_descriptor_soft_limit() -> std::io::Result<Option<u64>> {
     Ok(None)
 }
 
-fn validate_identity_reconciliation_bounds(
+fn identity_reconciliation_bytes(
     identity: &IdentityConfig,
     limits: &LimitsConfig,
-) -> Result<(), otap_df_config::error::Error> {
+) -> Result<u64, otap_df_config::error::Error> {
     let candidate_population = u64::from(limits.max_pending_candidates)
         .checked_add(u64::from(limits.max_open_files))
         .ok_or_else(|| invalid("identity reconciliation candidate population overflows u64"))?;
@@ -1514,7 +1606,7 @@ fn validate_identity_reconciliation_bounds(
         .fingerprint_bytes
         .checked_mul(DISCOVERY_CANDIDATE_FINGERPRINT_COPIES)
         .and_then(|bytes| {
-            (ADVISORY_PATH_STORED_MAX_BYTES as u64)
+            ADVISORY_PATH_MODELED_BYTES
                 .checked_mul(DISCOVERY_CANDIDATE_PATH_COPIES)
                 .and_then(|paths| bytes.checked_add(paths))
         })
@@ -1531,7 +1623,7 @@ fn validate_identity_reconciliation_bounds(
         .fingerprint_bytes
         .checked_mul(IDENTITY_OPEN_CANDIDATE_FINGERPRINT_COPIES)
         .and_then(|bytes| {
-            (ADVISORY_PATH_STORED_MAX_BYTES as u64)
+            ADVISORY_PATH_MODELED_BYTES
                 .checked_mul(IDENTITY_OPEN_CANDIDATE_PATH_COPIES)
                 .and_then(|paths| bytes.checked_add(paths))
         })
@@ -1542,7 +1634,8 @@ fn validate_identity_reconciliation_bounds(
         })?;
     let record_state_bytes = identity
         .fingerprint_bytes
-        .checked_add(ADVISORY_PATH_STORED_MAX_BYTES as u64)
+        .checked_add(ADVISORY_PATH_MODELED_BYTES)
+        .and_then(|bytes| bytes.checked_add(COMMITTED_FRONTIER_GUARD_LEN as u64))
         .and_then(|bytes| bytes.checked_add(IDENTITY_RECORD_INDEX_OVERHEAD_BYTES))
         .and_then(|bytes| bytes.checked_mul(u64::from(limits.max_tracked_files)))
         .ok_or_else(|| invalid("identity reconciliation record-state bound overflows u64"))?;
@@ -1562,7 +1655,194 @@ fn validate_identity_reconciliation_bounds(
              or identity.fingerprint_bytes"
         )));
     }
-    Ok(())
+    Ok(total)
+}
+
+fn reader_table_payload_bytes(
+    identity: &IdentityConfig,
+    limits: &LimitsConfig,
+) -> Result<u64, otap_df_config::error::Error> {
+    let per_reader = ADVISORY_PATH_MODELED_BYTES
+        .checked_mul(2)
+        .and_then(|paths| identity.fingerprint_bytes.checked_add(paths))
+        .and_then(|bytes| bytes.checked_add(1024))
+        .ok_or_else(|| {
+            invalid(
+                "reader-table per-reader formula overflows u64; reduce \
+                 identity.fingerprint_bytes",
+            )
+        })?;
+    u64::from(limits.max_tracked_files)
+        .checked_mul(per_reader)
+        .and_then(|bytes| bytes.checked_add(limits.max_read_bytes_per_turn))
+        .ok_or_else(|| {
+            invalid(
+                "reader-table payload formula overflows u64; reduce \
+                 limits.max_tracked_files, limits.max_read_bytes_per_turn, or \
+                 identity.fingerprint_bytes",
+            )
+        })
+}
+
+fn checked_resource_sum(
+    formula: &'static str,
+    remedies: &'static str,
+    parts: &[u64],
+) -> Result<u64, otap_df_config::error::Error> {
+    let mut total = 0u64;
+    for part in parts {
+        total = total
+            .checked_add(*part)
+            .ok_or_else(|| invalid(&format!("{formula} overflows u64; reduce {remedies}")))?;
+    }
+    Ok(total)
+}
+
+fn progress_transaction_bytes(
+    batch: &BatchConfig,
+    limits: &LimitsConfig,
+) -> Result<u64, otap_df_config::error::Error> {
+    let operation_count = u64::from(
+        batch
+            .max_records
+            .min(limits.max_tracked_files)
+            .min(u32::from(WAL_MAX_OPS_PER_TX)),
+    );
+    let operations = operation_count
+        .checked_mul(UPDATE_PROGRESS_MAX_OP_FRAME_BYTES)
+        .ok_or_else(|| {
+            invalid(
+                "retained-batch progress transaction formula overflows u64; reduce \
+                 batch.max_records or limits.max_tracked_files",
+            )
+        })?;
+    let bytes = checked_resource_sum(
+        "retained-batch progress transaction formula",
+        "batch.max_records or limits.max_tracked_files",
+        &[
+            TX_HEADER_BYTES as u64,
+            operations,
+            TX_FRAME_CRC_BYTES as u64,
+        ],
+    )?;
+    debug_assert!(bytes <= MAX_PROGRESS_TX_FRAME_BYTES);
+    Ok(bytes)
+}
+
+fn validate_resource_admission(
+    identity: &IdentityConfig,
+    limits: &LimitsConfig,
+    batch: &BatchConfig,
+    checkpoint_limits: StoreLimits,
+    framer_payload_per_reader_bytes: u64,
+    multiline_configured: bool,
+) -> Result<ResourceAdmissionReport, otap_df_config::error::Error> {
+    let candidate_identity_bytes = identity_reconciliation_bytes(identity, limits)?;
+    let reader_state_bytes = reader_table_payload_bytes(identity, limits)?;
+    // A framer is retained only for a resident reader. The worker discards
+    // speculative framer state before confirming descriptor eviction, and a
+    // carry-over's post-frame framer occupies one of the same resident slots.
+    let framer_payload_bytes = framer_payload_per_reader_bytes
+        .checked_mul(u64::from(limits.max_open_files))
+        .ok_or_else(|| {
+            invalid(
+                "aggregate framer payload formula overflows u64; reduce \
+                 limits.max_open_files, framing.max_line_bytes, or \
+                 framing.max_record_bytes",
+            )
+        })?;
+    let progress_transaction_bytes = progress_transaction_bytes(batch, limits)?;
+    let retained_batch_bytes = batch
+        .max_bytes
+        .checked_add(progress_transaction_bytes)
+        .ok_or_else(|| {
+            invalid(
+                "retained-batch resource formula overflows u64; reduce batch.max_bytes, \
+                 batch.max_records, or limits.max_tracked_files",
+            )
+        })?;
+    // Exact projected body and attributes are bounded by batch.max_bytes. One
+    // progress-operation frame covers its sole delta. Its post-frame Framer
+    // is already included in the resident-framer population above.
+    let carry_over_bytes = batch
+        .max_bytes
+        .checked_add(UPDATE_PROGRESS_MAX_OP_FRAME_BYTES)
+        .ok_or_else(|| {
+            invalid("carry-over resource formula overflows u64; reduce batch.max_bytes")
+        })?;
+    let regex_program_cache_bytes = if multiline_configured {
+        u64::try_from(MULTILINE_REGEX_SIZE_LIMIT_BYTES)
+            .ok()
+            .and_then(|program| {
+                u64::try_from(MULTILINE_REGEX_DFA_SIZE_LIMIT_BYTES)
+                    .ok()
+                    .and_then(|cache| program.checked_add(cache))
+            })
+            .ok_or_else(|| {
+                invalid(
+                    "multiline regex program/cache resource formula overflows u64; remove or \
+                     simplify framing.multiline.line_start_pattern or \
+                     framing.multiline.line_end_pattern",
+                )
+            })?
+    } else {
+        0
+    };
+
+    // Recovery happens before reader, discovery, framer, batch, lease, and
+    // worker tables are constructed, so its numeric phase is compared with
+    // rather than added to the steady-runtime subtotal. The compiled regex
+    // remains resident in both phases.
+    let numeric_recovery_subtotal_bytes = checked_resource_sum(
+        "resource-admission recovery numeric subtotal",
+        "checkpoint.compact_after_bytes, checkpoint.compact_after_transactions, \
+         limits.max_tracked_files, identity.fingerprint_bytes, or the multiline pattern",
+        &[
+            checkpoint_limits.max_recovery_working_bytes,
+            regex_program_cache_bytes,
+        ],
+    )?;
+    let numeric_runtime_subtotal_bytes = checked_resource_sum(
+        "resource-admission runtime numeric subtotal",
+        "limits.max_pending_candidates, limits.max_open_files, limits.max_tracked_files, \
+         limits.max_read_bytes_per_turn, identity.fingerprint_bytes, \
+         framing.max_line_bytes, framing.max_record_bytes, batch.max_bytes, \
+         batch.max_records, or the multiline pattern",
+        &[
+            candidate_identity_bytes,
+            reader_state_bytes,
+            framer_payload_bytes,
+            retained_batch_bytes,
+            carry_over_bytes,
+            regex_program_cache_bytes,
+        ],
+    )?;
+
+    let modeled = |bytes| ResourceAdmissionTerm {
+        bytes,
+        named_provisional_ceiling_bytes: None,
+    };
+    Ok(ResourceAdmissionReport {
+        candidate_identity_state: ResourceAdmissionTerm {
+            bytes: candidate_identity_bytes,
+            named_provisional_ceiling_bytes: Some(IDENTITY_RECONCILIATION_BYTES_CEILING),
+        },
+        reader_state: modeled(reader_state_bytes),
+        framer_payload_per_reader: modeled(framer_payload_per_reader_bytes),
+        framer_payload: modeled(framer_payload_bytes),
+        retained_batch: modeled(retained_batch_bytes),
+        carry_over: modeled(carry_over_bytes),
+        checkpoint_recovery: ResourceAdmissionTerm {
+            bytes: checkpoint_limits.max_recovery_working_bytes,
+            named_provisional_ceiling_bytes: Some(RECOVERY_WORKING_BYTES_CEILING),
+        },
+        regex_program_cache: modeled(regex_program_cache_bytes),
+        checkpoint_limits,
+        numeric_recovery_subtotal_bytes,
+        numeric_runtime_subtotal_bytes,
+        numeric_peak_subtotal_bytes: numeric_recovery_subtotal_bytes
+            .max(numeric_runtime_subtotal_bytes),
+    })
 }
 
 fn invalid_re2(field: &str, detail: &str) -> otap_df_config::error::Error {
@@ -1956,7 +2236,7 @@ fn validate_peak_framer_payload_bytes(
     framing: &FramingConfig,
     encoding: Encoding,
     on_decode_error: OnDecodeError,
-) -> Result<(), otap_df_config::error::Error> {
+) -> Result<u64, otap_df_config::error::Error> {
     let overflow = || {
         invalid(&format!(
             "framing bounds max_line_bytes={} and max_record_bytes={} overflow usize in the \
@@ -1968,9 +2248,9 @@ fn validate_peak_framer_payload_bytes(
     let max_line_bytes = usize::try_from(framing.max_line_bytes).map_err(|_| overflow())?;
     let max_record_bytes = usize::try_from(framing.max_record_bytes).map_err(|_| overflow())?;
     let copies = framer_payload_copy_count(encoding, on_decode_error);
-    peak_framer_payload_bytes(max_line_bytes, max_record_bytes, copies)
-        .ok_or_else(overflow)
-        .map(|_| ())
+    let bytes =
+        peak_framer_payload_bytes(max_line_bytes, max_record_bytes, copies).ok_or_else(overflow)?;
+    u64::try_from(bytes).map_err(|_| overflow())
 }
 
 fn validate_framing(
@@ -1978,8 +2258,15 @@ fn validate_framing(
     encoding: Encoding,
     on_decode_error: OnDecodeError,
     identity: &IdentityConfig,
-) -> Result<(FramingConfig, [u8; 32], Option<CompiledMultilinePattern>), otap_df_config::error::Error>
-{
+) -> Result<
+    (
+        FramingConfig,
+        [u8; 32],
+        Option<CompiledMultilinePattern>,
+        u64,
+    ),
+    otap_df_config::error::Error,
+> {
     if framing.max_line_bytes == 0 {
         return Err(invalid("framing.max_line_bytes must be greater than zero"));
     }
@@ -2006,7 +2293,8 @@ fn validate_framing(
             "framing.max_multiline_lines must be greater than zero",
         ));
     }
-    validate_peak_framer_payload_bytes(&framing, encoding, on_decode_error)?;
+    let framer_payload_per_reader_bytes =
+        validate_peak_framer_payload_bytes(&framing, encoding, on_decode_error)?;
 
     let (multiline_mode, compiled_pattern) = match (
         &framing.multiline.line_start_pattern,
@@ -2066,7 +2354,12 @@ fn validate_framing(
         ))
     })?;
 
-    Ok((framing, digest, compiled_pattern))
+    Ok((
+        framing,
+        digest,
+        compiled_pattern,
+        framer_payload_per_reader_bytes,
+    ))
 }
 
 const fn encoding_to_framing_profile(encoding: Encoding) -> framing_profile::FramingEncoding {
@@ -2177,7 +2470,7 @@ fn validate_checkpoint_bounds(
     checkpoint: &CheckpointConfig,
     limits: &LimitsConfig,
     identity: &IdentityConfig,
-) -> Result<(), otap_df_config::error::Error> {
+) -> Result<StoreLimits, otap_df_config::error::Error> {
     if checkpoint.compact_after_bytes == 0 {
         return Err(invalid(
             "checkpoint.compact_after_bytes must be greater than zero",
@@ -2208,14 +2501,13 @@ fn validate_checkpoint_bounds(
     // the same artifact caps when it writes. Running the derivation here
     // rejects an unrecoverable configuration at build time, with the knobs
     // to reduce, rather than at the first compaction or reopen.
-    let _store_limits = StoreLimits::derive(
+    StoreLimits::derive(
         checkpoint.compact_after_bytes,
         checkpoint.compact_after_transactions,
         limits.max_tracked_files,
         identity.fingerprint_bytes,
     )
-    .map_err(|error| invalid(&error.to_string()))?;
-    Ok(())
+    .map_err(|error| invalid(&error.to_string()))
 }
 
 fn resolve_checkpoint_id(
@@ -2886,10 +3178,7 @@ mod tests {
         let mut cfg = minimal_config();
         cfg.identity.fingerprint_bytes = MAX_FINGERPRINT_BYTES;
         let err = RuntimeConfig::from_config(cfg.clone(), "node-1").unwrap_err();
-        assert!(
-            err.to_string().contains("checkpoint recovery working set"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("checkpoint recovery"), "{err}");
 
         cfg.identity.fingerprint_bytes = MAX_FINGERPRINT_BYTES + 1;
         let err = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
@@ -3654,6 +3943,237 @@ mod tests {
         );
     }
 
+    /// Scenario: a small synthetic identity population is evaluated against
+    /// the reviewed candidate, open-candidate, checkpoint-record, and
+    /// discovery-tracked formulas.
+    /// Guarantees: every path copy includes the fixed 44-byte AdvisoryPath
+    /// fields, and checkpoint records include the explicit 34-byte committed
+    /// frontier guard rather than hiding either value in another coefficient.
+    #[test]
+    fn identity_reconciliation_formula_matches_reviewed_terms() {
+        let identity = IdentityConfig {
+            fingerprint_bytes: 32,
+            ..IdentityConfig::default()
+        };
+        let limits = LimitsConfig {
+            max_tracked_files: 5,
+            max_pending_candidates: 2,
+            max_open_files: 3,
+            max_read_bytes_per_turn: 7,
+        };
+        const PATH_BYTES: u64 = 44 + 4096;
+        let expected = (2 + 3) * (5 * 32 + 4 * PATH_BYTES + 2048)
+            + 3 * (10 * 32 + 10 * PATH_BYTES + 4096)
+            + 5 * (32 + PATH_BYTES + 34 + 384)
+            + 5 * 1024;
+
+        assert_eq!(
+            identity_reconciliation_bytes(&identity, &limits).unwrap(),
+            expected
+        );
+        assert_eq!(ADVISORY_PATH_MODELED_BYTES, PATH_BYTES);
+        assert_eq!(COMMITTED_FRONTIER_GUARD_LEN, 34);
+    }
+
+    /// Scenario: the reader-table formula is evaluated with small exact
+    /// values and then with a fingerprint width that makes its first checked
+    /// sum unrepresentable.
+    /// Guarantees: one shared turn buffer is added after the per-reader
+    /// product, every reader includes two complete AdvisoryPath values, and
+    /// overflow reports all knobs that can reduce the bound.
+    #[test]
+    fn reader_table_formula_is_exact_and_checked() {
+        let identity = IdentityConfig {
+            fingerprint_bytes: 32,
+            ..IdentityConfig::default()
+        };
+        let limits = LimitsConfig {
+            max_tracked_files: 5,
+            max_pending_candidates: 2,
+            max_open_files: 3,
+            max_read_bytes_per_turn: 7,
+        };
+        let expected = 5 * (32 + 2 * (44 + 4096) + 1024) + 7;
+        assert_eq!(
+            reader_table_payload_bytes(&identity, &limits).unwrap(),
+            expected
+        );
+
+        let overflowing = IdentityConfig {
+            fingerprint_bytes: u64::MAX,
+            ..IdentityConfig::default()
+        };
+        let error = reader_table_payload_bytes(&overflowing, &limits).unwrap_err();
+        assert!(error.to_string().contains("reader-table"), "{error}");
+        assert!(
+            error.to_string().contains("identity.fingerprint_bytes"),
+            "{error}"
+        );
+    }
+
+    /// Scenario: a small validated configuration derives every numeric
+    /// resource term, both sequential phase subtotals, and the explicit list
+    /// of implementation/library terms that still require measurement.
+    /// Guarantees: the integrated report covers all reviewed categories,
+    /// counts the carry-over framer only in the resident-framer population,
+    /// retains named ceilings only where the design defines them, and does
+    /// not claim a complete RSS ceiling.
+    #[test]
+    fn aggregate_resource_report_is_phase_aware_and_complete() {
+        let mut cfg = minimal_config();
+        cfg.encoding = Encoding::Raw;
+        cfg.on_decode_error = OnDecodeError::Fail;
+        cfg.identity.fingerprint_bytes = 32;
+        cfg.framing.max_line_bytes = 8;
+        cfg.framing.max_record_bytes = 12;
+        cfg.limits = LimitsConfig {
+            max_tracked_files: 5,
+            max_pending_candidates: 2,
+            max_open_files: 3,
+            max_read_bytes_per_turn: 7,
+        };
+        cfg.batch.max_records = 4;
+        cfg.batch.max_bytes = 1024 * 1024;
+        cfg.checkpoint.compact_after_bytes = store_limits::minimum_compact_after_bytes().unwrap();
+        cfg.checkpoint.compact_after_transactions = 1;
+
+        let runtime = RuntimeConfig::from_config(cfg, "node-1").unwrap();
+        let report = runtime.resource_admission;
+        const PATH_BYTES: u64 = 44 + 4096;
+        let expected_identity = (2 + 3) * (5 * 32 + 4 * PATH_BYTES + 2048)
+            + 3 * (10 * 32 + 10 * PATH_BYTES + 4096)
+            + 5 * (32 + PATH_BYTES + 34 + 384)
+            + 5 * 1024;
+        let expected_reader = 5 * (32 + 2 * PATH_BYTES + 1024) + 7;
+        let expected_framer_per_reader = 4 * (8 + 12) + 16 + 16;
+        let expected_framers = 3 * expected_framer_per_reader;
+        let expected_progress_transaction = 36 + 4 * 109 + 4;
+        let expected_retained = 1024 * 1024 + expected_progress_transaction;
+        let expected_carry_over = 1024 * 1024 + 109;
+        let expected_runtime = expected_identity
+            + expected_reader
+            + expected_framers
+            + expected_retained
+            + expected_carry_over;
+        let expected_recovery = report.checkpoint_limits.max_recovery_working_bytes;
+
+        assert_eq!(report.candidate_identity_state.bytes, expected_identity);
+        assert_eq!(
+            report
+                .candidate_identity_state
+                .named_provisional_ceiling_bytes,
+            Some(IDENTITY_RECONCILIATION_BYTES_CEILING)
+        );
+        assert_eq!(report.reader_state.bytes, expected_reader);
+        assert_eq!(
+            report.framer_payload_per_reader.bytes,
+            expected_framer_per_reader
+        );
+        assert_eq!(report.framer_payload.bytes, expected_framers);
+        assert_eq!(report.retained_batch.bytes, expected_retained);
+        assert_eq!(report.carry_over.bytes, expected_carry_over);
+        assert_eq!(report.regex_program_cache.bytes, 0);
+        assert_eq!(
+            report.checkpoint_recovery.named_provisional_ceiling_bytes,
+            Some(RECOVERY_WORKING_BYTES_CEILING)
+        );
+        assert_eq!(report.numeric_runtime_subtotal_bytes, expected_runtime);
+        assert_eq!(report.numeric_recovery_subtotal_bytes, expected_recovery);
+        assert_eq!(
+            report.numeric_peak_subtotal_bytes,
+            expected_runtime.max(expected_recovery)
+        );
+        assert_eq!(
+            report.unmeasured_terms(),
+            &RESOURCE_ADMISSION_UNMEASURED_TERMS
+        );
+        assert!(
+            report
+                .unmeasured_terms()
+                .iter()
+                .any(|term| term.contains("checkpoint runtime maintenance"))
+        );
+        assert!(
+            report
+                .unmeasured_terms()
+                .iter()
+                .any(|term| term.contains("bounded channel"))
+        );
+        assert_eq!(report.complete_rss_ceiling_bytes(), None);
+    }
+
+    /// Scenario: individually representable configured terms overflow first
+    /// a retained-batch addition and then the integrated runtime subtotal.
+    /// Guarantees: aggregate admission uses checked arithmetic at both term
+    /// and phase boundaries and reports the exact formula plus actionable
+    /// knobs instead of wrapping or applying a universal ceiling.
+    #[test]
+    fn aggregate_resource_report_rejects_checked_overflow() {
+        let identity = IdentityConfig {
+            fingerprint_bytes: 16,
+            ..IdentityConfig::default()
+        };
+        let limits = LimitsConfig {
+            max_tracked_files: 1,
+            max_pending_candidates: 1,
+            max_open_files: 1,
+            max_read_bytes_per_turn: 1,
+        };
+        let checkpoint_limits = StoreLimits::derive(
+            store_limits::minimum_compact_after_bytes().unwrap(),
+            1,
+            1,
+            16,
+        )
+        .unwrap();
+        let overflowing_batch = BatchConfig {
+            max_records: 1,
+            max_bytes: u64::MAX,
+            ..BatchConfig::default()
+        };
+        let error = validate_resource_admission(
+            &identity,
+            &limits,
+            &overflowing_batch,
+            checkpoint_limits,
+            1,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("retained-batch resource formula"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("batch.max_bytes"), "{error}");
+
+        let small_batch = BatchConfig {
+            max_records: 1,
+            max_bytes: 1,
+            ..BatchConfig::default()
+        };
+        let error = validate_resource_admission(
+            &identity,
+            &limits,
+            &small_batch,
+            checkpoint_limits,
+            u64::MAX,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("resource-admission runtime numeric subtotal"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("limits.max_open_files"),
+            "{error}"
+        );
+    }
+
     /// Scenario: pending-candidate capacity reaches the exact largest value
     /// whose complete discovery, identity, index, and tracked-state formula
     /// fits one GiB at the other defaults, then increases by one.
@@ -4061,9 +4581,7 @@ mod tests {
         .expect("the shipped defaults are recoverable");
         assert!(defaults.max_snapshot_bytes <= store_limits::ARTIFACT_BYTES_CEILING);
         assert!(defaults.max_wal_bytes <= store_limits::ARTIFACT_BYTES_CEILING);
-        assert!(
-            defaults.max_recovery_working_bytes <= store_limits::RECOVERY_WORKING_BYTES_CEILING
-        );
+        assert!(defaults.max_recovery_working_bytes <= RECOVERY_WORKING_BYTES_CEILING);
         assert!(RuntimeConfig::from_config(minimal_config(), "node-1").is_ok());
 
         // Largest tracked-file population whose complete recovery working
@@ -4092,10 +4610,7 @@ mod tests {
         let mut cfg = minimal_config();
         cfg.limits.max_tracked_files = boundary_files + 1;
         let err = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
-        assert!(
-            err.to_string().contains("checkpoint recovery working set"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("checkpoint recovery"), "{err}");
         assert!(err.to_string().contains(RECOVERY_REMEDY), "{err}");
 
         // Largest compaction threshold whose complete recovery working set
@@ -4123,10 +4638,7 @@ mod tests {
         let mut cfg = minimal_config();
         cfg.checkpoint.compact_after_bytes = boundary_bytes + 1;
         let err = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
-        assert!(
-            err.to_string().contains("checkpoint recovery working set"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("checkpoint recovery"), "{err}");
         assert!(err.to_string().contains(RECOVERY_REMEDY), "{err}");
 
         // Nothing saturates: the transaction threshold still bounds the WAL
@@ -4167,10 +4679,7 @@ mod tests {
         cfg.limits.max_pending_candidates = 1;
         cfg.limits.max_open_files = 1;
         let err = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
-        assert!(
-            err.to_string().contains("checkpoint recovery working set"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("checkpoint recovery"), "{err}");
         assert!(err.to_string().contains(RECOVERY_REMEDY), "{err}");
 
         // The format's widest representable fingerprint is consequently
@@ -4178,10 +4687,7 @@ mod tests {
         let mut cfg = minimal_config();
         cfg.identity.fingerprint_bytes = MAX_FINGERPRINT_BYTES;
         let err = RuntimeConfig::from_config(cfg, "node-1").unwrap_err();
-        assert!(
-            err.to_string().contains("checkpoint recovery working set"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("checkpoint recovery"), "{err}");
         assert!(err.to_string().contains(RECOVERY_REMEDY), "{err}");
     }
 

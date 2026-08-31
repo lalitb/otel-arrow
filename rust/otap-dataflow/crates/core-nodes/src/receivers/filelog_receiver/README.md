@@ -256,7 +256,10 @@ rotation.
 
 ## Telemetry
 
-The fixed-cardinality metric set is `receiver.filelog`. It has no path, file
+The implementation currently registers the fixed-cardinality metric set
+`receiver.filelog`. The semantic coverage is intentional, but the exact metric
+set and instrument names, kinds, units, and aggregation are provisional until
+the separate telemetry-contract review is complete. Metrics have no path, file
 ID, pattern, checkpoint ID, or error-string dimensions.
 
 High-signal operating metrics include:
@@ -333,6 +336,23 @@ spooled by the receiver.
   `+ 1` transient probe, and `+ 8` checkpoint/namespace handles. Unix startup
   rejects a budget above `RLIMIT_NOFILE` and warns above 80%; this is not an
   aggregate process admission claim.
+- Startup derives one checked resource-admission report for candidate and
+  identity reconciliation, readers, all resident framer payloads, the retained
+  batch, carry-over, checkpoint recovery, and regex program/cache state.
+  Identity reconciliation and checkpoint artifacts/recovery use their named
+  provisional one-GiB ceilings. Reader, framer, batch, and carry-over formulas
+  are checked for representability but are not compared with an invented
+  aggregate ceiling.
+- Recovery and steady runtime are reported as separate numeric phases so
+  sequential checkpoint recovery is not double-counted with tables allocated
+  afterward. Checkpoint maintenance scratch, decoder/fixed-framer objects,
+  channel storage, incremental lease-registry state, Arrow/allocator overhead,
+  fixed runtime state, and excess native path storage remain explicitly
+  measurement-required terms.
+- These formulas are conservative admission guidance, not exact heap, allocator
+  residence, or RSS measurements. A complete per-instance RSS ceiling and
+  production-readiness claim require representative host measurements and the
+  remaining qualification gates.
 - `EMFILE`/`ENFILE` use one receiver-global retry state. Other temporary
   source or root failures use one bounded per-file/root state with delays
   `250ms, 500ms, ... 30s`; they never become quarantine merely by recurring.

@@ -1,0 +1,6 @@
+change_type: bug_fix
+component: pipeline
+note: "Correct filelog startup resource admission formulas and report modeled runtime and recovery terms without claiming an RSS ceiling."
+issues: [3939]
+subtext: |
+  Startup now rejects identity and checkpoint bounds using the reviewed checked formulas and reports reader, framer, batch, carry-over, regex, and measurement-required terms. Exact RSS and metric contracts remain provisional.

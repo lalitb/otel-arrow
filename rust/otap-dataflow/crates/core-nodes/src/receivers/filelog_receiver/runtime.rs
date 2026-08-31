@@ -176,7 +176,40 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
         if let Some(metrics) = metrics.as_mut() {
             add_counter_saturating(&mut metrics.starts, 1);
         }
-        otel_info!("filelog_receiver.start");
+        let admission = &config.resource_admission;
+        otel_info!(
+            "filelog_receiver.start",
+            resource_candidate_identity_bytes = admission.candidate_identity_state.bytes,
+            resource_candidate_identity_ceiling_bytes = admission
+                .candidate_identity_state
+                .named_provisional_ceiling_bytes
+                .unwrap_or(0),
+            resource_reader_bytes = admission.reader_state.bytes,
+            resource_framer_per_reader_bytes = admission.framer_payload_per_reader.bytes,
+            resource_framer_bytes = admission.framer_payload.bytes,
+            resource_retained_batch_bytes = admission.retained_batch.bytes,
+            resource_carry_over_bytes = admission.carry_over.bytes,
+            resource_checkpoint_snapshot_bytes = admission.checkpoint_limits.max_snapshot_bytes,
+            resource_checkpoint_wal_bytes = admission.checkpoint_limits.max_wal_bytes,
+            resource_checkpoint_snapshot_phase_bytes = admission
+                .checkpoint_limits
+                .max_snapshot_recovery_working_bytes,
+            resource_checkpoint_wal_phase_bytes =
+                admission.checkpoint_limits.max_wal_recovery_working_bytes,
+            resource_checkpoint_recovery_bytes = admission.checkpoint_recovery.bytes,
+            resource_checkpoint_recovery_ceiling_bytes = admission
+                .checkpoint_recovery
+                .named_provisional_ceiling_bytes
+                .unwrap_or(0),
+            resource_regex_program_cache_bytes = admission.regex_program_cache.bytes,
+            resource_recovery_numeric_subtotal_bytes = admission.numeric_recovery_subtotal_bytes,
+            resource_runtime_numeric_subtotal_bytes = admission.numeric_runtime_subtotal_bytes,
+            resource_numeric_peak_subtotal_bytes = admission.numeric_peak_subtotal_bytes,
+            resource_unmeasured_term_count = admission.unmeasured_terms().len() as u64,
+            resource_unmeasured_terms = admission.unmeasured_terms_text(),
+            resource_complete_rss_ceiling_claimed =
+                admission.complete_rss_ceiling_bytes().is_some()
+        );
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
         let mut health_events = HealthEventLimiter::default();

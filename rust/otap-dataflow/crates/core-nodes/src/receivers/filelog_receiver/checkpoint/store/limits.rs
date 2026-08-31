@@ -34,6 +34,7 @@ use super::super::primitives::{
 };
 use super::super::snapshot::{SNAPSHOT_FOOTER_LEN, SNAPSHOT_HEADER_LEN};
 use super::super::wal::WAL_HEADER_LEN;
+use std::fmt;
 
 /// Practical ceiling on the worst case of any single durable checkpoint
 /// artifact: one snapshot, or one WAL.
@@ -73,6 +74,56 @@ const RECOVERY_REMEDY: &str = "reduce limits.max_tracked_files, \
                                checkpoint.compact_after_bytes, or \
                                checkpoint.compact_after_transactions, or \
                                identity.fingerprint_bytes";
+
+/// Configuration values that jointly determine durable artifact and recovery
+/// bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LimitInputs {
+    /// Configured WAL byte threshold.
+    pub compact_after_bytes: u64,
+    /// Configured WAL transaction threshold.
+    pub compact_after_transactions: u32,
+    /// Configured durable identity population.
+    pub max_tracked_files: u32,
+    /// Configured identity fingerprint width.
+    pub fingerprint_bytes: u64,
+}
+
+impl fmt::Display for LimitInputs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "configured values: checkpoint.compact_after_bytes={}, \
+             checkpoint.compact_after_transactions={}, limits.max_tracked_files={}, \
+             identity.fingerprint_bytes={}",
+            self.compact_after_bytes,
+            self.compact_after_transactions,
+            self.max_tracked_files,
+            self.fingerprint_bytes
+        )
+    }
+}
+
+/// Recovery phase whose modeled working set binds a limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryPhase {
+    /// Raw snapshot plus the recovered table under construction.
+    Snapshot,
+    /// Recovered table plus raw WAL and one decoded transaction.
+    Wal,
+    /// Both phase formulas produce the same over-limit value.
+    SnapshotAndWal,
+}
+
+impl fmt::Display for RecoveryPhase {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Snapshot => "snapshot",
+            Self::Wal => "WAL",
+            Self::SnapshotAndWal => "snapshot and WAL",
+        })
+    }
+}
 
 /// `record_len` + `record_crc32c` around a snapshot record payload, and
 /// `op_len` + `op_crc32c` around a WAL operation payload.
@@ -220,7 +271,7 @@ const REMOVE_FILE_BYTES: u64 = OPERATION_HEADER_BYTES
 /// These variants are configuration errors, not runtime failures: they are
 /// reported by config validation before a namespace is ever opened, and by
 /// [`super::CheckpointStore::open`] for options built by hand.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LimitsError {
     /// The worst case is not representable in `u64`.
     #[error("the worst-case {artifact} size for this configuration overflows u64; {remedy}")]
@@ -235,7 +286,7 @@ pub enum LimitsError {
     #[error(
         "the worst-case {artifact} size for this configuration is {computed} bytes, exceeding \
          the {ceiling}-byte maximum a checkpoint artifact may reach and still be recovered; \
-         {remedy}"
+         {remedy}; {inputs}"
     )]
     ExceedsCeiling {
         /// Which artifact's bound is too large.
@@ -246,20 +297,26 @@ pub enum LimitsError {
         ceiling: u64,
         /// The configuration knob to reduce.
         remedy: &'static str,
+        /// Exact configuration values used by the failed formula.
+        inputs: Box<LimitInputs>,
     },
     /// The conservative combined recovery working set is larger than the
     /// fixed startup-memory ceiling.
     #[error(
-        "the worst-case checkpoint recovery working set for this configuration is {computed} \
-         bytes, exceeding the {ceiling}-byte maximum; {remedy}"
+        "the worst-case checkpoint recovery {phase} phase for this configuration is {computed} \
+         bytes, exceeding the {ceiling}-byte maximum; {remedy}; {inputs}"
     )]
     RecoveryExceedsCeiling {
+        /// Recovery phase whose formula exceeded the ceiling.
+        phase: RecoveryPhase,
         /// Conservative logical working-set estimate.
         computed: u64,
         /// Ceiling the estimate exceeded.
         ceiling: u64,
         /// Configuration knobs that reduce the estimate.
         remedy: &'static str,
+        /// Exact configuration values used by the failed formula.
+        inputs: Box<LimitInputs>,
     },
     /// The configured fingerprint window is wider than the format's
     /// `u16`-length-prefixed `fingerprint` field, so it could never be
@@ -313,6 +370,10 @@ pub struct StoreLimits {
     pub max_snapshot_record_bytes: u64,
     /// Conservative maximum logical working set during recovery.
     pub max_recovery_working_bytes: u64,
+    /// Conservative snapshot-phase recovery working set.
+    pub max_snapshot_recovery_working_bytes: u64,
+    /// Conservative WAL-phase recovery working set.
+    pub max_wal_recovery_working_bytes: u64,
 }
 
 impl StoreLimits {
@@ -333,21 +394,49 @@ impl StoreLimits {
             });
         }
         validate_compaction_thresholds(compact_after_bytes, compact_after_transactions)?;
+        let inputs = LimitInputs {
+            compact_after_bytes,
+            compact_after_transactions,
+            max_tracked_files,
+            fingerprint_bytes,
+        };
         let max_snapshot_record_bytes = snapshot_record_bytes(fingerprint_bytes)?;
         let max_snapshot_bytes = snapshot_bytes(max_tracked_files, fingerprint_bytes)?;
         let max_transaction_bytes = WAL_MAX_TX_FRAME_BYTES;
         let max_wal_bytes = wal_bytes(compact_after_bytes, compact_after_transactions)?;
         let max_wal_transactions =
             wal_transactions(compact_after_bytes, compact_after_transactions)?;
-        within_ceiling(SNAPSHOT_ARTIFACT, max_snapshot_bytes, SNAPSHOT_REMEDY)?;
-        within_ceiling(WAL_ARTIFACT, max_wal_bytes, WAL_REMEDY)?;
-        let max_recovery_working_bytes =
-            recovery_working_bytes(max_snapshot_bytes, max_wal_bytes, max_transaction_bytes)?;
-        if max_recovery_working_bytes > RECOVERY_WORKING_BYTES_CEILING {
+        within_ceiling(
+            SNAPSHOT_ARTIFACT,
+            max_snapshot_bytes,
+            SNAPSHOT_REMEDY,
+            inputs,
+        )?;
+        within_ceiling(WAL_ARTIFACT, max_wal_bytes, WAL_REMEDY, inputs)?;
+        let recovery =
+            recovery_working_set(max_snapshot_bytes, max_wal_bytes, max_transaction_bytes)?;
+        let exceeded = match (
+            recovery.snapshot_phase_bytes > RECOVERY_WORKING_BYTES_CEILING,
+            recovery.wal_phase_bytes > RECOVERY_WORKING_BYTES_CEILING,
+        ) {
+            (false, false) => None,
+            (true, false) => Some((RecoveryPhase::Snapshot, recovery.snapshot_phase_bytes)),
+            (false, true) => Some((RecoveryPhase::Wal, recovery.wal_phase_bytes)),
+            (true, true) if recovery.snapshot_phase_bytes == recovery.wal_phase_bytes => {
+                Some((RecoveryPhase::SnapshotAndWal, recovery.snapshot_phase_bytes))
+            }
+            (true, true) if recovery.snapshot_phase_bytes > recovery.wal_phase_bytes => {
+                Some((RecoveryPhase::Snapshot, recovery.snapshot_phase_bytes))
+            }
+            (true, true) => Some((RecoveryPhase::Wal, recovery.wal_phase_bytes)),
+        };
+        if let Some((phase, computed)) = exceeded {
             return Err(LimitsError::RecoveryExceedsCeiling {
-                computed: max_recovery_working_bytes,
+                phase,
+                computed,
                 ceiling: RECOVERY_WORKING_BYTES_CEILING,
                 remedy: RECOVERY_REMEDY,
+                inputs: Box::new(inputs),
             });
         }
         Ok(Self {
@@ -356,9 +445,22 @@ impl StoreLimits {
             max_wal_transactions,
             max_transaction_bytes,
             max_snapshot_record_bytes,
-            max_recovery_working_bytes,
+            max_recovery_working_bytes: recovery.peak_bytes,
+            max_snapshot_recovery_working_bytes: recovery.snapshot_phase_bytes,
+            max_wal_recovery_working_bytes: recovery.wal_phase_bytes,
         })
     }
+}
+
+/// Both sequential checkpoint-recovery phase bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryWorkingSet {
+    /// Raw snapshot plus decoded records and the recovered table.
+    pub snapshot_phase_bytes: u64,
+    /// Recovered table plus raw WAL and one decoded transaction.
+    pub wal_phase_bytes: u64,
+    /// Larger of the two sequential phases.
+    pub peak_bytes: u64,
 }
 
 /// Conservative logical working-set bound for recovery.
@@ -367,11 +469,11 @@ impl StoreLimits {
 /// the table under construction. WAL replay drops the snapshot buffer first
 /// and retains only the recovered table, the raw WAL, one decoded
 /// transaction, and that transaction's touched-record scratch map.
-pub fn recovery_working_bytes(
+pub fn recovery_working_set(
     max_snapshot_bytes: u64,
     max_wal_bytes: u64,
     max_transaction_bytes: u64,
-) -> Result<u64, LimitsError> {
+) -> Result<RecoveryWorkingSet, LimitsError> {
     let snapshot_phase = max_snapshot_bytes
         .checked_mul(RECOVERED_TABLE_MULTIPLIER + 1)
         .ok_or(LimitsError::Overflow {
@@ -395,7 +497,20 @@ pub fn recovery_working_bytes(
         RECOVERY_REMEDY,
         &[recovered_table, max_wal_bytes, decoded_transaction],
     )?;
-    Ok(snapshot_phase.max(wal_phase))
+    Ok(RecoveryWorkingSet {
+        snapshot_phase_bytes: snapshot_phase,
+        wal_phase_bytes: wal_phase,
+        peak_bytes: snapshot_phase.max(wal_phase),
+    })
+}
+
+/// Larger of the two sequential checkpoint-recovery phase bounds.
+pub fn recovery_working_bytes(
+    max_snapshot_bytes: u64,
+    max_wal_bytes: u64,
+    max_transaction_bytes: u64,
+) -> Result<u64, LimitsError> {
+    Ok(recovery_working_set(max_snapshot_bytes, max_wal_bytes, max_transaction_bytes)?.peak_bytes)
 }
 
 /// The largest complete snapshot record frame, including its length prefix
@@ -602,6 +717,7 @@ fn within_ceiling(
     artifact: &'static str,
     computed: u64,
     remedy: &'static str,
+    inputs: LimitInputs,
 ) -> Result<(), LimitsError> {
     if computed > ARTIFACT_BYTES_CEILING {
         return Err(LimitsError::ExceedsCeiling {
@@ -609,6 +725,7 @@ fn within_ceiling(
             computed,
             ceiling: ARTIFACT_BYTES_CEILING,
             remedy,
+            inputs: Box::new(inputs),
         });
     }
     Ok(())
@@ -927,10 +1044,12 @@ mod tests {
     /// their sum, and no intermediate term can wrap into an accepted value.
     #[test]
     fn recovery_working_set_formula_is_phase_aware_and_checked() {
-        assert_eq!(
-            recovery_working_bytes(10, 20, 5).expect("small bounds are representable"),
-            70
-        );
+        let working =
+            recovery_working_set(10, 20, 5).expect("small recovery bounds are representable");
+        assert_eq!(working.snapshot_phase_bytes, 40);
+        assert_eq!(working.wal_phase_bytes, 70);
+        assert_eq!(working.peak_bytes, 70);
+        assert_eq!(recovery_working_bytes(10, 20, 5).unwrap(), 70);
         assert!(matches!(
             recovery_working_bytes(u64::MAX, 0, 0),
             Err(LimitsError::Overflow {
@@ -944,6 +1063,111 @@ mod tests {
                 artifact: "checkpoint recovery working set",
                 ..
             })
+        ));
+    }
+
+    /// Scenario: snapshot-heavy and WAL-heavy legal artifact configurations
+    /// independently exceed the combined recovery ceiling.
+    /// Guarantees: each rejection identifies the binding recovery phase,
+    /// computed value, ceiling, all contributing configuration values, and
+    /// actionable knobs without changing the artifact limits themselves.
+    #[test]
+    fn recovery_ceiling_errors_identify_phase_and_inputs() {
+        let snapshot_error =
+            StoreLimits::derive(minimum_compact_after_bytes().unwrap(), 1, 100_000, 1_000)
+                .unwrap_err();
+        let snapshot_text = snapshot_error.to_string();
+        match &snapshot_error {
+            LimitsError::RecoveryExceedsCeiling {
+                phase,
+                computed,
+                ceiling,
+                inputs,
+                ..
+            } => {
+                assert_eq!(*phase, RecoveryPhase::Snapshot);
+                assert!(computed > ceiling);
+                assert_eq!(*ceiling, RECOVERY_WORKING_BYTES_CEILING);
+                assert_eq!(inputs.compact_after_transactions, 1);
+                assert_eq!(inputs.max_tracked_files, 100_000);
+                assert_eq!(inputs.fingerprint_bytes, 1_000);
+            }
+            other => panic!("expected snapshot recovery rejection, got {other:?}"),
+        }
+        assert!(snapshot_text.contains("snapshot phase"), "{snapshot_text}");
+        assert!(
+            snapshot_text.contains("checkpoint.compact_after_transactions=1"),
+            "{snapshot_text}"
+        );
+        assert!(
+            snapshot_text.contains("limits.max_tracked_files=100000"),
+            "{snapshot_text}"
+        );
+
+        let wal_error = StoreLimits::derive(ARTIFACT_BYTES_CEILING, u32::MAX, 1, 16).unwrap_err();
+        let wal_text = wal_error.to_string();
+        match &wal_error {
+            LimitsError::RecoveryExceedsCeiling {
+                phase,
+                computed,
+                ceiling,
+                inputs,
+                ..
+            } => {
+                assert_eq!(*phase, RecoveryPhase::Wal);
+                assert!(computed > ceiling);
+                assert_eq!(*ceiling, RECOVERY_WORKING_BYTES_CEILING);
+                assert_eq!(inputs.compact_after_bytes, ARTIFACT_BYTES_CEILING);
+                assert_eq!(inputs.compact_after_transactions, u32::MAX);
+                assert_eq!(inputs.max_tracked_files, 1);
+                assert_eq!(inputs.fingerprint_bytes, 16);
+            }
+            other => panic!("expected WAL recovery rejection, got {other:?}"),
+        }
+        assert!(wal_text.contains("WAL phase"), "{wal_text}");
+        assert!(
+            wal_text.contains(&format!(
+                "checkpoint.compact_after_bytes={ARTIFACT_BYTES_CEILING}"
+            )),
+            "{wal_text}"
+        );
+        assert!(
+            wal_text.contains(&format!(
+                "checkpoint.compact_after_transactions={}",
+                u32::MAX
+            )),
+            "{wal_text}"
+        );
+    }
+
+    /// Scenario: a durable artifact estimate is exactly equal to its named
+    /// one-GiB ceiling and then exceeds it by one byte.
+    /// Guarantees: equality is admitted and only strict exceedance is
+    /// rejected with the exact formula inputs.
+    #[test]
+    fn artifact_ceiling_accepts_equality_and_rejects_next_byte() {
+        let inputs = LimitInputs {
+            compact_after_bytes: ARTIFACT_BYTES_CEILING,
+            compact_after_transactions: 1,
+            max_tracked_files: 1,
+            fingerprint_bytes: 16,
+        };
+        assert!(within_ceiling(WAL_ARTIFACT, ARTIFACT_BYTES_CEILING, WAL_REMEDY, inputs).is_ok());
+        assert!(matches!(
+            within_ceiling(
+                WAL_ARTIFACT,
+                ARTIFACT_BYTES_CEILING + 1,
+                WAL_REMEDY,
+                inputs
+            ),
+            Err(LimitsError::ExceedsCeiling {
+                computed,
+                ceiling,
+                inputs: actual_inputs,
+                ..
+            }) if computed == ARTIFACT_BYTES_CEILING + 1
+                && ceiling == ARTIFACT_BYTES_CEILING
+                && *actual_inputs == inputs
         ));
     }
 
@@ -961,6 +1185,12 @@ mod tests {
         assert!(defaults.max_snapshot_bytes <= ARTIFACT_BYTES_CEILING);
         assert!(defaults.max_wal_bytes <= ARTIFACT_BYTES_CEILING);
         assert!(defaults.max_recovery_working_bytes <= RECOVERY_WORKING_BYTES_CEILING);
+        assert_eq!(
+            defaults.max_recovery_working_bytes,
+            defaults
+                .max_snapshot_recovery_working_bytes
+                .max(defaults.max_wal_recovery_working_bytes)
+        );
         assert_eq!(defaults.max_transaction_bytes, WAL_MAX_TX_FRAME_BYTES);
         assert_eq!(defaults.max_wal_bytes, 64 * 1024 * 1024);
         assert_eq!(defaults.max_wal_transactions, 10_000);
