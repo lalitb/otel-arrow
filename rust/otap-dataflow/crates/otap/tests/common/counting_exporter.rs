@@ -99,11 +99,11 @@ impl Exporter<OtapPdata> for CountingExporter {
                 }
                 Message::PData(data) => {
                     let items = data.num_items() as u64;
-                    // Count items before ACKing
+                    // Publish the counter only after the Ack was accepted.
+                    effect_handler.notify_ack(AckMsg::new(data)).await?;
                     if let Some(ref counter) = self.counter {
                         let _ = counter.fetch_add(items, Ordering::Relaxed);
                     }
-                    effect_handler.notify_ack(AckMsg::new(data)).await?;
                 }
                 _ => {}
             }
