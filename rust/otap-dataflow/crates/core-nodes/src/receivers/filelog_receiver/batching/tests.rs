@@ -714,6 +714,43 @@ fn record_count_bound_accepts_exact_and_refuses_above() {
     );
 }
 
+/// Scenario: a same-file record is refused after the preceding record fills
+/// the current batch.
+/// Guarantees: refusal preserves the exact record, and explicit carry-over
+/// rebasing replaces only its durable base with the predecessor's resulting
+/// offset, resume, timestamp, and real frontier guard.
+#[test]
+fn same_file_carry_over_rebases_to_predecessor_frontier() {
+    let now = Instant::now();
+    let mut batch = batch_with_settings(settings(1, 1 << 20, Duration::from_secs(1)));
+    let _ = append(&mut batch, input(132, 0, 1, 0, now));
+    let refused = input(132, 1, 2, 0, now);
+    let expected = refused.clone();
+    let returned = match batch.try_append(refused).unwrap() {
+        BatchAppendOutcome::SealBefore {
+            record,
+            reason: SealReason::RecordCount,
+        } => record,
+        other => panic!("expected record-count refusal, got {other:?}"),
+    };
+    assert_eq!(returned, expected);
+
+    let rebased = batch.rebase_for_carry_over(returned).unwrap();
+    assert_eq!(rebased.framed, expected.framed);
+    assert_eq!(rebased.matched_path, expected.matched_path);
+    assert_eq!(rebased.resolved_path, expected.resolved_path);
+    assert_eq!(
+        rebased.progress_base,
+        ProgressBase {
+            file_epoch: 1,
+            committed_offset: 1,
+            framing_resume: FramingResume::Clean,
+            last_seen_time_unix_nano: 100,
+            committed_frontier_guard: test_guard(1),
+        }
+    );
+}
+
 fn one_record_logical_size(record: RecordInput) -> u64 {
     let mut probe = batch_with_settings(settings(10, 1 << 20, Duration::from_secs(1)));
     let _ = append(&mut probe, record);
@@ -1218,10 +1255,12 @@ fn zero_delta_finalize_exposes_no_window_to_install() {
 }
 
 /// Scenario: rotation finalization targets a file with an existing batch
-/// delta and a file with no record in the batch.
+/// delta and a file with no record in the batch, including a non-clean
+/// recordless frontier.
 /// Guarantees: matching existing progress merges finalization and rejects
-/// later appends; absent progress returns a direct same-frontier operation
-/// without making an empty OTAP batch.
+/// later appends; non-clean finalization fails before operation construction;
+/// clean absent progress returns a direct same-frontier operation without
+/// making an empty OTAP batch.
 #[test]
 fn recordless_finalization_merges_or_returns_direct_delta() {
     let now = Instant::now();
@@ -1248,8 +1287,8 @@ fn recordless_finalization_merges_or_returns_direct_delta() {
         Err(BatchError::InvalidProgress { .. })
     ));
 
-    let direct = batch
-        .finalize_file(
+    assert!(matches!(
+        batch.finalize_file(
             file_id(45),
             ProgressFrontier {
                 file_epoch: 7,
@@ -1259,6 +1298,19 @@ fn recordless_finalization_merges_or_returns_direct_delta() {
                     record_end_offset: 0,
                     next_fragment_index: 3,
                 },
+            },
+            300,
+        ),
+        Err(BatchError::InvalidProgress { .. })
+    ));
+
+    let direct = batch
+        .finalize_file(
+            file_id(45),
+            ProgressFrontier {
+                file_epoch: 7,
+                offset: 99,
+                framing_resume: FramingResume::Clean,
             },
             300,
         )
@@ -1273,11 +1325,7 @@ fn recordless_finalization_merges_or_returns_direct_delta() {
         .to_update_progress(ProgressBase {
             file_epoch: 7,
             committed_offset: 99,
-            framing_resume: FramingResume::Continuation {
-                record_start_offset: 90,
-                record_end_offset: 0,
-                next_fragment_index: 3,
-            },
+            framing_resume: FramingResume::Clean,
             last_seen_time_unix_nano: 350,
             committed_frontier_guard: test_guard(99),
         })

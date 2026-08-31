@@ -4338,13 +4338,13 @@ fn forced_shutdown_after_blocked_poll_suppresses_decode_quarantine() {
     assert!(record.quarantine_evidence.is_none());
 }
 
-/// Scenario: two files have satisfied idle deadlines at drain start while
-/// `batch.max_records` permits only one record in the retained batch.
-/// Guarantees: the first eligible record remains Ack-gated, while replay does
-/// not rearm the second file's already-consumed idle deadline or fabricate a
-/// second drain flush; its bytes remain uncommitted for restart/carry-over.
+/// Scenario: two files have satisfied idle deadlines at drain start and the
+/// second becomes ready after the first record's one-nanosecond batch deadline.
+/// Guarantees: the second exact framed record becomes the sole carry-over,
+/// emits after the predecessor Ack without rearming its consumed deadline,
+/// and both file frontiers become durable before drain completes.
 #[test]
-fn drain_does_not_rearm_idle_deadline_after_batch_replay() {
+fn drain_emits_exact_carry_over_across_multiple_batches() {
     let directory = tempdir().unwrap();
     std::fs::write(directory.path().join("a.log"), b"partial-a").unwrap();
     std::fs::write(directory.path().join("b.log"), b"partial-b").unwrap();
@@ -4352,9 +4352,10 @@ fn drain_does_not_rearm_idle_deadline_after_batch_replay() {
     let mut runtime_config = runtime_config(
         pattern.to_str().unwrap(),
         &directory.path().join("checkpoint"),
-        1,
+        2,
     );
     runtime_config.framing.force_flush_period = Duration::from_millis(10);
+    runtime_config.batch.max_flush_period = Duration::from_nanos(1);
     let mut runtime = WorkerRuntime::new(runtime_config).unwrap();
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
     let (_command_tx, command_rx) = sync_channel(4);
@@ -4435,44 +4436,90 @@ fn drain_does_not_rearm_idle_deadline_after_batch_replay() {
         runtime.drive_drain(&event_tx, &command_rx).unwrap(),
         LoopControl::Continue
     );
-    let first = match event_rx.try_recv().unwrap() {
+    let mut first = match event_rx.try_recv().unwrap() {
         WorkerEvent::Batch(batch) => batch,
         other => panic!("expected first drain batch, got {other:?}"),
     };
     assert_eq!(first.record_count, 1);
-    assert!(
-        runtime
-            .commit_retained(first.batch_id, first.attempt)
-            .unwrap()
-    );
-
+    let first_request = decode_worker_records(&mut first.records);
+    let first_body = log_body_bytes(only_log(&first_request)).to_vec();
+    assert!(runtime.carry_over.is_some());
     assert_eq!(
-        runtime.drive_drain(&event_tx, &command_rx).unwrap(),
+        runtime
+            .telemetry
+            .counter_for_test(WorkerCounter::CarryOverRecords),
+        1
+    );
+    assert_eq!(
+        runtime
+            .handle_command(
+                WorkerCommand::Commit {
+                    batch_id: first.batch_id,
+                    attempt: first.attempt,
+                    explicit_loss: false,
+                },
+                &event_tx,
+                &command_rx,
+            )
+            .unwrap(),
+        LoopControl::Continue
+    );
+    assert!(matches!(
+        event_rx.try_recv().unwrap(),
+        WorkerEvent::CommitResult { result: Ok(()), .. }
+    ));
+    let mut second = match event_rx.try_recv().unwrap() {
+        WorkerEvent::Batch(batch) => batch,
+        other => panic!("expected carry-over drain batch, got {other:?}"),
+    };
+    assert_eq!(second.record_count, 1);
+    let second_request = decode_worker_records(&mut second.records);
+    let second_body = log_body_bytes(only_log(&second_request)).to_vec();
+    assert_ne!(first_body, second_body);
+    assert!([b"partial-a".as_slice(), b"partial-b".as_slice()].contains(&first_body.as_slice()));
+    assert!([b"partial-a".as_slice(), b"partial-b".as_slice()].contains(&second_body.as_slice()));
+    assert!(runtime.carry_over.is_none());
+    assert_eq!(
+        runtime
+            .handle_command(
+                WorkerCommand::Commit {
+                    batch_id: second.batch_id,
+                    attempt: second.attempt,
+                    explicit_loss: false,
+                },
+                &event_tx,
+                &command_rx,
+            )
+            .unwrap(),
         LoopControl::Shutdown
     );
-    assert!(runtime.drain_complete);
+    assert!(matches!(
+        event_rx.try_recv().unwrap(),
+        WorkerEvent::CommitResult { result: Ok(()), .. }
+    ));
     assert!(matches!(
         event_rx.try_recv(),
         Err(tokio::sync::mpsc::error::TryRecvError::Empty)
     ));
+    assert!(runtime.drain_complete);
     let committed: Vec<u64> = runtime
         .store
         .table()
         .iter()
         .map(|(_, record)| record.committed_offset)
         .collect();
-    assert_eq!(committed.iter().filter(|offset| **offset == 9).count(), 1);
-    assert_eq!(committed.iter().filter(|offset| **offset == 0).count(), 1);
+    assert_eq!(committed.iter().filter(|offset| **offset == 9).count(), 2);
     runtime.shutdown_resources().unwrap();
 }
 
 /// Scenario: one read turn contains two queued newline records, and the
-/// second becomes ready exactly at the first record's batch deadline.
-/// Guarantees: `SealBefore` drops the refused record and its reservation,
-/// rewinds the reader to the accepted checkpoint, then rereads and commits
-/// the second record only after the first batch is Acked.
+/// second becomes ready exactly at the first record's batch deadline; the
+/// source is then rewritten while the first batch is retried.
+/// Guarantees: `SealBefore` retains exactly one projected carry-over, retry
+/// does not release it, and the next batch emits the original `two` bytes
+/// without rereading or substituting the rewritten `BAD` bytes.
 #[test]
-fn seal_before_discards_and_rereads_queued_turn_output() {
+fn seal_before_preserves_exact_carry_over_across_retry_and_source_rewrite() {
     let directory = tempdir().unwrap();
     let source = directory.path().join("seal-before.log");
     std::fs::write(&source, b"one\ntwo\n").unwrap();
@@ -4531,48 +4578,107 @@ fn seal_before_discards_and_rereads_queued_turn_output() {
             .unwrap(),
         LoopControl::Continue
     );
-    let first = match event_rx.try_recv().unwrap() {
+    let mut first = match event_rx.try_recv().unwrap() {
         WorkerEvent::Batch(batch) => batch,
         other => panic!("expected first sealed batch, got {other:?}"),
     };
     assert_eq!(first.record_count, 1);
+    let first_request = decode_worker_records(&mut first.records);
+    assert_eq!(log_body_bytes(only_log(&first_request)), b"one");
     let frontier = runtime.readers_ref().unwrap().frontiers().next().unwrap();
-    assert_eq!((frontier.committed_offset, frontier.read_offset), (0, 4));
-    assert!(
-        runtime
-            .commit_retained(first.batch_id, first.attempt)
-            .unwrap()
-    );
-
-    let replay = match runtime.readers_mut().unwrap().poll(Instant::now()).unwrap() {
-        ReaderPoll::Data(turn) => turn,
-        other => panic!("expected refused record replay, got {other:?}"),
-    };
-    assert_eq!(replay.source_offset(), 4);
-    assert_eq!(replay.bytes(), b"two\n");
-    let replay_ready = Instant::now();
+    assert_eq!((frontier.committed_offset, frontier.read_offset), (0, 8));
+    assert!(runtime.carry_over.is_some());
     assert_eq!(
         runtime
-            .process_turn_with_clock(replay, replay_ready, &event_tx, &command_rx, &mut || {
-                replay_ready
-            },)
+            .telemetry
+            .counter_for_test(WorkerCounter::CarryOverRecords),
+        1
+    );
+
+    std::fs::write(&source, b"one\nBAD\n").unwrap();
+    assert_eq!(
+        runtime
+            .handle_command(
+                WorkerCommand::Resend {
+                    batch_id: first.batch_id,
+                    next_attempt: 2,
+                },
+                &event_tx,
+                &command_rx,
+            )
             .unwrap(),
         LoopControl::Continue
     );
+    let mut resent = match event_rx.try_recv().unwrap() {
+        WorkerEvent::Batch(batch) => batch,
+        other => panic!("expected predecessor retry, got {other:?}"),
+    };
+    assert_eq!((resent.batch_id, resent.attempt), (first.batch_id, 2));
+    let resent_request = decode_worker_records(&mut resent.records);
+    assert_eq!(log_body_bytes(only_log(&resent_request)), b"one");
+    assert!(runtime.carry_over.is_some());
+
     assert_eq!(
-        runtime.seal_open_batch(&event_tx, &command_rx).unwrap(),
+        runtime
+            .handle_command(
+                WorkerCommand::Commit {
+                    batch_id: first.batch_id,
+                    attempt: 2,
+                    explicit_loss: false,
+                },
+                &event_tx,
+                &command_rx,
+            )
+            .unwrap(),
         LoopControl::Continue
     );
-    let second = match event_rx.try_recv().unwrap() {
+    assert!(matches!(
+        event_rx.try_recv().unwrap(),
+        WorkerEvent::CommitResult {
+            batch_id,
+            attempt: 2,
+            result: Ok(()),
+            ..
+        } if batch_id == first.batch_id
+    ));
+    assert!(runtime.carry_over.is_none());
+    let frontier = runtime.readers_ref().unwrap().frontiers().next().unwrap();
+    assert_eq!((frontier.committed_offset, frontier.read_offset), (4, 8));
+    let mut second = match event_rx.try_recv().unwrap() {
         WorkerEvent::Batch(batch) => batch,
-        other => panic!("expected replay batch, got {other:?}"),
+        other => panic!("expected seeded carry-over batch, got {other:?}"),
     };
     assert_eq!(second.record_count, 1);
-    assert!(
+    let second_request = decode_worker_records(&mut second.records);
+    assert_eq!(log_body_bytes(only_log(&second_request)), b"two");
+
+    assert_eq!(
         runtime
-            .commit_retained(second.batch_id, second.attempt)
-            .unwrap()
+            .handle_command(
+                WorkerCommand::Commit {
+                    batch_id: second.batch_id,
+                    attempt: second.attempt,
+                    explicit_loss: false,
+                },
+                &event_tx,
+                &command_rx,
+            )
+            .unwrap(),
+        LoopControl::Continue
     );
+    assert!(matches!(
+        event_rx.try_recv().unwrap(),
+        WorkerEvent::CommitResult {
+            batch_id,
+            attempt: 1,
+            result: Ok(()),
+            ..
+        } if batch_id == second.batch_id
+    ));
+    assert!(matches!(
+        event_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
     assert_eq!(
         runtime
             .store
@@ -4585,4 +4691,90 @@ fn seal_before_discards_and_rereads_queued_turn_output() {
         8
     );
     runtime.shutdown_resources().unwrap();
+}
+
+/// Scenario: direct shutdown arrives after a deadline-refused record became
+/// the sole carry-over while its predecessor batch remains unacknowledged.
+/// Guarantees: shutdown releases the carry-over only from memory and advances
+/// neither the predecessor nor carry-over source progress.
+#[test]
+fn direct_shutdown_releases_carry_over_without_progress() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("carry-shutdown.log");
+    std::fs::write(&source, b"one\ntwo\n").unwrap();
+    let mut config = runtime_config(
+        source.to_str().unwrap(),
+        &directory.path().join("checkpoint"),
+        10,
+    );
+    config.batch.max_flush_period = Duration::from_millis(10);
+    let mut runtime = WorkerRuntime::new(config.clone()).unwrap();
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+    let (_command_tx, command_rx) = sync_channel(4);
+    let deadline = Instant::now() + Duration::from_secs(5);
+
+    let turn = loop {
+        assert_eq!(
+            runtime
+                .process_discovery_message(&event_tx, &command_rx)
+                .unwrap(),
+            LoopControl::Continue
+        );
+        match runtime.readers_mut().unwrap().poll(Instant::now()).unwrap() {
+            ReaderPoll::Data(turn) => break turn,
+            ReaderPoll::Idle { .. } | ReaderPoll::DescriptorCapacityBlocked { .. } => {
+                std::thread::yield_now()
+            }
+            other => panic!("unexpected reader state before turn: {other:?}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker did not produce a read turn"
+        );
+    };
+    let first_ready = Instant::now();
+    let mut clock_calls = 0usize;
+    assert_eq!(
+        runtime
+            .process_turn_with_clock(turn, first_ready, &event_tx, &command_rx, &mut || {
+                clock_calls += 1;
+                if clock_calls == 1 {
+                    first_ready
+                } else {
+                    first_ready + Duration::from_millis(10)
+                }
+            },)
+            .unwrap(),
+        LoopControl::Continue
+    );
+    assert!(matches!(
+        event_rx.try_recv().unwrap(),
+        WorkerEvent::Batch(WorkerBatch {
+            record_count: 1,
+            ..
+        })
+    ));
+    assert!(runtime.carry_over.is_some());
+    assert_eq!(
+        runtime
+            .handle_command(WorkerCommand::Shutdown, &event_tx, &command_rx)
+            .unwrap(),
+        LoopControl::Shutdown
+    );
+    assert_eq!(
+        runtime
+            .store
+            .table()
+            .iter()
+            .next()
+            .unwrap()
+            .1
+            .committed_offset,
+        0
+    );
+    runtime.shutdown_resources().unwrap();
+    drop(runtime);
+
+    let store = CheckpointStore::open(StoreOptions::from_runtime_config(&config)).unwrap();
+    assert_eq!(store.table().iter().next().unwrap().1.committed_offset, 0);
 }

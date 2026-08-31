@@ -270,12 +270,6 @@ enum AppendControl {
     SealAfter,
 }
 
-impl AppendControl {
-    const fn requires_seal(self) -> bool {
-        !matches!(self, Self::Continue)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FramerBase {
     file_epoch: u32,
@@ -287,6 +281,21 @@ struct ActiveFramer {
     framer: Framer,
     base: FramerBase,
     pending_bytes: u64,
+}
+
+struct PendingCarryOver {
+    file_id: FileId,
+    batch: OpenBatch,
+}
+
+struct CarryOverPostFrame {
+    file_id: FileId,
+    active: ActiveFramer,
+}
+
+struct CarryOver {
+    batch: OpenBatch,
+    post_frame: CarryOverPostFrame,
 }
 
 struct RetainedBatch {
@@ -467,6 +476,9 @@ struct WorkerRuntime {
     open_batch: Option<OpenBatch>,
     record_numbers: RecordNumberTable,
     retained: Option<RetainedBatch>,
+    pending_carry_over: Option<PendingCarryOver>,
+    carry_over: Option<CarryOver>,
+    seeded_carry_over_requires_seal: bool,
     pending_decode_quarantine: Option<PendingDecodeQuarantine>,
     checkpoint_commit_failed: bool,
     checkpoint_maintenance_failures: u32,
@@ -689,6 +701,9 @@ impl WorkerRuntime {
             open_batch: Some(open_batch),
             record_numbers,
             retained: None,
+            pending_carry_over: None,
+            carry_over: None,
+            seeded_carry_over_requires_seal: false,
             pending_decode_quarantine: None,
             checkpoint_commit_failed: false,
             checkpoint_maintenance_failures: 0,
@@ -1000,6 +1015,10 @@ impl WorkerRuntime {
                 }
                 if control == HandoffControl::Drain {
                     self.drain_requested = true;
+                }
+                if committed && self.seeded_carry_over_requires_seal {
+                    self.seeded_carry_over_requires_seal = false;
+                    return self.seal_open_batch(event_tx, command_rx);
                 }
                 if self.retained.is_none() && self.drain_requested {
                     return self.drive_drain(event_tx, command_rx);
@@ -2304,8 +2323,13 @@ impl WorkerRuntime {
                 self.put_framer(file_id, active)?;
                 Ok(LoopControl::Continue)
             }
-            Ok((consumed, control @ (AppendControl::SealBefore | AppendControl::SealAfter))) => {
-                debug_assert!(control.requires_seal());
+            Ok((consumed, AppendControl::SealBefore)) => {
+                self.readers_mut()?
+                    .complete_turn(turn, consumed, TurnDisposition::Paused)?;
+                self.install_carry_over(active, false)?;
+                self.seal_open_batch(event_tx, command_rx)
+            }
+            Ok((consumed, AppendControl::SealAfter)) => {
                 self.readers_mut()?
                     .complete_turn(turn, consumed, TurnDisposition::Paused)?;
                 self.seal_open_batch(event_tx, command_rx)
@@ -2517,36 +2541,50 @@ impl WorkerRuntime {
         command_rx: &Receiver<WorkerCommand>,
     ) -> Result<LoopControl, WorkerError> {
         let mut active = self.take_framer(file_id);
-        if let Some(active) = active.as_mut() {
-            if active.base.file_epoch != file_epoch
-                || active.framer.next_expected_input_offset() != source_offset
+        let mut idle_carry_over = false;
+        if let Some(active_framer) = active.as_mut() {
+            if active_framer.base.file_epoch != file_epoch
+                || active_framer.framer.next_expected_input_offset() != source_offset
             {
                 return Err(WorkerError::Inconsistent {
                     reason: "EOF state does not match its active framer",
                 });
             }
-            active.framer.observe_eof(now)?;
+            active_framer.framer.observe_eof(now)?;
             loop {
                 let ready_at = Instant::now();
-                let step = match active.framer.poll_timeout(ready_at) {
+                let step = match active_framer.framer.poll_timeout(ready_at) {
                     Ok(step) => step,
                     Err(error) => {
                         return self
                             .handle_terminal_framer_error(file_id, error, event_tx, command_rx);
                     }
                 };
-                self.observe_framer_counters(&mut active.framer);
+                self.observe_framer_counters(&mut active_framer.framer);
                 let produced = step.output.is_some();
                 if let Some(record) = step.output {
-                    let control = self.append_record(file_id, active.base, record, ready_at)?;
-                    if control.requires_seal() {
-                        return self.seal_open_batch(event_tx, command_rx);
+                    match self.append_record(file_id, active_framer.base, record, ready_at)? {
+                        AppendControl::Continue => {}
+                        AppendControl::SealBefore => {
+                            idle_carry_over = true;
+                            break;
+                        }
+                        AppendControl::SealAfter => {
+                            return self.seal_open_batch(event_tx, command_rx);
+                        }
                     }
                 }
                 if !produced {
                     break;
                 }
             }
+        }
+        if idle_carry_over {
+            let active = active.take().ok_or(WorkerError::Inconsistent {
+                reason: "idle carry-over lost its post-frame state",
+            })?;
+            self.install_carry_over(active, false)?;
+            return self.seal_open_batch(event_tx, command_rx);
         }
 
         if !self.rotation_finalization_due(file_id, now)? {
@@ -2572,23 +2610,25 @@ impl WorkerRuntime {
         }
 
         let mut terminal_pending = false;
-        if let Some(active) = active.as_mut() {
+        let mut terminal_carry_over = None;
+        if let Some(active_framer) = active.as_mut() {
             loop {
                 let ready_at = Instant::now();
-                let step = match active.framer.flush_rotation(ready_at) {
+                let step = match active_framer.framer.flush_rotation(ready_at) {
                     Ok(step) => step,
                     Err(error) => {
                         return self
                             .handle_terminal_framer_error(file_id, error, event_tx, command_rx);
                     }
                 };
-                self.observe_framer_counters(&mut active.framer);
+                self.observe_framer_counters(&mut active_framer.framer);
                 let produced = step.output.is_some();
                 if let Some(record) = step.output {
-                    match self.append_record(file_id, active.base, record, ready_at)? {
+                    match self.append_record(file_id, active_framer.base, record, ready_at)? {
                         AppendControl::Continue => {}
                         AppendControl::SealBefore => {
-                            return self.seal_open_batch(event_tx, command_rx);
+                            terminal_carry_over = Some(!step.pending);
+                            break;
                         }
                         AppendControl::SealAfter => {
                             if step.pending {
@@ -2605,6 +2645,13 @@ impl WorkerRuntime {
                     break;
                 }
             }
+        }
+        if let Some(finalize) = terminal_carry_over {
+            let active = active.take().ok_or(WorkerError::Inconsistent {
+                reason: "terminal carry-over lost its post-frame state",
+            })?;
+            self.install_carry_over(active, finalize)?;
+            return self.seal_open_batch(event_tx, command_rx);
         }
         if terminal_pending {
             let mut active = active.take().ok_or(WorkerError::Inconsistent {
@@ -2791,9 +2838,15 @@ impl WorkerRuntime {
             self.observe_framer_counters(&mut active.framer);
             let produced = step.output.is_some();
             if let Some(record) = step.output {
-                let control = self.append_record(file_id, active.base, record, ready_at)?;
-                if control.requires_seal() {
-                    return self.seal_open_batch(event_tx, command_rx).map(Some);
+                match self.append_record(file_id, active.base, record, ready_at)? {
+                    AppendControl::Continue => {}
+                    AppendControl::SealBefore => {
+                        self.install_carry_over(active, false)?;
+                        return self.seal_open_batch(event_tx, command_rx).map(Some);
+                    }
+                    AppendControl::SealAfter => {
+                        return self.seal_open_batch(event_tx, command_rx).map(Some);
+                    }
                 }
             }
             if !produced {
@@ -2883,16 +2936,117 @@ impl WorkerRuntime {
                     AppendControl::Continue
                 })
             }
-            BatchAppendOutcome::SealBefore {
-                record: _,
-                reason: _,
-            } => {
-                // The refused record and its uncommitted number reservation
-                // are deliberately discarded. Seal rewind causes its bytes
-                // to be reread after Ack.
+            BatchAppendOutcome::SealBefore { record, reason: _ } => {
+                if self.pending_carry_over.is_some() || self.carry_over.is_some() {
+                    return Err(WorkerError::Inconsistent {
+                        reason: "a second carry-over record was prepared",
+                    });
+                }
+                let record = self
+                    .open_batch
+                    .as_ref()
+                    .ok_or(WorkerError::MissingOpenBatch {
+                        operation: "rebasing one carry-over record",
+                    })?
+                    .rebase_for_carry_over(record)?;
+                let carry_file_id = record.file_id;
+                let mut carry_batch = OpenBatch::new_carry_over(&self.config)?;
+                match carry_batch.try_append(record)? {
+                    BatchAppendOutcome::Appended { .. } => {}
+                    BatchAppendOutcome::SealBefore { .. } => {
+                        return Err(WorkerError::Inconsistent {
+                            reason: "an empty carry-over batch refused its sole record",
+                        });
+                    }
+                }
+                self.observe_framed_record(framed_telemetry);
+                if let Some(reservation) = reservation {
+                    let committed = self.record_numbers.commit(reservation)?;
+                    if committed != record_number {
+                        return Err(WorkerError::Inconsistent {
+                            reason: "carry-over number commit changed the prepared projection",
+                        });
+                    }
+                }
+                self.telemetry.add(WorkerCounter::CarryOverRecords, 1);
+                self.pending_carry_over = Some(PendingCarryOver {
+                    file_id: carry_file_id,
+                    batch: carry_batch,
+                });
                 Ok(AppendControl::SealBefore)
             }
         }
+    }
+
+    fn install_carry_over(
+        &mut self,
+        mut active: ActiveFramer,
+        finalize: bool,
+    ) -> Result<(), WorkerError> {
+        if self.carry_over.is_some() || self.retained.is_some() {
+            return Err(WorkerError::Inconsistent {
+                reason: "carry-over installation overlapped retained state",
+            });
+        }
+        let mut pending = self
+            .pending_carry_over
+            .take()
+            .ok_or(WorkerError::Inconsistent {
+                reason: "carry-over installation had no prepared record",
+            })?;
+        let frontier =
+            pending
+                .batch
+                .progress_frontier(pending.file_id)
+                .ok_or(WorkerError::Inconsistent {
+                    reason: "carry-over batch has no progress frontier",
+                })?;
+        if active.base.file_epoch != frontier.file_epoch
+            || active.framer.next_expected_input_offset() < frontier.offset
+        {
+            return Err(WorkerError::Inconsistent {
+                reason: "carry-over post-frame state does not cover its record",
+            });
+        }
+        if finalize {
+            match pending
+                .batch
+                .finalize_file(pending.file_id, frontier, unix_nanos()?.1)?
+            {
+                FinalizationOutcome::Merged => {}
+                FinalizationOutcome::Direct(_) => {
+                    return Err(WorkerError::Inconsistent {
+                        reason: "carry-over finalization did not merge into its record",
+                    });
+                }
+            }
+        }
+        if pending.batch.record_count() != 1
+            || pending.batch.progress_delta(pending.file_id).is_none()
+        {
+            return Err(WorkerError::Inconsistent {
+                reason: "carry-over is not exactly one record and one file delta",
+            });
+        }
+        active.pending_bytes = active.framer.pending_source_start().map_or(0, |start| {
+            active
+                .framer
+                .next_expected_input_offset()
+                .saturating_sub(start)
+        });
+        self.partial_bytes_pending = self
+            .partial_bytes_pending
+            .saturating_add(active.pending_bytes);
+        self.telemetry
+            .set(WorkerGauge::PartialBytesPending, self.partial_bytes_pending);
+        self.carry_over = Some(CarryOver {
+            batch: pending.batch,
+            post_frame: CarryOverPostFrame {
+                file_id: pending.file_id,
+                active,
+            },
+        });
+        Ok(())
     }
 
     fn observe_framer_error(&mut self, error: &FramerError) {
@@ -3038,10 +3192,16 @@ impl WorkerRuntime {
                 operation: "sealing",
             })?;
         let logical = open.finish()?;
-        self.open_batch = Some(OpenBatch::new(&self.config)?);
+        self.validate_carry_over_predecessor(&logical)?;
+        self.open_batch = if self.carry_over.is_some() {
+            None
+        } else {
+            Some(OpenBatch::new(&self.config)?)
+        };
 
         // Every framer may contain speculative decoder lookahead, including
-        // files that contributed no record to this batch.
+        // files that contributed no record to this batch. The sole
+        // carry-over owns its post-frame state separately.
         self.clear_framers();
         self.rewind_targets.clear();
         for delta in logical.deltas() {
@@ -3058,6 +3218,20 @@ impl WorkerRuntime {
                 });
             }
         }
+        let carry_target = if let Some(carry) = self.carry_over.as_ref() {
+            let delta = carry.batch.progress_delta(carry.post_frame.file_id).ok_or(
+                WorkerError::Inconsistent {
+                    reason: "carry-over batch lost its progress delta",
+                },
+            )?;
+            Some((
+                carry.post_frame.file_id,
+                delta.expected_file_epoch(),
+                carry.post_frame.active.framer.next_expected_input_offset(),
+            ))
+        } else {
+            None
+        };
         self.frontier_snapshot.clear();
         {
             let readers = self.readers.as_ref().ok_or(WorkerError::Inconsistent {
@@ -3068,16 +3242,28 @@ impl WorkerRuntime {
         self.readers_mut()?.prepare_batch_pause_order()?;
         for index in 0..self.frontier_snapshot.len() {
             let frontier = self.frontier_snapshot[index];
-            let target = match self.rewind_targets.get(&frontier.file_id) {
-                Some((epoch, offset)) => {
-                    if *epoch != frontier.file_epoch {
+            let target = match carry_target {
+                Some((carry_file_id, carry_epoch, carry_offset))
+                    if carry_file_id == frontier.file_id =>
+                {
+                    if carry_epoch != frontier.file_epoch {
                         return Err(WorkerError::Inconsistent {
-                            reason: "batch delta epoch differs from reader frontier",
+                            reason: "carry-over epoch differs from reader frontier",
                         });
                     }
-                    *offset
+                    carry_offset
                 }
-                None => frontier.committed_offset,
+                _ => match self.rewind_targets.get(&frontier.file_id) {
+                    Some((epoch, offset)) => {
+                        if *epoch != frontier.file_epoch {
+                            return Err(WorkerError::Inconsistent {
+                                reason: "batch delta epoch differs from reader frontier",
+                            });
+                        }
+                        *offset
+                    }
+                    None => frontier.committed_offset,
+                },
             };
             self.readers_mut()?.rewind_provisional_frontier(
                 frontier.file_id,
@@ -3106,6 +3292,67 @@ impl WorkerRuntime {
             }
             HandoffControl::Shutdown => Ok(LoopControl::Shutdown),
         }
+    }
+
+    fn validate_carry_over_predecessor(
+        &self,
+        predecessor: &LogicalBatch,
+    ) -> Result<(), WorkerError> {
+        let Some(carry) = self.carry_over.as_ref() else {
+            return Ok(());
+        };
+        if carry.batch.record_count() != 1 {
+            return Err(WorkerError::Inconsistent {
+                reason: "carry-over batch is not exactly one record",
+            });
+        }
+        let delta = carry.batch.progress_delta(carry.post_frame.file_id).ok_or(
+            WorkerError::Inconsistent {
+                reason: "carry-over batch has no matching progress delta",
+            },
+        )?;
+        if delta.file_id() != carry.post_frame.file_id
+            || carry.post_frame.active.base.file_epoch != delta.expected_file_epoch()
+            || carry.post_frame.active.framer.next_expected_input_offset() < delta.final_offset()
+        {
+            return Err(WorkerError::Inconsistent {
+                reason: "carry-over post-frame ownership does not match its delta",
+            });
+        }
+        let reader = self.readers_ref()?.frontier(delta.file_id())?;
+        if reader.file_epoch != delta.expected_file_epoch()
+            || reader.read_offset != carry.post_frame.active.framer.next_expected_input_offset()
+        {
+            return Err(WorkerError::Inconsistent {
+                reason: "carry-over reader frontier does not match retained post-frame state",
+            });
+        }
+        if let Some(prior) = predecessor
+            .deltas()
+            .iter()
+            .find(|prior| prior.file_id() == delta.file_id())
+        {
+            if prior.finalize()
+                || delta.expected_file_epoch() != prior.expected_file_epoch()
+                || delta.expected_committed_offset() != prior.final_offset()
+                || delta.expected_framing_resume() != prior.final_framing_resume()
+            {
+                return Err(WorkerError::Inconsistent {
+                    reason: "same-file carry-over does not follow the retained batch frontier",
+                });
+            }
+        } else {
+            let current = current_progress(&self.store, delta.file_id())?;
+            if delta.expected_file_epoch() != current.file_epoch
+                || delta.expected_committed_offset() != current.committed_offset
+                || delta.expected_framing_resume() != current.framing_resume
+            {
+                return Err(WorkerError::Inconsistent {
+                    reason: "different-file carry-over does not start at durable progress",
+                });
+            }
+        }
+        Ok(())
     }
 
     fn commit_retained(&mut self, batch_id: u64, attempt: u32) -> Result<bool, WorkerError> {
@@ -3141,6 +3388,9 @@ impl WorkerRuntime {
     }
 
     fn commit_logical_batch(&mut self, logical: &LogicalBatch) -> Result<bool, WorkerError> {
+        if self.carry_over.is_some() {
+            self.validate_carry_over_predecessor(logical)?;
+        }
         let mut updates = reserved_vec(self.max_progress_updates, "checkpoint progress updates")?;
         for delta in logical.deltas() {
             updates
@@ -3181,6 +3431,9 @@ impl WorkerRuntime {
                 delta.final_window().cloned(),
             )?;
         }
+        if self.carry_over.is_some() {
+            self.seed_carry_over()?;
+        }
         let resume = !self.drain_requested;
         self.readers_mut()?.finish_preflighted_batch_commit(resume);
         for delta in logical.deltas() {
@@ -3194,6 +3447,51 @@ impl WorkerRuntime {
             }
         }
         Ok(true)
+    }
+
+    fn seed_carry_over(&mut self) -> Result<(), WorkerError> {
+        if self.seeded_carry_over_requires_seal {
+            return Err(WorkerError::Inconsistent {
+                reason: "a prior seeded carry-over still requires sealing",
+            });
+        }
+        if self.open_batch.is_some() {
+            return Err(WorkerError::Inconsistent {
+                reason: "carry-over seed found another open batch",
+            });
+        }
+        let mut carry = self.carry_over.take().ok_or(WorkerError::Inconsistent {
+            reason: "carry-over seed had no retained record",
+        })?;
+        let delta = carry.batch.progress_delta(carry.post_frame.file_id).ok_or(
+            WorkerError::Inconsistent {
+                reason: "carry-over seed lost its progress delta",
+            },
+        )?;
+        let expected_file_epoch = delta.expected_file_epoch();
+        let expected_committed_offset = delta.expected_committed_offset();
+        let expected_framing_resume = delta.expected_framing_resume();
+        let current = current_progress(&self.store, carry.post_frame.file_id)?;
+        if current.file_epoch != expected_file_epoch
+            || current.committed_offset != expected_committed_offset
+            || current.framing_resume != expected_framing_resume
+            || self.framers.contains_key(&carry.post_frame.file_id)
+        {
+            return Err(WorkerError::Inconsistent {
+                reason: "carry-over seed base does not match applied predecessor progress",
+            });
+        }
+        self.partial_bytes_pending = self
+            .partial_bytes_pending
+            .saturating_sub(carry.post_frame.active.pending_bytes);
+        carry.post_frame.active.base = FramerBase {
+            file_epoch: expected_file_epoch,
+            committed_offset: expected_committed_offset,
+            framing_resume: expected_framing_resume,
+        };
+        self.open_batch = Some(carry.batch);
+        self.seeded_carry_over_requires_seal = true;
+        self.put_framer(carry.post_frame.file_id, carry.post_frame.active)
     }
 
     fn drive_drain(
@@ -3330,15 +3628,20 @@ impl WorkerRuntime {
                 self.observe_framer_counters(&mut active.framer);
                 let produced = step.output.is_some();
                 if let Some(record) = step.output {
-                    let control = self.append_record(file_id, active.base, record, ready_at)?;
-                    if control.requires_seal() {
-                        return self.seal_open_batch(event_tx, command_rx);
+                    match self.append_record(file_id, active.base, record, ready_at)? {
+                        AppendControl::Continue => {}
+                        AppendControl::SealBefore => {
+                            self.install_carry_over(active, false)?;
+                            return self.seal_open_batch(event_tx, command_rx);
+                        }
+                        AppendControl::SealAfter => {
+                            return self.seal_open_batch(event_tx, command_rx);
+                        }
                     }
                 }
                 if !produced {
-                    // `pending` with no output is an unflushable tail under
-                    // the configured disabled-partial policy. It is dropped
-                    // only from memory and rewound to durable progress below.
+                    // A not-yet-due or disabled idle rule leaves recoverable
+                    // bytes pending; rewind makes durable progress authoritative.
                     break;
                 }
             }
@@ -3547,6 +3850,10 @@ impl WorkerRuntime {
                 .retained
                 .as_ref()
                 .is_some_and(|retained| retained.logical.contains_file(file_id))
+            || self
+                .carry_over
+                .as_ref()
+                .is_some_and(|carry| carry.batch.contains_file(file_id))
             || self
                 .pending_decode_quarantine
                 .is_some_and(|pending| pending.file_id == file_id)
@@ -4076,8 +4383,12 @@ impl WorkerRuntime {
 
     fn clear_framers(&mut self) {
         self.framers.clear();
-        self.partial_bytes_pending = 0;
-        self.telemetry.set(WorkerGauge::PartialBytesPending, 0);
+        self.partial_bytes_pending = self
+            .carry_over
+            .as_ref()
+            .map_or(0, |carry| carry.post_frame.active.pending_bytes);
+        self.telemetry
+            .set(WorkerGauge::PartialBytesPending, self.partial_bytes_pending);
     }
 
     fn shutdown_resources(&mut self) -> Result<(), WorkerError> {

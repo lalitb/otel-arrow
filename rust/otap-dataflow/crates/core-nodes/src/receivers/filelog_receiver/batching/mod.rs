@@ -3,11 +3,9 @@
 
 //! Exact OTAP projection and bounded Phase 1 batch construction.
 //!
-//! A refused record is deliberately returned unchanged. Stage 11 must drop
-//! that speculative frame together with every decoder/framer state derived
-//! after the retained batch frontier, rewind readers, and reconstruct after
-//! Ack. Holding the refused record across the one-batch in-flight window
-//! would violate Phase 1's strict no-read-ahead contract.
+//! A refused record is deliberately returned unchanged. The worker rebases
+//! its progress contract to the current batch frontier, retains it as the
+//! sole carry-over, and never reconstructs it from mutable source bytes.
 
 use std::collections::{HashMap, TryReserveError};
 use std::path::{Path, PathBuf};
@@ -302,7 +300,7 @@ pub(crate) enum BatchAppendOutcome {
     /// append; `None` permits more records.
     Appended { seal: Option<SealReason> },
     /// The nonempty batch must seal first. The owned record is byte-for-byte
-    /// unchanged and must not be retained across the in-flight window.
+    /// unchanged so the worker can retain it as the sole carry-over.
     SealBefore {
         /// Refused input.
         record: RecordInput,
@@ -572,7 +570,22 @@ impl OpenBatch {
         Self::from_settings(BatchSettings::from_runtime(config))
     }
 
+    /// Creates the one-record carry-over builder.
+    ///
+    /// It reserves exactly one delta because the worker seeds and seals this
+    /// batch before any later source read.
+    pub(crate) fn new_carry_over(config: &RuntimeConfig) -> Result<Self, BatchError> {
+        Self::from_settings_with_delta_reserve(BatchSettings::from_runtime(config), 1)
+    }
+
     fn from_settings(settings: BatchSettings) -> Result<Self, BatchError> {
+        Self::from_settings_with_delta_reserve(settings, usize::MAX)
+    }
+
+    fn from_settings_with_delta_reserve(
+        settings: BatchSettings,
+        delta_reserve_limit: usize,
+    ) -> Result<Self, BatchError> {
         if settings.max_records == 0 || settings.max_records > u32::from(u16::MAX) {
             return Err(BatchError::InvalidSettings {
                 reason: "max_records must be in 1..=65535",
@@ -593,7 +606,8 @@ impl OpenBatch {
             .map_err(|_| BatchError::InvalidSettings {
                 reason: "max_records must fit usize",
             })?
-            .min(MAX_DISTINCT_DELTAS);
+            .min(MAX_DISTINCT_DELTAS)
+            .min(delta_reserve_limit);
         let mut deltas = Vec::new();
         deltas
             .try_reserve_exact(reserve)
@@ -642,13 +656,74 @@ impl OpenBatch {
     /// Returns the provisional progress frontier already represented by this
     /// batch for one file.
     pub(crate) fn progress_frontier(&self, file_id: FileId) -> Option<ProgressFrontier> {
-        let index = self.delta_index.get(&file_id).copied()?;
-        let delta = self.deltas.get(index)?;
+        let delta = self.progress_delta(file_id)?;
         Some(ProgressFrontier {
             file_epoch: delta.expected_file_epoch,
             offset: delta.final_offset,
             framing_resume: delta.final_framing_resume,
         })
+    }
+
+    /// Returns the exact unresolved progress delta for one represented file.
+    pub(crate) fn progress_delta(&self, file_id: FileId) -> Option<&ProgressDelta> {
+        let index = self.delta_index.get(&file_id).copied()?;
+        self.deltas.get(index)
+    }
+
+    /// Rebases one refused same-file record to the progress frontier this
+    /// batch will establish before the carry-over is emitted.
+    ///
+    /// A different-file record already starts at its durable base and is
+    /// returned unchanged. The exact prior guard is derived only from the
+    /// real window already owned by this batch.
+    pub(crate) fn rebase_for_carry_over(
+        &self,
+        mut record: RecordInput,
+    ) -> Result<RecordInput, BatchError> {
+        validate_record(&record, &self.settings)?;
+        let Some(index) = self.delta_index.get(&record.file_id).copied() else {
+            return Ok(record);
+        };
+        let delta = self.deltas.get(index).ok_or(BatchError::Inconsistent {
+            reason: "carry-over delta index points beyond the delta vector",
+        })?;
+        if delta.finalize {
+            return Err(BatchError::InvalidProgress {
+                file_id: record.file_id,
+                reason: "a carry-over cannot follow a finalized file delta",
+            });
+        }
+        if delta.expected_file_epoch != record.progress_base.file_epoch
+            || delta.expected_committed_offset != record.progress_base.committed_offset
+            || delta.expected_framing_resume != record.progress_base.framing_resume
+        {
+            return Err(BatchError::InvalidProgress {
+                file_id: record.file_id,
+                reason: "carry-over durable base differs from the current batch delta",
+            });
+        }
+        if delta.final_offset != record.framed.frame_source_range.start {
+            return Err(BatchError::InvalidProgress {
+                file_id: record.file_id,
+                reason: "carry-over frame does not follow the current batch frontier",
+            });
+        }
+        let window = delta.final_window().ok_or(BatchError::Inconsistent {
+            reason: "advancing carry-over predecessor has no real frontier window",
+        })?;
+        let committed_frontier_guard = window.guard().map_err(|_| BatchError::InvalidProgress {
+            file_id: record.file_id,
+            reason: "carry-over predecessor window cannot produce a valid guard",
+        })?;
+        record.progress_base = ProgressBase {
+            file_epoch: delta.expected_file_epoch,
+            committed_offset: delta.final_offset,
+            framing_resume: delta.final_framing_resume,
+            last_seen_time_unix_nano: delta.last_seen_time_unix_nano,
+            committed_frontier_guard,
+        };
+        validate_resume_transition(&record, delta.final_framing_resume)?;
+        Ok(record)
     }
 
     /// Whether the open batch owns unresolved progress for `file_id`.
@@ -919,6 +994,12 @@ impl OpenBatch {
         frontier: ProgressFrontier,
         last_seen_time_unix_nano: u64,
     ) -> Result<FinalizationOutcome, BatchError> {
+        if frontier.framing_resume != FramingResume::Clean {
+            return Err(BatchError::InvalidProgress {
+                file_id,
+                reason: "finalization requires a clean framing frontier",
+            });
+        }
         if let Some(index) = self.delta_index.get(&file_id).copied() {
             let delta = self.deltas.get_mut(index).ok_or(BatchError::Inconsistent {
                 reason: "finalization index points beyond the delta vector",
@@ -1482,8 +1563,9 @@ struct RecordNumberState {
 /// Transactional worker-local record-number decision.
 ///
 /// The worker prepares this before projection, puts [`Self::record_number`]
-/// into [`RecordInput`], and commits it only after `try_append` succeeds.
-/// Refused speculative records therefore do not consume a number.
+/// into [`RecordInput`], and commits it only after the record enters the open
+/// batch or the sole carry-over. Invalid or abandoned projections therefore
+/// do not consume a number.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RecordNumberReservation {
     file_id: FileId,

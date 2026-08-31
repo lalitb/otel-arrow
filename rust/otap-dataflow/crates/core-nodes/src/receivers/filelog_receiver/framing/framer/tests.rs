@@ -1740,6 +1740,41 @@ fn permanent_rotation_applies_decode_policy_to_incomplete_unit() {
     assert_eq!(framer.pending_source_start(), Some(0));
 }
 
+/// Scenario: permanent rotation EOF combines one buffered multiline line
+/// with an unterminated trigger line and crosses the split record bound.
+/// Guarantees: the first terminal fragment reports pending continuation
+/// state, and only the later fragment reaches a clean terminal frontier.
+#[test]
+fn permanent_rotation_multiline_split_reports_pending_before_final_fragment() {
+    let now = Instant::now();
+    let settings = TestSettings {
+        end_pattern: Some("^END$"),
+        max_line: 8,
+        max_record: 8,
+        flush_period: Duration::ZERO,
+        ..TestSettings::default()
+    };
+    let mut framer = framer(&settings, now);
+    assert!(feed(&mut framer, b"abc\ndefgh", now).is_empty());
+
+    let first = framer.flush_rotation(now).unwrap();
+    let first_record = first.output.expect("first split fragment must emit");
+    assert_eq!(bytes(&first_record), b"abc\n");
+    assert!(first.pending);
+    assert!(matches!(
+        first_record.resulting_resume,
+        FramingResume::Continuation { .. }
+    ));
+    assert!(!first_record.fragment.as_ref().unwrap().last);
+
+    let second = framer.flush_rotation(now).unwrap();
+    let second_record = second.output.expect("final split fragment must emit");
+    assert_eq!(bytes(&second_record), b"defgh");
+    assert!(!second.pending);
+    assert_eq!(second_record.resulting_resume, FramingResume::Clean);
+    assert!(second_record.fragment.as_ref().unwrap().last);
+}
+
 /// Scenario: a resumed split continuation with known end 10 is defensively
 /// asked to handle permanent EOF after receiving only bytes `[4, 6)`.
 /// Guarantees: the framer cannot fabricate a short final fragment; the reader

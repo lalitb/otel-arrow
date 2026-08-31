@@ -170,11 +170,15 @@ application timestamps.
 Capture, delivery, and recovery are separate:
 
 - The worker captures source bytes into one bounded receiver-wide logical
-  batch.
+  batch plus at most one fully framed carry-over record.
 - The async receiver retains that batch until the matching Ack, retry
   exhaustion, or an explicit terminal-loss policy.
+- A record that cannot enter a nonempty batch is retained byte-for-byte and
+  emitted as the next batch after its predecessor resolves, before any source
+  read. Source rewrite, truncation, rename, or removal cannot substitute it.
 - Only a matching Ack or `drop_and_continue` advances durable progress.
-- Drain and shutdown never synthesize progress for an unacknowledged batch.
+- Drain emits an eligible carry-over after its predecessor. Direct shutdown
+  releases unsent in-memory state without synthesizing progress.
 - A crash before progress is durable replays from the prior checkpoint and can
   produce duplicates.
 
@@ -257,6 +261,7 @@ High-signal operating metrics include:
 | `receiver.filelog.lifecycle.failures` | `{failure}` | Terminal receiver failures. |
 | `receiver.filelog.batches.acked` | `{batch}` | Matching downstream Acks. |
 | `receiver.filelog.batches.nacked` | `{batch}` | Matching downstream Nacks. |
+| `receiver.filelog.carry_over.records` | `{record}` | Fully framed records retained across one predecessor batch. |
 | `receiver.filelog.retries.exhausted` | `{batch}` | Retained batches that exhausted their send budget. |
 | `receiver.filelog.backpressure.pause.duration` | `ns` | Distribution of downstream-full pauses. |
 | `receiver.filelog.checkpoint.failures` | `{failure}` | Failed checkpoint operations. |
@@ -308,8 +313,9 @@ spooled by the receiver.
   unsupported for concurrent-rollout safety.
 - Run the source pipeline with one core. Use `receiver:filelog` followed by a
   topic exporter to fan out to multicore downstream processing.
-- Phase 1 supports one receiver-wide retained batch, so one slow or failing
-  delivery creates intentional receiver-wide head-of-line blocking.
+- Phase 1 supports one receiver-wide retained batch plus one carry-over
+  record, so one slow or failing delivery creates intentional receiver-wide
+  head-of-line blocking.
 - Runtime leases prevent overlapping patterns inside one process. They do not
   coordinate separate engine processes or separate state directories.
 - Writers must permit the platform's compatible shared-read/delete behavior.

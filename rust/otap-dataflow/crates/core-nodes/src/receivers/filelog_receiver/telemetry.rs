@@ -77,6 +77,9 @@ pub struct FilelogReceiverMetrics {
     /// Batches durably advanced under explicit drop-and-continue policy.
     #[metric(name = "batches.explicit_loss", unit = "{batch}")]
     pub batches_explicit_loss: Counter<u64>,
+    /// Fully framed records retained across one predecessor in-flight batch.
+    #[metric(name = "carry_over.records", unit = "{record}")]
+    pub carry_over_records: Counter<u64>,
     /// Completion contexts with an invalid shape.
     #[metric(name = "completions.malformed", unit = "{completion}")]
     pub malformed_completions: Counter<u64>,
@@ -400,6 +403,7 @@ pub(super) enum WorkerCounter {
     RecordsTruncated,
     SourceBytesDiscarded,
     SplitFragments,
+    CarryOverRecords,
     PartialBytesPendingDrain,
     TerminalUnterminatedRecords,
     PatternFallback,
@@ -562,6 +566,7 @@ impl WorkerTelemetryBridge {
         drain!(RecordsTruncated, records_truncated);
         drain!(SourceBytesDiscarded, source_bytes_discarded);
         drain!(SplitFragments, split_fragments);
+        drain!(CarryOverRecords, carry_over_records);
         drain!(PartialBytesPendingDrain, partial_bytes_pending_drain);
         drain!(TerminalUnterminatedRecords, terminal_unterminated_records);
         drain!(PatternFallback, pattern_fallback);
@@ -816,14 +821,17 @@ mod tests {
         let bridge = WorkerTelemetryBridge::default();
         let (_registry, mut metrics) = registered();
         bridge.add(WorkerCounter::FilesEligible, 3);
+        bridge.add(WorkerCounter::CarryOverRecords, 1);
         bridge.set(WorkerGauge::FilesOpen, 2);
         bridge.drain_into(&mut metrics);
         assert_eq!(metrics.files_eligible.get(), 3);
+        assert_eq!(metrics.carry_over_records.get(), 1);
         assert_eq!(metrics.files_open.get(), 2);
 
         metrics.clear_values();
         bridge.drain_into(&mut metrics);
         assert_eq!(metrics.files_eligible.get(), 0);
+        assert_eq!(metrics.carry_over_records.get(), 0);
         assert_eq!(metrics.files_open.get(), 2);
 
         bridge.add(WorkerCounter::FilesEligible, 4);

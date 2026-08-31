@@ -37,7 +37,7 @@ deliverables and required evidence for each phase.
 
 | Phase | Scope | Principal limitation or dependency |
 | --- | --- | --- |
-| Phase 1 | One receiver; periodic discovery; bounded reading and framing; one receiver-wide in-flight batch; Ack-gated checkpoints; durable identity and quarantine; move/create rotation | Receiver-wide head-of-line blocking; no distributed ownership, fencing, or lossless live-rollout readiness guarantee |
+| Phase 1 | One receiver; periodic discovery; bounded reading and framing; one receiver-wide in-flight batch plus one carry-over record; Ack-gated checkpoints; durable identity and quarantine; move/create rotation | Receiver-wide head-of-line blocking; no distributed ownership, fencing, or lossless live-rollout readiness guarantee |
 | Phase 2 | Native discovery notifications; multiple in-flight batches or local shards; background compaction | Ownership remains local and single-instance |
 | Phase 3 | Shared identity resolution; virtual-partition assignment; fenced checkpoint persistence; revoke/assign protocol; readiness; migration from Phase 1 state | Requires shared coordination and an explicit checkpoint-store migration |
 
@@ -60,7 +60,7 @@ compromises:
 | D10 | Emit raw OTAP logs with bounded source metadata | The receiver does not embed Stanza-style operator chains |
 | D11 | Bound readers, descriptors, buffers, batches, channels, retries, and scheduling turns | Memory and overload behavior must remain predictable |
 | D12 | Support move/create rotation and describe copy-truncate as best-effort | Portable filesystem observation cannot guarantee copy-truncate capture |
-| D13 | Retain one receiver-wide in-flight batch in Phase 1 | This simplifies progress correctness but intentionally couples all files for Ack latency, failure, and drain |
+| D13 | Retain one receiver-wide in-flight batch plus at most one bounded already-framed carry-over record | This preserves exact records across batch boundaries without source reread while intentionally coupling all files for Ack latency, failure, and drain |
 | D14 | Use periodic reconciliation as the Phase 1 discovery mechanism | Native notifications are a Phase 2 latency optimization, not a correctness source |
 | D15 | Use a namespace lock and process-local runtime leases for Phase 1 ownership | This prevents overlapping local readers but does not provide distributed fencing or lossless live-rollout readiness |
 | D16 | Fail closed on corrupt durable state and persist fail-policy quarantines | Ambiguous recovery never silently inherits an offset, and restart cannot bypass an operator-visible failure |
@@ -731,10 +731,11 @@ Three components keep blocking work isolated from the engine runtime:
   new files. Emits `CandidateEvent`s over a bounded channel. Slow scans delay
   discovery of *new* files but never stall tailing of already-assigned files.
 - **Read worker thread** (blocking): consumes candidate events; owns FDs, framing,
-  Arrow batch building, the in-memory offset table, the retained in-flight batch, and
-  all checkpoint I/O including fsync. Checkpoint writes stay on this thread in Phase 1
-  because the worker is idle during the in-flight window anyway (see Ack model): commit
-  I/O fills dead time rather than competing with reads.
+  Arrow batch building, the in-memory offset table, the retained in-flight batch, the
+  sole already-framed carry-over record, and all checkpoint I/O including fsync.
+  Checkpoint writes stay on this thread in Phase 1 because the worker is idle during
+  the in-flight window anyway (see Ack model): commit I/O fills dead time rather than
+  competing with reads.
 - **Async engine task**: owns the control channel, Ack/Nack correlation, emission, and
   drain deadlines. Two hard requirements from the engine contract:
   - control messages are polled with **biased priority** over the worker handoff
@@ -787,20 +788,19 @@ Reader scheduling within the worker:
   bytes. If those bytes no longer survive, the ordinary recovery limitation applies.
   Durable framing-resume state is changed only by Ack-gated progress, never by closing
   an uncommitted reader.
-- **No read-ahead past the unacked frontier (Phase 1):** while a batch is in flight, no
-  reader advances its file position beyond the offsets captured in that batch's delta
-  set. At seal, the worker discards the refused record and every decoder/framer state
-  derived beyond the sealed batch. It rewinds each delta file's in-memory reader
-  frontier to that delta's final offset and every other speculative reader to its
-  durable committed offset. This narrow rewind changes neither durable progress nor
-  durable framing resume and preserves an open descriptor. The worker performs no
-  reads during the in-flight window and reconstructs framers only after terminal Ack
-  processing. It never retains the refused record across that window. This deliberately
-  caps throughput at one batch per downstream round trip; lifting it is the Phase-2
-  pipelining/multi-in-flight work, which must then design read-ahead offset tracking.
-  Independently, one read worker is the Phase-1 aggregate file-I/O and checkpoint-I/O
-  throughput ceiling even when downstream latency is negligible; Phase-1 performance
-  claims and benchmarks must name both ceilings.
+- **No source read while a batch is in flight (Phase 1):** at seal, the worker may
+  retain one record that was already completely framed but could not enter the nonempty
+  batch. That carry-over owns its exact projected body, attributes, progress delta, and
+  post-frame decoder/framer state. Its reader remains paused at the frontier owned by
+  that state. Every other speculative framer is discarded and its reader rewinds to
+  the sealed batch or durable frontier. After the predecessor reaches terminal Ack/Nack
+  policy, the carry-over seeds and seals the next open batch before any source read.
+  Source rewrite, truncation, rename, or removal during the wait cannot replace it.
+  This deliberately caps throughput at one batch per downstream round trip; lifting it
+  is the Phase-2 pipelining/multi-in-flight work, which must then design read-ahead
+  offset tracking. Independently, one read worker is the Phase-1 aggregate file-I/O and
+  checkpoint-I/O throughput ceiling even when downstream latency is negligible;
+  Phase-1 performance claims and benchmarks must name both ceilings.
 
 The one-batch rule is receiver-wide, not per file. It deliberately accepts
 head-of-line blocking in Phase 1: one slow Ack pauses all file reads, a permanent batch
@@ -1204,8 +1204,9 @@ process recovery or epoch change resets the number to zero.
 Unsplit records receive and advance a number. Every split fragment omits the number:
 fragment index zero advances the logical-record counter once and later fragments do not.
 The stable fragment ID, not record number, is the cross-restart correlation key.
-Numbering uses a prepare/commit decision so a record refused at a batch boundary does
-not consume a number.
+Numbering uses a prepare/commit decision so an invalid or abandoned projection consumes
+no number. A valid refused record commits its projected number exactly once when it
+becomes the carry-over; predecessor retry and later seeding do not consume another.
 
 Logs receive zero-based `u16` IDs from `0` through `record_count - 1`; the count itself
 is tracked as `u32`. The hard maximum of 65,535 records therefore ends at ID 65,534.
@@ -1304,14 +1305,17 @@ value, a stale batch ID, or a stale attempt cannot advance progress. Phase 1 enf
 - **Retention:** the worker retains a shallow clone of the in-flight batch. This is
   bounded by the declared in-flight memory budget; cloning does not duplicate Arrow
   buffers because the columns are `Arc`-shared. Delta storage is also one
-  `Arc<[ProgressDelta]>`, shared by retained and completion views.
-- **Seal and speculative rewind:** if a nonempty batch must seal before a framed record,
-  the builder returns that owned record unchanged. The worker does not hold it. It
-  discards that record and all speculative decoder/framer state, rewinds delta readers
-  to batch final offsets and all other speculative readers to durable offsets, then
-  performs no source reads while the batch is in flight. Reader rewind preserves
-  descriptors and changes neither durable offset nor durable framing resume. Framers
-  are reconstructed after Ack handling.
+  `Arc<[ProgressDelta]>`, shared by retained and completion views. At most one
+  carry-over may coexist and owns one exact projected record, one progress delta, and
+  its post-frame state.
+- **Seal, carry-over, and speculative rewind:** if a nonempty batch must seal before a
+  fully framed record, the builder returns that owned record unchanged. The worker
+  rebases its expected progress to the predecessor batch frontier, projects it once
+  into the sole carry-over, and retains its post-frame decoder/framer state. Other
+  speculative framers rewind to batch or durable frontiers. No source read occurs
+  while the predecessor is in flight. After terminal Ack/Nack policy, the carry-over
+  seeds and seals the next open batch before any source read, even if the source was
+  rewritten, truncated, renamed, or removed.
 - **Ack:** only an Ack matching the current `(batch_id, attempt)` is terminal. The
   worker applies each delta only when its `file_epoch` still matches (a truncate reset
   invalidates old deltas) and its expected durable offset/resume still matches. It
@@ -1613,11 +1617,12 @@ The sequence below follows the engine's actual orchestration
    (waiting-for-ownership, D15); load snapshot and WAL (fail-closed); run initial
    discovery; acquire runtime file leases and durably register unmatched files before
    reading.
-2. **DrainIngress** (downstream still live): stop discovery and new
-   reads; flush the open batch; await Ack of the in-flight batch and sync the progress
-   log, bounded by the min of the engine deadline and `drain_timeout`. On
-   deadline with an unacked batch: warn, do not advance its offsets, rely on
-   at-least-once redelivery after restart.
+2. **DrainIngress** (downstream still live): stop discovery and new reads; flush the
+   open batch; await terminal handling of the in-flight batch; emit any sole
+   carry-over from its retained representation without rereading; and sync applied
+   progress, bounded by the min of the engine deadline and `drain_timeout`. On deadline
+   with unresolved state: warn, do not advance its offsets, and rely on surviving
+   source bytes for restart recovery.
 3. **Drain completion:** sync final progress, close FDs, release runtime leases and the
    namespace lock, call `notify_receiver_drained()`, and exit with terminal state. A
    cleanly drained receiver **never receives `Shutdown`** -- cleanup must not wait for
@@ -1708,7 +1713,7 @@ strings never become metric dimensions. Instrument suffixes and semantics are:
 | Area | Counter or distribution instruments | Current gauges |
 | --- | --- | --- |
 | Lifecycle and health | `lifecycle.starts`, `lifecycle.drains`, `lifecycle.shutdowns`, `lifecycle.failures`, `health_events.suppressed` | -- |
-| Delivery | `records.emitted`, `bytes.source.emitted`, `bytes.logical.emitted`, `batches.emitted`, `batches.acked`, `batches.nacked`, `batches.resent`, `batches.explicit_loss`, `retries.attempted`, `retries.exhausted`, `retry.backoff.duration`, `completions.malformed`, `completions.stale`, `completions.duplicate`, `backpressure.pause.duration` | -- |
+| Delivery | `records.emitted`, `bytes.source.emitted`, `bytes.logical.emitted`, `batches.emitted`, `batches.acked`, `batches.nacked`, `batches.resent`, `batches.explicit_loss`, `carry_over.records`, `retries.attempted`, `retries.exhausted`, `retry.backoff.duration`, `completions.malformed`, `completions.stale`, `completions.duplicate`, `backpressure.pause.duration` | -- |
 | Checkpoint | `checkpoint.wal.bytes`, `checkpoint.transactions`, `checkpoint.syncs`, `checkpoint.failures`, `checkpoint.persist.duration.total`, `checkpoint.persist.operations`, `checkpoint.sync.duration.total`, `checkpoint.sync.operations`, `checkpoint.compaction.duration.total`, `checkpoint.compactions`, `checkpoint.cleanup.generations`, `checkpoint.cleanup.failures` | `checkpoint.wal.size` |
 | Discovery and admission | `files.discovered`, `files.eligible`, `discovery.observed`, `discovery.updated`, `discovery.removed`, `discovery.scans`, `discovery.scan.errors`, `discovery.scan.duration.total`, `candidates.overflowed`, `candidates.overflow.scans`, `candidates.admission.delay.total`, `candidates.admissions`, `files.tracked.saturation`, `files.descriptor.saturation` | `files.tracked`, `files.pending`, `files.open`, `files.descriptor_blocked`, `files.removed_waiting`, `files.quarantined`, `candidates.oldest.age`, `candidates.overflow.persistence`, `files.tracked.saturated`, `files.descriptor.saturated` |
 | Identity and ownership | `identity.registrations`, `identity.resets`, `identity.recovery_mismatches`, `identity.matches.exact_locator`, `identity.matches.unique_fingerprint`, `ownership.namespace_lock.wait.duration.total`, `ownership.namespace_lock.waits`, `ownership.namespace_lock.contentions`, `ownership.namespace_lock.failures`, `ownership.runtime_lease.wait.duration.total`, `ownership.runtime_lease.waits`, `ownership.runtime_lease.contentions`, `ownership.runtime_lease.failures` | -- |
