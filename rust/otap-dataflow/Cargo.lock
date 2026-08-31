@@ -7582,7 +7582,6 @@ dependencies = [
  "tonic-middleware",
  "tower",
  "uuid",
- "walkdir",
  "weaver_common",
  "weaver_forge",
  "weaver_resolved_schema",

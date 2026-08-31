@@ -215,7 +215,6 @@ zstd = "0.13"
 sysinfo = "0.39"
 temp-env = "0.3.6"
 tempfile = "3"
-walkdir = "2.5.0"
 thiserror = "2.0.17"
 tracing = { version = ">=0.1.40", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false }

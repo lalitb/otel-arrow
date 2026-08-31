@@ -356,12 +356,16 @@ spooled by the receiver.
 - `EMFILE`/`ENFILE` use one receiver-global retry state. Other temporary
   source or root failures use one bounded per-file/root state with delays
   `250ms, 500ms, ... 30s`; they never become quarantine merely by recurring.
-- Discovery opens at most one traversal directory handle. Environmental
-  retries preserve progress, pause no healthy resident reader, and remain
-  interruptible by drain or direct shutdown.
-- Windows runtime qualification remains deferred. With
-  `follow_symlinks: true`, the current traversal dependency may retain one
-  ancestor handle per depth outside its requested one-handle cap.
+- Discovery opens at most one native traversal directory handle, closes it
+  before yielding or descending, and retains only depth-bounded locator and
+  resume evidence. It rescans a directory to select each next native name, so
+  memory is independent of directory width but a stable wide directory can
+  require quadratic enumeration work. Mutation or ambiguous resume makes the
+  pass incomplete and cannot prove absence.
+- The Windows traversal backend uses one directory handle and one fixed 64 KiB
+  `FileIdExtdDirectoryInfo` buffer with full 128-bit file IDs. It has
+  compile-only evidence on this host; Windows runtime and filesystem
+  qualification remain deferred.
 - Writers must permit the platform's compatible shared-read/delete behavior.
   A writer that denies shared read cannot be tailed.
 - Windows checkpoint marker replacement is atomic, but the standard library

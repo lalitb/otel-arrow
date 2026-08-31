@@ -1,0 +1,6 @@
+change_type: bug_fix
+component: pipeline
+note: "Replace filelog WalkDir discovery with one-handle, width-independent traversal and fail incomplete when directory resume evidence changes."
+issues: [3939]
+subtext: |
+  Discovery now closes each native directory handle before yielding or descending, validates locator and entry-set evidence on reopen, and cannot use ambiguous traversal to prove file absence.

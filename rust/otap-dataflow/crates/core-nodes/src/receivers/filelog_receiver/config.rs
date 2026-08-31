@@ -2585,6 +2585,12 @@ pub(super) fn glob_literal_prefix(pattern: &str) -> PathBuf {
     strip_leading_curdir(&prefix)
 }
 
+pub(super) fn glob_pattern_has_meta(pattern: &str) -> bool {
+    Path::new(pattern)
+        .components()
+        .any(|component| component_has_glob_meta(&component.as_os_str().to_string_lossy()))
+}
+
 #[cfg(not(windows))]
 fn unescape_glob_component(component: &str) -> String {
     let mut unescaped = String::with_capacity(component.len());

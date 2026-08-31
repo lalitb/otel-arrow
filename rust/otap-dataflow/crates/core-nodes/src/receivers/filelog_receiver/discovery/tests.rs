@@ -283,14 +283,122 @@ fn include_exclude_and_checkpoint_rules_are_enforced() {
     assert_eq!(batch.stats.scan_errors, 0);
 }
 
-/// Scenario: recursive include and exclude walks use the Phase 1 traversal
-/// descriptor allowance.
-/// Guarantees: both scanner paths request the frozen one-directory enumeration
-/// cap included in Unix startup descriptor admission; separately documented
-/// Windows link-following and buffering gates are not hidden by this test.
+/// Scenario: a recursive reconciliation descends through several directories
+/// and yields regular-file candidates from different depths.
+/// Guarantees: the native traversal wrapper has at most one actual directory
+/// enumeration handle live at every depth, and closes it before yielding.
 #[test]
 fn traversal_uses_one_open_directory_handle() {
-    assert_eq!(scanner::MAX_OPEN_TRAVERSAL_DIRECTORIES, 1);
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    std::fs::create_dir_all(root.join("a/b/c")).unwrap();
+    std::fs::write(root.join("root.log"), b"root").unwrap();
+    std::fs::write(root.join("a/b/c/deep.log"), b"deep").unwrap();
+    let config = runtime_config(root, vec![pattern(root, "**/*.log")], vec![]);
+    let (mut scanner, mut admission) = scanner_and_admission(&config);
+    traversal::reset_directory_handle_observations();
+
+    let batch = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+
+    assert!(batch.inventory.is_complete());
+    assert_eq!(observed_candidates(&batch).len(), 2);
+    assert_eq!(traversal::peak_directory_handles(), 1);
+}
+
+/// Scenario: a previously discovered and durably acknowledged file's glob
+/// root is absent before the next reconciliation.
+/// Guarantees: `NotFound` on the literal glob prefix is complete negative
+/// evidence and emits removal instead of globally vetoing healthy roots.
+#[test]
+fn missing_glob_root_proves_tracked_file_absent() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("root");
+    let moved = parent.path().join("moved");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("tracked.log"), b"line").unwrap();
+    let config = runtime_config(&root, vec![pattern(&root, "*.log")], vec![]);
+    let (mut scanner, mut admission) = scanner_and_admission(&config);
+    let first = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+    assert_eq!(observed_candidates(&first).len(), 1);
+    admission.apply_feedback(durable_feedback(&first)).unwrap();
+    std::fs::rename(&root, &moved).unwrap();
+
+    let second = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+
+    assert!(second.inventory.is_complete());
+    assert_eq!(second.stats.scan_errors, 0);
+    assert!(matches!(
+        second.events.as_slice(),
+        [CandidateEvent::Removed { .. }]
+    ));
+}
+
+/// Scenario: nonrecursive discovery sees one direct file and one nested
+/// directory containing another matching file.
+/// Guarantees: scanner policy explicitly skips the nested directory without
+/// treating the intentional nonrecursive boundary as depth exhaustion.
+#[test]
+fn nonrecursive_directory_skip_remains_complete() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    std::fs::write(root.join("direct.log"), b"direct").unwrap();
+    std::fs::create_dir(root.join("nested")).unwrap();
+    std::fs::write(root.join("nested/deep.log"), b"deep").unwrap();
+    let mut config = runtime_config(root, vec![pattern(root, "**/*.log")], vec![]);
+    config.recursive = false;
+    let (mut scanner, mut admission) = scanner_and_admission(&config);
+
+    let batch = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+
+    assert!(batch.inventory.is_complete());
+    assert_eq!(
+        observed_candidates(&batch)
+            .into_iter()
+            .map(|candidate| candidate.matched_path.clone())
+            .collect::<Vec<_>>(),
+        [root.join("direct.log")]
+    );
+}
+
+/// Scenario: recursive discovery is configured with a depth of one and sees
+/// a directory at that exact entry depth.
+/// Guarantees: requesting descent beyond the configured bound marks the pass
+/// incomplete instead of silently treating the unvisited subtree as absent.
+#[test]
+fn recursion_depth_exhaustion_is_explicitly_incomplete() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    std::fs::create_dir_all(root.join("a-child/grandchild")).unwrap();
+    std::fs::write(root.join("a-child/grandchild/deep.log"), b"deep").unwrap();
+    std::fs::write(root.join("z-visible.log"), b"visible").unwrap();
+    let mut config = runtime_config(root, vec![pattern(root, "**/*.log")], vec![]);
+    config.max_recursion_depth = 1;
+    let (mut scanner, mut admission) = scanner_and_admission(&config);
+
+    let batch = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+
+    assert!(!batch.inventory.is_complete());
+    assert_eq!(
+        observed_candidates(&batch)
+            .into_iter()
+            .map(|candidate| candidate.matched_path.clone())
+            .collect::<Vec<_>>(),
+        [root.join("z-visible.log")]
+    );
+    assert!(matches!(
+        batch.stats.first_issue,
+        Some(DiscoveryIssue::TraversalDepth { max_depth: 1, .. })
+    ));
 }
 
 #[cfg(unix)]
@@ -350,6 +458,190 @@ fn discovery_emfile_uses_one_global_descriptor_backoff() {
     assert!(recovered.inventory.is_complete());
     assert_eq!(scanner.descriptor_pressure_retry_at_for_test(), None);
     assert_eq!(recovered.stats.environmental_recoveries, 1);
+}
+
+#[cfg(unix)]
+/// Scenario: opening the first traversal directory fails with each Unix
+/// process/system descriptor-exhaustion code.
+/// Guarantees: traversal `EMFILE` and `ENFILE` enter the same receiver-global
+/// descriptor-pressure backoff as candidate probes and emit no false absence.
+#[test]
+fn traversal_descriptor_exhaustion_uses_global_backoff() {
+    for code in [libc::EMFILE, libc::ENFILE] {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("source.log"), b"line").unwrap();
+        let config = runtime_config(
+            directory.path(),
+            vec![pattern(directory.path(), "*.log")],
+            vec![],
+        );
+        let (mut scanner, mut admission) = scanner_and_admission(&config);
+        traversal::fail_next_directory_open(io::Error::from_raw_os_error(code));
+
+        let batch = scanner
+            .reconcile(&mut admission, SystemTime::now())
+            .unwrap();
+
+        assert!(!batch.inventory.is_complete());
+        assert!(observed_candidates(&batch).is_empty());
+        assert!(scanner.descriptor_pressure_retry_at_for_test().is_some());
+    }
+}
+
+#[cfg(unix)]
+/// Scenario: the first include root has a traversal permission error while a
+/// second root remains readable.
+/// Guarantees: only the failed root enters bounded environmental backoff, the
+/// pass is incomplete, and the unrelated root still produces fresh evidence.
+#[test]
+fn traversal_permission_error_is_root_local() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    std::fs::write(first.path().join("first.log"), b"first").unwrap();
+    std::fs::write(second.path().join("second.log"), b"second").unwrap();
+    let config = runtime_config(
+        first.path(),
+        vec![
+            pattern(first.path(), "*.log"),
+            pattern(second.path(), "*.log"),
+        ],
+        vec![],
+    );
+    let (mut scanner, mut admission) = scanner_and_admission(&config);
+    traversal::fail_next_directory_open(io::Error::from(io::ErrorKind::PermissionDenied));
+
+    let batch = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+
+    assert!(!batch.inventory.is_complete());
+    assert_eq!(observed_candidates(&batch).len(), 1);
+    assert!(
+        observed_candidates(&batch)[0]
+            .matched_path
+            .ends_with("second.log")
+    );
+    assert!(scanner.include_retry_state_for_test(0).is_some());
+    assert!(scanner.include_retry_state_for_test(1).is_none());
+}
+
+#[cfg(unix)]
+#[allow(
+    unsafe_code,
+    reason = "the test creates one FIFO with mkfifo to verify nonblocking rejection"
+)]
+/// Scenario: one include root contains a FIFO, Unix-domain socket, and a link
+/// to a character device under link-following discovery.
+/// Guarantees: every special candidate is rejected without blocking, no
+/// regular candidate is emitted, and the pass records incomplete evidence.
+#[test]
+fn special_file_candidates_are_nonblocking_and_rejected() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::net::UnixListener;
+
+    let directory = tempfile::tempdir().unwrap();
+    let fifo = directory.path().join("fifo.log");
+    let fifo_name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+    let _socket = UnixListener::bind(directory.path().join("socket.log")).unwrap();
+    symlink_file(Path::new("/dev/null"), &directory.path().join("device.log")).unwrap();
+    let mut config = runtime_config(
+        directory.path(),
+        vec![pattern(directory.path(), "*.log")],
+        vec![],
+    );
+    config.follow_symlinks = true;
+    let (mut scanner, mut admission) = scanner_and_admission(&config);
+    let started = Instant::now();
+
+    let batch = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(!batch.inventory.is_complete());
+    assert!(observed_candidates(&batch).is_empty());
+    assert_eq!(batch.stats.matched_paths, 3);
+}
+
+#[cfg(unix)]
+/// Scenario: link-following discovery encounters a dangling symlink ordered
+/// before one valid regular file.
+/// Guarantees: the dangling link is positive non-candidate evidence rather
+/// than a permanent traversal abort, so the later regular file is discovered
+/// and the pass remains complete.
+#[test]
+fn dangling_followed_symlink_does_not_hide_later_files() {
+    let directory = tempfile::tempdir().unwrap();
+    symlink_file(
+        &directory.path().join("missing-target"),
+        &directory.path().join("a-dangling.log"),
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("z-visible.log"), b"visible").unwrap();
+    let mut config = runtime_config(
+        directory.path(),
+        vec![pattern(directory.path(), "*.log")],
+        vec![],
+    );
+    config.follow_symlinks = true;
+    let (mut scanner, mut admission) = scanner_and_admission(&config);
+
+    let batch = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+
+    assert!(batch.inventory.is_complete());
+    assert_eq!(
+        observed_candidates(&batch)
+            .into_iter()
+            .map(|candidate| candidate.matched_path.clone())
+            .collect::<Vec<_>>(),
+        [directory.path().join("z-visible.log")]
+    );
+}
+
+#[cfg(unix)]
+/// Scenario: two followed file symlinks form an `ELOOP` cycle ordered before
+/// one valid regular file.
+/// Guarantees: the entry-local follow failure marks the inventory incomplete
+/// once but cannot terminate the pattern scan or hide later native names.
+#[test]
+fn cyclic_file_symlink_does_not_hide_later_files() {
+    let directory = tempfile::tempdir().unwrap();
+    symlink_file(
+        &directory.path().join("b-loop.log"),
+        &directory.path().join("a-loop.log"),
+    )
+    .unwrap();
+    symlink_file(
+        &directory.path().join("a-loop.log"),
+        &directory.path().join("b-loop.log"),
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("z-visible.log"), b"visible").unwrap();
+    let mut config = runtime_config(
+        directory.path(),
+        vec![pattern(directory.path(), "*.log")],
+        vec![],
+    );
+    config.follow_symlinks = true;
+    let (mut scanner, mut admission) = scanner_and_admission(&config);
+
+    let batch = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+
+    assert!(!batch.inventory.is_complete());
+    assert_eq!(
+        observed_candidates(&batch)
+            .into_iter()
+            .map(|candidate| candidate.matched_path.clone())
+            .collect::<Vec<_>>(),
+        [directory.path().join("z-visible.log")]
+    );
+    assert!(batch.stats.scan_errors >= 1);
 }
 
 #[cfg(unix)]
@@ -2073,6 +2365,63 @@ fn literal_file_include_is_discovered() {
 
     assert_eq!(observed_candidates(&batch).len(), 1);
     assert_eq!(observed_candidates(&batch)[0].matched_path, path);
+}
+
+/// Scenario: a broad include overlaps an exact literal exclude naming one
+/// regular file.
+/// Guarantees: the exclude root is dispatched through the file path rather
+/// than a directory-only traversal and suppresses candidate admission.
+#[test]
+fn literal_file_exclude_is_scanned() {
+    let directory = TempDir::new().unwrap();
+    let excluded = directory.path().join("excluded.log");
+    std::fs::write(&excluded, b"line").unwrap();
+    let config = runtime_config(
+        directory.path(),
+        vec![pattern(directory.path(), "*.log")],
+        vec![excluded.to_string_lossy().into_owned()],
+    );
+    let (mut scanner, mut admission) = scanner_and_admission(&config);
+
+    let batch = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+
+    assert!(batch.inventory.is_complete());
+    assert!(observed_candidates(&batch).is_empty());
+}
+
+/// Scenario: an exact literal file is durably acknowledged and then removed
+/// while its parent directory remains stable.
+/// Guarantees: discovery proves the literal name absent by traversing the
+/// parent directory and emits removal without treating the missing file path
+/// itself as complete evidence.
+#[test]
+fn literal_file_removal_is_proven_through_parent_directory() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("literal.log");
+    std::fs::write(&path, b"line").unwrap();
+    let config = runtime_config(
+        directory.path(),
+        vec![path.to_string_lossy().into_owned()],
+        vec![],
+    );
+    let (mut scanner, mut admission) = scanner_and_admission(&config);
+    let first = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+    admission.apply_feedback(durable_feedback(&first)).unwrap();
+    std::fs::remove_file(&path).unwrap();
+
+    let second = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+
+    assert!(second.inventory.is_complete());
+    assert!(matches!(
+        second.events.as_slice(),
+        [CandidateEvent::Removed { .. }]
+    ));
 }
 
 /// Scenario: a separator-free relative glob scans the current directory

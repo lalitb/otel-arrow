@@ -11,6 +11,7 @@
 pub(crate) mod admission;
 pub(crate) mod scanner;
 pub(crate) mod source;
+pub(crate) mod traversal;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -265,14 +266,41 @@ pub(crate) enum DiscoveryIssue {
         #[source]
         source: std::io::Error,
     },
-    /// WalkDir could not inspect one entry.
-    #[error("could not traverse below {path}: {source}")]
-    Walk {
-        /// Root or entry nearest the failure.
+    /// Native traversal could not open, inspect, or enumerate one directory.
+    #[error("could not {operation} at {path}: {source}")]
+    TraversalIo {
+        /// Stable traversal operation.
+        operation: &'static str,
+        /// Directory nearest the failure.
         path: PathBuf,
-        /// Structured traversal failure.
+        /// Underlying operating-system failure.
         #[source]
-        source: walkdir::Error,
+        source: std::io::Error,
+    },
+    /// A closed directory could not be resumed against identical bounded
+    /// locator and entry-set evidence.
+    #[error("could not resume traversal at {path}: {reason}")]
+    TraversalResume {
+        /// Directory whose resume evidence became ambiguous.
+        path: PathBuf,
+        /// Fixed bounded reason.
+        reason: &'static str,
+    },
+    /// Following a directory link reached an ancestor locator.
+    #[error("directory traversal cycle at {path} for locator {locator:?}")]
+    TraversalCycle {
+        /// Directory that repeated an ancestor locator.
+        path: PathBuf,
+        /// Repeated handle-derived directory locator.
+        locator: Locator,
+    },
+    /// Scanner policy requested descent beyond its configured bound.
+    #[error("directory traversal depth at {path} exceeds configured maximum {max_depth}")]
+    TraversalDepth {
+        /// Directory that would exceed the bound.
+        path: PathBuf,
+        /// Configured maximum entry depth.
+        max_depth: usize,
     },
     /// Handle-based identity collection rejected one candidate.
     #[error(transparent)]
@@ -310,6 +338,15 @@ pub(crate) enum DiscoveryError {
         field: &'static str,
         /// Rejected value.
         value: u64,
+    },
+    /// A bounded traversal allocation could not be reserved.
+    #[error("could not allocate bounded filelog discovery resource '{resource}'")]
+    AllocationFailed {
+        /// Resource whose validated capacity could not be reserved.
+        resource: &'static str,
+        /// Allocation failure reported by the standard collection.
+        #[source]
+        source: std::collections::TryReserveError,
     },
     /// A monotonic discovery counter exhausted its representation.
     #[error("filelog discovery counter '{counter}' overflowed")]

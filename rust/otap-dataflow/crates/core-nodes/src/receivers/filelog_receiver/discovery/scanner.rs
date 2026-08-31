@@ -13,14 +13,14 @@ use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use globset::GlobMatcher;
-use walkdir::WalkDir;
 
 use super::admission::AdmissionController;
+use super::traversal::{BoundedTraversal, TraversalEntryKind, TraversalFailure};
 use super::{
     DiscoveredCandidate, DiscoveryError, DiscoveryIssue, ReconciliationBatch, RevocationReason,
 };
 use crate::receivers::filelog_receiver::config::{
-    RuntimeConfig, glob_literal_prefix, reconciliation_delay_bounds_ns,
+    RuntimeConfig, glob_literal_prefix, glob_pattern_has_meta, reconciliation_delay_bounds_ns,
 };
 use crate::receivers::filelog_receiver::environment::{
     DescriptorPressure, EnvironmentalBackoff, EnvironmentalErrorClass, EnvironmentalOperation,
@@ -32,15 +32,10 @@ use crate::receivers::filelog_receiver::identity::platform::{
     open_locator_for_stability_check_cancellable,
 };
 
-/// Requested `walkdir` enumeration-handle cap. `walkdir` may buffer remaining
-/// entries when closing an iterator, and on Windows with link following it
-/// retains ancestor handles outside this cap. Those aggregate-resource and
-/// non-Linux runtime properties remain explicit qualification gates.
-pub(super) const MAX_OPEN_TRAVERSAL_DIRECTORIES: usize = 1;
-
 #[derive(Debug, Clone)]
 struct IncludeRoot {
     lexical_root: PathBuf,
+    literal_parent: Option<PathBuf>,
     matcher: GlobMatcher,
 }
 
@@ -160,16 +155,25 @@ impl DiscoveryPlan {
             .include
             .iter()
             .zip(&config.compiled_include)
-            .map(|(pattern, matcher)| IncludeRoot {
-                lexical_root: {
-                    let prefix = glob_literal_prefix(pattern);
-                    if prefix.as_os_str().is_empty() {
-                        PathBuf::from(".")
-                    } else {
-                        prefix
-                    }
-                },
-                matcher: matcher.clone(),
+            .map(|(pattern, matcher)| {
+                let prefix = glob_literal_prefix(pattern);
+                let lexical_root = if prefix.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    prefix
+                };
+                let literal_parent = (!glob_pattern_has_meta(pattern)).then(|| {
+                    lexical_root
+                        .parent()
+                        .filter(|parent| !parent.as_os_str().is_empty())
+                        .unwrap_or_else(|| Path::new("."))
+                        .to_path_buf()
+                });
+                IncludeRoot {
+                    lexical_root,
+                    literal_parent,
+                    matcher: matcher.clone(),
+                }
             })
             .collect();
         let exclude_patterns = config
@@ -516,46 +520,58 @@ impl FilesystemScanner {
         } else {
             1
         };
-        let mut entries = WalkDir::new(resolved_root)
-            .follow_links(self.plan.follow_symlinks)
-            .max_depth(maximum_depth)
-            .max_open(MAX_OPEN_TRAVERSAL_DIRECTORIES)
-            .into_iter();
+        let mut entries = BoundedTraversal::new(
+            resolved_root.to_path_buf(),
+            maximum_depth,
+            self.plan.follow_symlinks,
+        )?;
         loop {
             self.ensure_running()?;
-            let entry = entries.next();
+            let entry = entries.next(|| self.cancellation_requested());
             self.ensure_running()?;
-            let Some(entry) = entry else {
-                break;
-            };
             let entry = match entry {
-                Ok(entry) => entry,
-                Err(source) => {
-                    let path = source
-                        .path()
-                        .map_or_else(|| resolved_root.to_path_buf(), Path::to_path_buf);
-                    let issue = DiscoveryIssue::Walk { path, source };
-                    let retry =
-                        self.note_exclude_scan_environmental_failure(pattern_index, &issue)?;
-                    admission.record_denial_issue(issue)?;
-                    if retry {
-                        return Ok(());
+                Ok(Some(entry)) => {
+                    if entries.last_unit_opened_directory() {
+                        self.clear_descriptor_pressure_after_success(admission)?;
                     }
-                    continue;
+                    entry
+                }
+                Ok(None) => {
+                    if entries.last_unit_opened_directory() {
+                        self.clear_descriptor_pressure_after_success(admission)?;
+                    }
+                    break;
+                }
+                Err(failure) => {
+                    if self.record_exclude_traversal_failure(pattern_index, failure, admission)? {
+                        continue;
+                    }
+                    return Ok(());
                 }
             };
             let matched_path = entry.path();
-            if entry.depth() == 0 && entry.file_type().is_dir() {
+            if entry.depth() == 0 && entry.kind() == TraversalEntryKind::Directory {
                 if self.path_is_checkpoint_excluded(
                     matched_path,
                     matched_path,
                     checkpoint_namespace,
                 ) {
-                    entries.skip_current_dir();
+                    if let Err(failure) = entries.skip_current_dir() {
+                        let _ = self.record_exclude_traversal_failure(
+                            pattern_index,
+                            failure,
+                            admission,
+                        )?;
+                        return Ok(());
+                    }
+                } else if let Err(failure) = entries.descend_current_dir() {
+                    let _ =
+                        self.record_exclude_traversal_failure(pattern_index, failure, admission)?;
+                    return Ok(());
                 }
                 continue;
             }
-            if entry.file_type().is_dir() {
+            if entry.kind() == TraversalEntryKind::Directory {
                 let resolved_directory = std::fs::canonicalize(entry.path());
                 self.ensure_running()?;
                 let resolved_directory = match resolved_directory {
@@ -572,11 +588,18 @@ impl FilesystemScanner {
                         if retry {
                             return Ok(());
                         }
-                        entries.skip_current_dir();
+                        if let Err(failure) = entries.skip_current_dir() {
+                            let _ = self.record_exclude_traversal_failure(
+                                pattern_index,
+                                failure,
+                                admission,
+                            )?;
+                            return Ok(());
+                        }
                         continue;
                     }
                 };
-                if let Err(issue) = validate_walk_entry_path_stability(
+                if let Err(issue) = validate_traversal_entry_path_stability(
                     matched_path,
                     entry.path(),
                     &resolved_directory,
@@ -584,7 +607,14 @@ impl FilesystemScanner {
                     self.plan.follow_symlinks,
                 ) {
                     admission.record_denial_issue(issue)?;
-                    entries.skip_current_dir();
+                    if let Err(failure) = entries.skip_current_dir() {
+                        let _ = self.record_exclude_traversal_failure(
+                            pattern_index,
+                            failure,
+                            admission,
+                        )?;
+                        return Ok(());
+                    }
                     continue;
                 }
                 if self.path_is_checkpoint_excluded(
@@ -592,8 +622,33 @@ impl FilesystemScanner {
                     &resolved_directory,
                     checkpoint_namespace,
                 ) {
-                    entries.skip_current_dir();
+                    if let Err(failure) = entries.skip_current_dir() {
+                        let _ = self.record_exclude_traversal_failure(
+                            pattern_index,
+                            failure,
+                            admission,
+                        )?;
+                        return Ok(());
+                    }
+                } else if self.plan.recursive {
+                    if let Err(failure) = entries.descend_current_dir() {
+                        if self.record_exclude_traversal_failure(
+                            pattern_index,
+                            failure,
+                            admission,
+                        )? {
+                            continue;
+                        }
+                        return Ok(());
+                    }
+                } else if let Err(failure) = entries.skip_current_dir() {
+                    let _ =
+                        self.record_exclude_traversal_failure(pattern_index, failure, admission)?;
+                    return Ok(());
                 }
+                continue;
+            }
+            if entry.kind() == TraversalEntryKind::Other && entry.path_is_symlink() {
                 continue;
             }
             if !self.path_matches_user_exclude(matched_path, matched_path, resolved_excludes) {
@@ -620,7 +675,7 @@ impl FilesystemScanner {
                 }
             };
             self.ensure_running()?;
-            if let Err(issue) = validate_walk_entry_path_stability(
+            if let Err(issue) = validate_traversal_entry_path_stability(
                 matched_path,
                 entry.path(),
                 &resolved_path,
@@ -708,40 +763,64 @@ impl FilesystemScanner {
             })?;
             return Ok(());
         }
+        let mut scan_lexical_root = include.lexical_root.clone();
+        let mut absence_probe_only = false;
         let mut lexical_root_is_symlink = false;
-        if !self.plan.follow_symlinks {
-            let metadata = std::fs::symlink_metadata(&include.lexical_root);
-            self.ensure_running()?;
-            match metadata {
-                Ok(metadata) => lexical_root_is_symlink = metadata.file_type().is_symlink(),
-                Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                    self.clear_include_environmental_backoff(pattern_index, admission)?;
-                    return Ok(());
-                }
-                Err(source) => {
-                    let issue = DiscoveryIssue::Io {
-                        operation: "inspect include root without following links",
-                        path: include.lexical_root.clone(),
-                        source,
-                    };
-                    let _ = self.note_include_environmental_failure(pattern_index, &issue)?;
-                    admission.record_issue(issue)?;
-                    return Ok(());
-                }
-            }
-        }
-        let resolved_root = std::fs::canonicalize(&include.lexical_root);
+        let metadata = std::fs::symlink_metadata(&scan_lexical_root);
         self.ensure_running()?;
-        let resolved_root = match resolved_root {
-            Ok(path) => path,
+        match metadata {
+            Ok(metadata) => {
+                lexical_root_is_symlink =
+                    !self.plan.follow_symlinks && metadata.file_type().is_symlink();
+            }
+            Err(source)
+                if source.kind() == io::ErrorKind::NotFound && include.literal_parent.is_some() =>
+            {
+                scan_lexical_root = include
+                    .literal_parent
+                    .clone()
+                    .expect("the guarded literal parent exists");
+                absence_probe_only = true;
+            }
             Err(source) if source.kind() == io::ErrorKind::NotFound => {
                 self.clear_include_environmental_backoff(pattern_index, admission)?;
                 return Ok(());
             }
             Err(source) => {
                 let issue = DiscoveryIssue::Io {
-                    operation: "resolve include root",
+                    operation: "inspect include root without following links",
                     path: include.lexical_root.clone(),
+                    source,
+                };
+                let _ = self.note_include_environmental_failure(pattern_index, &issue)?;
+                admission.record_issue(issue)?;
+                return Ok(());
+            }
+        }
+        let mut resolved_root = std::fs::canonicalize(&scan_lexical_root);
+        self.ensure_running()?;
+        if resolved_root
+            .as_ref()
+            .is_err_and(|source| source.kind() == io::ErrorKind::NotFound)
+            && !absence_probe_only
+            && let Some(parent) = &include.literal_parent
+        {
+            scan_lexical_root = parent.clone();
+            absence_probe_only = true;
+            lexical_root_is_symlink = false;
+            resolved_root = std::fs::canonicalize(&scan_lexical_root);
+            self.ensure_running()?;
+        }
+        let resolved_root = match resolved_root {
+            Ok(path) => path,
+            Err(source) if source.kind() == io::ErrorKind::NotFound && !absence_probe_only => {
+                self.clear_include_environmental_backoff(pattern_index, admission)?;
+                return Ok(());
+            }
+            Err(source) => {
+                let issue = DiscoveryIssue::Io {
+                    operation: "resolve include root",
+                    path: scan_lexical_root.clone(),
                     source,
                 };
                 let _ = self.note_include_environmental_failure(pattern_index, &issue)?;
@@ -770,43 +849,52 @@ impl FilesystemScanner {
                 }
             }
         }
-        let maximum_depth = if self.plan.recursive {
+        let maximum_depth = if absence_probe_only {
+            1
+        } else if self.plan.recursive {
             self.plan.max_recursion_depth
         } else {
             1
         };
-        let mut entries = WalkDir::new(&resolved_root)
-            .follow_links(self.plan.follow_symlinks)
-            .max_depth(maximum_depth)
-            .max_open(MAX_OPEN_TRAVERSAL_DIRECTORIES)
-            .into_iter();
+        let mut entries = BoundedTraversal::new(
+            resolved_root.clone(),
+            maximum_depth,
+            self.plan.follow_symlinks,
+        )?;
         loop {
             self.ensure_running()?;
-            let entry = entries.next();
+            let entry = entries.next(|| self.cancellation_requested());
             self.ensure_running()?;
-            let Some(entry) = entry else {
-                break;
-            };
             let entry = match entry {
-                Ok(entry) => entry,
-                Err(source) => {
-                    let path = source
-                        .path()
-                        .map_or_else(|| resolved_root.clone(), Path::to_path_buf);
-                    let issue = DiscoveryIssue::Walk { path, source };
-                    let retry = self.note_include_environmental_failure(pattern_index, &issue)?;
-                    admission.record_issue(issue)?;
-                    if retry {
-                        return Ok(());
+                Ok(Some(entry)) => {
+                    if entries.last_unit_opened_directory() {
+                        self.clear_descriptor_pressure_after_success(admission)?;
                     }
-                    continue;
+                    entry
+                }
+                Ok(None) => {
+                    if entries.last_unit_opened_directory() {
+                        self.clear_descriptor_pressure_after_success(admission)?;
+                    }
+                    break;
+                }
+                Err(failure) => {
+                    if self.record_include_traversal_failure(pattern_index, failure, admission)? {
+                        continue;
+                    }
+                    return Ok(());
                 }
             };
-            if entry.depth() == 0 && entry.file_type().is_dir() {
+            if entry.depth() == 0 && entry.kind() == TraversalEntryKind::Directory {
+                if let Err(failure) = entries.descend_current_dir() {
+                    let _ =
+                        self.record_include_traversal_failure(pattern_index, failure, admission)?;
+                    return Ok(());
+                }
                 continue;
             }
             let matched_path = match entry.path().strip_prefix(&resolved_root) {
-                Ok(relative) => join_root(&include.lexical_root, relative),
+                Ok(relative) => join_root(&scan_lexical_root, relative),
                 Err(_) => {
                     admission.record_issue(DiscoveryIssue::Io {
                         operation: "map resolved entry to include root",
@@ -816,11 +904,21 @@ impl FilesystemScanner {
                             "walk entry escaped its resolved root",
                         ),
                     })?;
+                    if entry.kind() == TraversalEntryKind::Directory
+                        && let Err(failure) = entries.skip_current_dir()
+                    {
+                        let _ = self.record_include_traversal_failure(
+                            pattern_index,
+                            failure,
+                            admission,
+                        )?;
+                        return Ok(());
+                    }
                     continue;
                 }
             };
 
-            if entry.file_type().is_dir() {
+            if entry.kind() == TraversalEntryKind::Directory {
                 let resolved_directory = std::fs::canonicalize(entry.path());
                 self.ensure_running()?;
                 let resolved_directory = match resolved_directory {
@@ -837,11 +935,18 @@ impl FilesystemScanner {
                         if retry {
                             return Ok(());
                         }
-                        entries.skip_current_dir();
+                        if let Err(failure) = entries.skip_current_dir() {
+                            let _ = self.record_include_traversal_failure(
+                                pattern_index,
+                                failure,
+                                admission,
+                            )?;
+                            return Ok(());
+                        }
                         continue;
                     }
                 };
-                if let Err(issue) = validate_walk_entry_path_stability(
+                if let Err(issue) = validate_traversal_entry_path_stability(
                     &matched_path,
                     entry.path(),
                     &resolved_directory,
@@ -849,7 +954,14 @@ impl FilesystemScanner {
                     self.plan.follow_symlinks,
                 ) {
                     admission.record_issue(issue)?;
-                    entries.skip_current_dir();
+                    if let Err(failure) = entries.skip_current_dir() {
+                        let _ = self.record_include_traversal_failure(
+                            pattern_index,
+                            failure,
+                            admission,
+                        )?;
+                        return Ok(());
+                    }
                     continue;
                 }
                 let checkpoint_excluded = self.path_is_checkpoint_excluded(
@@ -858,7 +970,29 @@ impl FilesystemScanner {
                     checkpoint_namespace,
                 );
                 if checkpoint_excluded {
-                    entries.skip_current_dir();
+                    if let Err(failure) = entries.skip_current_dir() {
+                        let _ = self.record_include_traversal_failure(
+                            pattern_index,
+                            failure,
+                            admission,
+                        )?;
+                        return Ok(());
+                    }
+                } else if self.plan.recursive && !absence_probe_only {
+                    if let Err(failure) = entries.descend_current_dir() {
+                        if self.record_include_traversal_failure(
+                            pattern_index,
+                            failure,
+                            admission,
+                        )? {
+                            continue;
+                        }
+                        return Ok(());
+                    }
+                } else if let Err(failure) = entries.skip_current_dir() {
+                    let _ =
+                        self.record_include_traversal_failure(pattern_index, failure, admission)?;
+                    return Ok(());
                 }
                 continue;
             }
@@ -870,6 +1004,9 @@ impl FilesystemScanner {
             }
             if include_matches {
                 admission.increment_matched_paths()?;
+            }
+            if entry.kind() == TraversalEntryKind::Other && entry.path_is_symlink() {
+                continue;
             }
             if !self.plan.follow_symlinks && entry.path_is_symlink() {
                 continue;
@@ -911,7 +1048,7 @@ impl FilesystemScanner {
                 }
             };
             self.ensure_running()?;
-            if let Err(issue) = validate_walk_entry_path_stability(
+            if let Err(issue) = validate_traversal_entry_path_stability(
                 &matched_path,
                 entry.path(),
                 &resolved_path,
@@ -1319,6 +1456,65 @@ impl FilesystemScanner {
             || matched_path.starts_with(&self.plan.checkpoint_namespace_dir)
     }
 
+    fn clear_descriptor_pressure_after_success(
+        &mut self,
+        admission: &mut AdmissionController,
+    ) -> Result<(), DiscoveryError> {
+        if self
+            .descriptor_pressure
+            .clear_after_success(Instant::now())?
+        {
+            admission.record_environmental_recovery()?;
+        }
+        Ok(())
+    }
+
+    fn record_include_traversal_failure(
+        &mut self,
+        pattern_index: usize,
+        failure: TraversalFailure,
+        admission: &mut AdmissionController,
+    ) -> Result<bool, DiscoveryError> {
+        match failure {
+            TraversalFailure::Cancelled => {
+                self.ensure_running()?;
+                Ok(false)
+            }
+            TraversalFailure::Recoverable(issue) => {
+                admission.record_issue(issue)?;
+                Ok(true)
+            }
+            TraversalFailure::Stop(issue) => {
+                let _ = self.note_include_environmental_failure(pattern_index, &issue)?;
+                admission.record_issue(issue)?;
+                Ok(false)
+            }
+        }
+    }
+
+    fn record_exclude_traversal_failure(
+        &mut self,
+        pattern_index: usize,
+        failure: TraversalFailure,
+        admission: &mut AdmissionController,
+    ) -> Result<bool, DiscoveryError> {
+        match failure {
+            TraversalFailure::Cancelled => {
+                self.ensure_running()?;
+                Ok(false)
+            }
+            TraversalFailure::Recoverable(issue) => {
+                admission.record_denial_issue(issue)?;
+                Ok(true)
+            }
+            TraversalFailure::Stop(issue) => {
+                let _ = self.note_exclude_scan_environmental_failure(pattern_index, &issue)?;
+                admission.record_denial_issue(issue)?;
+                Ok(false)
+            }
+        }
+    }
+
     fn note_descriptor_pressure(&mut self, issue: &DiscoveryIssue) -> Result<bool, DiscoveryError> {
         let Some(source) = discovery_issue_io_error(issue) else {
             return Ok(false);
@@ -1526,9 +1722,12 @@ impl FilesystemScanner {
 fn discovery_issue_io_error(issue: &DiscoveryIssue) -> Option<&io::Error> {
     match issue {
         DiscoveryIssue::Io { source, .. } => Some(source),
-        DiscoveryIssue::Walk { source, .. } => source.io_error(),
+        DiscoveryIssue::TraversalIo { source, .. } => Some(source),
         DiscoveryIssue::Identity(IdentityError::Io { source, .. }) => Some(source),
         DiscoveryIssue::EnvironmentalBackoff { .. }
+        | DiscoveryIssue::TraversalResume { .. }
+        | DiscoveryIssue::TraversalCycle { .. }
+        | DiscoveryIssue::TraversalDepth { .. }
         | DiscoveryIssue::ConflictingPathRebind { .. }
         | DiscoveryIssue::Identity(_) => None,
     }
@@ -1542,7 +1741,7 @@ pub(crate) fn classify_environmental_issue(
         return None;
     }
     let operation = match issue {
-        DiscoveryIssue::Walk { .. } => EnvironmentalOperation::Traverse,
+        DiscoveryIssue::TraversalIo { .. } => EnvironmentalOperation::Traverse,
         DiscoveryIssue::Identity(IdentityError::Io { .. }) => EnvironmentalOperation::Probe,
         DiscoveryIssue::Io { operation, .. }
             if matches!(
@@ -1560,13 +1759,16 @@ pub(crate) fn classify_environmental_issue(
         }
         DiscoveryIssue::Io { .. } => EnvironmentalOperation::Probe,
         DiscoveryIssue::EnvironmentalBackoff { .. }
+        | DiscoveryIssue::TraversalResume { .. }
+        | DiscoveryIssue::TraversalCycle { .. }
+        | DiscoveryIssue::TraversalDepth { .. }
         | DiscoveryIssue::ConflictingPathRebind { .. }
         | DiscoveryIssue::Identity(_) => return None,
     };
     Some((operation, classify_io_error(source)))
 }
 
-fn validate_walk_entry_path_stability(
+fn validate_traversal_entry_path_stability(
     matched_path: &Path,
     walked_path: &Path,
     resolved_path: &Path,

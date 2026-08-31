@@ -66,7 +66,6 @@ secrecy.workspace = true
 async-stream.workspace = true
 arrow-ipc.workspace = true
 uuid.workspace = true
-walkdir.workspace = true
 xxhash-rust.workspace = true
 weaver_common = { workspace = true, optional = true }
 weaver_forge = { workspace = true, optional = true }

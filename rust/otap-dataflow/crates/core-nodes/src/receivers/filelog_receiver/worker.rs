@@ -1238,7 +1238,10 @@ impl WorkerRuntime {
                 .as_ref()
                 .map_or("unknown", |issue| match issue {
                     super::discovery::DiscoveryIssue::Io { .. } => "io",
-                    super::discovery::DiscoveryIssue::Walk { .. } => "walk",
+                    super::discovery::DiscoveryIssue::TraversalIo { .. } => "traversal_io",
+                    super::discovery::DiscoveryIssue::TraversalResume { .. } => "traversal_resume",
+                    super::discovery::DiscoveryIssue::TraversalCycle { .. } => "traversal_cycle",
+                    super::discovery::DiscoveryIssue::TraversalDepth { .. } => "traversal_depth",
                     super::discovery::DiscoveryIssue::Identity(_) => "identity",
                     super::discovery::DiscoveryIssue::EnvironmentalBackoff { .. } => {
                         "environmental_backoff"
