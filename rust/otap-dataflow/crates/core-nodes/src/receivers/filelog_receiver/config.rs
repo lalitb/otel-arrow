@@ -161,6 +161,9 @@ const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(5);
 /// Default `drain_timeout`.
 const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+const DISCOVERY_TRAVERSAL_DESCRIPTOR_BUDGET: u64 = 1;
+const TRANSIENT_PROBE_DESCRIPTOR_BUDGET: u64 = 1;
+const CHECKPOINT_DESCRIPTOR_BUDGET: u64 = 8;
 
 /// Registered semantic-convention attribute keys always attached to an
 /// emitted record when complete path evidence is lossless text, counted by
@@ -1055,6 +1058,15 @@ pub(crate) fn configured_logical_record_size(
     Ok(registered_size.max(native_size))
 }
 
+/// Receiver-owned descriptor admission evidence captured during config
+/// validation before any source or checkpoint handle is opened.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DescriptorBudget {
+    pub(crate) owned: u64,
+    pub(crate) soft_limit: Option<u64>,
+    pub(crate) warning: bool,
+}
+
 /// Validated, runtime-ready form of the filelog receiver configuration.
 ///
 /// Parsing produces this from [`Config`] once; a later runtime stage
@@ -1094,6 +1106,8 @@ pub(crate) struct RuntimeConfig {
     pub(crate) framing: FramingConfig,
     /// Bounded discovery, admission, and read populations.
     pub(crate) limits: LimitsConfig,
+    /// Receiver-local descriptor budget and process soft-limit comparison.
+    pub(crate) descriptor_budget: DescriptorBudget,
     /// Worker -> async batch shaping.
     pub(crate) batch: BatchConfig,
     /// Move/create and copy-truncate rotation handling.
@@ -1210,6 +1224,7 @@ impl RuntimeConfig {
         let checkpoint_namespace_dir = checkpoint_namespace_dir(&checkpoint_id);
         validate_checkpoint_bounds(&checkpoint, &limits, &identity)?;
         validate_identity_reconciliation_bounds(&identity, &limits)?;
+        let descriptor_budget = validate_descriptor_budget(limits.max_open_files)?;
 
         validate_discovery_pattern_population(&include, &exclude)?;
         let (include, compiled_include) = validate_include(include, &checkpoint_namespace_dir)?;
@@ -1232,6 +1247,7 @@ impl RuntimeConfig {
             on_decode_error,
             framing,
             limits,
+            descriptor_budget,
             batch,
             rotation,
             checkpoint,
@@ -1422,6 +1438,69 @@ fn validate_limits(limits: LimitsConfig) -> Result<LimitsConfig, otap_df_config:
         limits.max_read_bytes_per_turn,
     )?;
     Ok(limits)
+}
+
+fn validate_descriptor_budget(
+    max_open_files: u32,
+) -> Result<DescriptorBudget, otap_df_config::error::Error> {
+    let soft_limit = process_descriptor_soft_limit().map_err(|source| {
+        invalid(&format!(
+            "could not inspect the process descriptor soft limit: {source}"
+        ))
+    })?;
+    descriptor_budget_against_soft_limit(max_open_files, soft_limit)
+        .map_err(|message| invalid(&message))
+}
+
+fn descriptor_budget_against_soft_limit(
+    max_open_files: u32,
+    soft_limit: Option<u64>,
+) -> Result<DescriptorBudget, String> {
+    let owned = u64::from(max_open_files)
+        .checked_add(DISCOVERY_TRAVERSAL_DESCRIPTOR_BUDGET)
+        .and_then(|value| value.checked_add(TRANSIENT_PROBE_DESCRIPTOR_BUDGET))
+        .and_then(|value| value.checked_add(CHECKPOINT_DESCRIPTOR_BUDGET))
+        .ok_or_else(|| "filelog receiver descriptor budget overflows u64".to_owned())?;
+    let warning = match soft_limit {
+        Some(limit) if owned > limit => {
+            return Err(format!(
+                "filelog receiver descriptor budget {owned} exceeds process soft limit {limit} \
+                 (limits.max_open_files={max_open_files}, traversal=1, transient_probe=1, \
+                 checkpoint=8)"
+            ));
+        }
+        Some(limit) => u128::from(owned) * 100 > u128::from(limit) * 80,
+        None => false,
+    };
+    Ok(DescriptorBudget {
+        owned,
+        soft_limit,
+        warning,
+    })
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn process_descriptor_soft_limit() -> std::io::Result<Option<u64>> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid writable `rlimit` and remains alive for the
+    // duration of the call. `getrlimit` does not retain the pointer.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if limit.rlim_cur == libc::RLIM_INFINITY {
+        Ok(None)
+    } else {
+        Ok(Some(limit.rlim_cur))
+    }
+}
+
+#[cfg(not(unix))]
+fn process_descriptor_soft_limit() -> std::io::Result<Option<u64>> {
+    Ok(None)
 }
 
 fn validate_identity_reconciliation_bounds(
@@ -2448,6 +2527,13 @@ mod tests {
 
         let runtime = RuntimeConfig::from_config(cfg, "node-1").expect("defaults must validate");
         assert_eq!(runtime.checkpoint_id, "node-1");
+        assert_eq!(runtime.descriptor_budget.owned, 522);
+        assert!(
+            runtime
+                .descriptor_budget
+                .soft_limit
+                .is_none_or(|limit| limit >= runtime.descriptor_budget.owned)
+        );
         assert!(runtime.compiled_multiline_pattern.is_none());
     }
 
@@ -3474,6 +3560,33 @@ mod tests {
         cfg.limits.max_tracked_files = 10;
         cfg.limits.max_open_files = 10;
         assert!(RuntimeConfig::from_config(cfg, "node-1").is_ok());
+    }
+
+    /// Scenario: receiver-owned descriptor budgets are below, exactly at,
+    /// and above 80 percent and the process soft limit.
+    /// Guarantees: equality with 80 percent does not warn, values above it
+    /// warn, equality with the soft limit is accepted, and exceedance is
+    /// rejected before any handle is opened.
+    #[test]
+    fn descriptor_budget_enforces_soft_limit_and_warning_boundary() {
+        let exact_eighty = descriptor_budget_against_soft_limit(70, Some(100)).unwrap();
+        assert_eq!(exact_eighty.owned, 80);
+        assert!(!exact_eighty.warning);
+
+        let above_eighty = descriptor_budget_against_soft_limit(71, Some(100)).unwrap();
+        assert_eq!(above_eighty.owned, 81);
+        assert!(above_eighty.warning);
+
+        let exact_limit = descriptor_budget_against_soft_limit(90, Some(100)).unwrap();
+        assert_eq!(exact_limit.owned, 100);
+        assert!(exact_limit.warning);
+
+        let error = descriptor_budget_against_soft_limit(91, Some(100)).unwrap_err();
+        assert!(error.contains("exceeds process soft limit"));
+
+        let unlimited = descriptor_budget_against_soft_limit(u32::MAX, None).unwrap();
+        assert_eq!(unlimited.owned, u64::from(u32::MAX) + 10);
+        assert!(!unlimited.warning);
     }
 
     /// Scenario: discovery retains candidate state while one inventory is

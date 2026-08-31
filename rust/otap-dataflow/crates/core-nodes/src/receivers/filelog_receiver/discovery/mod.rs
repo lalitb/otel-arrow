@@ -19,6 +19,9 @@ use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 
 use super::checkpoint::{AdvisoryPath, Locator};
+use super::environment::{
+    DescriptorPressureError, EnvironmentalErrorClass, EnvironmentalOperation,
+};
 use super::identity::matcher::CandidateInventory;
 use super::identity::{CandidateEvidence, IdentityError};
 
@@ -92,6 +95,8 @@ pub(crate) struct DiscoveryStats {
     /// Recoverable filesystem or identity observations that made the pass
     /// incomplete.
     pub(crate) scan_errors: u64,
+    /// Environmental traversal/probe retry states cleared during this pass.
+    pub(crate) environmental_recoveries: u64,
     /// Retained pending-candidate depth after reconciliation.
     pub(crate) pending_candidates: usize,
     /// Candidate transitions in the emitted batch.
@@ -120,6 +125,7 @@ impl DiscoveryStats {
             eligible_candidates: 0,
             overflowed_candidates: 0,
             scan_errors: 0,
+            environmental_recoveries: 0,
             pending_candidates: 0,
             emitted_events: 0,
             scan_duration: Duration::ZERO,
@@ -271,6 +277,15 @@ pub(crate) enum DiscoveryIssue {
     /// Handle-based identity collection rejected one candidate.
     #[error(transparent)]
     Identity(#[from] IdentityError),
+    /// An environmental traversal or probe condition deferred work until its
+    /// bounded retry deadline.
+    #[error("filelog discovery is waiting to retry {operation} after {error}")]
+    EnvironmentalBackoff {
+        /// Operation that remains deferred.
+        operation: EnvironmentalOperation,
+        /// Fixed environmental error class.
+        error: EnvironmentalErrorClass,
+    },
     /// A distinguished matched-path binding's prior owner rebound to more
     /// than one live locator within one pass, or two different prior
     /// owners both rebound to the same newly observed locator. Either
@@ -309,6 +324,9 @@ pub(crate) enum DiscoveryError {
         /// Schedule field or operation that overflowed.
         field: &'static str,
     },
+    /// Shared receiver descriptor-pressure state failed.
+    #[error(transparent)]
+    DescriptorPressure(#[from] DescriptorPressureError),
     /// Reader feedback did not correspond to a live discovery entry.
     #[error("invalid filelog discovery feedback for locator {locator:?}: {reason}")]
     InvalidFeedback {

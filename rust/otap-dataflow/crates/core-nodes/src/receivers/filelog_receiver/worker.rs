@@ -32,14 +32,15 @@ use super::checkpoint::store::error::StoreError;
 use super::checkpoint::store::{CheckpointStore, StoreOptions, StoreStats};
 use super::checkpoint::wal::{Operation, QuarantineFile, ResetAfterTruncate};
 use super::config::{OnTruncate, RuntimeConfig};
-use super::discovery::scanner::DiscoveryPlan;
+use super::discovery::scanner::{DiscoveryPlan, classify_environmental_issue};
 use super::discovery::source::{
-    DiscoveryHandle, FeedbackSendError, spawn_discovery_with_shutdown_signal,
+    DiscoveryHandle, FeedbackSendError, spawn_discovery_with_shutdown_signal_and_pressure,
 };
 use super::discovery::{
     CandidateEvent, DiscoveryError, DiscoveryFeedback, DiscoveryMessage, DiscoveryRelease,
     DurableAck, ReconciliationBatch, RetentionRemovalAck,
 };
+use super::environment::{DescriptorPressure, EnvironmentalErrorClass};
 use super::framing::{DecodeError, DecodeOutcome, FlushReason, FramedRecord, Framer, FramerError};
 use super::identity::CandidateEvidence;
 use super::identity::IdentityError;
@@ -551,6 +552,18 @@ impl WorkerRuntime {
         telemetry: Arc<WorkerTelemetryBridge>,
         shutdown_requested: Arc<AtomicBool>,
     ) -> Result<Self, WorkerError> {
+        if config.descriptor_budget.warning {
+            telemetry.add(WorkerCounter::DescriptorBudgetWarnings, 1);
+            otel_warn!(
+                "filelog_receiver.descriptor_budget_warning",
+                receiver_budget = config.descriptor_budget.owned,
+                process_soft_limit = config.descriptor_budget.soft_limit.unwrap_or(u64::MAX),
+                max_open_files = config.limits.max_open_files,
+                traversal_descriptors = 1,
+                transient_probe_descriptors = 1,
+                checkpoint_descriptors = 8
+            );
+        }
         let cancellation = Arc::clone(&shutdown_requested);
         let store =
             CheckpointStore::open_cancellable(StoreOptions::from_runtime_config(&config), || {
@@ -668,16 +681,21 @@ impl WorkerRuntime {
         if shutdown_requested.load(Ordering::Acquire) {
             return Err(WorkerError::StartupCancelled);
         }
-        let readers = ReaderTable::new_with_shutdown_signal(
+        let descriptor_pressure = Arc::new(DescriptorPressure::default());
+        let readers = ReaderTable::new_with_shutdown_signal_and_pressure(
             ReaderSettings::from_runtime(&config),
             Arc::clone(&shutdown_requested),
+            Arc::clone(&descriptor_pressure),
         )?;
         let open_batch = OpenBatch::new(&config)?;
         if shutdown_requested.load(Ordering::Acquire) {
             return Err(WorkerError::StartupCancelled);
         }
-        let discovery =
-            spawn_discovery_with_shutdown_signal(discovery_plan, Arc::clone(&shutdown_requested))?;
+        let discovery = spawn_discovery_with_shutdown_signal_and_pressure(
+            discovery_plan,
+            Arc::clone(&shutdown_requested),
+            descriptor_pressure,
+        )?;
         if shutdown_requested.load(Ordering::Acquire) {
             drop(discovery);
             return Err(WorkerError::StartupCancelled);
@@ -853,6 +871,11 @@ impl WorkerRuntime {
                 return Ok(());
             }
             let poll = poll?;
+            let environmental_recoveries = self.readers_mut()?.take_environmental_recoveries();
+            self.telemetry.add(
+                WorkerCounter::EnvironmentalRecoveries,
+                environmental_recoveries,
+            );
             let next_reader_probe = match poll {
                 ReaderPoll::Cancelled => return Ok(()),
                 ReaderPoll::Data(turn) => {
@@ -918,6 +941,23 @@ impl WorkerRuntime {
                         self.discard_framer(request.victim_file_id);
                         self.readers_mut()?.confirm_eviction(request)?;
                         self.publish_reader_gauges();
+                    }
+                    continue;
+                }
+                ReaderPoll::EnvironmentalBackoff {
+                    operation, error, ..
+                } => {
+                    self.telemetry.add(WorkerCounter::EnvironmentalReprobes, 1);
+                    if error == EnvironmentalErrorClass::DescriptorPressure {
+                        self.telemetry.add(WorkerCounter::DescriptorSaturation, 1);
+                    }
+                    if let Some(suppressed) = self.health_event(HealthEventCategory::Source) {
+                        otel_warn!(
+                            "filelog_receiver.source_reprobe_scheduled",
+                            operation = operation.as_str(),
+                            error_type = error.as_str(),
+                            suppressed_events = suppressed
+                        );
                     }
                     continue;
                 }
@@ -1122,6 +1162,10 @@ impl WorkerRuntime {
         self.telemetry
             .add(WorkerCounter::DiscoveryScanErrors, stats.scan_errors);
         self.telemetry.add(
+            WorkerCounter::EnvironmentalRecoveries,
+            stats.environmental_recoveries,
+        );
+        self.telemetry.add(
             WorkerCounter::DiscoveryScanDurationNs,
             duration_ns(stats.scan_duration),
         );
@@ -1151,6 +1195,24 @@ impl WorkerRuntime {
             WorkerGauge::CandidateOverflowPersistenceNs,
             duration_ns(stats.overflow_persistence),
         );
+        if let Some((operation, error)) = stats
+            .first_issue
+            .as_ref()
+            .and_then(classify_environmental_issue)
+        {
+            self.telemetry.add(WorkerCounter::EnvironmentalReprobes, 1);
+            if error == EnvironmentalErrorClass::DescriptorPressure {
+                self.telemetry.add(WorkerCounter::DescriptorSaturation, 1);
+            }
+            if let Some(suppressed) = self.health_event(HealthEventCategory::Source) {
+                otel_warn!(
+                    "filelog_receiver.discovery_reprobe_scheduled",
+                    operation = operation.as_str(),
+                    error_type = error.as_str(),
+                    suppressed_events = suppressed
+                );
+            }
+        }
 
         let mut observed = 0u64;
         let mut updated = 0u64;
@@ -1178,6 +1240,9 @@ impl WorkerRuntime {
                     super::discovery::DiscoveryIssue::Io { .. } => "io",
                     super::discovery::DiscoveryIssue::Walk { .. } => "walk",
                     super::discovery::DiscoveryIssue::Identity(_) => "identity",
+                    super::discovery::DiscoveryIssue::EnvironmentalBackoff { .. } => {
+                        "environmental_backoff"
+                    }
                     super::discovery::DiscoveryIssue::ConflictingPathRebind { .. } => {
                         "conflicting_path_rebind"
                     }
@@ -1209,6 +1274,11 @@ impl WorkerRuntime {
     ) -> Result<LoopControl, WorkerError> {
         if self.cancellation_requested() {
             return Ok(LoopControl::Shutdown);
+        }
+        let now = Instant::now();
+        if let Some(retry_at) = self.readers_ref()?.descriptor_pressure_deadline(now)? {
+            self.defer_reconciliation(batch, Some(retry_at))?;
+            return Ok(LoopControl::Continue);
         }
         self.observe_retention_inventory(&batch);
         let retention_revalidation_ready = batch.stats.complete
@@ -3488,6 +3558,11 @@ impl WorkerRuntime {
                     return Ok(LoopControl::Shutdown);
                 }
                 let poll = poll?;
+                let environmental_recoveries = self.readers_mut()?.take_environmental_recoveries();
+                self.telemetry.add(
+                    WorkerCounter::EnvironmentalRecoveries,
+                    environmental_recoveries,
+                );
                 match poll {
                     ReaderPoll::Cancelled => return Ok(LoopControl::Shutdown),
                     ReaderPoll::Data(turn) => {
@@ -3546,6 +3621,18 @@ impl WorkerRuntime {
                         continue;
                     }
                     ReaderPoll::EvidenceUnstable { next_probe, .. } => {
+                        match command_rx.recv_timeout(self.next_wait(Some(next_probe))) {
+                            Ok(command) => {
+                                return self.handle_command(command, event_tx, command_rx);
+                            }
+                            Err(RecvTimeoutError::Timeout) => continue,
+                            Err(RecvTimeoutError::Disconnected) => {
+                                return Ok(LoopControl::Shutdown);
+                            }
+                        }
+                    }
+                    ReaderPoll::EnvironmentalBackoff { next_probe, .. } => {
+                        self.telemetry.add(WorkerCounter::EnvironmentalReprobes, 1);
                         match command_rx.recv_timeout(self.next_wait(Some(next_probe))) {
                             Ok(command) => {
                                 return self.handle_command(command, event_tx, command_rx);

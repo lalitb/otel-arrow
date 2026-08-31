@@ -175,6 +175,18 @@ pub struct FilelogReceiverMetrics {
     /// Events that encountered no evictable descriptor slot.
     #[metric(name = "files.descriptor.saturation", unit = "{event}")]
     pub descriptor_saturation: Counter<u64>,
+    /// Startup warnings where the receiver-owned descriptor budget exceeds
+    /// 80 percent of the process soft limit.
+    #[metric(name = "descriptor.budget.warnings", unit = "{warning}")]
+    pub descriptor_budget_warnings: Counter<u64>,
+    /// Source, probe, or traversal operations scheduled for bounded
+    /// environmental retry.
+    #[metric(name = "environmental.reprobes", unit = "{reprobe}")]
+    pub environmental_reprobes: Counter<u64>,
+    /// Environmental retry conditions cleared by a successful source or
+    /// discovery operation.
+    #[metric(name = "environmental.recoveries", unit = "{recovery}")]
+    pub environmental_recoveries: Counter<u64>,
     /// Current durable tracked-record population.
     #[metric(name = "files.tracked", unit = "{file}")]
     pub files_tracked: Gauge<u64>,
@@ -383,6 +395,9 @@ pub(super) enum WorkerCounter {
     CandidateAdmissions,
     TrackedSaturation,
     DescriptorSaturation,
+    DescriptorBudgetWarnings,
+    EnvironmentalReprobes,
+    EnvironmentalRecoveries,
     IdentityRegistrations,
     IdentityResets,
     IdentityRecoveryMismatches,
@@ -540,6 +555,9 @@ impl WorkerTelemetryBridge {
         drain!(CandidateAdmissions, candidate_admissions);
         drain!(TrackedSaturation, tracked_saturation);
         drain!(DescriptorSaturation, descriptor_saturation);
+        drain!(DescriptorBudgetWarnings, descriptor_budget_warnings);
+        drain!(EnvironmentalReprobes, environmental_reprobes);
+        drain!(EnvironmentalRecoveries, environmental_recoveries);
         drain!(IdentityRegistrations, identity_registrations);
         drain!(IdentityResets, identity_resets);
         drain!(IdentityRecoveryMismatches, identity_recovery_mismatches);
@@ -687,10 +705,11 @@ pub(super) enum HealthEventCategory {
     Quarantine,
     Rotation,
     Partial,
+    Source,
 }
 
 impl HealthEventCategory {
-    const COUNT: usize = Self::Partial as usize + 1;
+    const COUNT: usize = Self::Source as usize + 1;
 
     /// Stable bounded category value used by suppression summaries.
     pub(super) const fn as_str(self) -> &'static str {
@@ -715,6 +734,7 @@ impl HealthEventCategory {
             Self::Quarantine => "quarantine",
             Self::Rotation => "rotation",
             Self::Partial => "partial",
+            Self::Source => "source",
         }
     }
 }
@@ -822,16 +842,25 @@ mod tests {
         let (_registry, mut metrics) = registered();
         bridge.add(WorkerCounter::FilesEligible, 3);
         bridge.add(WorkerCounter::CarryOverRecords, 1);
+        bridge.add(WorkerCounter::DescriptorBudgetWarnings, 1);
+        bridge.add(WorkerCounter::EnvironmentalReprobes, 2);
+        bridge.add(WorkerCounter::EnvironmentalRecoveries, 1);
         bridge.set(WorkerGauge::FilesOpen, 2);
         bridge.drain_into(&mut metrics);
         assert_eq!(metrics.files_eligible.get(), 3);
         assert_eq!(metrics.carry_over_records.get(), 1);
+        assert_eq!(metrics.descriptor_budget_warnings.get(), 1);
+        assert_eq!(metrics.environmental_reprobes.get(), 2);
+        assert_eq!(metrics.environmental_recoveries.get(), 1);
         assert_eq!(metrics.files_open.get(), 2);
 
         metrics.clear_values();
         bridge.drain_into(&mut metrics);
         assert_eq!(metrics.files_eligible.get(), 0);
         assert_eq!(metrics.carry_over_records.get(), 0);
+        assert_eq!(metrics.descriptor_budget_warnings.get(), 0);
+        assert_eq!(metrics.environmental_reprobes.get(), 0);
+        assert_eq!(metrics.environmental_recoveries.get(), 0);
         assert_eq!(metrics.files_open.get(), 2);
 
         bridge.add(WorkerCounter::FilesEligible, 4);

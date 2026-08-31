@@ -35,7 +35,7 @@ use crate::receivers::filelog_receiver::checkpoint::wal::{RegisterFile, UpdatePr
 use crate::receivers::filelog_receiver::config::ATTR_KEY_TERMINAL_UNTERMINATED;
 use crate::receivers::filelog_receiver::config::{
     ATTR_KEY_FLUSH_REASON, ATTR_KEY_FRAGMENT_ID, ATTR_KEY_FRAGMENT_INDEX,
-    ATTR_KEY_FRAGMENT_IS_LAST, ATTR_KEY_LOG_FILE_NAME, Config, OnDecodeError,
+    ATTR_KEY_FRAGMENT_IS_LAST, ATTR_KEY_LOG_FILE_NAME, Config, DescriptorBudget, OnDecodeError,
 };
 use crate::receivers::filelog_receiver::discovery::admission::AdmissionController;
 use crate::receivers::filelog_receiver::discovery::scanner::DiscoveryPlan;
@@ -357,6 +357,39 @@ fn preappend_compaction_is_reported_through_store_deltas() {
             .telemetry
             .counter_for_test(WorkerCounter::CheckpointCompactionDurationNs),
         compaction_duration
+    );
+    runtime.shutdown_resources().unwrap();
+}
+
+/// Scenario: validated descriptor admission reports a receiver budget above
+/// 80 percent of a finite process soft limit.
+/// Guarantees: worker startup emits exactly one bounded warning counter and
+/// does not attach path, file, or raw-error dimensions.
+#[test]
+fn descriptor_budget_warning_is_reported_once_at_startup() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("descriptor-warning.log");
+    std::fs::write(&source, b"line\n").unwrap();
+    let mut config = runtime_config(
+        source.to_str().unwrap(),
+        &directory.path().join("checkpoint"),
+        1,
+    );
+    config.descriptor_budget = DescriptorBudget {
+        owned: 81,
+        soft_limit: Some(100),
+        warning: true,
+    };
+    let telemetry = Arc::new(WorkerTelemetryBridge::default());
+    let mut runtime = WorkerRuntime::new_with_telemetry(
+        config,
+        Arc::clone(&telemetry),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    assert_eq!(
+        telemetry.counter_for_test(WorkerCounter::DescriptorBudgetWarnings),
+        1
     );
     runtime.shutdown_resources().unwrap();
 }

@@ -122,6 +122,25 @@ fn eviction(poll: ReaderPoll) -> EvictionRequest {
     }
 }
 
+fn environmental(
+    poll: ReaderPoll,
+) -> (
+    FileId,
+    EnvironmentalOperation,
+    EnvironmentalErrorClass,
+    Instant,
+) {
+    match poll {
+        ReaderPoll::EnvironmentalBackoff {
+            file_id,
+            operation,
+            error,
+            next_probe,
+        } => (file_id, operation, error, next_probe),
+        other => panic!("expected environmental backoff, got {other:?}"),
+    }
+}
+
 /// Scenario: two continuously readable files share one bounded scheduler.
 /// Guarantees: each reader receives one source-byte turn before either gets
 /// a second turn, every turn respects the byte cap, and per-file offsets are
@@ -164,6 +183,236 @@ fn round_robin_turns_bound_bytes_and_preserve_file_order() {
     assert_eq!(first_again.bytes(), b"cd");
     table
         .complete_turn(first_again, 2, TurnDisposition::Paused)
+        .unwrap();
+    table.shutdown().unwrap();
+}
+
+/// Scenario: one resident reader's positioned read fails with a temporary
+/// permission error while a second file is ready.
+/// Guarantees: the failed file keeps its progress and descriptor, receives a
+/// 250ms bounded retry, and the unrelated file continues immediately.
+#[test]
+fn per_file_read_error_backs_off_without_blocking_other_readers() {
+    let directory = tempdir().unwrap();
+    let first_path = directory.path().join("failed.log");
+    let second_path = directory.path().join("healthy.log");
+    std::fs::write(&first_path, b"fail").unwrap();
+    std::fs::write(&second_path, b"okay").unwrap();
+    let mut table = ReaderTable::new(settings(2, 2, 4)).unwrap();
+    table
+        .insert(candidate(&first_path), resolved(1, 0))
+        .unwrap();
+    table
+        .insert(candidate(&second_path), resolved(2, 0))
+        .unwrap();
+    table.fail_next_read_for_test(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "temporary permission",
+    ));
+    let now = Instant::now();
+
+    let (failed, operation, class, retry_at) = environmental(table.poll(now).unwrap());
+    assert_eq!(failed, file_id(1));
+    assert_eq!(operation, EnvironmentalOperation::Read);
+    assert_eq!(class, EnvironmentalErrorClass::Permission);
+    assert_eq!(retry_at.duration_since(now), Duration::from_millis(250));
+    let healthy = data(table.poll(now).unwrap());
+    assert_eq!(healthy.file_id(), file_id(2));
+    assert_eq!(healthy.bytes(), b"okay");
+    table
+        .complete_turn(healthy, 4, TurnDisposition::Paused)
+        .unwrap();
+
+    let stats = table.stats();
+    assert_eq!(stats.environmental_backoff_readers, 1);
+    assert_eq!(stats.eof_readers, 0);
+    assert_eq!(stats.removed_readers, 0);
+    assert_eq!(table.frontier(file_id(1)).unwrap().committed_offset, 0);
+    let recovered = data(table.poll(retry_at).unwrap());
+    assert_eq!(recovered.file_id(), file_id(1));
+    assert_eq!(recovered.bytes(), b"fail");
+    table
+        .complete_turn(recovered, 4, TurnDisposition::Paused)
+        .unwrap();
+    assert_eq!(table.take_environmental_recoveries(), 1);
+    assert_eq!(table.stats().environmental_backoff_readers, 0);
+    table.shutdown().unwrap();
+}
+
+/// Scenario: opening one descriptor-absent file fails with a temporary
+/// permission error while another file is ready.
+/// Guarantees: only the failed file receives per-file backoff; descriptor
+/// pressure remains clear and the unrelated source opens and reads normally.
+#[test]
+fn per_file_open_error_does_not_pause_unrelated_reader() {
+    let directory = tempdir().unwrap();
+    let first_path = directory.path().join("failed-open.log");
+    let second_path = directory.path().join("healthy-open.log");
+    std::fs::write(&first_path, b"x").unwrap();
+    std::fs::write(&second_path, b"y").unwrap();
+    let mut table = ReaderTable::new(settings(2, 2, 1)).unwrap();
+    table
+        .insert(candidate(&first_path), resolved(1, 0))
+        .unwrap();
+    table
+        .insert(candidate(&second_path), resolved(2, 0))
+        .unwrap();
+    table.fail_next_open_for_test(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "temporary permission",
+    ));
+    let now = Instant::now();
+
+    let (failed, operation, class, retry_at) = environmental(table.poll(now).unwrap());
+    assert_eq!(failed, file_id(1));
+    assert_eq!(operation, EnvironmentalOperation::Open);
+    assert_eq!(class, EnvironmentalErrorClass::Permission);
+    assert_eq!(retry_at.duration_since(now), Duration::from_millis(250));
+    assert_eq!(table.descriptor_pressure_deadline(now).unwrap(), None);
+
+    let healthy = data(table.poll(now).unwrap());
+    assert_eq!(healthy.file_id(), file_id(2));
+    assert_eq!(healthy.bytes(), b"y");
+    table
+        .complete_turn(healthy, 1, TurnDisposition::Paused)
+        .unwrap();
+    assert_eq!(table.stats().environmental_backoff_readers, 1);
+    assert_eq!(table.stats().removed_readers, 0);
+    table.shutdown().unwrap();
+}
+
+/// Scenario: a present descriptor-absent reader's path temporarily returns
+/// `NotFound` before discovery has produced removal evidence.
+/// Guarantees: the reader preserves presence and progress under per-file
+/// environmental backoff; source reading does not invent a removal event.
+#[test]
+fn reopen_not_found_waits_for_discovery_removal_evidence() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("temporarily-missing.log");
+    std::fs::write(&path, b"x").unwrap();
+    let mut table = ReaderTable::new(settings(1, 1, 1)).unwrap();
+    table.insert(candidate(&path), resolved(1, 0)).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let now = Instant::now();
+
+    let (failed_id, operation, class, retry_at) = environmental(table.poll(now).unwrap());
+    assert_eq!(failed_id, file_id(1));
+    assert_eq!(operation, EnvironmentalOperation::Open);
+    assert_eq!(class, EnvironmentalErrorClass::Other);
+    assert_eq!(retry_at.duration_since(now), Duration::from_millis(250));
+    let frontier = table.frontier(failed_id).unwrap();
+    assert!(frontier.present);
+    assert_eq!(frontier.committed_offset, 0);
+    assert_eq!(table.stats().removed_readers, 0);
+    table.shutdown().unwrap();
+}
+
+/// Scenario: lifecycle pause arrives while a per-file environmental retry is
+/// waiting on its deadline.
+/// Guarantees: the wait is removed immediately without progress, while the
+/// bounded failure count remains available if drain explicitly retries the
+/// same source.
+#[test]
+fn lifecycle_pause_interrupts_environmental_retry_wait() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("paused-retry.log");
+    std::fs::write(&path, b"x").unwrap();
+    let mut table = ReaderTable::new(settings(1, 1, 1)).unwrap();
+    table.insert(candidate(&path), resolved(1, 0)).unwrap();
+    table.fail_next_read_for_test(io::Error::new(io::ErrorKind::WouldBlock, "retry"));
+    let now = Instant::now();
+    let (failed_id, _, _, _) = environmental(table.poll(now).unwrap());
+
+    table.pause(failed_id).unwrap();
+    assert_eq!(table.stats().environmental_backoff_readers, 0);
+    assert_eq!(table.frontier(failed_id).unwrap().read_offset, 0);
+    assert!(table.environmental_failures.contains_key(&failed_id));
+    table.shutdown().unwrap();
+}
+
+#[cfg(unix)]
+/// Scenario: the first descriptor open receives `EMFILE` while a second
+/// descriptor-absent reader is ready.
+/// Guarantees: one receiver-global 250ms deadline pauses both new opens,
+/// neither reader is removed or quarantined, and a successful retry clears
+/// descriptor pressure.
+#[test]
+fn emfile_pauses_new_opens_until_bounded_retry() {
+    let directory = tempdir().unwrap();
+    let first_path = directory.path().join("first.log");
+    let second_path = directory.path().join("second.log");
+    std::fs::write(&first_path, b"a").unwrap();
+    std::fs::write(&second_path, b"b").unwrap();
+    let mut table = ReaderTable::new(settings(2, 2, 1)).unwrap();
+    table
+        .insert(candidate(&first_path), resolved(1, 0))
+        .unwrap();
+    table
+        .insert(candidate(&second_path), resolved(2, 0))
+        .unwrap();
+    table.fail_next_open_for_test(io::Error::from_raw_os_error(libc::EMFILE));
+    let now = Instant::now();
+
+    let (first, operation, class, retry_at) = environmental(table.poll(now).unwrap());
+    assert_eq!(first, file_id(1));
+    assert_eq!(operation, EnvironmentalOperation::Open);
+    assert_eq!(class, EnvironmentalErrorClass::DescriptorPressure);
+    assert_eq!(retry_at.duration_since(now), Duration::from_millis(250));
+    let (second, _, second_class, second_retry) = environmental(table.poll(now).unwrap());
+    assert_eq!(second, file_id(2));
+    assert_eq!(second_class, EnvironmentalErrorClass::DescriptorPressure);
+    assert_eq!(second_retry, retry_at);
+    assert_eq!(table.stats().environmental_backoff_readers, 2);
+    assert_eq!(
+        table.descriptor_pressure_deadline(now).unwrap(),
+        Some(retry_at)
+    );
+
+    let turn = data(table.poll(retry_at).unwrap());
+    assert!([file_id(1), file_id(2)].contains(&turn.file_id()));
+    assert_eq!(turn.bytes().len(), 1);
+    table
+        .complete_turn(turn, 1, TurnDisposition::Paused)
+        .unwrap();
+    assert_eq!(table.descriptor_pressure_deadline(retry_at).unwrap(), None);
+    assert_eq!(table.take_environmental_recoveries(), 1);
+    assert_eq!(table.stats().removed_readers, 0);
+    table.shutdown().unwrap();
+}
+
+#[cfg(unix)]
+/// Scenario: bounded drain replay selects a descriptor-absent reader whose
+/// first open receives `EMFILE`.
+/// Guarantees: drain polling returns the same interruptible environmental
+/// deadline until it expires instead of reporting an idle scheduler or
+/// retrying the open early.
+#[test]
+fn drain_poll_preserves_active_descriptor_pressure_wait() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("drain-pressure.log");
+    std::fs::write(&path, b"x").unwrap();
+    let mut table = ReaderTable::new(settings(1, 1, 1)).unwrap();
+    table.insert(candidate(&path), resolved(1, 0)).unwrap();
+    table.fail_next_open_for_test(io::Error::from_raw_os_error(libc::EMFILE));
+    let now = Instant::now();
+
+    let (_, operation, class, retry_at) =
+        environmental(table.poll_until(now, file_id(1), 1).unwrap());
+    assert_eq!(operation, EnvironmentalOperation::Open);
+    assert_eq!(class, EnvironmentalErrorClass::DescriptorPressure);
+
+    let before_retry = now + Duration::from_millis(10);
+    let (_, repeated_operation, repeated_class, repeated_retry_at) =
+        environmental(table.poll_until(before_retry, file_id(1), 1).unwrap());
+    assert_eq!(repeated_operation, operation);
+    assert_eq!(repeated_class, class);
+    assert_eq!(repeated_retry_at, retry_at);
+
+    let turn = data(table.poll_until(retry_at, file_id(1), 1).unwrap());
+    assert_eq!(turn.file_id(), file_id(1));
+    assert_eq!(turn.bytes(), b"x");
+    table
+        .complete_turn(turn, 1, TurnDisposition::Paused)
         .unwrap();
     table.shutdown().unwrap();
 }

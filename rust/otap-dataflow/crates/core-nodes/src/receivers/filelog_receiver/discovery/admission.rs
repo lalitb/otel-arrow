@@ -299,6 +299,16 @@ impl AdmissionController {
         Ok(())
     }
 
+    pub(crate) fn record_environmental_recovery(&mut self) -> Result<(), DiscoveryError> {
+        let stats = self.current_stats_mut()?;
+        stats.environmental_recoveries = stats.environmental_recoveries.checked_add(1).ok_or(
+            DiscoveryError::CounterOverflow {
+                counter: "discovery environmental recoveries",
+            },
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn record_issue(&mut self, issue: DiscoveryIssue) -> Result<(), DiscoveryError> {
         self.removal_evidence_complete = false;
         self.current_stats_mut()?.record_issue(issue)

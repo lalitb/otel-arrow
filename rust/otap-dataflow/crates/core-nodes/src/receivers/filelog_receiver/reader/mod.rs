@@ -11,8 +11,10 @@
 //! stages to consume bytes without read-ahead and return the reusable bounded
 //! buffer before another file is served.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::collections::{TryReserveError, hash_map::Entry};
+#[cfg(test)]
+use std::io as test_io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +29,10 @@ use super::checkpoint::{
 };
 use super::config::RuntimeConfig;
 use super::discovery::DiscoveredCandidate;
+use super::environment::{
+    DescriptorPressure, DescriptorPressureError, EnvironmentalBackoff, EnvironmentalErrorClass,
+    EnvironmentalOperation, classify_io_error,
+};
 use super::identity::IdentityError;
 use super::identity::matcher::{IdentityMatch, ResolvedIdentity};
 #[cfg(test)]
@@ -90,6 +96,9 @@ pub(crate) enum ReaderError {
     /// Process-local runtime ownership failed.
     #[error(transparent)]
     Lease(#[from] LeaseError),
+    /// Shared receiver descriptor-pressure state failed.
+    #[error(transparent)]
+    DescriptorPressure(#[from] DescriptorPressureError),
     /// Candidate path or identity evidence could not satisfy the bounded
     /// platform contract.
     #[error(transparent)]
@@ -388,6 +397,18 @@ pub(crate) enum ReaderPoll {
         /// Earliest automatic retry.
         next_probe: Instant,
     },
+    /// A source operation failed environmentally and was scheduled for
+    /// bounded retry without changing durable or lifecycle state.
+    EnvironmentalBackoff {
+        /// Durable identity retaining its reader state.
+        file_id: FileId,
+        /// Operation that could not proceed.
+        operation: EnvironmentalOperation,
+        /// Fixed error class.
+        error: EnvironmentalErrorClass,
+        /// Checked retry deadline.
+        next_probe: Instant,
+    },
     /// A descriptor can rotate only after caller-owned uncommitted state is
     /// discarded.
     EvictionRequired(EvictionRequest),
@@ -421,6 +442,8 @@ pub(crate) struct ReaderStats {
     pub(crate) ready_readers: usize,
     /// Readers waiting for EOF re-probe.
     pub(crate) eof_readers: usize,
+    /// Readers waiting for bounded source-environment retry.
+    pub(crate) environmental_backoff_readers: usize,
     /// Readers removed from discovery but not finalized.
     pub(crate) removed_readers: usize,
     /// Readers waiting for a resident descriptor slot.
@@ -593,6 +616,10 @@ pub(crate) struct ReaderTable {
     by_locator: HashMap<Locator, FileId>,
     ready: VecDeque<FileId>,
     eof_deadlines: BTreeSet<(Instant, FileId)>,
+    environmental_waiting: HashSet<FileId>,
+    environmental_failures: HashMap<FileId, EnvironmentalBackoff>,
+    descriptor_pressure: Arc<DescriptorPressure>,
+    descriptor_pressure_waiting: HashMap<FileId, EnvironmentalOperation>,
     descriptor_blocked: BTreeSet<FileId>,
     open_count: usize,
     removed_count: usize,
@@ -605,11 +632,16 @@ pub(crate) struct ReaderTable {
     read_buffer: Option<Vec<u8>>,
     counters: ActivityCounters,
     lease_observations: LeaseObservations,
+    pending_environmental_recoveries: u64,
     shutdown_requested: Arc<AtomicBool>,
     #[cfg(test)]
     fail_next_revoked_release: bool,
     #[cfg(test)]
     next_source_read_gate: Option<ReaderPollGate>,
+    #[cfg(test)]
+    fail_next_open: Option<test_io::Error>,
+    #[cfg(test)]
+    fail_next_read: Option<test_io::Error>,
     #[cfg(test)]
     next_evidence_refresh_gate: Mutex<Option<ReaderPollGate>>,
 }
@@ -700,11 +732,36 @@ fn classify_cancellable_fingerprint_observation(
     }
 }
 
+fn environmental_reader_error(
+    error: &ReaderError,
+) -> Option<(EnvironmentalOperation, EnvironmentalErrorClass)> {
+    match error {
+        ReaderError::Reopen {
+            source: IdentityError::Io { source, .. },
+            ..
+        } => Some((EnvironmentalOperation::Open, classify_io_error(source))),
+        ReaderError::Read { source, .. } => {
+            Some((EnvironmentalOperation::Read, classify_io_error(source)))
+        }
+        ReaderError::Metadata { source, .. } => {
+            Some((EnvironmentalOperation::Inspect, classify_io_error(source)))
+        }
+        ReaderError::Identity(IdentityError::Io { source, .. }) => {
+            Some((EnvironmentalOperation::Inspect, classify_io_error(source)))
+        }
+        _ => None,
+    }
+}
+
 impl ReaderTable {
     /// Creates a bounded table and reserves its one shared source-read
     /// buffer before any file can be admitted.
     pub(crate) fn new(settings: ReaderSettings) -> Result<Self, ReaderError> {
-        Self::new_with_shutdown_signal(settings, Arc::new(AtomicBool::new(false)))
+        Self::new_with_shutdown_signal_and_pressure(
+            settings,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(DescriptorPressure::default()),
+        )
     }
 
     /// Creates a bounded table that observes the worker's out-of-band
@@ -712,6 +769,20 @@ impl ReaderTable {
     pub(crate) fn new_with_shutdown_signal(
         settings: ReaderSettings,
         shutdown_requested: Arc<AtomicBool>,
+    ) -> Result<Self, ReaderError> {
+        Self::new_with_shutdown_signal_and_pressure(
+            settings,
+            shutdown_requested,
+            Arc::new(DescriptorPressure::default()),
+        )
+    }
+
+    /// Creates a bounded table with lifecycle cancellation and one
+    /// receiver-global descriptor-pressure state shared with discovery.
+    pub(crate) fn new_with_shutdown_signal_and_pressure(
+        settings: ReaderSettings,
+        shutdown_requested: Arc<AtomicBool>,
+        descriptor_pressure: Arc<DescriptorPressure>,
     ) -> Result<Self, ReaderError> {
         if settings.max_readers == 0 {
             return Err(ReaderError::InvalidSettings {
@@ -755,6 +826,27 @@ impl ReaderTable {
                 source,
             }
         })?;
+        let mut environmental_waiting = HashSet::new();
+        environmental_waiting
+            .try_reserve(settings.max_readers)
+            .map_err(|source| ReaderError::AllocationFailed {
+                resource: "environmental retry population",
+                source,
+            })?;
+        let mut environmental_failures = HashMap::new();
+        environmental_failures
+            .try_reserve(settings.max_readers)
+            .map_err(|source| ReaderError::AllocationFailed {
+                resource: "environmental retry state",
+                source,
+            })?;
+        let mut descriptor_pressure_waiting = HashMap::new();
+        descriptor_pressure_waiting
+            .try_reserve(settings.max_readers)
+            .map_err(|source| ReaderError::AllocationFailed {
+                resource: "descriptor-pressure wait population",
+                source,
+            })?;
         let mut read_buffer = Vec::new();
         read_buffer
             .try_reserve_exact(settings.max_read_bytes_per_turn)
@@ -776,6 +868,10 @@ impl ReaderTable {
             by_locator,
             ready,
             eof_deadlines: BTreeSet::new(),
+            environmental_waiting,
+            environmental_failures,
+            descriptor_pressure,
+            descriptor_pressure_waiting,
             descriptor_blocked: BTreeSet::new(),
             open_count: 0,
             removed_count: 0,
@@ -788,11 +884,16 @@ impl ReaderTable {
             read_buffer: Some(read_buffer),
             counters: ActivityCounters::new(),
             lease_observations: LeaseObservations::default(),
+            pending_environmental_recoveries: 0,
             shutdown_requested,
             #[cfg(test)]
             fail_next_revoked_release: false,
             #[cfg(test)]
             next_source_read_gate: None,
+            #[cfg(test)]
+            fail_next_open: None,
+            #[cfg(test)]
+            fail_next_read: None,
             #[cfg(test)]
             next_evidence_refresh_gate: Mutex::new(None),
         })
@@ -992,6 +1093,7 @@ impl ReaderTable {
             reader.durable_fingerprint = candidate.evidence.fingerprint;
             should_wake
         };
+        self.clear_environmental_success(file_id, None)?;
         if should_wake {
             self.make_ready(file_id)
         } else {
@@ -1053,7 +1155,17 @@ impl ReaderTable {
         file_id: FileId,
         end_offset: u64,
     ) -> Result<ReaderPoll, ReaderError> {
-        self.make_ready(file_id)?;
+        if let Some(operation) = self.descriptor_pressure_waiting.get(&file_id).copied()
+            && let Some(next_probe) = self.descriptor_pressure.retry_at(now)?
+        {
+            return Ok(ReaderPoll::EnvironmentalBackoff {
+                file_id,
+                operation,
+                error: EnvironmentalErrorClass::DescriptorPressure,
+                next_probe,
+            });
+        }
+        self.make_ready_at(file_id, now)?;
         self.poll_inner(
             now,
             Some(ReadLimit {
@@ -1084,10 +1196,19 @@ impl ReaderTable {
         }
         if limit.is_none() {
             self.activate_due(now)?;
+            self.activate_descriptor_pressure_due(now)?;
         }
         let Some(file_id) = self.ready.pop_front() else {
+            let descriptor_probe = self.descriptor_pressure.retry_at(now)?;
             return Ok(ReaderPoll::Idle {
-                next_probe: self.eof_deadlines.first().map(|(deadline, _)| *deadline),
+                next_probe: match (
+                    self.eof_deadlines.first().map(|(deadline, _)| *deadline),
+                    descriptor_probe,
+                ) {
+                    (Some(left), Some(right)) => Some(left.min(right)),
+                    (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+                    (None, None) => None,
+                },
             });
         };
         if limit.is_some_and(|limit| limit.file_id != file_id) {
@@ -1144,17 +1265,27 @@ impl ReaderTable {
                 }
                 return Ok(ReaderPoll::DescriptorCapacityBlocked { file_id });
             }
-            let opened = self.open_reader(file_id);
+            if let Some(next_probe) = self.descriptor_pressure_deadline(now)? {
+                return self.schedule_descriptor_pressure_waiter(
+                    file_id,
+                    next_probe,
+                    EnvironmentalOperation::Open,
+                );
+            }
+            let opened = self.open_reader_for_poll(file_id);
             if self.cancellation_requested() {
                 return Ok(ReaderPoll::Cancelled);
             }
             match opened {
                 Ok(None) => return Ok(ReaderPoll::Cancelled),
-                Ok(Some(OpenReaderOutcome::Compatible)) => {}
+                Ok(Some(OpenReaderOutcome::Compatible)) => {
+                    self.clear_environmental_success(file_id, Some(now))?;
+                }
                 Ok(Some(OpenReaderOutcome::Truncated {
                     observed_size,
                     observed_fingerprint,
                 })) => {
+                    self.clear_environmental_success(file_id, Some(now))?;
                     let reader = self
                         .readers
                         .get(&file_id)
@@ -1180,16 +1311,26 @@ impl ReaderTable {
                         next_probe,
                     });
                 }
+                Err(ref error)
+                    if environmental_reader_error(error)
+                        .is_some_and(|_| !self.cancellation_requested()) =>
+                {
+                    let (operation, class) =
+                        environmental_reader_error(error).ok_or(ReaderError::Inconsistent {
+                            reason: "environmental reopen classification disappeared",
+                        })?;
+                    return self.schedule_environmental_backoff(file_id, now, operation, class);
+                }
                 Err(ReaderError::Reopen { .. }) => {
                     let reader =
                         self.readers
                             .get_mut(&file_id)
                             .ok_or(ReaderError::Inconsistent {
-                                reason: "unavailable reopen target disappeared",
+                                reason: "incompatible reopen target disappeared",
                             })?;
                     if !reader.present {
                         return Err(ReaderError::Inconsistent {
-                            reason: "unavailable reopen target was already removed",
+                            reason: "incompatible reopen target was already removed",
                         });
                     }
                     reader.present = false;
@@ -1272,6 +1413,24 @@ impl ReaderTable {
             return Ok(ReaderPoll::Cancelled);
         }
         let _read_turns = increment(&mut self.counters.read_turns, "source read turns")?;
+        #[cfg(test)]
+        let read_result = if let Some(source) = self.fail_next_read.take() {
+            Err(source)
+        } else {
+            let reader = self
+                .readers
+                .get(&file_id)
+                .ok_or(ReaderError::Inconsistent {
+                    reason: "selected reader disappeared before a read",
+                })?;
+            let resident = reader.resident.as_ref().ok_or(ReaderError::Inconsistent {
+                reason: "selected reader descriptor disappeared before a read",
+            })?;
+            read_source_at_cancellable(&resident.file, source_offset, &mut buffer, &mut || {
+                self.cancellation_requested()
+            })
+        };
+        #[cfg(not(test))]
         let read_result = {
             let reader = self
                 .readers
@@ -1298,13 +1457,18 @@ impl ReaderTable {
             }
             Err(source) => {
                 self.read_buffer = Some(buffer);
-                return Err(ReaderError::Read {
+                let class = classify_io_error(&source);
+                return self.schedule_environmental_backoff(
                     file_id,
-                    path: diagnostic_path,
-                    source,
-                });
+                    now,
+                    EnvironmentalOperation::Read,
+                    class,
+                );
             }
         };
+        if count != 0 {
+            self.clear_environmental_success(file_id, None)?;
+        }
 
         if count == 0 {
             self.read_buffer = Some(buffer);
@@ -1328,17 +1492,31 @@ impl ReaderTable {
                     self.settings.ignored_header_bytes,
                     &mut || self.cancellation_requested(),
                 );
-                let Some(observation) = classify_cancellable_fingerprint_observation(observation)?
-                else {
-                    return Ok(ReaderPoll::Cancelled);
-                };
-                observation
+                classify_cancellable_fingerprint_observation(observation)
+            };
+            let observation = match observation {
+                Ok(Some(observation)) => observation,
+                Ok(None) => return Ok(ReaderPoll::Cancelled),
+                Err(ref error)
+                    if environmental_reader_error(error)
+                        .is_some_and(|_| !self.cancellation_requested()) =>
+                {
+                    let (operation, class) =
+                        environmental_reader_error(error).ok_or(ReaderError::Inconsistent {
+                            reason: "environmental EOF classification disappeared",
+                        })?;
+                    return self.schedule_environmental_backoff(file_id, now, operation, class);
+                }
+                Err(error) => return Err(error),
             };
             if self.cancellation_requested() {
                 return Ok(ReaderPoll::Cancelled);
             }
             let (observed_fingerprint, observed_size) = match observation {
-                FingerprintObservation::Stable { fingerprint, size } => (fingerprint, size),
+                FingerprintObservation::Stable { fingerprint, size } => {
+                    self.clear_environmental_success(file_id, None)?;
+                    (fingerprint, size)
+                }
                 FingerprintObservation::Retry => {
                     let next_probe = self.schedule_eof_probe(file_id, now)?;
                     return Ok(ReaderPoll::EvidenceUnstable {
@@ -1499,6 +1677,15 @@ impl ReaderTable {
     /// Makes a paused or EOF reader immediately eligible for a later
     /// round-robin turn.
     pub(crate) fn make_ready(&mut self, file_id: FileId) -> Result<(), ReaderError> {
+        self.make_ready_at(file_id, Instant::now())
+    }
+
+    fn make_ready_at(&mut self, file_id: FileId, now: Instant) -> Result<(), ReaderError> {
+        if self.descriptor_pressure_waiting.contains_key(&file_id)
+            && self.descriptor_pressure.retry_at(now)?.is_some()
+        {
+            return Ok(());
+        }
         let descriptor_blocked = matches!(
             self.readers
                 .get(&file_id)
@@ -1529,6 +1716,7 @@ impl ReaderTable {
                             reason: "descriptor-blocked reader has no index entry",
                         });
                     }
+                    let _ = self.descriptor_pressure_waiting.remove(&file_id);
                     reader.schedule = ScheduleState::Ready;
                     None
                 }
@@ -1551,6 +1739,9 @@ impl ReaderTable {
             return Err(ReaderError::Inconsistent {
                 reason: "EOF reader has no deadline entry",
             });
+        }
+        if prior_deadline.is_some() {
+            let _ = self.environmental_waiting.remove(&file_id);
         }
         self.ready.push_back(file_id);
         Ok(())
@@ -1641,6 +1832,7 @@ impl ReaderTable {
                         reason: "paused EOF reader has no deadline entry",
                     });
                 }
+                let _ = self.environmental_waiting.remove(&file_id);
             }
             ScheduleState::DescriptorBlocked => {
                 if !self.descriptor_blocked.remove(&file_id) {
@@ -1648,6 +1840,7 @@ impl ReaderTable {
                         reason: "paused descriptor-blocked reader has no index entry",
                     });
                 }
+                let _ = self.descriptor_pressure_waiting.remove(&file_id);
             }
             ScheduleState::Paused => {}
             ScheduleState::InFlight { .. } => unreachable!("checked before replacement"),
@@ -2151,6 +2344,18 @@ impl ReaderTable {
     }
 
     #[cfg(test)]
+    /// Makes the next descriptor open fail with the supplied OS error.
+    pub(crate) fn fail_next_open_for_test(&mut self, error: test_io::Error) {
+        self.fail_next_open = Some(error);
+    }
+
+    #[cfg(test)]
+    /// Makes the next positioned source read fail with the supplied OS error.
+    pub(crate) fn fail_next_read_for_test(&mut self, error: test_io::Error) {
+        self.fail_next_read = Some(error);
+    }
+
+    #[cfg(test)]
     /// Blocks the next candidate-evidence refresh after its first observation.
     pub(crate) fn gate_next_evidence_refresh_after_first_sample_for_test(&self) -> ReaderPollGate {
         let gate = ReaderPollGate::default();
@@ -2268,7 +2473,14 @@ impl ReaderTable {
             tracked_readers: self.readers.len(),
             open_files: self.open_count,
             ready_readers: self.ready.len(),
-            eof_readers: self.eof_deadlines.len(),
+            eof_readers: self
+                .eof_deadlines
+                .len()
+                .saturating_sub(self.environmental_waiting.len()),
+            environmental_backoff_readers: self
+                .environmental_waiting
+                .len()
+                .saturating_add(self.descriptor_pressure_waiting.len()),
             removed_readers: self.removed_count,
             descriptor_blocked_readers: self.descriptor_blocked.len(),
             read_turns: self.counters.read_turns,
@@ -2287,9 +2499,23 @@ impl ReaderTable {
         self.open_count
     }
 
+    /// Active receiver-global descriptor-pressure deadline, if new
+    /// admissions and opens must remain paused.
+    pub(crate) fn descriptor_pressure_deadline(
+        &self,
+        now: Instant,
+    ) -> Result<Option<Instant>, ReaderError> {
+        Ok(self.descriptor_pressure.retry_at(now)?)
+    }
+
     /// Transfers runtime-lease observations without retaining per-file state.
     pub(crate) fn take_lease_observations(&mut self) -> LeaseObservations {
         std::mem::take(&mut self.lease_observations)
+    }
+
+    /// Transfers successful environmental-retry recoveries.
+    pub(crate) fn take_environmental_recoveries(&mut self) -> u64 {
+        std::mem::take(&mut self.pending_environmental_recoveries)
     }
 
     /// Iterates every logical reader without allocating or cloning path
@@ -2539,6 +2765,14 @@ impl ReaderTable {
         self.by_locator.clear();
         self.ready.clear();
         self.eof_deadlines.clear();
+        self.environmental_waiting.clear();
+        self.environmental_failures.clear();
+        if let Err(error) = self.descriptor_pressure.reset()
+            && first_error.is_none()
+        {
+            first_error = Some(ReaderError::DescriptorPressure(error));
+        }
+        self.descriptor_pressure_waiting.clear();
         self.descriptor_blocked.clear();
         self.open_count = 0;
         self.removed_count = 0;
@@ -2578,9 +2812,66 @@ impl ReaderTable {
                 });
             }
             reader.schedule = ScheduleState::Ready;
+            let _ = self.environmental_waiting.remove(&file_id);
             self.ready.push_back(file_id);
         }
         Ok(())
+    }
+
+    fn activate_descriptor_pressure_due(&mut self, now: Instant) -> Result<(), ReaderError> {
+        if self
+            .descriptor_pressure
+            .current()?
+            .is_some_and(|state| state.retry_at() > now)
+        {
+            return Ok(());
+        }
+        while let Some(file_id) = self.descriptor_pressure_waiting.keys().next().copied() {
+            let _ = self.descriptor_pressure_waiting.remove(&file_id);
+            if !self.descriptor_blocked.remove(&file_id) {
+                return Err(ReaderError::Inconsistent {
+                    reason: "descriptor-pressure reader has no blocked index entry",
+                });
+            }
+            let reader = self
+                .readers
+                .get_mut(&file_id)
+                .ok_or(ReaderError::Inconsistent {
+                    reason: "descriptor-pressure deadline points to a missing reader",
+                })?;
+            if !matches!(reader.schedule, ScheduleState::DescriptorBlocked) {
+                return Err(ReaderError::Inconsistent {
+                    reason: "descriptor-pressure reader is not blocked",
+                });
+            }
+            reader.schedule = ScheduleState::Ready;
+            self.ready.push_back(file_id);
+        }
+        Ok(())
+    }
+
+    fn open_reader_for_poll(
+        &mut self,
+        file_id: FileId,
+    ) -> Result<Option<OpenReaderOutcome>, ReaderError> {
+        #[cfg(test)]
+        if let Some(source) = self.fail_next_open.take() {
+            let path = self
+                .readers
+                .get(&file_id)
+                .ok_or(ReaderError::UnknownFile { file_id })?
+                .matched_path
+                .clone();
+            return Err(ReaderError::Reopen {
+                file_id,
+                source: IdentityError::Io {
+                    operation: "open injected reader",
+                    path,
+                    source,
+                },
+            });
+        }
+        self.open_reader(file_id)
     }
 
     fn open_reader(&mut self, file_id: FileId) -> Result<Option<OpenReaderOutcome>, ReaderError> {
@@ -2830,6 +3121,8 @@ impl ReaderTable {
             ScheduleState::Ready => self.remove_ready(file_id),
             ScheduleState::Eof { next_probe } => {
                 if self.eof_deadlines.remove(&(*next_probe, file_id)) {
+                    let _ = self.environmental_waiting.remove(&file_id);
+                    let _ = self.environmental_failures.remove(&file_id);
                     Ok(())
                 } else {
                     Err(ReaderError::Inconsistent {
@@ -2839,6 +3132,7 @@ impl ReaderTable {
             }
             ScheduleState::DescriptorBlocked => {
                 if self.descriptor_blocked.remove(&file_id) {
+                    let _ = self.descriptor_pressure_waiting.remove(&file_id);
                     Ok(())
                 } else {
                     Err(ReaderError::Inconsistent {
@@ -2863,26 +3157,159 @@ impl ReaderTable {
         let next_probe = now
             .checked_add(self.settings.eof_probe_interval)
             .ok_or(ReaderError::DeadlineOverflow)?;
-        let reader = self
+        let state = &self
             .readers
-            .get_mut(&file_id)
+            .get(&file_id)
             .ok_or(ReaderError::Inconsistent {
                 reason: "EOF reader disappeared",
-            })?;
-        if !matches!(reader.schedule, ScheduleState::Paused) {
+            })?
+            .schedule;
+        if !matches!(state, ScheduleState::Paused) {
             return Err(ReaderError::InvalidState {
                 file_id,
                 operation: "schedule EOF probe",
-                state: reader.schedule.name(),
+                state: state.name(),
             });
         }
-        reader.schedule = ScheduleState::Eof { next_probe };
+        let _ = self.environmental_waiting.remove(&file_id);
+        let _ = self.environmental_failures.remove(&file_id);
+        self.readers
+            .get_mut(&file_id)
+            .ok_or(ReaderError::Inconsistent {
+                reason: "EOF reader disappeared while scheduling",
+            })?
+            .schedule = ScheduleState::Eof { next_probe };
         if !self.eof_deadlines.insert((next_probe, file_id)) {
             return Err(ReaderError::Inconsistent {
                 reason: "EOF deadline was already present",
             });
         }
         Ok(next_probe)
+    }
+
+    fn schedule_environmental_backoff(
+        &mut self,
+        file_id: FileId,
+        now: Instant,
+        operation: EnvironmentalOperation,
+        error: EnvironmentalErrorClass,
+    ) -> Result<ReaderPoll, ReaderError> {
+        if error == EnvironmentalErrorClass::DescriptorPressure {
+            let retry_at = self.descriptor_pressure.record_failure(now)?;
+            return self.schedule_descriptor_pressure_waiter(file_id, retry_at, operation);
+        }
+        let state = EnvironmentalBackoff::after_failure(
+            self.environmental_failures.get(&file_id).copied(),
+            now,
+        )
+        .ok_or(ReaderError::DeadlineOverflow)?;
+        let _ = self.environmental_failures.insert(file_id, state);
+        self.schedule_environmental_at(file_id, state.retry_at(), operation, error)
+    }
+
+    fn schedule_descriptor_pressure_waiter(
+        &mut self,
+        file_id: FileId,
+        next_probe: Instant,
+        operation: EnvironmentalOperation,
+    ) -> Result<ReaderPoll, ReaderError> {
+        let state = &self
+            .readers
+            .get(&file_id)
+            .ok_or(ReaderError::UnknownFile { file_id })?
+            .schedule;
+        if !matches!(state, ScheduleState::Paused) {
+            return Err(ReaderError::InvalidState {
+                file_id,
+                operation: "wait for descriptor-pressure retry",
+                state: state.name(),
+            });
+        }
+        if self.descriptor_blocked.contains(&file_id)
+            || self.descriptor_pressure_waiting.contains_key(&file_id)
+        {
+            return Err(ReaderError::Inconsistent {
+                reason: "descriptor-pressure reader was already waiting",
+            });
+        }
+        let blocked_inserted = self.descriptor_blocked.insert(file_id);
+        let prior_operation = self.descriptor_pressure_waiting.insert(file_id, operation);
+        debug_assert!(blocked_inserted && prior_operation.is_none());
+        self.readers
+            .get_mut(&file_id)
+            .ok_or(ReaderError::Inconsistent {
+                reason: "descriptor-pressure reader disappeared",
+            })?
+            .schedule = ScheduleState::DescriptorBlocked;
+        Ok(ReaderPoll::EnvironmentalBackoff {
+            file_id,
+            operation,
+            error: EnvironmentalErrorClass::DescriptorPressure,
+            next_probe,
+        })
+    }
+
+    fn schedule_environmental_at(
+        &mut self,
+        file_id: FileId,
+        next_probe: Instant,
+        operation: EnvironmentalOperation,
+        error: EnvironmentalErrorClass,
+    ) -> Result<ReaderPoll, ReaderError> {
+        let state = &self
+            .readers
+            .get(&file_id)
+            .ok_or(ReaderError::UnknownFile { file_id })?
+            .schedule;
+        if !matches!(state, ScheduleState::Paused) {
+            return Err(ReaderError::InvalidState {
+                file_id,
+                operation: "schedule environmental retry",
+                state: state.name(),
+            });
+        }
+        if self.eof_deadlines.contains(&(next_probe, file_id))
+            || !self.environmental_waiting.insert(file_id)
+        {
+            return Err(ReaderError::Inconsistent {
+                reason: "environmental retry was already scheduled",
+            });
+        }
+        self.readers
+            .get_mut(&file_id)
+            .ok_or(ReaderError::Inconsistent {
+                reason: "environmental retry reader disappeared",
+            })?
+            .schedule = ScheduleState::Eof { next_probe };
+        if !self.eof_deadlines.insert((next_probe, file_id)) {
+            let _ = self.environmental_waiting.remove(&file_id);
+            return Err(ReaderError::Inconsistent {
+                reason: "environmental retry deadline was already present",
+            });
+        }
+        Ok(ReaderPoll::EnvironmentalBackoff {
+            file_id,
+            operation,
+            error,
+            next_probe,
+        })
+    }
+
+    fn clear_environmental_success(
+        &mut self,
+        file_id: FileId,
+        descriptor_opened_at: Option<Instant>,
+    ) -> Result<(), ReaderError> {
+        let mut recoveries = u64::from(self.environmental_failures.remove(&file_id).is_some());
+        if let Some(now) = descriptor_opened_at
+            && self.descriptor_pressure.clear_after_success(now)?
+        {
+            recoveries = recoveries.saturating_add(1);
+        }
+        self.pending_environmental_recoveries = self
+            .pending_environmental_recoveries
+            .saturating_add(recoveries);
+        Ok(())
     }
 
     fn preflight_lifecycle_transition(&self, file_id: FileId) -> Result<(), ReaderError> {
@@ -2954,7 +3381,11 @@ impl ReaderTable {
     }
 
     fn promote_descriptor_waiter(&mut self) -> Result<(), ReaderError> {
-        let next = self.descriptor_blocked.first().copied();
+        let next = self
+            .descriptor_blocked
+            .iter()
+            .copied()
+            .find(|file_id| !self.descriptor_pressure_waiting.contains_key(file_id));
         if let Some(file_id) = next
             && (self.open_count < self.settings.max_open_files
                 || self.select_lrs_victim(file_id).is_some())
@@ -2980,6 +3411,9 @@ impl ReaderTable {
 
     fn release_reader(&mut self, file_id: FileId) -> Result<Locator, ReaderError> {
         self.remove_scheduling_state(file_id)?;
+        let _ = self.environmental_waiting.remove(&file_id);
+        let _ = self.environmental_failures.remove(&file_id);
+        let _ = self.descriptor_pressure_waiting.remove(&file_id);
         let reader = self
             .readers
             .remove(&file_id)

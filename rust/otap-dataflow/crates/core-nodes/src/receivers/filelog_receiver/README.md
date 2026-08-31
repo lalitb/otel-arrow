@@ -278,6 +278,9 @@ High-signal operating metrics include:
 | `receiver.filelog.candidates.overflowed` | `{candidate}` | Candidate observations rejected by the configured bound. |
 | `receiver.filelog.files.tracked.saturation` | `{event}` | Admissions that encountered a full tracked table. |
 | `receiver.filelog.files.descriptor.saturation` | `{event}` | Reads that encountered descriptor saturation. |
+| `receiver.filelog.descriptor.budget.warnings` | `{warning}` | Starts whose receiver-owned FD budget exceeds 80% of the Unix soft limit. |
+| `receiver.filelog.environmental.reprobes` | `{reprobe}` | Source/traversal operations scheduled for bounded environmental retry. |
+| `receiver.filelog.environmental.recoveries` | `{recovery}` | Environmental retry conditions cleared by successful source or discovery operations. |
 | `receiver.filelog.rotation.copytruncate.detected` | `{rotation}` | Observable copy-truncate transitions. |
 | `receiver.filelog.partial.bytes.pending` | `By` | Current uncommitted partial source bytes. |
 | `receiver.filelog.terminal.unterminated.records` | `{record}` | Records emitted only because permanent rotation EOF established a boundary. |
@@ -300,6 +303,9 @@ include:
 | `filelog_receiver.candidate_overflow` | `warn` | Discovery exceeded pending-candidate capacity. |
 | `filelog_receiver.tracked_table_saturated` | `warn` | Durable tracked-file capacity was full. |
 | `filelog_receiver.descriptor_capacity_saturated` | `warn` | No descriptor slot was currently usable. |
+| `filelog_receiver.descriptor_budget_warning` | `warn` | Receiver-owned descriptors exceed 80% of the Unix process soft limit. |
+| `filelog_receiver.source_reprobe_scheduled` | `warn` | One source operation entered bounded environmental retry. |
+| `filelog_receiver.discovery_reprobe_scheduled` | `warn` | One traversal root or candidate probe entered bounded environmental retry. |
 | `filelog_receiver.copytruncate_quarantined` | `warn` | Detectable truncation was quarantined under `fail`. |
 | `filelog_receiver.copytruncate_reset` | `warn` | Detectable truncation reset to a new epoch under `read_new`. |
 | `filelog_receiver.decode_quarantined` | `warn` | A decode failure was durably quarantined. |
@@ -323,6 +329,19 @@ spooled by the receiver.
   head-of-line blocking.
 - Runtime leases prevent overlapping patterns inside one process. They do not
   coordinate separate engine processes or separate state directories.
+- The receiver-owned FD budget is `max_open_files + 1` traversal handle,
+  `+ 1` transient probe, and `+ 8` checkpoint/namespace handles. Unix startup
+  rejects a budget above `RLIMIT_NOFILE` and warns above 80%; this is not an
+  aggregate process admission claim.
+- `EMFILE`/`ENFILE` use one receiver-global retry state. Other temporary
+  source or root failures use one bounded per-file/root state with delays
+  `250ms, 500ms, ... 30s`; they never become quarantine merely by recurring.
+- Discovery opens at most one traversal directory handle. Environmental
+  retries preserve progress, pause no healthy resident reader, and remain
+  interruptible by drain or direct shutdown.
+- Windows runtime qualification remains deferred. With
+  `follow_symlinks: true`, the current traversal dependency may retain one
+  ancestor handle per depth outside its requested one-handle cap.
 - Writers must permit the platform's compatible shared-read/delete behavior.
   A writer that denies shared read cannot be tailed.
 - Windows checkpoint marker replacement is atomic, but the standard library

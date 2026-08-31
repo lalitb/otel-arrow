@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime};
 use super::admission::AdmissionController;
 use super::scanner::{DiscoveryPlan, FilesystemScanner};
 use super::{DiscoveryError, DiscoveryFeedback, DiscoveryMessage};
+use crate::receivers::filelog_receiver::environment::DescriptorPressure;
 
 const EVENT_CHANNEL_CAPACITY: usize = 1;
 const COMMAND_CHANNEL_CAPACITY: usize = 2;
@@ -118,6 +119,20 @@ pub(crate) fn spawn_discovery_with_shutdown_signal(
     plan: DiscoveryPlan,
     shutdown_requested: Arc<AtomicBool>,
 ) -> Result<DiscoveryHandle, DiscoveryError> {
+    spawn_discovery_with_shutdown_signal_and_pressure(
+        plan,
+        shutdown_requested,
+        Arc::new(DescriptorPressure::default()),
+    )
+}
+
+/// Spawns discovery with cancellation and receiver-global descriptor
+/// pressure shared with the source reader.
+pub(crate) fn spawn_discovery_with_shutdown_signal_and_pressure(
+    plan: DiscoveryPlan,
+    shutdown_requested: Arc<AtomicBool>,
+    descriptor_pressure: Arc<DescriptorPressure>,
+) -> Result<DiscoveryHandle, DiscoveryError> {
     let admission = AdmissionController::new(
         plan.max_pending_candidates(),
         plan.max_tracked_files(),
@@ -138,6 +153,7 @@ pub(crate) fn spawn_discovery_with_shutdown_signal(
                 command_rx,
                 message_tx,
                 thread_shutdown_requested,
+                descriptor_pressure,
             );
         })
         .map_err(|source| DiscoveryError::ThreadSpawn { source })?;
@@ -155,10 +171,14 @@ fn discovery_loop(
     command_rx: Receiver<DiscoveryCommand>,
     message_tx: SyncSender<DiscoveryMessage>,
     shutdown_requested: Arc<AtomicBool>,
+    descriptor_pressure: Arc<DescriptorPressure>,
 ) {
     let reconciliation_schedule = plan.reconciliation_schedule();
-    let mut scanner =
-        FilesystemScanner::with_shutdown_signal(plan, Arc::clone(&shutdown_requested));
+    let mut scanner = FilesystemScanner::with_shutdown_signal_and_pressure(
+        plan,
+        Arc::clone(&shutdown_requested),
+        descriptor_pressure,
+    );
     loop {
         let batch = match scanner.reconcile(&mut admission, SystemTime::now()) {
             Ok(batch) => batch,

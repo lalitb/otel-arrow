@@ -75,6 +75,7 @@ mod batching;
 mod config;
 mod delivery;
 mod discovery;
+mod environment;
 mod framing;
 mod identity;
 mod lease;

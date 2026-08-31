@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use std::sync::{Condvar, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use globset::GlobMatcher;
 use walkdir::WalkDir;
@@ -22,11 +22,21 @@ use super::{
 use crate::receivers::filelog_receiver::config::{
     RuntimeConfig, glob_literal_prefix, reconciliation_delay_bounds_ns,
 };
+use crate::receivers::filelog_receiver::environment::{
+    DescriptorPressure, EnvironmentalBackoff, EnvironmentalErrorClass, EnvironmentalOperation,
+    classify_io_error,
+};
 use crate::receivers::filelog_receiver::identity::IdentityError;
 use crate::receivers::filelog_receiver::identity::platform::{
     encode_advisory_path, open_candidate_at_cancellable,
     open_locator_for_stability_check_cancellable,
 };
+
+/// Requested `walkdir` enumeration-handle cap. `walkdir` may buffer remaining
+/// entries when closing an iterator, and on Windows with link following it
+/// retains ancestor handles outside this cap. Those aggregate-resource and
+/// non-Linux runtime properties remain explicit qualification gates.
+pub(super) const MAX_OPEN_TRAVERSAL_DIRECTORIES: usize = 1;
 
 #[derive(Debug, Clone)]
 struct IncludeRoot {
@@ -42,6 +52,7 @@ struct ExcludePattern {
 
 #[derive(Debug)]
 struct ResolvedExclude {
+    pattern_index: usize,
     lexical_root: PathBuf,
     resolved_root: Option<PathBuf>,
     matcher: GlobMatcher,
@@ -50,6 +61,13 @@ struct ResolvedExclude {
 enum StableCandidateObservation {
     Eligible(DiscoveredCandidate),
     Revoked(crate::receivers::filelog_receiver::checkpoint::Locator),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DiscoveryBackoff {
+    state: EnvironmentalBackoff,
+    operation: EnvironmentalOperation,
+    error: EnvironmentalErrorClass,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -227,10 +245,16 @@ impl DiscoveryPlan {
 pub(crate) struct FilesystemScanner {
     plan: DiscoveryPlan,
     shutdown_requested: Arc<AtomicBool>,
+    descriptor_pressure: Arc<DescriptorPressure>,
+    include_backoffs: Vec<Option<DiscoveryBackoff>>,
+    exclude_resolution_backoffs: Vec<Option<DiscoveryBackoff>>,
+    exclude_scan_backoffs: Vec<Option<DiscoveryBackoff>>,
     #[cfg(test)]
     next_candidate_sample_gate: Mutex<Option<CandidateSamplingGate>>,
     #[cfg(test)]
     next_candidate_open_gate: Mutex<Option<CandidateSamplingGate>>,
+    #[cfg(test)]
+    next_candidate_open_error: Mutex<Option<io::Error>>,
     #[cfg(test)]
     next_candidate_resolution_gate: Mutex<Option<CandidateSamplingGate>>,
 }
@@ -281,29 +305,45 @@ impl CandidateSamplingGate {
 
 impl FilesystemScanner {
     pub(crate) fn new(plan: DiscoveryPlan) -> Self {
-        Self {
+        Self::with_shutdown_signal_and_pressure(
             plan,
-            shutdown_requested: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
-            next_candidate_sample_gate: Mutex::new(None),
-            #[cfg(test)]
-            next_candidate_open_gate: Mutex::new(None),
-            #[cfg(test)]
-            next_candidate_resolution_gate: Mutex::new(None),
-        }
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(DescriptorPressure::default()),
+        )
     }
 
     pub(crate) fn with_shutdown_signal(
         plan: DiscoveryPlan,
         shutdown_requested: Arc<AtomicBool>,
     ) -> Self {
+        Self::with_shutdown_signal_and_pressure(
+            plan,
+            shutdown_requested,
+            Arc::new(DescriptorPressure::default()),
+        )
+    }
+
+    pub(crate) fn with_shutdown_signal_and_pressure(
+        plan: DiscoveryPlan,
+        shutdown_requested: Arc<AtomicBool>,
+        descriptor_pressure: Arc<DescriptorPressure>,
+    ) -> Self {
+        let include_backoffs = vec![None; plan.include_roots.len()];
+        let exclude_resolution_backoffs = vec![None; plan.exclude_patterns.len()];
+        let exclude_scan_backoffs = vec![None; plan.exclude_patterns.len()];
         Self {
             plan,
             shutdown_requested,
+            descriptor_pressure,
+            include_backoffs,
+            exclude_resolution_backoffs,
+            exclude_scan_backoffs,
             #[cfg(test)]
             next_candidate_sample_gate: Mutex::new(None),
             #[cfg(test)]
             next_candidate_open_gate: Mutex::new(None),
+            #[cfg(test)]
+            next_candidate_open_error: Mutex::new(None),
             #[cfg(test)]
             next_candidate_resolution_gate: Mutex::new(None),
         }
@@ -338,6 +378,35 @@ impl FilesystemScanner {
     }
 
     #[cfg(test)]
+    pub(crate) fn fail_next_candidate_open_for_test(&self, error: io::Error) {
+        *self
+            .next_candidate_open_error
+            .lock()
+            .expect("candidate open error lock poisoned") = Some(error);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn descriptor_pressure_retry_at_for_test(&self) -> Option<Instant> {
+        self.descriptor_pressure
+            .current()
+            .ok()
+            .flatten()
+            .map(EnvironmentalBackoff::retry_at)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn include_retry_state_for_test(
+        &self,
+        pattern_index: usize,
+    ) -> Option<(u8, Instant)> {
+        self.include_backoffs
+            .get(pattern_index)
+            .copied()
+            .flatten()
+            .map(|backoff| (backoff.state.failures(), backoff.state.retry_at()))
+    }
+
+    #[cfg(test)]
     pub(crate) fn gate_next_candidate_before_resolution_for_test(
         &mut self,
     ) -> CandidateSamplingGate {
@@ -357,6 +426,13 @@ impl FilesystemScanner {
     ) -> Result<ReconciliationBatch, DiscoveryError> {
         self.ensure_running()?;
         let generation = admission.begin_scan(now)?;
+        if self.descriptor_pressure.retry_at(Instant::now())?.is_some() {
+            admission.record_issue(DiscoveryIssue::EnvironmentalBackoff {
+                operation: EnvironmentalOperation::Probe,
+                error: EnvironmentalErrorClass::DescriptorPressure,
+            })?;
+            return admission.finish_scan();
+        }
         let Some(resolved_excludes) = self.resolve_excludes(admission)? else {
             return admission.finish_scan();
         };
@@ -381,6 +457,7 @@ impl FilesystemScanner {
             if scanned_exclude_roots.insert(resolved_root) {
                 self.ensure_running()?;
                 self.scan_exclude_root(
+                    exclude.pattern_index,
                     resolved_root,
                     generation,
                     &resolved_excludes,
@@ -389,10 +466,12 @@ impl FilesystemScanner {
                 )?;
             }
         }
-        for include in &self.plan.include_roots {
+        for index in 0..self.plan.include_roots.len() {
             self.ensure_running()?;
+            let include = self.plan.include_roots[index].clone();
             self.scan_include(
-                include,
+                index,
+                &include,
                 generation,
                 &resolved_excludes,
                 checkpoint_namespace.as_deref(),
@@ -403,13 +482,35 @@ impl FilesystemScanner {
     }
 
     fn scan_exclude_root(
-        &self,
+        &mut self,
+        pattern_index: usize,
         resolved_root: &Path,
         generation: u64,
         resolved_excludes: &[ResolvedExclude],
         checkpoint_namespace: Option<&Path>,
         admission: &mut AdmissionController,
     ) -> Result<(), DiscoveryError> {
+        self.ensure_running()?;
+        if self.descriptor_pressure_active()? {
+            admission.record_denial_issue(DiscoveryIssue::EnvironmentalBackoff {
+                operation: EnvironmentalOperation::Traverse,
+                error: EnvironmentalErrorClass::DescriptorPressure,
+            })?;
+            return Ok(());
+        }
+        if let Some(backoff) = self
+            .exclude_scan_backoffs
+            .get(pattern_index)
+            .copied()
+            .flatten()
+            .filter(|backoff| backoff.state.retry_at() > Instant::now())
+        {
+            admission.record_denial_issue(DiscoveryIssue::EnvironmentalBackoff {
+                operation: backoff.operation,
+                error: backoff.error,
+            })?;
+            return Ok(());
+        }
         let maximum_depth = if self.plan.recursive {
             self.plan.max_recursion_depth
         } else {
@@ -418,6 +519,7 @@ impl FilesystemScanner {
         let mut entries = WalkDir::new(resolved_root)
             .follow_links(self.plan.follow_symlinks)
             .max_depth(maximum_depth)
+            .max_open(MAX_OPEN_TRAVERSAL_DIRECTORIES)
             .into_iter();
         loop {
             self.ensure_running()?;
@@ -432,7 +534,13 @@ impl FilesystemScanner {
                     let path = source
                         .path()
                         .map_or_else(|| resolved_root.to_path_buf(), Path::to_path_buf);
-                    admission.record_denial_issue(DiscoveryIssue::Walk { path, source })?;
+                    let issue = DiscoveryIssue::Walk { path, source };
+                    let retry =
+                        self.note_exclude_scan_environmental_failure(pattern_index, &issue)?;
+                    admission.record_denial_issue(issue)?;
+                    if retry {
+                        return Ok(());
+                    }
                     continue;
                 }
             };
@@ -453,11 +561,17 @@ impl FilesystemScanner {
                 let resolved_directory = match resolved_directory {
                     Ok(path) => path,
                     Err(source) => {
-                        admission.record_denial_issue(DiscoveryIssue::Io {
+                        let issue = DiscoveryIssue::Io {
                             operation: "resolve excluded directory",
                             path: matched_path.to_path_buf(),
                             source,
-                        })?;
+                        };
+                        let retry =
+                            self.note_exclude_scan_environmental_failure(pattern_index, &issue)?;
+                        admission.record_denial_issue(issue)?;
+                        if retry {
+                            return Ok(());
+                        }
                         entries.skip_current_dir();
                         continue;
                     }
@@ -491,11 +605,17 @@ impl FilesystemScanner {
             let resolved_path = match std::fs::canonicalize(entry.path()) {
                 Ok(path) => path,
                 Err(source) => {
-                    admission.record_denial_issue(DiscoveryIssue::Io {
+                    let issue = DiscoveryIssue::Io {
                         operation: "resolve excluded candidate",
                         path: matched_path.to_path_buf(),
                         source,
-                    })?;
+                    };
+                    let retry =
+                        self.note_exclude_scan_environmental_failure(pattern_index, &issue)?;
+                    admission.record_denial_issue(issue)?;
+                    if retry {
+                        return Ok(());
+                    }
                     continue;
                 }
             };
@@ -514,6 +634,13 @@ impl FilesystemScanner {
             {
                 continue;
             }
+            if self.descriptor_pressure_active()? {
+                admission.record_denial_issue(DiscoveryIssue::EnvironmentalBackoff {
+                    operation: EnvironmentalOperation::Probe,
+                    error: EnvironmentalErrorClass::DescriptorPressure,
+                })?;
+                return Ok(());
+            }
             let locator = self.collect_stable_revoked_locator(
                 matched_path,
                 &resolved_path,
@@ -523,20 +650,37 @@ impl FilesystemScanner {
             );
             self.ensure_running()?;
             match locator {
-                Ok(Some(locator)) => admission.observe_revoked(
-                    generation,
-                    locator,
-                    RevocationReason::ExcludedByPolicy,
-                )?,
+                Ok(Some(locator)) => {
+                    if self
+                        .descriptor_pressure
+                        .clear_after_success(Instant::now())?
+                    {
+                        admission.record_environmental_recovery()?;
+                    }
+                    admission.observe_revoked(
+                        generation,
+                        locator,
+                        RevocationReason::ExcludedByPolicy,
+                    )?;
+                }
                 Ok(None) => {}
-                Err(issue) => admission.record_denial_issue(issue)?,
+                Err(issue) => {
+                    let retry =
+                        self.note_exclude_scan_environmental_failure(pattern_index, &issue)?;
+                    admission.record_denial_issue(issue)?;
+                    if retry {
+                        return Ok(());
+                    }
+                }
             }
         }
+        self.clear_exclude_scan_environmental_backoff(pattern_index, admission)?;
         Ok(())
     }
 
     fn scan_include(
-        &self,
+        &mut self,
+        pattern_index: usize,
         include: &IncludeRoot,
         generation: u64,
         resolved_excludes: &[ResolvedExclude],
@@ -544,19 +688,44 @@ impl FilesystemScanner {
         admission: &mut AdmissionController,
     ) -> Result<(), DiscoveryError> {
         self.ensure_running()?;
+        if self.descriptor_pressure_active()? {
+            admission.record_issue(DiscoveryIssue::EnvironmentalBackoff {
+                operation: EnvironmentalOperation::Traverse,
+                error: EnvironmentalErrorClass::DescriptorPressure,
+            })?;
+            return Ok(());
+        }
+        if let Some(backoff) = self
+            .include_backoffs
+            .get(pattern_index)
+            .copied()
+            .flatten()
+            .filter(|backoff| backoff.state.retry_at() > Instant::now())
+        {
+            admission.record_issue(DiscoveryIssue::EnvironmentalBackoff {
+                operation: backoff.operation,
+                error: backoff.error,
+            })?;
+            return Ok(());
+        }
         let mut lexical_root_is_symlink = false;
         if !self.plan.follow_symlinks {
             let metadata = std::fs::symlink_metadata(&include.lexical_root);
             self.ensure_running()?;
             match metadata {
                 Ok(metadata) => lexical_root_is_symlink = metadata.file_type().is_symlink(),
-                Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                    self.clear_include_environmental_backoff(pattern_index, admission)?;
+                    return Ok(());
+                }
                 Err(source) => {
-                    admission.record_issue(DiscoveryIssue::Io {
+                    let issue = DiscoveryIssue::Io {
                         operation: "inspect include root without following links",
                         path: include.lexical_root.clone(),
                         source,
-                    })?;
+                    };
+                    let _ = self.note_include_environmental_failure(pattern_index, &issue)?;
+                    admission.record_issue(issue)?;
                     return Ok(());
                 }
             }
@@ -565,13 +734,18 @@ impl FilesystemScanner {
         self.ensure_running()?;
         let resolved_root = match resolved_root {
             Ok(path) => path,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                self.clear_include_environmental_backoff(pattern_index, admission)?;
+                return Ok(());
+            }
             Err(source) => {
-                admission.record_issue(DiscoveryIssue::Io {
+                let issue = DiscoveryIssue::Io {
                     operation: "resolve include root",
                     path: include.lexical_root.clone(),
                     source,
-                })?;
+                };
+                let _ = self.note_include_environmental_failure(pattern_index, &issue)?;
+                admission.record_issue(issue)?;
                 return Ok(());
             }
         };
@@ -580,13 +754,18 @@ impl FilesystemScanner {
             self.ensure_running()?;
             match metadata {
                 Ok(metadata) if metadata.is_dir() => {}
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    self.clear_include_environmental_backoff(pattern_index, admission)?;
+                    return Ok(());
+                }
                 Err(source) => {
-                    admission.record_issue(DiscoveryIssue::Io {
+                    let issue = DiscoveryIssue::Io {
                         operation: "inspect resolved include root",
                         path: include.lexical_root.clone(),
                         source,
-                    })?;
+                    };
+                    let _ = self.note_include_environmental_failure(pattern_index, &issue)?;
+                    admission.record_issue(issue)?;
                     return Ok(());
                 }
             }
@@ -599,6 +778,7 @@ impl FilesystemScanner {
         let mut entries = WalkDir::new(&resolved_root)
             .follow_links(self.plan.follow_symlinks)
             .max_depth(maximum_depth)
+            .max_open(MAX_OPEN_TRAVERSAL_DIRECTORIES)
             .into_iter();
         loop {
             self.ensure_running()?;
@@ -613,7 +793,12 @@ impl FilesystemScanner {
                     let path = source
                         .path()
                         .map_or_else(|| resolved_root.clone(), Path::to_path_buf);
-                    admission.record_issue(DiscoveryIssue::Walk { path, source })?;
+                    let issue = DiscoveryIssue::Walk { path, source };
+                    let retry = self.note_include_environmental_failure(pattern_index, &issue)?;
+                    admission.record_issue(issue)?;
+                    if retry {
+                        return Ok(());
+                    }
                     continue;
                 }
             };
@@ -641,11 +826,17 @@ impl FilesystemScanner {
                 let resolved_directory = match resolved_directory {
                     Ok(path) => path,
                     Err(source) => {
-                        admission.record_issue(DiscoveryIssue::Io {
+                        let issue = DiscoveryIssue::Io {
                             operation: "resolve candidate directory",
                             path: matched_path,
                             source,
-                        })?;
+                        };
+                        let retry =
+                            self.note_include_environmental_failure(pattern_index, &issue)?;
+                        admission.record_issue(issue)?;
+                        if retry {
+                            return Ok(());
+                        }
                         entries.skip_current_dir();
                         continue;
                     }
@@ -707,10 +898,14 @@ impl FilesystemScanner {
                         path: matched_path,
                         source,
                     };
+                    let retry = self.note_include_environmental_failure(pattern_index, &issue)?;
                     if lexically_excluded {
                         admission.record_denial_issue(issue)?;
                     } else {
                         admission.record_issue(issue)?;
+                    }
+                    if retry {
+                        return Ok(());
                     }
                     continue;
                 }
@@ -735,6 +930,13 @@ impl FilesystemScanner {
                 continue;
             }
             if self.path_matches_user_exclude(&matched_path, &resolved_path, resolved_excludes) {
+                if self.descriptor_pressure_active()? {
+                    admission.record_denial_issue(DiscoveryIssue::EnvironmentalBackoff {
+                        operation: EnvironmentalOperation::Probe,
+                        error: EnvironmentalErrorClass::DescriptorPressure,
+                    })?;
+                    return Ok(());
+                }
                 let locator = self.collect_stable_revoked_locator(
                     &matched_path,
                     &resolved_path,
@@ -744,13 +946,28 @@ impl FilesystemScanner {
                 );
                 self.ensure_running()?;
                 match locator {
-                    Ok(Some(locator)) => admission.observe_revoked(
-                        generation,
-                        locator,
-                        RevocationReason::ExcludedByPolicy,
-                    )?,
+                    Ok(Some(locator)) => {
+                        if self
+                            .descriptor_pressure
+                            .clear_after_success(Instant::now())?
+                        {
+                            admission.record_environmental_recovery()?;
+                        }
+                        admission.observe_revoked(
+                            generation,
+                            locator,
+                            RevocationReason::ExcludedByPolicy,
+                        )?;
+                    }
                     Ok(None) => {}
-                    Err(issue) => admission.record_denial_issue(issue)?,
+                    Err(issue) => {
+                        let retry =
+                            self.note_include_environmental_failure(pattern_index, &issue)?;
+                        admission.record_denial_issue(issue)?;
+                        if retry {
+                            return Ok(());
+                        }
+                    }
                 }
                 continue;
             }
@@ -770,6 +987,13 @@ impl FilesystemScanner {
                 continue;
             }
 
+            if self.descriptor_pressure_active()? {
+                admission.record_issue(DiscoveryIssue::EnvironmentalBackoff {
+                    operation: EnvironmentalOperation::Probe,
+                    error: EnvironmentalErrorClass::DescriptorPressure,
+                })?;
+                return Ok(());
+            }
             let observation = self.collect_stable_candidate(
                 &matched_path,
                 &resolved_path,
@@ -779,10 +1003,22 @@ impl FilesystemScanner {
             );
             self.ensure_running()?;
             let observation = match observation {
-                Ok(Some(observation)) => observation,
+                Ok(Some(observation)) => {
+                    if self
+                        .descriptor_pressure
+                        .clear_after_success(Instant::now())?
+                    {
+                        admission.record_environmental_recovery()?;
+                    }
+                    observation
+                }
                 Ok(None) => continue,
                 Err(issue) => {
+                    let retry = self.note_include_environmental_failure(pattern_index, &issue)?;
                     admission.record_issue(issue)?;
+                    if retry {
+                        return Ok(());
+                    }
                     continue;
                 }
             };
@@ -797,6 +1033,7 @@ impl FilesystemScanner {
                 )?,
             }
         }
+        self.clear_include_environmental_backoff(pattern_index, admission)?;
         Ok(())
     }
 
@@ -876,6 +1113,19 @@ impl FilesystemScanner {
     ) -> Result<Option<StableCandidateObservation>, DiscoveryIssue> {
         if self.cancellation_requested() {
             return Ok(None);
+        }
+        #[cfg(test)]
+        if let Some(source) = self
+            .next_candidate_open_error
+            .lock()
+            .expect("candidate open error lock poisoned")
+            .take()
+        {
+            return Err(DiscoveryIssue::Identity(IdentityError::Io {
+                operation: "open injected candidate",
+                path: matched_path.to_path_buf(),
+                source,
+            }));
         }
         #[cfg(test)]
         let gate = self
@@ -1069,27 +1319,189 @@ impl FilesystemScanner {
             || matched_path.starts_with(&self.plan.checkpoint_namespace_dir)
     }
 
+    fn note_descriptor_pressure(&mut self, issue: &DiscoveryIssue) -> Result<bool, DiscoveryError> {
+        let Some(source) = discovery_issue_io_error(issue) else {
+            return Ok(false);
+        };
+        if classify_io_error(source) != EnvironmentalErrorClass::DescriptorPressure {
+            return Ok(false);
+        }
+        let _ = self.descriptor_pressure.record_failure(Instant::now())?;
+        Ok(true)
+    }
+
+    fn note_include_environmental_failure(
+        &mut self,
+        pattern_index: usize,
+        issue: &DiscoveryIssue,
+    ) -> Result<bool, DiscoveryError> {
+        let Some((operation, error)) = classify_environmental_issue(issue) else {
+            return Ok(false);
+        };
+        if error == EnvironmentalErrorClass::DescriptorPressure {
+            return self.note_descriptor_pressure(issue);
+        }
+        let previous = self
+            .include_backoffs
+            .get(pattern_index)
+            .copied()
+            .flatten()
+            .map(|backoff| backoff.state);
+        let state = EnvironmentalBackoff::after_failure(previous, Instant::now()).ok_or(
+            DiscoveryError::ScheduleOverflow {
+                field: "discovery include-root environmental retry deadline",
+            },
+        )?;
+        self.include_backoffs[pattern_index] = Some(DiscoveryBackoff {
+            state,
+            operation,
+            error,
+        });
+        Ok(true)
+    }
+
+    fn note_exclude_scan_environmental_failure(
+        &mut self,
+        pattern_index: usize,
+        issue: &DiscoveryIssue,
+    ) -> Result<bool, DiscoveryError> {
+        let Some((operation, error)) = classify_environmental_issue(issue) else {
+            return Ok(false);
+        };
+        if error == EnvironmentalErrorClass::DescriptorPressure {
+            return self.note_descriptor_pressure(issue);
+        }
+        let previous = self
+            .exclude_scan_backoffs
+            .get(pattern_index)
+            .copied()
+            .flatten()
+            .map(|backoff| backoff.state);
+        let state = EnvironmentalBackoff::after_failure(previous, Instant::now()).ok_or(
+            DiscoveryError::ScheduleOverflow {
+                field: "discovery exclude-root environmental retry deadline",
+            },
+        )?;
+        self.exclude_scan_backoffs[pattern_index] = Some(DiscoveryBackoff {
+            state,
+            operation,
+            error,
+        });
+        Ok(true)
+    }
+
+    fn note_exclude_resolution_environmental_failure(
+        &mut self,
+        pattern_index: usize,
+        issue: &DiscoveryIssue,
+    ) -> Result<(), DiscoveryError> {
+        let Some((operation, error)) = classify_environmental_issue(issue) else {
+            return Ok(());
+        };
+        if error == EnvironmentalErrorClass::DescriptorPressure {
+            let _ = self.note_descriptor_pressure(issue)?;
+            return Ok(());
+        }
+        let previous = self
+            .exclude_resolution_backoffs
+            .get(pattern_index)
+            .copied()
+            .flatten()
+            .map(|backoff| backoff.state);
+        let state = EnvironmentalBackoff::after_failure(previous, Instant::now()).ok_or(
+            DiscoveryError::ScheduleOverflow {
+                field: "discovery exclude-root resolution retry deadline",
+            },
+        )?;
+        self.exclude_resolution_backoffs[pattern_index] = Some(DiscoveryBackoff {
+            state,
+            operation,
+            error,
+        });
+        Ok(())
+    }
+
+    fn descriptor_pressure_active(&self) -> Result<bool, DiscoveryError> {
+        Ok(self.descriptor_pressure.retry_at(Instant::now())?.is_some())
+    }
+
+    fn clear_include_environmental_backoff(
+        &mut self,
+        pattern_index: usize,
+        admission: &mut AdmissionController,
+    ) -> Result<(), DiscoveryError> {
+        if self.include_backoffs[pattern_index].take().is_some() {
+            admission.record_environmental_recovery()?;
+        }
+        Ok(())
+    }
+
+    fn clear_exclude_scan_environmental_backoff(
+        &mut self,
+        pattern_index: usize,
+        admission: &mut AdmissionController,
+    ) -> Result<(), DiscoveryError> {
+        if self.exclude_scan_backoffs[pattern_index].take().is_some() {
+            admission.record_environmental_recovery()?;
+        }
+        Ok(())
+    }
+
+    fn clear_exclude_resolution_environmental_backoff(
+        &mut self,
+        pattern_index: usize,
+        admission: &mut AdmissionController,
+    ) -> Result<(), DiscoveryError> {
+        if self.exclude_resolution_backoffs[pattern_index]
+            .take()
+            .is_some()
+        {
+            admission.record_environmental_recovery()?;
+        }
+        Ok(())
+    }
+
     fn resolve_excludes(
-        &self,
+        &mut self,
         admission: &mut AdmissionController,
     ) -> Result<Option<Vec<ResolvedExclude>>, DiscoveryError> {
         let mut resolved = Vec::with_capacity(self.plan.exclude_patterns.len());
-        for exclude in &self.plan.exclude_patterns {
+        for pattern_index in 0..self.plan.exclude_patterns.len() {
             self.ensure_running()?;
+            if let Some(backoff) = self
+                .exclude_resolution_backoffs
+                .get(pattern_index)
+                .copied()
+                .flatten()
+                .filter(|backoff| backoff.state.retry_at() > Instant::now())
+            {
+                admission.record_denial_issue(DiscoveryIssue::EnvironmentalBackoff {
+                    operation: backoff.operation,
+                    error: backoff.error,
+                })?;
+                return Ok(None);
+            }
+            let exclude = self.plan.exclude_patterns[pattern_index].clone();
             let resolved_root = canonicalize_optional(&exclude.lexical_root);
             self.ensure_running()?;
             let resolved_root = match resolved_root {
-                Ok(path) => path,
+                Ok(path) => {
+                    self.clear_exclude_resolution_environmental_backoff(pattern_index, admission)?;
+                    path
+                }
                 Err(source) => {
-                    admission.record_denial_issue(DiscoveryIssue::Io {
+                    let issue = DiscoveryIssue::Io {
                         operation: "resolve exclude root",
                         path: exclude.lexical_root.clone(),
                         source,
-                    })?;
+                    };
+                    self.note_exclude_resolution_environmental_failure(pattern_index, &issue)?;
+                    admission.record_denial_issue(issue)?;
                     return Ok(None);
                 }
             };
             resolved.push(ResolvedExclude {
+                pattern_index,
                 lexical_root: exclude.lexical_root.clone(),
                 resolved_root,
                 matcher: exclude.matcher.clone(),
@@ -1109,6 +1521,49 @@ impl FilesystemScanner {
     fn cancellation_requested(&self) -> bool {
         self.shutdown_requested.load(Ordering::Acquire)
     }
+}
+
+fn discovery_issue_io_error(issue: &DiscoveryIssue) -> Option<&io::Error> {
+    match issue {
+        DiscoveryIssue::Io { source, .. } => Some(source),
+        DiscoveryIssue::Walk { source, .. } => source.io_error(),
+        DiscoveryIssue::Identity(IdentityError::Io { source, .. }) => Some(source),
+        DiscoveryIssue::EnvironmentalBackoff { .. }
+        | DiscoveryIssue::ConflictingPathRebind { .. }
+        | DiscoveryIssue::Identity(_) => None,
+    }
+}
+
+pub(crate) fn classify_environmental_issue(
+    issue: &DiscoveryIssue,
+) -> Option<(EnvironmentalOperation, EnvironmentalErrorClass)> {
+    let source = discovery_issue_io_error(issue)?;
+    if source.kind() == io::ErrorKind::NotFound {
+        return None;
+    }
+    let operation = match issue {
+        DiscoveryIssue::Walk { .. } => EnvironmentalOperation::Traverse,
+        DiscoveryIssue::Identity(IdentityError::Io { .. }) => EnvironmentalOperation::Probe,
+        DiscoveryIssue::Io { operation, .. }
+            if matches!(
+                *operation,
+                "inspect include root without following links"
+                    | "resolve include root"
+                    | "inspect resolved include root"
+                    | "resolve candidate directory"
+                    | "resolve excluded directory"
+                    | "map resolved entry to include root"
+                    | "resolve exclude root"
+            ) =>
+        {
+            EnvironmentalOperation::Traverse
+        }
+        DiscoveryIssue::Io { .. } => EnvironmentalOperation::Probe,
+        DiscoveryIssue::EnvironmentalBackoff { .. }
+        | DiscoveryIssue::ConflictingPathRebind { .. }
+        | DiscoveryIssue::Identity(_) => return None,
+    };
+    Some((operation, classify_io_error(source)))
 }
 
 fn validate_walk_entry_path_stability(

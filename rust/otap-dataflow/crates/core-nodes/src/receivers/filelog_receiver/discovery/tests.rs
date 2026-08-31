@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashSet;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,6 +23,8 @@ use crate::receivers::filelog_receiver::checkpoint::primitives::{
 use crate::receivers::filelog_receiver::checkpoint::store::{CheckpointStore, StoreOptions};
 use crate::receivers::filelog_receiver::checkpoint::wal::{Operation, RegisterFile};
 use crate::receivers::filelog_receiver::config::{Config, RuntimeConfig};
+#[cfg(unix)]
+use crate::receivers::filelog_receiver::environment::DescriptorPressure;
 use crate::receivers::filelog_receiver::identity::matcher::{
     IdentityMatch, IdentitySettings, resolve_and_persist,
 };
@@ -47,22 +50,22 @@ fn zero_window(end_offset: u64) -> CommittedFrontierWindow {
 }
 
 #[cfg(unix)]
-fn symlink_file(original: &Path, link: &Path) -> std::io::Result<()> {
+fn symlink_file(original: &Path, link: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(original, link)
 }
 
 #[cfg(windows)]
-fn symlink_file(original: &Path, link: &Path) -> std::io::Result<()> {
+fn symlink_file(original: &Path, link: &Path) -> io::Result<()> {
     std::os::windows::fs::symlink_file(original, link)
 }
 
 #[cfg(unix)]
-fn symlink_dir(original: &Path, link: &Path) -> std::io::Result<()> {
+fn symlink_dir(original: &Path, link: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(original, link)
 }
 
 #[cfg(windows)]
-fn symlink_dir(original: &Path, link: &Path) -> std::io::Result<()> {
+fn symlink_dir(original: &Path, link: &Path) -> io::Result<()> {
     std::os::windows::fs::symlink_dir(original, link)
 }
 
@@ -278,6 +281,267 @@ fn include_exclude_and_checkpoint_rules_are_enforced() {
     );
     assert!(batch.inventory.is_complete());
     assert_eq!(batch.stats.scan_errors, 0);
+}
+
+/// Scenario: recursive include and exclude walks use the Phase 1 traversal
+/// descriptor allowance.
+/// Guarantees: both scanner paths request the frozen one-directory enumeration
+/// cap included in Unix startup descriptor admission; separately documented
+/// Windows link-following and buffering gates are not hidden by this test.
+#[test]
+fn traversal_uses_one_open_directory_handle() {
+    assert_eq!(scanner::MAX_OPEN_TRAVERSAL_DIRECTORIES, 1);
+}
+
+#[cfg(unix)]
+/// Scenario: the first candidate probe across two include roots receives
+/// `EMFILE`.
+/// Guarantees: discovery creates one receiver-global 250ms backoff, marks the
+/// inventory incomplete, starts no further candidate probe in that pass, and
+/// reports one recovery when a later probe succeeds.
+#[test]
+fn discovery_emfile_uses_one_global_descriptor_backoff() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    std::fs::write(first.path().join("first.log"), b"first").unwrap();
+    std::fs::write(second.path().join("second.log"), b"second").unwrap();
+    let config = runtime_config(
+        first.path(),
+        vec![
+            pattern(first.path(), "*.log"),
+            pattern(second.path(), "*.log"),
+        ],
+        vec![],
+    );
+    let (mut scanner, mut admission) = scanner_and_admission(&config);
+    scanner.fail_next_candidate_open_for_test(io::Error::from_raw_os_error(libc::EMFILE));
+    let started = Instant::now();
+
+    let batch = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+    assert!(!batch.inventory.is_complete());
+    assert!(observed_candidates(&batch).is_empty());
+    let retry_at = scanner
+        .descriptor_pressure_retry_at_for_test()
+        .expect("descriptor pressure must retain one global deadline");
+    assert!(retry_at >= started + Duration::from_millis(250));
+    assert!(retry_at <= Instant::now() + Duration::from_millis(250));
+
+    let immediate = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+    assert!(!immediate.inventory.is_complete());
+    assert!(matches!(
+        immediate.stats.first_issue,
+        Some(DiscoveryIssue::EnvironmentalBackoff {
+            error: EnvironmentalErrorClass::DescriptorPressure,
+            ..
+        })
+    ));
+    std::thread::sleep(
+        retry_at
+            .saturating_duration_since(Instant::now())
+            .saturating_add(Duration::from_millis(1)),
+    );
+    let recovered = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+    assert!(recovered.inventory.is_complete());
+    assert_eq!(scanner.descriptor_pressure_retry_at_for_test(), None);
+    assert_eq!(recovered.stats.environmental_recoveries, 1);
+}
+
+#[cfg(unix)]
+/// Scenario: another source operation records descriptor pressure while one
+/// discovery candidate probe is already in flight.
+/// Guarantees: the in-flight success cannot erase the newer global failure,
+/// and discovery starts no additional candidate probe in that pass.
+#[test]
+fn inflight_probe_does_not_clear_concurrent_descriptor_pressure() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("first.log"), b"first").unwrap();
+    std::fs::write(directory.path().join("second.log"), b"second").unwrap();
+    let config = runtime_config(
+        directory.path(),
+        vec![pattern(directory.path(), "*.log")],
+        vec![],
+    );
+    let plan = DiscoveryPlan::from_runtime(&config).unwrap();
+    let mut admission = AdmissionController::new(
+        plan.max_pending_candidates(),
+        plan.max_tracked_files(),
+        plan.max_candidate_events(),
+        plan.fingerprint_bytes(),
+    )
+    .unwrap();
+    let pressure = Arc::new(DescriptorPressure::default());
+    let mut scanner = FilesystemScanner::with_shutdown_signal_and_pressure(
+        plan,
+        Arc::new(AtomicBool::new(false)),
+        Arc::clone(&pressure),
+    );
+    let gate = scanner.gate_next_candidate_before_first_open_for_test();
+    let reconcile = std::thread::spawn(move || {
+        scanner
+            .reconcile(&mut admission, SystemTime::now())
+            .unwrap()
+    });
+
+    assert!(gate.wait_until_entered(Duration::from_secs(5)));
+    let now = Instant::now();
+    let mut retry_at = now;
+    for _ in 0..8 {
+        retry_at = pressure.record_failure(now).unwrap();
+    }
+    gate.release();
+    let batch = reconcile.join().unwrap();
+
+    assert!(!batch.inventory.is_complete());
+    assert_eq!(observed_candidates(&batch).len(), 1);
+    assert_eq!(
+        pressure.current().unwrap().map(|state| state.retry_at()),
+        Some(retry_at)
+    );
+}
+
+/// Scenario: one candidate probe in the first of two include roots receives
+/// a temporary permission failure.
+/// Guarantees: only that traversal root enters bounded backoff; the second
+/// root still discovers its healthy file and the combined inventory remains
+/// explicitly incomplete, then a successful retry reports one recovery.
+#[test]
+fn discovery_root_error_does_not_block_unrelated_root() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    std::fs::write(first.path().join("failed.log"), b"failed").unwrap();
+    let healthy = second.path().join("healthy.log");
+    std::fs::write(&healthy, b"healthy").unwrap();
+    let config = runtime_config(
+        first.path(),
+        vec![
+            pattern(first.path(), "*.log"),
+            pattern(second.path(), "*.log"),
+        ],
+        vec![],
+    );
+    let (mut scanner, mut admission) = scanner_and_admission(&config);
+    scanner.fail_next_candidate_open_for_test(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "temporary permission",
+    ));
+
+    let batch = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+    assert!(!batch.inventory.is_complete());
+    assert_eq!(
+        observed_candidates(&batch)
+            .into_iter()
+            .map(|candidate| candidate.matched_path.clone())
+            .collect::<Vec<_>>(),
+        vec![healthy]
+    );
+    assert_eq!(scanner.descriptor_pressure_retry_at_for_test(), None);
+    let (failures, retry_at) = scanner
+        .include_retry_state_for_test(0)
+        .expect("failed root must retain one retry state");
+    assert_eq!(failures, 1);
+
+    let immediate = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+    assert!(!immediate.inventory.is_complete());
+    std::thread::sleep(
+        retry_at
+            .saturating_duration_since(Instant::now())
+            .saturating_add(Duration::from_millis(1)),
+    );
+    let recovered = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+    assert!(recovered.inventory.is_complete());
+    assert_eq!(scanner.include_retry_state_for_test(0), None);
+    assert_eq!(recovered.stats.environmental_recoveries, 1);
+
+    scanner.fail_next_candidate_open_for_test(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "temporary permission",
+    ));
+    let _ = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+    assert_eq!(
+        scanner.include_retry_state_for_test(0).map(|state| state.0),
+        Some(1)
+    );
+}
+
+/// Scenario: one of two candidates in the same traversal root disappears
+/// between enumeration and its identity probe.
+/// Guarantees: the pass is incomplete but the vanished entry does not create
+/// root backoff or prevent the other candidate from being observed.
+#[test]
+fn vanished_candidate_does_not_back_off_its_traversal_root() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("first.log"), b"first").unwrap();
+    std::fs::write(directory.path().join("second.log"), b"second").unwrap();
+    let config = runtime_config(
+        directory.path(),
+        vec![pattern(directory.path(), "*.log")],
+        vec![],
+    );
+    let (mut scanner, mut admission) = scanner_and_admission(&config);
+    scanner.fail_next_candidate_open_for_test(io::Error::new(
+        io::ErrorKind::NotFound,
+        "candidate vanished",
+    ));
+
+    let batch = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+
+    assert!(!batch.inventory.is_complete());
+    assert_eq!(observed_candidates(&batch).len(), 1);
+    assert_eq!(scanner.include_retry_state_for_test(0), None);
+}
+
+#[cfg(unix)]
+/// Scenario: traversal of a resolved exclude root encounters a temporarily
+/// unreadable descendant while an unrelated include root remains healthy.
+/// Guarantees: exclude-scan backoff keeps both passes incomplete but never
+/// suppresses reconciliation of the unrelated include root.
+#[test]
+fn exclude_scan_backoff_does_not_suppress_include_roots() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let included = tempfile::tempdir().unwrap();
+    let healthy = included.path().join("healthy.log");
+    std::fs::write(&healthy, b"healthy").unwrap();
+    let excluded = tempfile::tempdir().unwrap();
+    let unreadable = excluded.path().join("unreadable");
+    std::fs::create_dir(&unreadable).unwrap();
+    std::fs::write(unreadable.join("hidden.log"), b"hidden").unwrap();
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o0)).unwrap();
+    let config = runtime_config(
+        included.path(),
+        vec![pattern(included.path(), "*.log")],
+        vec![pattern(excluded.path(), "**/*.log")],
+    );
+    let (mut scanner, mut admission) = scanner_and_admission(&config);
+
+    let first = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+    let immediate = scanner
+        .reconcile(&mut admission, SystemTime::now())
+        .unwrap();
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(!first.inventory.is_complete());
+    assert_eq!(first.stats.matched_paths, 1);
+    assert!(!immediate.inventory.is_complete());
+    assert_eq!(immediate.stats.matched_paths, 1);
 }
 
 /// Scenario: a recursive glob can match a nested file, but the receiver's
@@ -1458,7 +1722,7 @@ fn incomplete_scan_preserves_unseen_tracked_and_pending_state() {
         .record_issue(DiscoveryIssue::Io {
             operation: "test interrupted traversal",
             path: PathBuf::from("unreadable"),
-            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+            source: io::Error::new(io::ErrorKind::PermissionDenied, "denied"),
         })
         .unwrap();
     let incomplete = admission.finish_scan().unwrap();
@@ -2049,7 +2313,7 @@ fn incomplete_pass_preserves_binding_instead_of_reselecting() {
         .record_issue(DiscoveryIssue::Io {
             operation: "test forced incompleteness",
             path: PathBuf::from("unrelated"),
-            source: std::io::Error::other("boom"),
+            source: io::Error::other("boom"),
         })
         .unwrap();
     let second = admission.finish_scan().unwrap();
