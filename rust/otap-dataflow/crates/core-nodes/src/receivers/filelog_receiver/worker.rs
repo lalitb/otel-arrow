@@ -22,7 +22,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use super::batching::{
     BatchAppendOutcome, BatchError, FinalizationOutcome, LogicalBatch, OpenBatch, ProgressBase,
-    ProgressDelta, ProgressFrontier, RecordInput, RecordNumberTable,
+    ProgressDelta, ProgressFrontier, RecordInput,
 };
 use super::checkpoint::primitives::{
     FileId, FramingResume, LifecycleState, Locator, QUARANTINE_REASON_DECODE,
@@ -474,7 +474,6 @@ struct WorkerRuntime {
     pending_finalizations: Vec<Locator>,
     detected_truncations: Vec<DetectedTruncation>,
     open_batch: Option<OpenBatch>,
-    record_numbers: RecordNumberTable,
     retained: Option<RetainedBatch>,
     pending_carry_over: Option<PendingCarryOver>,
     carry_over: Option<CarryOver>,
@@ -674,7 +673,6 @@ impl WorkerRuntime {
             Arc::clone(&shutdown_requested),
         )?;
         let open_batch = OpenBatch::new(&config)?;
-        let record_numbers = RecordNumberTable::new(max_readers)?;
         if shutdown_requested.load(Ordering::Acquire) {
             return Err(WorkerError::StartupCancelled);
         }
@@ -699,7 +697,6 @@ impl WorkerRuntime {
             pending_finalizations,
             detected_truncations,
             open_batch: Some(open_batch),
-            record_numbers,
             retained: None,
             pending_carry_over: None,
             carry_over: None,
@@ -1566,7 +1563,6 @@ impl WorkerRuntime {
                                     });
                                 }
                                 let _ = self.rotation_waits.remove(&file_id);
-                                let _ = self.record_numbers.remove(file_id);
                                 self.remove_drain_file(file_id);
                                 self.remember_inactive_locator(locator, file_id)?;
                                 feedback.released.push(DiscoveryRelease::Revoked(locator));
@@ -1945,7 +1941,6 @@ impl WorkerRuntime {
                 }
                 self.discard_framer(truncation.file_id);
                 let _ = self.rotation_waits.remove(&truncation.file_id);
-                let _ = self.record_numbers.remove(truncation.file_id);
                 self.remove_drain_file(truncation.file_id);
                 if truncation.present {
                     self.remember_inactive_locator(truncation.locator, truncation.file_id)?;
@@ -2010,7 +2005,6 @@ impl WorkerRuntime {
                 )?;
                 self.discard_framer(truncation.file_id);
                 let _ = self.rotation_waits.remove(&truncation.file_id);
-                let _ = self.record_numbers.remove(truncation.file_id);
                 self.remove_drain_file(truncation.file_id);
             }
         }
@@ -2450,7 +2444,6 @@ impl WorkerRuntime {
         }
         self.discard_framer(file_id);
         let _ = self.rotation_waits.remove(&file_id);
-        let _ = self.record_numbers.remove(file_id);
         self.remove_drain_file(file_id);
         if frontier.present {
             self.remember_inactive_locator(locator, file_id)?;
@@ -2874,14 +2867,11 @@ impl WorkerRuntime {
             });
         }
         let (observed_time_unix_nano, last_seen_time_unix_nano) = unix_nanos()?;
-        let (matched_path, resolved_path) = {
-            let context = self.readers_ref()?.record_context(file_id)?;
-            (
-                context.matched_path.to_path_buf(),
-                context.resolved_path.to_path_buf(),
-            )
-        };
-        let fragment_index = framed.fragment.as_ref().map(|fragment| fragment.index);
+        let matched_path = self
+            .readers_ref()?
+            .record_context(file_id)?
+            .matched_path
+            .to_path_buf();
         let framed_telemetry = FramedTelemetry {
             decode_outcome: framed.decode_outcome,
             flush_reason: framed.flush_reason,
@@ -2889,27 +2879,14 @@ impl WorkerRuntime {
             discarded_source_bytes: framed.discarded_source_bytes,
             split: framed.fragment.is_some(),
         };
-        let reservation = if self.config.metadata.include_file_record_number {
-            Some(
-                self.record_numbers
-                    .prepare(file_id, base.file_epoch, fragment_index)?,
-            )
-        } else {
-            None
-        };
-        let record_number = reservation
-            .as_ref()
-            .and_then(super::batching::RecordNumberReservation::record_number);
         let input = RecordInput {
             framed,
             file_id,
             progress_base: current,
             matched_path,
-            resolved_path,
             observed_time_unix_nano,
             last_seen_time_unix_nano,
             ready_at,
-            record_number,
         };
         let outcome = self
             .open_batch
@@ -2921,15 +2898,6 @@ impl WorkerRuntime {
         match outcome {
             BatchAppendOutcome::Appended { seal } => {
                 self.observe_framed_record(framed_telemetry);
-                if let Some(reservation) = reservation {
-                    let committed = self.record_numbers.commit(reservation)?;
-                    if committed != record_number {
-                        return Err(WorkerError::Inconsistent {
-                            reason: "record-number commit changed the prepared projection",
-                        });
-                    }
-                }
-
                 Ok(if seal.is_some() {
                     AppendControl::SealAfter
                 } else {
@@ -2960,14 +2928,6 @@ impl WorkerRuntime {
                     }
                 }
                 self.observe_framed_record(framed_telemetry);
-                if let Some(reservation) = reservation {
-                    let committed = self.record_numbers.commit(reservation)?;
-                    if committed != record_number {
-                        return Err(WorkerError::Inconsistent {
-                            reason: "carry-over number commit changed the prepared projection",
-                        });
-                    }
-                }
                 self.telemetry.add(WorkerCounter::CarryOverRecords, 1);
                 self.pending_carry_over = Some(PendingCarryOver {
                     file_id: carry_file_id,
@@ -3441,7 +3401,6 @@ impl WorkerRuntime {
                 let locator = self.readers_mut()?.release_finalized(delta.file_id())?;
                 self.queue_finalization_feedback(locator)?;
                 let _ = self.rotation_waits.remove(&delta.file_id());
-                let _ = self.record_numbers.remove(delta.file_id());
                 self.remove_drain_file(delta.file_id());
                 record_rotation_finalization_telemetry(&self.telemetry);
             }
@@ -4060,7 +4019,6 @@ impl WorkerRuntime {
 
         for removal in &self.retention_removals {
             let _ = self.absence_since.remove(&removal.file_id);
-            let _ = self.record_numbers.remove(removal.file_id);
             if removal.lifecycle_state == LifecycleState::Active
                 && !feedback.finalized.contains(&removal.locator)
             {
@@ -4466,7 +4424,6 @@ impl WorkerRuntime {
             let locator = self.readers_mut()?.release_finalized(delta.file_id())?;
             self.queue_finalization_feedback(locator)?;
             let _ = self.rotation_waits.remove(&delta.file_id());
-            let _ = self.record_numbers.remove(delta.file_id());
             self.remove_drain_file(delta.file_id());
             record_rotation_finalization_telemetry(&self.telemetry);
             self.retention_schedule_dirty = true;

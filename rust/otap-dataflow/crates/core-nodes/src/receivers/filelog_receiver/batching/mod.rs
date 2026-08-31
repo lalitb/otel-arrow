@@ -24,22 +24,26 @@ use thiserror::Error;
 
 use super::checkpoint::primitives::WAL_MAX_OPS_PER_TX;
 use super::checkpoint::wal::UpdateProgress;
-use super::checkpoint::{CommittedFrontierGuard, CommittedFrontierWindow, FileId, FramingResume};
+use super::checkpoint::{
+    AdvisoryPathKind, CommittedFrontierGuard, CommittedFrontierWindow, FileId, FramingResume,
+};
 use super::config::{
     ATTR_KEY_DECODE_ERROR_COUNT, ATTR_KEY_DECODE_ERROR_POLICY, ATTR_KEY_FLUSH_REASON,
-    ATTR_KEY_FRAGMENT_ID, ATTR_KEY_FRAGMENT_INDEX, ATTR_KEY_FRAGMENT_LAST,
-    ATTR_KEY_FRAGMENT_SOURCE_END, ATTR_KEY_FRAGMENT_SOURCE_START, ATTR_KEY_LOG_FILE_NAME,
-    ATTR_KEY_LOG_FILE_PATH, ATTR_KEY_PATH_ENCODING, ATTR_KEY_PATH_RESOLVED, ATTR_KEY_RECORD_NUMBER,
-    ATTR_KEY_RECORD_OFFSET, ATTR_KEY_RECORD_TRUNCATED, ATTR_KEY_TERMINAL_UNTERMINATED,
-    ENCODED_PATH_DISCRIMINATOR, ENCODED_PATH_PREFIX, LogicalAttributeSize, LogicalSizeError,
-    MetadataConfig, RuntimeConfig, checked_logical_record_size, logical_bool_value_len,
+    ATTR_KEY_FRAGMENT_BODY_END, ATTR_KEY_FRAGMENT_BODY_START, ATTR_KEY_FRAGMENT_FRAME_END,
+    ATTR_KEY_FRAGMENT_FRAME_START, ATTR_KEY_FRAGMENT_ID, ATTR_KEY_FRAGMENT_INDEX,
+    ATTR_KEY_FRAGMENT_IS_LAST, ATTR_KEY_LOG_FILE_NAME, ATTR_KEY_LOG_FILE_PATH, ATTR_KEY_PATH_KIND,
+    ATTR_KEY_PATH_NATIVE, ATTR_KEY_PATH_SHA256, ATTR_KEY_PATH_TRUNCATED, ATTR_KEY_RECORD_TRUNCATED,
+    ATTR_KEY_TERMINAL_UNTERMINATED, LogicalAttributeSize, LogicalSizeError, PATH_KIND_UNIX_BYTES,
+    PATH_KIND_WINDOWS_UTF16LE, RuntimeConfig, checked_logical_record_size, logical_bool_value_len,
     logical_int_value_len, logical_string_value_len,
 };
 use super::framing::{
     DecodeOutcome, FlushReason, FragmentMetadata, FramedBody, FramedRecord, fragment_id,
 };
 use super::identity::IdentityError;
-use super::identity::platform::native_path_bytes;
+use super::identity::platform::{
+    encode_advisory_path, native_path_fits_advisory_bound, native_path_sha256,
+};
 use super::{MaxLogSizeBehavior, OnDecodeError};
 
 #[cfg(test)]
@@ -92,17 +96,12 @@ pub(crate) struct RecordInput {
     pub(crate) progress_base: ProgressBase,
     /// Operator-visible path matched by discovery.
     pub(crate) matched_path: PathBuf,
-    /// Canonical target path opened by discovery.
-    pub(crate) resolved_path: PathBuf,
     /// Per-record observed timestamp; negative Unix timestamps are rejected.
     pub(crate) observed_time_unix_nano: i64,
     /// Independent monotonic metadata timestamp used only by checkpointing.
     pub(crate) last_seen_time_unix_nano: u64,
     /// Monotonic worker clock instant at which the frame became ready.
     pub(crate) ready_at: Instant,
-    /// Optional zero-based worker-local number supplied by
-    /// [`RecordNumberTable`].
-    pub(crate) record_number: Option<u64>,
 }
 
 /// The evidence source for one delta's resulting committed-frontier guard.
@@ -355,9 +354,6 @@ pub(crate) enum BatchError {
         /// Rejected matched path.
         path: PathBuf,
     },
-    /// Percent-output capacity arithmetic overflowed.
-    #[error("filelog path percent encoding overflows addressable capacity")]
-    PathEncodingOverflow,
     /// Shared logical-size arithmetic overflowed.
     #[error(transparent)]
     LogicalSize(#[from] LogicalSizeError),
@@ -406,23 +402,15 @@ pub(crate) enum BatchError {
     /// `finish` was requested before any record was appended.
     #[error("filelog cannot finish an empty logical batch")]
     EmptyBatch,
-    /// A bounded record-number table has no slot for another identity.
-    #[error("filelog record-number table is full at {max_files} files")]
-    RecordNumberCapacityExhausted {
-        /// Configured table maximum.
-        max_files: usize,
-    },
-    /// A record-number reservation no longer matches table state.
-    #[error("stale filelog record-number reservation for {file_id:?}")]
-    StaleRecordNumberReservation {
-        /// Identity named by the stale reservation.
+    /// A fragment source offset cannot be represented by OTLP `int_value`.
+    #[error("filelog fragment field '{field}' offset {offset} exceeds i64 for {file_id:?}")]
+    FragmentOffsetOutOfRange {
+        /// Durable identity owning the fragment.
         file_id: FileId,
-    },
-    /// A file's worker-local record number exhausted `u64`.
-    #[error("filelog record number overflowed for {file_id:?}")]
-    RecordNumberOverflow {
-        /// Identity whose next number cannot advance.
-        file_id: FileId,
+        /// Registry field whose value is out of range.
+        field: &'static str,
+        /// Original unsigned source offset.
+        offset: u64,
     },
     /// Canonical Arrow construction failed. Finishing is terminal.
     #[error("could not finish filelog Arrow projection: {0}")]
@@ -444,7 +432,6 @@ pub(crate) struct BatchSettings {
     max_records: u32,
     max_bytes: u64,
     max_flush_period: Duration,
-    metadata: MetadataConfig,
     oversize_behavior: MaxLogSizeBehavior,
     decode_policy: OnDecodeError,
 }
@@ -455,7 +442,6 @@ impl BatchSettings {
             max_records: config.batch.max_records,
             max_bytes: config.batch.max_bytes,
             max_flush_period: config.batch.max_flush_period,
-            metadata: config.metadata,
             oversize_behavior: config.framing.max_log_size_behavior,
             decode_policy: config.on_decode_error,
         }
@@ -464,7 +450,6 @@ impl BatchSettings {
     #[cfg(test)]
     fn for_test(
         batch: BatchConfig,
-        metadata: MetadataConfig,
         oversize_behavior: MaxLogSizeBehavior,
         decode_policy: OnDecodeError,
     ) -> Self {
@@ -472,7 +457,6 @@ impl BatchSettings {
             max_records: batch.max_records,
             max_bytes: batch.max_bytes,
             max_flush_period: batch.max_flush_period,
-            metadata,
             oversize_behavior,
             decode_policy,
         }
@@ -483,6 +467,7 @@ impl BatchSettings {
 enum PreparedValue {
     String(String),
     StaticString(&'static str),
+    Bytes(Vec<u8>),
     Int(i64),
     Bool(bool),
 }
@@ -492,6 +477,9 @@ impl PreparedValue {
         match self {
             Self::String(value) => logical_string_value_len(value),
             Self::StaticString(value) => logical_string_value_len(value),
+            Self::Bytes(value) => {
+                u64::try_from(value.len()).map_err(|_| LogicalSizeError::Overflow)
+            }
             Self::Int(value) => Ok(logical_int_value_len(*value)),
             Self::Bool(value) => Ok(logical_bool_value_len(*value)),
         }
@@ -501,6 +489,7 @@ impl PreparedValue {
         match self {
             Self::String(value) => attributes.any_values_builder.append_str(value.as_bytes()),
             Self::StaticString(value) => attributes.any_values_builder.append_str(value.as_bytes()),
+            Self::Bytes(value) => attributes.any_values_builder.append_bytes(value),
             Self::Int(value) => attributes.any_values_builder.append_int(*value),
             Self::Bool(value) => attributes.any_values_builder.append_bool(*value),
         }
@@ -526,9 +515,17 @@ impl PreparedAttribute {
 }
 
 #[derive(Debug)]
-struct PreparedPath {
-    value: String,
-    encoded: bool,
+enum PreparedPathProvenance {
+    Registered {
+        path: String,
+        name: String,
+    },
+    Native {
+        kind: &'static str,
+        bytes: Vec<u8>,
+        truncated: bool,
+        sha256: Option<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -743,7 +740,7 @@ impl OpenBatch {
         record: RecordInput,
     ) -> Result<BatchAppendOutcome, BatchError> {
         validate_record(&record, &self.settings)?;
-        let attributes = prepare_attributes(&record, &self.settings)?;
+        let attributes = prepare_attributes(&record)?;
         let body_bytes = match &record.framed.body {
             FramedBody::Text(body) => {
                 u64::try_from(body.len()).map_err(|_| LogicalSizeError::Overflow)?
@@ -1202,15 +1199,6 @@ fn validate_record(record: &RecordInput, settings: &BatchSettings) -> Result<(),
             }
         }
     }
-    if settings.metadata.include_file_record_number
-        && record.framed.fragment.is_none()
-        && record.record_number.is_none()
-    {
-        return Err(BatchError::InvalidRecord {
-            file_id: record.file_id,
-            reason: "enabled record-number metadata requires a worker-generated number",
-        });
-    }
     match record.framed.decode_outcome {
         DecodeOutcome::Clean => {}
         DecodeOutcome::Replacements { count } => {
@@ -1310,26 +1298,8 @@ fn validate_resume_transition(
     Ok(())
 }
 
-fn prepare_attributes(
-    record: &RecordInput,
-    settings: &BatchSettings,
-) -> Result<Vec<PreparedAttribute>, BatchError> {
-    let matched = prepare_path(&record.matched_path, "matched")?;
-    let file_name = record
-        .matched_path
-        .file_name()
-        .ok_or_else(|| BatchError::MissingFileName {
-            path: record.matched_path.clone(),
-        })?;
-    let name = prepare_path(Path::new(file_name), "file name")?;
-    let resolved = settings
-        .metadata
-        .include_file_path_resolved
-        .then(|| prepare_path(&record.resolved_path, "resolved"))
-        .transpose()?;
-    let path_was_encoded =
-        matched.encoded || name.encoded || resolved.as_ref().is_some_and(|path| path.encoded);
-
+fn prepare_attributes(record: &RecordInput) -> Result<Vec<PreparedAttribute>, BatchError> {
+    let provenance = prepare_path_provenance(&record.matched_path)?;
     let mut attributes = Vec::new();
     attributes
         .try_reserve_exact(MAX_PREPARED_ATTRIBUTES)
@@ -1337,44 +1307,47 @@ fn prepare_attributes(
             resource: "projected record attributes",
             source,
         })?;
-    push_attribute(
-        &mut attributes,
-        ATTR_KEY_LOG_FILE_PATH,
-        PreparedValue::String(matched.value),
-    )?;
-    push_attribute(
-        &mut attributes,
-        ATTR_KEY_LOG_FILE_NAME,
-        PreparedValue::String(name.value),
-    )?;
-    if let Some(resolved) = resolved {
-        push_attribute(
-            &mut attributes,
-            ATTR_KEY_PATH_RESOLVED,
-            PreparedValue::String(resolved.value),
-        )?;
-    }
-    if path_was_encoded {
-        push_attribute(
-            &mut attributes,
-            ATTR_KEY_PATH_ENCODING,
-            PreparedValue::StaticString(ENCODED_PATH_DISCRIMINATOR),
-        )?;
-    }
-    if settings.metadata.include_file_record_offset {
-        push_attribute(
-            &mut attributes,
-            ATTR_KEY_RECORD_OFFSET,
-            PreparedValue::String(record.framed.body_source_range.start.to_string()),
-        )?;
-    }
-    if settings.metadata.include_file_record_number && record.framed.fragment.is_none() {
-        if let Some(record_number) = record.record_number {
+    match provenance {
+        PreparedPathProvenance::Registered { path, name } => {
             push_attribute(
                 &mut attributes,
-                ATTR_KEY_RECORD_NUMBER,
-                PreparedValue::String(record_number.to_string()),
+                ATTR_KEY_LOG_FILE_PATH,
+                PreparedValue::String(path),
             )?;
+            push_attribute(
+                &mut attributes,
+                ATTR_KEY_LOG_FILE_NAME,
+                PreparedValue::String(name),
+            )?;
+        }
+        PreparedPathProvenance::Native {
+            kind,
+            bytes,
+            truncated,
+            sha256,
+        } => {
+            push_attribute(
+                &mut attributes,
+                ATTR_KEY_PATH_KIND,
+                PreparedValue::StaticString(kind),
+            )?;
+            push_attribute(
+                &mut attributes,
+                ATTR_KEY_PATH_NATIVE,
+                PreparedValue::Bytes(bytes),
+            )?;
+            push_attribute(
+                &mut attributes,
+                ATTR_KEY_PATH_TRUNCATED,
+                PreparedValue::Bool(truncated),
+            )?;
+            if let Some(sha256) = sha256 {
+                push_attribute(
+                    &mut attributes,
+                    ATTR_KEY_PATH_SHA256,
+                    PreparedValue::String(sha256),
+                )?;
+            }
         }
     }
     if let Some(fragment) = &record.framed.fragment {
@@ -1430,19 +1403,47 @@ fn push_fragment_attributes(
     )?;
     push_attribute(
         attributes,
-        ATTR_KEY_FRAGMENT_LAST,
+        ATTR_KEY_FRAGMENT_IS_LAST,
         PreparedValue::Bool(fragment.last),
     )?;
-    push_attribute(
+    push_fragment_offset(
         attributes,
-        ATTR_KEY_FRAGMENT_SOURCE_START,
-        PreparedValue::String(record.framed.body_source_range.start.to_string()),
+        record.file_id,
+        ATTR_KEY_FRAGMENT_BODY_START,
+        record.framed.body_source_range.start,
     )?;
-    push_attribute(
+    push_fragment_offset(
         attributes,
-        ATTR_KEY_FRAGMENT_SOURCE_END,
-        PreparedValue::String(record.framed.body_source_range.end.to_string()),
+        record.file_id,
+        ATTR_KEY_FRAGMENT_BODY_END,
+        record.framed.body_source_range.end,
+    )?;
+    push_fragment_offset(
+        attributes,
+        record.file_id,
+        ATTR_KEY_FRAGMENT_FRAME_START,
+        record.framed.frame_source_range.start,
+    )?;
+    push_fragment_offset(
+        attributes,
+        record.file_id,
+        ATTR_KEY_FRAGMENT_FRAME_END,
+        record.framed.frame_source_range.end,
     )
+}
+
+fn push_fragment_offset(
+    attributes: &mut Vec<PreparedAttribute>,
+    file_id: FileId,
+    field: &'static str,
+    offset: u64,
+) -> Result<(), BatchError> {
+    let value = i64::try_from(offset).map_err(|_| BatchError::FragmentOffsetOutOfRange {
+        file_id,
+        field,
+        offset,
+    })?;
+    push_attribute(attributes, field, PreparedValue::Int(value))
 }
 
 fn push_decode_attributes(
@@ -1471,41 +1472,56 @@ fn push_attribute(
     Ok(())
 }
 
-fn prepare_path(path: &Path, field: &'static str) -> Result<PreparedPath, BatchError> {
-    let native = native_path_bytes(path).map_err(|source| BatchError::Path {
-        field,
+fn prepare_path_provenance(path: &Path) -> Result<PreparedPathProvenance, BatchError> {
+    let fits_bound = native_path_fits_advisory_bound(path).map_err(|source| BatchError::Path {
+        field: "matched",
         path: path.to_path_buf(),
         source: Box::new(source),
     })?;
-    if let Some(value) = path.to_str() {
-        return Ok(PreparedPath {
-            value: value.to_owned(),
-            encoded: false,
+    if fits_bound && let Some(path_text) = path.to_str() {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| BatchError::MissingFileName {
+                path: path.to_path_buf(),
+            })?;
+        return Ok(PreparedPathProvenance::Registered {
+            path: path_text.to_owned(),
+            name: file_name.to_owned(),
         });
     }
 
-    let encoded_bytes = native
-        .len()
-        .checked_mul(3)
-        .and_then(|bytes| bytes.checked_add(ENCODED_PATH_PREFIX.len()))
-        .ok_or(BatchError::PathEncodingOverflow)?;
-    let mut value = String::new();
-    value
-        .try_reserve_exact(encoded_bytes)
-        .map_err(|source| BatchError::AllocationFailed {
-            resource: "percent-encoded path",
-            source,
-        })?;
-    value.push_str(ENCODED_PATH_PREFIX);
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    for byte in native {
-        value.push('%');
-        value.push(char::from(HEX[usize::from(byte >> 4)]));
-        value.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    Ok(PreparedPath {
-        value,
-        encoded: true,
+    let evidence = encode_advisory_path(path).map_err(|source| BatchError::Path {
+        field: "matched",
+        path: path.to_path_buf(),
+        source: Box::new(source),
+    })?;
+    let kind = match evidence.kind() {
+        AdvisoryPathKind::UnixBytes => PATH_KIND_UNIX_BYTES,
+        AdvisoryPathKind::WindowsUtf16Le => PATH_KIND_WINDOWS_UTF16LE,
+        AdvisoryPathKind::Unavailable => {
+            return Err(BatchError::Inconsistent {
+                reason: "a live matched path cannot have unavailable native evidence",
+            });
+        }
+    };
+    let truncated = evidence.is_truncated();
+    let sha256 = if truncated {
+        Some(hex::encode(native_path_sha256(path).map_err(|source| {
+            BatchError::Path {
+                field: "matched",
+                path: path.to_path_buf(),
+                source: Box::new(source),
+            }
+        })?))
+    } else {
+        None
+    };
+    Ok(PreparedPathProvenance::Native {
+        kind,
+        bytes: evidence.stored_path_bytes().to_vec(),
+        truncated,
+        sha256,
     })
 }
 
@@ -1552,128 +1568,6 @@ fn log_id_for_count(record_count: u32) -> Result<u16, BatchError> {
         return Err(BatchError::InvalidLogId { record_count });
     }
     u16::try_from(record_count).map_err(|_| BatchError::InvalidLogId { record_count })
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RecordNumberState {
-    file_epoch: u32,
-    next: u64,
-}
-
-/// Transactional worker-local record-number decision.
-///
-/// The worker prepares this before projection, puts [`Self::record_number`]
-/// into [`RecordInput`], and commits it only after the record enters the open
-/// batch or the sole carry-over. Invalid or abandoned projections therefore
-/// do not consume a number.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RecordNumberReservation {
-    file_id: FileId,
-    expected: Option<RecordNumberState>,
-    resulting: RecordNumberState,
-    record_number: Option<u64>,
-}
-
-impl RecordNumberReservation {
-    /// Number projected for an unsplit record; fragments always return
-    /// `None`.
-    pub(crate) const fn record_number(&self) -> Option<u64> {
-        self.record_number
-    }
-}
-
-/// Bounded worker-local record numbers keyed by durable identity.
-///
-/// Entries survive descriptor eviction because descriptor lifecycle never
-/// touches this table. A new process constructs a new table, and an epoch
-/// change resets that file to zero.
-pub(crate) struct RecordNumberTable {
-    max_files: usize,
-    states: HashMap<FileId, RecordNumberState>,
-}
-
-impl RecordNumberTable {
-    /// Pre-reserves the complete configured file population.
-    pub(crate) fn new(max_files: usize) -> Result<Self, BatchError> {
-        if max_files == 0 {
-            return Err(BatchError::InvalidSettings {
-                reason: "record-number max_files must be greater than zero",
-            });
-        }
-        let mut states = HashMap::new();
-        states
-            .try_reserve(max_files)
-            .map_err(|source| BatchError::AllocationFailed {
-                resource: "record-number table",
-                source,
-            })?;
-        Ok(Self { max_files, states })
-    }
-
-    /// Prepares a number decision without mutating the table.
-    ///
-    /// `fragment_index == None` numbers and advances an unsplit record.
-    /// Fragment zero advances once but emits no number; later fragments do
-    /// neither. Every fragment omits the projected number.
-    pub(crate) fn prepare(
-        &self,
-        file_id: FileId,
-        file_epoch: u32,
-        fragment_index: Option<u32>,
-    ) -> Result<RecordNumberReservation, BatchError> {
-        let expected = self.states.get(&file_id).copied();
-        if expected.is_none() && self.states.len() >= self.max_files {
-            return Err(BatchError::RecordNumberCapacityExhausted {
-                max_files: self.max_files,
-            });
-        }
-        let next = expected
-            .filter(|state| state.file_epoch == file_epoch)
-            .map_or(0, |state| state.next);
-        let advance = fragment_index.is_none() || fragment_index == Some(0);
-        let resulting_next = if advance {
-            next.checked_add(1)
-                .ok_or(BatchError::RecordNumberOverflow { file_id })?
-        } else {
-            next
-        };
-        Ok(RecordNumberReservation {
-            file_id,
-            expected,
-            resulting: RecordNumberState {
-                file_epoch,
-                next: resulting_next,
-            },
-            record_number: fragment_index.is_none().then_some(next),
-        })
-    }
-
-    /// Commits a decision after its record was accepted into the open batch.
-    pub(crate) fn commit(
-        &mut self,
-        reservation: RecordNumberReservation,
-    ) -> Result<Option<u64>, BatchError> {
-        if self.states.get(&reservation.file_id).copied() != reservation.expected {
-            return Err(BatchError::StaleRecordNumberReservation {
-                file_id: reservation.file_id,
-            });
-        }
-        if reservation.expected.is_none() && self.states.len() >= self.max_files {
-            return Err(BatchError::RecordNumberCapacityExhausted {
-                max_files: self.max_files,
-            });
-        }
-        let _ = self
-            .states
-            .insert(reservation.file_id, reservation.resulting);
-        Ok(reservation.record_number)
-    }
-
-    /// Releases numbering state after the identity leaves the tracked-file
-    /// population. Descriptor closure alone must not call this method.
-    pub(crate) fn remove(&mut self, file_id: FileId) -> bool {
-        self.states.remove(&file_id).is_some()
-    }
 }
 
 #[cfg(test)]

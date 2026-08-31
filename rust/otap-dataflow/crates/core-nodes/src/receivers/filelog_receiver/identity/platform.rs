@@ -8,10 +8,12 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
 
+use sha2::{Digest, Sha256};
+
 use super::{CandidateEvidence, IdentityError};
 use crate::receivers::filelog_receiver::checkpoint::primitives::{
-    AdvisoryPath, COMMITTED_FRONTIER_GUARD_WINDOW_BYTES, CommittedFrontierGuard,
-    CommittedFrontierWindow, Locator,
+    ADVISORY_PATH_STORED_MAX_BYTES, AdvisoryPath, COMMITTED_FRONTIER_GUARD_WINDOW_BYTES,
+    CommittedFrontierGuard, CommittedFrontierWindow, Locator,
 };
 
 /// An opened regular-file candidate and the evidence collected from that
@@ -1414,37 +1416,62 @@ pub(crate) fn encode_advisory_path(path: &Path) -> Result<AdvisoryPath, Identity
     })
 }
 
-/// Returns the complete, unbounded native-byte representation of `path`:
-/// raw Unix `OsStr` bytes, or little-endian-serialized Windows UTF-16 code
-/// units.
-///
-/// Distinct from [`encode_advisory_path`]: this never truncates. It is for
-/// callers that still hold the live, complete native path and need a
-/// lossless textual/byte encoding of it (OTAP provenance attributes), not
-/// the bounded durable [`AdvisoryPath`] evidence -- an oversized durable
-/// value is truncated evidence, but a live provenance attribute either
-/// carries the complete path or, per the format's provenance contract,
-/// none of it.
+/// Whether the complete native path fits the reversible advisory-path bound.
 #[cfg(unix)]
-pub(crate) fn native_path_bytes(path: &Path) -> Result<Vec<u8>, IdentityError> {
+pub(crate) fn native_path_fits_advisory_bound(path: &Path) -> Result<bool, IdentityError> {
     use std::os::unix::ffi::OsStrExt;
 
-    Ok(path.as_os_str().as_bytes().to_vec())
+    Ok(path.as_os_str().as_bytes().len() <= ADVISORY_PATH_STORED_MAX_BYTES)
 }
 
+/// Whether the complete native path fits the reversible advisory-path bound.
 #[cfg(windows)]
-pub(crate) fn native_path_bytes(path: &Path) -> Result<Vec<u8>, IdentityError> {
+pub(crate) fn native_path_fits_advisory_bound(path: &Path) -> Result<bool, IdentityError> {
     use std::os::windows::ffi::OsStrExt;
 
+    let maximum_units = ADVISORY_PATH_STORED_MAX_BYTES / 2;
     Ok(path
         .as_os_str()
         .encode_wide()
-        .flat_map(u16::to_le_bytes)
-        .collect())
+        .take(maximum_units + 1)
+        .count()
+        <= maximum_units)
 }
 
+/// Whether the complete native path fits the reversible advisory-path bound.
 #[cfg(not(any(unix, windows)))]
-pub(crate) fn native_path_bytes(path: &Path) -> Result<Vec<u8>, IdentityError> {
+pub(crate) fn native_path_fits_advisory_bound(path: &Path) -> Result<bool, IdentityError> {
+    Err(IdentityError::UnsupportedPlatform {
+        path: path.to_path_buf(),
+    })
+}
+
+/// Plain SHA-256 over the complete native path representation used by OTAP
+/// provenance: Unix bytes or little-endian Windows UTF-16 code-unit bytes.
+#[cfg(unix)]
+pub(crate) fn native_path_sha256(path: &Path) -> Result<[u8; 32], IdentityError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    Ok(Sha256::digest(path.as_os_str().as_bytes()).into())
+}
+
+/// Plain SHA-256 over the complete native path representation used by OTAP
+/// provenance: Unix bytes or little-endian Windows UTF-16 code-unit bytes.
+#[cfg(windows)]
+pub(crate) fn native_path_sha256(path: &Path) -> Result<[u8; 32], IdentityError> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut hasher = Sha256::new();
+    for unit in path.as_os_str().encode_wide() {
+        hasher.update(unit.to_le_bytes());
+    }
+    Ok(hasher.finalize().into())
+}
+
+/// Plain SHA-256 over the complete native path representation used by OTAP
+/// provenance.
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn native_path_sha256(path: &Path) -> Result<[u8; 32], IdentityError> {
     Err(IdentityError::UnsupportedPlatform {
         path: path.to_path_buf(),
     })

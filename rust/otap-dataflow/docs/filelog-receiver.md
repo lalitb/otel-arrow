@@ -1026,18 +1026,18 @@ operator-chain compatibility.
   separator would exceed the bound. Both policies emit telemetry, and emitted records
   identify truncation or fragmentation. Until equivalent OpenTelemetry semantic
   conventions are accepted, split fragments use experimental project attributes:
-  `otel_arrow.filelog.fragment.id` (string),
-  `otel_arrow.filelog.fragment.index` (zero-based integer), and
-  `otel_arrow.filelog.fragment.last` (boolean). They are not registered semantic
-  conventions. A future convention must include an explicit migration rather than
-  silently reusing a `log.*` name.
+  `otel.arrow.filelog.fragment.id`, `.index`, `.is_last`, `.body.start`,
+  `.body.end`, `.frame.start`, and `.frame.end`. The four range values are
+  signed OTLP integers after checked conversion from source offsets. They are
+  not registered semantic conventions. A future convention must include an
+  explicit migration rather than silently reusing a `log.*` name.
 
-  `otel_arrow.filelog.fragment.id` is the lowercase 64-character hexadecimal encoding of the
+  `otel.arrow.filelog.fragment.id` is the lowercase 64-character hexadecimal encoding of the
   full SHA-256 digest over the following byte sequence:
 
   ```text
   UTF-8("otel-arrow-filelog-fragment-v1\0") ||
-  file_id as 16-byte big-endian ||
+  file_id as its exact 16 opaque bytes ||
   file_epoch as u32 big-endian ||
   record_start_offset as u64 big-endian
   ```
@@ -1142,11 +1142,10 @@ record built with `LogsRecordBatchBuilder` +
 
 The private batching boundary takes one owned `FramedRecord`, `file_id`, an explicit
 durable `ProgressBase { file_epoch, committed_offset, framing_resume,
-last_seen_time_unix_nano }`, matched and resolved `PathBuf` values, a nonnegative `i64`
-observed Unix-nanosecond timestamp, an independent current `u64` last-seen
-Unix-nanosecond timestamp, monotonic `ready_at: Instant`, and an optional
-worker-generated record number. A record has no mandatory finalization bit; recordless
-lifecycle finalization is a separate operation with a distinct
+last_seen_time_unix_nano }`, one matched `PathBuf`, a nonnegative `i64` observed
+Unix-nanosecond timestamp, an independent current `u64` last-seen Unix-nanosecond
+timestamp, and monotonic `ready_at: Instant`. A record has no mandatory finalization
+bit; recordless lifecycle finalization is a separate operation with a distinct
 `ProgressFrontier { file_epoch, offset, framing_resume }` because that frontier may
 still be provisional.
 
@@ -1167,17 +1166,19 @@ The complete log-attribute contract is:
 
 | Key | OTLP type | Presence and exact value |
 | --- | --- | --- |
-| `log.file.path` | String | Always; discovery's matched path |
-| `log.file.name` | String | Always; final component of the matched path |
-| `otel_arrow.filelog.path_resolved` | String | When `metadata.include_file_path_resolved`; resolved target path |
-| `otel_arrow.filelog.path.encoding` | String | If any emitted path-shaped value required reversible encoding; exactly `percent-v1` |
-| `otel_arrow.filelog.record.offset` | String | When `metadata.include_file_record_offset`; decimal `body_source_range.start` |
-| `otel_arrow.filelog.record.number` | String | When enabled and supplied for an unsplit record; decimal worker-local number |
-| `otel_arrow.filelog.fragment.id` | String | Split fragment; stable 64-character ID defined above |
-| `otel_arrow.filelog.fragment.index` | Int | Split fragment; zero-based fragment index |
-| `otel_arrow.filelog.fragment.last` | Bool | Split fragment; whether this is the final fragment |
-| `otel_arrow.filelog.fragment.source.start` | String | Split fragment; decimal half-open `body_source_range.start` |
-| `otel_arrow.filelog.fragment.source.end` | String | Split fragment; decimal half-open `body_source_range.end` |
+| `log.file.path` | String | Complete, untruncated matched path only when it converts losslessly to text |
+| `log.file.name` | String | Final component of that same lossless registered path |
+| `otel.arrow.filelog.path.kind` | String | Native fallback only; exactly `unix_bytes` or `windows_utf16le` |
+| `otel.arrow.filelog.path.native` | Bytes | Native fallback only; complete native bytes or the exact final 4,096-byte suffix |
+| `otel.arrow.filelog.path.truncated` | Bool | Native fallback only; whether `path.native` omits a prefix |
+| `otel.arrow.filelog.path.sha256` | String | Truncated native fallback only; lowercase plain SHA-256 over the complete native bytes |
+| `otel.arrow.filelog.fragment.id` | String | Split fragment; stable 64-character ID defined above |
+| `otel.arrow.filelog.fragment.index` | Int | Split fragment; zero-based fragment index |
+| `otel.arrow.filelog.fragment.is_last` | Bool | Split fragment; whether this is the final fragment |
+| `otel.arrow.filelog.fragment.body.start` | Int | Split fragment; inclusive `body_source_range.start` |
+| `otel.arrow.filelog.fragment.body.end` | Int | Split fragment; exclusive `body_source_range.end` |
+| `otel.arrow.filelog.fragment.frame.start` | Int | Split fragment; inclusive `frame_source_range.start` |
+| `otel.arrow.filelog.fragment.frame.end` | Int | Split fragment; exclusive `frame_source_range.end` |
 | `otel_arrow.filelog.record.truncated` | Bool | Truncated record only; exactly `true` |
 | `otel_arrow.filelog.flush.reason` | String | When present; exactly `max_lines`, `timeout`, `oversize_line_boundary`, `rotation`, or `drain` |
 | `otel.arrow.filelog.terminal_unterminated` | Bool | Exactly `true` only when confirmed permanent rotation EOF established the boundary |
@@ -1188,25 +1189,18 @@ A clean decode emits neither decode attribute. Decode attributes are policy/erro
 evidence; they do not claim that bytes discarded by an explicit truncation policy are
 represented in the body. The receiver does not yet emit discarded-byte count.
 
-Valid UTF-8 path values remain exact, including a literal value beginning with
-`filelog-percent:`. A path that is not valid UTF-8 reuses the identity layer's reversible
-native encoding: raw `OsStr` bytes on Unix and big-endian UTF-16 code-unit bytes on
-Windows, capped at `ADVISORY_PATH_MAX_BYTES` (4,096 bytes). Its String value is
-`filelog-percent:` followed by uppercase `%HH` for every encoded byte. The
-`otel_arrow.filelog.path.encoding = "percent-v1"` discriminator distinguishes that
-encoding from a valid literal prefix. If matched path, file name, or enabled resolved
-path is encoded, the discriminator is emitted once.
+Registered path fields are all-or-nothing: truncated evidence or a native path that
+cannot convert losslessly to text emits neither registered field. The fallback reuses
+the checkpoint `AdvisoryPath` representation: raw Unix `OsStr` bytes or little-endian
+Windows UTF-16 code-unit bytes. Values through 4,096 native bytes remain complete;
+longer values retain exactly the final 4,096-byte suffix plus full-length digest
+evidence. The digest is plain SHA-256 over the complete native representation,
+not the checkpoint format's domain-separated advisory-path digest. A Windows
+suffix boundary always falls between complete code units.
 
-Record numbers are optional and disabled by default. They are zero-based and local to
-one worker process and file epoch. A bounded table sized by `max_tracked_files` survives
-descriptor eviction. Removing or finalizing a tracked identity releases its table slot;
-process recovery or epoch change resets the number to zero.
-Unsplit records receive and advance a number. Every split fragment omits the number:
-fragment index zero advances the logical-record counter once and later fragments do not.
-The stable fragment ID, not record number, is the cross-restart correlation key.
-Numbering uses a prepare/commit decision so an invalid or abandoned projection consumes
-no number. A valid refused record commits its projected number exactly once when it
-becomes the carry-over; predecessor retry and later seeding do not consume another.
+General body/frame ranges remain internal for unsplit records. Phase 1 exposes no
+resolved-path, generic record-offset, or record-number configuration. Opaque `file_id`
+and host identity are not emitted.
 
 Logs receive zero-based `u16` IDs from `0` through `record_count - 1`; the count itself
 is tracked as `u32`. The hard maximum of 65,535 records therefore ends at ID 65,534.
@@ -1231,17 +1225,16 @@ body bytes
 + 128 fixed bytes per record
 ```
 
-String value length is its UTF-8 byte length. Int value length is the conservative
-decimal-text width including a minus sign; Bool length is the actual lowercase textual
-width (`true` or `false`). The 128-byte term is conservative OTAP/Arrow record
-bookkeeping, not measured Arrow allocation. Runtime enumerates the exact attributes it
-appends and never serializes a record to estimate size. Configuration uses the same
-primitive with checked arithmetic and reserves, for each possible path, the
-`filelog-percent:` prefix plus three bytes for each of the 4,096 native bytes. It also
-reserves the path discriminator, enabled resolved/offset/number metadata,
-policy-dependent fragment or truncate fields, and worst-case flush/decode markers.
-Both `max_line_bytes` and `max_record_bytes` plus this worst case must fit
-`batch.max_bytes`.
+String value length is its UTF-8 byte length; Bytes length is its exact byte count. Int
+value length is the conservative decimal-text width including a minus sign; Bool length
+is the actual lowercase textual width (`true` or `false`). The 128-byte term is
+conservative OTAP/Arrow record bookkeeping, not measured Arrow allocation. Runtime
+enumerates the exact attributes it appends and never serializes a record to estimate
+size. Configuration uses the same primitive with checked arithmetic and reserves the
+larger of the complete registered text pair and the bounded native
+kind/bytes/truncation/digest fallback, plus policy-dependent fragment or truncate fields
+and worst-case flush/decode markers. Both `max_line_bytes` and `max_record_bytes` plus
+this worst case must fit `batch.max_bytes`.
 
 ## Ack and checkpoint model
 
@@ -2394,10 +2387,6 @@ receivers:
           line_start_pattern: null              # zero or one start/end pattern
           line_end_pattern: null
         max_multiline_lines: 500
-      metadata:
-        include_file_path_resolved: false
-        include_file_record_offset: false
-        include_file_record_number: false
       limits:
         max_tracked_files: 10000
         max_pending_candidates: 10000

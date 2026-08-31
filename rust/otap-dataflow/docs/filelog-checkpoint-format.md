@@ -351,7 +351,7 @@ kind : u8
 starts a new logical record. `Continuation` is INV-FR1's split-record resume
 state: the original record's start offset and the next fragment index to
 emit, both of which are required to reconstruct
-`otel_arrow.filelog.fragment.id` and `.index` deterministically after
+`otel.arrow.filelog.fragment.id` and `.index` deterministically after
 restart. `kind` is structural; `0x02`..`0xFF` fail decoding closed.
 
 ## Lifecycle state discriminant

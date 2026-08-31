@@ -163,42 +163,37 @@ const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(5);
 const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Registered semantic-convention attribute keys always attached to an
-/// emitted record, counted by [`checked_logical_record_size`].
+/// emitted record when complete path evidence is lossless text, counted by
+/// [`checked_logical_record_size`].
 pub(crate) const ATTR_KEY_LOG_FILE_PATH: &str = "log.file.path";
 pub(crate) const ATTR_KEY_LOG_FILE_NAME: &str = "log.file.name";
-/// Experimental metadata attribute keys, counted only when their matching
-/// `metadata.*` flag is enabled.
-pub(crate) const ATTR_KEY_PATH_RESOLVED: &str = "otel_arrow.filelog.path_resolved";
-pub(crate) const ATTR_KEY_PATH_ENCODING: &str = "otel_arrow.filelog.path.encoding";
-pub(crate) const ATTR_KEY_RECORD_OFFSET: &str = "otel_arrow.filelog.record.offset";
-pub(crate) const ATTR_KEY_RECORD_NUMBER: &str = "otel_arrow.filelog.record.number";
-/// Experimental oversize-marker attribute keys, counted according to the
-/// configured `max_log_size_behavior`.
-pub(crate) const ATTR_KEY_FRAGMENT_ID: &str = "otel_arrow.filelog.fragment.id";
-pub(crate) const ATTR_KEY_FRAGMENT_INDEX: &str = "otel_arrow.filelog.fragment.index";
-pub(crate) const ATTR_KEY_FRAGMENT_LAST: &str = "otel_arrow.filelog.fragment.last";
-pub(crate) const ATTR_KEY_FRAGMENT_SOURCE_START: &str = "otel_arrow.filelog.fragment.source.start";
-pub(crate) const ATTR_KEY_FRAGMENT_SOURCE_END: &str = "otel_arrow.filelog.fragment.source.end";
+/// Project-owned bounded native-path fallback attributes.
+pub(crate) const ATTR_KEY_PATH_KIND: &str = "otel.arrow.filelog.path.kind";
+pub(crate) const ATTR_KEY_PATH_NATIVE: &str = "otel.arrow.filelog.path.native";
+pub(crate) const ATTR_KEY_PATH_TRUNCATED: &str = "otel.arrow.filelog.path.truncated";
+pub(crate) const ATTR_KEY_PATH_SHA256: &str = "otel.arrow.filelog.path.sha256";
+/// Project-owned split-fragment attributes.
+pub(crate) const ATTR_KEY_FRAGMENT_ID: &str = "otel.arrow.filelog.fragment.id";
+pub(crate) const ATTR_KEY_FRAGMENT_INDEX: &str = "otel.arrow.filelog.fragment.index";
+pub(crate) const ATTR_KEY_FRAGMENT_IS_LAST: &str = "otel.arrow.filelog.fragment.is_last";
+pub(crate) const ATTR_KEY_FRAGMENT_BODY_START: &str = "otel.arrow.filelog.fragment.body.start";
+pub(crate) const ATTR_KEY_FRAGMENT_BODY_END: &str = "otel.arrow.filelog.fragment.body.end";
+pub(crate) const ATTR_KEY_FRAGMENT_FRAME_START: &str = "otel.arrow.filelog.fragment.frame.start";
+pub(crate) const ATTR_KEY_FRAGMENT_FRAME_END: &str = "otel.arrow.filelog.fragment.frame.end";
 pub(crate) const ATTR_KEY_RECORD_TRUNCATED: &str = "otel_arrow.filelog.record.truncated";
 pub(crate) const ATTR_KEY_FLUSH_REASON: &str = "otel_arrow.filelog.flush.reason";
 pub(crate) const ATTR_KEY_TERMINAL_UNTERMINATED: &str = "otel.arrow.filelog.terminal_unterminated";
 pub(crate) const ATTR_KEY_DECODE_ERROR_POLICY: &str = "otel_arrow.filelog.decode.error.policy";
 pub(crate) const ATTR_KEY_DECODE_ERROR_COUNT: &str = "otel_arrow.filelog.decode.error_count";
 
-/// Prefix distinguishing a reversible non-UTF-8 path value.
-pub(crate) const ENCODED_PATH_PREFIX: &str = "filelog-percent:";
-/// Discriminator value emitted whenever any path-shaped value is encoded.
-pub(crate) const ENCODED_PATH_DISCRIMINATOR: &str = "percent-v1";
-
-/// Worst-case percent-encoded output for one path-shaped attribute value.
-///
-/// Native path evidence is capped at `ADVISORY_PATH_STORED_MAX_BYTES`; every byte
-/// expands to `%HH`, after the fixed discriminator prefix.
-pub(crate) const MAX_ENCODED_PATH_ATTRIBUTE_VALUE_BYTES: u64 =
-    ENCODED_PATH_PREFIX.len() as u64 + 3 * ADVISORY_PATH_STORED_MAX_BYTES as u64;
+pub(crate) const PATH_KIND_UNIX_BYTES: &str = "unix_bytes";
+pub(crate) const PATH_KIND_WINDOWS_UTF16LE: &str = "windows_utf16le";
+const MAX_PATH_KIND_VALUE_BYTES: u64 = PATH_KIND_WINDOWS_UTF16LE.len() as u64;
+const MAX_NATIVE_PATH_ATTRIBUTE_VALUE_BYTES: u64 = ADVISORY_PATH_STORED_MAX_BYTES as u64;
+const MAX_REGISTERED_PATH_TEXT_VALUE_BYTES: u64 = 3 * (ADVISORY_PATH_STORED_MAX_BYTES as u64 / 2);
+const SHA256_HEX_VALUE_BYTES: u64 = 64;
 /// Conservative reserved bytes for a decimal-encoded `u64` attribute value
-/// (source byte offset / record number), sized for the longest possible
-/// `u64` (20 digits).
+/// (decode-error count), sized for the longest possible `u64` (20 digits).
 const RESERVED_DECIMAL_U64_VALUE_BYTES: u64 = 20;
 /// Length in bytes of the fixed-width lowercase-hex fragment id value.
 const FRAGMENT_ID_VALUE_BYTES: u64 = 64;
@@ -538,21 +533,6 @@ impl Default for FramingConfig {
     }
 }
 
-/// Optional source-position metadata, off by default.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct MetadataConfig {
-    /// Attach the resolved target path under the experimental filelog key.
-    #[serde(default)]
-    pub include_file_path_resolved: bool,
-    /// Attach the first source byte offset represented by the record.
-    #[serde(default)]
-    pub include_file_record_offset: bool,
-    /// Attach the source record number.
-    #[serde(default)]
-    pub include_file_record_number: bool,
-}
-
 /// Bounded discovery, admission, and read populations.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -845,9 +825,6 @@ pub struct Config {
     /// Framing bounds and multiline contract.
     #[serde(default)]
     pub framing: FramingConfig,
-    /// Optional source-position metadata.
-    #[serde(default)]
-    pub metadata: MetadataConfig,
     /// Bounded discovery, admission, and read populations.
     #[serde(default)]
     pub limits: LimitsConfig,
@@ -902,7 +879,6 @@ impl Default for Config {
             encoding: Encoding::default(),
             on_decode_error: OnDecodeError::default(),
             framing: FramingConfig::default(),
-            metadata: MetadataConfig::default(),
             limits: LimitsConfig::default(),
             batch: BatchConfig::default(),
             rotation: RotationConfig::default(),
@@ -994,23 +970,21 @@ pub(crate) fn checked_logical_record_size(
 
 /// Computes the conservative configuration-time bound for one record.
 ///
-/// Each path reserves `filelog-percent:` plus three output bytes for every
-/// byte in the 4,096-byte reversible advisory-path cap. The path-encoding
-/// discriminator, the longest flush reason, policy-specific decode evidence,
-/// and all enabled/policy-specific metadata are included.
+/// Provenance reserves the larger of the lossless registered text pair and
+/// the bounded native fallback. Fragment ranges, the longest flush reason,
+/// terminal evidence, and policy-specific decode evidence are included.
 pub(crate) fn configured_logical_record_size(
     body_bytes: u64,
-    metadata: &MetadataConfig,
     oversize_behavior: MaxLogSizeBehavior,
     decode_policy: OnDecodeError,
 ) -> Result<u64, LogicalSizeError> {
-    const MAX_ATTRIBUTES: usize = 15;
+    const MAX_COMMON_ATTRIBUTES: usize = 11;
     const EMPTY: LogicalAttributeSize = LogicalAttributeSize {
         key_bytes: 0,
         value_bytes: 0,
     };
 
-    let mut attributes = [EMPTY; MAX_ATTRIBUTES];
+    let mut attributes = [EMPTY; MAX_COMMON_ATTRIBUTES];
     let mut count = 0usize;
     let mut push = |key: &str, value_bytes: u64| -> Result<(), LogicalSizeError> {
         let slot = attributes
@@ -1021,30 +995,6 @@ pub(crate) fn configured_logical_record_size(
         Ok(())
     };
 
-    push(
-        ATTR_KEY_LOG_FILE_PATH,
-        MAX_ENCODED_PATH_ATTRIBUTE_VALUE_BYTES,
-    )?;
-    push(
-        ATTR_KEY_LOG_FILE_NAME,
-        MAX_ENCODED_PATH_ATTRIBUTE_VALUE_BYTES,
-    )?;
-    if metadata.include_file_path_resolved {
-        push(
-            ATTR_KEY_PATH_RESOLVED,
-            MAX_ENCODED_PATH_ATTRIBUTE_VALUE_BYTES,
-        )?;
-    }
-    push(
-        ATTR_KEY_PATH_ENCODING,
-        ENCODED_PATH_DISCRIMINATOR.len() as u64,
-    )?;
-    if metadata.include_file_record_offset {
-        push(ATTR_KEY_RECORD_OFFSET, RESERVED_DECIMAL_U64_VALUE_BYTES)?;
-    }
-    if metadata.include_file_record_number {
-        push(ATTR_KEY_RECORD_NUMBER, RESERVED_DECIMAL_U64_VALUE_BYTES)?;
-    }
     match oversize_behavior {
         MaxLogSizeBehavior::Split => {
             push(ATTR_KEY_FRAGMENT_ID, FRAGMENT_ID_VALUE_BYTES)?;
@@ -1052,15 +1002,17 @@ pub(crate) fn configured_logical_record_size(
                 ATTR_KEY_FRAGMENT_INDEX,
                 logical_int_value_len(i64::from(u32::MAX)),
             )?;
-            push(ATTR_KEY_FRAGMENT_LAST, logical_bool_value_len(false))?;
+            push(ATTR_KEY_FRAGMENT_IS_LAST, logical_bool_value_len(false))?;
             push(
-                ATTR_KEY_FRAGMENT_SOURCE_START,
-                RESERVED_DECIMAL_U64_VALUE_BYTES,
+                ATTR_KEY_FRAGMENT_BODY_START,
+                logical_int_value_len(i64::MAX),
             )?;
+            push(ATTR_KEY_FRAGMENT_BODY_END, logical_int_value_len(i64::MAX))?;
             push(
-                ATTR_KEY_FRAGMENT_SOURCE_END,
-                RESERVED_DECIMAL_U64_VALUE_BYTES,
+                ATTR_KEY_FRAGMENT_FRAME_START,
+                logical_int_value_len(i64::MAX),
             )?;
+            push(ATTR_KEY_FRAGMENT_FRAME_END, logical_int_value_len(i64::MAX))?;
         }
         MaxLogSizeBehavior::Truncate => {
             push(ATTR_KEY_RECORD_TRUNCATED, logical_bool_value_len(true))?;
@@ -1086,7 +1038,21 @@ pub(crate) fn configured_logical_record_size(
         OnDecodeError::Fail => {}
     }
 
-    checked_logical_record_size(body_bytes, attributes[..count].iter().copied())
+    let registered = [
+        LogicalAttributeSize::new(ATTR_KEY_LOG_FILE_PATH, MAX_REGISTERED_PATH_TEXT_VALUE_BYTES)?,
+        LogicalAttributeSize::new(ATTR_KEY_LOG_FILE_NAME, MAX_REGISTERED_PATH_TEXT_VALUE_BYTES)?,
+    ];
+    let native = [
+        LogicalAttributeSize::new(ATTR_KEY_PATH_KIND, MAX_PATH_KIND_VALUE_BYTES)?,
+        LogicalAttributeSize::new(ATTR_KEY_PATH_NATIVE, MAX_NATIVE_PATH_ATTRIBUTE_VALUE_BYTES)?,
+        LogicalAttributeSize::new(ATTR_KEY_PATH_TRUNCATED, logical_bool_value_len(true))?,
+        LogicalAttributeSize::new(ATTR_KEY_PATH_SHA256, SHA256_HEX_VALUE_BYTES)?,
+    ];
+    let common = attributes[..count].iter().copied();
+    let registered_size =
+        checked_logical_record_size(body_bytes, common.clone().chain(registered))?;
+    let native_size = checked_logical_record_size(body_bytes, common.chain(native))?;
+    Ok(registered_size.max(native_size))
 }
 
 /// Validated, runtime-ready form of the filelog receiver configuration.
@@ -1126,8 +1092,6 @@ pub(crate) struct RuntimeConfig {
     pub(crate) on_decode_error: OnDecodeError,
     /// Framing bounds and multiline contract.
     pub(crate) framing: FramingConfig,
-    /// Optional source-position metadata.
-    pub(crate) metadata: MetadataConfig,
     /// Bounded discovery, admission, and read populations.
     pub(crate) limits: LimitsConfig,
     /// Worker -> async batch shaping.
@@ -1215,7 +1179,6 @@ impl RuntimeConfig {
             encoding,
             on_decode_error,
             framing,
-            metadata,
             limits,
             batch,
             rotation,
@@ -1239,7 +1202,7 @@ impl RuntimeConfig {
         let limits = validate_limits(limits)?;
         let (framing, framing_profile_digest, compiled_multiline_pattern) =
             validate_framing(framing, encoding, on_decode_error, &identity)?;
-        let batch = validate_batch(batch, &framing, &metadata, on_decode_error)?;
+        let batch = validate_batch(batch, &framing, on_decode_error)?;
         let rotation = validate_rotation(rotation)?;
         let retry = validate_retry(retry)?;
 
@@ -1268,7 +1231,6 @@ impl RuntimeConfig {
             encoding,
             on_decode_error,
             framing,
-            metadata,
             limits,
             batch,
             rotation,
@@ -2041,7 +2003,6 @@ const fn encoding_to_framing_profile(encoding: Encoding) -> framing_profile::Fra
 fn validate_batch(
     batch: BatchConfig,
     framing: &FramingConfig,
-    metadata: &MetadataConfig,
     decode_policy: OnDecodeError,
 ) -> Result<BatchConfig, otap_df_config::error::Error> {
     if batch.max_records == 0 {
@@ -2069,7 +2030,6 @@ fn validate_batch(
     // could only "validate" via saturation is rejected here instead.
     let line_bound = configured_logical_record_size(
         framing.max_line_bytes,
-        metadata,
         framing.max_log_size_behavior,
         decode_policy,
     )
@@ -2089,7 +2049,6 @@ fn validate_batch(
     ensure_fits_usize("framing.max_line_bytes logical record size", line_bound)?;
     let record_bound = configured_logical_record_size(
         framing.max_record_bytes,
-        metadata,
         framing.max_log_size_behavior,
         decode_policy,
     )
@@ -2462,9 +2421,6 @@ mod tests {
         assert_eq!(cfg.framing.multiline.line_start_pattern, None);
         assert_eq!(cfg.framing.multiline.line_end_pattern, None);
         assert_eq!(cfg.framing.max_multiline_lines, 500);
-        assert!(!cfg.metadata.include_file_path_resolved);
-        assert!(!cfg.metadata.include_file_record_offset);
-        assert!(!cfg.metadata.include_file_record_number);
         assert_eq!(cfg.limits.max_tracked_files, 10_000);
         assert_eq!(cfg.limits.max_pending_candidates, 10_000);
         assert_eq!(cfg.limits.max_open_files, 512);
@@ -2495,25 +2451,62 @@ mod tests {
         assert!(runtime.compiled_multiline_pattern.is_none());
     }
 
-    /// Scenario: resolved-path metadata is explicitly enabled in user
-    /// configuration.
-    /// Guarantees: the new flag deserializes under `metadata`, defaults
-    /// independently from offset/number flags, and survives runtime
-    /// validation.
+    /// Scenario: an unreleased metadata object requests resolved path, generic
+    /// record offset, or process-local record number attributes.
+    /// Guarantees: the exact Phase 1 schema rejects the unsupported surface
+    /// instead of silently emitting non-registry attributes.
     #[test]
-    fn resolved_path_metadata_flag_deserializes_and_validates() {
+    fn unsupported_metadata_surface_is_rejected() {
         let config = parse(serde_json::json!({
             "include": ["/var/log/app/*.log"],
             "metadata": {
-                "include_file_path_resolved": true
+                "include_file_path_resolved": true,
+                "include_file_record_offset": true,
+                "include_file_record_number": true
             }
-        }))
-        .unwrap();
-        assert!(config.metadata.include_file_path_resolved);
-        assert!(!config.metadata.include_file_record_offset);
-        assert!(!config.metadata.include_file_record_number);
-        let runtime = RuntimeConfig::from_config(config, "node-1").unwrap();
-        assert!(runtime.metadata.include_file_path_resolved);
+        }));
+        assert!(config.is_err());
+    }
+
+    /// Scenario: the Phase 1 project-owned provenance registry is inspected
+    /// independently from record projection.
+    /// Guarantees: every path/fragment key and native-kind value retains its
+    /// exact frozen spelling; underscore-era experimental names cannot return
+    /// through a coordinated producer/test rename.
+    #[test]
+    fn provenance_registry_spellings_are_frozen() {
+        assert_eq!(ATTR_KEY_PATH_KIND, "otel.arrow.filelog.path.kind");
+        assert_eq!(ATTR_KEY_PATH_NATIVE, "otel.arrow.filelog.path.native");
+        assert_eq!(ATTR_KEY_PATH_TRUNCATED, "otel.arrow.filelog.path.truncated");
+        assert_eq!(ATTR_KEY_PATH_SHA256, "otel.arrow.filelog.path.sha256");
+        assert_eq!(ATTR_KEY_FRAGMENT_ID, "otel.arrow.filelog.fragment.id");
+        assert_eq!(ATTR_KEY_FRAGMENT_INDEX, "otel.arrow.filelog.fragment.index");
+        assert_eq!(
+            ATTR_KEY_FRAGMENT_IS_LAST,
+            "otel.arrow.filelog.fragment.is_last"
+        );
+        assert_eq!(
+            ATTR_KEY_FRAGMENT_BODY_START,
+            "otel.arrow.filelog.fragment.body.start"
+        );
+        assert_eq!(
+            ATTR_KEY_FRAGMENT_BODY_END,
+            "otel.arrow.filelog.fragment.body.end"
+        );
+        assert_eq!(
+            ATTR_KEY_FRAGMENT_FRAME_START,
+            "otel.arrow.filelog.fragment.frame.start"
+        );
+        assert_eq!(
+            ATTR_KEY_FRAGMENT_FRAME_END,
+            "otel.arrow.filelog.fragment.frame.end"
+        );
+        assert_eq!(
+            ATTR_KEY_TERMINAL_UNTERMINATED,
+            "otel.arrow.filelog.terminal_unterminated"
+        );
+        assert_eq!(PATH_KIND_UNIX_BYTES, "unix_bytes");
+        assert_eq!(PATH_KIND_WINDOWS_UTF16LE, "windows_utf16le");
     }
 
     /// Scenario: an unknown field appears at the top level, inside a nested
@@ -3617,11 +3610,9 @@ mod tests {
     /// failure to a runtime record that can never be flushed.
     #[test]
     fn oversized_record_bound_relative_to_batch_bytes_is_rejected() {
-        let metadata = MetadataConfig::default();
         let small_line_bytes = 10u64;
         let batch_bytes = configured_logical_record_size(
             small_line_bytes,
-            &metadata,
             MaxLogSizeBehavior::Split,
             OnDecodeError::PreserveRaw,
         )
@@ -3646,11 +3637,9 @@ mod tests {
     /// `max_record_bytes`.
     #[test]
     fn oversized_line_bound_relative_to_batch_bytes_is_rejected() {
-        let metadata = MetadataConfig::default();
         let small_record_bytes = 10u64;
         let batch_bytes = configured_logical_record_size(
             small_record_bytes,
-            &metadata,
             MaxLogSizeBehavior::Split,
             OnDecodeError::PreserveRaw,
         )
@@ -3667,104 +3656,36 @@ mod tests {
         assert!(err.to_string().contains("max_line_bytes"));
     }
 
-    /// Scenario: enabling both `metadata.include_file_record_offset` and
-    /// `metadata.include_file_record_number` increases the fixed attribute
-    /// overhead counted by configured logical sizing.
-    /// Guarantees: a `batch.max_bytes` configuration that fits the default
-    /// (disabled) metadata overhead is rejected once both metadata flags are
-    /// enabled, proving the flags are actually counted.
-    #[test]
-    fn metadata_flags_increase_logical_record_size() {
-        let disabled = configured_logical_record_size(
-            10,
-            &MetadataConfig {
-                include_file_path_resolved: false,
-                include_file_record_offset: false,
-                include_file_record_number: false,
-            },
-            MaxLogSizeBehavior::Split,
-            OnDecodeError::PreserveRaw,
-        )
-        .expect("small body_bytes must not overflow");
-        let enabled = configured_logical_record_size(
-            10,
-            &MetadataConfig {
-                include_file_path_resolved: true,
-                include_file_record_offset: true,
-                include_file_record_number: true,
-            },
-            MaxLogSizeBehavior::Split,
-            OnDecodeError::PreserveRaw,
-        )
-        .expect("small body_bytes must not overflow");
-        assert!(enabled > disabled);
-
-        let mut cfg = minimal_config();
-        cfg.framing.max_record_bytes = 10;
-        cfg.framing.max_line_bytes = 10;
-        cfg.batch.max_bytes = enabled - 1;
-        cfg.metadata.include_file_path_resolved = true;
-        cfg.metadata.include_file_record_offset = true;
-        cfg.metadata.include_file_record_number = true;
-        assert!(RuntimeConfig::from_config(cfg, "node-1").is_err());
-    }
-
-    /// Scenario: all metadata flags, split policy, the longest flush marker,
-    /// and preserve-raw decode evidence contribute to the configuration
-    /// worst case.
+    /// Scenario: bounded native and registered provenance alternatives, split
+    /// policy, the longest flush marker, and preserve-raw decode evidence
+    /// contribute to the configuration worst case.
     /// Guarantees: the high-level bound is exactly the shared primitive over
-    /// every reserved key/value length, including three maximum encoded paths
-    /// and the path-encoding discriminator.
+    /// every common field plus the larger provenance alternative.
     #[test]
     fn configured_logical_size_uses_exact_worst_case_attribute_formula() {
-        let metadata = MetadataConfig {
-            include_file_path_resolved: true,
-            include_file_record_offset: true,
-            include_file_record_number: true,
-        };
-        let attributes = vec![
-            LogicalAttributeSize::new(
-                ATTR_KEY_LOG_FILE_PATH,
-                MAX_ENCODED_PATH_ATTRIBUTE_VALUE_BYTES,
-            )
-            .unwrap(),
-            LogicalAttributeSize::new(
-                ATTR_KEY_LOG_FILE_NAME,
-                MAX_ENCODED_PATH_ATTRIBUTE_VALUE_BYTES,
-            )
-            .unwrap(),
-            LogicalAttributeSize::new(
-                ATTR_KEY_PATH_RESOLVED,
-                MAX_ENCODED_PATH_ATTRIBUTE_VALUE_BYTES,
-            )
-            .unwrap(),
-            LogicalAttributeSize::new(
-                ATTR_KEY_PATH_ENCODING,
-                ENCODED_PATH_DISCRIMINATOR.len() as u64,
-            )
-            .unwrap(),
-            LogicalAttributeSize::new(ATTR_KEY_RECORD_OFFSET, RESERVED_DECIMAL_U64_VALUE_BYTES)
-                .unwrap(),
-            LogicalAttributeSize::new(ATTR_KEY_RECORD_NUMBER, RESERVED_DECIMAL_U64_VALUE_BYTES)
-                .unwrap(),
+        let common = [
             LogicalAttributeSize::new(ATTR_KEY_FRAGMENT_ID, FRAGMENT_ID_VALUE_BYTES).unwrap(),
             LogicalAttributeSize::new(
                 ATTR_KEY_FRAGMENT_INDEX,
                 logical_int_value_len(i64::from(u32::MAX)),
             )
             .unwrap(),
-            LogicalAttributeSize::new(ATTR_KEY_FRAGMENT_LAST, logical_bool_value_len(false))
+            LogicalAttributeSize::new(ATTR_KEY_FRAGMENT_IS_LAST, logical_bool_value_len(false))
                 .unwrap(),
             LogicalAttributeSize::new(
-                ATTR_KEY_FRAGMENT_SOURCE_START,
-                RESERVED_DECIMAL_U64_VALUE_BYTES,
+                ATTR_KEY_FRAGMENT_BODY_START,
+                logical_int_value_len(i64::MAX),
             )
             .unwrap(),
+            LogicalAttributeSize::new(ATTR_KEY_FRAGMENT_BODY_END, logical_int_value_len(i64::MAX))
+                .unwrap(),
             LogicalAttributeSize::new(
-                ATTR_KEY_FRAGMENT_SOURCE_END,
-                RESERVED_DECIMAL_U64_VALUE_BYTES,
+                ATTR_KEY_FRAGMENT_FRAME_START,
+                logical_int_value_len(i64::MAX),
             )
             .unwrap(),
+            LogicalAttributeSize::new(ATTR_KEY_FRAGMENT_FRAME_END, logical_int_value_len(i64::MAX))
+                .unwrap(),
             LogicalAttributeSize::new(ATTR_KEY_FLUSH_REASON, "oversize_line_boundary".len() as u64)
                 .unwrap(),
             LogicalAttributeSize::new(ATTR_KEY_TERMINAL_UNTERMINATED, logical_bool_value_len(true))
@@ -3777,23 +3698,37 @@ mod tests {
             )
             .unwrap(),
         ];
-        let expected = checked_logical_record_size(123, attributes).unwrap();
+        let registered = [
+            LogicalAttributeSize::new(ATTR_KEY_LOG_FILE_PATH, MAX_REGISTERED_PATH_TEXT_VALUE_BYTES)
+                .unwrap(),
+            LogicalAttributeSize::new(ATTR_KEY_LOG_FILE_NAME, MAX_REGISTERED_PATH_TEXT_VALUE_BYTES)
+                .unwrap(),
+        ];
+        let native = [
+            LogicalAttributeSize::new(ATTR_KEY_PATH_KIND, MAX_PATH_KIND_VALUE_BYTES).unwrap(),
+            LogicalAttributeSize::new(ATTR_KEY_PATH_NATIVE, MAX_NATIVE_PATH_ATTRIBUTE_VALUE_BYTES)
+                .unwrap(),
+            LogicalAttributeSize::new(ATTR_KEY_PATH_TRUNCATED, logical_bool_value_len(true))
+                .unwrap(),
+            LogicalAttributeSize::new(ATTR_KEY_PATH_SHA256, SHA256_HEX_VALUE_BYTES).unwrap(),
+        ];
+        let expected_registered =
+            checked_logical_record_size(123, common.into_iter().chain(registered)).unwrap();
+        let expected_native =
+            checked_logical_record_size(123, common.into_iter().chain(native)).unwrap();
+        assert!(expected_registered > expected_native);
+        let expected = expected_registered.max(expected_native);
         let actual = configured_logical_record_size(
             123,
-            &metadata,
             MaxLogSizeBehavior::Split,
             OnDecodeError::PreserveRaw,
         )
         .unwrap();
         assert_eq!(actual, expected);
 
-        let fail_decode = configured_logical_record_size(
-            123,
-            &metadata,
-            MaxLogSizeBehavior::Split,
-            OnDecodeError::Fail,
-        )
-        .unwrap();
+        let fail_decode =
+            configured_logical_record_size(123, MaxLogSizeBehavior::Split, OnDecodeError::Fail)
+                .unwrap();
         assert!(fail_decode < actual);
     }
 
@@ -3804,17 +3739,14 @@ mod tests {
     /// attribute set, so the two policies are not conflated.
     #[test]
     fn oversize_behavior_changes_logical_record_size_overhead() {
-        let metadata = MetadataConfig::default();
         let split = configured_logical_record_size(
             10,
-            &metadata,
             MaxLogSizeBehavior::Split,
             OnDecodeError::PreserveRaw,
         )
         .expect("small body_bytes must not overflow");
         let truncate = configured_logical_record_size(
             10,
-            &metadata,
             MaxLogSizeBehavior::Truncate,
             OnDecodeError::PreserveRaw,
         )
@@ -3831,10 +3763,8 @@ mod tests {
     /// successfully despite being unrepresentable and unallocatable.
     #[test]
     fn logical_record_size_reports_overflow_instead_of_saturating() {
-        let metadata = MetadataConfig::default();
         let err = configured_logical_record_size(
             u64::MAX,
-            &metadata,
             MaxLogSizeBehavior::Split,
             OnDecodeError::PreserveRaw,
         )

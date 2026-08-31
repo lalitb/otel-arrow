@@ -34,8 +34,8 @@ use crate::receivers::filelog_receiver::checkpoint::wal::{RegisterFile, UpdatePr
 #[cfg(unix)]
 use crate::receivers::filelog_receiver::config::ATTR_KEY_TERMINAL_UNTERMINATED;
 use crate::receivers::filelog_receiver::config::{
-    ATTR_KEY_FLUSH_REASON, ATTR_KEY_FRAGMENT_ID, ATTR_KEY_FRAGMENT_INDEX, ATTR_KEY_FRAGMENT_LAST,
-    ATTR_KEY_LOG_FILE_NAME, Config, OnDecodeError,
+    ATTR_KEY_FLUSH_REASON, ATTR_KEY_FRAGMENT_ID, ATTR_KEY_FRAGMENT_INDEX,
+    ATTR_KEY_FRAGMENT_IS_LAST, ATTR_KEY_LOG_FILE_NAME, Config, OnDecodeError,
 };
 use crate::receivers::filelog_receiver::discovery::admission::AdmissionController;
 use crate::receivers::filelog_receiver::discovery::scanner::DiscoveryPlan;
@@ -645,7 +645,7 @@ async fn acked_split_fragment_resumes_across_worker_restart() {
         Some(&Value::IntValue(0))
     );
     assert_eq!(
-        log_attr(first_log, ATTR_KEY_FRAGMENT_LAST),
+        log_attr(first_log, ATTR_KEY_FRAGMENT_IS_LAST),
         Some(&Value::BoolValue(false))
     );
     worker
@@ -687,7 +687,7 @@ async fn acked_split_fragment_resumes_across_worker_restart() {
         Some(&Value::IntValue(1))
     );
     assert_eq!(
-        log_attr(second_log, ATTR_KEY_FRAGMENT_LAST),
+        log_attr(second_log, ATTR_KEY_FRAGMENT_IS_LAST),
         Some(&Value::BoolValue(true))
     );
     worker
@@ -765,7 +765,7 @@ async fn acked_partial_flush_resumes_cleanly_across_worker_restart() {
     for key in [
         ATTR_KEY_FRAGMENT_ID,
         ATTR_KEY_FRAGMENT_INDEX,
-        ATTR_KEY_FRAGMENT_LAST,
+        ATTR_KEY_FRAGMENT_IS_LAST,
     ] {
         assert!(
             log_attr(next_log, key).is_none(),
@@ -3469,8 +3469,8 @@ fn direct_recordless_finalization_commits_without_otap() {
 /// Scenario: an admitted nonresident reader's path is replaced before
 /// discovery can deliver the old locator's `Removed` event.
 /// Guarantees: reopen reports descriptor unavailability, the worker releases
-/// volatile state, the old durable identity remains Active and unfinalized,
-/// and same-epoch record numbering does not restart.
+/// volatile state, and the old durable identity remains Active and
+/// unfinalized.
 #[test]
 fn pre_discovery_path_replacement_uses_per_file_containment() {
     let directory = tempdir().unwrap();
@@ -3530,13 +3530,6 @@ fn pre_discovery_path_replacement_uses_per_file_containment() {
         )
         .unwrap();
     runtime.readers = Some(readers);
-    let first_number = runtime
-        .record_numbers
-        .prepare(file_id, 1, None)
-        .and_then(|reservation| runtime.record_numbers.commit(reservation))
-        .unwrap();
-    assert_eq!(first_number, Some(0));
-
     std::fs::rename(&source, &rotated).unwrap();
     std::fs::write(&source, b"new\n").unwrap();
     assert!(matches!(
@@ -3555,14 +3548,6 @@ fn pre_discovery_path_replacement_uses_per_file_containment() {
     let record = runtime.store.table().get(&file_id).unwrap();
     assert_eq!(record, &durable_before);
     assert_eq!(runtime.inactive_locators.get(&locator), Some(&file_id));
-    assert_eq!(
-        runtime
-            .record_numbers
-            .prepare(file_id, 1, None)
-            .unwrap()
-            .record_number(),
-        Some(1)
-    );
     runtime.shutdown_resources().unwrap();
 }
 

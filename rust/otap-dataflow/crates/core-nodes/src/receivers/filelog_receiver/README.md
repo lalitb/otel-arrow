@@ -95,10 +95,6 @@ config:
       line_start_pattern: null
       line_end_pattern: null
     max_multiline_lines: 500
-  metadata:
-    include_file_path_resolved: false
-    include_file_record_offset: false
-    include_file_record_number: false
   limits:
     max_tracked_files: 10000
     max_pending_candidates: 10000
@@ -138,6 +134,15 @@ Important policy values are:
 | `framing.max_log_size_behavior` | `split`, `truncate` | Emits bounded fragments or a bounded truncated record and discards through the line boundary. |
 | `rotation.on_truncate` | `fail`, `read_new` | Durably quarantines detectable truncation or explicitly resets to a new file epoch. |
 | `on_nack` | `fail`, `drop_and_continue` | Fails the receiver or durably advances under an explicit loss policy after terminal delivery failure. |
+
+Complete, untruncated paths that convert losslessly to text emit
+`log.file.path` and `log.file.name`. Non-text or over-bound paths omit those
+registered attributes and instead emit bounded
+`otel.arrow.filelog.path.{kind,native,truncated,sha256}` evidence; `sha256` is
+the plain SHA-256 of the complete native bytes and is present only when
+`native` is truncated to its final 4,096 bytes.
+Phase 1 has no resolved-path, generic record-offset, or record-number
+configuration.
 
 `discovery.reconcile_interval` is independently jittered after each completed
 scan by `discovery.reconcile_jitter_percent`. `reader.eof_reprobe_interval`

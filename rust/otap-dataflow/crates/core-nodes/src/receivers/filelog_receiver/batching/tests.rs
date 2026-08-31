@@ -35,7 +35,6 @@ fn settings(max_records: u32, max_bytes: u64, max_flush_period: Duration) -> Bat
             max_bytes,
             max_flush_period,
         },
-        MetadataConfig::default(),
         MaxLogSizeBehavior::Split,
         OnDecodeError::PreserveRaw,
     )
@@ -79,12 +78,10 @@ fn input(seed: u64, start: u64, end: u64, base: u64, ready_at: Instant) -> Recor
             last_seen_time_unix_nano: 0,
             committed_frontier_guard: test_guard(base),
         },
-        matched_path: path.clone(),
-        resolved_path: path,
+        matched_path: path,
         observed_time_unix_nano: 100,
         last_seen_time_unix_nano: 100,
         ready_at,
-        record_number: Some(start),
     }
 }
 
@@ -128,14 +125,6 @@ fn string_attr<'a>(record: &'a LogRecord, key: &str) -> Option<&'a str> {
         Some(Value::StringValue(value)) => Some(value),
         _ => None,
     }
-}
-
-fn percent_path(bytes: &[u8]) -> String {
-    let mut result = ENCODED_PATH_PREFIX.to_owned();
-    for byte in bytes {
-        result.push_str(&format!("%{byte:02X}"));
-    }
-    result
 }
 
 /// Scenario: text, exact bytes, and newline-preserving multiline bodies share
@@ -213,32 +202,24 @@ fn projects_bodies_defaults_and_scope_without_identity_leakage() {
     }
 }
 
-/// Scenario: a split preserve-raw fragment carries every enabled source and
-/// error marker, including a resolved path and an oversize-boundary flush.
+/// Scenario: a split preserve-raw fragment carries lossless registered path
+/// provenance, every frozen fragment range, and an oversize-boundary flush.
 /// Guarantees: every conditional key has the specified OTLP type and value,
-/// fragment ranges are half-open body ranges, and record number is omitted
-/// from every fragment.
+/// with distinct half-open body and frame ranges.
 #[test]
 fn projects_all_split_and_decode_attributes_with_exact_types() {
-    let metadata = MetadataConfig {
-        include_file_path_resolved: true,
-        include_file_record_offset: true,
-        include_file_record_number: true,
-    };
     let settings = BatchSettings::for_test(
         BatchConfig {
             max_records: 10,
             max_bytes: 1 << 20,
             max_flush_period: Duration::from_secs(1),
         },
-        metadata,
         MaxLogSizeBehavior::Split,
         OnDecodeError::PreserveRaw,
     );
     let now = Instant::now();
     let mut record = input(2, 0, 21, 0, now);
     record.matched_path = PathBuf::from("/matched/app.log");
-    record.resolved_path = PathBuf::from("/real/app.log");
     record.framed.body = FramedBody::Bytes(b"raw".to_vec());
     record.framed.body_source_range = SourceRange { start: 10, end: 20 };
     let expected_fragment_id = fragment_id(record.file_id, record.progress_base.file_epoch, 10);
@@ -254,7 +235,6 @@ fn projects_all_split_and_decode_attributes_with_exact_types() {
     };
     record.framed.decode_outcome = DecodeOutcome::PreserveRaw { count: 7 };
     record.framed.flush_reason = Some(FlushReason::OversizeLineBoundary);
-    record.record_number = Some(99);
 
     let mut batch = batch_with_settings(settings);
     let _ = append(&mut batch, record);
@@ -267,12 +247,6 @@ fn projects_all_split_and_decode_attributes_with_exact_types() {
     );
     assert_eq!(string_attr(log, ATTR_KEY_LOG_FILE_NAME), Some("app.log"));
     assert_eq!(
-        string_attr(log, ATTR_KEY_PATH_RESOLVED),
-        Some("/real/app.log")
-    );
-    assert_eq!(string_attr(log, ATTR_KEY_RECORD_OFFSET), Some("10"));
-    assert!(attr(log, ATTR_KEY_RECORD_NUMBER).is_none());
-    assert_eq!(
         string_attr(log, ATTR_KEY_FRAGMENT_ID),
         Some(expected_fragment_id.as_str())
     );
@@ -281,11 +255,25 @@ fn projects_all_split_and_decode_attributes_with_exact_types() {
         Some(Value::IntValue(0))
     ));
     assert!(matches!(
-        attr(log, ATTR_KEY_FRAGMENT_LAST),
+        attr(log, ATTR_KEY_FRAGMENT_IS_LAST),
         Some(Value::BoolValue(false))
     ));
-    assert_eq!(string_attr(log, ATTR_KEY_FRAGMENT_SOURCE_START), Some("10"));
-    assert_eq!(string_attr(log, ATTR_KEY_FRAGMENT_SOURCE_END), Some("20"));
+    assert_eq!(
+        attr(log, ATTR_KEY_FRAGMENT_BODY_START),
+        Some(&Value::IntValue(10))
+    );
+    assert_eq!(
+        attr(log, ATTR_KEY_FRAGMENT_BODY_END),
+        Some(&Value::IntValue(20))
+    );
+    assert_eq!(
+        attr(log, ATTR_KEY_FRAGMENT_FRAME_START),
+        Some(&Value::IntValue(0))
+    );
+    assert_eq!(
+        attr(log, ATTR_KEY_FRAGMENT_FRAME_END),
+        Some(&Value::IntValue(21))
+    );
     assert_eq!(
         string_attr(log, ATTR_KEY_FLUSH_REASON),
         Some("oversize_line_boundary")
@@ -298,25 +286,43 @@ fn projects_all_split_and_decode_attributes_with_exact_types() {
     assert!(attr(log, ATTR_KEY_RECORD_TRUNCATED).is_none());
 }
 
-/// Scenario: a truncated replacement-decoded record enables offset and
-/// worker-local number metadata.
-/// Guarantees: truncation is Bool, offset/number/error count are decimal
-/// Strings, decode policy is `replace`, and discarded-byte count is not
-/// exposed.
+/// Scenario: a synthetic fragment range exceeds the signed OTLP integer
+/// domain even though the internal source offset is `u64`.
+/// Guarantees: projection fails before Arrow mutation instead of wrapping or
+/// emitting a misleading negative provenance offset.
 #[test]
-fn projects_truncate_number_and_replacement_evidence() {
-    let metadata = MetadataConfig {
-        include_file_record_offset: true,
-        include_file_record_number: true,
-        ..MetadataConfig::default()
-    };
+fn fragment_offset_above_i64_fails_before_projection() {
+    let start = i64::MAX as u64 + 1;
+    let mut record = input(102, start, start + 1, start, Instant::now());
+    record.framed.fragment = Some(FragmentMetadata {
+        id: fragment_id(record.file_id, record.progress_base.file_epoch, start),
+        index: 0,
+        last: true,
+    });
+    let mut batch = batch_with_settings(settings(1, 1 << 20, Duration::from_secs(1)));
+    assert!(matches!(
+        batch.try_append(record),
+        Err(BatchError::FragmentOffsetOutOfRange {
+            field: ATTR_KEY_FRAGMENT_BODY_START,
+            offset,
+            ..
+        }) if offset == start
+    ));
+    assert_eq!(batch.record_count(), 0);
+}
+
+/// Scenario: a truncated replacement-decoded record carries the existing
+/// bounded loss markers.
+/// Guarantees: truncation is Bool, error count is a decimal String, decode
+/// policy is `replace`, and generic offset/number fields are not invented.
+#[test]
+fn projects_truncate_and_replacement_evidence() {
     let settings = BatchSettings::for_test(
         BatchConfig {
             max_records: 10,
             max_bytes: 1 << 20,
             max_flush_period: Duration::from_secs(1),
         },
-        metadata,
         MaxLogSizeBehavior::Truncate,
         OnDecodeError::Replace,
     );
@@ -328,15 +334,12 @@ fn projects_truncate_number_and_replacement_evidence() {
     record.framed.discarded_source_bytes = 2;
     record.framed.decode_outcome = DecodeOutcome::Replacements { count: 4 };
     record.framed.flush_reason = Some(FlushReason::Timeout);
-    record.record_number = Some(7);
 
     let mut batch = batch_with_settings(settings);
     let _ = append(&mut batch, record);
     let request = decode(&batch.finish().unwrap());
     let log = &request.resource_logs[0].scope_logs[0].log_records[0];
 
-    assert_eq!(string_attr(log, ATTR_KEY_RECORD_OFFSET), Some("5"));
-    assert_eq!(string_attr(log, ATTR_KEY_RECORD_NUMBER), Some("7"));
     assert!(matches!(
         attr(log, ATTR_KEY_RECORD_TRUNCATED),
         Some(Value::BoolValue(true))
@@ -354,10 +357,9 @@ fn projects_truncate_number_and_replacement_evidence() {
     );
 }
 
-/// Scenario: a clean unsplit record uses default-disabled metadata.
-/// Guarantees: only matched path and file name are emitted; clean decode,
-/// resolved path, offsets, numbers, flush, split, and truncate markers are
-/// all absent.
+/// Scenario: a clean unsplit record has a complete lossless textual path.
+/// Guarantees: only registered path and file name are emitted; native
+/// fallback, fragment, flush, decode, and truncate markers are all absent.
 #[test]
 fn clean_default_projection_omits_every_conditional_attribute() {
     let now = Instant::now();
@@ -367,10 +369,11 @@ fn clean_default_projection_omits_every_conditional_attribute() {
     let log = &request.resource_logs[0].scope_logs[0].log_records[0];
 
     assert_eq!(log.attributes.len(), 2);
-    assert!(attr(log, ATTR_KEY_PATH_RESOLVED).is_none());
-    assert!(attr(log, ATTR_KEY_PATH_ENCODING).is_none());
-    assert!(attr(log, ATTR_KEY_RECORD_OFFSET).is_none());
-    assert!(attr(log, ATTR_KEY_RECORD_NUMBER).is_none());
+    assert!(attr(log, ATTR_KEY_PATH_KIND).is_none());
+    assert!(attr(log, ATTR_KEY_PATH_NATIVE).is_none());
+    assert!(attr(log, ATTR_KEY_PATH_TRUNCATED).is_none());
+    assert!(attr(log, ATTR_KEY_PATH_SHA256).is_none());
+    assert!(attr(log, ATTR_KEY_FRAGMENT_ID).is_none());
     assert!(attr(log, ATTR_KEY_FLUSH_REASON).is_none());
     assert!(attr(log, ATTR_KEY_DECODE_ERROR_POLICY).is_none());
     assert!(attr(log, ATTR_KEY_DECODE_ERROR_COUNT).is_none());
@@ -410,26 +413,24 @@ fn flush_reasons_use_frozen_string_values() {
 }
 
 #[cfg(unix)]
-/// Scenario: one valid path literally begins with the encoding prefix while
-/// another contains invalid UTF-8 bytes.
-/// Guarantees: valid UTF-8 remains literal without a discriminator; invalid
-/// Unix bytes use uppercase percent encoding for every byte and emit
-/// `percent-v1`.
+/// Scenario: one complete Unix path is valid UTF-8 while another contains
+/// invalid UTF-8 bytes.
+/// Guarantees: valid text uses only registered provenance; non-text omits
+/// misleading registered fields and emits exact native bytes with kind and
+/// non-truncated evidence.
 #[test]
-fn unix_path_encoding_is_reversible_and_literal_prefix_is_unambiguous() {
+fn unix_paths_choose_lossless_registered_or_native_provenance() {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
 
     let now = Instant::now();
     let literal = PathBuf::from("/logs/filelog-percent:%FF.log");
     let mut literal_record = input(20, 0, 1, 0, now);
-    literal_record.matched_path = literal.clone();
-    literal_record.resolved_path = literal;
+    literal_record.matched_path = literal;
     let raw = b"/logs/\xff.log";
     let encoded_path = PathBuf::from(OsString::from_vec(raw.to_vec()));
     let mut encoded_record = input(21, 0, 1, 0, now);
-    encoded_record.matched_path = encoded_path.clone();
-    encoded_record.resolved_path = encoded_path;
+    encoded_record.matched_path = encoded_path;
 
     let mut batch = batch_with_settings(settings(2, 1 << 20, Duration::from_secs(1)));
     let _ = append(&mut batch, literal_record);
@@ -441,31 +442,32 @@ fn unix_path_encoding_is_reversible_and_literal_prefix_is_unambiguous() {
         string_attr(&logs[0], ATTR_KEY_LOG_FILE_PATH),
         Some("/logs/filelog-percent:%FF.log")
     );
-    assert!(attr(&logs[0], ATTR_KEY_PATH_ENCODING).is_none());
+    assert!(attr(&logs[0], ATTR_KEY_PATH_KIND).is_none());
+    assert!(attr(&logs[1], ATTR_KEY_LOG_FILE_PATH).is_none());
+    assert!(attr(&logs[1], ATTR_KEY_LOG_FILE_NAME).is_none());
     assert_eq!(
-        string_attr(&logs[1], ATTR_KEY_LOG_FILE_PATH),
-        Some(percent_path(raw).as_str())
+        string_attr(&logs[1], ATTR_KEY_PATH_KIND),
+        Some(PATH_KIND_UNIX_BYTES)
     );
     assert_eq!(
-        string_attr(&logs[1], ATTR_KEY_LOG_FILE_NAME),
-        Some(percent_path(b"\xff.log").as_str())
+        attr(&logs[1], ATTR_KEY_PATH_NATIVE),
+        Some(&Value::BytesValue(raw.to_vec()))
     );
     assert_eq!(
-        string_attr(&logs[1], ATTR_KEY_PATH_ENCODING),
-        Some("percent-v1")
+        attr(&logs[1], ATTR_KEY_PATH_TRUNCATED),
+        Some(&Value::BoolValue(false))
     );
+    assert!(attr(&logs[1], ATTR_KEY_PATH_SHA256).is_none());
 }
 
 #[cfg(unix)]
 /// Scenario: live Unix path evidence is exactly at and one byte above the
 /// durable format's 4,096-byte advisory-path stored maximum.
-/// Guarantees: the OTAP provenance attribute always carries the complete
-/// live native path losslessly -- the durable stored-byte cap bounds only
-/// checkpointed `AdvisoryPath` evidence, never a live provenance attribute
-/// -- so both lengths expand to prefix plus three bytes per native byte
-/// and succeed.
+/// Guarantees: the boundary emits complete native bytes without truncation;
+/// the over-bound path emits exactly the final 4,096-byte suffix, a
+/// truncation marker, and the full-path digest.
 #[test]
-fn unix_path_encoding_is_unbounded_for_live_full_paths() {
+fn unix_native_path_provenance_is_bounded_with_digest() {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
 
@@ -474,70 +476,144 @@ fn unix_path_encoding_is_unbounded_for_live_full_paths() {
         vec![0xff; super::super::checkpoint::primitives::ADVISORY_PATH_STORED_MAX_BYTES];
     let maximum_path = PathBuf::from(OsString::from_vec(maximum_raw.clone()));
     let mut maximum = empty_input(22, 0, 1, 0, now);
-    maximum.matched_path = maximum_path.clone();
-    maximum.resolved_path = maximum_path;
+    maximum.matched_path = maximum_path;
     let mut batch = batch_with_settings(settings(1, 64 << 20, Duration::from_secs(1)));
     let _ = append(&mut batch, maximum);
     let request = decode(&batch.finish().unwrap());
     let log = &request.resource_logs[0].scope_logs[0].log_records[0];
+    assert!(attr(log, ATTR_KEY_LOG_FILE_PATH).is_none());
     assert_eq!(
-        string_attr(log, ATTR_KEY_LOG_FILE_PATH).unwrap().len(),
-        ENCODED_PATH_PREFIX.len() + 3 * maximum_raw.len()
+        attr(log, ATTR_KEY_PATH_NATIVE),
+        Some(&Value::BytesValue(maximum_raw.clone()))
     );
+    assert_eq!(
+        attr(log, ATTR_KEY_PATH_TRUNCATED),
+        Some(&Value::BoolValue(false))
+    );
+    assert!(attr(log, ATTR_KEY_PATH_SHA256).is_none());
 
     let over_raw =
         vec![0xff; super::super::checkpoint::primitives::ADVISORY_PATH_STORED_MAX_BYTES + 1];
     let over_path = PathBuf::from(OsString::from_vec(over_raw.clone()));
     let mut over = empty_input(23, 0, 1, 0, now);
-    over.matched_path = over_path.clone();
-    over.resolved_path = over_path;
+    over.matched_path = over_path;
     let mut batch = batch_with_settings(settings(1, 64 << 20, Duration::from_secs(1)));
     let _ = append(&mut batch, over);
     let request = decode(&batch.finish().unwrap());
     let log = &request.resource_logs[0].scope_logs[0].log_records[0];
+    assert!(attr(log, ATTR_KEY_LOG_FILE_PATH).is_none());
     assert_eq!(
-        string_attr(log, ATTR_KEY_LOG_FILE_PATH).unwrap().len(),
-        ENCODED_PATH_PREFIX.len() + 3 * over_raw.len()
+        attr(log, ATTR_KEY_PATH_NATIVE),
+        Some(&Value::BytesValue(
+            over_raw[over_raw.len()
+                - super::super::checkpoint::primitives::ADVISORY_PATH_STORED_MAX_BYTES..]
+                .to_vec()
+        ))
+    );
+    assert_eq!(
+        attr(log, ATTR_KEY_PATH_TRUNCATED),
+        Some(&Value::BoolValue(true))
+    );
+    assert_eq!(
+        string_attr(log, ATTR_KEY_PATH_SHA256),
+        Some("ea9c097317ba6d33927a94480040f58d128b94831dfb1873a31bf50b305acab1")
+    );
+}
+
+#[cfg(unix)]
+/// Scenario: lossless UTF-8 Unix paths are exactly at and one byte above the
+/// 4,096-byte native evidence bound.
+/// Guarantees: the complete boundary path uses registered attributes, while
+/// the truncated text path omits them and uses bounded native suffix/digest
+/// evidence instead of presenting incomplete text as `log.file.path`.
+#[test]
+fn unix_truncated_text_path_never_populates_registered_provenance() {
+    let now = Instant::now();
+    let complete_text =
+        "a".repeat(super::super::checkpoint::primitives::ADVISORY_PATH_STORED_MAX_BYTES);
+    let mut complete = empty_input(27, 0, 1, 0, now);
+    complete.matched_path = PathBuf::from(&complete_text);
+    let mut batch = batch_with_settings(settings(1, 64 << 20, Duration::from_secs(1)));
+    let _ = append(&mut batch, complete);
+    let request = decode(&batch.finish().unwrap());
+    let log = &request.resource_logs[0].scope_logs[0].log_records[0];
+    assert_eq!(
+        string_attr(log, ATTR_KEY_LOG_FILE_PATH),
+        Some(complete_text.as_str())
+    );
+    assert_eq!(
+        string_attr(log, ATTR_KEY_LOG_FILE_NAME),
+        Some(complete_text.as_str())
+    );
+    assert!(attr(log, ATTR_KEY_PATH_NATIVE).is_none());
+
+    let truncated_text =
+        "b".repeat(super::super::checkpoint::primitives::ADVISORY_PATH_STORED_MAX_BYTES + 1);
+    let mut truncated = empty_input(28, 0, 1, 0, now);
+    truncated.matched_path = PathBuf::from(&truncated_text);
+    let mut batch = batch_with_settings(settings(1, 64 << 20, Duration::from_secs(1)));
+    let _ = append(&mut batch, truncated);
+    let request = decode(&batch.finish().unwrap());
+    let log = &request.resource_logs[0].scope_logs[0].log_records[0];
+    assert!(attr(log, ATTR_KEY_LOG_FILE_PATH).is_none());
+    assert!(attr(log, ATTR_KEY_LOG_FILE_NAME).is_none());
+    assert_eq!(
+        attr(log, ATTR_KEY_PATH_NATIVE),
+        Some(&Value::BytesValue(truncated_text.as_bytes()[1..].to_vec()))
+    );
+    assert_eq!(
+        attr(log, ATTR_KEY_PATH_TRUNCATED),
+        Some(&Value::BoolValue(true))
+    );
+    assert_eq!(
+        string_attr(log, ATTR_KEY_PATH_SHA256),
+        Some("ea5cf8db017b25b5aeb6a33bb5c794a15ebbcf6458b337cee8fbc10520117591")
     );
 }
 
 #[cfg(windows)]
 /// Scenario: a Windows matched path contains an unpaired UTF-16 surrogate.
-/// Guarantees: projection percent-encodes every little-endian UTF-16
-/// code-unit byte (`AdvisoryPathKind::WindowsUtf16Le`'s native byte order)
-/// and marks the String with the `percent-v1` discriminator.
+/// Guarantees: registered text fields are omitted and project provenance
+/// carries every little-endian UTF-16 code-unit byte with explicit kind and
+/// non-truncated evidence.
 #[test]
-fn windows_unpaired_surrogate_uses_utf16le_percent_encoding() {
+fn windows_unpaired_surrogate_uses_native_utf16le_provenance() {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
 
     let units = [u16::from(b'C'), u16::from(b':'), u16::from(b'\\'), 0xd800];
     let path = PathBuf::from(OsString::from_wide(&units));
     let mut record = empty_input(24, 0, 1, 0, Instant::now());
-    record.matched_path = path.clone();
-    record.resolved_path = path;
+    record.matched_path = path;
     let expected: Vec<u8> = units.into_iter().flat_map(u16::to_le_bytes).collect();
     let mut batch = batch_with_settings(settings(1, 1 << 20, Duration::from_secs(1)));
     let _ = append(&mut batch, record);
     let request = decode(&batch.finish().unwrap());
     let log = &request.resource_logs[0].scope_logs[0].log_records[0];
+    assert!(attr(log, ATTR_KEY_LOG_FILE_PATH).is_none());
+    assert!(attr(log, ATTR_KEY_LOG_FILE_NAME).is_none());
     assert_eq!(
-        string_attr(log, ATTR_KEY_LOG_FILE_PATH),
-        Some(percent_path(&expected).as_str())
+        string_attr(log, ATTR_KEY_PATH_KIND),
+        Some(PATH_KIND_WINDOWS_UTF16LE)
     );
-    assert_eq!(string_attr(log, ATTR_KEY_PATH_ENCODING), Some("percent-v1"));
+    assert_eq!(
+        attr(log, ATTR_KEY_PATH_NATIVE),
+        Some(&Value::BytesValue(expected))
+    );
+    assert_eq!(
+        attr(log, ATTR_KEY_PATH_TRUNCATED),
+        Some(&Value::BoolValue(false))
+    );
 }
 
 #[cfg(windows)]
 /// Scenario: unpaired-surrogate Windows path evidence is exactly at and one
 /// code unit above the durable format's 4,096-byte advisory-path stored
 /// maximum.
-/// Guarantees: the OTAP provenance attribute always carries the complete
-/// live native path losslessly regardless of the durable stored-byte cap,
-/// so 2,048 and 2,049 UTF-16 units both receive the full prefix-plus-`%HH`
-/// expansion and succeed.
+/// Guarantees: 2,048 units remain complete; 2,049 units retain exactly the
+/// final 2,048 whole code units with truncation and full-path digest evidence.
 #[test]
-fn windows_path_encoding_is_unbounded_for_live_full_paths() {
+fn windows_native_path_provenance_is_bounded_on_code_units() {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
 
@@ -545,29 +621,45 @@ fn windows_path_encoding_is_unbounded_for_live_full_paths() {
     let units = vec![0xd800; 2_048];
     let path = PathBuf::from(OsString::from_wide(&units));
     let mut maximum = empty_input(25, 0, 1, 0, now);
-    maximum.matched_path = path.clone();
-    maximum.resolved_path = path;
+    maximum.matched_path = path;
     let mut batch = batch_with_settings(settings(1, 64 << 20, Duration::from_secs(1)));
     let _ = append(&mut batch, maximum);
     let request = decode(&batch.finish().unwrap());
     let log = &request.resource_logs[0].scope_logs[0].log_records[0];
+    let maximum_bytes: Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
     assert_eq!(
-        string_attr(log, ATTR_KEY_LOG_FILE_PATH).unwrap().len(),
-        ENCODED_PATH_PREFIX.len() + 3 * 4_096
+        attr(log, ATTR_KEY_PATH_NATIVE),
+        Some(&Value::BytesValue(maximum_bytes))
+    );
+    assert_eq!(
+        attr(log, ATTR_KEY_PATH_TRUNCATED),
+        Some(&Value::BoolValue(false))
     );
 
     let over_units = vec![0xd800; 2_049];
     let over_path = PathBuf::from(OsString::from_wide(&over_units));
+    let expected_sha256 = hex::encode(native_path_sha256(&over_path).unwrap());
     let mut over = empty_input(26, 0, 1, 0, now);
-    over.matched_path = over_path.clone();
-    over.resolved_path = over_path;
+    over.matched_path = over_path;
     let mut batch = batch_with_settings(settings(1, 64 << 20, Duration::from_secs(1)));
     let _ = append(&mut batch, over);
     let request = decode(&batch.finish().unwrap());
     let log = &request.resource_logs[0].scope_logs[0].log_records[0];
+    let suffix: Vec<u8> = over_units[1..]
+        .iter()
+        .flat_map(|unit| unit.to_le_bytes())
+        .collect();
     assert_eq!(
-        string_attr(log, ATTR_KEY_LOG_FILE_PATH).unwrap().len(),
-        ENCODED_PATH_PREFIX.len() + 3 * 4_098
+        attr(log, ATTR_KEY_PATH_NATIVE),
+        Some(&Value::BytesValue(suffix))
+    );
+    assert_eq!(
+        attr(log, ATTR_KEY_PATH_TRUNCATED),
+        Some(&Value::BoolValue(true))
+    );
+    assert_eq!(
+        string_attr(log, ATTR_KEY_PATH_SHA256),
+        Some(expected_sha256.as_str())
     );
 }
 
@@ -578,11 +670,6 @@ fn windows_path_encoding_is_unbounded_for_live_full_paths() {
 /// covers it.
 #[test]
 fn runtime_attribute_enumeration_matches_shared_logical_size() {
-    let metadata = MetadataConfig {
-        include_file_path_resolved: true,
-        include_file_record_offset: true,
-        include_file_record_number: true,
-    };
     let batch_config = BatchConfig {
         max_records: 10,
         max_bytes: 1 << 20,
@@ -590,7 +677,6 @@ fn runtime_attribute_enumeration_matches_shared_logical_size() {
     };
     let settings = BatchSettings::for_test(
         batch_config,
-        metadata,
         MaxLogSizeBehavior::Split,
         OnDecodeError::PreserveRaw,
     );
@@ -623,6 +709,7 @@ fn runtime_attribute_enumeration_matches_shared_logical_size() {
             .expect("filelog attributes always have values");
         let value_bytes = match value {
             Value::StringValue(value) => logical_string_value_len(value).unwrap(),
+            Value::BytesValue(value) => value.len() as u64,
             Value::IntValue(value) => logical_int_value_len(*value),
             Value::BoolValue(value) => logical_bool_value_len(*value),
             other => panic!("unexpected projected attribute type: {other:?}"),
@@ -632,13 +719,9 @@ fn runtime_attribute_enumeration_matches_shared_logical_size() {
     let enumerated = checked_logical_record_size(4, sizes).unwrap();
     assert_eq!(runtime_size, enumerated);
 
-    let configured = configured_logical_record_size(
-        4,
-        &metadata,
-        MaxLogSizeBehavior::Split,
-        OnDecodeError::PreserveRaw,
-    )
-    .unwrap();
+    let configured =
+        configured_logical_record_size(4, MaxLogSizeBehavior::Split, OnDecodeError::PreserveRaw)
+            .unwrap();
     assert!(configured >= runtime_size);
 }
 
@@ -738,7 +821,6 @@ fn same_file_carry_over_rebases_to_predecessor_frontier() {
     let rebased = batch.rebase_for_carry_over(returned).unwrap();
     assert_eq!(rebased.framed, expected.framed);
     assert_eq!(rebased.matched_path, expected.matched_path);
-    assert_eq!(rebased.resolved_path, expected.resolved_path);
     assert_eq!(
         rebased.progress_base,
         ProgressBase {
@@ -1380,71 +1462,6 @@ fn merged_finalization_requires_exact_epoch_and_frontier() {
     assert!(!batch.deltas[0].finalize());
 }
 
-/// Scenario: transactional numbering accepts unsplit records, a fragment
-/// sequence, and a later unsplit record in one epoch.
-/// Guarantees: unsplit records receive zero-based values, fragment zero
-/// advances once, continued fragments do not, all fragments omit numbers,
-/// and stale reservations cannot double-commit.
-#[test]
-fn record_numbers_handle_fragments_and_transactional_commit() {
-    let mut table = RecordNumberTable::new(2).unwrap();
-    let first = table.prepare(file_id(50), 1, None).unwrap();
-    assert_eq!(first.record_number(), Some(0));
-    assert_eq!(table.commit(first).unwrap(), Some(0));
-    assert!(matches!(
-        table.commit(first),
-        Err(BatchError::StaleRecordNumberReservation { .. })
-    ));
-
-    let fragment_zero = table.prepare(file_id(50), 1, Some(0)).unwrap();
-    assert_eq!(fragment_zero.record_number(), None);
-    assert_eq!(table.commit(fragment_zero).unwrap(), None);
-    let continuation = table.prepare(file_id(50), 1, Some(1)).unwrap();
-    assert_eq!(continuation.record_number(), None);
-    assert_eq!(table.commit(continuation).unwrap(), None);
-    let next = table.prepare(file_id(50), 1, None).unwrap();
-    assert_eq!(next.record_number(), Some(2));
-    assert_eq!(table.commit(next).unwrap(), Some(2));
-}
-
-/// Scenario: a descriptor-equivalent pause leaves numbering state alive,
-/// then epoch change and process recovery create new number domains.
-/// Guarantees: descriptor lifecycle does not reset a file, epoch change does
-/// reset it to zero, a fresh helper resets all files, and removing a tracked
-/// identity releases its bounded capacity.
-#[test]
-fn record_numbers_survive_descriptor_lifecycle_but_reset_epoch_and_process() {
-    let mut table = RecordNumberTable::new(1).unwrap();
-    let first = table.prepare(file_id(51), 1, None).unwrap();
-    let _ = table.commit(first).unwrap();
-    let after_descriptor_close = table.prepare(file_id(51), 1, None).unwrap();
-    assert_eq!(after_descriptor_close.record_number(), Some(1));
-    let _ = table.commit(after_descriptor_close).unwrap();
-
-    let new_epoch = table.prepare(file_id(51), 2, None).unwrap();
-    assert_eq!(new_epoch.record_number(), Some(0));
-    let _ = table.commit(new_epoch).unwrap();
-    assert!(matches!(
-        table.prepare(file_id(52), 1, None),
-        Err(BatchError::RecordNumberCapacityExhausted { max_files: 1 })
-    ));
-    assert!(table.remove(file_id(51)));
-    assert!(!table.remove(file_id(51)));
-    assert_eq!(
-        table.prepare(file_id(52), 1, None).unwrap().record_number(),
-        Some(0)
-    );
-
-    let recovered = RecordNumberTable::new(1).unwrap();
-    assert_eq!(
-        recovered
-            .prepare(file_id(51), 2, None)
-            .unwrap()
-            .record_number(),
-        Some(0)
-    );
-}
-
 /// Scenario: a finished logical batch is cloned for retained and outbound
 /// use.
 /// Guarantees: Arrow array Arcs and progress-delta Arc storage are shared;
@@ -1469,51 +1486,4 @@ fn logical_batch_clone_and_outbound_view_are_shallow() {
     let original_deltas = batch.shared_deltas();
     let clone_deltas = clone.shared_deltas();
     assert!(Arc::ptr_eq(&original_deltas, &clone_deltas));
-}
-
-/// Scenario: enabled record-number metadata is absent on an unsplit worker
-/// input and present on a split input.
-/// Guarantees: missing required unsplit numbering is rejected, while a
-/// speculative fragment number is ignored so no fragment emits it.
-#[test]
-fn enabled_record_number_requires_unsplit_input_and_omits_fragments() {
-    let metadata = MetadataConfig {
-        include_file_record_number: true,
-        ..MetadataConfig::default()
-    };
-    let settings = BatchSettings::for_test(
-        BatchConfig {
-            max_records: 2,
-            max_bytes: 1 << 20,
-            max_flush_period: Duration::from_secs(1),
-        },
-        metadata,
-        MaxLogSizeBehavior::Split,
-        OnDecodeError::PreserveRaw,
-    );
-    let now = Instant::now();
-    let mut missing = input(61, 0, 1, 0, now);
-    missing.record_number = None;
-    let mut batch = batch_with_settings(settings.clone());
-    assert!(matches!(
-        batch.try_append(missing),
-        Err(BatchError::InvalidRecord { .. })
-    ));
-
-    let mut fragment = input(61, 0, 1, 0, now);
-    fragment.framed.fragment = Some(FragmentMetadata {
-        id: fragment_id(
-            fragment.file_id,
-            fragment.progress_base.file_epoch,
-            fragment.framed.body_source_range.start,
-        ),
-        index: 0,
-        last: true,
-    });
-    fragment.record_number = Some(123);
-    let mut batch = batch_with_settings(settings);
-    let _ = append(&mut batch, fragment);
-    let request = decode(&batch.finish().unwrap());
-    let log = &request.resource_logs[0].scope_logs[0].log_records[0];
-    assert!(attr(log, ATTR_KEY_RECORD_NUMBER).is_none());
 }

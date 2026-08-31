@@ -88,9 +88,9 @@ use runtime::FilelogReceiver;
 
 pub use config::{
     BatchConfig, CheckpointConfig, Config, DiscoveryConfig, Encoding, FILELOG_RECEIVER_URN,
-    FramingConfig, IdentityConfig, LimitsConfig, MaxLogSizeBehavior, MetadataConfig,
-    MultilineConfig, OnDecodeError, OnNack, OnRecoveryMismatch, OnTruncate, RegexProfile,
-    RetryConfig, RotationConfig, StartAt,
+    FramingConfig, IdentityConfig, LimitsConfig, MaxLogSizeBehavior, MultilineConfig,
+    OnDecodeError, OnNack, OnRecoveryMismatch, OnTruncate, RegexProfile, RetryConfig,
+    RotationConfig, StartAt,
 };
 pub use telemetry::FilelogReceiverMetrics;
 
