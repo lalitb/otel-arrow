@@ -1,0 +1,6 @@
+change_type: bug_fix
+component: pipeline
+note: "Keep filelog discovery bounded while reducing wide-directory rescans on Linux."
+issues: [3939]
+subtext: |
+  Traversal retains one fixed 256-entry batch, revalidates its parent before cached yields, discards cached siblings on descent, and marks changed evidence incomplete.

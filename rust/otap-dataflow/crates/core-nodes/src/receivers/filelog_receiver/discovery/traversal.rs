@@ -16,6 +16,10 @@ use crate::receivers::filelog_receiver::checkpoint::Locator;
 const DIRECTORY_ENTRY_DIGEST_DOMAIN: &[u8] = b"otel-arrow-filelog-directory-entry-v1\0";
 const DIRECTORY_ENTRY_SET_DIGEST_DOMAIN: &[u8] = b"otel-arrow-filelog-directory-entry-set-v1\0";
 const DIRECTORY_CHANGE_DIGEST_DOMAIN: &[u8] = b"otel-arrow-filelog-directory-change-v1\0";
+#[cfg(target_os = "linux")]
+const DIRECTORY_ENTRY_BATCH_SIZE: usize = 256;
+#[cfg(not(target_os = "linux"))]
+const DIRECTORY_ENTRY_BATCH_SIZE: usize = 1;
 
 /// Type information used only to route one traversal entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,12 +80,20 @@ struct DirectoryEvidence {
 
 #[derive(Debug)]
 struct Frame {
+    id: u64,
     component: Option<OsString>,
     depth: usize,
     baseline: Option<DirectoryEvidence>,
     after: Option<OsString>,
     recovery_attempts: u8,
     entry_issue_reported: bool,
+}
+
+#[derive(Debug)]
+struct CachedEntry {
+    name: OsString,
+    kind: TraversalEntryKind,
+    path_is_symlink: bool,
 }
 
 #[derive(Debug)]
@@ -102,6 +114,9 @@ pub(super) struct BoundedTraversal {
     last_unit_opened_directory: bool,
     frames: Vec<Frame>,
     pending_directory: Option<PendingDirectory>,
+    entry_batch: Vec<CachedEntry>,
+    entry_batch_owner: Option<u64>,
+    next_frame_id: u64,
 }
 
 impl BoundedTraversal {
@@ -123,6 +138,13 @@ impl BoundedTraversal {
                 source,
             }
         })?;
+        let mut entry_batch = Vec::new();
+        entry_batch
+            .try_reserve_exact(DIRECTORY_ENTRY_BATCH_SIZE)
+            .map_err(|source| DiscoveryError::AllocationFailed {
+                resource: "directory traversal native-entry batch",
+                source,
+            })?;
         Ok(Self {
             root,
             max_depth,
@@ -132,11 +154,14 @@ impl BoundedTraversal {
             last_unit_opened_directory: false,
             frames,
             pending_directory: None,
+            entry_batch,
+            entry_batch_owner: None,
+            next_frame_id: 1,
         })
     }
 
     /// Returns one native-name-ordered entry after closing and path-validating
-    /// the only directory enumeration handle used for this unit.
+    /// the only directory handle used for this unit.
     pub(super) fn next(
         &mut self,
         mut cancelled: impl FnMut() -> bool,
@@ -193,57 +218,121 @@ impl BoundedTraversal {
         }
 
         loop {
-            let Some(frame) = self.frames.last() else {
+            let Some(_) = self.frames.last() else {
                 self.finished = true;
                 return Ok(None);
             };
             let directory_path = self.current_directory_path();
-            let expected = frame.baseline.as_ref();
-            let after = frame.after.as_deref();
+            if !self.entry_batch.is_empty() {
+                let frame = self
+                    .frames
+                    .last()
+                    .expect("a cached entry batch always has an owning frame");
+                if self.entry_batch_owner != Some(frame.id) {
+                    self.clear_entry_batch();
+                    return Err(TraversalFailure::Stop(DiscoveryIssue::TraversalResume {
+                        path: directory_path,
+                        reason: "cached directory entries lost their owning traversal frame",
+                    }));
+                }
+                let expected = frame
+                    .baseline
+                    .as_ref()
+                    .expect("a cached entry batch always has baseline evidence")
+                    .token
+                    .clone();
+                self.last_unit_opened_directory = true;
+                match verify_cached_directory(
+                    &directory_path,
+                    &expected,
+                    self.follow_symlinks,
+                    &mut cancelled,
+                ) {
+                    Ok(CachedDirectoryVerification::Stable) => {
+                        return self.take_cached_entry(directory_path);
+                    }
+                    Ok(CachedDirectoryVerification::Changed) => {
+                        self.mark_current_frame_ambiguous(None);
+                        return Err(TraversalFailure::Recoverable(
+                            DiscoveryIssue::TraversalResume {
+                                path: directory_path,
+                                reason: "directory change evidence changed before cached resume",
+                            },
+                        ));
+                    }
+                    Err(DirectoryScanFailure::Cancelled) => {
+                        self.clear_entry_batch();
+                        return Err(TraversalFailure::Cancelled);
+                    }
+                    Err(DirectoryScanFailure::Stop(issue)) => {
+                        self.clear_entry_batch();
+                        return Err(TraversalFailure::Stop(issue));
+                    }
+                    Err(DirectoryScanFailure::Unstable(reason)) => {
+                        self.mark_current_frame_ambiguous(None);
+                        return Err(TraversalFailure::Recoverable(
+                            DiscoveryIssue::TraversalResume {
+                                path: directory_path,
+                                reason,
+                            },
+                        ));
+                    }
+                    Err(DirectoryScanFailure::Replaced(reason)) => {
+                        self.clear_entry_batch();
+                        let _ = self.frames.pop();
+                        return Err(TraversalFailure::Recoverable(
+                            DiscoveryIssue::TraversalResume {
+                                path: directory_path,
+                                reason,
+                            },
+                        ));
+                    }
+                }
+            }
+            let (expected, after) = {
+                let frame = self
+                    .frames
+                    .last()
+                    .expect("the traversal frame was checked above");
+                (frame.baseline.clone(), frame.after.clone())
+            };
+            self.clear_entry_batch();
             let scan = match scan_directory(
                 &directory_path,
-                expected,
-                after,
+                expected.as_ref(),
+                after.as_deref(),
                 self.follow_symlinks,
+                &mut self.entry_batch,
                 &mut cancelled,
             ) {
                 Ok(DirectoryScanOutcome::Stable(scan)) => scan,
                 Ok(DirectoryScanOutcome::Changed(scan)) => {
                     self.last_unit_opened_directory = true;
-                    let frame_index = self.frames.len() - 1;
                     let issue = DiscoveryIssue::TraversalResume {
                         path: directory_path,
                         reason: "directory entry-set resume evidence changed",
                     };
-                    if self.frames[frame_index].recovery_attempts == 0 {
-                        self.frames[frame_index].baseline = Some(scan.evidence);
-                        self.frames[frame_index].recovery_attempts = 1;
-                    } else {
-                        let _ = self.frames.pop();
-                    }
+                    self.mark_current_frame_ambiguous(Some(scan.evidence));
                     return Err(TraversalFailure::Recoverable(issue));
                 }
                 Err(DirectoryScanFailure::Cancelled) => {
+                    self.clear_entry_batch();
                     return Err(TraversalFailure::Cancelled);
                 }
                 Err(DirectoryScanFailure::Stop(issue)) => {
+                    self.clear_entry_batch();
                     return Err(TraversalFailure::Stop(issue));
                 }
                 Err(DirectoryScanFailure::Unstable(reason)) => {
-                    let frame_index = self.frames.len() - 1;
                     let issue = DiscoveryIssue::TraversalResume {
                         path: directory_path,
                         reason,
                     };
-                    if self.frames[frame_index].recovery_attempts == 0 {
-                        self.frames[frame_index].baseline = None;
-                        self.frames[frame_index].recovery_attempts = 1;
-                    } else {
-                        let _ = self.frames.pop();
-                    }
+                    self.mark_current_frame_ambiguous(None);
                     return Err(TraversalFailure::Recoverable(issue));
                 }
                 Err(DirectoryScanFailure::Replaced(reason)) => {
+                    self.clear_entry_batch();
                     let _ = self.frames.pop();
                     return Err(TraversalFailure::Recoverable(
                         DiscoveryIssue::TraversalResume {
@@ -266,6 +355,7 @@ impl BoundedTraversal {
                         .as_ref()
                         .is_some_and(|evidence| evidence.token.locator == locator)
                 }) {
+                    self.clear_entry_batch();
                     let _ = self.frames.pop();
                     return Err(TraversalFailure::Recoverable(
                         DiscoveryIssue::TraversalCycle {
@@ -274,7 +364,12 @@ impl BoundedTraversal {
                         },
                     ));
                 }
+            }
+            if self.frames[frame_index].baseline.is_none() || DIRECTORY_ENTRY_BATCH_SIZE > 1 {
                 self.frames[frame_index].baseline = Some(scan.evidence.clone());
+            }
+            if !self.entry_batch.is_empty() {
+                self.entry_batch_owner = Some(self.frames[frame_index].id);
             }
             if let Some(issue) = scan.entry_issue
                 && !self.frames[frame_index].entry_issue_reported
@@ -282,35 +377,12 @@ impl BoundedTraversal {
                 self.frames[frame_index].entry_issue_reported = true;
                 return Err(TraversalFailure::Recoverable(issue));
             }
-            let Some(selected) = scan.selected else {
+            if self.entry_batch.is_empty() {
+                self.clear_entry_batch();
                 let _ = self.frames.pop();
                 continue;
-            };
-            self.frames[frame_index].after = Some(selected.name.clone());
-            let entry_path = directory_path.join(&selected.name);
-            let entry = TraversalEntry {
-                path: entry_path.clone(),
-                name: selected.name.clone(),
-                depth: self.frames[frame_index]
-                    .depth
-                    .checked_add(1)
-                    .ok_or_else(|| {
-                        TraversalFailure::Stop(DiscoveryIssue::TraversalDepth {
-                            path: entry_path.clone(),
-                            max_depth: self.max_depth,
-                        })
-                    })?,
-                kind: selected.kind,
-                path_is_symlink: selected.path_is_symlink,
-            };
-            if entry.kind == TraversalEntryKind::Directory {
-                self.pending_directory = Some(PendingDirectory {
-                    component: Some(entry.name.clone()),
-                    path: entry.path.clone(),
-                    depth: entry.depth,
-                });
             }
-            return Ok(Some(entry));
+            return self.take_cached_entry(directory_path);
         }
     }
 
@@ -323,6 +395,7 @@ impl BoundedTraversal {
                 reason: "traversal descent was requested without a pending directory",
             })
         })?;
+        self.clear_entry_batch();
         if pending.depth >= self.max_depth {
             return Err(TraversalFailure::Recoverable(
                 DiscoveryIssue::TraversalDepth {
@@ -331,7 +404,15 @@ impl BoundedTraversal {
                 },
             ));
         }
+        let frame_id = self.next_frame_id;
+        self.next_frame_id = frame_id.checked_add(1).ok_or_else(|| {
+            TraversalFailure::Stop(DiscoveryIssue::TraversalResume {
+                path: pending.path.clone(),
+                reason: "directory traversal frame identity overflowed",
+            })
+        })?;
         self.frames.push(Frame {
+            id: frame_id,
             component: pending.component,
             depth: pending.depth,
             baseline: None,
@@ -351,6 +432,7 @@ impl BoundedTraversal {
             })
         })?;
         if pending.depth == 0 {
+            self.clear_entry_batch();
             self.finished = true;
         }
         Ok(())
@@ -374,11 +456,83 @@ impl BoundedTraversal {
     fn retained_frame_capacity(&self) -> usize {
         self.frames.capacity()
     }
+
+    fn clear_entry_batch(&mut self) {
+        self.entry_batch.clear();
+        self.entry_batch_owner = None;
+    }
+
+    fn mark_current_frame_ambiguous(&mut self, baseline: Option<DirectoryEvidence>) {
+        self.clear_entry_batch();
+        let should_pop = {
+            let frame = self
+                .frames
+                .last_mut()
+                .expect("an ambiguous traversal unit has a current frame");
+            if frame.recovery_attempts == 0 {
+                frame.baseline = baseline;
+                frame.recovery_attempts = 1;
+                false
+            } else {
+                true
+            }
+        };
+        if should_pop {
+            let _ = self.frames.pop();
+        }
+    }
+
+    fn take_cached_entry(
+        &mut self,
+        directory_path: PathBuf,
+    ) -> Result<Option<TraversalEntry>, TraversalFailure> {
+        let frame_index = self.frames.len() - 1;
+        if self.entry_batch_owner != Some(self.frames[frame_index].id) {
+            self.clear_entry_batch();
+            return Err(TraversalFailure::Stop(DiscoveryIssue::TraversalResume {
+                path: directory_path,
+                reason: "cached directory entries lost their owning traversal frame",
+            }));
+        }
+        let selected = self.entry_batch.pop().ok_or_else(|| {
+            TraversalFailure::Stop(DiscoveryIssue::TraversalResume {
+                path: directory_path.clone(),
+                reason: "cached directory entry batch was unexpectedly empty",
+            })
+        })?;
+        if self.entry_batch.is_empty() {
+            self.entry_batch_owner = None;
+        }
+        self.frames[frame_index].after = Some(selected.name.clone());
+        let entry_path = directory_path.join(&selected.name);
+        let entry = TraversalEntry {
+            path: entry_path.clone(),
+            name: selected.name.clone(),
+            depth: self.frames[frame_index]
+                .depth
+                .checked_add(1)
+                .ok_or_else(|| {
+                    TraversalFailure::Stop(DiscoveryIssue::TraversalDepth {
+                        path: entry_path.clone(),
+                        max_depth: self.max_depth,
+                    })
+                })?,
+            kind: selected.kind,
+            path_is_symlink: selected.path_is_symlink,
+        };
+        if entry.kind == TraversalEntryKind::Directory {
+            self.pending_directory = Some(PendingDirectory {
+                component: Some(entry.name.clone()),
+                path: entry.path.clone(),
+                depth: entry.depth,
+            });
+        }
+        Ok(Some(entry))
+    }
 }
 
 struct DirectoryScan {
     evidence: DirectoryEvidence,
-    selected: Option<NativeEntry>,
     entry_issue: Option<DiscoveryIssue>,
 }
 
@@ -395,11 +549,46 @@ enum DirectoryScanFailure {
     Replaced(&'static str),
 }
 
+enum CachedDirectoryVerification {
+    Stable,
+    Changed,
+}
+
+fn verify_cached_directory(
+    path: &Path,
+    expected: &DirectoryToken,
+    follow_symlinks: bool,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<CachedDirectoryVerification, DirectoryScanFailure> {
+    if cancelled() {
+        return Err(DirectoryScanFailure::Cancelled);
+    }
+    let verifier = platform::DirectoryHandle::open(path, follow_symlinks)
+        .map_err(|error| platform_failure(path, error))?;
+    let verified = verifier
+        .token(path)
+        .map_err(|error| platform_failure(path, error))?;
+    drop(verifier);
+    if cancelled() {
+        return Err(DirectoryScanFailure::Cancelled);
+    }
+    if verified.locator != expected.locator {
+        return Err(DirectoryScanFailure::Replaced(
+            "directory pathname no longer resolves to the cached directory",
+        ));
+    }
+    if verified.change_digest != expected.change_digest {
+        return Ok(CachedDirectoryVerification::Changed);
+    }
+    Ok(CachedDirectoryVerification::Stable)
+}
+
 fn scan_directory(
     path: &Path,
     expected: Option<&DirectoryEvidence>,
     after: Option<&OsStr>,
     follow_symlinks: bool,
+    selected: &mut Vec<CachedEntry>,
     cancelled: &mut impl FnMut() -> bool,
 ) -> Result<DirectoryScanOutcome, DirectoryScanFailure> {
     scan_directory_with_hook(
@@ -407,6 +596,7 @@ fn scan_directory(
         expected,
         after,
         follow_symlinks,
+        selected,
         cancelled,
         &mut |_| {},
     )
@@ -417,19 +607,22 @@ fn scan_directory_with_hook(
     expected: Option<&DirectoryEvidence>,
     after: Option<&OsStr>,
     follow_symlinks: bool,
+    selected: &mut Vec<CachedEntry>,
     cancelled: &mut impl FnMut() -> bool,
     before_path_reopen: &mut impl FnMut(&Path),
 ) -> Result<DirectoryScanOutcome, DirectoryScanFailure> {
     if cancelled() {
         return Err(DirectoryScanFailure::Cancelled);
     }
+    selected.clear();
+    debug_assert!(selected.capacity() >= DIRECTORY_ENTRY_BATCH_SIZE);
+    note_directory_scan_started();
     let mut directory = platform::DirectoryHandle::open(path, follow_symlinks)
         .map_err(|error| platform_failure(path, error))?;
     let before = directory
         .token(path)
         .map_err(|error| platform_failure(path, error))?;
     let mut accumulator = EntrySetAccumulator::default();
-    let mut selected: Option<NativeEntry> = None;
     let mut entry_issue = None;
     loop {
         if cancelled() {
@@ -454,11 +647,15 @@ fn scan_directory_with_hook(
             })
         })?;
         let after_match = after.is_none_or(|after| native_name_cmp(&entry.name, after).is_gt());
-        let before_selected = selected
-            .as_ref()
-            .is_none_or(|current| native_name_cmp(&entry.name, &current.name).is_lt());
-        if selectable && after_match && before_selected {
-            selected = Some(entry);
+        if selectable && after_match {
+            retain_cached_entry(
+                selected,
+                CachedEntry {
+                    name: entry.name,
+                    kind: entry.kind,
+                    path_is_symlink: entry.path_is_symlink,
+                },
+            );
         }
     }
     let after_enumeration = directory
@@ -493,10 +690,14 @@ fn scan_directory_with_hook(
             "directory pathname no longer resolves to the enumerated directory",
         ));
     }
-    if selected.is_none() && verified.change_digest != after_enumeration.change_digest {
-        return Err(DirectoryScanFailure::Unstable(
-            "directory changed before terminal traversal completion",
-        ));
+    if (DIRECTORY_ENTRY_BATCH_SIZE > 1 || selected.is_empty())
+        && verified.change_digest != after_enumeration.change_digest
+    {
+        return Err(DirectoryScanFailure::Unstable(if selected.is_empty() {
+            "directory changed before terminal traversal completion"
+        } else {
+            "directory changed before cached traversal batch publication"
+        }));
     }
     if let Some(expected) = expected {
         if expected.token.locator != evidence.token.locator {
@@ -504,21 +705,36 @@ fn scan_directory_with_hook(
                 "directory locator changed before resume",
             ));
         }
-        if expected.entry_count != evidence.entry_count
+        if (DIRECTORY_ENTRY_BATCH_SIZE > 1
+            && expected.token.change_digest != evidence.token.change_digest)
+            || expected.entry_count != evidence.entry_count
             || expected.entry_set_digest != evidence.entry_set_digest
         {
+            selected.clear();
             return Ok(DirectoryScanOutcome::Changed(DirectoryScan {
                 evidence,
-                selected,
                 entry_issue,
             }));
         }
     }
+    selected.reverse();
+    note_entry_batch_len(selected.len());
     Ok(DirectoryScanOutcome::Stable(DirectoryScan {
         evidence,
-        selected,
         entry_issue,
     }))
+}
+
+fn retain_cached_entry(entries: &mut Vec<CachedEntry>, entry: CachedEntry) {
+    let position = entries
+        .binary_search_by(|current| native_name_cmp(&current.name, &entry.name))
+        .unwrap_or_else(|position| position);
+    if entries.len() < DIRECTORY_ENTRY_BATCH_SIZE {
+        entries.insert(position, entry);
+    } else if position < DIRECTORY_ENTRY_BATCH_SIZE {
+        let _ = entries.pop();
+        entries.insert(position, entry);
+    }
 }
 
 fn platform_failure(path: &Path, error: PlatformError) -> DirectoryScanFailure {
@@ -766,6 +982,8 @@ fn directory_change_digest(parts: &[&[u8]]) -> [u8; 32] {
 thread_local! {
     static OPEN_DIRECTORY_HANDLES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PEAK_DIRECTORY_HANDLES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FULL_DIRECTORY_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MAX_ENTRY_BATCH_LEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static NEXT_DIRECTORY_OPEN_ERROR: std::cell::RefCell<Option<io::Error>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -801,14 +1019,49 @@ fn note_directory_handle_closed() {
 fn note_directory_handle_closed() {}
 
 #[cfg(test)]
+fn note_directory_scan_started() {
+    FULL_DIRECTORY_SCANS.with(|scans| {
+        scans.set(
+            scans
+                .get()
+                .checked_add(1)
+                .expect("test directory scan count fits"),
+        );
+    });
+}
+
+#[cfg(not(test))]
+fn note_directory_scan_started() {}
+
+#[cfg(test)]
+fn note_entry_batch_len(len: usize) {
+    MAX_ENTRY_BATCH_LEN.with(|maximum| maximum.set(maximum.get().max(len)));
+}
+
+#[cfg(not(test))]
+fn note_entry_batch_len(_len: usize) {}
+
+#[cfg(test)]
 pub(super) fn reset_directory_handle_observations() {
     OPEN_DIRECTORY_HANDLES.with(|current| current.set(0));
     PEAK_DIRECTORY_HANDLES.with(|peak| peak.set(0));
+    FULL_DIRECTORY_SCANS.with(|scans| scans.set(0));
+    MAX_ENTRY_BATCH_LEN.with(|maximum| maximum.set(0));
 }
 
 #[cfg(test)]
 pub(super) fn peak_directory_handles() -> usize {
     PEAK_DIRECTORY_HANDLES.with(std::cell::Cell::get)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn full_directory_scans() -> usize {
+    FULL_DIRECTORY_SCANS.with(std::cell::Cell::get)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn max_entry_batch_len() -> usize {
+    MAX_ENTRY_BATCH_LEN.with(std::cell::Cell::get)
 }
 
 #[cfg(all(test, unix))]
@@ -927,6 +1180,8 @@ mod platform {
             };
             let mode = metadata.mode().to_be_bytes();
             let links = metadata.nlink().to_be_bytes();
+            let size = metadata.size().to_be_bytes();
+            let blocks = metadata.blocks().to_be_bytes();
             let modified_seconds = metadata.mtime().to_be_bytes();
             let modified_nanoseconds = metadata.mtime_nsec().to_be_bytes();
             let changed_seconds = metadata.ctime().to_be_bytes();
@@ -941,6 +1196,8 @@ mod platform {
                     path_bytes,
                     &mode,
                     &links,
+                    &size,
+                    &blocks,
                     &modified_seconds,
                     &modified_nanoseconds,
                     &changed_seconds,
@@ -1050,7 +1307,9 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use std::ffi::{OsStr, OsString};
+        use std::fs::{File, FileTimes};
         use std::path::PathBuf;
+        use std::time::{Duration, SystemTime};
 
         use super::super::*;
 
@@ -1071,6 +1330,24 @@ mod platform {
                 }
             }
             files
+        }
+
+        fn entry_batch() -> Vec<CachedEntry> {
+            let mut entries = Vec::new();
+            entries
+                .try_reserve_exact(DIRECTORY_ENTRY_BATCH_SIZE)
+                .unwrap();
+            entries
+        }
+
+        fn set_directory_mtime(path: &Path, seconds: u64) {
+            let directory = File::open(path).unwrap();
+            directory
+                .set_times(
+                    FileTimes::new()
+                        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
+                )
+                .unwrap();
         }
 
         /// Scenario: identical entry records are accumulated in opposite backend
@@ -1138,8 +1415,9 @@ mod platform {
 
         /// Scenario: a directory contains 256 regular files while the
         /// configured traversal depth remains one.
-        /// Guarantees: every entry is visited, frame capacity is independent of
-        /// directory width, and only one native directory handle is ever live.
+        /// Guarantees: every entry is visited, frame and entry-batch capacity
+        /// are independent of directory width, Linux uses one complete refill
+        /// plus one terminal scan, and only one native directory handle is live.
         #[test]
         fn wide_directory_keeps_bounded_traversal_state() {
             let directory = tempfile::tempdir().unwrap();
@@ -1150,14 +1428,97 @@ mod platform {
             let mut traversal =
                 BoundedTraversal::new(directory.path().to_path_buf(), 1, false).unwrap();
             let initial_capacity = traversal.retained_frame_capacity();
+            let initial_entry_capacity = traversal.entry_batch.capacity();
             descend_root(&mut traversal);
 
             let files = collect_regular_files(&mut traversal);
 
             assert_eq!(files.len(), 256);
             assert_eq!(traversal.retained_frame_capacity(), initial_capacity);
+            assert_eq!(traversal.entry_batch.capacity(), initial_entry_capacity);
+            assert!(initial_entry_capacity >= DIRECTORY_ENTRY_BATCH_SIZE);
+            #[cfg(target_os = "linux")]
+            {
+                assert_eq!(full_directory_scans(), 2);
+                assert_eq!(max_entry_batch_len(), DIRECTORY_ENTRY_BATCH_SIZE);
+            }
             assert_eq!(peak_directory_handles(), 1);
             assert_eq!(current_directory_handles(), 0);
+        }
+
+        /// Scenario: stable Linux directories contain populations immediately
+        /// below, at, and above one or two fixed native-entry batches.
+        /// Guarantees: complete scans equal `ceil(entries / batch) + 1`, the
+        /// logical batch never exceeds its fixed bound, and capacity never grows.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn linux_entry_batch_boundaries_have_fixed_scan_and_memory_counts() {
+            for count in [255usize, 256, 257, 512] {
+                let directory = tempfile::tempdir().unwrap();
+                for index in 0..count {
+                    std::fs::write(directory.path().join(format!("{index:04}.log")), b"line")
+                        .unwrap();
+                }
+                reset_directory_handle_observations();
+                let mut traversal =
+                    BoundedTraversal::new(directory.path().to_path_buf(), 1, false).unwrap();
+                let initial_entry_capacity = traversal.entry_batch.capacity();
+                descend_root(&mut traversal);
+
+                let files = collect_regular_files(&mut traversal);
+
+                assert_eq!(files.len(), count);
+                assert_eq!(traversal.entry_batch.capacity(), initial_entry_capacity);
+                assert_eq!(
+                    full_directory_scans(),
+                    count.div_ceil(DIRECTORY_ENTRY_BATCH_SIZE) + 1
+                );
+                assert_eq!(max_entry_batch_len(), count.min(DIRECTORY_ENTRY_BATCH_SIZE));
+                assert_eq!(peak_directory_handles(), 1);
+                assert_eq!(current_directory_handles(), 0);
+            }
+        }
+
+        /// Scenario: the first and then a middle entry in a full parent batch
+        /// are directories with regular-file siblings after them.
+        /// Guarantees: descent discards cached parent names, resumes from only
+        /// the last yielded name, and later siblings are rediscovered in order.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn batched_parent_siblings_are_rediscovered_after_descent() {
+            let first_parent = tempfile::tempdir().unwrap();
+            std::fs::create_dir(first_parent.path().join("a-dir")).unwrap();
+            std::fs::write(first_parent.path().join("a-dir/inside.log"), b"inside").unwrap();
+            std::fs::write(first_parent.path().join("b.log"), b"b").unwrap();
+            std::fs::write(first_parent.path().join("c.log"), b"c").unwrap();
+            let mut first =
+                BoundedTraversal::new(first_parent.path().to_path_buf(), 2, false).unwrap();
+            descend_root(&mut first);
+            assert_eq!(
+                collect_regular_files(&mut first),
+                [
+                    first_parent.path().join("a-dir/inside.log"),
+                    first_parent.path().join("b.log"),
+                    first_parent.path().join("c.log"),
+                ]
+            );
+
+            let middle_parent = tempfile::tempdir().unwrap();
+            std::fs::write(middle_parent.path().join("a.log"), b"a").unwrap();
+            std::fs::create_dir(middle_parent.path().join("b-dir")).unwrap();
+            std::fs::write(middle_parent.path().join("b-dir/inside.log"), b"inside").unwrap();
+            std::fs::write(middle_parent.path().join("c.log"), b"c").unwrap();
+            let mut middle =
+                BoundedTraversal::new(middle_parent.path().to_path_buf(), 2, false).unwrap();
+            descend_root(&mut middle);
+            assert_eq!(
+                collect_regular_files(&mut middle),
+                [
+                    middle_parent.path().join("a.log"),
+                    middle_parent.path().join("b-dir/inside.log"),
+                    middle_parent.path().join("c.log"),
+                ]
+            );
         }
 
         /// Scenario: traversal descends through 256 one-child directories
@@ -1269,6 +1630,153 @@ mod platform {
             assert!(resumed.path().ends_with("c.log"));
         }
 
+        /// Scenario: Linux caches `a.log` and `c.log`, then `b.log` is inserted
+        /// inside the unconsumed native-name range after `a.log` is yielded.
+        /// Guarantees: token change invalidates the cache, marks the pass
+        /// incomplete, and the replacement scan yields `b.log` before `c.log`.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn insertion_inside_cached_range_is_not_skipped() {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("a.log"), b"a").unwrap();
+            std::fs::write(directory.path().join("c.log"), b"c").unwrap();
+            let mut traversal =
+                BoundedTraversal::new(directory.path().to_path_buf(), 1, false).unwrap();
+            descend_root(&mut traversal);
+            let first = traversal.next(|| false).unwrap().unwrap();
+            assert!(first.path().ends_with("a.log"));
+            std::fs::write(directory.path().join("b.log"), b"b").unwrap();
+
+            assert!(matches!(
+                traversal.next(|| false),
+                Err(TraversalFailure::Recoverable(
+                    DiscoveryIssue::TraversalResume { .. }
+                ))
+            ));
+            assert!(
+                traversal
+                    .next(|| false)
+                    .unwrap()
+                    .unwrap()
+                    .path()
+                    .ends_with("b.log")
+            );
+            assert!(
+                traversal
+                    .next(|| false)
+                    .unwrap()
+                    .unwrap()
+                    .path()
+                    .ends_with("c.log")
+            );
+        }
+
+        /// Scenario: Linux directory metadata changes without changing its
+        /// entry set while cached names remain.
+        /// Guarantees: the observed token change still marks the pass
+        /// incomplete before traversal establishes new evidence and continues.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn token_change_with_unchanged_entry_set_marks_pass_incomplete() {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("a.log"), b"a").unwrap();
+            std::fs::write(directory.path().join("b.log"), b"b").unwrap();
+            let mut traversal =
+                BoundedTraversal::new(directory.path().to_path_buf(), 1, false).unwrap();
+            descend_root(&mut traversal);
+            assert!(
+                traversal
+                    .next(|| false)
+                    .unwrap()
+                    .unwrap()
+                    .path()
+                    .ends_with("a.log")
+            );
+            set_directory_mtime(directory.path(), 1_000_000);
+
+            assert!(matches!(
+                traversal.next(|| false),
+                Err(TraversalFailure::Recoverable(
+                    DiscoveryIssue::TraversalResume { .. }
+                ))
+            ));
+            assert!(
+                traversal
+                    .next(|| false)
+                    .unwrap()
+                    .unwrap()
+                    .path()
+                    .ends_with("b.log")
+            );
+        }
+
+        /// Scenario: Linux directory change evidence is disturbed twice while
+        /// cached names remain in the same frame.
+        /// Guarantees: one rebase is allowed, the second ambiguity prunes the
+        /// frame, and the traversal cannot spin indefinitely.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn repeated_token_churn_prunes_the_frame_after_one_rebase() {
+            let directory = tempfile::tempdir().unwrap();
+            for name in ["a.log", "b.log", "c.log"] {
+                std::fs::write(directory.path().join(name), name).unwrap();
+            }
+            let mut traversal =
+                BoundedTraversal::new(directory.path().to_path_buf(), 1, false).unwrap();
+            descend_root(&mut traversal);
+            assert!(traversal.next(|| false).unwrap().is_some());
+
+            set_directory_mtime(directory.path(), 1_000_000);
+            assert!(matches!(
+                traversal.next(|| false),
+                Err(TraversalFailure::Recoverable(
+                    DiscoveryIssue::TraversalResume { .. }
+                ))
+            ));
+            assert!(traversal.next(|| false).unwrap().is_some());
+
+            set_directory_mtime(directory.path(), 1_000_001);
+            assert!(matches!(
+                traversal.next(|| false),
+                Err(TraversalFailure::Recoverable(
+                    DiscoveryIssue::TraversalResume { .. }
+                ))
+            ));
+            assert!(traversal.next(|| false).unwrap().is_none());
+        }
+
+        /// Scenario: Linux adds an entry after enumeration closes but before
+        /// the pathname verifier opens for a nonterminal refill.
+        /// Guarantees: no cached name is published under a token that was not
+        /// produced by the same complete enumeration.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn refill_mutation_before_path_verifier_discards_the_batch() {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("a.log"), b"a").unwrap();
+            std::fs::write(directory.path().join("b.log"), b"b").unwrap();
+            let mut entries = entry_batch();
+
+            let result = scan_directory_with_hook(
+                directory.path(),
+                None,
+                None,
+                false,
+                &mut entries,
+                &mut || false,
+                &mut |path| {
+                    std::fs::write(path.join("c.log"), b"c").unwrap();
+                },
+            );
+
+            assert!(matches!(
+                result,
+                Err(DirectoryScanFailure::Unstable(
+                    "directory changed before cached traversal batch publication"
+                ))
+            ));
+        }
+
         /// Scenario: the root pathname is replaced after the terminal rescan has
         /// found no successor but before the sequential pathname verifier opens.
         /// Guarantees: the final no-successor unit cannot declare a detached old
@@ -1280,12 +1788,13 @@ mod platform {
             let old = parent.path().join("old");
             std::fs::create_dir(&root).unwrap();
             std::fs::write(root.join("only.log"), b"x").unwrap();
+            let mut entries = entry_batch();
             let DirectoryScanOutcome::Stable(first) =
-                scan_directory(&root, None, None, false, &mut || false).unwrap()
+                scan_directory(&root, None, None, false, &mut entries, &mut || false).unwrap()
             else {
                 panic!("the first stable scan must establish a baseline");
             };
-            let after = first.selected.as_ref().unwrap().name.clone();
+            let after = entries.pop().unwrap().name;
             let baseline = first.evidence;
 
             let result = scan_directory_with_hook(
@@ -1293,6 +1802,7 @@ mod platform {
                 Some(&baseline),
                 Some(&after),
                 false,
+                &mut entries,
                 &mut || false,
                 &mut |_| {
                     std::fs::rename(&root, &old).unwrap();
@@ -1334,12 +1844,19 @@ mod platform {
         fn terminal_entry_insertion_is_detected_before_completion() {
             let directory = tempfile::tempdir().unwrap();
             std::fs::write(directory.path().join("only.log"), b"x").unwrap();
-            let DirectoryScanOutcome::Stable(first) =
-                scan_directory(directory.path(), None, None, false, &mut || false).unwrap()
-            else {
+            let mut entries = entry_batch();
+            let DirectoryScanOutcome::Stable(first) = scan_directory(
+                directory.path(),
+                None,
+                None,
+                false,
+                &mut entries,
+                &mut || false,
+            )
+            .unwrap() else {
                 panic!("the first stable scan must establish a baseline");
             };
-            let after = first.selected.as_ref().unwrap().name.clone();
+            let after = entries.pop().unwrap().name;
             let baseline = first.evidence;
 
             let result = scan_directory_with_hook(
@@ -1347,6 +1864,7 @@ mod platform {
                 Some(&baseline),
                 Some(&after),
                 false,
+                &mut entries,
                 &mut || false,
                 &mut |path| {
                     std::fs::create_dir(path.join("inserted")).unwrap();

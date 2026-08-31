@@ -413,12 +413,16 @@ spooled by the receiver.
 - `EMFILE`/`ENFILE` use one receiver-global retry state. Other temporary
   source or root failures use one bounded per-file/root state with delays
   `250ms, 500ms, ... 30s`; they never become quarantine merely by recurring.
-- Discovery opens at most one native traversal directory handle, closes it
-  before yielding or descending, and retains only depth-bounded locator and
-  resume evidence. It rescans a directory to select each next native name, so
-  memory is independent of directory width but a stable wide directory can
-  require quadratic enumeration work. Mutation or ambiguous resume makes the
-  pass incomplete and cannot prove absence.
+- Discovery opens at most one native traversal directory handle and closes it
+  before yielding or descending. It retains depth-bounded locator/resume
+  evidence plus one receiver-wide fixed native-entry batch: up to 256 entries
+  on Linux and one entry on platforms awaiting runtime qualification. Cached
+  parent entries are revalidated before each yield and discarded on descent;
+  every refill and terminal boundary recomputes the complete entry-set
+  evidence. Memory remains independent of directory width. Wide-directory work
+  is substantially reduced on Linux but still has no universal finite-latency
+  claim; mutation or ambiguous resume makes the pass incomplete and cannot
+  prove absence.
 - The Windows traversal backend uses one directory handle and one fixed 64 KiB
   `FileIdExtdDirectoryInfo` buffer with full 128-bit file IDs. It has
   compile-only evidence on this host; Windows runtime and filesystem

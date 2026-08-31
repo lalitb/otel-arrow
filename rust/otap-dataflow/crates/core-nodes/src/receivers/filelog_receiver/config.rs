@@ -90,7 +90,7 @@ const RESOURCE_ADMISSION_UNMEASURED_TERMS: [&str; 6] = [
     "bounded channel and queue storage: fixed internal capacities (inventory and Arrow payloads already modeled)",
     "incremental per-receiver lease registry state: limits.max_tracked_files (reader guard already modeled; process registry shared)",
     "Arrow and allocator/library overhead: batch.max_records, batch.max_bytes (logical retained and carry-over bytes already modeled)",
-    "fixed worker/runtime state and excess native path storage: discovery patterns and limits.* (variable modeled payloads excluded)",
+    "fixed worker/runtime state and excess native path storage: discovery patterns, the platform traversal entry batch, and limits.* (variable modeled payloads excluded)",
 ];
 /// Stable bounded text emitted with the startup admission report.
 const RESOURCE_ADMISSION_UNMEASURED_TERMS_TEXT: &str = "checkpoint runtime maintenance scratch: checkpoint.compact_after_bytes, checkpoint.compact_after_transactions, limits.max_tracked_files (base table and progress frame already modeled); \
@@ -98,7 +98,7 @@ const RESOURCE_ADMISSION_UNMEASURED_TERMS_TEXT: &str = "checkpoint runtime maint
      bounded channel and queue storage: fixed internal capacities (inventory and Arrow payloads already modeled); \
      incremental per-receiver lease registry state: limits.max_tracked_files (reader guard already modeled; process registry shared); \
      Arrow and allocator/library overhead: batch.max_records, batch.max_bytes (logical retained and carry-over bytes already modeled); \
-     fixed worker/runtime state and excess native path storage: discovery patterns and limits.* (variable modeled payloads excluded)";
+     fixed worker/runtime state and excess native path storage: discovery patterns, the platform traversal entry batch, and limits.* (variable modeled payloads excluded)";
 
 /// Maximum accepted `identity.ignored_header_bytes`: the checkpoint codec
 /// stores `ignored_header_bytes` as a `u32`, so a value larger than this can
