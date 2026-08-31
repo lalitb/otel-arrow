@@ -235,6 +235,7 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
         }
         let mut worker = Some(worker_handle);
         let mut pending_batch = None;
+        let mut pending_record_count = None;
         let mut retry_deadline = None;
         let mut drain_deadline = None;
         let mut consecutive_checkpoint_failures = 0u32;
@@ -450,15 +451,18 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                             let key = BatchKey::new(batch.batch_id, batch.attempt).ok_or_else(|| {
                                 terminal_error(&effect_handler, "filelog worker emitted a zero batch ID or attempt")
                             })?;
+                            let record_count = batch.record_count;
                             // `PendingBatch` always enters `Sending` before this
                             // downstream send is attempted, whether this is the
                             // initial send or a worker resend.
                             let resend = pending_batch.is_some();
                             if resend {
+                                let matching_record_count =
+                                    pending_record_count == Some(record_count);
                                 let accepted = pending_batch
                                     .as_mut()
                                     .is_some_and(|pending| pending.begin_send(key));
-                                if !accepted {
+                                if !accepted || !matching_record_count {
                                     shutdown_worker(
                                         &mut worker,
                                         &mut event_rx,
@@ -471,14 +475,20 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                                     .await?;
                                     return Err(terminal_error(
                                         &effect_handler,
-                                        format!(
-                                            "filelog worker resend ({}, {}) does not match async pending state",
-                                            key.batch_id, key.attempt
-                                        ),
+                                        if matching_record_count {
+                                            format!(
+                                                "filelog worker resend ({}, {}) does not match async pending state",
+                                                key.batch_id, key.attempt
+                                            )
+                                        } else {
+                                            "filelog resend record count differs from retained state"
+                                                .to_owned()
+                                        },
                                     ));
                                 }
                             } else if key.attempt == 1 {
                                 pending_batch = Some(PendingBatch::sending(key));
+                                pending_record_count = Some(record_count);
                             } else {
                                 shutdown_worker(
                                     &mut worker,
@@ -670,8 +680,19 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                                             );
                                         }
                                     }
-                                    record_commit_success(&mut metrics, explicit_loss);
+                                    let record_count = pending_record_count.ok_or_else(|| {
+                                        terminal_error(
+                                            &effect_handler,
+                                            "filelog commit completed without a pending record count",
+                                        )
+                                    })?;
+                                    record_commit_success(
+                                        &mut metrics,
+                                        explicit_loss,
+                                        record_count,
+                                    );
                                     pending_batch = None;
+                                    pending_record_count = None;
                                     retry_deadline = None;
                                     consecutive_checkpoint_failures = 0;
                                 }
@@ -1276,7 +1297,9 @@ fn record_emitted_batch(
     let Some(metrics) = metrics.as_mut() else {
         return;
     };
-    add_counter_saturating(&mut metrics.batches_emitted, 1);
+    if key.attempt == 1 {
+        add_counter_saturating(&mut metrics.batches_emitted, 1);
+    }
     add_counter_saturating(&mut metrics.records_emitted, u64::from(record_count));
     add_counter_saturating(&mut metrics.source_bytes_emitted, source_bytes);
     add_counter_saturating(&mut metrics.logical_bytes_emitted, logical_bytes);
@@ -1300,9 +1323,14 @@ fn record_retry_metrics(
 fn record_commit_success(
     metrics: &mut Option<MetricSet<FilelogReceiverMetrics>>,
     explicit_loss: bool,
+    record_count: u32,
 ) {
     if explicit_loss && let Some(metrics) = metrics.as_mut() {
         add_counter_saturating(&mut metrics.batches_explicit_loss, 1);
+        add_counter_saturating(
+            &mut metrics.records_dropped_on_nack,
+            u64::from(record_count),
+        );
     }
 }
 
@@ -1715,10 +1743,10 @@ mod tests {
             );
         }
         record_retry_metrics(&mut metrics, Duration::from_millis(25));
-        record_commit_success(&mut metrics, true);
+        record_commit_success(&mut metrics, true, 3);
 
         let metrics = metrics.unwrap();
-        assert_eq!(metrics.batches_emitted.get(), 2);
+        assert_eq!(metrics.batches_emitted.get(), 1);
         assert_eq!(metrics.batches_resent.get(), 1);
         assert_eq!(metrics.records_emitted.get(), 4);
         assert_eq!(metrics.source_bytes_emitted.get(), 20);
@@ -1728,6 +1756,7 @@ mod tests {
         assert_eq!(metrics.retry_attempts.get(), 1);
         assert_eq!(metrics.retry_exhausted.get(), 1);
         assert_eq!(metrics.batches_explicit_loss.get(), 1);
+        assert_eq!(metrics.records_dropped_on_nack.get(), 3);
         assert_eq!(metrics.malformed_completions.get(), 1);
         assert_eq!(metrics.stale_completions.get(), 1);
         assert_eq!(metrics.duplicate_completions.get(), 1);

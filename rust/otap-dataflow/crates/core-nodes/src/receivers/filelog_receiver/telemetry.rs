@@ -48,7 +48,8 @@ pub struct FilelogReceiverMetrics {
     /// Logical OTAP bytes successfully handed downstream.
     #[metric(name = "bytes.logical.emitted", unit = "By")]
     pub logical_bytes_emitted: Counter<u64>,
-    /// Successful downstream batch sends, including resends.
+    /// Initial successful downstream batch sends. Resends use the separate
+    /// `batches.resent` semantic.
     #[metric(name = "batches.emitted", unit = "{batch}")]
     pub batches_emitted: Counter<u64>,
     /// Matching downstream Acks.
@@ -77,6 +78,9 @@ pub struct FilelogReceiverMetrics {
     /// Batches durably advanced under explicit drop-and-continue policy.
     #[metric(name = "batches.explicit_loss", unit = "{batch}")]
     pub batches_explicit_loss: Counter<u64>,
+    /// Records durably skipped after explicit drop-and-continue exhaustion.
+    #[metric(name = "records.dropped_on_nack", unit = "{record}")]
+    pub records_dropped_on_nack: Counter<u64>,
     /// Fully framed records retained across one predecessor in-flight batch.
     #[metric(name = "carry_over.records", unit = "{record}")]
     pub carry_over_records: Counter<u64>,
@@ -117,6 +121,18 @@ pub struct FilelogReceiverMetrics {
     /// WAL sync latency observation count.
     #[metric(name = "checkpoint.sync.operations", unit = "{operation}")]
     pub checkpoint_sync_operations: Counter<u64>,
+    /// Total delay from the first unsynced Ack transaction to successful sync.
+    #[metric(name = "checkpoint.sync.delay.total", unit = "ns")]
+    pub checkpoint_sync_delay_ns: Counter<u64>,
+    /// Successful sync-delay observations.
+    #[metric(name = "checkpoint.sync.delay.operations", unit = "{operation}")]
+    pub checkpoint_sync_delay_operations: Counter<u64>,
+    /// Total checkpoint namespace recovery duration.
+    #[metric(name = "checkpoint.recovery.duration.total", unit = "ns")]
+    pub checkpoint_recovery_duration_ns: Counter<u64>,
+    /// Checkpoint namespace recovery attempts observed.
+    #[metric(name = "checkpoint.recovery.operations", unit = "{operation}")]
+    pub checkpoint_recovery_operations: Counter<u64>,
     /// Total compaction latency; divide by compactions for the mean.
     #[metric(name = "checkpoint.compaction.duration.total", unit = "ns")]
     pub checkpoint_compaction_duration_ns: Counter<u64>,
@@ -132,6 +148,12 @@ pub struct FilelogReceiverMetrics {
     /// Current live WAL size.
     #[metric(name = "checkpoint.wal.size", unit = "By")]
     pub checkpoint_wal_size: Gauge<u64>,
+    /// Current complete transactions in the live WAL.
+    #[metric(name = "checkpoint.wal.transactions", unit = "{transaction}")]
+    pub checkpoint_wal_transactions: Gauge<u64>,
+    /// Checkpoint records removed by receiver-owned retention.
+    #[metric(name = "checkpoint.records.removed", unit = "{record}")]
+    pub checkpoint_records_removed: Counter<u64>,
 
     /// Include matches observed by discovery.
     #[metric(name = "files.discovered", unit = "{file}")]
@@ -175,6 +197,12 @@ pub struct FilelogReceiverMetrics {
     /// Events that encountered no evictable descriptor slot.
     #[metric(name = "files.descriptor.saturation", unit = "{event}")]
     pub descriptor_saturation: Counter<u64>,
+    /// Confirmed least-recently-served descriptor evictions.
+    #[metric(name = "files.descriptor.evictions", unit = "{eviction}")]
+    pub descriptor_evictions: Counter<u64>,
+    /// Failed descriptor reopens after a reader had opened successfully.
+    #[metric(name = "files.descriptor.reopen_failures", unit = "{failure}")]
+    pub descriptor_reopen_failures: Counter<u64>,
     /// Startup warnings where the receiver-owned descriptor budget exceeds
     /// 80 percent of the process soft limit.
     #[metric(name = "descriptor.budget.warnings", unit = "{warning}")]
@@ -183,10 +211,6 @@ pub struct FilelogReceiverMetrics {
     /// environmental retry.
     #[metric(name = "environmental.reprobes", unit = "{reprobe}")]
     pub environmental_reprobes: Counter<u64>,
-    /// Environmental retry conditions cleared by a successful source or
-    /// discovery operation.
-    #[metric(name = "environmental.recoveries", unit = "{recovery}")]
-    pub environmental_recoveries: Counter<u64>,
     /// Current durable tracked-record population.
     #[metric(name = "files.tracked", unit = "{file}")]
     pub files_tracked: Gauge<u64>,
@@ -217,6 +241,15 @@ pub struct FilelogReceiverMetrics {
     /// Whether descriptor capacity is currently saturated.
     #[metric(name = "files.descriptor.saturated", unit = "{boolean}")]
     pub descriptor_saturated: Gauge<u64>,
+    /// Current removed readers retaining late-write-capable descriptors.
+    #[metric(name = "rotation.pinned_handles", unit = "{handle}")]
+    pub pinned_rotated_handles: Gauge<u64>,
+    /// Age of the oldest removed reader retaining a descriptor.
+    #[metric(name = "rotation.pinned_oldest.age", unit = "ns")]
+    pub pinned_rotated_oldest_age_ns: Gauge<u64>,
+    /// Descriptor saturation observations while rotated handles were pinned.
+    #[metric(name = "rotation.pinned.saturation", unit = "{event}")]
+    pub pinned_rotation_saturation: Counter<u64>,
 
     /// Durable file registrations.
     #[metric(name = "identity.registrations", unit = "{file}")]
@@ -281,6 +314,9 @@ pub struct FilelogReceiverMetrics {
     /// Emitted split fragments.
     #[metric(name = "records.split_fragments", unit = "{fragment}")]
     pub split_fragments: Counter<u64>,
+    /// Logical records whose first split fragment was emitted.
+    #[metric(name = "records.split", unit = "{record}")]
+    pub records_split: Counter<u64>,
     /// Recoverable partial source bytes present at drain.
     #[metric(name = "partial.bytes.pending_drain", unit = "By")]
     pub partial_bytes_pending_drain: Counter<u64>,
@@ -309,6 +345,18 @@ pub struct FilelogReceiverMetrics {
     /// Drain-triggered partial flushes.
     #[metric(name = "flush.drain", unit = "{flush}")]
     pub flush_drain: Counter<u64>,
+    /// Checkpoint records rejected for an incompatible framing profile.
+    #[metric(name = "framing.profile.incompatible", unit = "{file}")]
+    pub framing_profile_incompatible: Counter<u64>,
+    /// Native advisory paths whose bounded evidence stores only a suffix.
+    #[metric(name = "path.advisory.truncated", unit = "{path}")]
+    pub advisory_path_truncated: Counter<u64>,
+    /// Positioned source-read turns attempted.
+    #[metric(name = "reader.turns", unit = "{turn}")]
+    pub read_turns: Counter<u64>,
+    /// Ordinary EOF deadlines promoted for another source probe.
+    #[metric(name = "reader.eof.reprobes", unit = "{reprobe}")]
+    pub eof_reprobes: Counter<u64>,
 
     /// Decode-policy quarantines.
     #[metric(name = "quarantine.decode", unit = "{file}")]
@@ -377,6 +425,10 @@ pub(super) enum WorkerCounter {
     CheckpointPersistOperations,
     CheckpointSyncDurationNs,
     CheckpointSyncOperations,
+    CheckpointSyncDelayNs,
+    CheckpointSyncDelayOperations,
+    CheckpointRecoveryDurationNs,
+    CheckpointRecoveryOperations,
     CheckpointCompactionDurationNs,
     CheckpointCompactions,
     CheckpointCleanupGenerations,
@@ -395,9 +447,11 @@ pub(super) enum WorkerCounter {
     CandidateAdmissions,
     TrackedSaturation,
     DescriptorSaturation,
+    DescriptorEvictions,
+    DescriptorReopenFailures,
+    PinnedRotationSaturation,
     DescriptorBudgetWarnings,
     EnvironmentalReprobes,
-    EnvironmentalRecoveries,
     IdentityRegistrations,
     IdentityResets,
     IdentityRecoveryMismatches,
@@ -418,6 +472,7 @@ pub(super) enum WorkerCounter {
     RecordsTruncated,
     SourceBytesDiscarded,
     SplitFragments,
+    RecordsSplit,
     CarryOverRecords,
     PartialBytesPendingDrain,
     TerminalUnterminatedRecords,
@@ -427,6 +482,11 @@ pub(super) enum WorkerCounter {
     FlushOversizeLineBoundary,
     FlushRotation,
     FlushDrain,
+    FramingProfileIncompatible,
+    AdvisoryPathTruncated,
+    ReadTurns,
+    EofReprobes,
+    CheckpointRecordsRemoved,
     QuarantineDecode,
     QuarantineTruncate,
     QuarantineRecoveryMismatch,
@@ -455,6 +515,7 @@ impl WorkerCounter {
 #[repr(usize)]
 pub(super) enum WorkerGauge {
     CheckpointWalSize,
+    CheckpointWalTransactions,
     FilesTracked,
     FilesPending,
     FilesOpen,
@@ -465,6 +526,8 @@ pub(super) enum WorkerGauge {
     CandidateOverflowPersistenceNs,
     TrackedSaturated,
     DescriptorSaturated,
+    PinnedRotatedHandles,
+    PinnedRotatedOldestAgeNs,
     PartialBytesPending,
 }
 
@@ -534,6 +597,16 @@ impl WorkerTelemetryBridge {
         drain!(CheckpointPersistOperations, checkpoint_persist_operations);
         drain!(CheckpointSyncDurationNs, checkpoint_sync_duration_ns);
         drain!(CheckpointSyncOperations, checkpoint_sync_operations);
+        drain!(CheckpointSyncDelayNs, checkpoint_sync_delay_ns);
+        drain!(
+            CheckpointSyncDelayOperations,
+            checkpoint_sync_delay_operations
+        );
+        drain!(
+            CheckpointRecoveryDurationNs,
+            checkpoint_recovery_duration_ns
+        );
+        drain!(CheckpointRecoveryOperations, checkpoint_recovery_operations);
         drain!(
             CheckpointCompactionDurationNs,
             checkpoint_compaction_duration_ns
@@ -555,9 +628,11 @@ impl WorkerTelemetryBridge {
         drain!(CandidateAdmissions, candidate_admissions);
         drain!(TrackedSaturation, tracked_saturation);
         drain!(DescriptorSaturation, descriptor_saturation);
+        drain!(DescriptorEvictions, descriptor_evictions);
+        drain!(DescriptorReopenFailures, descriptor_reopen_failures);
+        drain!(PinnedRotationSaturation, pinned_rotation_saturation);
         drain!(DescriptorBudgetWarnings, descriptor_budget_warnings);
         drain!(EnvironmentalReprobes, environmental_reprobes);
-        drain!(EnvironmentalRecoveries, environmental_recoveries);
         drain!(IdentityRegistrations, identity_registrations);
         drain!(IdentityResets, identity_resets);
         drain!(IdentityRecoveryMismatches, identity_recovery_mismatches);
@@ -584,6 +659,7 @@ impl WorkerTelemetryBridge {
         drain!(RecordsTruncated, records_truncated);
         drain!(SourceBytesDiscarded, source_bytes_discarded);
         drain!(SplitFragments, split_fragments);
+        drain!(RecordsSplit, records_split);
         drain!(CarryOverRecords, carry_over_records);
         drain!(PartialBytesPendingDrain, partial_bytes_pending_drain);
         drain!(TerminalUnterminatedRecords, terminal_unterminated_records);
@@ -593,6 +669,11 @@ impl WorkerTelemetryBridge {
         drain!(FlushOversizeLineBoundary, flush_oversize_line_boundary);
         drain!(FlushRotation, flush_rotation);
         drain!(FlushDrain, flush_drain);
+        drain!(FramingProfileIncompatible, framing_profile_incompatible);
+        drain!(AdvisoryPathTruncated, advisory_path_truncated);
+        drain!(ReadTurns, read_turns);
+        drain!(EofReprobes, eof_reprobes);
+        drain!(CheckpointRecordsRemoved, checkpoint_records_removed);
         drain!(QuarantineDecode, quarantine_decode);
         drain!(QuarantineTruncate, quarantine_truncate);
         drain!(QuarantineRecoveryMismatch, quarantine_recovery_mismatch);
@@ -619,6 +700,7 @@ impl WorkerTelemetryBridge {
             };
         }
         gauge!(CheckpointWalSize, checkpoint_wal_size);
+        gauge!(CheckpointWalTransactions, checkpoint_wal_transactions);
         gauge!(FilesTracked, files_tracked);
         gauge!(FilesPending, files_pending);
         gauge!(FilesOpen, files_open);
@@ -632,6 +714,8 @@ impl WorkerTelemetryBridge {
         );
         gauge!(TrackedSaturated, tracked_saturated);
         gauge!(DescriptorSaturated, descriptor_saturated);
+        gauge!(PinnedRotatedHandles, pinned_rotated_handles);
+        gauge!(PinnedRotatedOldestAgeNs, pinned_rotated_oldest_age_ns);
         gauge!(PartialBytesPending, partial_bytes_pending);
     }
 
@@ -704,6 +788,9 @@ pub(super) enum HealthEventCategory {
     Truncation,
     Quarantine,
     Rotation,
+    PinnedRotation,
+    AdvisoryPath,
+    Compatibility,
     Partial,
     Source,
 }
@@ -733,6 +820,9 @@ impl HealthEventCategory {
             Self::Truncation => "truncation",
             Self::Quarantine => "quarantine",
             Self::Rotation => "rotation",
+            Self::PinnedRotation => "pinned_rotation",
+            Self::AdvisoryPath => "advisory_path",
+            Self::Compatibility => "compatibility",
             Self::Partial => "partial",
             Self::Source => "source",
         }
@@ -825,10 +915,12 @@ mod tests {
         (registry, FilelogReceiverMetrics::register(&pipeline))
     }
 
-    /// Scenario: the filelog metric set is registered in a pipeline context.
-    /// Guarantees: the public metric-set name is exactly `receiver.filelog`.
+    /// Scenario: the current provisional filelog metric set is registered in
+    /// a pipeline context.
+    /// Guarantees: the implementation uses `receiver.filelog` consistently
+    /// without declaring that exact name a stable public contract.
     #[test]
-    fn metric_set_registers_authoritative_name() {
+    fn metric_set_registers_current_provisional_name() {
         let (_registry, metrics) = registered();
         assert_eq!(metrics.snapshot().descriptor().name, "receiver.filelog");
     }
@@ -844,15 +936,45 @@ mod tests {
         bridge.add(WorkerCounter::CarryOverRecords, 1);
         bridge.add(WorkerCounter::DescriptorBudgetWarnings, 1);
         bridge.add(WorkerCounter::EnvironmentalReprobes, 2);
-        bridge.add(WorkerCounter::EnvironmentalRecoveries, 1);
+        bridge.add(WorkerCounter::CheckpointSyncDelayNs, 11);
+        bridge.add(WorkerCounter::CheckpointSyncDelayOperations, 1);
+        bridge.add(WorkerCounter::CheckpointRecoveryDurationNs, 12);
+        bridge.add(WorkerCounter::CheckpointRecoveryOperations, 1);
+        bridge.add(WorkerCounter::DescriptorEvictions, 2);
+        bridge.add(WorkerCounter::DescriptorReopenFailures, 3);
+        bridge.add(WorkerCounter::PinnedRotationSaturation, 4);
+        bridge.add(WorkerCounter::ReadTurns, 5);
+        bridge.add(WorkerCounter::EofReprobes, 6);
+        bridge.add(WorkerCounter::FramingProfileIncompatible, 7);
+        bridge.add(WorkerCounter::AdvisoryPathTruncated, 8);
+        bridge.add(WorkerCounter::CheckpointRecordsRemoved, 9);
+        bridge.add(WorkerCounter::RecordsSplit, 10);
         bridge.set(WorkerGauge::FilesOpen, 2);
+        bridge.set(WorkerGauge::CheckpointWalTransactions, 13);
+        bridge.set(WorkerGauge::PinnedRotatedHandles, 2);
+        bridge.set(WorkerGauge::PinnedRotatedOldestAgeNs, 14);
         bridge.drain_into(&mut metrics);
         assert_eq!(metrics.files_eligible.get(), 3);
         assert_eq!(metrics.carry_over_records.get(), 1);
         assert_eq!(metrics.descriptor_budget_warnings.get(), 1);
         assert_eq!(metrics.environmental_reprobes.get(), 2);
-        assert_eq!(metrics.environmental_recoveries.get(), 1);
+        assert_eq!(metrics.checkpoint_sync_delay_ns.get(), 11);
+        assert_eq!(metrics.checkpoint_sync_delay_operations.get(), 1);
+        assert_eq!(metrics.checkpoint_recovery_duration_ns.get(), 12);
+        assert_eq!(metrics.checkpoint_recovery_operations.get(), 1);
+        assert_eq!(metrics.descriptor_evictions.get(), 2);
+        assert_eq!(metrics.descriptor_reopen_failures.get(), 3);
+        assert_eq!(metrics.pinned_rotation_saturation.get(), 4);
+        assert_eq!(metrics.read_turns.get(), 5);
+        assert_eq!(metrics.eof_reprobes.get(), 6);
+        assert_eq!(metrics.framing_profile_incompatible.get(), 7);
+        assert_eq!(metrics.advisory_path_truncated.get(), 8);
+        assert_eq!(metrics.checkpoint_records_removed.get(), 9);
+        assert_eq!(metrics.records_split.get(), 10);
         assert_eq!(metrics.files_open.get(), 2);
+        assert_eq!(metrics.checkpoint_wal_transactions.get(), 13);
+        assert_eq!(metrics.pinned_rotated_handles.get(), 2);
+        assert_eq!(metrics.pinned_rotated_oldest_age_ns.get(), 14);
 
         metrics.clear_values();
         bridge.drain_into(&mut metrics);
@@ -860,12 +982,43 @@ mod tests {
         assert_eq!(metrics.carry_over_records.get(), 0);
         assert_eq!(metrics.descriptor_budget_warnings.get(), 0);
         assert_eq!(metrics.environmental_reprobes.get(), 0);
-        assert_eq!(metrics.environmental_recoveries.get(), 0);
+        assert_eq!(metrics.checkpoint_sync_delay_ns.get(), 0);
+        assert_eq!(metrics.descriptor_evictions.get(), 0);
+        assert_eq!(metrics.read_turns.get(), 0);
+        assert_eq!(metrics.checkpoint_records_removed.get(), 0);
         assert_eq!(metrics.files_open.get(), 2);
+        assert_eq!(metrics.checkpoint_wal_transactions.get(), 13);
+        assert_eq!(metrics.pinned_rotated_handles.get(), 2);
+        assert_eq!(metrics.pinned_rotated_oldest_age_ns.get(), 14);
 
         bridge.add(WorkerCounter::FilesEligible, 4);
         bridge.drain_into(&mut metrics);
         assert_eq!(metrics.files_eligible.get(), 4);
+    }
+
+    /// Scenario: diagnostic counters receive `u64::MAX` followed by another
+    /// update while a current gauge is replaced from `u64::MAX` to zero.
+    /// Guarantees: counters saturate without panic or wrap, while gauges store
+    /// exact current values rather than applying counter-style saturation.
+    #[test]
+    fn counters_saturate_but_current_gauges_replace_exactly() {
+        let bridge = WorkerTelemetryBridge::default();
+        bridge.add(WorkerCounter::ReadTurns, u64::MAX);
+        bridge.add(WorkerCounter::ReadTurns, 1);
+        assert_eq!(bridge.counter_for_test(WorkerCounter::ReadTurns), u64::MAX);
+
+        bridge.set(WorkerGauge::PinnedRotatedHandles, u64::MAX);
+        assert_eq!(
+            bridge.gauge_for_test(WorkerGauge::PinnedRotatedHandles),
+            u64::MAX
+        );
+        bridge.set(WorkerGauge::PinnedRotatedHandles, 0);
+        assert_eq!(bridge.gauge_for_test(WorkerGauge::PinnedRotatedHandles), 0);
+
+        let mut metric = Counter::<u64>::default();
+        add_counter_saturating(&mut metric, u64::MAX);
+        add_counter_saturating(&mut metric, 1);
+        assert_eq!(metric.get(), u64::MAX);
     }
 
     /// Scenario: a metrics reporter is full while worker deltas continue.
@@ -942,6 +1095,14 @@ mod tests {
         );
         assert_eq!(limiter.admit(HealthEventCategory::Scan, start), Some(0));
         assert_eq!(
+            limiter.admit(HealthEventCategory::PinnedRotation, start),
+            Some(0)
+        );
+        assert_eq!(
+            limiter.admit(HealthEventCategory::AdvisoryPath, start),
+            Some(0)
+        );
+        assert_eq!(
             limiter.admit(
                 HealthEventCategory::CheckpointMaintenance,
                 start + Duration::from_secs(10)
@@ -964,7 +1125,11 @@ mod tests {
         let (_registry, metrics) = registered();
         let mut metrics = Some(metrics);
         bridge.add(WorkerCounter::CopytruncateDetected, 1);
+        bridge.add(WorkerCounter::ReadTurns, 4);
         bridge.set(WorkerGauge::FilesQuarantined, 2);
+        bridge.set(WorkerGauge::CheckpointWalTransactions, 3);
+        bridge.set(WorkerGauge::PinnedRotatedHandles, 1);
+        bridge.set(WorkerGauge::PinnedRotatedOldestAgeNs, 99);
 
         let snapshots = terminal_snapshots(&mut metrics, &bridge);
         assert_eq!(snapshots.len(), 1);
@@ -973,8 +1138,20 @@ mod tests {
             &otap_df_telemetry::metrics::MetricValue::U64(1)
         );
         assert_eq!(
+            metric_value(&snapshots[0], "reader.turns"),
+            &otap_df_telemetry::metrics::MetricValue::U64(4)
+        );
+        assert_eq!(
             metric_value(&snapshots[0], "files.quarantined"),
             &otap_df_telemetry::metrics::MetricValue::U64(2)
+        );
+        assert_eq!(
+            metric_value(&snapshots[0], "checkpoint.wal.transactions"),
+            &otap_df_telemetry::metrics::MetricValue::U64(3)
+        );
+        assert_eq!(
+            metric_value(&snapshots[0], "rotation.pinned_handles"),
+            &otap_df_telemetry::metrics::MetricValue::U64(1)
         );
         let second = terminal_snapshots(&mut metrics, &bridge);
         assert_eq!(
@@ -1007,6 +1184,43 @@ mod tests {
                     field.name
                 );
             }
+        }
+    }
+
+    /// Scenario: the metric descriptor is inspected for every Stage 8O
+    /// receiver-owned semantic added to the provisional catalog.
+    /// Guarantees: checkpoint, reader, rotation, framing, path, retention,
+    /// and split-record semantics each have one fixed-cardinality instrument.
+    #[test]
+    fn metric_schema_contains_bounded_stage_8o_semantics() {
+        let (_registry, metrics) = registered();
+        let snapshot = metrics.snapshot();
+        let names: std::collections::HashSet<_> = snapshot
+            .descriptor()
+            .metrics
+            .iter()
+            .map(|field| field.name)
+            .collect();
+        for expected in [
+            "records.dropped_on_nack",
+            "checkpoint.sync.delay.total",
+            "checkpoint.sync.delay.operations",
+            "checkpoint.recovery.duration.total",
+            "checkpoint.recovery.operations",
+            "checkpoint.wal.transactions",
+            "checkpoint.records.removed",
+            "files.descriptor.evictions",
+            "files.descriptor.reopen_failures",
+            "rotation.pinned_handles",
+            "rotation.pinned_oldest.age",
+            "rotation.pinned.saturation",
+            "records.split",
+            "framing.profile.incompatible",
+            "path.advisory.truncated",
+            "reader.turns",
+            "reader.eof.reprobes",
+        ] {
+            assert!(names.contains(expected), "missing metric {expected}");
         }
     }
 }

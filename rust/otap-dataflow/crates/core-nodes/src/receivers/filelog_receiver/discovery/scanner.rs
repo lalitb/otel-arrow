@@ -706,12 +706,9 @@ impl FilesystemScanner {
             self.ensure_running()?;
             match locator {
                 Ok(Some(locator)) => {
-                    if self
+                    let _ = self
                         .descriptor_pressure
-                        .clear_after_success(Instant::now())?
-                    {
-                        admission.record_environmental_recovery()?;
-                    }
+                        .clear_after_success(Instant::now())?;
                     admission.observe_revoked(
                         generation,
                         locator,
@@ -1084,12 +1081,9 @@ impl FilesystemScanner {
                 self.ensure_running()?;
                 match locator {
                     Ok(Some(locator)) => {
-                        if self
+                        let _ = self
                             .descriptor_pressure
-                            .clear_after_success(Instant::now())?
-                        {
-                            admission.record_environmental_recovery()?;
-                        }
+                            .clear_after_success(Instant::now())?;
                         admission.observe_revoked(
                             generation,
                             locator,
@@ -1141,12 +1135,9 @@ impl FilesystemScanner {
             self.ensure_running()?;
             let observation = match observation {
                 Ok(Some(observation)) => {
-                    if self
+                    let _ = self
                         .descriptor_pressure
-                        .clear_after_success(Instant::now())?
-                    {
-                        admission.record_environmental_recovery()?;
-                    }
+                        .clear_after_success(Instant::now())?;
                     observation
                 }
                 Ok(None) => continue,
@@ -1458,14 +1449,11 @@ impl FilesystemScanner {
 
     fn clear_descriptor_pressure_after_success(
         &mut self,
-        admission: &mut AdmissionController,
+        _admission: &mut AdmissionController,
     ) -> Result<(), DiscoveryError> {
-        if self
+        let _ = self
             .descriptor_pressure
-            .clear_after_success(Instant::now())?
-        {
-            admission.record_environmental_recovery()?;
-        }
+            .clear_after_success(Instant::now())?;
         Ok(())
     }
 
@@ -1624,36 +1612,27 @@ impl FilesystemScanner {
     fn clear_include_environmental_backoff(
         &mut self,
         pattern_index: usize,
-        admission: &mut AdmissionController,
+        _admission: &mut AdmissionController,
     ) -> Result<(), DiscoveryError> {
-        if self.include_backoffs[pattern_index].take().is_some() {
-            admission.record_environmental_recovery()?;
-        }
+        let _ = self.include_backoffs[pattern_index].take();
         Ok(())
     }
 
     fn clear_exclude_scan_environmental_backoff(
         &mut self,
         pattern_index: usize,
-        admission: &mut AdmissionController,
+        _admission: &mut AdmissionController,
     ) -> Result<(), DiscoveryError> {
-        if self.exclude_scan_backoffs[pattern_index].take().is_some() {
-            admission.record_environmental_recovery()?;
-        }
+        let _ = self.exclude_scan_backoffs[pattern_index].take();
         Ok(())
     }
 
     fn clear_exclude_resolution_environmental_backoff(
         &mut self,
         pattern_index: usize,
-        admission: &mut AdmissionController,
+        _admission: &mut AdmissionController,
     ) -> Result<(), DiscoveryError> {
-        if self.exclude_resolution_backoffs[pattern_index]
-            .take()
-            .is_some()
-        {
-            admission.record_environmental_recovery()?;
-        }
+        let _ = self.exclude_resolution_backoffs[pattern_index].take();
         Ok(())
     }
 

@@ -234,7 +234,6 @@ fn per_file_read_error_backs_off_without_blocking_other_readers() {
     table
         .complete_turn(recovered, 4, TurnDisposition::Paused)
         .unwrap();
-    assert_eq!(table.take_environmental_recoveries(), 1);
     assert_eq!(table.stats().environmental_backoff_readers, 0);
     table.shutdown().unwrap();
 }
@@ -375,7 +374,6 @@ fn emfile_pauses_new_opens_until_bounded_retry() {
         .complete_turn(turn, 1, TurnDisposition::Paused)
         .unwrap();
     assert_eq!(table.descriptor_pressure_deadline(retry_at).unwrap(), None);
-    assert_eq!(table.take_environmental_recoveries(), 1);
     assert_eq!(table.stats().removed_readers, 0);
     table.shutdown().unwrap();
 }
@@ -556,6 +554,9 @@ fn temporary_eof_reactivates_on_deadline_after_append() {
     table
         .complete_turn(appended, 1, TurnDisposition::Paused)
         .unwrap();
+    let stats = table.stats();
+    assert_eq!(stats.eof_reprobes, 1);
+    assert_eq!(stats.read_turns, 3);
     table.shutdown().unwrap();
 }
 
@@ -624,6 +625,7 @@ fn descriptor_rotation_selects_lrs_and_requires_confirmation() {
     table.confirm_eviction(request).unwrap();
     assert_eq!(table.stats().open_files, 1);
     assert_eq!(table.stats().source_bytes_rewound, 1);
+    assert_eq!(table.stats().descriptor_evictions, 1);
 
     let third = data(table.poll(now).unwrap());
     assert_eq!(third.file_id(), file_id(3));
@@ -701,10 +703,14 @@ fn removed_open_handle_is_not_an_lrs_victim() {
     table
         .complete_turn(first, 1, TurnDisposition::Ready)
         .unwrap();
+    let pinned_since = now - Duration::from_millis(25);
     assert_eq!(
-        table.mark_removed(locator).unwrap(),
+        table.mark_removed_at(locator, pinned_since).unwrap(),
         RemovalDisposition::HandleRetained
     );
+    let pinned = table.stats_at(now);
+    assert_eq!(pinned.pinned_rotated_handles, 1);
+    assert!(pinned.pinned_rotated_oldest_age_ns >= 25_000_000);
     assert!(matches!(
         table.poll(now).unwrap(),
         ReaderPoll::DescriptorCapacityBlocked { file_id: blocked } if blocked == file_id(8)
@@ -714,11 +720,68 @@ fn removed_open_handle_is_not_an_lrs_victim() {
 
     table.pause(file_id(7)).unwrap();
     let _released = table.release_finalized(file_id(7)).unwrap();
+    let released = table.stats_at(now);
+    assert_eq!(released.pinned_rotated_handles, 0);
+    assert_eq!(released.pinned_rotated_oldest_age_ns, 0);
     let replacement = data(table.poll(now).unwrap());
     assert_eq!(replacement.file_id(), file_id(8));
     table
         .complete_turn(replacement, 1, TurnDisposition::Paused)
         .unwrap();
+    table.shutdown().unwrap();
+}
+
+/// Scenario: a reader opens successfully, is evicted for another reader, and
+/// then its next descriptor reopen fails.
+/// Guarantees: only the failed reopen increments the bounded monotonic reopen
+/// failure counter; the initial open is not misclassified.
+#[test]
+fn descriptor_reopen_failure_is_counted_after_prior_open() {
+    let directory = tempdir().unwrap();
+    let first_path = directory.path().join("first.log");
+    let second_path = directory.path().join("second.log");
+    std::fs::write(&first_path, b"a").unwrap();
+    std::fs::write(&second_path, b"b").unwrap();
+    let mut table = ReaderTable::new(settings(2, 1, 1)).unwrap();
+    table
+        .insert(candidate(&first_path), resolved(58, 0))
+        .unwrap();
+    table
+        .insert(candidate(&second_path), resolved(59, 0))
+        .unwrap();
+    let now = Instant::now();
+
+    let first = data(table.poll(now).unwrap());
+    table
+        .complete_turn(first, 1, TurnDisposition::Ready)
+        .unwrap();
+    let request = eviction(table.poll(now).unwrap());
+    table.confirm_eviction(request).unwrap();
+    let second = data(table.poll(now).unwrap());
+    table
+        .complete_turn(second, 1, TurnDisposition::Paused)
+        .unwrap();
+    let reopen_request = eviction(table.poll(now).unwrap());
+    assert_eq!(reopen_request.target_file_id, file_id(58));
+    table.confirm_eviction(reopen_request).unwrap();
+    table.fail_next_open_for_test(io::Error::from(io::ErrorKind::PermissionDenied));
+
+    let result = table.poll(now);
+    assert!(
+        matches!(
+        result,
+        Ok(ReaderPoll::EnvironmentalBackoff {
+            file_id: failed,
+            operation: EnvironmentalOperation::Open,
+            error: EnvironmentalErrorClass::Permission,
+            ..
+        }) if failed == file_id(58)
+        ),
+        "{result:?}"
+    );
+    assert_eq!(table.stats().opens, 2);
+    assert_eq!(table.stats().reopens, 0);
+    assert_eq!(table.stats().descriptor_reopen_failures, 1);
     table.shutdown().unwrap();
 }
 

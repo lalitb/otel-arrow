@@ -96,8 +96,8 @@ pub(crate) struct DiscoveryStats {
     /// Recoverable filesystem or identity observations that made the pass
     /// incomplete.
     pub(crate) scan_errors: u64,
-    /// Environmental traversal/probe retry states cleared during this pass.
-    pub(crate) environmental_recoveries: u64,
+    /// Candidate advisory paths whose bounded evidence stores only a suffix.
+    pub(crate) advisory_paths_truncated: u64,
     /// Retained pending-candidate depth after reconciliation.
     pub(crate) pending_candidates: usize,
     /// Candidate transitions in the emitted batch.
@@ -126,7 +126,7 @@ impl DiscoveryStats {
             eligible_candidates: 0,
             overflowed_candidates: 0,
             scan_errors: 0,
-            environmental_recoveries: 0,
+            advisory_paths_truncated: 0,
             pending_candidates: 0,
             emitted_events: 0,
             scan_duration: Duration::ZERO,

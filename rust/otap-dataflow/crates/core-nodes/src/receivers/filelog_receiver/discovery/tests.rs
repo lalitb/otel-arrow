@@ -199,6 +199,26 @@ fn fake_candidate_alias(number: u64, alias: &str) -> DiscoveredCandidate {
     candidate
 }
 
+/// Scenario: one candidate carries an advisory path larger than the durable
+/// stored suffix bound.
+/// Guarantees: discovery records one fixed-cardinality truncation semantic
+/// before any admission selection or capacity outcome can discard the event.
+#[test]
+fn advisory_path_truncation_is_counted_before_admission() {
+    let mut admission = AdmissionController::new(1, 1, 1, 16).unwrap();
+    let mut candidate = fake_candidate(99);
+    candidate.evidence.advisory_path = AdvisoryPath::from_unix_bytes(&vec![b'x'; 5_000]).unwrap();
+    assert!(candidate.evidence.advisory_path.is_truncated());
+    let generation = admission.begin_scan(SystemTime::now()).unwrap();
+
+    admission
+        .observe(generation, candidate, Duration::ZERO)
+        .unwrap();
+    let batch = admission.finish_scan().unwrap();
+
+    assert_eq!(batch.stats.advisory_paths_truncated, 1);
+}
+
 /// Scenario: a tracked locator, fingerprint, and advisory matched path stay
 /// unchanged while the canonical target path changes.
 /// Guarantees: discovery emits an update so an evicted logical reader can
@@ -406,7 +426,7 @@ fn recursion_depth_exhaustion_is_explicitly_incomplete() {
 /// `EMFILE`.
 /// Guarantees: discovery creates one receiver-global 250ms backoff, marks the
 /// inventory incomplete, starts no further candidate probe in that pass, and
-/// reports one recovery when a later probe succeeds.
+/// clears the shared pressure state when a later probe succeeds.
 #[test]
 fn discovery_emfile_uses_one_global_descriptor_backoff() {
     let first = tempfile::tempdir().unwrap();
@@ -457,7 +477,6 @@ fn discovery_emfile_uses_one_global_descriptor_backoff() {
         .unwrap();
     assert!(recovered.inventory.is_complete());
     assert_eq!(scanner.descriptor_pressure_retry_at_for_test(), None);
-    assert_eq!(recovered.stats.environmental_recoveries, 1);
 }
 
 #[cfg(unix)]
@@ -754,7 +773,6 @@ fn discovery_root_error_does_not_block_unrelated_root() {
         .unwrap();
     assert!(recovered.inventory.is_complete());
     assert_eq!(scanner.include_retry_state_for_test(0), None);
-    assert_eq!(recovered.stats.environmental_recoveries, 1);
 
     scanner.fail_next_candidate_open_for_test(io::Error::new(
         io::ErrorKind::PermissionDenied,

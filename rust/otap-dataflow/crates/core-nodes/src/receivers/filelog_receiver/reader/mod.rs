@@ -458,10 +458,18 @@ pub(crate) struct ReaderStats {
     pub(crate) reopens: u64,
     /// Confirmed least-recently-served evictions.
     pub(crate) descriptor_evictions: u64,
+    /// Failed descriptor reopens after an earlier successful open.
+    pub(crate) descriptor_reopen_failures: u64,
     /// Uncommitted source bytes rewound by confirmed eviction.
     pub(crate) source_bytes_rewound: u64,
     /// Temporary EOF observations.
     pub(crate) eof_observations: u64,
+    /// Ordinary EOF deadlines promoted for another probe.
+    pub(crate) eof_reprobes: u64,
+    /// Removed readers retaining late-write-capable descriptors.
+    pub(crate) pinned_rotated_handles: usize,
+    /// Age of the oldest pinned rotated descriptor.
+    pub(crate) pinned_rotated_oldest_age_ns: u64,
 }
 
 /// Fixed-size runtime-lease observations transferred after admission.
@@ -527,8 +535,10 @@ struct ActivityCounters {
     opens: u64,
     reopens: u64,
     descriptor_evictions: u64,
+    descriptor_reopen_failures: u64,
     source_bytes_rewound: u64,
     eof_observations: u64,
+    eof_reprobes: u64,
 }
 
 impl ActivityCounters {
@@ -539,8 +549,10 @@ impl ActivityCounters {
             opens: 0,
             reopens: 0,
             descriptor_evictions: 0,
+            descriptor_reopen_failures: 0,
             source_bytes_rewound: 0,
             eof_observations: 0,
+            eof_reprobes: 0,
         }
     }
 }
@@ -603,6 +615,7 @@ struct LogicalReader {
     present: bool,
     ever_opened: bool,
     resident: Option<ResidentReader>,
+    pinned_since: Option<Instant>,
     schedule: ScheduleState,
     paused_for_batch: bool,
 }
@@ -621,6 +634,7 @@ pub(crate) struct ReaderTable {
     descriptor_pressure: Arc<DescriptorPressure>,
     descriptor_pressure_waiting: HashMap<FileId, EnvironmentalOperation>,
     descriptor_blocked: BTreeSet<FileId>,
+    pinned_rotated: BTreeSet<(Instant, FileId)>,
     open_count: usize,
     removed_count: usize,
     service_sequence: u64,
@@ -632,7 +646,6 @@ pub(crate) struct ReaderTable {
     read_buffer: Option<Vec<u8>>,
     counters: ActivityCounters,
     lease_observations: LeaseObservations,
-    pending_environmental_recoveries: u64,
     shutdown_requested: Arc<AtomicBool>,
     #[cfg(test)]
     fail_next_revoked_release: bool,
@@ -873,6 +886,7 @@ impl ReaderTable {
             descriptor_pressure,
             descriptor_pressure_waiting,
             descriptor_blocked: BTreeSet::new(),
+            pinned_rotated: BTreeSet::new(),
             open_count: 0,
             removed_count: 0,
             service_sequence: 0,
@@ -884,7 +898,6 @@ impl ReaderTable {
             read_buffer: Some(read_buffer),
             counters: ActivityCounters::new(),
             lease_observations: LeaseObservations::default(),
-            pending_environmental_recoveries: 0,
             shutdown_requested,
             #[cfg(test)]
             fail_next_revoked_release: false,
@@ -1011,6 +1024,7 @@ impl ReaderTable {
             present: true,
             ever_opened: false,
             resident: None,
+            pinned_since: None,
             schedule: ScheduleState::Ready,
             paused_for_batch: false,
         };
@@ -1106,12 +1120,20 @@ impl ReaderTable {
         &mut self,
         locator: Locator,
     ) -> Result<RemovalDisposition, ReaderError> {
+        self.mark_removed_at(locator, Instant::now())
+    }
+
+    fn mark_removed_at(
+        &mut self,
+        locator: Locator,
+        now: Instant,
+    ) -> Result<RemovalDisposition, ReaderError> {
         let file_id = *self
             .by_locator
             .get(&locator)
             .ok_or(ReaderError::UnknownLocator { locator })?;
         self.cancel_eviction_involving(file_id)?;
-        let has_descriptor = {
+        let pinned_since = {
             let reader = self
                 .readers
                 .get_mut(&file_id)
@@ -1126,7 +1148,9 @@ impl ReaderTable {
                 });
             }
             reader.present = false;
-            reader.resident.is_some()
+            let pinned_since = reader.resident.is_some().then_some(now);
+            reader.pinned_since = pinned_since;
+            pinned_since
         };
         self.removed_count =
             self.removed_count
@@ -1134,7 +1158,12 @@ impl ReaderTable {
                 .ok_or(ReaderError::CounterOverflow {
                     counter: "removed readers",
                 })?;
-        if has_descriptor {
+        if let Some(pinned_since) = pinned_since {
+            if !self.pinned_rotated.insert((pinned_since, file_id)) {
+                return Err(ReaderError::Inconsistent {
+                    reason: "removed reader pin was already indexed",
+                });
+            }
             Ok(RemovalDisposition::HandleRetained)
         } else {
             self.pause(file_id)?;
@@ -2469,6 +2498,10 @@ impl ReaderTable {
     /// Returns a snapshot of bounded populations and monotonic activity.
     #[must_use]
     pub(crate) fn stats(&self) -> ReaderStats {
+        self.stats_at(Instant::now())
+    }
+
+    fn stats_at(&self, now: Instant) -> ReaderStats {
         ReaderStats {
             tracked_readers: self.readers.len(),
             open_files: self.open_count,
@@ -2488,8 +2521,14 @@ impl ReaderTable {
             opens: self.counters.opens,
             reopens: self.counters.reopens,
             descriptor_evictions: self.counters.descriptor_evictions,
+            descriptor_reopen_failures: self.counters.descriptor_reopen_failures,
             source_bytes_rewound: self.counters.source_bytes_rewound,
             eof_observations: self.counters.eof_observations,
+            eof_reprobes: self.counters.eof_reprobes,
+            pinned_rotated_handles: self.pinned_rotated.len(),
+            pinned_rotated_oldest_age_ns: self.pinned_rotated.first().map_or(0, |(since, _)| {
+                u64::try_from(now.saturating_duration_since(*since).as_nanos()).unwrap_or(u64::MAX)
+            }),
         }
     }
 
@@ -2511,11 +2550,6 @@ impl ReaderTable {
     /// Transfers runtime-lease observations without retaining per-file state.
     pub(crate) fn take_lease_observations(&mut self) -> LeaseObservations {
         std::mem::take(&mut self.lease_observations)
-    }
-
-    /// Transfers successful environmental-retry recoveries.
-    pub(crate) fn take_environmental_recoveries(&mut self) -> u64 {
-        std::mem::take(&mut self.pending_environmental_recoveries)
     }
 
     /// Iterates every logical reader without allocating or cloning path
@@ -2774,6 +2808,7 @@ impl ReaderTable {
         }
         self.descriptor_pressure_waiting.clear();
         self.descriptor_blocked.clear();
+        self.pinned_rotated.clear();
         self.open_count = 0;
         self.removed_count = 0;
         if let Err(error) = self.lease_scope.close()
@@ -2812,7 +2847,10 @@ impl ReaderTable {
                 });
             }
             reader.schedule = ScheduleState::Ready;
-            let _ = self.environmental_waiting.remove(&file_id);
+            let environmental = self.environmental_waiting.remove(&file_id);
+            if !environmental {
+                let _ = increment(&mut self.counters.eof_reprobes, "EOF reprobes")?;
+            }
             self.ready.push_back(file_id);
         }
         Ok(())
@@ -2854,24 +2892,39 @@ impl ReaderTable {
         &mut self,
         file_id: FileId,
     ) -> Result<Option<OpenReaderOutcome>, ReaderError> {
+        let is_reopen = self
+            .readers
+            .get(&file_id)
+            .ok_or(ReaderError::UnknownFile { file_id })?
+            .ever_opened;
         #[cfg(test)]
-        if let Some(source) = self.fail_next_open.take() {
+        let result = if let Some(source) = self.fail_next_open.take() {
             let path = self
                 .readers
                 .get(&file_id)
                 .ok_or(ReaderError::UnknownFile { file_id })?
                 .matched_path
                 .clone();
-            return Err(ReaderError::Reopen {
+            Err(ReaderError::Reopen {
                 file_id,
                 source: IdentityError::Io {
                     operation: "open injected reader",
                     path,
                     source,
                 },
-            });
+            })
+        } else {
+            self.open_reader(file_id)
+        };
+        #[cfg(not(test))]
+        let result = self.open_reader(file_id);
+        if is_reopen && result.is_err() {
+            let _ = increment(
+                &mut self.counters.descriptor_reopen_failures,
+                "descriptor reopen failures",
+            )?;
         }
-        self.open_reader(file_id)
+        result
     }
 
     fn open_reader(&mut self, file_id: FileId) -> Result<Option<OpenReaderOutcome>, ReaderError> {
@@ -3300,15 +3353,12 @@ impl ReaderTable {
         file_id: FileId,
         descriptor_opened_at: Option<Instant>,
     ) -> Result<(), ReaderError> {
-        let mut recoveries = u64::from(self.environmental_failures.remove(&file_id).is_some());
-        if let Some(now) = descriptor_opened_at
-            && self.descriptor_pressure.clear_after_success(now)?
-        {
-            recoveries = recoveries.saturating_add(1);
+        let _ = self.environmental_failures.remove(&file_id);
+        if let Some(now) = descriptor_opened_at {
+            // The reviewed telemetry contract records reprobes, not a
+            // separate recovery instrument.
+            let _ = self.descriptor_pressure.clear_after_success(now)?;
         }
-        self.pending_environmental_recoveries = self
-            .pending_environmental_recoveries
-            .saturating_add(recoveries);
         Ok(())
     }
 
@@ -3420,6 +3470,13 @@ impl ReaderTable {
             .ok_or(ReaderError::Inconsistent {
                 reason: "released reader disappeared",
             })?;
+        if let Some(pinned_since) = reader.pinned_since
+            && !self.pinned_rotated.remove(&(pinned_since, file_id))
+        {
+            return Err(ReaderError::Inconsistent {
+                reason: "released pinned reader lacks its age index",
+            });
+        }
         if reader.resident.is_some() {
             self.open_count = self
                 .open_count

@@ -341,6 +341,7 @@ struct FramedTelemetry {
     truncated: bool,
     discarded_source_bytes: u64,
     split: bool,
+    split_started: bool,
 }
 
 /// Starts the sole read/checkpoint OS thread.
@@ -502,6 +503,7 @@ struct WorkerRuntime {
     telemetry: Arc<WorkerTelemetryBridge>,
     health_events: HealthEventLimiter,
     observed_store: ObservedStoreStats,
+    observed_reader: ObservedReaderStats,
     partial_bytes_pending: u64,
     shutdown_requested: Arc<AtomicBool>,
 }
@@ -515,6 +517,8 @@ struct ObservedStoreStats {
     persist_operations: u64,
     sync_duration_ns: u64,
     sync_operations: u64,
+    sync_delay_ns: u64,
+    sync_delay_operations: u64,
     namespace_lock_wait_ns: u64,
     namespace_lock_contentions: u64,
     namespace_lock_observed: bool,
@@ -526,6 +530,14 @@ struct ObservedStoreStats {
     preappend_compaction_duration_ns: u64,
     preappend_cleanup_generations: u64,
     preappend_cleanup_failures: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ObservedReaderStats {
+    read_turns: u64,
+    descriptor_evictions: u64,
+    descriptor_reopen_failures: u64,
+    eof_reprobes: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -572,6 +584,11 @@ impl WorkerRuntime {
         let Some(store) = store else {
             return Err(WorkerError::StartupCancelled);
         };
+        telemetry.add(
+            WorkerCounter::CheckpointRecoveryDurationNs,
+            store.recovery().duration_ns,
+        );
+        telemetry.add(WorkerCounter::CheckpointRecoveryOperations, 1);
         Self::with_store(config, store, telemetry, shutdown_requested)
     }
 
@@ -742,6 +759,7 @@ impl WorkerRuntime {
             telemetry,
             health_events: HealthEventLimiter::default(),
             observed_store: ObservedStoreStats::default(),
+            observed_reader: ObservedReaderStats::default(),
             partial_bytes_pending: 0,
             shutdown_requested,
         };
@@ -871,11 +889,6 @@ impl WorkerRuntime {
                 return Ok(());
             }
             let poll = poll?;
-            let environmental_recoveries = self.readers_mut()?.take_environmental_recoveries();
-            self.telemetry.add(
-                WorkerCounter::EnvironmentalRecoveries,
-                environmental_recoveries,
-            );
             let next_reader_probe = match poll {
                 ReaderPoll::Cancelled => return Ok(()),
                 ReaderPoll::Data(turn) => {
@@ -938,7 +951,7 @@ impl WorkerRuntime {
                             return Ok(());
                         }
                     } else {
-                        self.discard_framer(request.victim_file_id);
+                        self.discard_framer(request.victim_file_id)?;
                         self.readers_mut()?.confirm_eviction(request)?;
                         self.publish_reader_gauges();
                     }
@@ -962,7 +975,23 @@ impl WorkerRuntime {
                     continue;
                 }
                 ReaderPoll::DescriptorCapacityBlocked { .. } => {
-                    self.telemetry.add(WorkerCounter::DescriptorSaturation, 1);
+                    let reader_stats = self.readers_ref()?.stats();
+                    record_descriptor_saturation_telemetry(
+                        &self.telemetry,
+                        reader_stats.pinned_rotated_handles,
+                    );
+                    if reader_stats.pinned_rotated_handles != 0
+                        && let Some(suppressed) =
+                            self.health_event(HealthEventCategory::PinnedRotation)
+                    {
+                        otel_warn!(
+                            "filelog_receiver.pinned_rotation_saturation",
+                            pinned_handles = u64::try_from(reader_stats.pinned_rotated_handles)
+                                .unwrap_or(u64::MAX),
+                            oldest_age_ns = reader_stats.pinned_rotated_oldest_age_ns,
+                            suppressed_events = suppressed
+                        );
+                    }
                     if let Some(suppressed) = self.health_event(HealthEventCategory::Saturation) {
                         otel_warn!(
                             "filelog_receiver.descriptor_capacity_saturated",
@@ -1162,9 +1191,18 @@ impl WorkerRuntime {
         self.telemetry
             .add(WorkerCounter::DiscoveryScanErrors, stats.scan_errors);
         self.telemetry.add(
-            WorkerCounter::EnvironmentalRecoveries,
-            stats.environmental_recoveries,
+            WorkerCounter::AdvisoryPathTruncated,
+            stats.advisory_paths_truncated,
         );
+        if stats.advisory_paths_truncated != 0
+            && let Some(suppressed) = self.health_event(HealthEventCategory::AdvisoryPath)
+        {
+            otel_warn!(
+                "filelog_receiver.advisory_path_truncated",
+                truncated_paths = stats.advisory_paths_truncated,
+                suppressed_events = suppressed
+            );
+        }
         self.telemetry.add(
             WorkerCounter::DiscoveryScanDurationNs,
             duration_ns(stats.scan_duration),
@@ -1371,7 +1409,7 @@ impl WorkerRuntime {
             return Ok(LoopControl::Shutdown);
         }
         let shutdown_requested = Arc::clone(&self.shutdown_requested);
-        let mut plan = plan_with_admission(
+        let mut plan = match plan_with_admission(
             &self.store,
             &self.candidate_evidence,
             &batch.inventory,
@@ -1379,8 +1417,13 @@ impl WorkerRuntime {
             now_unix_nano,
             &batch.recognized_replacements,
             &confirmed_path_bindings,
-        )
-        .map_err(WorkerError::Identity)?;
+        ) {
+            Ok(plan) => plan,
+            Err(error @ IdentityError::IncompatibleProfile { .. }) => {
+                return Err(self.identity_plan_error(error));
+            }
+            Err(error) => return Err(WorkerError::Identity(error)),
+        };
         if self.cancellation_requested() {
             return Ok(LoopControl::Shutdown);
         }
@@ -1628,7 +1671,7 @@ impl WorkerRuntime {
                                     reason: "policy revocation still overlaps an open batch after preemption",
                                 });
                             } else {
-                                self.discard_framer(file_id);
+                                self.discard_framer(file_id)?;
                                 let released = self.readers_mut()?.release_revoked(file_id)?;
                                 if released != locator {
                                     return Err(WorkerError::Inconsistent {
@@ -2012,7 +2055,7 @@ impl WorkerRuntime {
                         reason: "quarantined reader released a different locator",
                     });
                 }
-                self.discard_framer(truncation.file_id);
+                self.discard_framer(truncation.file_id)?;
                 let _ = self.rotation_waits.remove(&truncation.file_id);
                 self.remove_drain_file(truncation.file_id);
                 if truncation.present {
@@ -2076,7 +2119,7 @@ impl WorkerRuntime {
                     truncation.observed_fingerprint,
                     resume,
                 )?;
-                self.discard_framer(truncation.file_id);
+                self.discard_framer(truncation.file_id)?;
                 let _ = self.rotation_waits.remove(&truncation.file_id);
                 self.remove_drain_file(truncation.file_id);
             }
@@ -2144,7 +2187,7 @@ impl WorkerRuntime {
                 reason: "descriptor-free rotation released a different locator",
             });
         }
-        self.discard_framer(file_id);
+        self.discard_framer(file_id)?;
         let _ = self.rotation_waits.remove(&file_id);
         self.remove_drain_file(file_id);
         self.retention_schedule_dirty = true;
@@ -2322,7 +2365,7 @@ impl WorkerRuntime {
             committed_offset: turn.committed_offset(),
             framing_resume: turn.framing_resume(),
         };
-        let mut active = match self.take_framer(file_id) {
+        let mut active = match self.take_framer(file_id)? {
             Some(active) => {
                 if active.base != base {
                     let error = WorkerError::Inconsistent {
@@ -2420,7 +2463,7 @@ impl WorkerRuntime {
                     TurnDisposition::Paused,
                 )?;
                 if let Some(observed_size) = fatal_decode_size {
-                    self.discard_framer(file_id);
+                    self.discard_framer(file_id)?;
                     if self.cancellation_requested() {
                         return Ok(LoopControl::Shutdown);
                     }
@@ -2515,7 +2558,7 @@ impl WorkerRuntime {
                 reason: "decode quarantine released a different locator",
             });
         }
-        self.discard_framer(file_id);
+        self.discard_framer(file_id)?;
         let _ = self.rotation_waits.remove(&file_id);
         self.remove_drain_file(file_id);
         if frontier.present {
@@ -2606,7 +2649,7 @@ impl WorkerRuntime {
         event_tx: &tokio_mpsc::Sender<WorkerEvent>,
         command_rx: &Receiver<WorkerCommand>,
     ) -> Result<LoopControl, WorkerError> {
-        let mut active = self.take_framer(file_id);
+        let mut active = self.take_framer(file_id)?;
         let mut idle_carry_over = false;
         if let Some(active_framer) = active.as_mut() {
             if active_framer.base.file_epoch != file_epoch
@@ -2757,7 +2800,7 @@ impl WorkerRuntime {
         let FramerError::Decode(DecodeError::FatalMalformed { range, .. }) = error else {
             return Err(WorkerError::Framer(error));
         };
-        self.discard_framer(file_id);
+        self.discard_framer(file_id)?;
         if self.cancellation_requested() {
             return Ok(LoopControl::Shutdown);
         }
@@ -2888,9 +2931,11 @@ impl WorkerRuntime {
         let Some((_, file_id)) = due else {
             return Ok(None);
         };
-        let mut active = self.take_framer(file_id).ok_or(WorkerError::Inconsistent {
-            reason: "due framer disappeared",
-        })?;
+        let mut active = self
+            .take_framer(file_id)?
+            .ok_or(WorkerError::Inconsistent {
+                reason: "due framer disappeared",
+            })?;
         loop {
             let ready_at = Instant::now();
             let step = match active.framer.poll_timeout(ready_at) {
@@ -2951,6 +2996,10 @@ impl WorkerRuntime {
             truncated: framed.truncated,
             discarded_source_bytes: framed.discarded_source_bytes,
             split: framed.fragment.is_some(),
+            split_started: framed
+                .fragment
+                .as_ref()
+                .is_some_and(|fragment| fragment.index == 0),
         };
         let input = RecordInput {
             framed,
@@ -3067,9 +3116,8 @@ impl WorkerRuntime {
                 .next_expected_input_offset()
                 .saturating_sub(start)
         });
-        self.partial_bytes_pending = self
-            .partial_bytes_pending
-            .saturating_add(active.pending_bytes);
+        self.partial_bytes_pending =
+            checked_add_partial_bytes(self.partial_bytes_pending, active.pending_bytes)?;
         self.telemetry
             .set(WorkerGauge::PartialBytesPending, self.partial_bytes_pending);
         self.carry_over = Some(CarryOver {
@@ -3096,6 +3144,21 @@ impl WorkerRuntime {
                 );
             }
         }
+    }
+
+    fn identity_plan_error(&mut self, error: IdentityError) -> WorkerError {
+        if matches!(error, IdentityError::IncompatibleProfile { .. }) {
+            self.telemetry
+                .add(WorkerCounter::FramingProfileIncompatible, 1);
+            if let Some(suppressed) = self.health_event(HealthEventCategory::Compatibility) {
+                otel_warn!(
+                    "filelog_receiver.framing_profile_incompatible",
+                    reason = "checkpoint_profile_mismatch",
+                    suppressed_events = suppressed
+                );
+            }
+        }
+        WorkerError::Identity(error)
     }
 
     fn observe_framer_counters(&mut self, framer: &mut Framer) {
@@ -3137,6 +3200,7 @@ fn record_framed_telemetry(telemetry: &WorkerTelemetryBridge, framed: FramedTele
         framed.discarded_source_bytes,
     );
     telemetry.add(WorkerCounter::SplitFragments, u64::from(framed.split));
+    telemetry.add(WorkerCounter::RecordsSplit, u64::from(framed.split_started));
     match framed.flush_reason {
         None => {}
         Some(FlushReason::MaxLines) => {
@@ -3178,8 +3242,32 @@ fn record_descriptor_unavailable_telemetry(telemetry: &WorkerTelemetryBridge) {
     telemetry.add(WorkerCounter::RotationDescriptorUnavailable, 1);
 }
 
+fn record_descriptor_saturation_telemetry(
+    telemetry: &WorkerTelemetryBridge,
+    pinned_rotated_handles: usize,
+) {
+    telemetry.add(WorkerCounter::DescriptorSaturation, 1);
+    if pinned_rotated_handles != 0 {
+        telemetry.add(WorkerCounter::PinnedRotationSaturation, 1);
+    }
+}
+
 fn record_rotation_finalization_telemetry(telemetry: &WorkerTelemetryBridge) {
     telemetry.add(WorkerCounter::RotationFinalizations, 1);
+}
+
+fn checked_add_partial_bytes(current: u64, added: u64) -> Result<u64, WorkerError> {
+    current.checked_add(added).ok_or(WorkerError::Inconsistent {
+        reason: "partial-byte gauge overflowed",
+    })
+}
+
+fn checked_sub_partial_bytes(current: u64, removed: u64) -> Result<u64, WorkerError> {
+    current
+        .checked_sub(removed)
+        .ok_or(WorkerError::Inconsistent {
+            reason: "partial-byte gauge underflowed",
+        })
 }
 
 fn record_checkpoint_maintenance_telemetry(
@@ -3513,9 +3601,10 @@ impl WorkerRuntime {
                 reason: "carry-over seed base does not match applied predecessor progress",
             });
         }
-        self.partial_bytes_pending = self
-            .partial_bytes_pending
-            .saturating_sub(carry.post_frame.active.pending_bytes);
+        self.partial_bytes_pending = checked_sub_partial_bytes(
+            self.partial_bytes_pending,
+            carry.post_frame.active.pending_bytes,
+        )?;
         carry.post_frame.active.base = FramerBase {
             file_epoch: expected_file_epoch,
             committed_offset: expected_committed_offset,
@@ -3561,11 +3650,6 @@ impl WorkerRuntime {
                     return Ok(LoopControl::Shutdown);
                 }
                 let poll = poll?;
-                let environmental_recoveries = self.readers_mut()?.take_environmental_recoveries();
-                self.telemetry.add(
-                    WorkerCounter::EnvironmentalRecoveries,
-                    environmental_recoveries,
-                );
                 match poll {
                     ReaderPoll::Cancelled => return Ok(LoopControl::Shutdown),
                     ReaderPoll::Data(turn) => {
@@ -3611,7 +3695,7 @@ impl WorkerRuntime {
                         });
                     }
                     ReaderPoll::EvictionRequired(request) => {
-                        self.discard_framer(request.victim_file_id);
+                        self.discard_framer(request.victim_file_id)?;
                         self.readers_mut()?.confirm_eviction(request)?;
                         continue;
                     }
@@ -3660,7 +3744,7 @@ impl WorkerRuntime {
             }
 
             self.readers_mut()?.pause(file_id)?;
-            let Some(mut active) = self.take_framer(file_id) else {
+            let Some(mut active) = self.take_framer(file_id)? else {
                 let _ = self.drain_order.pop();
                 let _ = self.drain_limits.remove(&file_id);
                 continue;
@@ -4098,6 +4182,10 @@ impl WorkerRuntime {
                 reason: "retention compaction removed a different record count",
             });
         }
+        self.telemetry.add(
+            WorkerCounter::CheckpointRecordsRemoved,
+            u64::try_from(removed).unwrap_or(u64::MAX),
+        );
         record_checkpoint_maintenance_telemetry(
             &self.telemetry,
             generation_before,
@@ -4226,6 +4314,10 @@ impl WorkerRuntime {
         self.telemetry
             .set(WorkerGauge::CheckpointWalSize, stats.wal_bytes);
         self.telemetry.set(
+            WorkerGauge::CheckpointWalTransactions,
+            stats.wal_transactions,
+        );
+        self.telemetry.set(
             WorkerGauge::FilesTracked,
             u64::try_from(stats.records).unwrap_or(u64::MAX),
         );
@@ -4246,9 +4338,24 @@ impl WorkerRuntime {
 
     /// Refreshes reader populations from constant-state counters and bounded
     /// scheduling-index lengths; it never scans the reader table.
-    fn publish_reader_gauges(&self) {
+    fn publish_reader_gauges(&mut self) {
         if let Some(readers) = self.readers.as_ref() {
             let reader_stats = readers.stats();
+            macro_rules! delta {
+                ($field:ident, $counter:ident) => {
+                    self.telemetry.add(
+                        WorkerCounter::$counter,
+                        reader_stats
+                            .$field
+                            .saturating_sub(self.observed_reader.$field),
+                    );
+                    self.observed_reader.$field = reader_stats.$field;
+                };
+            }
+            delta!(read_turns, ReadTurns);
+            delta!(descriptor_evictions, DescriptorEvictions);
+            delta!(descriptor_reopen_failures, DescriptorReopenFailures);
+            delta!(eof_reprobes, EofReprobes);
             self.telemetry.set(
                 WorkerGauge::FilesOpen,
                 u64::try_from(reader_stats.open_files).unwrap_or(u64::MAX),
@@ -4265,11 +4372,21 @@ impl WorkerRuntime {
                 WorkerGauge::DescriptorSaturated,
                 u64::from(reader_stats.descriptor_blocked_readers != 0),
             );
+            self.telemetry.set(
+                WorkerGauge::PinnedRotatedHandles,
+                u64::try_from(reader_stats.pinned_rotated_handles).unwrap_or(u64::MAX),
+            );
+            self.telemetry.set(
+                WorkerGauge::PinnedRotatedOldestAgeNs,
+                reader_stats.pinned_rotated_oldest_age_ns,
+            );
         } else {
             self.telemetry.set(WorkerGauge::FilesOpen, 0);
             self.telemetry.set(WorkerGauge::FilesDescriptorBlocked, 0);
             self.telemetry.set(WorkerGauge::FilesRemovedWaiting, 0);
             self.telemetry.set(WorkerGauge::DescriptorSaturated, 0);
+            self.telemetry.set(WorkerGauge::PinnedRotatedHandles, 0);
+            self.telemetry.set(WorkerGauge::PinnedRotatedOldestAgeNs, 0);
         }
     }
 
@@ -4278,6 +4395,10 @@ impl WorkerRuntime {
         self.publish_store_deltas(&stats);
         self.telemetry
             .set(WorkerGauge::CheckpointWalSize, stats.wal_bytes);
+        self.telemetry.set(
+            WorkerGauge::CheckpointWalTransactions,
+            stats.wal_transactions,
+        );
     }
 
     fn publish_store_deltas(&mut self, stats: &StoreStats) {
@@ -4297,6 +4418,8 @@ impl WorkerRuntime {
         delta!(persist_operations, CheckpointPersistOperations);
         delta!(sync_duration_ns, CheckpointSyncDurationNs);
         delta!(sync_operations, CheckpointSyncOperations);
+        delta!(sync_delay_ns, CheckpointSyncDelayNs);
+        delta!(sync_delay_operations, CheckpointSyncDelayOperations);
         delta!(quarantine_reset_beginning, QuarantineResetBeginning);
         delta!(quarantine_reset_end, QuarantineResetEnd);
         delta!(quarantine_keep_failed, QuarantineKeepFailed);
@@ -4393,12 +4516,13 @@ impl WorkerRuntime {
         })
     }
 
-    fn take_framer(&mut self, file_id: FileId) -> Option<ActiveFramer> {
-        let active = self.framers.remove(&file_id)?;
-        self.partial_bytes_pending = self
-            .partial_bytes_pending
-            .saturating_sub(active.pending_bytes);
-        Some(active)
+    fn take_framer(&mut self, file_id: FileId) -> Result<Option<ActiveFramer>, WorkerError> {
+        let Some(active) = self.framers.remove(&file_id) else {
+            return Ok(None);
+        };
+        self.partial_bytes_pending =
+            checked_sub_partial_bytes(self.partial_bytes_pending, active.pending_bytes)?;
+        Ok(Some(active))
     }
 
     fn put_framer(&mut self, file_id: FileId, mut active: ActiveFramer) -> Result<(), WorkerError> {
@@ -4413,9 +4537,8 @@ impl WorkerRuntime {
                 .next_expected_input_offset()
                 .saturating_sub(start)
         });
-        self.partial_bytes_pending = self
-            .partial_bytes_pending
-            .saturating_add(active.pending_bytes);
+        self.partial_bytes_pending =
+            checked_add_partial_bytes(self.partial_bytes_pending, active.pending_bytes)?;
         self.telemetry
             .set(WorkerGauge::PartialBytesPending, self.partial_bytes_pending);
         let previous = self.framers.insert(file_id, active);
@@ -4423,10 +4546,11 @@ impl WorkerRuntime {
         Ok(())
     }
 
-    fn discard_framer(&mut self, file_id: FileId) {
-        let _ = self.take_framer(file_id);
+    fn discard_framer(&mut self, file_id: FileId) -> Result<(), WorkerError> {
+        let _ = self.take_framer(file_id)?;
         self.telemetry
             .set(WorkerGauge::PartialBytesPending, self.partial_bytes_pending);
+        Ok(())
     }
 
     fn clear_framers(&mut self) {

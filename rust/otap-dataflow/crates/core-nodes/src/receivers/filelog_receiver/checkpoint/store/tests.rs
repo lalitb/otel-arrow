@@ -116,6 +116,123 @@ fn interval_sync_can_be_driven_while_the_source_is_idle() {
     assert!(store.sync_if_due().expect("the deadline poll syncs"));
     assert!(store.next_sync_deadline().is_none());
     assert_eq!(store.stats().unsynced_transactions, 0);
+    assert_eq!(store.stats().wal_transactions, 2);
+}
+
+/// Scenario: one Ack-driven progress transaction remains unsynced for a
+/// deterministic interval before a successful explicit sync.
+/// Guarantees: sync-delay telemetry starts at the first unsynced progress,
+/// records exactly once after successful sync, and an empty repeated sync
+/// cannot duplicate the observation.
+#[test]
+fn sync_delay_measures_first_unsynced_progress_to_successful_sync() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    let mut store = CheckpointStore::open(StoreOptions {
+        sync_interval: NEVER_ELAPSES,
+        ..options(&path)
+    })
+    .expect("namespace opens");
+    let _registered = store
+        .register_files(vec![registration(1)])
+        .expect("registers");
+    let _progressed = store
+        .commit_progress(vec![progress(1, 0, 128)])
+        .expect("progress succeeds");
+    assert_eq!(store.stats().sync_delay_operations, 0);
+    store.first_unsynced_at = Some(Instant::now() - Duration::from_millis(10));
+
+    store.sync().expect("outstanding progress syncs");
+    let synced = store.stats();
+    assert_eq!(synced.sync_delay_operations, 1);
+    assert!(synced.sync_delay_ns >= 10_000_000);
+
+    store.sync().expect("empty repeated sync is a no-op");
+    let repeated = store.stats();
+    assert_eq!(repeated.sync_delay_operations, 1);
+    assert_eq!(repeated.sync_delay_ns, synced.sync_delay_ns);
+}
+
+/// Scenario: a zero-interval Ack progress append completes, its required WAL
+/// sync fails, and the exact transaction is retried after the fault clears.
+/// Guarantees: current WAL size/count reflect the known-complete pending frame,
+/// and successful retry records one immediate sync-delay observation without
+/// losing the original append start.
+#[test]
+fn sync_failure_preserves_physical_wal_gauges_and_delay_start() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    let mut store = CheckpointStore::open(StoreOptions {
+        sync_interval: Duration::ZERO,
+        ..options(&path)
+    })
+    .expect("namespace opens");
+    let _registered = store
+        .register_files(vec![registration(1)])
+        .expect("registers");
+    let before = store.stats();
+    store.faults = FaultPlan::armed(FaultPoint::BeforeWalSync);
+
+    assert!(matches!(
+        store.commit_progress(vec![progress(1, 0, 128)]),
+        Err(StoreError::InjectedFault {
+            point: FaultPoint::BeforeWalSync
+        })
+    ));
+    let pending = store
+        .pending_wal_append
+        .expect("the complete append remains pending required sync");
+    assert!(pending.requires_sync);
+    let failed = store.stats();
+    assert_eq!(failed.wal_bytes, pending.wal_bytes_after);
+    assert_eq!(failed.wal_transactions, pending.wal_transactions_after);
+    assert!(failed.wal_bytes > before.wal_bytes);
+    assert_eq!(failed.wal_transactions, before.wal_transactions + 1);
+    assert_eq!(failed.sync_delay_operations, 0);
+
+    store.faults = FaultPlan::disabled();
+    let retried = store
+        .commit_progress(vec![progress(1, 0, 128)])
+        .expect("the exact pending append reconciles and syncs");
+    assert!(retried[0].synced);
+    let synced = store.stats();
+    assert_eq!(synced.wal_transactions, pending.wal_transactions_after);
+    assert_eq!(synced.sync_delay_operations, 1);
+}
+
+/// Scenario: deferred Ack progress is made durable by compaction, then a new
+/// generation receives another deferred progress transaction.
+/// Guarantees: compaction consumes the old sync-delay timer and the next
+/// generation starts a fresh observation rather than spanning generations.
+#[test]
+fn compaction_consumes_sync_delay_before_new_generation() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    let mut store = CheckpointStore::open(StoreOptions {
+        sync_interval: NEVER_ELAPSES,
+        ..options(&path)
+    })
+    .expect("namespace opens");
+    let _registered = store
+        .register_files(vec![registration(1)])
+        .expect("registers");
+    let _progressed = store
+        .commit_progress(vec![progress(1, 0, 64)])
+        .expect("progress is deferred");
+    store.first_unsynced_at = Some(Instant::now() - Duration::from_millis(5));
+
+    store
+        .compact()
+        .expect("compaction syncs the old generation");
+    assert_eq!(store.stats().sync_delay_operations, 1);
+    assert!(store.first_unsynced_at.is_none());
+
+    let _progressed = store
+        .commit_progress(vec![progress(1, 64, 128)])
+        .expect("new-generation progress is deferred");
+    assert!(store.first_unsynced_at.is_some());
+    store.sync().expect("new generation syncs");
+    assert_eq!(store.stats().sync_delay_operations, 2);
 }
 
 /// Scenario: `checkpoint.sync_interval` is `Duration::MAX`, which cannot be
@@ -141,6 +258,7 @@ fn unrepresentable_sync_interval_is_immediately_due() {
         .expect("progress succeeds");
     assert!(outcome[0].synced);
     assert_eq!(store.stats().unsynced_transactions, 0);
+    assert_eq!(store.stats().sync_delay_operations, 1);
     assert!(store.next_sync_deadline().is_none());
 }
 
@@ -2118,7 +2236,12 @@ fn wal_append_faults_reconcile_the_exact_retry_once() {
             "expected the injected fault at {point}, got {error:?}"
         );
         assert!(store.table().is_empty());
-        assert_eq!(store.stats().wal_transactions, 0);
+        let known_complete_waiting_sync =
+            matches!(point, FaultPoint::BeforeWalSync | FaultPoint::AfterWalSync);
+        assert_eq!(
+            store.stats().wal_transactions,
+            u64::from(known_complete_waiting_sync)
+        );
         assert_eq!(store.stats().next_sequence, 1);
         let failed_wal = fs::read(&wal_path).expect("failed WAL reads");
         let transaction_was_written = !matches!(

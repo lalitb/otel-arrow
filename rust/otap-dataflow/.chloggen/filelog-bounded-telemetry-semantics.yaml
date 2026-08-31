@@ -1,0 +1,6 @@
+change_type: enhancement
+component: observability
+note: "Complete bounded filelog checkpoint, reader, rotation, framing, path, retention, and explicit-loss telemetry semantics."
+issues: [3939]
+subtext: |
+  Initial sends and resends are counted separately, explicit loss reports dropped records, current gauges remain exact, and all names, kinds, units, and aggregation remain provisional.

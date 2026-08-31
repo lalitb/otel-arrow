@@ -299,16 +299,6 @@ impl AdmissionController {
         Ok(())
     }
 
-    pub(crate) fn record_environmental_recovery(&mut self) -> Result<(), DiscoveryError> {
-        let stats = self.current_stats_mut()?;
-        stats.environmental_recoveries = stats.environmental_recoveries.checked_add(1).ok_or(
-            DiscoveryError::CounterOverflow {
-                counter: "discovery environmental recoveries",
-            },
-        )?;
-        Ok(())
-    }
-
     pub(crate) fn record_issue(&mut self, issue: DiscoveryIssue) -> Result<(), DiscoveryError> {
         self.removal_evidence_complete = false;
         self.current_stats_mut()?.record_issue(issue)
@@ -333,6 +323,14 @@ impl AdmissionController {
                 expected: self.generation,
                 found: generation,
             });
+        }
+        if candidate.evidence.advisory_path.is_truncated() {
+            let stats = self.current_stats_mut()?;
+            stats.advisory_paths_truncated = stats.advisory_paths_truncated.checked_add(1).ok_or(
+                DiscoveryError::CounterOverflow {
+                    counter: "truncated advisory paths",
+                },
+            )?;
         }
         let locator = candidate.evidence.locator;
         self.record_presence(locator)?;

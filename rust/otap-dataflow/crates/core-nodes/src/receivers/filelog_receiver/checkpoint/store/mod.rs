@@ -287,6 +287,8 @@ pub struct RecoveryReport {
     /// recoverable until [`CheckpointStore::cleanup_retired_generations`]
     /// removes them.
     pub retired_generations: Vec<u64>,
+    /// Time spent recovering after namespace ownership was acquired.
+    pub duration_ns: u64,
 }
 
 /// The result of appending one transaction.
@@ -365,6 +367,11 @@ pub struct StoreStats {
     pub sync_duration_ns: u64,
     /// Number of measured WAL sync operations.
     pub sync_operations: u64,
+    /// Total delay from the first unsynced interval transaction to successful
+    /// WAL sync.
+    pub sync_delay_ns: u64,
+    /// Successful first-unsynced-to-sync observations.
+    pub sync_delay_operations: u64,
     /// Time spent acquiring the checkpoint namespace lock.
     pub namespace_lock_wait_ns: u64,
     /// Failed immediate namespace-lock attempts before acquisition.
@@ -417,6 +424,7 @@ struct PendingWalAppend {
     policy: SyncPolicy,
     requires_sync: bool,
     repair_sync_required: bool,
+    started_sync_delay: bool,
 }
 
 impl PendingWalAppend {
@@ -468,6 +476,7 @@ impl PendingWalAppend {
             policy,
             requires_sync: false,
             repair_sync_required: false,
+            started_sync_delay: false,
         })
     }
 
@@ -711,6 +720,7 @@ pub struct CheckpointStore {
     next_sequence: u64,
     unsynced_transactions: u64,
     last_sync: Instant,
+    first_unsynced_at: Option<Instant>,
     syncs: u64,
     wal_bytes_appended: u64,
     transactions_appended: u64,
@@ -718,6 +728,8 @@ pub struct CheckpointStore {
     persist_operations: u64,
     sync_duration_ns: u64,
     sync_operations: u64,
+    sync_delay_ns: u64,
+    sync_delay_operations: u64,
     quarantine_reset_beginning: u64,
     quarantine_reset_end: u64,
     quarantine_keep_failed: u64,
@@ -842,6 +854,7 @@ impl CheckpointStore {
             torn_tail_bytes: repaired_torn_tail_bytes,
             removed_temp_files: 0,
             retired_generations: retired_generations.clone(),
+            duration_ns: 0,
         };
 
         Ok(Self {
@@ -865,6 +878,7 @@ impl CheckpointStore {
             next_sequence: loaded.next_sequence,
             unsynced_transactions: 0,
             last_sync: Instant::now(),
+            first_unsynced_at: None,
             syncs: 0,
             wal_bytes_appended: 0,
             transactions_appended: 0,
@@ -872,6 +886,8 @@ impl CheckpointStore {
             persist_operations: 0,
             sync_duration_ns: 0,
             sync_operations: 0,
+            sync_delay_ns: 0,
+            sync_delay_operations: 0,
             quarantine_reset_beginning: 0,
             quarantine_reset_end: 0,
             quarantine_keep_failed: 0,
@@ -943,6 +959,7 @@ impl CheckpointStore {
         else {
             return Ok(None);
         };
+        let recovery_started = Instant::now();
         prepared_namespace.verify("revalidate the namespace chain after lock acquisition")?;
         let marker_path = namespace_dir.join(CURRENT_FILE_NAME);
         prepared_namespace.verify("revalidate the namespace chain before reading authority")?;
@@ -1061,6 +1078,7 @@ impl CheckpointStore {
             torn_tail_bytes: loaded.torn_tail_bytes,
             removed_temp_files,
             retired_generations: retired_generations.clone(),
+            duration_ns: duration_nanos(recovery_started.elapsed()),
         };
 
         Ok(Some(Self {
@@ -1089,6 +1107,7 @@ impl CheckpointStore {
             next_sequence: loaded.next_sequence,
             unsynced_transactions: 0,
             last_sync: Instant::now(),
+            first_unsynced_at: None,
             syncs: 0,
             wal_bytes_appended: 0,
             transactions_appended: 0,
@@ -1096,6 +1115,8 @@ impl CheckpointStore {
             persist_operations: 0,
             sync_duration_ns: 0,
             sync_operations: 0,
+            sync_delay_ns: 0,
+            sync_delay_operations: 0,
             quarantine_reset_beginning: 0,
             quarantine_reset_end: 0,
             quarantine_keep_failed: 0,
@@ -2094,13 +2115,22 @@ impl CheckpointStore {
     /// Durable and in-memory accounting for this store instance.
     #[must_use]
     pub fn stats(&self) -> StoreStats {
+        let known_complete_pending = self
+            .pending_wal_append
+            .filter(|pending| pending.requires_sync);
         StoreStats {
             generation: self.generation,
             retired_generations: self.retired_generations.clone(),
             records: self.table.len(),
-            wal_bytes: self.wal_bytes,
-            wal_transactions: self.wal_transactions,
-            unsynced_transactions: self.unsynced_transactions,
+            wal_bytes: known_complete_pending
+                .map_or(self.wal_bytes, |pending| pending.wal_bytes_after),
+            wal_transactions: known_complete_pending.map_or(self.wal_transactions, |pending| {
+                pending.wal_transactions_after
+            }),
+            unsynced_transactions: known_complete_pending
+                .map_or(self.unsynced_transactions, |pending| {
+                    pending.unsynced_transactions_after
+                }),
             next_sequence: self.next_sequence,
             syncs: self.syncs,
             quarantined_records: self.table.quarantined_len(),
@@ -2110,6 +2140,8 @@ impl CheckpointStore {
             persist_operations: self.persist_operations,
             sync_duration_ns: self.sync_duration_ns,
             sync_operations: self.sync_operations,
+            sync_delay_ns: self.sync_delay_ns,
+            sync_delay_operations: self.sync_delay_operations,
             namespace_lock_wait_ns: duration_nanos(self._lock.waited()),
             namespace_lock_contentions: self._lock.contentions(),
             quarantine_reset_beginning: self.quarantine_reset_beginning,
@@ -2849,6 +2881,7 @@ impl CheckpointStore {
         self.next_sequence = 1;
         self.unsynced_transactions = 0;
         self.last_sync = Instant::now();
+        self.record_sync_delay();
         self.retired_generations.push(previous);
         if replace_table {
             self.table = CheckpointTable::from_snapshot_records(records)
@@ -3432,6 +3465,11 @@ impl CheckpointStore {
                 }),
             };
         }
+        let append_started = Instant::now();
+        if policy == SyncPolicy::Interval && self.first_unsynced_at.is_none() {
+            self.first_unsynced_at = Some(append_started);
+            pending.started_sync_delay = true;
+        }
         if let Err(source) = self.wal.write_all(bytes) {
             self.pending_wal_append = Some(pending);
             return Err(StoreError::Io {
@@ -3520,6 +3558,9 @@ impl CheckpointStore {
                 if pending.repair_sync_required {
                     self.sync_torn_append_repair(pending)?;
                 }
+                if pending.started_sync_delay {
+                    self.first_unsynced_at = None;
+                }
                 PendingAppendResolution::RetryWrite
             }
             WalAppendObservation::Torn { bytes } => {
@@ -3532,6 +3573,9 @@ impl CheckpointStore {
                 pending.repair_sync_required = true;
                 self.pending_wal_append = Some(pending);
                 self.sync_torn_append_repair(pending)?;
+                if pending.started_sync_delay {
+                    self.first_unsynced_at = None;
+                }
                 PendingAppendResolution::RetryWrite
             }
             WalAppendObservation::Complete {
@@ -3646,6 +3690,13 @@ impl CheckpointStore {
     }
 
     fn install_pending_append_accounting(&mut self, pending: PendingWalAppend) {
+        if pending.policy == SyncPolicy::Interval
+            && pending.unsynced_transactions_before == 0
+            && pending.unsynced_transactions_after != 0
+            && self.first_unsynced_at.is_none()
+        {
+            self.first_unsynced_at = Some(Instant::now());
+        }
         self.wal_bytes = pending.wal_bytes_after;
         self.wal_transactions = pending.wal_transactions_after;
         self.unsynced_transactions = pending.unsynced_transactions_after;
@@ -3727,7 +3778,17 @@ impl CheckpointStore {
         self.unsynced_transactions = 0;
         self.last_sync = Instant::now();
         self.syncs = syncs;
+        self.record_sync_delay();
         Ok(())
+    }
+
+    fn record_sync_delay(&mut self) {
+        if let Some(first_unsynced_at) = self.first_unsynced_at.take() {
+            self.sync_delay_ns = self
+                .sync_delay_ns
+                .saturating_add(duration_nanos(first_unsynced_at.elapsed()));
+            self.sync_delay_operations = self.sync_delay_operations.saturating_add(1);
+        }
     }
 }
 

@@ -274,6 +274,10 @@ High-signal operating metrics include:
 | `receiver.filelog.backpressure.pause.duration` | `ns` | Distribution of downstream-full pauses. |
 | `receiver.filelog.checkpoint.failures` | `{failure}` | Failed checkpoint operations. |
 | `receiver.filelog.checkpoint.wal.size` | `By` | Current active WAL size. |
+| `receiver.filelog.checkpoint.wal.transactions` | `{transaction}` | Current complete transactions in the active WAL. |
+| `receiver.filelog.checkpoint.sync.delay.total` | `ns` | Total delay from first unsynced Ack progress to successful sync. |
+| `receiver.filelog.checkpoint.recovery.duration.total` | `ns` | Total checkpoint namespace recovery duration. |
+| `receiver.filelog.checkpoint.records.removed` | `{record}` | Records removed by receiver-owned retention compaction. |
 | `receiver.filelog.files.tracked` | `{file}` | Current durable checkpoint population. |
 | `receiver.filelog.files.pending` | `{file}` | Current pending-candidate population. |
 | `receiver.filelog.files.open` | `{file}` | Current resident source handles. |
@@ -281,9 +285,19 @@ High-signal operating metrics include:
 | `receiver.filelog.candidates.overflowed` | `{candidate}` | Candidate observations rejected by the configured bound. |
 | `receiver.filelog.files.tracked.saturation` | `{event}` | Admissions that encountered a full tracked table. |
 | `receiver.filelog.files.descriptor.saturation` | `{event}` | Reads that encountered descriptor saturation. |
+| `receiver.filelog.files.descriptor.evictions` | `{eviction}` | Confirmed descriptor evictions. |
+| `receiver.filelog.files.descriptor.reopen_failures` | `{failure}` | Failed reopens after a prior successful open. |
+| `receiver.filelog.rotation.pinned_handles` | `{handle}` | Removed readers retaining late-write-capable descriptors. |
+| `receiver.filelog.rotation.pinned_oldest.age` | `ns` | Age of the oldest pinned rotated descriptor. |
+| `receiver.filelog.rotation.pinned.saturation` | `{event}` | Descriptor saturation while rotated handles are pinned. |
 | `receiver.filelog.descriptor.budget.warnings` | `{warning}` | Starts whose receiver-owned FD budget exceeds 80% of the Unix soft limit. |
 | `receiver.filelog.environmental.reprobes` | `{reprobe}` | Source/traversal operations scheduled for bounded environmental retry. |
-| `receiver.filelog.environmental.recoveries` | `{recovery}` | Environmental retry conditions cleared by successful source or discovery operations. |
+| `receiver.filelog.reader.turns` | `{turn}` | Positioned source-read turns attempted. |
+| `receiver.filelog.reader.eof.reprobes` | `{reprobe}` | Ordinary EOF deadlines promoted for another probe. |
+| `receiver.filelog.framing.profile.incompatible` | `{file}` | Checkpoint records rejected for a framing-profile mismatch. |
+| `receiver.filelog.path.advisory.truncated` | `{path}` | Native advisory paths stored as bounded suffix evidence. |
+| `receiver.filelog.records.split` | `{record}` | Logical records that entered split framing. |
+| `receiver.filelog.records.dropped_on_nack` | `{record}` | Records durably skipped under explicit drop-and-continue exhaustion. |
 | `receiver.filelog.rotation.copytruncate.detected` | `{rotation}` | Observable copy-truncate transitions. |
 | `receiver.filelog.partial.bytes.pending` | `By` | Current uncommitted partial source bytes. |
 | `receiver.filelog.terminal.unterminated.records` | `{record}` | Records emitted only because permanent rotation EOF established a boundary. |
@@ -292,6 +306,12 @@ High-signal operating metrics include:
 The complete instrument catalog and averaging rules for total-duration
 counters are in the
 [self-telemetry design](../../../../../docs/filelog-receiver.md#self-telemetry).
+
+`checkpoint.records.removed` covers receiver-owned retention compaction.
+Offline administrative removal has no live receiver metric owner and remains
+observable through the bounded command result rather than fabricated receiver
+telemetry. Whole-namespace reset telemetry remains unavailable because that
+operation is not authorized.
 
 Detailed events are rate-limited by fixed category. Operator-relevant events
 include:

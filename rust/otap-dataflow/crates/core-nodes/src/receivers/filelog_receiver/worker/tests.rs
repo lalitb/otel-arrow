@@ -180,6 +180,7 @@ fn framed_record_telemetry_uses_exact_bounded_categories() {
             truncated: true,
             discarded_source_bytes: 7,
             split: false,
+            split_started: false,
         },
     );
     record_truncation_detection(&telemetry);
@@ -187,6 +188,8 @@ fn framed_record_telemetry_uses_exact_bounded_categories() {
     record_truncation_detection(&telemetry);
     record_truncation_outcome(&telemetry, OnTruncate::ReadNew);
     record_descriptor_unavailable_telemetry(&telemetry);
+    record_descriptor_saturation_telemetry(&telemetry, 0);
+    record_descriptor_saturation_telemetry(&telemetry, 1);
     record_rotation_finalization_telemetry(&telemetry);
     record_checkpoint_maintenance_telemetry(&telemetry, 1, 2, Duration::from_nanos(11), 2, true);
     record_framed_telemetry(
@@ -197,6 +200,7 @@ fn framed_record_telemetry_uses_exact_bounded_categories() {
             truncated: false,
             discarded_source_bytes: 0,
             split: true,
+            split_started: true,
         },
     );
     record_framed_telemetry(
@@ -207,6 +211,7 @@ fn framed_record_telemetry_uses_exact_bounded_categories() {
             truncated: false,
             discarded_source_bytes: 0,
             split: false,
+            split_started: false,
         },
     );
 
@@ -236,6 +241,10 @@ fn framed_record_telemetry_uses_exact_bounded_categories() {
     );
     assert_eq!(
         telemetry.take_counter_for_test(WorkerCounter::SplitFragments),
+        1
+    );
+    assert_eq!(
+        telemetry.take_counter_for_test(WorkerCounter::RecordsSplit),
         1
     );
     assert_eq!(
@@ -275,6 +284,14 @@ fn framed_record_telemetry_uses_exact_bounded_categories() {
         1
     );
     assert_eq!(
+        telemetry.take_counter_for_test(WorkerCounter::DescriptorSaturation),
+        2
+    );
+    assert_eq!(
+        telemetry.take_counter_for_test(WorkerCounter::PinnedRotationSaturation),
+        1
+    );
+    assert_eq!(
         telemetry.take_counter_for_test(WorkerCounter::RotationFinalizations),
         1
     );
@@ -294,6 +311,28 @@ fn framed_record_telemetry_uses_exact_bounded_categories() {
         telemetry.take_counter_for_test(WorkerCounter::CheckpointCleanupFailures),
         1
     );
+}
+
+/// Scenario: partial-byte gauge arithmetic is evaluated at exact zero and
+/// `u64::MAX` boundaries.
+/// Guarantees: valid equality is accepted, while underflow and overflow
+/// return an internal consistency error instead of silently saturating.
+#[test]
+fn partial_byte_gauge_arithmetic_is_exact() {
+    assert_eq!(checked_add_partial_bytes(7, 5).unwrap(), 12);
+    assert_eq!(checked_sub_partial_bytes(12, 5).unwrap(), 7);
+    assert!(matches!(
+        checked_add_partial_bytes(u64::MAX, 1),
+        Err(WorkerError::Inconsistent {
+            reason: "partial-byte gauge overflowed"
+        })
+    ));
+    assert!(matches!(
+        checked_sub_partial_bytes(0, 1),
+        Err(WorkerError::Inconsistent {
+            reason: "partial-byte gauge underflowed"
+        })
+    ));
 }
 
 /// Scenario: a store append reaches its transaction threshold and compacts
@@ -389,6 +428,51 @@ fn descriptor_budget_warning_is_reported_once_at_startup() {
     .unwrap();
     assert_eq!(
         telemetry.counter_for_test(WorkerCounter::DescriptorBudgetWarnings),
+        1
+    );
+    assert_eq!(
+        telemetry.counter_for_test(WorkerCounter::CheckpointRecoveryOperations),
+        1
+    );
+    runtime.shutdown_resources().unwrap();
+}
+
+/// Scenario: identity planning rejects one live checkpoint record whose
+/// framing-profile version and digest differ from configuration.
+/// Guarantees: the incompatibility increments exactly one fixed telemetry
+/// counter before the structured identity error propagates.
+#[test]
+fn framing_profile_incompatibility_is_reported_once() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("profile.log");
+    std::fs::write(&source, b"line\n").unwrap();
+    let config = runtime_config(
+        source.to_str().unwrap(),
+        &directory.path().join("checkpoint"),
+        1,
+    );
+    let telemetry = Arc::new(WorkerTelemetryBridge::default());
+    let mut runtime = WorkerRuntime::new_with_telemetry(
+        config,
+        Arc::clone(&telemetry),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+
+    let error = runtime.identity_plan_error(IdentityError::IncompatibleProfile {
+        file_id: FileId::from_bytes([7; 16]),
+        stored_version: 1,
+        stored_digest: [1; 32],
+        configured_version: 2,
+        configured_digest: [2; 32],
+    });
+
+    assert!(matches!(
+        error,
+        WorkerError::Identity(IdentityError::IncompatibleProfile { .. })
+    ));
+    assert_eq!(
+        telemetry.counter_for_test(WorkerCounter::FramingProfileIncompatible),
         1
     );
     runtime.shutdown_resources().unwrap();
@@ -560,6 +644,14 @@ async fn worker_shutdown_zeros_all_terminal_population_gauges() {
     );
     assert_eq!(
         telemetry.gauge_for_test(WorkerGauge::FilesRemovedWaiting),
+        0
+    );
+    assert_eq!(
+        telemetry.gauge_for_test(WorkerGauge::PinnedRotatedHandles),
+        0
+    );
+    assert_eq!(
+        telemetry.gauge_for_test(WorkerGauge::PinnedRotatedOldestAgeNs),
         0
     );
     assert_eq!(telemetry.gauge_for_test(WorkerGauge::FilesPending), 0);
@@ -2380,6 +2472,7 @@ async fn unlink_reads_acked_late_write_before_finalization() {
 
     std::fs::remove_file(&source).unwrap();
     wait_for_worker_gauge(&telemetry, WorkerGauge::FilesRemovedWaiting, 1).await;
+    wait_for_worker_gauge(&telemetry, WorkerGauge::PinnedRotatedHandles, 1).await;
     late_writer.write_all(b"late\n").unwrap();
     late_writer.flush().unwrap();
     let late = receive_batch(&mut events).await;
@@ -2395,6 +2488,7 @@ async fn unlink_reads_acked_late_write_before_finalization() {
     drop(late_writer);
 
     wait_for_worker_gauge(&telemetry, WorkerGauge::FilesRemovedWaiting, 0).await;
+    wait_for_worker_gauge(&telemetry, WorkerGauge::PinnedRotatedHandles, 0).await;
     stop_worker(worker, &mut events).await.unwrap();
 
     let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
@@ -4020,6 +4114,12 @@ fn retention_cleans_preappend_generation_before_filtered_compaction() {
             locator: expired_locator,
             reconciliation_generation: revalidated.stats.generation,
         })]
+    );
+    assert_eq!(
+        runtime
+            .telemetry
+            .counter_for_test(WorkerCounter::CheckpointRecordsRemoved),
+        1
     );
     runtime.shutdown_resources().unwrap();
 }
