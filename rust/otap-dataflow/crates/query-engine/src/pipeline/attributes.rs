@@ -47,7 +47,14 @@ impl PipelineStage for AttributeTransformPipelineStage {
             AttributesIdentifier::Root => match otap_batch {
                 OtapArrowRecords::Logs(_) => ArrowPayloadType::LogAttrs,
                 OtapArrowRecords::Traces(_) => ArrowPayloadType::SpanAttrs,
-                _ => ArrowPayloadType::MetricAttrs,
+                OtapArrowRecords::Metrics(_) => ArrowPayloadType::MetricAttrs,
+                OtapArrowRecords::Profiles(_) => {
+                    return Err(crate::error::Error::NotYetSupportedError {
+                        message:
+                            "generic query attribute transforms do not define a Profiles owner"
+                                .into(),
+                    });
+                }
             },
             AttributesIdentifier::NonRoot(payload_type) => payload_type,
         };

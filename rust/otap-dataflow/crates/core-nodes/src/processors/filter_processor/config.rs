@@ -5,7 +5,7 @@
 //!
 
 use otel_arrow_dfe_pdata::otap::filter::{
-    logs::LogFilter, metrics::MetricFilter, traces::TraceFilter,
+    logs::LogFilter, metrics::MetricFilter, profiles::ProfileFilter, traces::TraceFilter,
 };
 
 use serde::Deserialize;
@@ -18,6 +18,8 @@ pub struct Config {
     logs: LogFilter,
     #[serde(default = "default_trace_filter")]
     traces: TraceFilter,
+    #[serde(default)]
+    profiles: ProfileFilter,
 }
 
 /// create empty log filter as default value
@@ -36,23 +38,21 @@ const fn default_trace_filter() -> TraceFilter {
 }
 
 impl Config {
-    pub const fn new(logs: LogFilter, traces: TraceFilter) -> Self {
+    pub fn new(logs: LogFilter, traces: TraceFilter) -> Self {
         Self {
             metrics: MetricFilter::new(None, None),
             logs,
             traces,
+            profiles: ProfileFilter::default(),
         }
     }
 
-    pub const fn new_with_metrics(
-        metrics: MetricFilter,
-        logs: LogFilter,
-        traces: TraceFilter,
-    ) -> Self {
+    pub fn new_with_metrics(metrics: MetricFilter, logs: LogFilter, traces: TraceFilter) -> Self {
         Self {
             metrics,
             logs,
             traces,
+            profiles: ProfileFilter::default(),
         }
     }
 
@@ -69,5 +69,10 @@ impl Config {
     #[must_use]
     pub const fn trace_filters(&self) -> &TraceFilter {
         &self.traces
+    }
+
+    #[must_use]
+    pub const fn profile_filters(&self) -> &ProfileFilter {
+        &self.profiles
     }
 }

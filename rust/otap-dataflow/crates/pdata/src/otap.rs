@@ -11,6 +11,7 @@ use transform::transport_optimize::{
     remove_transport_optimized_encodings,
 };
 
+use crate::views::otap::profiles::validate_shared_attribute_keys;
 use crate::{
     decode::record_message::RecordMessage,
     error::{self, Result},
@@ -1106,15 +1107,54 @@ impl Profiles {
     pub fn into_raw(self) -> raw_batch_store::RawProfilesStore {
         self.inner
     }
+
+    fn validate_canonical(self) -> Result<Self> {
+        let batches: Vec<_> = Self::allowed_payload_types()
+            .iter()
+            .copied()
+            .filter(|payload_type| {
+                !matches!(
+                    payload_type,
+                    ArrowPayloadType::ResourceAttrs | ArrowPayloadType::ScopeAttrs
+                )
+            })
+            .filter_map(|payload_type| {
+                self.get(payload_type)
+                    .cloned()
+                    .map(|batch| (payload_type, batch))
+            })
+            .collect();
+        let view = ProfilesBatchView::try_new(&batches)
+            .map_err(|source| error::Error::InvalidProfilesGraph { source })?;
+        view.validate_graph()
+            .map_err(|source| error::Error::InvalidProfilesGraph { source })?;
+        for payload_type in [
+            ArrowPayloadType::ResourceAttrs,
+            ArrowPayloadType::ScopeAttrs,
+        ] {
+            if let Some(batch) = self.get(payload_type) {
+                validate_shared_attribute_keys(batch, payload_type)
+                    .map_err(|source| error::Error::InvalidProfilesGraph { source })?;
+            }
+        }
+        Ok(self)
+    }
 }
 
 impl TryFrom<raw_batch_store::RawProfilesStore> for Profiles {
     type Error = error::Error;
 
-    fn try_from(raw: raw_batch_store::RawProfilesStore) -> Result<Self> {
+    fn try_from(mut raw: raw_batch_store::RawProfilesStore) -> Result<Self> {
+        for payload_type in Self::allowed_payload_types().iter().copied() {
+            if let Some(batch) = raw.get(payload_type).cloned() {
+                raw.set(
+                    payload_type,
+                    remove_transport_optimized_encodings(payload_type, &batch)?,
+                );
+            }
+        }
         validate_raw_batches(&raw, Self::allowed_payload_types())?;
-        let profiles = Self { inner: raw };
-        profiles.validate()
+        Self { inner: raw }.validate_canonical()
     }
 }
 
@@ -1156,35 +1196,28 @@ impl OtapBatchStore for Profiles {
         ]
     }
 
-    fn decode_transport_optimized_ids(_otap_batch: &mut OtapArrowRecords) -> Result<()> {
+    fn decode_transport_optimized_ids(otap_batch: &mut OtapArrowRecords) -> Result<()> {
+        for payload_type in Self::allowed_payload_types().iter().copied() {
+            if let Some(batch) = otap_batch.get(payload_type) {
+                let batch = remove_transport_optimized_encodings(payload_type, batch)?;
+                otap_batch.set(payload_type, batch)?;
+            }
+        }
         Ok(())
     }
 
-    fn encode_transport_optimized(_otap_batch: &mut OtapArrowRecords) -> Result<()> {
+    fn encode_transport_optimized(otap_batch: &mut OtapArrowRecords) -> Result<()> {
+        for payload_type in Self::allowed_payload_types().iter().copied() {
+            if let Some(batch) = otap_batch.get(payload_type) {
+                let (batch, _) = apply_transport_optimized_encodings(&payload_type, batch)?;
+                otap_batch.set(payload_type, batch)?;
+            }
+        }
         Ok(())
     }
 
     fn validate(self) -> Result<Self> {
-        let batches: Vec<_> = Self::allowed_payload_types()
-            .iter()
-            .copied()
-            .filter(|payload_type| {
-                !matches!(
-                    payload_type,
-                    ArrowPayloadType::ResourceAttrs | ArrowPayloadType::ScopeAttrs
-                )
-            })
-            .filter_map(|payload_type| {
-                self.get(payload_type)
-                    .cloned()
-                    .map(|batch| (payload_type, batch))
-            })
-            .collect();
-        let view = ProfilesBatchView::try_new(&batches)
-            .map_err(|source| error::Error::InvalidProfilesGraph { source })?;
-        view.validate_graph()
-            .map_err(|source| error::Error::InvalidProfilesGraph { source })?;
-        Ok(self)
+        Self::try_from(self.inner)
     }
 
     fn set(&mut self, payload_type: ArrowPayloadType, record_batch: RecordBatch) -> Result<()> {

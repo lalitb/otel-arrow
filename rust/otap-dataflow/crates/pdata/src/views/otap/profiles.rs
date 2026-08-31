@@ -5,10 +5,13 @@
 
 use std::collections::{HashMap, HashSet};
 
-use arrow::array::{Array, LargeListArray, RecordBatch, UInt8Array, UInt32Array};
+use arrow::array::{Array, LargeListArray, RecordBatch, UInt8Array, UInt16Array, UInt32Array};
 use arrow::datatypes::{Int64Type, UInt64Type};
 
-use crate::arrays::{NullableArrayAccessor, StringArrayAccessor, UInt32ArrayAccessor};
+use crate::arrays::{
+    MaybeDictArrayAccessor, NullableArrayAccessor, StringArrayAccessor, UInt32ArrayAccessor,
+    get_u64_array,
+};
 use crate::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 use crate::schema::{consts, payloads};
 
@@ -113,6 +116,42 @@ pub enum ProfilesValidationError {
         /// The sample containing the lists.
         sample_id: u32,
     },
+    /// One owner has more than one attribute with the same key.
+    #[error("duplicate attribute key {key:?} for parent {parent_id} in {payload_type:?}")]
+    DuplicateAttributeKey {
+        /// The attribute payload.
+        payload_type: ArrowPayloadType,
+        /// The owning entity ID.
+        parent_id: u32,
+        /// The duplicated key.
+        key: String,
+    },
+    /// A nonzero function entity has no identifying string.
+    #[error("zero function row for function {function_id}")]
+    ZeroFunction {
+        /// The invalid function ID.
+        function_id: u32,
+    },
+    /// An attribute key is empty.
+    #[error("empty attribute key for parent {parent_id} in {payload_type:?}")]
+    EmptyAttributeKey {
+        /// The attribute payload.
+        payload_type: ArrowPayloadType,
+        /// The owning entity ID.
+        parent_id: u32,
+    },
+    /// A nonzero mapping entity is structurally equal to the reserved zero mapping.
+    #[error("zero mapping row for mapping {mapping_id}")]
+    ZeroMapping {
+        /// The invalid mapping ID.
+        mapping_id: u32,
+    },
+    /// A nonzero location entity is structurally equal to the reserved zero location.
+    #[error("zero location row for location {location_id}")]
+    ZeroLocation {
+        /// The invalid location ID.
+        location_id: u32,
+    },
 }
 
 impl<'a> ProfilesBatchView<'a> {
@@ -209,6 +248,196 @@ impl<'a> ProfilesBatchView<'a> {
 
         self.validate_value_type_roles()?;
         self.validate_observations()?;
+        self.validate_functions()?;
+        self.validate_mappings()?;
+        self.validate_locations()?;
+        for payload_type in [
+            ArrowPayloadType::ProfileAttrs,
+            ArrowPayloadType::ProfileSampleAttrs,
+            ArrowPayloadType::ProfileMappingAttrs,
+            ArrowPayloadType::ProfileLocationAttrs,
+        ] {
+            self.validate_attribute_keys(payload_type)?;
+        }
+        Ok(())
+    }
+
+    fn validate_functions(&self) -> Result<(), ProfilesValidationError> {
+        let payload_type = ArrowPayloadType::ProfileFunctions;
+        let Some(batch) = self.get(payload_type) else {
+            return Ok(());
+        };
+        let ids = native_u32(batch, payload_type, consts::ID)?;
+        let names = optional_strings(batch, payload_type, consts::NAME)?;
+        let system_names = optional_strings(batch, payload_type, consts::SYSTEM_NAME)?;
+        let filenames = optional_strings(batch, payload_type, consts::FILENAME)?;
+        for row in 0..batch.num_rows() {
+            if names
+                .as_ref()
+                .and_then(|values| values.str_at(row))
+                .unwrap_or_default()
+                .is_empty()
+                && system_names
+                    .as_ref()
+                    .and_then(|values| values.str_at(row))
+                    .unwrap_or_default()
+                    .is_empty()
+                && filenames
+                    .as_ref()
+                    .and_then(|values| values.str_at(row))
+                    .unwrap_or_default()
+                    .is_empty()
+            {
+                return Err(ProfilesValidationError::ZeroFunction {
+                    function_id: ids.value(row),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_mappings(&self) -> Result<(), ProfilesValidationError> {
+        let payload_type = ArrowPayloadType::ProfileMappings;
+        let Some(batch) = self.get(payload_type) else {
+            return Ok(());
+        };
+        let ids = native_u32(batch, payload_type, consts::ID)?;
+        let starts = get_u64_array(batch, consts::MEMORY_START).map_err(|error| {
+            ProfilesValidationError::InvalidColumn {
+                payload_type,
+                column: consts::MEMORY_START,
+                message: error.to_string(),
+            }
+        })?;
+        let limits = get_u64_array(batch, consts::MEMORY_LIMIT).map_err(|error| {
+            ProfilesValidationError::InvalidColumn {
+                payload_type,
+                column: consts::MEMORY_LIMIT,
+                message: error.to_string(),
+            }
+        })?;
+        let offsets = get_u64_array(batch, consts::FILE_OFFSET).map_err(|error| {
+            ProfilesValidationError::InvalidColumn {
+                payload_type,
+                column: consts::FILE_OFFSET,
+                message: error.to_string(),
+            }
+        })?;
+        let filenames = optional_strings(batch, payload_type, consts::FILENAME)?;
+        let attributed = self.parent_ids(ArrowPayloadType::ProfileMappingAttrs)?;
+        for row in 0..batch.num_rows() {
+            let id = ids.value(row);
+            if starts.value(row) == 0
+                && limits.value(row) == 0
+                && offsets.value(row) == 0
+                && filenames
+                    .as_ref()
+                    .and_then(|values| values.str_at(row))
+                    .unwrap_or_default()
+                    .is_empty()
+                && !attributed.contains(&id)
+            {
+                return Err(ProfilesValidationError::ZeroMapping { mapping_id: id });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_locations(&self) -> Result<(), ProfilesValidationError> {
+        let payload_type = ArrowPayloadType::ProfileLocations;
+        let Some(batch) = self.get(payload_type) else {
+            return Ok(());
+        };
+        let ids = native_u32(batch, payload_type, consts::ID)?;
+        let addresses = get_u64_array(batch, consts::ADDRESS).map_err(|error| {
+            ProfilesValidationError::InvalidColumn {
+                payload_type,
+                column: consts::ADDRESS,
+                message: error.to_string(),
+            }
+        })?;
+        let mapping_ids = batch
+            .column_by_name(consts::MAPPING_ID)
+            .map(|array| {
+                array.as_any().downcast_ref::<UInt32Array>().ok_or_else(|| {
+                    ProfilesValidationError::InvalidColumn {
+                        payload_type,
+                        column: consts::MAPPING_ID,
+                        message: format!("expected UInt32, got {}", array.data_type()),
+                    }
+                })
+            })
+            .transpose()?;
+        let lined = self.parent_ids(ArrowPayloadType::ProfileLocationLines)?;
+        let attributed = self.parent_ids(ArrowPayloadType::ProfileLocationAttrs)?;
+        for row in 0..batch.num_rows() {
+            let id = ids.value(row);
+            if mapping_ids
+                .and_then(|values| values.value_at(row))
+                .is_none()
+                && addresses.value(row) == 0
+                && !lined.contains(&id)
+                && !attributed.contains(&id)
+            {
+                return Err(ProfilesValidationError::ZeroLocation { location_id: id });
+            }
+        }
+        Ok(())
+    }
+
+    fn parent_ids(
+        &self,
+        payload_type: ArrowPayloadType,
+    ) -> Result<HashSet<u32>, ProfilesValidationError> {
+        let Some(batch) = self.get(payload_type) else {
+            return Ok(HashSet::new());
+        };
+        let parents = required_u32(batch, payload_type, consts::PARENT_ID)?;
+        Ok((0..parents.len())
+            .filter_map(|row| parents.value_at(row))
+            .collect())
+    }
+
+    fn validate_attribute_keys(
+        &self,
+        payload_type: ArrowPayloadType,
+    ) -> Result<(), ProfilesValidationError> {
+        let Some(batch) = self.get(payload_type) else {
+            return Ok(());
+        };
+        let parents = required_u32(batch, payload_type, consts::PARENT_ID)?;
+        let keys = batch
+            .column_by_name(consts::ATTRIBUTE_KEY)
+            .map(StringArrayAccessor::try_new)
+            .transpose()
+            .map_err(|error| ProfilesValidationError::InvalidColumn {
+                payload_type,
+                column: consts::ATTRIBUTE_KEY,
+                message: error.to_string(),
+            })?
+            .ok_or_else(|| ProfilesValidationError::InvalidColumn {
+                payload_type,
+                column: consts::ATTRIBUTE_KEY,
+                message: "missing key".to_string(),
+            })?;
+        let mut seen = HashSet::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            let parent_id = parents.value_at(row).unwrap_or_default();
+            let key = keys.str_at(row).unwrap_or_default();
+            if key.is_empty() {
+                return Err(ProfilesValidationError::EmptyAttributeKey {
+                    payload_type,
+                    parent_id,
+                });
+            }
+            if !seen.insert((parent_id, key)) {
+                return Err(ProfilesValidationError::DuplicateAttributeKey {
+                    payload_type,
+                    parent_id,
+                    key: key.to_string(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -397,6 +626,69 @@ impl<'a> ProfilesBatchView<'a> {
         }
         Ok(())
     }
+}
+
+/// Validate unique keys for shared resource or scope attribute owners.
+pub(crate) fn validate_shared_attribute_keys(
+    batch: &RecordBatch,
+    payload_type: ArrowPayloadType,
+) -> Result<(), ProfilesValidationError> {
+    let parents =
+        MaybeDictArrayAccessor::<UInt16Array>::try_new_for_column(batch, consts::PARENT_ID)
+            .map_err(|error| ProfilesValidationError::InvalidColumn {
+                payload_type,
+                column: consts::PARENT_ID,
+                message: error.to_string(),
+            })?;
+    let keys = batch
+        .column_by_name(consts::ATTRIBUTE_KEY)
+        .map(StringArrayAccessor::try_new)
+        .transpose()
+        .map_err(|error| ProfilesValidationError::InvalidColumn {
+            payload_type,
+            column: consts::ATTRIBUTE_KEY,
+            message: error.to_string(),
+        })?
+        .ok_or_else(|| ProfilesValidationError::InvalidColumn {
+            payload_type,
+            column: consts::ATTRIBUTE_KEY,
+            message: "missing key".to_string(),
+        })?;
+    let mut seen = HashSet::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        let parent_id = parents.value_at(row).unwrap_or_default();
+        let key = keys.str_at(row).unwrap_or_default();
+        if key.is_empty() {
+            return Err(ProfilesValidationError::EmptyAttributeKey {
+                payload_type,
+                parent_id: u32::from(parent_id),
+            });
+        }
+        if !seen.insert((parent_id, key)) {
+            return Err(ProfilesValidationError::DuplicateAttributeKey {
+                payload_type,
+                parent_id: u32::from(parent_id),
+                key: key.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn optional_strings<'a>(
+    batch: &'a RecordBatch,
+    payload_type: ArrowPayloadType,
+    column: &'static str,
+) -> Result<Option<StringArrayAccessor<'a>>, ProfilesValidationError> {
+    batch
+        .column_by_name(column)
+        .map(StringArrayAccessor::try_new)
+        .transpose()
+        .map_err(|error| ProfilesValidationError::InvalidColumn {
+            payload_type,
+            column,
+            message: error.to_string(),
+        })
 }
 
 fn payload_index(payload_type: ArrowPayloadType) -> Option<usize> {
@@ -665,6 +957,30 @@ mod tests {
                 id: 1,
                 reason: "duplicate",
             })
+        );
+    }
+
+    /// Scenario: An orphan function row has empty name, system name, and filename values.
+    /// Guarantees: Canonical Profiles validation rejects a nonzero zero-function entity.
+    #[test]
+    fn rejects_zero_function_row() {
+        let mut batches = minimal_batches(1, &[&[7]], &[&[11]]);
+        batches.push((
+            ArrowPayloadType::ProfileFunctions,
+            RecordBatch::try_from_iter([
+                (consts::ID, Arc::new(UInt32Array::from(vec![1])) as ArrayRef),
+                (
+                    consts::FILENAME,
+                    Arc::new(StringArray::from(vec![""])) as ArrayRef,
+                ),
+            ])
+            .unwrap(),
+        ));
+
+        let view = ProfilesBatchView::try_new(&batches).unwrap();
+        assert_eq!(
+            view.validate_graph(),
+            Err(ProfilesValidationError::ZeroFunction { function_id: 1 })
         );
     }
 

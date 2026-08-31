@@ -10,8 +10,8 @@
 
 ## Overview
 
-The filter processor drops logs or traces according to configured include and
-exclude rules. Metrics currently pass through unchanged.
+The filter processor drops logs, metric streams, traces, or individual Profiles
+samples according to signal-specific include and exclude rules.
 
 For reference, compare the Go Collector
 [filter processor](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/processor/filterprocessor/README.md).
@@ -34,7 +34,7 @@ config:
 ## Configuration
 
 The node-level config can define independent filter rules for metrics, logs,
-and traces:
+traces, and Profiles:
 
 ```yaml
 type: processor:filter
@@ -114,6 +114,25 @@ config:
       link_attributes:
         - key: correlation
           value: false
+  profiles:
+    include:
+      match_type: strict
+      sample_attributes:
+        - key: process.executable.name
+          value: checkout
+    exclude:
+      match_type: regexp
+      sample_attributes:
+        - key: thread.name
+          value: ^internal-.*
+    # Shared dimensions are retained by default.
+    compact: true
+    # Dense IDs are rewritten only when compaction is enabled.
+    dense_ids: true
+    limits:
+      max_output_rows: 1000000
+      max_output_bytes: 268435456
+      max_cloned_rows: 100000
 ```
 
 For a runnable metric-name filter pipeline, see
@@ -145,6 +164,18 @@ for each of the remaining fields only one entry has to match),
 `span_attributes`, `span_names`, `event_names`, `event_attributes` and
 `link_attributes`.
 
+### Profiles
+
+Profiles filtering selects `SAMPLES` rows by sample-owned scalar attributes.
+String values support `strict` and `regexp`; integer, double, and boolean values
+use exact matching. Complex array and key/value-list criteria are rejected.
+
+Filtering does not remove shared stacks or symbols implicitly. Set
+`profiles.compact: true` to remove unreachable stacks, locations, mappings,
+functions, links, and their owned attributes. `dense_ids: true` additionally
+rewrites all retained Profiles IDs and foreign keys into deterministic dense
+ranges.
+
 ## Telemetry
 
 These tables list telemetry emitted directly by this node. Common engine
@@ -157,6 +188,7 @@ runtime metric sets may also be attached by the pipeline telemetry policy.
 | Metric | Unit | Description |
 | --- | --- | --- |
 | `processor.filter.pdata.dropped.items` | `{item}` | Number of signal items (log records, spans, or metric data points) a decision node chose to drop. |
+| `processor.filter.pdata.dropped.samples` | `{sample}` | Number of Profiles samples removed without dropping their owning profile. |
 
 ### Events
 
@@ -166,9 +198,13 @@ runtime metric sets may also be attached by the pipeline telemetry policy.
 
 ## Limits
 
-- Metric filtering is not currently supported.
 - Include and exclude semantics depend on the signal-specific filter type in
   `otel-arrow-dfe-pdata`.
+- Profiles filtering supports sample-owned attributes only. Resource, scope,
+  profile, mapping, and location predicates require owner splitting or
+  copy-on-write semantics and remain unsupported.
+- Profiles compaction is explicit because it can traverse and rewrite the full
+  BAR-scoped graph.
 
 ## Related Docs
 

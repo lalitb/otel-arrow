@@ -17,6 +17,10 @@ updating, renaming, and hashing attributes.
 The processor can apply actions to signal attributes, resource attributes,
 scope attributes, or any combination of those domains.
 
+For Profiles, the `signal` domain covers profile-, sample-, mapping-, and
+location-owned attributes across the complete BAR. Mapping and location
+changes are therefore global to those shared owners.
+
 ## Getting Started
 
 Start with an ordered action list and the attribute domains to mutate:
@@ -25,6 +29,11 @@ Start with an ordered action list and the attribute domains to mutate:
 type: processor:attribute
 config:
   apply_to: ["resource", "signal"]
+
+  profiles_limits:
+    max_output_rows: 1000000
+    max_output_bytes: 268435456
+    max_cloned_rows: 100000
   actions:
     - action: upsert
       key: deployment.environment
@@ -86,6 +95,12 @@ Supported actions:
 `hash.algorithm` defaults to `sha256`; `hash.salt` defaults to an empty string.
 Unsupported action variants are accepted for forward compatibility and ignored.
 
+Profiles signal attributes currently support `rename` and `delete`. The
+processor rejects Profiles `insert`, `upsert`, `update`, and `hash` because the
+generic value builder does not preserve the required `ordinal` and `unit`
+columns. The same action restriction applies to Profiles resource and scope
+domains, which remain whole-owner, BAR-global operations.
+
 ## Examples
 
 Rename a resource attribute:
@@ -124,6 +139,10 @@ runtime metric sets may also be attached by the pipeline telemetry policy.
 
 - `apply_to` values other than `signal`, `resource`, or `scope` are rejected.
 - Hashing supports scalar values and currently documents `sha256`.
+- Profiles mapping and location transformations affect every path referencing
+  those shared owners; this processor does not present them as sample-local.
+- Selection-local shared-entity mutation is available only through bounded
+  native Profiles copy-on-write kernels.
 - The same key cannot currently be used by more than one action in a single
   action list; see [issue #1036](https://github.com/open-telemetry/otel-arrow/issues/1036).
 - Unsupported actions deserialize but are ignored.

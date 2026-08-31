@@ -145,7 +145,7 @@ pub(super) fn eval_datafusion_expr_value(
                     otap_batch.root_record_batch().map(Cow::Borrowed)
                 }
                 DataScope::Attribute(attrs_id, key) => {
-                    let attrs_payload_type = resolve_attrs_payload_type(attrs_id, otap_batch);
+                    let attrs_payload_type = resolve_attrs_payload_type(attrs_id, otap_batch)?;
                     otap_batch
                         .get(attrs_payload_type)
                         .map(|rb| project_attrs(rb, key.as_str(), *attr_key_case_sensitive))
@@ -154,7 +154,7 @@ pub(super) fn eval_datafusion_expr_value(
                         .map(Cow::Owned)
                 }
                 DataScope::AttributesAll(attrs_id) => {
-                    let attrs_payload_type = resolve_attrs_payload_type(attrs_id, otap_batch);
+                    let attrs_payload_type = resolve_attrs_payload_type(attrs_id, otap_batch)?;
                     otap_batch.get(attrs_payload_type).map(Cow::Borrowed)
                 }
                 DataScope::StaticScalar => Some(Cow::Borrowed(SCALAR_RECORD_BATCH_INPUT.deref())),
@@ -587,14 +587,26 @@ fn evaluate_with_anyval_partitions(
 pub(crate) fn resolve_attrs_payload_type(
     attrs_id: &AttributesIdentifier,
     otap_batch: &OtapArrowRecords,
-) -> ArrowPayloadType {
+) -> Result<ArrowPayloadType> {
+    if matches!(otap_batch, OtapArrowRecords::Profiles(_)) {
+        return Err(Error::NotYetSupportedError {
+            message: "generic query attribute evaluation does not define Profiles owner semantics"
+                .into(),
+        });
+    }
     match *attrs_id {
         AttributesIdentifier::Root => match otap_batch.root_payload_type() {
-            ArrowPayloadType::Logs => ArrowPayloadType::LogAttrs,
-            ArrowPayloadType::Spans => ArrowPayloadType::SpanAttrs,
-            _ => ArrowPayloadType::MetricAttrs,
+            ArrowPayloadType::Logs => Ok(ArrowPayloadType::LogAttrs),
+            ArrowPayloadType::Spans => Ok(ArrowPayloadType::SpanAttrs),
+            ArrowPayloadType::UnivariateMetrics | ArrowPayloadType::MultivariateMetrics => {
+                Ok(ArrowPayloadType::MetricAttrs)
+            }
+            ArrowPayloadType::Profiles => unreachable!("Profiles rejected above"),
+            _ => Err(Error::ExecutionError {
+                cause: "unexpected root payload type".into(),
+            }),
         },
-        AttributesIdentifier::NonRoot(payload_type) => payload_type,
+        AttributesIdentifier::NonRoot(payload_type) => Ok(payload_type),
     }
 }
 
@@ -978,4 +990,20 @@ pub(crate) fn align_value_to_root(
         result_scope.as_ref().clone(),
         root_batch,
     ))
+}
+
+#[cfg(test)]
+mod profiles_tests {
+    use super::*;
+    use otel_arrow_dfe_pdata::otap::Profiles;
+
+    /// Scenario: Generic root attribute evaluation is requested for a Profiles BAR.
+    /// Guarantees: Query evaluation rejects ambiguous owner semantics instead of using MetricAttrs.
+    #[test]
+    fn rejects_profiles_root_attribute_resolution() {
+        let records = OtapArrowRecords::Profiles(Profiles::default());
+        let result = resolve_attrs_payload_type(&AttributesIdentifier::Root, &records);
+
+        assert!(matches!(result, Err(Error::NotYetSupportedError { .. })));
+    }
 }

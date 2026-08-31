@@ -42,6 +42,7 @@ use crate::schema::consts::{self, metadata};
 use crate::schema::{get_field_metadata, update_field_metadata};
 
 pub mod concatenate;
+pub mod profiles;
 pub mod reindex;
 pub mod sanitize;
 pub mod split;
@@ -86,7 +87,7 @@ where
             expect: T::DATA_TYPE,
         })?;
 
-    let new_column = Arc::new(remove_delta_encoding_from_column(column));
+    let new_column = Arc::new(remove_delta_encoding_from_column(column)?);
     let columns = record_batch
         .columns()
         .iter()
@@ -113,8 +114,7 @@ where
         .expect("should be able to create record batch"))
 }
 
-#[must_use]
-pub fn remove_delta_encoding_from_column<T>(array: &PrimitiveArray<T>) -> PrimitiveArray<T>
+pub fn remove_delta_encoding_from_column<T>(array: &PrimitiveArray<T>) -> Result<PrimitiveArray<T>>
 where
     T: ArrowPrimitiveType,
     <T as ArrowPrimitiveType>::Native: AddAssign + Copy,
@@ -126,19 +126,26 @@ where
     if let Some(nulls) = array.nulls() {
         for (start, end) in BitSliceIterator::new(nulls.buffer().as_slice(), 0, array.len()) {
             for delta in new_values.iter_mut().take(end).skip(start) {
-                acc += *delta;
+                acc = acc.add_checked(*delta).map_err(|_| Error::Format {
+                    error: "overflow decoding delta-encoded ID column".to_string(),
+                })?;
                 *delta = acc;
             }
         }
     } else {
         // no nulls, just accumulate every value
         for delta in new_values.iter_mut().take(array.len()) {
-            acc += *delta;
+            acc = acc.add_checked(*delta).map_err(|_| Error::Format {
+                error: "overflow decoding delta-encoded ID column".to_string(),
+            })?;
             *delta = acc;
         }
     }
 
-    PrimitiveArray::<T>::new(ScalarBuffer::from(new_values), array.nulls().cloned())
+    Ok(PrimitiveArray::<T>::new(
+        ScalarBuffer::from(new_values),
+        array.nulls().cloned(),
+    ))
 }
 
 /// Decodes the parent IDs from their transport optimized encoding to the actual ID values.
@@ -447,7 +454,11 @@ where
 
                     // process delta-encoded range
                     while batch_idx < batch_delta_end {
-                        curr_parent_id += materialized_parent_ids[batch_idx];
+                        curr_parent_id = curr_parent_id
+                            .add_checked(materialized_parent_ids[batch_idx])
+                            .map_err(|_| Error::Format {
+                                error: "overflow decoding quasi-delta parent ID column".to_string(),
+                            })?;
                         materialized_parent_ids[batch_idx] = curr_parent_id;
                         batch_idx += 1;
                     }
@@ -567,7 +578,11 @@ where
     for i in 1..record_batch.num_rows() {
         let delta_or_parent_id = encoded_parent_ids.value(i);
         if eq_next.value(i - 1) {
-            curr_parent_id += delta_or_parent_id;
+            curr_parent_id = curr_parent_id
+                .add_checked(delta_or_parent_id)
+                .map_err(|_| Error::Format {
+                    error: "overflow decoding columnar quasi-delta parent ID column".to_string(),
+                })?;
         } else {
             curr_parent_id = delta_or_parent_id;
         }
@@ -1071,6 +1086,14 @@ pub fn apply_attribute_transform(
         ArrowPayloadType::HistogramDpExemplarAttrs => ArrowPayloadType::HistogramDpExemplars,
         ArrowPayloadType::ExpHistogramDpAttrs => ArrowPayloadType::ExpHistogramDataPoints,
         ArrowPayloadType::ExpHistogramDpExemplarAttrs => ArrowPayloadType::ExpHistogramDpExemplars,
+        ArrowPayloadType::ProfileAttrs
+        | ArrowPayloadType::ProfileSampleAttrs
+        | ArrowPayloadType::ProfileMappingAttrs
+        | ArrowPayloadType::ProfileLocationAttrs => {
+            return Err(Error::UnsupportedProfilesTransform {
+                operation: "use the Profiles attribute transform API to preserve UInt32 owners and ordinals",
+            });
+        }
         _ => {
             // what we've been passed is not an attributes payload type, so no transform to apply
             return Ok(compute_stats.then_some(TransformStats::default()));

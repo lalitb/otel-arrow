@@ -102,6 +102,7 @@ mod tests {
             ],
         )
         .unwrap();
+        let samples = crate::otap::testing::mark_id_columns_plain(samples);
 
         let mut profiles = Profiles::default();
         profiles.set(ArrowPayloadType::Profiles, root).unwrap();

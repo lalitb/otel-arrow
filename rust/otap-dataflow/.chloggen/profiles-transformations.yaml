@@ -1,0 +1,7 @@
+change_type: enhancement
+component: pipeline
+note: "Add bounded native filtering, compaction, attribute redaction, and copy-on-write for OTAP Profiles."
+issues: [2303]
+subtext: >-
+  Filters samples by scalar attributes, optionally compacts shared dimensions,
+  preserves owner semantics, and rejects unsupported graph mutations.

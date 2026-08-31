@@ -119,6 +119,12 @@ impl FilterProcessor {
             serde_json::from_value(config.clone()).map_err(|e| ConfigError::InvalidUserConfig {
                 error: e.to_string(),
             })?;
+        config
+            .profile_filters()
+            .validate()
+            .map_err(|e| ConfigError::InvalidUserConfig {
+                error: e.to_string(),
+            })?;
         Ok(FilterProcessor {
             config,
             metrics,
@@ -160,8 +166,9 @@ impl local::Processor<OtapPdata> for FilterProcessor {
                 let mut arrow_records: OtapArrowRecords = payload.try_into_with_default()?;
                 arrow_records.decode_transport_optimized_ids()?;
 
-                let (filtered_arrow_records, _signals_consumed, dropped_items): (
+                let (filtered_arrow_records, _signals_consumed, dropped_items, dropped_samples): (
                     OtapArrowRecords,
+                    u64,
                     u64,
                     u64,
                 ) =
@@ -181,7 +188,7 @@ impl local::Processor<OtapPdata> for FilterProcessor {
                                             source_detail,
                                         }
                                     })?;
-                                Ok((filtered, consumed, filtered_count))
+                                Ok((filtered, consumed, filtered_count, 0))
                             }
                             SignalType::Logs => {
                                 let (filtered, consumed, filtered_count) =
@@ -196,7 +203,7 @@ impl local::Processor<OtapPdata> for FilterProcessor {
                                             }
                                         },
                                     )?;
-                                Ok((filtered, consumed, filtered_count))
+                                Ok((filtered, consumed, filtered_count, 0))
                             }
                             SignalType::Traces => {
                                 let (filtered, consumed, filtered_count) =
@@ -211,14 +218,30 @@ impl local::Processor<OtapPdata> for FilterProcessor {
                                             }
                                         },
                                     )?;
-                                Ok((filtered, consumed, filtered_count))
+                                Ok((filtered, consumed, filtered_count, 0))
                             }
-                            SignalType::Profiles => Ok((arrow_records, 0, 0)),
+                            SignalType::Profiles => {
+                                let (filtered, consumed, filtered_count) = self
+                                    .config
+                                    .profile_filters()
+                                    .filter(arrow_records)
+                                    .map_err(|e| {
+                                        let source_detail = format_error_sources(&e);
+                                        Error::ProcessorError {
+                                            processor: effect_handler.processor_id(),
+                                            kind: ProcessorErrorKind::Other,
+                                            error: format!("Filter error: {e}"),
+                                            source_detail,
+                                        }
+                                    })?;
+                                Ok((filtered, consumed, 0, filtered_count))
+                            }
                         }
                     })?;
 
                 let metric = self.metrics.with(SignalAttributes { signal });
                 metric.dropped_items.add(dropped_items);
+                metric.dropped_samples.add(dropped_samples);
 
                 // Record the drop flow-metric. A no-op unless this node is
                 // a decision node in a flow that enables `dropped.items`.
@@ -259,6 +282,8 @@ mod tests {
     use otel_arrow_dfe_otap::pdata::OtapPdata;
     use otel_arrow_dfe_pdata::OtlpProtoBytes;
     use otel_arrow_dfe_pdata::TryIntoWithOptions;
+    use otel_arrow_dfe_pdata::encode::encode_profiles_otap_batch;
+    use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
     use otel_arrow_dfe_pdata::otap::filter::{
         AnyValue as AnyValueFilter, KeyValue as KeyValueFilter, MatchType,
         logs::{LogFilter, LogMatchProperties, LogSeverityNumberMatchProperties},
@@ -266,6 +291,7 @@ mod tests {
         traces::{TraceFilter, TraceMatchProperties},
     };
     use otel_arrow_dfe_pdata::proto::opentelemetry::{
+        arrow::v1::ArrowPayloadType,
         common::v1::{AnyValue, InstrumentationScope, KeyValue},
         logs::v1::{LogRecord, LogsData, ResourceLogs, ScopeLogs, SeverityNumber},
         metrics::v1::{
@@ -279,6 +305,7 @@ mod tests {
             status::StatusCode,
         },
     };
+    use otel_arrow_dfe_pdata::testing::profiles::{ProfilesDatasetKind, profiles_dataset};
     use otel_arrow_dfe_telemetry::registry::TelemetryRegistryHandle;
     use prost::Message as _;
     use serde_json::json;
@@ -915,6 +942,69 @@ mod tests {
                 assert_fully_filtered(&mut ctx, otlp_traces_bytes, SignalType::Traces).await;
             })
         }
+    }
+
+    /// Scenario: The filter processor receives Profiles with a strict sample-attribute include rule.
+    /// Guarantees: Only matching samples are forwarded and their graph remains valid after compaction.
+    #[test]
+    fn test_filter_processor_profiles_sample_attributes() {
+        let test_runtime = TestRuntime::new();
+        let user_config = Arc::new(NodeUserConfig::new_processor_config(FILTER_PROCESSOR_URN));
+        let telemetry_registry_handle = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(telemetry_registry_handle);
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        let config = json!({
+            "profiles": {
+                "include": {
+                    "match_type": "strict",
+                    "sample_attributes": [
+                        {
+                            "key": "sample.id",
+                            "value": "0:1"
+                        }
+                    ]
+                },
+                "compact": true,
+                "dense_ids": true
+            }
+        });
+        let processor = ProcessorWrapper::local(
+            FilterProcessor::from_config(pipeline_ctx, &config).unwrap(),
+            test_node(test_runtime.config().name.clone()),
+            user_config,
+            test_runtime.config(),
+        );
+
+        test_runtime
+            .set_processor(processor)
+            .run_test(|mut ctx| {
+                Box::pin(async move {
+                    let records = encode_profiles_otap_batch(&profiles_dataset(
+                        ProfilesDatasetKind::HighCardinalityAttributes,
+                        1,
+                        3,
+                        2,
+                    ))
+                    .unwrap();
+                    ctx.process(Message::PData(OtapPdata::new_default(records.into())))
+                        .await
+                        .expect("Profiles filter should process");
+                    let output = ctx.drain_pdata().await;
+                    assert_eq!(output.len(), 1);
+                    let (_, payload) = output.into_iter().next().unwrap().into_parts();
+                    let output: OtapArrowRecords = payload.try_into_with_default().unwrap();
+                    assert_eq!(output.get(ArrowPayloadType::Samples).unwrap().num_rows(), 1);
+                    assert_eq!(
+                        output
+                            .get(ArrowPayloadType::ProfileSampleAttrs)
+                            .unwrap()
+                            .num_rows(),
+                        1
+                    );
+                })
+            })
+            .validate(validation_procedure());
     }
 
     #[test]

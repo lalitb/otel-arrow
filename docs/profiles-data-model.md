@@ -751,6 +751,13 @@ The host validates handles, applies the native kernel, accounts for memory, and
 returns a new host-owned Profiles payload. Kernel failure must preserve the
 pipeline's Ack/Nack and failure-policy semantics.
 
+The current native implementation supports sample-attribute filtering,
+explicit reachability compaction with optional dense ID remapping, whole-owner
+attribute rename/delete, BAR-global function filename redaction, and bounded
+sample-local function-redaction copy-on-write. It keeps generic query stages and
+unimplemented value-changing attribute actions rejected rather than inferring
+owner semantics.
+
 ## Worked Example
 
 Consider one BAR containing two CPU profiles under different resources:
@@ -844,6 +851,12 @@ the existing OTAP protocol. Adaptive schemas may omit absent optional columns.
 An IPC dictionary is scoped to its Arrow stream and may be reset when the schema
 changes. Entity relationships never use IPC dictionary indexes, so a dictionary
 reset cannot invalidate a foreign key.
+
+Profiles parent columns declared as `delta` are sorted and encoded before OTAP
+transport, then materialized before graph validation or transformation.
+Internally constructed plain columns carry explicit metadata so they are not
+mistaken for metadata-free encoded input. Delta and quasi-delta overflow rejects
+the complete BAR.
 
 Logical row order never changes ID meaning, but a selected transport encoding
 may impose a physical sort contract. A related batch using `delta` on

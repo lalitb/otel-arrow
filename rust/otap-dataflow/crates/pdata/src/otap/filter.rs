@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 pub mod logs;
 pub mod metrics;
+pub mod profiles;
 pub mod traces;
 // threshold numbers to determine which method to use for building id filter
 // ToDo: determine optimimal numbers
@@ -1362,7 +1363,9 @@ fn get_attr_filter(
         let value_filter = match &attribute.value {
             AnyValue::String(value) => {
                 // get string column
-                let string_column = get_required_array(log_attrs, consts::ATTRIBUTE_STR)?;
+                let Some(string_column) = log_attrs.column_by_name(consts::ATTRIBUTE_STR) else {
+                    continue;
+                };
 
                 match match_type {
                     MatchType::Regexp => regex_match_column(string_column, value)?,

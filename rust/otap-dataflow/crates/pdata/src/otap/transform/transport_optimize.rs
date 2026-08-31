@@ -51,12 +51,8 @@ mod attributes;
 macro_rules! profile_payload_types {
     () => {
         ArrowPayloadType::Profiles
-            | ArrowPayloadType::ProfileValueTypes
-            | ArrowPayloadType::Samples
             | ArrowPayloadType::Stacks
-            | ArrowPayloadType::StackLocations
             | ArrowPayloadType::ProfileLocations
-            | ArrowPayloadType::ProfileLocationLines
             | ArrowPayloadType::ProfileFunctions
             | ArrowPayloadType::ProfileMappings
             | ArrowPayloadType::ProfileLinks
@@ -231,6 +227,14 @@ const fn get_column_encodings(
                 encoding: Encoding::ColumnarQuasiDelta(&[consts::TRACE_ID]),
             },
         ],
+        ArrowPayloadType::ProfileValueTypes
+        | ArrowPayloadType::Samples
+        | ArrowPayloadType::StackLocations
+        | ArrowPayloadType::ProfileLocationLines => &[ColumnEncoding {
+            path: consts::PARENT_ID,
+            data_type: DataType::UInt32,
+            encoding: Encoding::Delta,
+        }],
         ArrowPayloadType::Logs
         | &ArrowPayloadType::UnivariateMetrics
         | ArrowPayloadType::Spans
@@ -295,6 +299,10 @@ const fn get_sort_column_paths(payload_type: &ArrowPayloadType) -> &'static [&'s
 
         ArrowPayloadType::SpanEvents => &[consts::NAME, consts::PARENT_ID],
         ArrowPayloadType::SpanLinks => &[consts::TRACE_ID, consts::PARENT_ID],
+        ArrowPayloadType::ProfileValueTypes | ArrowPayloadType::Samples => &[consts::PARENT_ID],
+        ArrowPayloadType::StackLocations | ArrowPayloadType::ProfileLocationLines => {
+            &[consts::PARENT_ID, consts::ORDINAL]
+        }
         ArrowPayloadType::Logs => &[RESOURCE_ID_COL_PATH, SCOPE_ID_COL_PATH, consts::TRACE_ID],
         ArrowPayloadType::Spans => &[
             RESOURCE_ID_COL_PATH,
@@ -748,6 +756,12 @@ fn remove_parent_id_column_encoding(
         | ArrowPayloadType::ExpHistogramDpExemplars => {
             materialize_parent_id_for_exemplars::<u32>(record_batch)
         }
+        ArrowPayloadType::ProfileValueTypes
+        | ArrowPayloadType::Samples
+        | ArrowPayloadType::StackLocations
+        | ArrowPayloadType::ProfileLocationLines => {
+            remove_delta_encoding::<UInt32Type>(record_batch, consts::PARENT_ID)
+        }
 
         ArrowPayloadType::Logs
         | ArrowPayloadType::UnivariateMetrics
@@ -969,7 +983,7 @@ pub fn remove_transport_optimized_encodings(
                             actual: struct_ids.data_type().clone(),
                         })?;
 
-                    let new_struct_ids = remove_delta_encoding_from_column(struct_ids);
+                    let new_struct_ids = remove_delta_encoding_from_column(struct_ids)?;
                     replace_column(
                         struct_id_path,
                         None,
@@ -1031,6 +1045,12 @@ pub fn remove_transport_optimized_encodings(
         | ArrowPayloadType::ExpHistogramDpExemplars => {
             let rb = remove_delta_encoding::<UInt32Type>(record_batch, consts::ID)?;
             materialize_parent_id_for_exemplars::<u32>(&rb)
+        }
+        ArrowPayloadType::ProfileValueTypes
+        | ArrowPayloadType::Samples
+        | ArrowPayloadType::StackLocations
+        | ArrowPayloadType::ProfileLocationLines => {
+            remove_delta_encoding::<UInt32Type>(record_batch, consts::PARENT_ID)
         }
 
         ArrowPayloadType::Unknown => {

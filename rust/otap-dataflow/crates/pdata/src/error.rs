@@ -260,6 +260,19 @@ pub enum Error {
 
     #[error("Unsupported signal type: {signal:?}")]
     UnsupportedSignalType { signal: SignalType },
+
+    #[error("Invalid Profiles selection length: expected {expected}, actual {actual}")]
+    InvalidProfilesSelectionLength { expected: usize, actual: usize },
+
+    #[error("Profiles transform limit exceeded for {limit}: actual {actual}, maximum {maximum}")]
+    ProfilesTransformLimitExceeded {
+        limit: &'static str,
+        actual: usize,
+        maximum: usize,
+    },
+
+    #[error("Unsupported Profiles transform: {operation}")]
+    UnsupportedProfilesTransform { operation: &'static str },
 }
 
 impl From<crate::otlp::common::Dropped> for Error {

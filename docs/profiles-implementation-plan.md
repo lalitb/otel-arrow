@@ -12,9 +12,12 @@ Each branch is stacked on the preceding branch.
   stack branches.
 - All stack branches are rebased onto upstream commit `80d38834` from August
   28, 2026.
-- Step 9 is implemented on the current branch with OTLP/gRPC, OTLP/HTTP, and
-  OTAP Profiles receiver/exporter support. The shared OTAP protobuf has an
-  `ArrowProfilesService`, and Rust and Go bindings are regenerated.
+- Steps 1 through 9 are implemented and committed on their corresponding local
+  stack branches.
+- Step 10 is implemented on the current branch with native sample filtering,
+  explicit graph compaction and dense ID remapping, whole-owner attribute
+  rename/delete operations, global function-filename redaction, and bounded
+  selection-local copy-on-write.
 - Profiles BARs remain separate during batching, and oversized BARs are
   rejected until graph-aware partitioning and concatenation are implemented.
   Serialized OTLP Profiles requests likewise remain separate because each owns
@@ -25,7 +28,9 @@ Each branch is stacked on the preceding branch.
   available, so those remain explicit follow-ups.
 - The Go binding exposes the Profiles stream API, but the Go runtime still has
   no Profiles Arrow codec or receiver/exporter implementation.
-- Steps 10 and 11 have not started.
+- Generic query transformations, selection-local resource/scope mutation, and
+  Profiles insert/upsert/update/hash remain explicit unsupported paths.
+- Step 11 has not started.
 
 1. `profiles/01-otap-data-model-design`
    - Define the Profiles OTAP data model, processing semantics, validation
@@ -70,6 +75,11 @@ Each branch is stacked on the preceding branch.
 10. `profiles/10-profile-transformations`
     - Add native filtering, attribute transformation, redaction, compaction,
       and copy-on-write handling for shared profile entities.
+    - Status: implemented; sample filtering can optionally compact unreachable
+      dimensions and densely rewrite IDs. Rename/delete operations preserve
+      profile attribute owners and ordinals. Function filename redaction
+      supports both BAR-global mutation and bounded sample-local copy-on-write.
+      Generic query stages and value-creating attribute actions remain rejected.
 11. `profiles/11-ebpf-profiler-integration`
     - Connect the eBPF profiler to the Profiles pipeline and verify the complete
       collection, transport, processing, buffering, and export path.

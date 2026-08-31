@@ -258,7 +258,7 @@ fn align_selection_vec_from_atts(
         })?;
 
     // get the id column from the root batch for this attribute type
-    let attrs_payload_type = resolve_attrs_payload_type(attrs_id, otap_batch);
+    let attrs_payload_type = resolve_attrs_payload_type(attrs_id, otap_batch)?;
     let id_col = match UInt16Type::get_id_col_from_parent(root_rb, attrs_payload_type)? {
         Some(MaybeDictArrayAccessor::Native(id_col)) => id_col,
         Some(_) => {

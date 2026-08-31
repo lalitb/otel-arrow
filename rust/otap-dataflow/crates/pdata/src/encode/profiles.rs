@@ -28,7 +28,7 @@ use crate::proto::opentelemetry::profiles::v1development::{
     Function, KeyValueAndUnit, Link, Location, Mapping, ProfilesData, ProfilesDictionary,
     ResourceProfiles, Stack, ValueType,
 };
-use crate::schema::consts;
+use crate::schema::{consts, update_field_metadata};
 use crate::views::otlp::proto::common::{ObjAny, ObjKeyValue};
 use crate::views::otlp::proto::wrappers::Wraps;
 
@@ -176,7 +176,10 @@ fn encode_profiles_parts(
 
     let mut profiles = Profiles::default();
     profiles.set(ArrowPayloadType::Profiles, roots.finish()?)?;
-    profiles.set(ArrowPayloadType::Samples, samples.finish()?)?;
+    profiles.set(
+        ArrowPayloadType::Samples,
+        mark_parent_id_plain(samples.finish()?),
+    )?;
 
     set_nonempty(
         &mut profiles,
@@ -238,9 +241,23 @@ fn set_nonempty(
     batch: RecordBatch,
 ) -> Result<()> {
     if batch.num_rows() > 0 {
-        profiles.set(payload_type, batch)?;
+        profiles.set(payload_type, mark_parent_id_plain(batch))?;
     }
     Ok(())
+}
+
+fn mark_parent_id_plain(batch: RecordBatch) -> RecordBatch {
+    if batch.column_by_name(consts::PARENT_ID).is_none() {
+        return batch;
+    }
+    let schema = update_field_metadata(
+        batch.schema_ref(),
+        consts::PARENT_ID,
+        consts::metadata::COLUMN_ENCODING,
+        consts::metadata::encodings::PLAIN,
+    );
+    RecordBatch::try_new(Arc::new(schema), batch.columns().to_vec())
+        .expect("Profiles parent metadata preserves record batch validity")
 }
 
 fn take_next_id(next: &mut u32) -> Result<u32> {

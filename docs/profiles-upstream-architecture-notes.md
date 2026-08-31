@@ -146,6 +146,11 @@ before being proposed upstream.
 - Local direction: return explicit unsupported errors for Profiles filtering,
   conditional processing, query assignment, and configured attribute
   transformations.
+- Local result: step 10 adds explicit native sample filtering, optional
+  reachability compaction, whole-owner profile/sample/mapping/location
+  rename/delete operations, and bounded function-redaction copy-on-write.
+  Generic query stages remain rejected because they do not encode Profiles
+  owner semantics.
 - Upstream framing: enable these operations only with graph closure,
   copy-on-write, `UInt32` owner support, ordinal maintenance, and post-mutation
   validation.
@@ -258,6 +263,62 @@ before being proposed upstream.
   wire contract stays synchronized, without implying runtime support.
 - Upstream framing: implement the Go Profiles Arrow codec and transport path in
   a separate change with cross-language Rust/Go fixtures.
+
+### PA-017: Generic attribute value builders drop Profiles owner metadata
+
+- Status: `open`
+- Area: pdata attribute insert, upsert, update, and hash transforms
+- Evidence: the generic builder reconstructs the common attribute schema but
+  does not retain Profiles `ordinal` and `unit` columns.
+- Impact: routing Profiles through value-changing actions can publish an
+  invalid or semantically incomplete attribute batch.
+- Local direction: step 10 supports collision-safe rename and delete through a
+  Profiles-specific wrapper and rejects insert, upsert, update, and hash.
+- Upstream framing: make attribute builders schema-extensible before enabling
+  value-changing Profiles actions.
+
+### PA-018: Query languages do not express Profiles attribute owners
+
+- Status: `open`
+- Area: query-engine filtering, apply-to-attributes, and root attribute scopes
+- Evidence: existing query scopes distinguish root and non-root attributes for
+  logs, metrics, and traces but cannot identify profile, sample, mapping, or
+  location owners and their global versus selection-local semantics.
+- Impact: guessing a payload can silently no-op or mutate a shared owner more
+  broadly than the query implies.
+- Local direction: keep generic query stages explicitly rejected and expose
+  safe semantics through native Profiles filter and transformation kernels.
+- Upstream framing: add typed Profiles owner scopes before enabling query
+  filtering or assignment.
+
+### PA-019: Selection-local copy-on-write is intentionally narrow
+
+- Status: `open`
+- Area: Profiles shared-entity mutation
+- Evidence: step 10 implements a bounded reverse walk for function-filename
+  redaction by cloning functions, complete locations, lines, location
+  attributes, stacks, and stack-location edges.
+- Impact: selection-local mapping/location attributes, resource/scope changes,
+  arbitrary function fields, and profile splitting still lack bounded kernels.
+- Local direction: expose only the implemented filename-redaction walk and keep
+  other selection-local operations unsupported.
+- Upstream framing: add one bounded, benchmarked semantic kernel at a time
+  rather than a generic graph mutation API.
+
+### PA-020: Profiles parent encodings must be canonicalized before validation
+
+- Status: `resolved-local`
+- Area: OTAP transport optimization and Profiles graph construction
+- Evidence: Profiles uses UInt32 delta parents for samples, value types,
+  stack-location edges, and location-line rows; resource and scope attributes
+  use UInt16 quasi-delta parents.
+- Impact: validating physical deltas as logical IDs can corrupt graph closure,
+  owner uniqueness, dense remapping, and copy-on-write selection.
+- Local direction: mark internal plain parents explicitly, encode the specified
+  Profiles columns for transport, materialize all encoded parents inside
+  `Profiles::try_from`, and reject cumulative overflow.
+- Upstream framing: every graph validator must operate on canonical logical IDs,
+  never transport deltas.
 
 ## Review Policy
 

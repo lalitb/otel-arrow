@@ -7,7 +7,7 @@
 //! on OTAP Arrow payloads (OtapArrowRecords and OtapArrowBytes) and can convert OTLP
 //! bytes to OTAP for processing.
 //!
-//! Supported actions (current subset):
+//! Supported actions for logs, metrics, and traces:
 //! - `rename`: Renames an attribute key (non-standard deviation from the Go collector).
 //! - `delete`: Removes an attribute by key.
 //! - `insert`: Inserts a new attribute (only if the key doesn't already exist).
@@ -18,6 +18,10 @@
 //! Unsupported actions are ignored if present in the config:
 //! `extract`, `convert`.
 //! We may add support for them later.
+//!
+//! Profiles signal attributes support `rename` and `delete` across profile,
+//! sample, mapping, and location owners. Other Profiles actions return an
+//! explicit error until the extended `ordinal` and `unit` schema is preserved.
 //!
 //! Example configuration (YAML):
 //! You can optionally scope the transformation using `apply_to`. Valid values: signal, resource, scope.
@@ -58,8 +62,11 @@ use otel_arrow_dfe_otap::{
     OTAP_PROCESSOR_FACTORIES, opaque_string::OpaqueString, pdata::OtapPdata,
 };
 use otel_arrow_dfe_pdata::TryIntoWithOptions;
-use otel_arrow_dfe_pdata::error::Error as PDataError;
 use otel_arrow_dfe_pdata::otap::transform::apply_attribute_transform;
+use otel_arrow_dfe_pdata::otap::transform::profiles::{
+    ProfilesAttributeOwner, ProfilesTransformLimits, transform_profile_attributes,
+    transform_shared_profile_attributes, validate_profile_transform_output,
+};
 use otel_arrow_dfe_pdata::otap::{
     OtapArrowRecords,
     transform::{
@@ -167,7 +174,8 @@ const fn default_hash_algorithm() -> HashAlgorithm {
 /// Others are ignored.
 ///
 /// You can control which attribute domains are transformed via `apply_to`.
-/// Valid values: "signal" (default), "resource", "scope".
+/// Valid values: "signal" (default), "resource", "scope". For Profiles,
+/// "signal" covers profile, sample, mapping, and location owners globally.
 pub struct Config {
     /// List of actions to apply in order.
     #[serde(default)]
@@ -176,6 +184,10 @@ pub struct Config {
     /// Attribute domains to apply transforms to. Defaults to ["signal"].
     #[serde(default)]
     pub apply_to: Option<Vec<String>>,
+
+    /// Output limits for Profiles-owned attribute transformations.
+    #[serde(default)]
+    pub profiles_limits: ProfilesTransformLimits,
 }
 
 /// Processor that applies attribute transformations to OTAP attribute batches.
@@ -190,6 +202,7 @@ pub struct AttributesProcessor {
     has_resource_domain: bool,
     has_scope_domain: bool,
     has_signal_domain: bool,
+    profiles_limits: ProfilesTransformLimits,
     // Metrics handle
     metrics: metrics::AttributesProcessorMetrics,
     // Opt-in compute-duration timing
@@ -317,6 +330,7 @@ impl AttributesProcessor {
             has_resource_domain,
             has_scope_domain,
             has_signal_domain,
+            profiles_limits: config.profiles_limits,
             metrics: metrics::AttributesProcessorMetrics::new(&pipeline_ctx),
             compute_duration: ComputeDuration::new(&pipeline_ctx),
         })
@@ -344,55 +358,142 @@ impl AttributesProcessor {
         if self.is_noop() {
             return Ok(per_domain);
         }
-
-        // Helper closure to aggregate stats across a slice of payload types.
-        let mut apply_domain =
-            |payloads: &[ArrowPayloadType]| -> Result<(u64, u64, u64, u64, u64, u64), EngineError> {
-                let mut deleted = 0u64;
-                let mut renamed = 0u64;
-                let mut inserted = 0u64;
-                let mut upserted = 0u64;
-                let mut updated = 0u64;
-                let mut hashed = 0u64;
-                for &payload_ty in payloads {
-                    let stats =
-                        apply_attribute_transform(records, payload_ty, &self.transform, true)?
-                            .unwrap_or_default();
-                    deleted += stats.deleted_entries;
-                    renamed += stats.renamed_entries;
-                    inserted += stats.inserted_entries;
-                    upserted += stats.upserted_entries;
-                    updated += stats.updated_entries;
-                    hashed += stats.hashed_entries;
-                }
-                Ok((deleted, renamed, inserted, upserted, updated, hashed))
-            };
+        if signal == SignalType::Profiles {
+            return self.apply_profiles_transform_with_stats(records);
+        }
 
         if self.has_signal_domain {
-            let payloads = match signal {
-                SignalType::Logs => payload_sets::LOGS_SIGNAL,
-                SignalType::Metrics => payload_sets::METRICS_SIGNAL,
-                SignalType::Traces => payload_sets::TRACES_SIGNAL,
-                SignalType::Profiles => {
-                    return Err(PDataError::UnsupportedSignalType { signal }.into());
+            let stats = match signal {
+                SignalType::Logs => {
+                    apply_payload_transforms(records, payload_sets::LOGS_SIGNAL, &self.transform)?
                 }
+                SignalType::Metrics => apply_payload_transforms(
+                    records,
+                    payload_sets::METRICS_SIGNAL,
+                    &self.transform,
+                )?,
+                SignalType::Traces => {
+                    apply_payload_transforms(records, payload_sets::TRACES_SIGNAL, &self.transform)?
+                }
+                SignalType::Profiles => unreachable!("Profiles handled above"),
             };
-            let (d, r, i, u, upd, h) = apply_domain(payloads)?;
+            let (d, r, i, u, upd, h) = stats;
             per_domain.push((metrics::TargetDomain::Signal, d, r, i, u, upd, h));
         }
 
         if self.has_resource_domain {
-            let (d, r, i, u, upd, h) = apply_domain(payload_sets::RESOURCE_ONLY)?;
+            let (d, r, i, u, upd, h) =
+                apply_payload_transforms(records, payload_sets::RESOURCE_ONLY, &self.transform)?;
             per_domain.push((metrics::TargetDomain::Resource, d, r, i, u, upd, h));
         }
 
         if self.has_scope_domain {
-            let (d, r, i, u, upd, h) = apply_domain(payload_sets::SCOPE_ONLY)?;
+            let (d, r, i, u, upd, h) =
+                apply_payload_transforms(records, payload_sets::SCOPE_ONLY, &self.transform)?;
             per_domain.push((metrics::TargetDomain::Scope, d, r, i, u, upd, h));
         }
 
         Ok(per_domain)
     }
+
+    #[allow(clippy::result_large_err)]
+    fn apply_profiles_transform_with_stats(
+        &self,
+        records: &mut OtapArrowRecords,
+    ) -> Result<SmallVec<[(metrics::TargetDomain, u64, u64, u64, u64, u64, u64); 3]>, EngineError>
+    {
+        let mut candidate = records.clone();
+        let mut per_domain = SmallVec::new();
+
+        if self.has_signal_domain {
+            let mut totals = (0, 0, 0, 0, 0, 0);
+            for owner in [
+                ProfilesAttributeOwner::Profile,
+                ProfilesAttributeOwner::Sample,
+                ProfilesAttributeOwner::Mapping,
+                ProfilesAttributeOwner::Location,
+            ] {
+                let (next, stats) = transform_profile_attributes(
+                    &candidate,
+                    owner,
+                    &self.transform,
+                    self.profiles_limits,
+                )?;
+                candidate = next;
+                add_transform_stats(&mut totals, &stats);
+            }
+            per_domain.push((
+                metrics::TargetDomain::Signal,
+                totals.0,
+                totals.1,
+                totals.2,
+                totals.3,
+                totals.4,
+                totals.5,
+            ));
+        }
+
+        for (enabled, payload_type, domain) in [
+            (
+                self.has_resource_domain,
+                ArrowPayloadType::ResourceAttrs,
+                metrics::TargetDomain::Resource,
+            ),
+            (
+                self.has_scope_domain,
+                ArrowPayloadType::ScopeAttrs,
+                metrics::TargetDomain::Scope,
+            ),
+        ] {
+            if enabled {
+                let (next, stats) = transform_shared_profile_attributes(
+                    &candidate,
+                    payload_type,
+                    &self.transform,
+                    self.profiles_limits,
+                )?;
+                candidate = next;
+                per_domain.push((
+                    domain,
+                    stats.deleted_entries,
+                    stats.renamed_entries,
+                    stats.inserted_entries,
+                    stats.upserted_entries,
+                    stats.updated_entries,
+                    stats.hashed_entries,
+                ));
+            }
+        }
+
+        *records = validate_profile_transform_output(candidate, self.profiles_limits)?;
+        Ok(per_domain)
+    }
+}
+
+fn apply_payload_transforms(
+    records: &mut OtapArrowRecords,
+    payloads: &[ArrowPayloadType],
+    transform: &AttributesTransform,
+) -> Result<(u64, u64, u64, u64, u64, u64), EngineError> {
+    let mut totals = (0, 0, 0, 0, 0, 0);
+    for &payload_type in payloads {
+        let stats =
+            apply_attribute_transform(records, payload_type, transform, true)?.unwrap_or_default();
+        add_transform_stats(&mut totals, &stats);
+    }
+    Ok(totals)
+}
+
+fn add_transform_stats(
+    totals: &mut (u64, u64, u64, u64, u64, u64),
+    stats: &otel_arrow_dfe_pdata::otap::transform::TransformStats,
+) {
+    totals.0 += stats.deleted_entries;
+    totals.1 += stats.renamed_entries;
+    totals.2 += stats.inserted_entries;
+    totals.3 += stats.upserted_entries;
+    totals.4 += stats.updated_entries;
+    totals.5 += stats.hashed_entries;
 }
 
 #[async_trait(?Send)]
@@ -601,6 +702,7 @@ mod tests {
     use otel_arrow_dfe_engine::message::Message;
     use otel_arrow_dfe_engine::testing::{node::test_node, processor::TestRuntime};
     use otel_arrow_dfe_otap::pdata::OtapPdata;
+    use otel_arrow_dfe_pdata::encode::encode_profiles_otap_batch;
     use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::metric::Data;
     use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{
         Metric, MetricsData, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum,
@@ -611,10 +713,132 @@ mod tests {
         logs::v1::{LogRecord, ResourceLogs, ScopeLogs, SeverityNumber},
         resource::v1::Resource,
     };
+    use otel_arrow_dfe_pdata::testing::profiles::{ProfilesDatasetKind, profiles_dataset};
     use otel_arrow_dfe_pdata::{OtlpProtoBytes, PayloadData};
     use otel_arrow_dfe_telemetry::registry::TelemetryRegistryHandle;
     use prost::Message as _;
     use serde_json::json;
+
+    /// Scenario: The attributes processor deletes a signal key from Profiles and samples.
+    /// Guarantees: Whole-owner mutation is atomic and both Profiles attribute payloads stay valid.
+    #[test]
+    fn transforms_profiles_signal_attributes() {
+        let telemetry_registry_handle = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(telemetry_registry_handle);
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        let processor = AttributesProcessor::from_config(
+            pipeline_ctx,
+            &json!({
+                "apply_to": ["signal"],
+                "actions": [
+                    {
+                        "action": "delete",
+                        "key": "profile.kind"
+                    }
+                ]
+            }),
+        )
+        .unwrap();
+        let mut records =
+            encode_profiles_otap_batch(&profiles_dataset(ProfilesDatasetKind::Cpu, 1, 2, 2))
+                .unwrap();
+        let expected_deleted = [
+            ArrowPayloadType::ProfileAttrs,
+            ArrowPayloadType::ProfileSampleAttrs,
+            ArrowPayloadType::ProfileMappingAttrs,
+            ArrowPayloadType::ProfileLocationAttrs,
+        ]
+        .into_iter()
+        .filter_map(|payload_type| records.get(payload_type))
+        .map(|batch| batch.num_rows() as u64)
+        .sum::<u64>();
+
+        let stats = processor
+            .apply_transform_with_stats(&mut records, SignalType::Profiles)
+            .unwrap();
+
+        assert!(records.get(ArrowPayloadType::ProfileAttrs).is_none());
+        assert!(records.get(ArrowPayloadType::ProfileSampleAttrs).is_none());
+        assert!(records.get(ArrowPayloadType::ProfileMappingAttrs).is_none());
+        assert!(
+            records
+                .get(ArrowPayloadType::ProfileLocationAttrs)
+                .is_none()
+        );
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].0, metrics::TargetDomain::Signal);
+        assert_eq!(stats[0].1, expected_deleted);
+    }
+
+    /// Scenario: A whole-signal Profiles delete would create a zero shared mapping.
+    /// Guarantees: Failure in a later owner leaves every earlier owner batch unchanged.
+    #[test]
+    fn profiles_signal_attribute_failure_is_atomic() {
+        let telemetry_registry_handle = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(telemetry_registry_handle);
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        let processor = AttributesProcessor::from_config(
+            pipeline_ctx,
+            &json!({
+                "apply_to": ["signal"],
+                "actions": [
+                    {
+                        "action": "delete",
+                        "key": "profile.kind"
+                    }
+                ]
+            }),
+        )
+        .unwrap();
+        let mut data = profiles_dataset(ProfilesDatasetKind::Cpu, 1, 1, 1);
+        let mapping = &mut data.dictionary.as_mut().unwrap().mapping_table[1];
+        mapping.memory_start = 0;
+        mapping.memory_limit = 0;
+        mapping.file_offset = 0;
+        mapping.filename_strindex = 0;
+        let mut records = encode_profiles_otap_batch(&data).unwrap();
+        let original = records.clone();
+
+        let result = processor.apply_transform_with_stats(&mut records, SignalType::Profiles);
+
+        assert!(result.is_err());
+        assert_eq!(records, original);
+    }
+
+    /// Scenario: A Profiles resource rename would create an empty shared-owner key.
+    /// Guarantees: Resource/scope domains use the same validation, limits, and atomic transaction.
+    #[test]
+    fn profiles_resource_attribute_failure_is_atomic() {
+        let telemetry_registry_handle = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(telemetry_registry_handle);
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        let processor = AttributesProcessor::from_config(
+            pipeline_ctx,
+            &json!({
+                "apply_to": ["resource"],
+                "actions": [
+                    {
+                        "action": "rename",
+                        "source_key": "service.name",
+                        "destination_key": ""
+                    }
+                ]
+            }),
+        )
+        .unwrap();
+        let mut records =
+            encode_profiles_otap_batch(&profiles_dataset(ProfilesDatasetKind::Cpu, 1, 1, 1))
+                .unwrap();
+        let original = records.clone();
+
+        let result = processor.apply_transform_with_stats(&mut records, SignalType::Profiles);
+
+        assert!(result.is_err());
+        assert_eq!(records, original);
+    }
 
     fn build_logs_with_attrs(
         res_attrs: Vec<KeyValue>,

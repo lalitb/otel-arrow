@@ -17,4 +17,24 @@ pub struct FilterPdataMetrics {
     /// decision node chose to drop.
     #[metric(name = "dropped.items", unit = "{item}")]
     pub dropped_items: Counter<u64>,
+
+    /// Number of Profiles sample rows removed without dropping their owning profile.
+    #[metric(name = "dropped.samples", unit = "{sample}")]
+    pub dropped_samples: Counter<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Scenario: Profiles filtering removes samples without removing a root profile.
+    /// Guarantees: Sample drops are counted separately from signal-item drops.
+    #[test]
+    fn separates_profile_sample_drops_from_signal_items() {
+        let mut metrics = FilterPdataMetrics::default();
+        metrics.dropped_samples.add(2);
+
+        assert_eq!(metrics.dropped_items.get(), 0);
+        assert_eq!(metrics.dropped_samples.get(), 2);
+    }
 }

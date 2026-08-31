@@ -54,14 +54,8 @@ impl PipelineStage for ApplyToAttributesPipelineStage {
         task_context: Arc<TaskContext>,
         exec_options: &mut ExecutionState,
     ) -> Result<OtapArrowRecords> {
-        let attrs_payload_type = match &self.attributes_id {
-            AttributesIdentifier::Root => match otap_batch.root_payload_type() {
-                ArrowPayloadType::Logs => ArrowPayloadType::LogAttrs,
-                ArrowPayloadType::Spans => ArrowPayloadType::SpanAttrs,
-                _ => ArrowPayloadType::MetricAttrs,
-            },
-            AttributesIdentifier::NonRoot(payload_type) => *payload_type,
-        };
+        let attrs_payload_type =
+            resolve_apply_attrs_payload_type(&self.attributes_id, &otap_batch)?;
 
         let Some(mut curr_batch) = otap_batch.get(attrs_payload_type).cloned() else {
             // nothing to do - just return the original batch
@@ -91,13 +85,40 @@ impl PipelineStage for ApplyToAttributesPipelineStage {
     }
 }
 
+fn resolve_apply_attrs_payload_type(
+    attributes_id: &AttributesIdentifier,
+    otap_batch: &OtapArrowRecords,
+) -> Result<ArrowPayloadType> {
+    if matches!(otap_batch, OtapArrowRecords::Profiles(_)) {
+        return Err(crate::error::Error::NotYetSupportedError {
+            message: "generic apply-to-attributes pipelines do not define Profiles owner semantics"
+                .into(),
+        });
+    }
+    match attributes_id {
+        AttributesIdentifier::Root => match otap_batch.root_payload_type() {
+            ArrowPayloadType::Logs => Ok(ArrowPayloadType::LogAttrs),
+            ArrowPayloadType::Spans => Ok(ArrowPayloadType::SpanAttrs),
+            ArrowPayloadType::UnivariateMetrics | ArrowPayloadType::MultivariateMetrics => {
+                Ok(ArrowPayloadType::MetricAttrs)
+            }
+            ArrowPayloadType::Profiles => unreachable!("Profiles rejected above"),
+            _ => Err(crate::error::Error::ExecutionError {
+                cause: "unexpected root payload type".into(),
+            }),
+        },
+        AttributesIdentifier::NonRoot(payload_type) => Ok(*payload_type),
+    }
+}
+
 #[cfg(test)]
 mod test {
+    use super::resolve_apply_attrs_payload_type;
     use arrow::{array::UInt8Array, datatypes::DataType};
     use otel_arrow_contrib_data_engine_kql_parser::Parser;
     use otel_arrow_dfe_pdata::{
         OtapArrowRecords,
-        otap::Logs,
+        otap::{Logs, Profiles},
         otlp::attributes::AttributeValueType,
         proto::{
             OtlpProtoMessage,
@@ -116,7 +137,24 @@ mod test {
     };
     use otel_arrow_dfe_query_engine_languages::opl::parser::OplParser;
 
-    use crate::pipeline::{Pipeline, planner::PipelinePlanner, test::exec_logs_pipeline};
+    use crate::pipeline::{
+        Pipeline,
+        planner::{AttributesIdentifier, PipelinePlanner},
+        test::exec_logs_pipeline,
+    };
+
+    /// Scenario: Apply-to-attributes is requested for a Profiles root attribute scope.
+    /// Guarantees: The stage rejects ambiguous owner semantics instead of targeting MetricAttrs.
+    #[test]
+    fn rejects_profiles_apply_to_attributes_resolution() {
+        let records = OtapArrowRecords::Profiles(Profiles::default());
+        let result = resolve_apply_attrs_payload_type(&AttributesIdentifier::Root, &records);
+
+        assert!(matches!(
+            result,
+            Err(crate::error::Error::NotYetSupportedError { .. })
+        ));
+    }
 
     fn gen_logs_records_with_string_attrs() -> Vec<LogRecord> {
         vec![
