@@ -2774,7 +2774,7 @@ fn compaction_keeps_the_previous_generation_until_cleanup() {
 }
 
 /// Scenario: cancellation becomes visible after cleanup removes the retired
-/// snapshot but before it removes the retired WAL.
+/// WAL but before it removes the retired snapshot.
 /// Guarantees: cleanup starts no later unlink, retains the complete retired
 /// list, and an uncancelled retry resumes idempotently.
 #[test]
@@ -2787,12 +2787,12 @@ fn retired_generation_cleanup_cancellation_stops_between_unlinks() {
     let retired_wal = path.join(wal_file_name(0));
 
     let outcome = store
-        .cleanup_retired_generations_cancellable(|| !retired_snapshot.exists())
+        .cleanup_retired_generations_cancellable(|| !retired_wal.exists())
         .expect("cancellation is not a cleanup error");
 
     assert!(outcome.is_none());
-    assert!(!retired_snapshot.exists());
-    assert!(retired_wal.is_file());
+    assert!(!retired_wal.exists());
+    assert!(retired_snapshot.is_file());
     assert_eq!(store.retired_generations(), [0]);
     assert_eq!(
         store
@@ -2800,8 +2800,48 @@ fn retired_generation_cleanup_cancellation_stops_between_unlinks() {
             .expect("cleanup retry succeeds"),
         1
     );
-    assert!(!retired_wal.exists());
+    assert!(!retired_snapshot.exists());
     assert!(store.retired_generations().is_empty());
+}
+
+/// Scenario: a retired snapshot pathname is replaced by either a symlink or a
+/// second hard link before cleanup begins.
+/// Guarantees: cleanup validates and binds the complete retired pair before
+/// deleting its WAL, rejects both substitutions, and preserves every target.
+#[cfg(unix)]
+#[test]
+fn retired_cleanup_rejects_snapshot_substitution_before_wal_removal() {
+    use std::os::unix::fs::symlink;
+
+    for hard_link in [false, true] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("namespace");
+        let mut store = open(&path);
+        store.compact().expect("compaction succeeds");
+        let retired_snapshot = path.join(snapshot_file_name(0));
+        let retired_wal = path.join(wal_file_name(0));
+        let displaced = path.join(if hard_link {
+            "retired.snapshot.hardlink-target"
+        } else {
+            "retired.snapshot.symlink-target"
+        });
+        fs::rename(&retired_snapshot, &displaced).unwrap();
+        if hard_link {
+            fs::hard_link(&displaced, &retired_snapshot).unwrap();
+        } else {
+            symlink(&displaced, &retired_snapshot).unwrap();
+        }
+        let target_bytes = fs::read(&displaced).unwrap();
+
+        assert!(
+            store.cleanup_retired_generations().is_err(),
+            "cleanup accepted {} substitution",
+            if hard_link { "hard-link" } else { "symlink" }
+        );
+        assert!(retired_wal.is_file());
+        assert_eq!(fs::read(&displaced).unwrap(), target_bytes);
+        assert_eq!(store.retired_generations(), [0]);
+    }
 }
 
 /// Scenario: compaction interrupted at each persistence boundary in turn --
@@ -4618,9 +4658,9 @@ fn cleanup_preserves_the_remainder_and_retries_after_a_partial_failure() {
                 assert!(path.join(snapshot_file_name(0)).is_file());
                 assert!(path.join(wal_file_name(0)).is_file());
             }
-            FaultPoint::AfterRetiredSnapshotRemoval => {
-                assert!(!path.join(snapshot_file_name(0)).exists());
-                assert!(path.join(wal_file_name(0)).is_file());
+            FaultPoint::AfterRetiredWalRemoval => {
+                assert!(path.join(snapshot_file_name(0)).is_file());
+                assert!(!path.join(wal_file_name(0)).exists());
             }
             FaultPoint::BeforeRetiredDirectorySync => {
                 assert!(!path.join(snapshot_file_name(0)).exists());

@@ -2978,22 +2978,44 @@ impl CheckpointStore {
         if cancelled() {
             return Ok(None);
         }
+        let wal_path = dir.join(wal_file_name(generation));
+        let snapshot_path = dir.join(snapshot_file_name(generation));
+        let wal = fsio::CheckpointFilePathBinding::open_if_present(
+            &wal_path,
+            "bind a retired checkpoint WAL before cleanup",
+        )?;
+        if cancelled() {
+            return Ok(None);
+        }
+        let snapshot = fsio::CheckpointFilePathBinding::open_if_present(
+            &snapshot_path,
+            "bind a retired checkpoint snapshot before cleanup",
+        )?;
+        if cancelled() {
+            return Ok(None);
+        }
         faults.check(FaultPoint::BeforeRetiredGenerationRemoval)?;
-        let snapshot_removed =
-            fsio::remove_file_if_present(&dir.join(snapshot_file_name(generation)));
+        let wal_removed = match wal {
+            Some(wal) => {
+                wal.remove("remove a retired checkpoint WAL")?;
+                true
+            }
+            None => false,
+        };
         if cancelled() {
             return Ok(None);
         }
-        let snapshot_removed = snapshot_removed?;
-        faults.check(FaultPoint::AfterRetiredSnapshotRemoval)?;
+        faults.check(FaultPoint::AfterRetiredWalRemoval)?;
+        let snapshot_removed = match snapshot {
+            Some(snapshot) => {
+                snapshot.remove("remove a retired checkpoint snapshot")?;
+                true
+            }
+            None => false,
+        };
         if cancelled() {
             return Ok(None);
         }
-        let wal_removed = fsio::remove_file_if_present(&dir.join(wal_file_name(generation)));
-        if cancelled() {
-            return Ok(None);
-        }
-        let wal_removed = wal_removed?;
         Ok(Some(snapshot_removed || wal_removed))
     }
 

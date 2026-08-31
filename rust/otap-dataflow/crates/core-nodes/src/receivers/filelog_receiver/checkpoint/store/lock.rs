@@ -36,6 +36,32 @@ use super::fsio;
 use super::layout::OWNERSHIP_LOCK_FILE_NAME;
 use super::os_lock::{TryLockOutcome, try_lock_exclusive, unlock_exclusive};
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_LOCK_ATTEMPT_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+pub(super) fn set_before_lock_attempt_hook(hook: impl FnOnce(&Path) + 'static) {
+    BEFORE_LOCK_ATTEMPT_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_before_lock_attempt_hook(path: &Path) {
+    BEFORE_LOCK_ATTEMPT_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(path);
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_before_lock_attempt_hook(_path: &Path) {}
+
 /// Unix mode for the ownership lock file.
 #[cfg(unix)]
 const LOCK_FILE_MODE: u32 = 0o600;
@@ -179,6 +205,7 @@ impl NamespaceLock {
         let Some(()) = validated else {
             return Ok(None);
         };
+        run_before_lock_attempt_hook(&path);
 
         let started = Instant::now();
         let mut contentions = 0u64;
@@ -192,6 +219,14 @@ impl NamespaceLock {
             }
             match attempt {
                 Ok(TryLockOutcome::Acquired) => {
+                    fsio::verify_checkpoint_file_path_binding(
+                        &file,
+                        &path,
+                        "verify the checkpoint namespace ownership-lock path after acquisition",
+                    )?;
+                    if cancelled() {
+                        return Ok(None);
+                    }
                     return Ok(Some(Self {
                         file,
                         path,
@@ -269,6 +304,47 @@ impl NamespaceLock {
             path: self.path.clone(),
             source,
         })
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use std::time::Duration;
+
+    use super::{NamespaceLock, set_before_lock_attempt_hook};
+    use crate::receivers::filelog_receiver::checkpoint::store::error::StoreError;
+    use crate::receivers::filelog_receiver::checkpoint::store::layout::OWNERSHIP_LOCK_FILE_NAME;
+
+    /// Scenario: the visible ownership-lock path is replaced after its opened
+    /// handle is validated but before the nonblocking advisory lock is taken.
+    /// Guarantees: acquisition rejects the displaced locked inode, releases
+    /// it, and leaves the visible replacement available for a fresh owner.
+    #[test]
+    fn lock_path_replacement_before_acquisition_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let lock_path = directory.path().join(OWNERSHIP_LOCK_FILE_NAME);
+        let displaced = directory.path().join("ownership.lock.displaced");
+        std::fs::write(&lock_path, []).unwrap();
+        let displaced_for_hook = displaced.clone();
+        set_before_lock_attempt_hook(move |path| {
+            std::fs::rename(path, &displaced_for_hook).unwrap();
+            std::fs::write(path, []).unwrap();
+        });
+
+        let error =
+            NamespaceLock::acquire(directory.path(), Duration::ZERO, Duration::from_millis(10))
+                .expect_err("the locked handle no longer has the visible path binding");
+        assert!(matches!(
+            error,
+            StoreError::UnsafeFilesystemObject { path, .. } if path == lock_path
+        ));
+        assert!(displaced.is_file());
+        assert!(lock_path.is_file());
+
+        NamespaceLock::acquire(directory.path(), Duration::ZERO, Duration::from_millis(10))
+            .unwrap()
+            .release()
+            .unwrap();
     }
 }
 

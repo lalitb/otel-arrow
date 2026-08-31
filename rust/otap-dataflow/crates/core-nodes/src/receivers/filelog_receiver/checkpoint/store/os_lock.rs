@@ -89,11 +89,21 @@ pub(super) fn unlock_exclusive(file: &File) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle as _;
 
     use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::Storage::FileSystem::UnlockFile;
+    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
 
-    // SAFETY: `file` owns the live handle and this unlock uses the exact byte
-    // range locked by `try_lock_exclusive`.
-    let result = unsafe { UnlockFile(file.as_raw_handle() as HANDLE, 0, 0, u32::MAX, u32::MAX) };
+    // SAFETY: `file` owns the live handle. The zeroed OVERLAPPED selects the
+    // same offset-zero range passed to LockFileEx, and this synchronous call
+    // does not retain the stack value after returning.
+    let result = unsafe {
+        let mut overlapped = std::mem::zeroed();
+        UnlockFileEx(
+            file.as_raw_handle() as HANDLE,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
     if result != 0 {
         Ok(())
     } else {
@@ -167,7 +177,7 @@ mod tests {
     /// Scenario: two independently opened Windows file handles contend for one
     /// namespace lock.
     /// Guarantees: `LockFileEx` with exclusive and fail-immediately flags
-    /// rejects the second handle and permits it after the first unlocks.
+    /// rejects the second handle and `UnlockFileEx` permits it after release.
     #[cfg(windows)]
     #[test]
     fn windows_lock_file_ex_conflicts_between_independent_handles() {

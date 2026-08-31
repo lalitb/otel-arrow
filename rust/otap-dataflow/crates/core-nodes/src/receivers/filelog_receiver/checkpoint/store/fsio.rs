@@ -162,6 +162,24 @@ impl CheckpointFilePathBinding {
         Ok(binding)
     }
 
+    /// Opens and validates one checkpoint artifact when it is present.
+    ///
+    /// Absence is idempotent cleanup state. Every object that does exist must
+    /// still pass the complete no-follow, regular-file, single-link, and path
+    /// binding checks before a caller can remove it.
+    pub(crate) fn open_if_present(
+        path: &Path,
+        operation: &'static str,
+    ) -> Result<Option<Self>, StoreError> {
+        match Self::open(path, operation) {
+            Ok(binding) => Ok(Some(binding)),
+            Err(StoreError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Verifies that the exact pathname still resolves to the retained file.
     pub(crate) fn verify(&self, operation: &'static str) -> Result<(), StoreError> {
         let mut options = OpenOptions::new();
@@ -1864,19 +1882,4 @@ pub(crate) fn open_for_append_cancellable(
         return Ok(None);
     };
     Ok(Some(file))
-}
-
-/// Removes `path`, reporting whether it existed. A file that is already gone
-/// is not an error for idempotent cleanup, but every other failure is
-/// reported.
-pub(crate) fn remove_file_if_present(path: &Path) -> Result<bool, StoreError> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(true),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(source) => Err(StoreError::Io {
-            operation: "remove a checkpoint file",
-            path: path.to_path_buf(),
-            source,
-        }),
-    }
 }

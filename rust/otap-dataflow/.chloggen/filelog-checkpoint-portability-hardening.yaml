@@ -1,0 +1,6 @@
+change_type: bug_fix
+component: pipeline
+note: "Reject replaced checkpoint locks and unsafe retired artifacts, and use the matching Windows unlock API."
+issues: [3939]
+subtext: |
+  Retired cleanup validates both files, removes WAL before snapshot, and remains resumable. This improves checkpoint ownership and cleanup safety.

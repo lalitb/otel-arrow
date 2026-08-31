@@ -88,10 +88,9 @@ pub enum FaultPoint {
     AfterMarkerDirSync,
     /// Before either file of a retired generation is unlinked.
     BeforeRetiredGenerationRemoval,
-    /// After a retired generation's snapshot is unlinked, before its WAL
-    /// is, which is the partial-removal state cleanup must stay resumable
-    /// from.
-    AfterRetiredSnapshotRemoval,
+    /// After a retired generation's WAL is unlinked, before its snapshot is,
+    /// which is the required partial-removal state cleanup must resume from.
+    AfterRetiredWalRemoval,
     /// Before syncing the directory after retired files were removed.
     BeforeRetiredDirectorySync,
     /// Before writing a normal WAL transaction.
@@ -146,7 +145,7 @@ impl FaultPoint {
     /// executes them.
     pub const CLEANUP: [FaultPoint; 3] = [
         FaultPoint::BeforeRetiredGenerationRemoval,
-        FaultPoint::AfterRetiredSnapshotRemoval,
+        FaultPoint::AfterRetiredWalRemoval,
         FaultPoint::BeforeRetiredDirectorySync,
     ];
 
@@ -192,7 +191,7 @@ impl FaultPoint {
             FaultPoint::BeforeMarkerDirSync => "before_marker_dir_sync",
             FaultPoint::AfterMarkerDirSync => "after_marker_dir_sync",
             FaultPoint::BeforeRetiredGenerationRemoval => "before_retired_generation_removal",
-            FaultPoint::AfterRetiredSnapshotRemoval => "after_retired_snapshot_removal",
+            FaultPoint::AfterRetiredWalRemoval => "after_retired_wal_removal",
             FaultPoint::BeforeRetiredDirectorySync => "before_retired_directory_sync",
             FaultPoint::BeforeWalTransactionWrite => "before_wal_transaction_write",
             FaultPoint::DuringWalTransactionWrite => "during_wal_transaction_write",
