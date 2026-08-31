@@ -25,6 +25,8 @@ use otap_df_telemetry::metrics::{MetricSet, MetricSetSnapshot};
 use otap_df_telemetry::reporter::ReportOutcome;
 use otap_df_telemetry::{otel_debug, otel_info, otel_warn};
 
+#[cfg(test)]
+use super::checkpoint::store::fault::FaultPoint;
 use super::config::RuntimeConfig;
 use super::delivery::{
     BatchKey, CompletionIgnore, DeliveryDecision, PendingBatch, call_data, key_from_call_data,
@@ -33,6 +35,8 @@ use super::telemetry::{
     FilelogReceiverMetrics, HealthEventCategory, HealthEventLimiter, WorkerTelemetryBridge,
     add_counter_saturating, duration_ns, terminal_snapshots,
 };
+#[cfg(test)]
+use super::worker::spawn_worker_with_store_fault;
 use super::worker::{
     WORKER_EVENT_CONTROL_SLOTS, WorkerBatch, WorkerCommand, WorkerEvent, WorkerHandle, spawn_worker,
 };
@@ -49,6 +53,22 @@ pub(super) struct FilelogReceiver {
     blocked_send_started: Option<tokio::sync::oneshot::Sender<StdInstant>>,
     #[cfg(test)]
     worker_telemetry_ready: Option<tokio::sync::oneshot::Sender<Arc<WorkerTelemetryBridge>>>,
+    #[cfg(test)]
+    worker_fault: Option<(FaultPoint, usize)>,
+    #[cfg(test)]
+    commit_failure_observer: Option<tokio::sync::oneshot::Sender<CommitFailureObservation>>,
+    #[cfg(test)]
+    commit_retry_gate: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CommitFailureObservation {
+    pending_batch: bool,
+    delivery_explicit_loss_commits: u64,
+    metric_explicit_loss_batches: u64,
+    metric_explicit_loss_records: u64,
+    explicit_loss_event_emitted: bool,
 }
 
 impl FilelogReceiver {
@@ -60,6 +80,12 @@ impl FilelogReceiver {
             blocked_send_started: None,
             #[cfg(test)]
             worker_telemetry_ready: None,
+            #[cfg(test)]
+            worker_fault: None,
+            #[cfg(test)]
+            commit_failure_observer: None,
+            #[cfg(test)]
+            commit_retry_gate: None,
         }
     }
 }
@@ -172,6 +198,12 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
             mut blocked_send_started,
             #[cfg(test)]
             mut worker_telemetry_ready,
+            #[cfg(test)]
+            worker_fault,
+            #[cfg(test)]
+            mut commit_failure_observer,
+            #[cfg(test)]
+            mut commit_retry_gate,
         } = *self;
         if let Some(metrics) = metrics.as_mut() {
             add_counter_saturating(&mut metrics.starts, 1);
@@ -214,7 +246,19 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
         let mut health_events = HealthEventLimiter::default();
         let startup_telemetry = WorkerTelemetryBridge::default();
-        let worker_handle = match spawn_worker(config.clone(), event_tx) {
+        #[cfg(test)]
+        let worker_result = match worker_fault {
+            Some((point, matching_occurrences_to_skip)) => spawn_worker_with_store_fault(
+                config.clone(),
+                event_tx,
+                point,
+                matching_occurrences_to_skip,
+            ),
+            None => spawn_worker(config.clone(), event_tx),
+        };
+        #[cfg(not(test))]
+        let worker_result = spawn_worker(config.clone(), event_tx);
+        let worker_handle = match worker_result {
             Ok(worker) => worker,
             Err(error) => {
                 let primary = terminal_error(&effect_handler, error.to_string());
@@ -714,6 +758,38 @@ impl local::Receiver<OtapPdata> for FilelogReceiver {
                                             operation = "commit_progress",
                                             suppressed_events = suppressed
                                         );
+                                    }
+                                    #[cfg(test)]
+                                    if let Some(observer) = commit_failure_observer.take() {
+                                        let observation = CommitFailureObservation {
+                                            pending_batch: pending_batch.is_some(),
+                                            delivery_explicit_loss_commits: counters
+                                                .explicit_loss_commits,
+                                            metric_explicit_loss_batches: metrics
+                                                .as_ref()
+                                                .map_or(0, |metrics| {
+                                                    metrics.batches_explicit_loss.get()
+                                                }),
+                                            metric_explicit_loss_records: metrics
+                                                .as_ref()
+                                                .map_or(0, |metrics| {
+                                                    metrics.records_dropped_on_nack.get()
+                                                }),
+                                            explicit_loss_event_emitted: health_events
+                                                .emitted_for_test(
+                                                    HealthEventCategory::ExplicitLoss,
+                                                ),
+                                        };
+                                        let _ = observer.send(observation);
+                                    }
+                                    #[cfg(test)]
+                                    if let Some(gate) = commit_retry_gate.take() {
+                                        gate.await.map_err(|_| {
+                                            terminal_error(
+                                                &effect_handler,
+                                                "filelog test commit-retry gate was dropped",
+                                            )
+                                        })?;
                                     }
                                     consecutive_checkpoint_failures = consecutive_checkpoint_failures
                                         .checked_add(1)
@@ -1584,7 +1660,7 @@ mod tests {
     use crate::receivers::filelog_receiver::config::{Config, peak_framer_payload_bytes};
     use crate::receivers::filelog_receiver::telemetry::{WorkerCounter, WorkerGauge};
     use crate::receivers::filelog_receiver::worker::WorkerError;
-    use crate::receivers::filelog_receiver::{OnDecodeError, StartAt};
+    use crate::receivers::filelog_receiver::{OnDecodeError, OnNack, StartAt};
 
     fn runtime_config() -> RuntimeConfig {
         let config: Config = serde_json::from_value(json!({
@@ -2717,6 +2793,148 @@ mod tests {
             let store = CheckpointStore::open(StoreOptions::from_runtime_config(&reopened_runtime))
                 .unwrap();
             assert_eq!(store.table().iter().next().unwrap().1.committed_offset, 5);
+        }));
+    }
+
+    /// Scenario: `drop_and_continue` reaches terminal Nack on a one-record
+    /// batch while each WAL append/sync boundary fails once, and Drain arrives
+    /// while the exact explicit-loss commit retry is test-gated.
+    /// Guarantees: failed persistence retains the batch and emits no loss
+    /// counter, loss metric, loss event, or drained notification; only the
+    /// successful exact retry advances EOF, reports one lost record, and drains.
+    #[test]
+    fn explicit_loss_and_drain_wait_for_faulted_commit_retry() {
+        let (tokio_runtime, local_tasks) = setup_test_runtime();
+        tokio_runtime.block_on(local_tasks.run_until(async {
+            for point in FaultPoint::WAL_DURABILITY {
+                let directory = tempdir().unwrap();
+                let source = directory.path().join("explicit-loss.log");
+                std::fs::write(&source, b"line\n").unwrap();
+                let runtime =
+                    source_runtime_with(&source, &directory.path().join("checkpoint"), |config| {
+                        config.retry.max_attempts = 1;
+                        config.on_nack = OnNack::DropAndContinue;
+                        config.checkpoint.max_consecutive_failures = 2;
+                    });
+                let reopened_runtime = runtime.clone();
+
+                let (control_tx, control_rx) = mpsc::Channel::new(8);
+                let control_rx = local::ControlChannel::new(EngineReceiver::Local(
+                    LocalReceiver::mpsc(control_rx),
+                ));
+                let (output_tx, output_rx) = mpsc::Channel::new(1);
+                let mut outputs = HashMap::new();
+                let _ = outputs.insert(
+                    Cow::Borrowed("out"),
+                    EngineSender::Local(LocalSender::mpsc(output_tx)),
+                );
+                let (runtime_tx, mut runtime_rx) = runtime_ctrl_msg_channel(4);
+                let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
+                let effect_handler = local::EffectHandler::new(
+                    test_node("filelog"),
+                    outputs,
+                    Some(Cow::Borrowed("out")),
+                    runtime_tx,
+                    metrics_reporter,
+                );
+                let (observation_tx, observation_rx) = tokio::sync::oneshot::channel();
+                let (retry_tx, retry_rx) = tokio::sync::oneshot::channel();
+                let receiver = tokio::task::spawn_local(async move {
+                    let mut filelog = FilelogReceiver::new(runtime);
+                    filelog.metrics = registered_metrics();
+                    filelog.worker_fault = Some((point, 1));
+                    filelog.commit_failure_observer = Some(observation_tx);
+                    filelog.commit_retry_gate = Some(retry_rx);
+                    Box::new(filelog).start(control_rx, effect_handler).await
+                });
+
+                let forwarded = tokio::time::timeout(Duration::from_secs(5), output_rx.recv())
+                    .await
+                    .expect("the fault case emits one filelog batch")
+                    .expect("the output route remains open");
+                let (_, nack) = next_nack(NackMsg::new_permanent(
+                    "exercise explicit-loss checkpoint retry",
+                    forwarded,
+                ))
+                .expect("filelog subscribed to Nack");
+                control_tx
+                    .send_async(NodeControlMsg::Nack(nack))
+                    .await
+                    .unwrap();
+
+                let observation = tokio::time::timeout(Duration::from_secs(5), observation_rx)
+                    .await
+                    .unwrap_or_else(|_| panic!("{point} did not reach the commit-failure gate"))
+                    .expect("the commit-failure observer remains live");
+                assert_eq!(
+                    observation,
+                    CommitFailureObservation {
+                        pending_batch: true,
+                        delivery_explicit_loss_commits: 0,
+                        metric_explicit_loss_batches: 0,
+                        metric_explicit_loss_records: 0,
+                        explicit_loss_event_emitted: false,
+                    },
+                    "{point}"
+                );
+
+                let deadline = StdInstant::now() + Duration::from_secs(10);
+                control_tx
+                    .send_async(NodeControlMsg::DrainIngress {
+                        deadline,
+                        reason: "drain after explicit-loss fault".to_owned(),
+                    })
+                    .await
+                    .unwrap();
+                tokio::task::yield_now().await;
+                assert!(runtime_rx.try_recv().is_err(), "{point}");
+                assert!(!receiver.is_finished(), "{point}");
+                assert!(output_rx.try_recv().is_err(), "{point}");
+
+                retry_tx
+                    .send(())
+                    .unwrap_or_else(|_| panic!("{point} retry gate receiver was dropped"));
+                let terminal = tokio::time::timeout(Duration::from_secs(10), receiver)
+                    .await
+                    .unwrap_or_else(|_| panic!("{point} did not complete after exact retry"))
+                    .unwrap()
+                    .unwrap_or_else(|error| panic!("{point} receiver failed: {error}"));
+                assert_eq!(terminal.deadline(), deadline);
+                let metrics = &terminal.metrics()[0];
+                assert_eq!(
+                    terminal_metric_value(metrics, "checkpoint.failures"),
+                    otap_df_telemetry::metrics::MetricValue::U64(1),
+                    "{point}"
+                );
+                assert_eq!(
+                    terminal_metric_value(metrics, "batches.explicit_loss"),
+                    otap_df_telemetry::metrics::MetricValue::U64(1),
+                    "{point}"
+                );
+                assert_eq!(
+                    terminal_metric_value(metrics, "records.dropped_on_nack"),
+                    otap_df_telemetry::metrics::MetricValue::U64(1),
+                    "{point}"
+                );
+                assert_eq!(
+                    terminal_metric_value(metrics, "lifecycle.drains"),
+                    otap_df_telemetry::metrics::MetricValue::U64(1),
+                    "{point}"
+                );
+                assert!(matches!(
+                    runtime_rx.recv().await.unwrap(),
+                    RuntimeControlMsg::ReceiverDrained { .. }
+                ));
+
+                let store =
+                    CheckpointStore::open(StoreOptions::from_runtime_config(&reopened_runtime))
+                        .unwrap();
+                assert_eq!(
+                    store.table().iter().next().unwrap().1.committed_offset,
+                    5,
+                    "{point}"
+                );
+            }
         }));
     }
 

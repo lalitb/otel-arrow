@@ -1114,6 +1114,67 @@ fn end_request(
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum FaultedAdminAction {
+    ResetToBeginning,
+    ResetToEnd,
+    KeepFailed,
+    RemoveQuarantined,
+}
+
+impl FaultedAdminAction {
+    const ALL: [Self; 4] = [
+        Self::ResetToBeginning,
+        Self::ResetToEnd,
+        Self::KeepFailed,
+        Self::RemoveQuarantined,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::ResetToBeginning => "reset-beginning",
+            Self::ResetToEnd => "reset-end",
+            Self::KeepFailed => "keep-failed",
+            Self::RemoveQuarantined => "remove",
+        }
+    }
+
+    const fn expected_result(self) -> QuarantineMutationAction {
+        match self {
+            Self::ResetToBeginning => QuarantineMutationAction::ResetToBeginning,
+            Self::ResetToEnd => QuarantineMutationAction::ResetToEnd,
+            Self::KeepFailed => QuarantineMutationAction::KeepFailed,
+            Self::RemoveQuarantined => QuarantineMutationAction::RemoveQuarantined,
+        }
+    }
+}
+
+fn invoke_faulted_admin_action(
+    session: &mut CheckpointAdminSession,
+    action: FaultedAdminAction,
+    seed: u8,
+    source: &Path,
+) -> Result<FileMutationResult, CheckpointAdminError> {
+    let reason = format!("retry {} after injected fault", action.label());
+    match action {
+        FaultedAdminAction::ResetToBeginning => {
+            session.reset_to_beginning(beginning_request(seed, 1, source, false, &reason))
+        }
+        FaultedAdminAction::ResetToEnd => {
+            session.reset_to_end(end_request(seed, 1, source, false, &reason))
+        }
+        FaultedAdminAction::KeepFailed => session.keep_failed(keep_request(seed, 1, &reason)),
+        FaultedAdminAction::RemoveQuarantined => {
+            session.remove_quarantined(RemoveQuarantinedRequest {
+                target: mutation_target(seed, 1),
+                removal_reason: 0x0009,
+                consequence: RemovalConsequence::AcknowledgeDuplicateOrLossPossible,
+                audit: mutation_audit(&reason, 6_000),
+            })
+        }
+    }
+}
+
 /// Scenario: a quarantined continuation is reset to the beginning through
 /// the high-level administration API.
 /// Guarantees: the API increments the epoch, installs offset zero, the empty
@@ -1479,6 +1540,138 @@ fn reset_to_end_commits_exact_locator_eof_and_real_guard() {
     assert_eq!(record.framing_resume, FramingResume::Clean);
     assert_eq!(record.fingerprint, bytes);
     assert_eq!(record.lifecycle_state, LifecycleState::Active);
+}
+
+/// Scenario: each audited per-file action encounters every WAL write/sync
+/// fault once, then the same high-level request is retried in the locked
+/// administration session.
+/// Guarantees: reset-to-beginning, reset-to-end, keep-failed, and removal each
+/// publish exactly one durable transaction and recover their exact final state
+/// without duplicating an uncertain append.
+#[test]
+fn every_per_file_admin_action_retries_every_wal_fault_exactly_once() {
+    for (action_index, action) in FaultedAdminAction::ALL.into_iter().enumerate() {
+        for point in FaultPoint::WAL_DURABILITY {
+            let root = tempfile::tempdir().unwrap();
+            let source = root.path().join("source.log");
+            let source_bytes = vec![b'a' + u8::try_from(action_index).unwrap(); 128];
+            fs::write(&source, &source_bytes).unwrap();
+            let namespace_id = format!("{}-{}", action.label(), point.as_str());
+            let store_options = options(&root.path().join("state"), &namespace_id);
+            let seed = 40u8
+                .checked_add(u8::try_from(action_index).unwrap())
+                .unwrap();
+            let old = seed_quarantined_source(
+                &store_options,
+                &source,
+                seed,
+                32,
+                FramingResume::Clean,
+                AdvisoryPath::unavailable(),
+            );
+
+            let mut session =
+                CheckpointAdminSession::open_with_fault(store_options.clone(), point).unwrap();
+            let transactions_before = session.validation().wal_transaction_count;
+            let error = invoke_faulted_admin_action(&mut session, action, seed, &source)
+                .expect_err("the armed administrative WAL boundary must fail once");
+            assert!(
+                matches!(
+                    error,
+                    CheckpointAdminError::Store(StoreError::InjectedFault { point: fired })
+                        if fired == point
+                ),
+                "{action:?} at {point}: {error}"
+            );
+
+            let result = invoke_faulted_admin_action(&mut session, action, seed, &source)
+                .unwrap_or_else(|error| {
+                    panic!("exact retry for {action:?} at {point} failed: {error}")
+                });
+            assert_eq!(result.action, action.expected_result(), "{point}");
+            assert_eq!(result.wal_sequence, transactions_before + 1, "{point}");
+            assert_eq!(
+                session.validation().wal_transaction_count,
+                transactions_before + 1,
+                "{point}"
+            );
+            session.release().unwrap();
+
+            let reopened = CheckpointStore::open(store_options.clone()).unwrap();
+            let record = reopened.table().get(&FileId([seed; 16]));
+            match action {
+                FaultedAdminAction::ResetToBeginning => {
+                    let record = record.expect("reset-to-beginning keeps the record");
+                    assert_eq!(record.lifecycle_state, LifecycleState::Active, "{point}");
+                    assert_eq!(record.file_epoch, 2, "{point}");
+                    assert_eq!(record.committed_offset, 0, "{point}");
+                    assert_eq!(
+                        record.committed_frontier_guard,
+                        CommittedFrontierGuard::empty(),
+                        "{point}"
+                    );
+                }
+                FaultedAdminAction::ResetToEnd => {
+                    let record = record.expect("reset-to-end keeps the record");
+                    assert_eq!(record.lifecycle_state, LifecycleState::Active, "{point}");
+                    assert_eq!(record.file_epoch, 2, "{point}");
+                    assert_eq!(
+                        record.committed_offset,
+                        u64::try_from(source_bytes.len()).unwrap(),
+                        "{point}"
+                    );
+                }
+                FaultedAdminAction::KeepFailed => {
+                    assert_eq!(record, Some(&old), "{point}");
+                }
+                FaultedAdminAction::RemoveQuarantined => {
+                    assert!(record.is_none(), "{point}");
+                }
+            }
+            let wal = decode_wal(
+                &fs::read(store_options.namespace_dir.join(wal_file_name(0))).unwrap(),
+                &namespace_digest(&namespace_id),
+            )
+            .unwrap();
+            assert_eq!(
+                u64::try_from(wal.transactions.len()).unwrap(),
+                transactions_before + 1,
+                "{action:?} at {point}"
+            );
+            let last = wal.transactions.last().unwrap();
+            assert_eq!(last.operations.len(), 1, "{action:?} at {point}");
+            match (action, &last.operations[0]) {
+                (
+                    FaultedAdminAction::ResetToBeginning,
+                    Operation::ResetQuarantinedFile(operation),
+                ) => assert_eq!(
+                    operation.action,
+                    ResetQuarantineAction::ResetToBeginning,
+                    "{point}"
+                ),
+                (FaultedAdminAction::ResetToEnd, Operation::ResetQuarantinedFile(operation)) => {
+                    assert_eq!(
+                        operation.action,
+                        ResetQuarantineAction::ResetToEnd,
+                        "{point}"
+                    )
+                }
+                (FaultedAdminAction::KeepFailed, Operation::ResetQuarantinedFile(operation)) => {
+                    assert_eq!(
+                        operation.action,
+                        ResetQuarantineAction::KeepFailed,
+                        "{point}"
+                    )
+                }
+                (FaultedAdminAction::RemoveQuarantined, Operation::RemoveFile(operation)) => {
+                    assert!(operation.administrative, "{point}");
+                }
+                (_, operation) => {
+                    panic!("unexpected final operation for {action:?} at {point}: {operation:?}")
+                }
+            }
+        }
+    }
 }
 
 /// Scenario: malformed IDs, empty or oversized audit reasons, stale epochs,

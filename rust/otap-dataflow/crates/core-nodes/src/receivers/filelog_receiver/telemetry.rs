@@ -859,6 +859,12 @@ impl HealthEventLimiter {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn emitted_for_test(&self, category: HealthEventCategory) -> bool {
+        let slot = &self.slots[category as usize];
+        slot.next_allowed.is_some() || slot.suppress_forever
+    }
+
     /// Returns the number suppressed since the previous emitted event.
     ///
     /// `None` means this occurrence is suppressed. Suppression counts

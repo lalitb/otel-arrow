@@ -374,7 +374,7 @@ pub(super) fn spawn_worker(
 }
 
 #[cfg(test)]
-fn spawn_worker_with_store_fault(
+pub(super) fn spawn_worker_with_store_fault(
     config: RuntimeConfig,
     event_tx: tokio_mpsc::Sender<WorkerEvent>,
     point: super::checkpoint::store::fault::FaultPoint,

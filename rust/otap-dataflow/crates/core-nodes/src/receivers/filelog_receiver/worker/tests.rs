@@ -1467,7 +1467,8 @@ async fn identity_registration_retries_each_wal_fault_boundary() {
 /// Scenario: a direct identity-registration append fails with a configured
 /// checkpoint failure budget of one attempt.
 /// Guarantees: no retry exceeds the configured bound, the worker terminates
-/// after one reported failure, and no registration becomes durable.
+/// after one reported failure, reads no source bytes, emits no batch, and
+/// leaves no durable registration.
 #[tokio::test]
 async fn direct_checkpoint_retry_honors_the_failure_budget() {
     let directory = tempdir().unwrap();
@@ -1494,13 +1495,20 @@ async fn direct_checkpoint_retry_honors_the_failure_budget() {
         {
             WorkerEvent::Failed(message) => break message,
             WorkerEvent::Stopped => panic!("worker stopped without failure evidence"),
-            WorkerEvent::Batch(_) | WorkerEvent::CommitResult { .. } | WorkerEvent::Drained => {}
+            WorkerEvent::Batch(batch) => {
+                panic!("registration fault emitted a source batch: {batch:?}")
+            }
+            WorkerEvent::CommitResult { .. } | WorkerEvent::Drained => {}
         }
     };
     assert!(failure.contains("checkpoint"), "{failure}");
     assert_eq!(
         telemetry.counter_for_test(WorkerCounter::CheckpointFailures),
         1
+    );
+    assert_eq!(
+        telemetry.counter_for_test(WorkerCounter::SourceBytesRead),
+        0
     );
     events.close();
     drop(worker.command_tx);
