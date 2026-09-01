@@ -10,9 +10,9 @@ future changes must preserve. It is intended for maintainers and contributors.
 For configuration and operational guidance, see the [file exporter README](README.md).
 
 The component is experimental and registered as `urn:otel:exporter:file`. It
-writes logs, metrics, and traces as newline-delimited OTLP JSON for local
-capture, offline transfer, and replay. It accepts both OTLP protobuf bytes and
-OTAP Arrow records without materializing an intermediate protobuf object.
+writes logs, metrics, and traces as newline-delimited OTLP JSON, or any signal
+including Profiles as versioned, checksummed OTLP protobuf frames. It accepts
+both OTLP protobuf bytes and OTAP Arrow records.
 
 ## Compatibility Contract
 
@@ -26,8 +26,12 @@ recheck it before extending the on-disk format. The relevant requirements are:
 | Every line is a valid JSON value | A complete top-level OTLP data object is encoded before any file write. |
 | Lines end with the byte `\n` | The framing adapter reserves and appends exactly one line-feed byte. |
 | Data follows OTLP JSON encoding | Serialization is delegated to the shared view-based OTLP JSON module. |
-| A file contains exactly one of `LogsData`, `MetricsData`, or `TracesData` | `{signal}` is mandatory and resolves to a different path for each signal. |
+| A file contains one signal data type | `{signal}` is mandatory and resolves to a different path for every signal. |
 | No ordering guarantee | This implementation preserves arrival order within one resolved file but makes no cross-file ordering promise. |
+
+The `otlp_proto` framing is an experimental OTAP Dataflow extension, not an
+OpenTelemetry file-exporter specification format. Its versioned contract and
+matching inspector are maintained together in this component.
 
 The specification also discusses SDK environment variables, stdout, and
 programmatic exporter configuration. Those provisions do not map directly to
@@ -37,7 +41,7 @@ an OTAP Dataflow node and are not part of this component's contract.
 
 The current design optimizes for a small, bounded capture-and-replay sink:
 
-- preserve the complete OTLP hierarchy for logs, metrics, and traces;
+- preserve the complete OTLP hierarchy for every supported signal;
 - write one independently parseable frame per non-empty input batch;
 - bound encoding memory and writer count;
 - preserve the engine's backpressure and ACK/NACK semantics;
@@ -62,19 +66,19 @@ OtapPdata                | representation + signal |
                          +------------+------------+
                                       |
                                       v
-                         shared view-based OTLP JSON
+                         OTLP JSON or framed protobuf
                                       |
-                              bounded JSONL frame
+                         bounded versioned file frame
                                       |
                          +------------+------------+
                          | local exporter run loop |
                          +------------+------------+
                                       |
-                  +-------------------+-------------------+
-                  v                   v                   v
-             logs writer         metrics writer      traces writer
-                  |                   |                   |
-                  +------ write / rollback / ACK-NACK ---+
+             +------------+------------+------------+------------+
+             v            v            v            v
+         logs writer  metrics writer traces writer profiles writer
+             |            |            |            |
+             +--------- write / rollback / ACK-NACK ---------+
 ```
 
 One local exporter instance owns the complete mutable state. Its run loop
@@ -88,7 +92,8 @@ periodic flush task, mutex on the hot path, internal queue, or retry loop.
 | --- | --- |
 | [`mod.rs`](mod.rs) | Factory registration, local run loop, representation dispatch, ACK/NACK routing, shutdown, and event emission. |
 | [`config.rs`](config.rs) | Typed configuration, cross-field validation, path-token substitution, ownership-token isolation, and path collision checks. |
-| [`encoding.rs`](encoding.rs) | Exporter-local size bound and JSON Lines framing around the shared serializers. |
+| [`encoding.rs`](encoding.rs) | Exporter-local JSON and protobuf frame size bounds. |
+| [`framing.rs`](framing.rs) | Versioned OTLP protobuf header, signal codes, length, CRC32, and matching validation. |
 | [`writer.rs`](writer.rs) | Path leases, directory and file creation, open modes, tail recovery, transactional writes, rollback, and final synchronization. |
 | [`metrics.rs`](metrics.rs) | Component-specific counters with closed signal, outcome, and operation attributes. |
 | [`otel_arrow_dfe_pdata::otlp::json`](../../../../pdata/src/otlp/json/README.md) | Canonical view-based OTLP JSON serialization shared with other producers and consumers. |
@@ -103,7 +108,7 @@ The factory performs these steps before the run loop starts:
 1. Parse `FileExporterConfig` with unknown-field rejection.
 2. Validate configuration syntax and field relationships without filesystem
    access.
-3. Substitute the pipeline core ID and deployment generation into the three
+3. Substitute the pipeline core ID and deployment generation into the four
    signal paths.
 4. Verify that every ownership token changes the normalized destination and
    reject cross-signal collisions.
@@ -111,15 +116,15 @@ The factory performs these steps before the run loop starts:
 
 The instance retains:
 
-- three `Option<SignalWriter>` slots indexed by the closed `SignalType` enum;
-- one reusable `Vec<u8>` for the current JSON Lines frame;
-- three booleans used to consolidate repeated failure events; and
+- four `Option<SignalWriter>` slots indexed by the closed `SignalType` enum;
+- one reusable `Vec<u8>` for the current encoded frame;
+- four booleans used to consolidate repeated failure events; and
 - bounded metric sets keyed by closed enums.
 
 At most one input pdata and one encoded frame are being processed by an
 instance. The encoded length is limited by `max_frame_bytes`; the allocator may
-round the reusable vector's capacity above its logical length. At most three
-file handles and three process-local path leases exist per instance.
+round the reusable vector's capacity above its logical length. At most four
+file handles and four process-local path leases exist per instance.
 
 ## Data and Encoding Path
 
@@ -131,10 +136,21 @@ loop selects a view without converting between those representations:
 | Logs | `RawLogsData` | `OtapLogsView` |
 | Metrics | `RawMetricsData` | `OtapMetricsView` |
 | Traces | `RawTraceData` | `OtapTracesView` |
+| Profiles | Canonical protobuf bytes | Canonical OTAP-to-OTLP reconstruction |
 
-Each view implements the signal-specific pdata view trait consumed by the
-shared JSON serializer. This keeps resource, scope, and record semantics in one
-serializer and avoids a protobuf allocation on the OTAP path.
+For `otlp_json`, each view implements the signal-specific pdata view trait
+consumed by the shared JSON serializer. This keeps resource, scope, and record
+semantics in one serializer and avoids a protobuf allocation on the OTAP path.
+
+For `otlp_proto`, existing OTLP bytes are retained byte-for-byte without
+materializing a protobuf graph. OTAP input is first reconstructed as canonical OTLP. Each request is wrapped in a 20-byte
+version 1 header containing `OTLPDF01`, a signal code, reserved zero bytes, a
+big-endian payload length, and a CRC32 checksum. The matching reader validates
+the header, signal, length, checksum, and protobuf message.
+
+The writer validates framing integrity, not the semantics of already serialized
+OTLP input. This permits bounded forensic capture of malformed wire bytes. The
+matching inspector performs protobuf decoding and reports invalid messages.
 
 The framing adapter clears the reusable buffer, allows the serializer to write
 at most `max_frame_bytes - 1` document bytes, and appends `\n` only after
@@ -142,8 +158,8 @@ successful serialization. A serialization or limit error clears every partial
 byte. Consequently, invalid input and oversized frames are rejected before a
 destination is opened or modified.
 
-One non-empty input batch remains one top-level OTLP object and one physical
-line. Do not flatten records or split a batch inside this format: doing so
+One non-empty input batch remains one top-level OTLP request and one physical
+frame. Do not flatten records or split a batch inside either format: doing so
 would change hierarchy, replay behavior, and ACK granularity. Empty pdata is
 ACKed without opening a signal file or writing a frame.
 
@@ -157,7 +173,7 @@ values are contractual and belong in shared serializer tests.
 Every path template must be absolute and contain each of these tokens exactly
 once:
 
-- `{signal}` becomes `logs`, `metrics`, or `traces` and enforces the
+- `{signal}` becomes `logs`, `metrics`, `traces`, or `profiles` and enforces the
   specification's single-data-type rule;
 - `{core_id}` prevents several share-nothing pipeline runtimes from writing
   the same file; and
@@ -199,7 +215,7 @@ Opening a writer follows this order:
 1. Acquire the process-local path lease.
 2. Optionally create parent directories.
 3. Open with `append`, `truncate`, or `create_new` semantics.
-4. In append mode, validate or repair the final frame boundary.
+4. In JSON append mode, validate or repair the final frame boundary.
 
 The writer is installed in the signal slot only when every step succeeds. The
 exporter does not write a synthetic readiness frame into the destination. The
@@ -209,7 +225,7 @@ NACK, and a later batch may retry the lazy open.
 
 ### Append-tail Recovery
 
-Append mode first checks whether an existing non-empty file ends in `\n`. If
+JSON append mode first checks whether an existing non-empty file ends in `\n`. If
 not, `tail_recovery: fail` rejects it. `truncate_partial` scans backward by at
 most `max_frame_bytes`, finds the last complete line boundary, truncates the
 incomplete suffix, and synchronizes the repair.
@@ -218,6 +234,10 @@ If no boundary exists within that bound, opening fails without guessing. In
 particular, the exporter does not silently erase a non-empty file containing
 only an incomplete first frame. Recovery repairs only an incomplete tail; it
 does not validate older JSON lines.
+
+`otlp_proto` requires `truncate` or `create_new`. Its reader detects incomplete
+headers, incomplete payloads, unsupported versions or signal codes, and CRC32
+mismatches. Binary append-tail repair is intentionally not claimed.
 
 ### Frame Write Transaction
 
@@ -247,7 +267,7 @@ shutdown error. Previously issued ACKs are not revoked.
 | Condition | Completion and node behavior |
 | --- | --- |
 | Empty pdata | ACK; no encoding, open, or write. |
-| Malformed view or JSON serialization failure | Permanent NACK; no file modification; continue. |
+| Malformed view, conversion, or serialization failure | Permanent NACK; no file modification; continue. |
 | Frame exceeds `max_frame_bytes` | Permanent NACK with upstream-splitting guidance; continue. |
 | Open or tail validation fails | Retryable NACK; leave writer unopened; continue. |
 | Write or `sync_data` fails and rollback succeeds | Retryable NACK; continue. |
@@ -301,19 +321,19 @@ otherwise.
 
 | Area | Go Collector file exporter | OTAP Dataflow file exporter | Rationale |
 | --- | --- | --- | --- |
-| Signal isolation | A configured exporter path is normally tied to a signal pipeline. | `{signal}` always creates distinct paths for logs, metrics, and traces. | Enforce the specification in a multi-signal OTAP node. |
+| Signal isolation | A configured exporter path is normally tied to a signal pipeline. | `{signal}` always creates distinct paths for logs, metrics, traces, and Profiles. | Enforce the specification in a multi-signal OTAP node. |
 | Runtime ownership | A path can be relative and does not encode the OTAP runtime identity. | Paths are absolute and require `{core_id}` and `{generation}`. | Preserve share-nothing cores and rolling-generation isolation. |
 | Default open behavior | `append: false` truncates by default. | `append` is the default; `truncate` and `create_new` are explicit. | Avoid silently discarding a previous capture. |
-| Output formats | JSON, length-prefixed protobuf, and encoding extensions are available. | Only typed `otlp_json` is accepted. | Keep a specified, replayable format until other framing contracts have matching readers. |
+| Output formats | JSON, length-prefixed protobuf, and encoding extensions are available. | Typed `otlp_json` plus versioned, checksummed `otlp_proto`. | Keep every format bounded and pair binary framing with a matching reader. |
 | Buffering | A buffered writer and `flush_interval` can defer writes. | One frame is awaited directly; there is no flush ticker. | Preserve direct backpressure and simple completion ownership. |
 | Durability | Flush timing is configurable but ACK durability is not exposed as the same explicit contract. | `write` and `sync_data` define the pre-ACK durability point. | Make completion semantics reviewable and testable. |
 | Write recovery | No equivalent bounded append-tail and per-frame rollback contract is exposed. | Append-tail repair is bounded; failed writes attempt rollback to the prior length. | Keep JSON Lines replayable after common interruption and I/O failures. |
 | Writer readiness | Writer lifecycle follows the Go component startup model. | Each valid signal destination is opened on first use; the first actual frame exercises the write path. | Avoid unused and synthetic frames while failing the triggering batch if the destination is not writable. |
 | Rotation and retention | Optional size/age rotation and backup cleanup. | Not yet supported. | Ownership, cleanup bounds, and crash semantics need an OTAP-specific design. |
 | Compression | zstd support includes historical per-message framing and native file-level behavior. | Not yet supported. | Avoid a legacy wire format; future compression should produce standard files. |
-| Dynamic grouping | Resource attributes can select paths, with an LRU bounded by `max_open_files`. | Telemetry cannot influence paths; each instance has at most three writers. | Avoid path injection, cardinality growth, churn, and hot-path synchronization. |
+| Dynamic grouping | Resource attributes can select paths, with an LRU bounded by `max_open_files`. | Telemetry cannot influence paths; each instance has at most four writers. | Avoid path injection, cardinality growth, churn, and hot-path synchronization. |
 | Directory permissions | Directory mode is configurable and defaults to `0755`. | New Unix directories request `0700`; files request `0600`. | Default to private storage for full telemetry. |
-| Profiles | Profiles are under development in the Go component. | Not yet supported. | Wait for stable OTAP profile views and a specified top-level file representation. |
+| Profiles | Profiles are under development in the Go component. | Supported as canonical `otlp_proto`; JSON remains unsupported. | Preserve the complete Alpha message without inventing a partial JSON mapping. |
 | Retry and persistent buffering | Collector exporter helpers compose queue and retry behavior. | Engine ACK/NACK, retry, and durable-buffer components are composed explicitly. | Keep policy and retained work visible at the pipeline level. |
 
 These differences are deliberate, not a backlog to reach option parity. A
@@ -378,21 +398,21 @@ claim JSON Lines compatibility for bytes that require decompression first.
 
 ### Additional Formats
 
-Framed protobuf requires a versioned framing contract, byte order, maximum
-length, corruption detection, recovery rules, and a matching reader. Prior art
-using only a four-byte length prefix is not sufficient justification by itself.
+The current protobuf format provides versioned magic, signal identity,
+big-endian length, CRC32 integrity, bounded frames, non-append recovery rules,
+and a matching reader. Future framing revisions must use a new version and
+remain explicitly distinguishable.
 
 Human-readable logs, metrics, traces, templates, or per-record envelopes must
 be explicit typed formats. Their documentation must state which OTLP fields
 are lost, how resource and scope context is represented, and whether replay is
 possible. They must not silently change the meaning of `otlp_json`.
 
-### Profiles
+### Profiles JSON
 
-Add profiles only after OTAP has a stable signal representation, view traits,
-engine registration, shared serialization, and a top-level file contract. The
-signal must receive its own path value and preserve the one-data-type-per-file
-invariant.
+Profiles ProtoJSON remains future work. It requires a shared pdata serializer
+and semantic compatibility tests; the file exporter must not invent a
+component-local JSON shape.
 
 ### Partitioning and Dynamic Paths
 
@@ -423,7 +443,7 @@ substitute for real cross-process exclusion.
 ### Performance Work
 
 Optimize only after preserving the completion and ownership model. Benchmarks
-should cover logs, metrics, and traces; OTLP bytes and OTAP Arrow views;
+should cover logs, metrics, traces, and Profiles; OTLP bytes and OTAP Arrow views;
 representative small and large batches; `write` and `sync_data`; and 1, 2, and
 4 cores. Track items and bytes per second, CPU, allocations, retained frame
 capacity, and event-loop stalls. Throughput gains that add unbounded buffering
@@ -433,9 +453,10 @@ or weaken ACK semantics are not acceptable.
 
 Current unit and component coverage includes configuration defaults and
 relationships, path rendering and collisions, exact frame bounds,
-representative JSON for all signals and input representations, open modes,
+representative JSON for supported signals and both input representations, open modes,
 append preservation, bounded tail repair, directory creation, process-local
-leases, empty and invalid pdata, multi-signal output, and metric schema.
+leases, empty and invalid pdata, versioned Profiles protobuf framing and
+inspection, multi-signal output, and metric schema.
 
 Before promotion beyond experimental stability, add or maintain:
 

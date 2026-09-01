@@ -32,6 +32,7 @@ blake3.workspace = true
 byte-unit.workspace = true
 bytes.workspace = true
 chrono.workspace = true
+crc32fast.workspace = true
 hashbrown.workspace = true
 otel-arrow-contrib-data-engine-expressions.workspace = true
 otel-arrow-contrib-data-engine-kql-parser.workspace = true

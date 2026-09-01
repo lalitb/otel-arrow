@@ -23,4 +23,7 @@ pub struct DebugMetrics {
     /// Span links
     #[metric(name = "consumed.links", unit = "{link}")]
     pub consumed_links: Counter<u64>,
+    /// Profile samples nested below profile roots.
+    #[metric(name = "consumed.samples", unit = "{sample}")]
+    pub consumed_samples: Counter<u64>,
 }

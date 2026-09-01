@@ -37,6 +37,7 @@ groups:
               protocols:
                 grpc:
                   listening_addr: "${env:OTEL_ARROW_EBPF_INGEST_HOST:-127.0.0.1}:${env:OTEL_ARROW_EBPF_INGEST_PORT:-14317}"
+                  wait_for_result: true
                   max_decoding_message_size: "32MiB"
 
           profiles_filter:
@@ -90,11 +91,29 @@ groups:
               protocols:
                 grpc:
                   listening_addr: "127.0.0.1:${env:OTEL_ARROW_EBPF_SINK_PORT:-14318}"
+                  wait_for_result: true
                   max_decoding_message_size: "32MiB"
 
-          sink:
-            type: exporter:noop
+          profiles_debug:
+            type: processor:debug
+            config:
+              verbosity: detailed
+              mode: batch
+              signals: [profiles]
+              output: "${env:OTEL_ARROW_EBPF_OUTPUT_RUN_DIR:-/tmp/otel-arrow-profiles-ebpf-output}/profiles-debug.txt"
+
+          profiles_file:
+            type: exporter:file
+            config:
+              path: "${env:OTEL_ARROW_EBPF_OUTPUT_RUN_DIR:-/tmp/otel-arrow-profiles-ebpf-output}/{signal}-{core_id}-{generation}.otlp"
+              create_directories: true
+              format: otlp_proto
+              open_mode: create_new
+              durability: sync_data
+              max_frame_bytes: 33554452
 
         connections:
           - from: sink_receiver
-            to: sink
+            to: profiles_debug
+          - from: profiles_debug
+            to: profiles_file

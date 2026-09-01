@@ -27,6 +27,7 @@ config:
     - metrics
     - spans
     - logs
+    - profiles
   filters:
     - predicate:
         field: attribute
@@ -49,11 +50,12 @@ config:
   # Display mode: "batch" or "signal" (default: batch).
   mode: batch
 
-  # Active signals (default: metrics, logs, and spans).
+  # Active signals (default: metrics, logs, spans, and Profiles).
   signals:
     - metrics
     - logs
     - spans
+    - profiles
 
   # Output target. Omit for console output, set a string for file output, or
   # set a list of output ports for pipeline-node output.
@@ -85,7 +87,9 @@ use `node.input.items`.
 
 Named events and span links remain debug processor metrics because they are
 nested signal details, not the primary log records, metric data points, or
-spans counted by universal channel item metrics.
+spans counted by universal channel item metrics. Profile samples use the same
+dedicated treatment because the universal Profiles item count represents
+profile roots.
 
 ### Metric Sets
 
@@ -95,6 +99,7 @@ spans counted by universal channel item metrics.
 | --- | --- | --- |
 | `processor.debug.consumed.events` | `{event}` | Named log events for logs, or span events for traces. |
 | `processor.debug.consumed.links` | `{link}` | Span links. |
+| `processor.debug.consumed.samples` | `{sample}` | Samples nested below profile roots. |
 
 ### Events
 
@@ -106,6 +111,12 @@ spans counted by universal channel item metrics.
 
 - Debug output is diagnostic and not a stable machine-readable export format.
 - File or console output can become expensive for high-volume streams.
+- Profiles output bounds each message to 8 profiles, 8 samples per profile,
+  32 frames per stack, 4 lines per location, 16 attributes, and 16 observation
+  values before reporting omitted entries. Individual strings are escaped and
+  limited to 256 characters.
+- Profiles filter rules are not applied by the debug processor; use the
+  graph-aware filter processor earlier in the pipeline.
 - Configuration changes are not applied dynamically after node creation.
 
 ## Related Docs
@@ -136,7 +147,10 @@ By default mode is set to `batch`
 ### Signal Selection
 
 Select what signals you want output for, by default the following
-signals will be displayed `metrics`, `logs`, and `spans`
+signals will be displayed `metrics`, `logs`, `spans`, and `profiles`
+
+Profiles retain their complete batch dictionary when output through ports;
+`mode: signal` does not split their shared graph.
 
 ### Filtering
 
@@ -163,7 +177,8 @@ config:
 ```
 
 In this config the debug-processor will write to a file named `file_name.txt`
-it will append to the file rather than overwriting
+it will append to the file rather than overwriting. New Unix files request
+mode `0600`; existing permissions are unchanged.
 
 #### Output to pipeline node
 

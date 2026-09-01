@@ -8,6 +8,7 @@ use crate::processors::debug_processor::Verbosity;
 use crate::processors::debug_processor::detailed_marshaler::DetailedViewMarshaler;
 use crate::processors::debug_processor::marshaler::ViewMarshaler;
 use crate::processors::debug_processor::normal_marshaler::NormalViewMarshaler;
+use crate::processors::debug_processor::profiles_marshaler::marshal_profiles;
 use crate::processors::debug_processor::sampling::Sampler;
 use async_trait::async_trait;
 use otel_arrow_dfe_config::PortName;
@@ -21,6 +22,7 @@ use otel_arrow_dfe_pdata::proto::{
     opentelemetry::{
         logs::v1::{LogsData, ResourceLogs, ScopeLogs},
         metrics::v1::{MetricsData, ResourceMetrics, ScopeMetrics},
+        profiles::v1development::ProfilesData,
         trace::v1::{ResourceSpans, ScopeSpans, TracesData},
     },
 };
@@ -54,6 +56,11 @@ pub trait DebugOutput {
         log_request: LogsData,
         sampler: &mut Sampler,
     ) -> Result<(), Error>;
+    async fn output_profiles(
+        &mut self,
+        profile_request: ProfilesData,
+        sampler: &mut Sampler,
+    ) -> Result<(), Error>;
     fn is_basic(&self) -> bool;
 }
 
@@ -62,6 +69,7 @@ pub struct DebugOutputWriter {
     writer: Box<dyn AsyncWrite + Unpin>,
     processor_id: NodeId,
     marshaler: Option<Box<dyn ViewMarshaler>>,
+    verbosity: Verbosity,
     display_mode: DisplayMode,
 }
 
@@ -74,21 +82,21 @@ impl DebugOutputWriter {
     ) -> Result<Self, Error> {
         let writer: Box<dyn AsyncWrite + Unpin> = match output_file {
             Some(file_name) => {
-                let file = File::options()
-                    .write(true)
-                    .append(true)
-                    .create(true)
-                    .open(file_name)
-                    .await
-                    .map_err(|e| {
-                        let source_detail = format_error_sources(&e);
-                        Error::ProcessorError {
-                            processor: processor_id.clone(),
-                            kind: ProcessorErrorKind::Configuration,
-                            error: format!("File error: {e}"),
-                            source_detail,
-                        }
-                    })?;
+                let mut options = File::options();
+                _ = options.write(true).append(true).create(true);
+                #[cfg(unix)]
+                {
+                    _ = options.mode(0o600);
+                }
+                let file = options.open(file_name).await.map_err(|e| {
+                    let source_detail = format_error_sources(&e);
+                    Error::ProcessorError {
+                        processor: processor_id.clone(),
+                        kind: ProcessorErrorKind::Configuration,
+                        error: format!("File error: {e}"),
+                        source_detail,
+                    }
+                })?;
                 Box::new(file)
             }
             None => Box::new(tokio::io::stdout()),
@@ -104,6 +112,7 @@ impl DebugOutputWriter {
             writer,
             processor_id,
             marshaler,
+            verbosity,
             display_mode,
         })
     }
@@ -223,6 +232,19 @@ impl DebugOutput for DebugOutputWriter {
             self.marshaler = Some(marshaler);
         }
         Ok(())
+    }
+
+    async fn output_profiles(
+        &mut self,
+        profile_request: ProfilesData,
+        sampler: &mut Sampler,
+    ) -> Result<(), Error> {
+        let report = marshal_profiles(&profile_request, self.verbosity);
+        if self.verbosity == Verbosity::Basic {
+            return self.output_message(&report).await;
+        }
+        let send_message = async || self.output_message(&report).await;
+        sampler.sample(send_message).await
     }
 
     fn is_basic(&self) -> bool {
@@ -474,6 +496,18 @@ impl DebugOutput for DebugOutputPorts {
             }
         }
         Ok(())
+    }
+
+    async fn output_profiles(
+        &mut self,
+        profile_request: ProfilesData,
+        sampler: &mut Sampler,
+    ) -> Result<(), Error> {
+        let send_message = async || {
+            self.send_to_output_ports(OtlpProtoMessage::Profiles(profile_request).try_into()?)
+                .await
+        };
+        sampler.sample(send_message).await
     }
 
     fn is_basic(&self) -> bool {

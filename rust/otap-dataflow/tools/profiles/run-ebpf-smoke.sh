@@ -11,6 +11,7 @@ readonly DATAFLOW_CONFIG="${DATAFLOW_DIR}/configs/profiles-ebpf-smoke.yaml"
 
 readonly PROFILER_IMAGE="${OTEL_ARROW_EBPF_PROFILER_IMAGE:-${PROFILER_IMAGE_DEFAULT}}"
 readonly WORKLOAD_IMAGE="${OTEL_ARROW_EBPF_WORKLOAD_IMAGE:-${WORKLOAD_IMAGE_DEFAULT}}"
+readonly OUTPUT_ROOT="${OTEL_ARROW_EBPF_OUTPUT_DIR:-${DATAFLOW_DIR}/target/profiles-ebpf-smoke}"
 readonly DURATION_SECONDS="${OTEL_ARROW_EBPF_DURATION_SECONDS:-15}"
 readonly INGEST_PORT="${OTEL_ARROW_EBPF_INGEST_PORT:-14317}"
 readonly SINK_PORT="${OTEL_ARROW_EBPF_SINK_PORT:-14318}"
@@ -23,6 +24,8 @@ readonly DATAFLOW_LOG="${WORK_DIR}/df-engine.log"
 readonly PROFILER_LOG="${WORK_DIR}/profiler.log"
 readonly METRICS_JSON="${WORK_DIR}/metrics.json"
 readonly STATIC_PROFILE_WORKLOAD="${WORK_DIR}/profile_workload"
+readonly RUN_OUTPUT_DIR="${OUTPUT_ROOT}/$(date -u +%Y%m%dT%H%M%SZ)-${$}"
+readonly DEBUG_OUTPUT_PATH="${RUN_OUTPUT_DIR}/profiles-debug.txt"
 
 df_engine_pid=""
 profiler_pid=""
@@ -65,7 +68,7 @@ fail() {
   exit 1
 }
 
-for command in cargo curl docker python3 rustc sort uname; do
+for command in cargo curl date docker python3 rustc sort uname; do
   command -v "${command}" >/dev/null 2>&1 || fail "required command not found: ${command}"
 done
 
@@ -73,6 +76,7 @@ done
   || fail "OTEL_ARROW_EBPF_DURATION_SECONDS must be an integer"
 ((DURATION_SECONDS >= 1 && DURATION_SECONDS <= 300)) \
   || fail "OTEL_ARROW_EBPF_DURATION_SECONDS must be between 1 and 300"
+[[ "${OUTPUT_ROOT}" == /* ]] || fail "OTEL_ARROW_EBPF_OUTPUT_DIR must be absolute"
 
 case "$(uname -m)" in
   x86_64 | aarch64 | arm64) ;;
@@ -98,6 +102,7 @@ if [[ "${OTEL_ARROW_EBPF_SKIP_BUILD:-0}" != "1" ]]; then
   (
     cd "${DATAFLOW_DIR}"
     cargo build --quiet --bin df_engine
+    cargo build --quiet -p otel-arrow-dfe-validation --example inspect_profiles_file
     if [[ "${docker_desktop_mode}" == false ]]; then
       cargo build --quiet -p otel-arrow-dfe-validation --example profile_workload
     fi
@@ -106,7 +111,10 @@ fi
 
 readonly DF_ENGINE="${DATAFLOW_DIR}/target/debug/df_engine"
 readonly PROFILE_WORKLOAD="${DATAFLOW_DIR}/target/debug/examples/profile_workload"
+readonly PROFILE_INSPECTOR="${DATAFLOW_DIR}/target/debug/examples/inspect_profiles_file"
 [[ -x "${DF_ENGINE}" ]] || fail "missing ${DF_ENGINE}; run without OTEL_ARROW_EBPF_SKIP_BUILD"
+[[ -x "${PROFILE_INSPECTOR}" ]] \
+  || fail "missing ${PROFILE_INSPECTOR}; run without OTEL_ARROW_EBPF_SKIP_BUILD"
 if [[ "${docker_desktop_mode}" == true ]]; then
   rustc \
     --edition=2024 \
@@ -123,11 +131,15 @@ else
 fi
 
 mkdir -p "${BUFFER_PATH}"
+mkdir -p "${RUN_OUTPUT_DIR}"
+chmod 700 "${RUN_OUTPUT_DIR}"
+echo "Profiles output directory: ${RUN_OUTPUT_DIR}"
 OTEL_ARROW_EBPF_INGEST_HOST="${ingest_listen_host}" \
 OTEL_ARROW_EBPF_INGEST_PORT="${INGEST_PORT}" \
 OTEL_ARROW_EBPF_SINK_PORT="${SINK_PORT}" \
 OTEL_ARROW_EBPF_ADMIN_PORT="${ADMIN_PORT}" \
 OTEL_ARROW_EBPF_BUFFER_PATH="${BUFFER_PATH}" \
+OTEL_ARROW_EBPF_OUTPUT_RUN_DIR="${RUN_OUTPUT_DIR}" \
   "${DF_ENGINE}" --config "${DATAFLOW_CONFIG}" --num-cores 2 \
   >"${DATAFLOW_LOG}" 2>&1 &
 df_engine_pid=$!
@@ -221,6 +233,7 @@ else
 fi
 
 metrics_url="http://127.0.0.1:${ADMIN_PORT}/api/v1/metrics?format=json_compact"
+delivered=false
 for _ in $(seq 1 30); do
   if ! curl --fail --silent --show-error "${metrics_url}" >"${METRICS_JSON}"; then
     sleep 1
@@ -271,12 +284,47 @@ if required.issubset(observed):
 raise SystemExit(1)
 PY
   then
-    echo "eBPF Profiles smoke test passed"
-    exit 0
+    delivered=true
+    break
   fi
   sleep 1
 done
 
-cat "${PROFILER_LOG}" >&2
-cat "${DATAFLOW_LOG}" >&2
-fail "non-empty Profiles did not traverse both OTLP receivers"
+if [[ "${delivered}" != true ]]; then
+  cat "${PROFILER_LOG}" >&2
+  cat "${DATAFLOW_LOG}" >&2
+  fail "non-empty Profiles did not traverse both OTLP receivers"
+fi
+
+artifacts_ready=false
+profile_files=()
+for _ in $(seq 1 30); do
+  shopt -s nullglob
+  profile_files=("${RUN_OUTPUT_DIR}"/profiles-*.otlp)
+  shopt -u nullglob
+  if [[ -s "${DEBUG_OUTPUT_PATH}" && ${#profile_files[@]} -gt 0 ]]; then
+    all_nonempty=true
+    for profile_file in "${profile_files[@]}"; do
+      if [[ ! -s "${profile_file}" ]]; then
+        all_nonempty=false
+      fi
+    done
+    if [[ "${all_nonempty}" == true ]]; then
+      artifacts_ready=true
+      break
+    fi
+  fi
+  sleep 1
+done
+
+if [[ "${artifacts_ready}" != true ]]; then
+  cat "${DATAFLOW_LOG}" >&2
+  fail "Profiles reached the sink but inspectable output artifacts were not persisted"
+fi
+
+for profile_file in "${profile_files[@]}"; do
+  "${PROFILE_INSPECTOR}" "${profile_file}"
+  echo "Replayable OTLP Profiles: ${profile_file}"
+done
+echo "Readable Profiles debug output: ${DEBUG_OUTPUT_PATH}"
+echo "eBPF Profiles smoke test passed"

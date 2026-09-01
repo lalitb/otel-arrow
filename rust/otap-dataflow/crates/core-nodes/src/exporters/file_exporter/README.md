@@ -10,9 +10,9 @@
 
 ## Overview
 
-The file exporter writes logs, metrics, and traces as newline-delimited OTLP
-JSON. It accepts OTLP protobuf bytes and OTAP Arrow records. Each non-empty
-input batch becomes one compact JSON object followed by `\n`.
+The file exporter writes telemetry as newline-delimited OTLP JSON or as
+versioned, checksummed OTLP protobuf frames. It accepts OTLP protobuf bytes and
+OTAP Arrow records. Profiles are supported by the `otlp_proto` format.
 
 Every physical file contains one signal type. The required path tokens keep
 files exclusive to one signal, core, and deployment generation.
@@ -29,25 +29,39 @@ The parent directory must already exist unless `create_directories` is true.
 For logs on core 3 in deployment generation 7, the example resolves to
 `/var/log/otel/telemetry-logs-3-7.jsonl`.
 
+Persist Profiles protobuf with pre-ACK synchronization:
+
+```yaml
+type: exporter:file
+config:
+  path: "/var/lib/otel/profiles-{signal}-{core_id}-{generation}.otlp"
+  create_directories: true
+  format: otlp_proto
+  open_mode: create_new
+  durability: sync_data
+```
+
 ## Configuration
 
 | Field | Default | Description |
 | --- | --- | --- |
 | `path` | Required | Absolute template containing `{signal}`, `{core_id}`, and `{generation}` exactly once. |
 | `create_directories` | `false` | Create missing parent directories. |
-| `format` | `otlp_json` | Output format. OTLP JSON is the only supported value. |
+| `format` | `otlp_json` | `otlp_json` or versioned `otlp_proto`. |
 | `open_mode` | `append` | First-open behavior: `append`, `truncate`, or `create_new`. |
 | `durability` | `write` | ACK after `write`, or after `sync_data`. |
-| `max_frame_bytes` | `67108864` | Maximum encoded frame size including `\n`; range 1 through 268435456. |
-| `tail_recovery` | `truncate_partial` | Append-mode handling: `truncate_partial` or `fail`. |
+| `max_frame_bytes` | `67108864` | Maximum complete encoded frame size; range 1 through 268435456. |
+| `tail_recovery` | `truncate_partial` | JSON append-mode handling: `truncate_partial` or `fail`. |
 
 Unknown fields, relative paths, missing or repeated tokens, unknown tokens,
 tokens removed by lexical parent traversal, and explicit `tail_recovery`
 settings outside append mode are rejected during configuration validation.
+`otlp_proto` additionally requires `open_mode: truncate` or `create_new`
+because binary append-tail repair is intentionally unsupported.
 
 ### Open modes
 
-- `append` retains complete frames. If the file has an incomplete final frame,
+- `append` retains complete JSON frames. If the file has an incomplete final frame,
   `truncate_partial` scans backward by at most `max_frame_bytes` and removes
   only that tail. `fail` rejects the file instead.
 - `truncate` explicitly discards existing contents when a signal first opens.
@@ -75,6 +89,8 @@ policy and the durable-buffer processor for crash-persistent pending work.
 
 ## Output
 
+### OTLP JSON
+
 | Signal | `{signal}` | Top-level repeated field |
 | --- | --- | --- |
 | Logs | `logs` | `resourceLogs` |
@@ -85,6 +101,35 @@ The encoding follows OTLP ProtoJSON rules, including quoted 64-bit integers,
 hexadecimal trace and span IDs, base64 byte values, numeric enums, lower-camel-case
 field names, and omission of default values. Field ordering and insignificant
 whitespace are not part of the contract.
+
+### OTLP protobuf
+
+`otlp_proto` supports logs, metrics, traces, and Profiles. Existing OTLP bytes
+are retained exactly without materializing a protobuf graph; OTAP input is
+reconstructed as canonical OTLP. Every complete frame
+contains:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 8 | Versioned ASCII magic `OTLPDF01` |
+| 8 | 1 | Signal code: logs=1, metrics=2, traces=3, Profiles=4 |
+| 9 | 3 | Reserved zero bytes |
+| 12 | 4 | Big-endian protobuf payload length |
+| 16 | 4 | Big-endian CRC32 of the protobuf payload |
+| 20 | Variable | Canonical OTLP protobuf request bytes |
+
+The fixed header makes frames self-identifying and detects unsupported
+versions, truncation, and payload corruption. `max_frame_bytes` includes both
+the 20-byte header and payload. Framing integrity does not claim that captured
+raw OTLP bytes are semantically valid; the matching inspector performs protobuf
+decoding.
+
+Inspect a Profiles file from `rust/otap-dataflow`:
+
+```bash
+cargo run -p otel-arrow-dfe-validation \
+  --example inspect_profiles_file -- /path/to/profiles.otlp
+```
 
 ## Security and Operations
 
@@ -112,7 +157,7 @@ destination lifecycle operations.
 | --- | --- | --- | --- |
 | `exporter.file.exports.messages` | `{message}` | `signal`, `outcome` | Telemetry messages whose file export reached a terminal outcome. |
 | `exporter.file.items` | `{item}` | `signal` | Signal items in successfully written frames. |
-| `exporter.file.bytes` | `By` | `signal` | Successfully written bytes including delimiters. |
+| `exporter.file.bytes` | `By` | `signal` | Successfully written bytes including frame headers or delimiters. |
 | `exporter.file.failures` | `{failure}` | `signal`, `operation` | Open, write, sync, or rollback failures. |
 | `exporter.file.tail_recoveries` | `{recovery}` | `signal` | Incomplete final frames repaired at open. |
 | `exporter.file.tail_recovered_bytes` | `By` | `signal` | Bytes removed by successful tail repair. |
@@ -132,10 +177,11 @@ No metric contains a destination path.
 
 ## Limits
 
-The first release does not support profiles, rotation, retention, compression,
-protobuf output, plain-text templates, attribute-derived paths, an internal
-retry queue, or exactly-once delivery. A completed frame may be replayed twice
-if its write succeeded but its ACK was not observed before a crash.
+The exporter does not support Profiles as OTLP JSON, binary append-tail
+recovery, rotation, retention, compression, plain-text templates,
+attribute-derived paths, an internal retry queue, or exactly-once delivery. A
+completed frame may be replayed twice if its write succeeded but its ACK was
+not observed before a crash.
 
 ## Related Docs
 

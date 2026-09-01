@@ -41,6 +41,7 @@ use otel_arrow_dfe_pdata::TryIntoWithOptions;
 use otel_arrow_dfe_pdata::proto::opentelemetry::{
     logs::v1::LogsData,
     metrics::v1::{MetricsData, metric::Data},
+    profiles::v1development::ProfilesData,
     trace::v1::TracesData,
 };
 use otel_arrow_dfe_telemetry::metrics::MeasurementMetricSet;
@@ -57,6 +58,7 @@ mod metrics;
 mod normal_marshaler;
 mod output;
 mod predicate;
+mod profiles_marshaler;
 mod sampling;
 
 /// The URN for the debug processor
@@ -386,7 +388,18 @@ impl local::Processor<OtapPdata> for DebugProcessor {
                             self.process_trace(req, debug_output.as_mut()).await?;
                         }
                     }
-                    OtlpProtoBytes::ExportProfilesRequest(_) => {}
+                    OtlpProtoBytes::ExportProfilesRequest(bytes) => {
+                        if active_signals.contains(&SignalActive::Profiles) {
+                            let req = effect_handler.timed(&self.compute_duration, || {
+                                ProfilesData::decode(bytes.as_ref()).map_err(|e| {
+                                    Error::PdataConversionError {
+                                        error: format!("error decoding proto bytes: {e}"),
+                                    }
+                                })
+                            })?;
+                            self.process_profiles(req, debug_output.as_mut()).await?;
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -395,6 +408,29 @@ impl local::Processor<OtapPdata> for DebugProcessor {
 }
 
 impl DebugProcessor {
+    async fn process_profiles(
+        &mut self,
+        profile_request: ProfilesData,
+        debug_output: &mut dyn DebugOutput,
+    ) -> Result<(), Error> {
+        let samples = profile_request
+            .resource_profiles
+            .iter()
+            .flat_map(|resource| &resource.scope_profiles)
+            .flat_map(|scope| &scope.profiles)
+            .map(|profile| profile.samples.len() as u64)
+            .sum();
+        self.metrics
+            .with(metrics::SignalAttributes {
+                signal: otel_arrow_dfe_config::SignalType::Profiles,
+            })
+            .consumed_samples
+            .add(samples);
+        debug_output
+            .output_profiles(profile_request, &mut self.sampler)
+            .await
+    }
+
     /// Function to collect and report the data contained in a Metrics object received by the Debug processor
     async fn process_metric(
         &mut self,
@@ -594,6 +630,7 @@ mod tests {
             span::SpanKind, status::StatusCode,
         },
     };
+    use otel_arrow_dfe_pdata::testing::profiles::{ProfilesDatasetKind, profiles_dataset};
     use prost::Message as _;
     use serde_json::Value;
     use std::collections::HashSet;
@@ -604,6 +641,7 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Arc;
     use std::time::Instant;
+    use tempfile::tempdir;
     use tokio::time::Duration;
 
     /// Validation closure that checks the outputted data
@@ -918,6 +956,62 @@ mod tests {
         );
 
         remove_file(output_file).expect("Failed to remove file");
+    }
+
+    /// Scenario: Detailed debug output receives canonical OTLP Profiles after reconstruction.
+    /// Guarantees: Profiles pass through unchanged and a private readable stack summary is persisted.
+    #[test]
+    fn test_debug_processor_writes_profiles_to_file() {
+        let test_runtime = TestRuntime::new();
+        let output_dir = tempdir().unwrap();
+        let output_file = output_dir.path().join("profiles-debug.txt");
+        let config = Config::new(
+            Verbosity::Detailed,
+            DisplayMode::Batch,
+            HashSet::from([SignalActive::Profiles]),
+            OutputMode::File(output_file.to_string_lossy().into_owned()),
+            Vec::new(),
+            SamplingConfig::NoSampling,
+        );
+        let user_config = Arc::new(NodeUserConfig::new_processor_config(DEBUG_PROCESSOR_URN));
+        let controller_ctx = ControllerContext::new(test_runtime.metrics_registry());
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        let processor = ProcessorWrapper::local(
+            DebugProcessor::new(config, pipeline_ctx),
+            test_node(test_runtime.config().name.clone()),
+            user_config,
+            test_runtime.config(),
+        );
+        let profiles = profiles_dataset(ProfilesDatasetKind::Cpu, 1, 2, 2);
+        let mut bytes = BytesMut::new();
+        profiles.encode(&mut bytes).unwrap();
+        let pdata =
+            OtapPdata::new_default(OtlpProtoBytes::ExportProfilesRequest(bytes.freeze()).into());
+
+        test_runtime
+            .set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                ctx.process(Message::PData(pdata)).await.unwrap();
+                assert_eq!(ctx.drain_pdata().await.len(), 1);
+            })
+            .validate(move |_| async move {
+                let output = tokio::fs::read_to_string(&output_file).await.unwrap();
+                assert!(output.contains("Received 1 profiles"));
+                assert!(output.contains("Received 2 samples"));
+                assert!(output.contains("function=fixture_function_0"));
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = tokio::fs::metadata(&output_file)
+                        .await
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777;
+                    assert_eq!(mode, 0o600);
+                }
+            });
     }
 
     #[test]

@@ -65,10 +65,15 @@ privileges.
 
 ## Real profiler smoke test
 
-The real-host pipeline is defined in `configs/profiles-ebpf-smoke.yaml`. It
+The real-profiler pipeline is defined in `configs/profiles-ebpf-smoke.yaml`. It
 receives OTLP Profiles, compacts and validates the graph, persists it in the
 durable buffer, reconstructs OTLP, and sends it to a second local OTLP receiver.
-The smoke test succeeds only after both receivers report non-empty Profiles.
+The sink writes bounded human-readable stack details and synchronized canonical
+OTLP protobuf frames. The smoke test succeeds only after both receivers report
+non-empty Profiles and both output artifacts are non-empty.
+Both OTLP receivers wait for downstream completion. The terminal ACK follows
+the file exporter's `sync_data`, while the source side is independently
+protected by the durable buffer.
 
 The launcher selects one of two collection modes:
 
@@ -88,9 +93,10 @@ cd rust/otap-dataflow
 tools/profiles/run-ebpf-smoke.sh
 ```
 
-The script builds `df_engine` and the in-repository CPU workload, starts the
-pipeline, launches the pinned profiler image, waits for the
-`Attached sched monitor` marker, runs the workload, and checks engine metrics.
+The script builds `df_engine`, the in-repository CPU workload, and the Profiles
+file inspector. It starts the pipeline, launches the pinned profiler image,
+waits for the `Attached sched monitor` marker, runs the workload, checks engine
+metrics, validates every persisted frame, and prints the artifact paths.
 
 The following environment variables are optional:
 
@@ -103,6 +109,28 @@ The following environment variables are optional:
 | `OTEL_ARROW_EBPF_SKIP_BUILD` | `0` | Reuse previously built debug binaries |
 | `OTEL_ARROW_EBPF_PROFILER_IMAGE` | pinned image | Override only for explicit compatibility testing |
 | `OTEL_ARROW_EBPF_WORKLOAD_IMAGE` | pinned Alpine image | Override the Docker Desktop sidecar workload image |
+| `OTEL_ARROW_EBPF_OUTPUT_DIR` | `target/profiles-ebpf-smoke` | Absolute parent directory for private per-run artifacts |
+
+## Inspecting persisted Profiles
+
+Each run creates a mode-`0700` timestamped directory containing:
+
+- `profiles-debug.txt`: mode-`0600` bounded profile, sample, attribute, stack,
+  function, filename, and line output;
+- `profiles-<core>-<generation>.otlp`: mode-`0600` versioned and checksummed
+  canonical OTLP Profiles protobuf frames.
+
+Reinspect the protobuf file with:
+
+```bash
+cargo run -p otel-arrow-dfe-validation \
+  --example inspect_profiles_file -- \
+  target/profiles-ebpf-smoke/<run>/profiles-1-0.otlp
+```
+
+The file format uses the `OTLPDF01` magic, signal identity, big-endian payload
+length, CRC32, and exact protobuf bytes. The debug file is diagnostic text and
+is not a replay format.
 
 ## Host requirements
 
@@ -135,9 +163,11 @@ coredumps, or a host profile capture. The profiler source is Apache-2.0, while
 its embedded eBPF object carries GPL-2.0 terms. Referencing the pinned official
 image avoids redistributing that artifact as part of this repository.
 
-The smoke test profiles only the short-lived in-repository workload and does
-not save exported Profiles. A future checked-in capture must be sanitized,
-redistributable, and accompanied by provenance and privacy review.
+The smoke test profiles only the short-lived in-repository workload. Its output
+directory is ignored build storage and must not be committed. Delete or retain
+individual runs according to local privacy and retention policy. Any future
+checked-in capture must be sanitized, redistributable, and accompanied by
+provenance and privacy review.
 
 ## Known limitations
 

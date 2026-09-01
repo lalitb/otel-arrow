@@ -37,6 +37,7 @@ pub enum SignalActive {
     Metrics,
     Logs,
     Spans,
+    Profiles,
 }
 
 /// Defines the settings of the debug processor, controls the level of verbosity the processor outputs
@@ -66,6 +67,7 @@ fn default_active_signal() -> HashSet<SignalActive> {
         SignalActive::Metrics,
         SignalActive::Logs,
         SignalActive::Spans,
+        SignalActive::Profiles,
     ])
 }
 
@@ -148,5 +150,21 @@ impl Default for Config {
             filters: default_filters(),
             sampling: default_sampling(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Scenario: The debug processor uses its default signal selection.
+    /// Guarantees: Profiles are observed by default alongside logs, metrics, and spans.
+    #[test]
+    fn default_signals_include_profiles() {
+        assert!(
+            Config::default()
+                .signals()
+                .contains(&SignalActive::Profiles)
+        );
     }
 }

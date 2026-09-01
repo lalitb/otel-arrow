@@ -422,6 +422,22 @@ before being proposed upstream.
 - Upstream framing: schema tests for new signals must cover every AnyValue
   physical encoding produced by shared builders, not only string fixtures.
 
+### PA-028: Rust diagnostic sinks did not expose Profiles
+
+- Status: `resolved-local`
+- Area: debug processor and file exporter
+- Evidence: the debug processor ignored `ExportProfilesRequest`, while the
+  console and file exporters explicitly rejected `SignalType::Profiles`.
+- Impact: the real eBPF path could prove delivery only through metrics and a
+  noop sink; operators could not inspect or retain the reconstructed output.
+- Local direction: add a bounded Profiles debug renderer and a private
+  synchronized file sink using versioned magic, signal identity, big-endian
+  length, CRC32 integrity, and canonical OTLP protobuf bytes. Binary append
+  remains unsupported rather than guessing crash-tail recovery.
+- Upstream framing: diagnostic support for graph signals must cap expansion,
+  preserve complete messages for replay, and separate unstable readable text
+  from a versioned machine-readable contract.
+
 ## Review Policy
 
 New findings should record evidence, practical Profiles impact, whether they

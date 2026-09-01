@@ -12,24 +12,23 @@
 //!   `{generation}` exactly once.
 //! - `create_directories` controls whether missing parent directories are created and defaults to
 //!   `false`.
-//! - `format` selects the output encoding and currently supports only `otlp_json`.
+//! - `format` selects `otlp_json` or versioned, checksummed `otlp_proto`.
 //! - `open_mode` controls first-open behavior (`append`, `truncate`, or `create_new`) and defaults
 //!   to `append`.
 //! - `durability` controls whether ACK follows `write` or `sync_data` and defaults to `write`.
-//! - `max_frame_bytes` bounds each JSONL frame, including its newline, and defaults to 64 MiB.
+//! - `max_frame_bytes` bounds each complete JSON or protobuf frame and defaults to 64 MiB.
 //! - `tail_recovery` controls incomplete-tail handling in append mode (`truncate_partial` or
-//!   `fail`) and defaults to `truncate_partial`.
+//!   `fail`) for `otlp_json` and defaults to `truncate_partial`.
 //!
 //! Unknown fields, invalid path templates, out-of-range frame limits, and `tail_recovery` outside
 //! append mode are rejected during configuration validation.
 //!
 //! # Future evolutions
 //!
-//! Planned configuration extensions include typed output formats such as plain text, human-readable
-//! signal renderings, framed protobuf, and structured per-record envelopes. Bounded size- and
+//! Planned configuration extensions include typed output formats such as plain text,
+//! human-readable signal renderings, and structured per-record envelopes. Bounded size- and
 //! time-based rotation, backup retention, and standard file-level zstd compression may follow once
-//! their ownership, recovery, and failure semantics are defined. Profiles can be supported after
-//! OTAP provides a stable profile signal representation and file format.
+//! their ownership, recovery, and failure semantics are defined.
 
 use otel_arrow_dfe_config::SignalType;
 use otel_arrow_dfe_config::error::Error as ConfigError;
@@ -38,7 +37,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
 
-/// Default maximum encoded JSONL frame size, including its newline.
+/// Default maximum encoded frame size, including format-specific framing.
 const DEFAULT_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// Hard upper bound accepted for the maximum encoded frame size.
 const MAX_MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
@@ -52,6 +51,8 @@ pub enum FileFormat {
     /// Compact OTLP ProtoJSON with one pdata batch per line.
     #[default]
     OtlpJson,
+    /// OTLP protobuf requests in versioned, checksummed frames.
+    OtlpProto,
 }
 
 /// Behavior when a signal file is first opened.
@@ -107,7 +108,7 @@ pub struct FileExporterConfig {
     /// ACK durability point.
     #[serde(default)]
     pub durability: Durability,
-    /// Maximum encoded frame size, including the newline.
+    /// Maximum encoded frame size, including format-specific framing.
     #[serde(default = "default_max_frame_bytes")]
     pub max_frame_bytes: usize,
     /// Explicit append-mode crash-tail policy.
@@ -226,6 +227,11 @@ impl FileExporterConfig {
                 "file.tail_recovery is only valid with open_mode=append",
             ));
         }
+        if self.format == FileFormat::OtlpProto && self.open_mode == OpenMode::Append {
+            return Err(invalid(
+                "file.format=otlp_proto requires open_mode=truncate or create_new",
+            ));
+        }
         Ok(())
     }
 }
@@ -312,6 +318,7 @@ mod tests {
     #[test]
     fn configuration_enum_attribute_values_are_stable() {
         assert_eq!(FileFormat::OtlpJson.as_str(), "otlp_json");
+        assert_eq!(FileFormat::OtlpProto.as_str(), "otlp_proto");
         assert_eq!(OpenMode::Append.as_str(), "append");
         assert_eq!(OpenMode::Truncate.as_str(), "truncate");
         assert_eq!(OpenMode::CreateNew.as_str(), "create_new");
@@ -364,8 +371,33 @@ mod tests {
         assert!(error.is_err());
     }
 
+    /// Scenario: Versioned protobuf output selects an unambiguous first-open mode.
+    /// Guarantees: Create-new is accepted while append is rejected without binary tail recovery.
+    #[test]
+    fn protobuf_format_requires_non_append_open_mode() {
+        let config = FileExporterConfig::parse(&json!({
+            "path": absolute_template(),
+            "format": "otlp_proto",
+            "open_mode": "create_new",
+            "durability": "sync_data"
+        }))
+        .unwrap();
+        assert_eq!(config.format, FileFormat::OtlpProto);
+        assert_eq!(config.open_mode, OpenMode::CreateNew);
+        assert_eq!(config.durability, Durability::SyncData);
+
+        assert!(
+            FileExporterConfig::parse(&json!({
+                "path": absolute_template(),
+                "format": "otlp_proto",
+                "open_mode": "append"
+            }))
+            .is_err()
+        );
+    }
+
     /// Scenario: Runtime identifiers and each signal are substituted into a valid path template.
-    /// Guarantees: Logs, metrics, and traces resolve deterministically to distinct absolute paths.
+    /// Guarantees: Every signal resolves deterministically to a distinct absolute path.
     #[test]
     fn renders_signal_core_and_generation_paths() {
         let config = FileExporterConfig::parse(&json!({"path": absolute_template()})).unwrap();
@@ -380,6 +412,11 @@ mod tests {
             paths
                 .get(SignalType::Traces)
                 .ends_with("otel-traces-3-7.jsonl")
+        );
+        assert!(
+            paths
+                .get(SignalType::Profiles)
+                .ends_with("otel-profiles-3-7.jsonl")
         );
     }
 

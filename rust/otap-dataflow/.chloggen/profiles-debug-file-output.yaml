@@ -1,0 +1,7 @@
+change_type: enhancement
+component: pipeline
+note: "Persist OTAP Profiles as readable debug output and versioned, checksummed OTLP protobuf frames."
+issues: [2303]
+subtext: >-
+  Adds bounded stack and attribute inspection plus synchronized private files
+  that preserve canonical Profiles requests for offline decoding.

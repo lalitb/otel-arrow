@@ -1,7 +1,7 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Multi-signal OTLP JSON Lines file exporter.
+//! Multi-signal OTLP JSON Lines and framed protobuf file exporter.
 //!
 //! The exporter encodes OTLP-byte or OTAP Arrow pdata through backend-agnostic views, then writes
 //! one bounded frame to a lazily opened signal-specific file. The local run loop owns all state so
@@ -9,6 +9,7 @@
 
 mod config;
 mod encoding;
+pub mod framing;
 mod metrics;
 mod writer;
 
@@ -16,7 +17,7 @@ pub use config::{Durability, FileExporterConfig, FileFormat, OpenMode, TailRecov
 
 use async_trait::async_trait;
 use config::RenderedPaths;
-use encoding::{FrameEncodeError, encode_logs, encode_metrics, encode_traces};
+use encoding::{FrameEncodeError, encode_logs, encode_metrics, encode_otlp_proto, encode_traces};
 use linkme::distributed_slice;
 use metrics::{
     FileExporterExportMetrics, FileFailureMetrics, FileOperation, FileSignalMetrics,
@@ -40,7 +41,9 @@ use otel_arrow_dfe_pdata::views::otap::{OtapLogsView, OtapMetricsView, OtapTrace
 use otel_arrow_dfe_pdata::views::otlp::bytes::logs::RawLogsData;
 use otel_arrow_dfe_pdata::views::otlp::bytes::metrics::RawMetricsData;
 use otel_arrow_dfe_pdata::views::otlp::bytes::traces::RawTraceData;
-use otel_arrow_dfe_pdata::{OtapPayload, OtapPayloadHelpers, PayloadData};
+use otel_arrow_dfe_pdata::{
+    OtapPayload, OtapPayloadHelpers, OtlpProtoBytes, PayloadData, TryIntoWithOptions,
+};
 use otel_arrow_dfe_telemetry::attributes::AttributeEnum as _;
 use otel_arrow_dfe_telemetry::common_attributes::{
     Outcome, SignalAttributes, SignalOutcomeAttributes,
@@ -56,7 +59,7 @@ const FILE_SIGNAL_COUNT: usize = 4;
 /// Component URN for the file exporter.
 pub const FILE_EXPORTER_URN: &str = "urn:otel:exporter:file";
 
-/// OTLP JSON file exporter with one lazily opened writer per signal.
+/// OTLP file exporter with one lazily opened writer per signal.
 pub struct FileExporter {
     config: FileExporterConfig,
     paths: RenderedPaths,
@@ -164,13 +167,14 @@ impl FileExporter {
         }
         if let Err(error) = encode_payload(
             pdata.payload_ref(),
+            self.config.format,
             &mut self.frame,
             self.config.max_frame_bytes,
         ) {
             self.record_export_outcome(signal, Outcome::Failure);
             let reason = match error {
                 EncodeFailure::Frame(FrameEncodeError::FrameTooLarge { .. }) => {
-                    "file exporter frame exceeds max_frame_bytes; split the batch upstream"
+                    "file exporter frame exceeds max_frame_bytes; reduce the source batch or increase the bounded limit"
                         .to_owned()
                 }
                 error => format!("file exporter rejected invalid pdata: {error}"),
@@ -371,30 +375,42 @@ enum EncodeFailure {
 
 fn encode_payload(
     payload: &OtapPayload,
+    format: FileFormat,
+    frame: &mut Vec<u8>,
+    max_frame_bytes: usize,
+) -> Result<(), EncodeFailure> {
+    match format {
+        FileFormat::OtlpJson => encode_json_payload(payload, frame, max_frame_bytes),
+        FileFormat::OtlpProto => encode_proto_payload(payload, frame, max_frame_bytes),
+    }
+}
+
+fn encode_json_payload(
+    payload: &OtapPayload,
     frame: &mut Vec<u8>,
     max_frame_bytes: usize,
 ) -> Result<(), EncodeFailure> {
     frame.clear();
     match payload.data() {
         PayloadData::OtlpBytes(bytes) => match bytes {
-            otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(_) => {
+            OtlpProtoBytes::ExportLogsRequest(_) => {
                 let view = RawLogsData::try_from(bytes)
                     .map_err(|error| EncodeFailure::View(error.to_string()))?;
                 encode_logs(&view, frame, max_frame_bytes)?;
             }
-            otel_arrow_dfe_pdata::OtlpProtoBytes::ExportMetricsRequest(bytes) => {
+            OtlpProtoBytes::ExportMetricsRequest(bytes) => {
                 let view = RawMetricsData::try_new(bytes)
                     .map_err(|error| EncodeFailure::View(error.to_string()))?;
                 encode_metrics(&view, frame, max_frame_bytes)?;
             }
-            otel_arrow_dfe_pdata::OtlpProtoBytes::ExportTracesRequest(bytes) => {
+            OtlpProtoBytes::ExportTracesRequest(bytes) => {
                 let view = RawTraceData::try_new(bytes)
                     .map_err(|error| EncodeFailure::View(error.to_string()))?;
                 encode_traces(&view, frame, max_frame_bytes)?;
             }
-            otel_arrow_dfe_pdata::OtlpProtoBytes::ExportProfilesRequest(_) => {
+            OtlpProtoBytes::ExportProfilesRequest(_) => {
                 return Err(EncodeFailure::View(
-                    "file export does not support Profiles yet".to_string(),
+                    "file format otlp_json does not support Profiles".to_string(),
                 ));
             }
         },
@@ -416,11 +432,33 @@ fn encode_payload(
             }
             SignalType::Profiles => {
                 return Err(EncodeFailure::View(
-                    "file export does not support Profiles yet".to_string(),
+                    "file format otlp_json does not support Profiles".to_string(),
                 ));
             }
         },
     }
+    Ok(())
+}
+
+fn encode_proto_payload(
+    payload: &OtapPayload,
+    frame: &mut Vec<u8>,
+    max_frame_bytes: usize,
+) -> Result<(), EncodeFailure> {
+    frame.clear();
+    let bytes = match payload.data() {
+        PayloadData::OtlpBytes(bytes) => bytes.clone(),
+        PayloadData::OtapArrowRecords(_) => payload.clone().try_into_with_default().map_err(
+            |error: otel_arrow_dfe_pdata::error::Error| EncodeFailure::View(error.to_string()),
+        )?,
+    };
+    let payload_bytes = match &bytes {
+        OtlpProtoBytes::ExportLogsRequest(bytes)
+        | OtlpProtoBytes::ExportMetricsRequest(bytes)
+        | OtlpProtoBytes::ExportTracesRequest(bytes)
+        | OtlpProtoBytes::ExportProfilesRequest(bytes) => bytes.as_ref(),
+    };
+    encode_otlp_proto(payload.signal_type(), payload_bytes, frame, max_frame_bytes)?;
     Ok(())
 }
 
@@ -455,9 +493,9 @@ mod tests {
         TestContext, TestRuntime, create_exporter_from_factory,
     };
     use otel_arrow_dfe_otap::testing::{TestCallData, create_empty_test_pdata};
-    use otel_arrow_dfe_pdata::OtlpProtoBytes;
     use otel_arrow_dfe_pdata::encode::{
-        encode_logs_otap_batch, encode_metrics_otap_batch, encode_spans_otap_batch,
+        encode_logs_otap_batch, encode_metrics_otap_batch, encode_profiles_otap_batch,
+        encode_spans_otap_batch,
     };
     use otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest;
     use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceRequest;
@@ -468,7 +506,10 @@ mod tests {
     use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{
         Metric, ResourceMetrics, ScopeMetrics,
     };
+    use otel_arrow_dfe_pdata::proto::opentelemetry::profiles::v1development::ProfilesData;
     use otel_arrow_dfe_pdata::proto::opentelemetry::trace::v1::{ResourceSpans, ScopeSpans, Span};
+    use otel_arrow_dfe_pdata::testing::profiles::{ProfilesDatasetKind, profiles_dataset};
+    use prost::Message as _;
     use serde_json::json;
     use std::time::{Duration, Instant as StdInstant};
     use tempfile::tempdir;
@@ -541,6 +582,14 @@ mod tests {
         pdata(SignalType::Traces, trace_request())
     }
 
+    fn profile_data() -> ProfilesData {
+        profiles_dataset(ProfilesDatasetKind::Cpu, 2, 3, 4)
+    }
+
+    fn profile_pdata() -> OtapPdata {
+        pdata(SignalType::Profiles, profile_data())
+    }
+
     async fn assert_permanent_nack(ctx: &mut TestContext<OtapPdata>, expected_reason: &str) {
         let mut completion_receiver = ctx.take_pipeline_completion_receiver().unwrap();
         let completion = tokio::time::timeout(Duration::from_secs(3), completion_receiver.recv())
@@ -554,6 +603,18 @@ mod tests {
             }
             PipelineCompletionMsg::DeliverAck { .. } => panic!("expected a permanent NACK"),
         }
+    }
+
+    async fn assert_ack(ctx: &mut TestContext<OtapPdata>) {
+        let mut completion_receiver = ctx.take_pipeline_completion_receiver().unwrap();
+        let completion = tokio::time::timeout(Duration::from_secs(3), completion_receiver.recv())
+            .await
+            .expect("timed out waiting for file exporter ACK")
+            .expect("completion channel closed before file exporter ACK");
+        assert!(matches!(
+            completion,
+            PipelineCompletionMsg::DeliverAck { .. }
+        ));
     }
 
     /// Scenario: OTAP Arrow batches for logs, metrics, and traces enter the common payload path.
@@ -574,7 +635,7 @@ mod tests {
         let expected_fields = ["resourceLogs", "resourceMetrics", "resourceSpans"];
         let mut frame = Vec::new();
         for (payload, expected_field) in payloads.iter().zip(expected_fields) {
-            encode_payload(payload, &mut frame, 4096).unwrap();
+            encode_payload(payload, FileFormat::OtlpJson, &mut frame, 4096).unwrap();
             let value: serde_json::Value = serde_json::from_slice(&frame).unwrap();
             assert!(value.get(expected_field).is_some());
         }
@@ -587,7 +648,79 @@ mod tests {
         let payload =
             OtapPayload::from(OtlpProtoBytes::new_from_bytes(SignalType::Logs, vec![0x80]));
         let mut frame = b"previous telemetry\n".to_vec();
-        assert!(encode_payload(&payload, &mut frame, 4096).is_err());
+        assert!(encode_payload(&payload, FileFormat::OtlpJson, &mut frame, 4096).is_err());
+        assert!(frame.is_empty());
+    }
+
+    /// Scenario: Raw OTLP protobuf bytes are captured without materializing an object graph.
+    /// Guarantees: The exact bytes remain bounded and replayable even when later decoding fails.
+    #[test]
+    fn protobuf_format_preserves_raw_otlp_bytes() {
+        let payload =
+            OtapPayload::from(OtlpProtoBytes::new_from_bytes(SignalType::Logs, vec![0x80]));
+        let mut frame = Vec::new();
+        encode_payload(&payload, FileFormat::OtlpProto, &mut frame, 4096).unwrap();
+        let raw_header: [u8; framing::OTLP_PROTO_FRAME_HEADER_BYTES] = frame
+            [..framing::OTLP_PROTO_FRAME_HEADER_BYTES]
+            .try_into()
+            .unwrap();
+        let header = framing::decode_otlp_proto_frame_header(&raw_header).unwrap();
+        let bytes = &frame[framing::OTLP_PROTO_FRAME_HEADER_BYTES..];
+        framing::validate_otlp_proto_frame_payload(header, bytes).unwrap();
+        assert_eq!(header.signal, SignalType::Logs);
+        assert_eq!(bytes, &[0x80]);
+    }
+
+    /// Scenario: OTLP and OTAP Profiles enter the versioned protobuf path.
+    /// Guarantees: Both representations produce self-identifying, valid Profiles frames.
+    #[test]
+    fn protobuf_format_accepts_otlp_and_otap_profiles() {
+        let profiles = profile_data();
+        let encoded_profiles = encoded(&profiles);
+        let payloads = [
+            OtapPayload::from(OtlpProtoBytes::new_from_bytes(
+                SignalType::Profiles,
+                encoded_profiles,
+            )),
+            OtapPayload::from(encode_profiles_otap_batch(&profiles).unwrap()),
+        ];
+
+        for payload in payloads {
+            let mut frame = Vec::new();
+            encode_payload(&payload, FileFormat::OtlpProto, &mut frame, 1024 * 1024).unwrap();
+            let raw_header: [u8; framing::OTLP_PROTO_FRAME_HEADER_BYTES] = frame
+                [..framing::OTLP_PROTO_FRAME_HEADER_BYTES]
+                .try_into()
+                .unwrap();
+            let header = framing::decode_otlp_proto_frame_header(&raw_header).unwrap();
+            let payload = &frame[framing::OTLP_PROTO_FRAME_HEADER_BYTES..];
+            framing::validate_otlp_proto_frame_payload(header, payload).unwrap();
+            assert_eq!(header.signal, SignalType::Profiles);
+            let decoded = ProfilesData::decode(payload).unwrap();
+            assert_eq!(decoded.resource_profiles.len(), 1);
+            assert_eq!(
+                decoded.resource_profiles[0].scope_profiles[0]
+                    .profiles
+                    .len(),
+                2
+            );
+        }
+    }
+
+    /// Scenario: Profiles are sent to the default JSON format.
+    /// Guarantees: The exporter rejects the unsupported format explicitly instead of losing data.
+    #[test]
+    fn profiles_require_protobuf_file_format() {
+        let pdata = profile_pdata();
+        let mut frame = Vec::new();
+        let error = encode_payload(
+            pdata.payload_ref(),
+            FileFormat::OtlpJson,
+            &mut frame,
+            1024 * 1024,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("otlp_json"));
         assert!(frame.is_empty());
     }
 
@@ -628,6 +761,62 @@ mod tests {
                     let value: serde_json::Value = serde_json::from_str(&content).unwrap();
                     assert!(value.get(expected_field).is_some());
                 }
+            });
+    }
+
+    /// Scenario: The file exporter receives canonical OTLP Profiles with sync durability.
+    /// Guarantees: It writes one complete replayable protobuf frame before acknowledging.
+    #[test]
+    fn exporter_persists_profiles_as_framed_otlp_protobuf() {
+        let dir = tempdir().unwrap();
+        let template = dir
+            .path()
+            .join("capture-{signal}-{core_id}-{generation}.otlp");
+        let exporter = create_exporter_from_factory(
+            &FILE_EXPORTER,
+            json!({
+                "path": template.to_string_lossy(),
+                "format": "otlp_proto",
+                "open_mode": "create_new",
+                "durability": "sync_data"
+            }),
+        )
+        .unwrap();
+        let path = dir.path().join("capture-profiles-0-0.otlp");
+
+        TestRuntime::new()
+            .set_exporter(exporter)
+            .run_test(|ctx| async move {
+                let pdata = profile_pdata().test_subscribe_to(
+                    Interests::ACKS,
+                    TestCallData::default().into(),
+                    123,
+                );
+                ctx.send_pdata(pdata).await.unwrap();
+                ctx.send_shutdown(StdInstant::now() + Duration::from_secs(10), "test complete")
+                    .await
+                    .unwrap();
+            })
+            .run_validation(move |mut ctx, result| async move {
+                result.unwrap();
+                assert_ack(&mut ctx).await;
+                let frame = tokio::fs::read(path).await.unwrap();
+                let raw_header: [u8; framing::OTLP_PROTO_FRAME_HEADER_BYTES] = frame
+                    [..framing::OTLP_PROTO_FRAME_HEADER_BYTES]
+                    .try_into()
+                    .unwrap();
+                let header = framing::decode_otlp_proto_frame_header(&raw_header).unwrap();
+                let payload = &frame[framing::OTLP_PROTO_FRAME_HEADER_BYTES..];
+                framing::validate_otlp_proto_frame_payload(header, payload).unwrap();
+                assert_eq!(header.signal, SignalType::Profiles);
+                let decoded = ProfilesData::decode(payload).unwrap();
+                assert_eq!(decoded.resource_profiles.len(), 1);
+                assert_eq!(
+                    decoded.resource_profiles[0].scope_profiles[0]
+                        .profiles
+                        .len(),
+                    2
+                );
             });
     }
 

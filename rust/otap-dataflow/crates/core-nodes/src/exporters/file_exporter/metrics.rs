@@ -53,7 +53,7 @@ pub struct FileSignalMetrics {
     /// Signal items in frames successfully written before ACK routing.
     #[metric(unit = "{item}")]
     pub items: Counter<u64>,
-    /// Successfully written frame bytes, including newline delimiters.
+    /// Successfully written bytes, including format-specific frame headers or delimiters.
     #[metric(unit = "By")]
     pub bytes: Counter<u64>,
     /// Append-mode partial tails successfully repaired.
