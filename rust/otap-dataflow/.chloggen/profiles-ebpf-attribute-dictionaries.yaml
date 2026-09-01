@@ -1,0 +1,7 @@
+change_type: bug_fix
+component: pdata
+note: "Accept dictionary-encoded integer and binary values in OTAP Profiles attribute batches."
+issues: [2303]
+subtext: >-
+  Allows real eBPF sample attributes to pass graph validation and round-trip
+  through processing, durable buffering, and OTLP reconstruction.

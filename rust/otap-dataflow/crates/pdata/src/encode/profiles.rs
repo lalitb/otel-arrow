@@ -1424,12 +1424,15 @@ mod tests {
     use super::*;
     use crate::TryIntoWithOptions;
     use crate::arrays::MaybeDictArrayAccessor;
+    use crate::proto::OtlpProtoMessage;
     use crate::proto::opentelemetry::common::v1::EntityRef;
     use crate::proto::opentelemetry::common::v1::{ArrayValue, InstrumentationScope, KeyValueList};
     use crate::proto::opentelemetry::profiles::v1development::{
         Line, Profile, Sample, ScopeProfiles,
     };
     use crate::proto::opentelemetry::resource::v1::Resource;
+    use crate::testing::equiv::assert_equivalent;
+    use crate::{OtapPayload, OtlpProtoBytes};
     use arrow::array::{StringArray, StructArray};
     use prost::Message;
 
@@ -1489,6 +1492,80 @@ mod tests {
                 .num_rows(),
             1
         );
+    }
+
+    /// Scenario: eBPF-style sample attributes contain integer, bytes, and complex values.
+    /// Guarantees: Shared dictionary encodings validate and survive canonical OTLP reconstruction.
+    #[test]
+    fn encodes_dictionary_backed_profile_attribute_values() {
+        let mut data = minimal_data();
+        let dictionary = data.dictionary.as_mut().unwrap();
+        dictionary.string_table.extend(
+            ["sample.int", "sample.bytes", "sample.complex"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        dictionary.attribute_table.extend([
+            KeyValueAndUnit {
+                key_strindex: 1,
+                value: Some(AnyValue {
+                    value: Some(any_value::Value::IntValue(42)),
+                }),
+                unit_strindex: 0,
+            },
+            KeyValueAndUnit {
+                key_strindex: 2,
+                value: Some(AnyValue {
+                    value: Some(any_value::Value::BytesValue(vec![1, 2, 3])),
+                }),
+                unit_strindex: 0,
+            },
+            KeyValueAndUnit {
+                key_strindex: 3,
+                value: Some(AnyValue {
+                    value: Some(any_value::Value::ArrayValue(ArrayValue {
+                        values: vec![AnyValue {
+                            value: Some(any_value::Value::IntValue(7)),
+                        }],
+                    })),
+                }),
+                unit_strindex: 0,
+            },
+        ]);
+        data.resource_profiles[0].scope_profiles[0].profiles[0].samples[0].attribute_indices =
+            vec![1, 2, 3];
+
+        let records = encode_profiles_otap_batch(&data).unwrap();
+        let attrs = records
+            .get(ArrowPayloadType::ProfileSampleAttrs)
+            .expect("sample attributes");
+        assert_eq!(
+            attrs
+                .column_by_name(consts::ATTRIBUTE_INT)
+                .unwrap()
+                .data_type(),
+            &DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Int64))
+        );
+        assert_eq!(
+            attrs
+                .column_by_name(consts::ATTRIBUTE_BYTES)
+                .unwrap()
+                .data_type(),
+            &DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Binary))
+        );
+        assert_eq!(
+            attrs
+                .column_by_name(consts::ATTRIBUTE_SER)
+                .unwrap()
+                .data_type(),
+            &DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Binary))
+        );
+
+        let bytes: OtlpProtoBytes = OtapPayload::from_otap(records)
+            .try_into_with_default()
+            .unwrap();
+        let decoded: OtlpProtoMessage = bytes.try_into().unwrap();
+        assert_equivalent(&[OtlpProtoMessage::Profiles(data)], &[decoded]);
     }
 
     /// Scenario: Profiles data uses every dictionary table and nested string references.
@@ -1696,10 +1773,9 @@ mod tests {
             dictionary: data.dictionary,
         };
         let bytes = request.encode_to_vec();
-        let records: OtapArrowRecords =
-            crate::otlp::OtlpProtoBytes::ExportProfilesRequest(bytes.into())
-                .try_into_with_default()
-                .unwrap();
+        let records: OtapArrowRecords = OtlpProtoBytes::ExportProfilesRequest(bytes.into())
+            .try_into_with_default()
+            .unwrap();
 
         assert!(matches!(records, OtapArrowRecords::Profiles(_)));
         assert_eq!(records.num_items(), 1);

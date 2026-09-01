@@ -86,7 +86,8 @@ Each branch is stacked on the preceding branch.
       graph-aware processing, durable buffering, OTAP transport, canonical
       reconstruction, and semantic equivalence. A pinned Collector
       `0.159.0` smoke test exercises the real profiler on approved Linux hosts
-      with Docker and the required eBPF privileges.
+      with Docker and the required eBPF privileges, including a
+      container-scoped Docker Desktop mode for WSL validation.
 
 The branch names after step 3 are provisional and may be adjusted when each
 change is started. Schema or protocol discoveries may also require inserting a

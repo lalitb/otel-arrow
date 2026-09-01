@@ -535,7 +535,10 @@ profile_schema!(
         },
         Field {
             name: ATTRIBUTE_INT,
-            data_type: DataType::Simple(Int64),
+            data_type: DataType::Dictionary {
+                min_key_size: DictKeySize::U16,
+                value_type: Int64
+            },
             required: false
         },
         Field {
@@ -550,12 +553,18 @@ profile_schema!(
         },
         Field {
             name: ATTRIBUTE_BYTES,
-            data_type: DataType::Simple(Binary),
+            data_type: DataType::Dictionary {
+                min_key_size: DictKeySize::U16,
+                value_type: Binary
+            },
             required: false
         },
         Field {
             name: ATTRIBUTE_SER,
-            data_type: DataType::Simple(Binary),
+            data_type: DataType::Dictionary {
+                min_key_size: DictKeySize::U16,
+                value_type: Binary
+            },
             required: false
         },
         Field {

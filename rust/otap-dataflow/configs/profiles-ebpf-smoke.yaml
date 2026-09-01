@@ -36,7 +36,7 @@ groups:
             config:
               protocols:
                 grpc:
-                  listening_addr: "127.0.0.1:${env:OTEL_ARROW_EBPF_INGEST_PORT:-14317}"
+                  listening_addr: "${env:OTEL_ARROW_EBPF_INGEST_HOST:-127.0.0.1}:${env:OTEL_ARROW_EBPF_INGEST_PORT:-14317}"
                   max_decoding_message_size: "32MiB"
 
           profiles_filter:

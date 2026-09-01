@@ -344,7 +344,9 @@ before being proposed upstream.
 - Impact: the real integration cannot run on ordinary unprivileged CI workers,
   non-Linux hosts, or Docker environments without host integration.
 - Local direction: keep deterministic Profiles generation in normal CI and run
-  the pinned real-profiler smoke only on explicitly approved hosts.
+  the pinned real-profiler smoke only on explicitly approved hosts. Native
+  Linux uses host PID mode; Docker Desktop uses PID-namespace translation and a
+  workload sidecar without claiming host-wide WSL coverage.
 - Upstream framing: add a reporter-level replay or synthetic source that uses
   the production export path without requiring kernel attachment.
 
@@ -403,6 +405,22 @@ before being proposed upstream.
 - Upstream framing: continue the generic status propagation work tracked by
   [open-telemetry/otel-arrow#1921](https://github.com/open-telemetry/otel-arrow/issues/1921)
   rather than treating Profiles as a special case.
+
+### PA-027: Profiles attribute schemas rejected shared adaptive encodings
+
+- Status: `resolved-local`
+- Area: OTLP Profiles to OTAP attribute encoding
+- Evidence: the shared AnyValue builder emits dictionary-backed `Int64` and
+  `Binary` columns, while the initial Profiles attribute schema required plain
+  integer, bytes, and serialized columns. Real eBPF sample attributes exercised
+  the dictionary-backed integer path.
+- Impact: a valid profiler export terminated the processing pipeline before
+  filtering or durable buffering.
+- Local direction: align profile, sample, mapping, and location attribute
+  schemas with the shared adaptive attribute representation and add a
+  mixed-value semantic round trip.
+- Upstream framing: schema tests for new signals must cover every AnyValue
+  physical encoding produced by shared builders, not only string fixtures.
 
 ## Review Policy
 

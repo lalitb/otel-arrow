@@ -23,6 +23,9 @@ message definitions match the repository-pinned
 The profiler exports gzip-compressed OTLP/gRPC Profiles. The configured
 receiver accepts messages up to 32 MiB because the profiler distribution can
 produce requests larger than the receiver's normal 4 MiB default.
+Collector `0.159.0` also requires the
+`+service.profilesSupport` feature gate because the Profiles pipeline remains
+alpha.
 
 ## Deterministic validation
 
@@ -67,6 +70,17 @@ receives OTLP Profiles, compacts and validates the graph, persists it in the
 durable buffer, reconstructs OTLP, and sends it to a second local OTLP receiver.
 The smoke test succeeds only after both receivers report non-empty Profiles.
 
+The launcher selects one of two collection modes:
+
+- Native Linux Docker uses the host PID and network namespaces and profiles the
+  workload running directly on the host.
+- Docker Desktop under WSL uses the profiler's PID-namespace translation mode.
+  It builds a static in-repository workload and runs it in a second,
+  digest-pinned container sharing the profiler's PID namespace. This exercises
+  the real eBPF tracer without claiming visibility into other WSL processes.
+  The OTLP ingress port is bound to all WSL interfaces only for the duration of
+  this mode so Docker Desktop's host gateway can reach it.
+
 Run:
 
 ```bash
@@ -88,10 +102,11 @@ The following environment variables are optional:
 | `OTEL_ARROW_EBPF_ADMIN_PORT` | `18080` | Dataflow admin endpoint |
 | `OTEL_ARROW_EBPF_SKIP_BUILD` | `0` | Reuse previously built debug binaries |
 | `OTEL_ARROW_EBPF_PROFILER_IMAGE` | pinned image | Override only for explicit compatibility testing |
+| `OTEL_ARROW_EBPF_WORKLOAD_IMAGE` | pinned Alpine image | Override the Docker Desktop sidecar workload image |
 
 ## Host requirements
 
-The real smoke test intentionally fails fast unless the host provides:
+Native host-wide mode requires:
 
 - Linux on amd64 or arm64;
 - kernel 5.10 or newer with eBPF support;
@@ -109,7 +124,9 @@ only on a dedicated development or CI worker where system-wide profiling is
 approved. Ordinary CI must use the deterministic validation path instead.
 
 Docker Desktop users running under WSL must enable Docker integration for the
-distribution before running the smoke test.
+distribution. Docker Desktop's host PID namespace belongs to its Linux VM, not
+the WSL distribution, so the script automatically uses container-scoped
+sidecar mode instead of host-wide mode.
 
 ## Artifact and data handling
 
@@ -127,6 +144,9 @@ redistributable, and accompanied by provenance and privacy review.
 - The upstream profiler has no replay or synthetic mode that exercises its
   reporter without loading eBPF.
 - The privileged smoke cannot run on ordinary unprivileged CI workers.
+- Docker Desktop sidecar mode validates real eBPF collection only inside the
+  shared profiler/workload PID namespace; use native Linux for host-wide
+  process coverage.
 - The smoke validates collection, graph conversion, processing, persistence,
   reconstruction, and non-empty delivery; deterministic semantic equivalence
   remains the responsibility of the unprivileged scenario.

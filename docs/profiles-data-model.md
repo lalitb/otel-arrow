@@ -516,17 +516,17 @@ column:
 | `key` | Utf8 | Dict(u8), Dict(u16) | Yes | `plain` | data | Attribute key |
 | `type` | UInt8 | - | Yes | `plain` | data | Existing OTAP AnyValue discriminator |
 | `str` | Utf8 | Dict(u8), Dict(u16) | No | `plain` | data | String value |
-| `int` | Int64 | - | No | `plain` | data | Integer value |
+| `int` | Int64 | Dict(u16) | No | `plain` | data | Integer value |
 | `double` | Float64 | - | No | `plain` | data | Floating-point value |
 | `bool` | Boolean | - | No | `plain` | data | Boolean value |
-| `bytes` | Binary | - | No | `plain` | data | Byte value |
-| `ser` | Binary | - | No | `plain` | data | CBOR-serialized complex AnyValue |
+| `bytes` | Binary | Dict(u16) | No | `plain` | data | Byte value |
+| `ser` | Binary | Dict(u16) | No | `plain` | data | CBOR-serialized complex AnyValue |
 | `unit` | Utf8 | Dict(u8), Dict(u16) | No | `plain` | data | UCUM unit or absent |
 
 For one owner, keys must satisfy the Profiles attribute-key uniqueness rule.
 An OTLP encoder may deduplicate identical key/value/unit tuples into the
-protobuf attribute dictionary. Arrow IPC dictionary encoding of `key`, `str`,
-or `unit` is independent from that operation.
+protobuf attribute dictionary. Arrow IPC dictionary encoding of materialized
+attribute columns is independent from that operation.
 
 Resource and scope attributes continue to use the existing `RESOURCE_ATTRS`
 and `SCOPE_ATTRS` payload types and do not acquire a unit column. Their

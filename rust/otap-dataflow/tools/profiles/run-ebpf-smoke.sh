@@ -3,22 +3,26 @@
 set -euo pipefail
 
 readonly PROFILER_IMAGE_DEFAULT="otel/opentelemetry-collector-ebpf-profiler:0.159.0@sha256:90d6b6536ce0283d706f7e7b6c45f534c65b140ff6ec456c19385e50a7d12b8e"
+readonly WORKLOAD_IMAGE_DEFAULT="alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b"
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly DATAFLOW_DIR="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 readonly PROFILER_CONFIG="${SCRIPT_DIR}/ebpf-profiler-config.yaml"
 readonly DATAFLOW_CONFIG="${DATAFLOW_DIR}/configs/profiles-ebpf-smoke.yaml"
 
 readonly PROFILER_IMAGE="${OTEL_ARROW_EBPF_PROFILER_IMAGE:-${PROFILER_IMAGE_DEFAULT}}"
+readonly WORKLOAD_IMAGE="${OTEL_ARROW_EBPF_WORKLOAD_IMAGE:-${WORKLOAD_IMAGE_DEFAULT}}"
 readonly DURATION_SECONDS="${OTEL_ARROW_EBPF_DURATION_SECONDS:-15}"
 readonly INGEST_PORT="${OTEL_ARROW_EBPF_INGEST_PORT:-14317}"
 readonly SINK_PORT="${OTEL_ARROW_EBPF_SINK_PORT:-14318}"
 readonly ADMIN_PORT="${OTEL_ARROW_EBPF_ADMIN_PORT:-18080}"
 readonly CONTAINER_NAME="otel-arrow-ebpf-profiler-${$}"
+readonly WORKLOAD_CONTAINER_NAME="otel-arrow-ebpf-workload-${$}"
 readonly WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/otel-arrow-profiles-ebpf.XXXXXX")"
 readonly BUFFER_PATH="${WORK_DIR}/buffer"
 readonly DATAFLOW_LOG="${WORK_DIR}/df-engine.log"
 readonly PROFILER_LOG="${WORK_DIR}/profiler.log"
 readonly METRICS_JSON="${WORK_DIR}/metrics.json"
+readonly STATIC_PROFILE_WORKLOAD="${WORK_DIR}/profile_workload"
 
 df_engine_pid=""
 profiler_pid=""
@@ -34,6 +38,9 @@ cleanup() {
   fi
   if docker inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
     docker stop --time 5 "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+  fi
+  if docker inspect "${WORKLOAD_CONTAINER_NAME}" >/dev/null 2>&1; then
+    docker stop --time 5 "${WORKLOAD_CONTAINER_NAME}" >/dev/null 2>&1 || true
   fi
   if [[ -n "${profiler_pid}" ]] && kill -0 "${profiler_pid}" 2>/dev/null; then
     kill "${profiler_pid}" 2>/dev/null || true
@@ -58,7 +65,7 @@ fail() {
   exit 1
 }
 
-for command in cargo curl docker python3 sort uname; do
+for command in cargo curl docker python3 rustc sort uname; do
   command -v "${command}" >/dev/null 2>&1 || fail "required command not found: ${command}"
 done
 
@@ -77,22 +84,46 @@ kernel_version="$(uname -r | cut -d- -f1)"
   || fail "kernel 5.10 or newer is required; found ${kernel_version}"
 [[ -d /sys/kernel/tracing ]] || fail "/sys/kernel/tracing is not available"
 docker info >/dev/null 2>&1 || fail "Docker daemon is unavailable"
+docker_operating_system="$(docker info --format '{{.OperatingSystem}}')"
+docker_desktop_mode=false
+if [[ "${docker_operating_system}" == *"Docker Desktop"* ]]; then
+  docker_desktop_mode=true
+fi
+ingest_listen_host="127.0.0.1"
+if [[ "${docker_desktop_mode}" == true ]]; then
+  ingest_listen_host="0.0.0.0"
+fi
 
 if [[ "${OTEL_ARROW_EBPF_SKIP_BUILD:-0}" != "1" ]]; then
   (
     cd "${DATAFLOW_DIR}"
     cargo build --quiet --bin df_engine
-    cargo build --quiet -p otel-arrow-dfe-validation --example profile_workload
+    if [[ "${docker_desktop_mode}" == false ]]; then
+      cargo build --quiet -p otel-arrow-dfe-validation --example profile_workload
+    fi
   )
 fi
 
 readonly DF_ENGINE="${DATAFLOW_DIR}/target/debug/df_engine"
 readonly PROFILE_WORKLOAD="${DATAFLOW_DIR}/target/debug/examples/profile_workload"
 [[ -x "${DF_ENGINE}" ]] || fail "missing ${DF_ENGINE}; run without OTEL_ARROW_EBPF_SKIP_BUILD"
-[[ -x "${PROFILE_WORKLOAD}" ]] \
-  || fail "missing ${PROFILE_WORKLOAD}; run without OTEL_ARROW_EBPF_SKIP_BUILD"
+if [[ "${docker_desktop_mode}" == true ]]; then
+  rustc \
+    --edition=2024 \
+    -C opt-level=1 \
+    -C debuginfo=1 \
+    -C target-feature=+crt-static \
+    "${DATAFLOW_DIR}/crates/validation/examples/profile_workload.rs" \
+    -o "${STATIC_PROFILE_WORKLOAD}"
+  echo "Using Docker Desktop sidecar PID namespace mode"
+else
+  [[ -x "${PROFILE_WORKLOAD}" ]] \
+    || fail "missing ${PROFILE_WORKLOAD}; run without OTEL_ARROW_EBPF_SKIP_BUILD"
+  echo "Using native host PID namespace mode"
+fi
 
 mkdir -p "${BUFFER_PATH}"
+OTEL_ARROW_EBPF_INGEST_HOST="${ingest_listen_host}" \
 OTEL_ARROW_EBPF_INGEST_PORT="${INGEST_PORT}" \
 OTEL_ARROW_EBPF_SINK_PORT="${SINK_PORT}" \
 OTEL_ARROW_EBPF_ADMIN_PORT="${ADMIN_PORT}" \
@@ -122,8 +153,6 @@ docker_args=(
   run
   --rm
   --name "${CONTAINER_NAME}"
-  --network host
-  --pid host
   --cap-add BPF
   --cap-add PERFMON
   --cap-add SYS_PTRACE
@@ -135,16 +164,26 @@ docker_args=(
   --security-opt seccomp=unconfined
   --mount "type=bind,src=${PROFILER_CONFIG},dst=/etc/otelcol-ebpf-profiler/config.yaml,readonly"
   --mount "type=bind,src=/sys/kernel/tracing,dst=/sys/kernel/tracing,readonly"
-  --env "OTEL_EXPORTER_OTLP_ENDPOINT=127.0.0.1:${INGEST_PORT}"
 )
+profiler_endpoint="127.0.0.1:${INGEST_PORT}"
+if [[ "${docker_desktop_mode}" == true ]]; then
+  profiler_endpoint="host.docker.internal:${INGEST_PORT}"
+else
+  docker_args+=(--network host --pid host)
+fi
+docker_args+=(--env "OTEL_EXPORTER_OTLP_ENDPOINT=${profiler_endpoint}")
 if [[ -r /sys/module/apparmor/parameters/enabled ]] \
   && grep -q '^Y' /sys/module/apparmor/parameters/enabled; then
   docker_args+=(--security-opt apparmor=unconfined)
 fi
 docker_args+=(
   "${PROFILER_IMAGE}"
+  --feature-gates=+service.profilesSupport
   --config=/etc/otelcol-ebpf-profiler/config.yaml
 )
+if [[ "${docker_desktop_mode}" == true ]]; then
+  docker_args+=(--set=receivers.profiling.pid_namespace_translation=true)
+fi
 
 docker "${docker_args[@]}" >"${PROFILER_LOG}" 2>&1 &
 profiler_pid=$!
@@ -165,10 +204,21 @@ grep -q "Attached sched monitor" "${PROFILER_LOG}" \
     fail "eBPF profiler did not attach within 60 seconds"
   }
 
-"${PROFILE_WORKLOAD}" "${DURATION_SECONDS}" >"${WORK_DIR}/workload.log" 2>&1 &
-workload_pid=$!
-wait "${workload_pid}"
-workload_pid=""
+if [[ "${docker_desktop_mode}" == true ]]; then
+  docker run \
+    --rm \
+    --name "${WORKLOAD_CONTAINER_NAME}" \
+    --pid "container:${CONTAINER_NAME}" \
+    --mount "type=bind,src=${STATIC_PROFILE_WORKLOAD},dst=/profile_workload,readonly" \
+    "${WORKLOAD_IMAGE}" \
+    /profile_workload "${DURATION_SECONDS}" \
+    >"${WORK_DIR}/workload.log" 2>&1
+else
+  "${PROFILE_WORKLOAD}" "${DURATION_SECONDS}" >"${WORK_DIR}/workload.log" 2>&1 &
+  workload_pid=$!
+  wait "${workload_pid}"
+  workload_pid=""
+fi
 
 metrics_url="http://127.0.0.1:${ADMIN_PORT}/api/v1/metrics?format=json_compact"
 for _ in $(seq 1 30); do

@@ -12,6 +12,10 @@ pub const PROFILER_IMAGE: &str = "otel/opentelemetry-collector-ebpf-profiler";
 pub const PROFILER_IMAGE_TAG: &str =
     "0.159.0@sha256:90d6b6536ce0283d706f7e7b6c45f534c65b140ff6ec456c19385e50a7d12b8e";
 
+/// Pinned minimal image used to run the static workload in sidecar PID mode.
+pub const SIDECAR_WORKLOAD_IMAGE: &str =
+    "alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b";
+
 /// Log marker emitted after the profiler attaches its scheduler monitor.
 pub const PROFILER_READY_LOG: &str = "Attached sched monitor";
 
@@ -39,7 +43,10 @@ pub fn profiler_container(
 ) -> ContainerConfig {
     let mut config = ContainerConfig::new(PROFILER_IMAGE, PROFILER_IMAGE_TAG)
         .env("OTEL_EXPORTER_OTLP_ENDPOINT", otlp_endpoint)
-        .command(["--config=/etc/otelcol-ebpf-profiler/config.yaml"])
+        .command([
+            "--feature-gates=+service.profilesSupport",
+            "--config=/etc/otelcol-ebpf-profiler/config.yaml",
+        ])
         .bind_mount(
             host_config_path,
             "/etc/otelcol-ebpf-profiler/config.yaml",
@@ -87,7 +94,10 @@ mod tests {
         );
         assert_eq!(
             config.command,
-            vec!["--config=/etc/otelcol-ebpf-profiler/config.yaml"]
+            vec![
+                "--feature-gates=+service.profilesSupport",
+                "--config=/etc/otelcol-ebpf-profiler/config.yaml"
+            ]
         );
     }
 
@@ -106,7 +116,10 @@ mod tests {
         let image_reference = format!("{PROFILER_IMAGE}:{PROFILER_IMAGE_TAG}");
 
         assert!(script.contains(&image_reference));
+        assert!(script.contains(SIDECAR_WORKLOAD_IMAGE));
         assert!(script.contains(PROFILER_READY_LOG));
+        assert!(script.contains("--feature-gates=+service.profilesSupport"));
+        assert!(script.contains("--set=receivers.profiling.pid_namespace_translation=true"));
         for capability in PROFILER_CAPABILITIES {
             assert!(script.contains(&format!("--cap-add {capability}")));
         }

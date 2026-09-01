@@ -7,7 +7,7 @@ receivers:
     max_rpc_msg_size: 33554432
 
 exporters:
-  otlp:
+  otlp_grpc:
     endpoint: "${env:OTEL_EXPORTER_OTLP_ENDPOINT}"
     compression: gzip
     tls:
@@ -21,4 +21,4 @@ service:
     profiles:
       receivers: [profiling]
       processors: []
-      exporters: [otlp]
+      exporters: [otlp_grpc]
