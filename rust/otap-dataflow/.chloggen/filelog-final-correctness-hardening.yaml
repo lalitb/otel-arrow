@@ -1,0 +1,8 @@
+change_type: bug_fix
+component: pipeline
+note: "Preserve filelog recovery across age filters, contain incompatible profiles per file, and bound framing checkpoint history."
+issues: [3939]
+subtext: |
+  Exact split ends now survive Ack and restart, idle timing follows source
+  activity, macOS no-replace publication uses the correct flag, and unrelated
+  compatible files continue when one durable profile is incompatible.

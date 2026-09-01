@@ -232,6 +232,46 @@ pub(crate) struct ResolvedIdentity {
     pub(crate) advisory_path: AdvisoryPath,
 }
 
+/// Why one durable identity is blocked without changing checkpoint state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IdentityBlockReason {
+    /// Stored framing-profile version or digest differs from configuration.
+    IncompatibleProfile,
+    /// Stored identity evidence begins at a different source boundary.
+    IncompatibleIgnoredHeaderBytes,
+}
+
+/// Existing durable identity that cannot safely resume under this
+/// configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlockedIdentity {
+    pub(crate) file_id: FileId,
+    pub(crate) advisory_path: AdvisoryPath,
+    pub(crate) reason: IdentityBlockReason,
+    stored_version: u16,
+    stored_digest: [u8; 32],
+    configured_version: u16,
+    configured_digest: [u8; 32],
+}
+
+impl BlockedIdentity {
+    #[cfg(test)]
+    fn into_error(self) -> IdentityError {
+        match self.reason {
+            IdentityBlockReason::IncompatibleProfile => IdentityError::IncompatibleProfile {
+                file_id: self.file_id,
+                stored_version: self.stored_version,
+                stored_digest: self.stored_digest,
+                configured_version: self.configured_version,
+                configured_digest: self.configured_digest,
+            },
+            IdentityBlockReason::IncompatibleIgnoredHeaderBytes => IdentityError::InvalidEvidence {
+                reason: "checkpoint ignored_header_bytes differs from configuration",
+            },
+        }
+    }
+}
+
 /// Capacity-aware result for one candidate in reconciliation order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum IdentityResolution {
@@ -241,6 +281,9 @@ pub(crate) enum IdentityResolution {
     /// A genuinely new identity could not consume durable tracked capacity.
     /// No operation for this candidate was persisted.
     Deferred,
+    /// Matching durable state exists but its resume profile is incompatible.
+    /// The record remains unchanged and no reader is attached.
+    Blocked(BlockedIdentity),
 }
 
 /// One fully planned reconciliation whose checkpoint transactions can resume
@@ -460,6 +503,7 @@ pub(super) fn resolve_and_persist_with_source(
             IdentityResolution::Deferred => Err(IdentityError::InvalidEvidence {
                 reason: "non-admission identity resolution unexpectedly deferred a candidate",
             }),
+            IdentityResolution::Blocked(blocked) => Err(blocked.into_error()),
         })
         .collect()
 }
@@ -489,6 +533,16 @@ fn resolve_with_source_mode(
         recognized_replacements,
         confirmed_path_bindings,
     )?;
+    if !defer_new_at_capacity
+        && let Some(blocked) = plan.resolutions.as_ref().and_then(|resolutions| {
+            resolutions.iter().find_map(|resolution| match resolution {
+                IdentityResolution::Blocked(blocked) => Some(blocked),
+                IdentityResolution::Resolved(_) | IdentityResolution::Deferred => None,
+            })
+        })
+    {
+        return Err(blocked.clone().into_error());
+    }
     if cancelled() {
         return Ok(None);
     }
@@ -507,7 +561,6 @@ fn plan_with_source_mode(
     recognized_replacements: &HashSet<Locator>,
     confirmed_path_bindings: ConfirmedPathBindings<'_>,
 ) -> Result<IdentityResolutionPlan, IdentityError> {
-    validate_resumption_profiles(store, settings)?;
     validate_candidates(candidates, inventory, settings)?;
 
     let mut batch_locators = HashSet::with_capacity(candidates.len());
@@ -542,6 +595,9 @@ fn plan_with_source_mode(
     let mut plans: Vec<Option<PlannedIdentity>> = std::iter::repeat_with(|| None)
         .take(candidates.len())
         .collect();
+    let mut blocked: Vec<Option<BlockedIdentity>> = std::iter::repeat_with(|| None)
+        .take(candidates.len())
+        .collect();
     let mut recovery_evidence = vec![false; candidates.len()];
     // Active records found at a candidate's exact locator that cannot be
     // resumed are retired atomically with the replacement registration.
@@ -564,13 +620,16 @@ fn plan_with_source_mode(
             )
         });
         let Some(record) = live_records.next() else {
-            recovery_evidence[index] = true;
             continue;
         };
         if live_records.next().is_some() {
             return Err(IdentityError::InvalidEvidence {
                 reason: "checkpoint table contains duplicate live locator claims",
             });
+        }
+        if let Some(incompatible) = profile_incompatibility(record, settings) {
+            blocked[index] = Some(incompatible);
+            continue;
         }
         if record.lifecycle_state == LifecycleState::Quarantined {
             plans[index] = Some(plan_existing(
@@ -600,7 +659,7 @@ fn plan_with_source_mode(
     }
 
     for (index, candidate) in candidates.iter().enumerate() {
-        if plans[index].is_some() {
+        if plans[index].is_some() || blocked[index].is_some() {
             continue;
         }
 
@@ -643,10 +702,6 @@ fn plan_with_source_mode(
         ));
     }
 
-    let plans: Vec<PlannedIdentity> = plans
-        .into_iter()
-        .map(|plan| plan.expect("every validated candidate receives an identity plan"))
-        .collect();
     let mut operation_groups = Vec::new();
     let mut resolutions = Vec::with_capacity(plans.len());
     let mut remaining_capacity = settings
@@ -655,7 +710,12 @@ fn plan_with_source_mode(
         .ok_or(IdentityError::InvalidEvidence {
             reason: "checkpoint table exceeds configured tracked-file capacity",
         })?;
-    for plan in plans {
+    for (plan, blocked) in plans.into_iter().zip(blocked) {
+        if let Some(blocked) = blocked {
+            resolutions.push(IdentityResolution::Blocked(blocked));
+            continue;
+        }
+        let plan = plan.expect("every unblocked candidate receives an identity plan");
         let creates_identity = matches!(
             plan.resolved.matched_by,
             IdentityMatch::NewDiscovery
@@ -780,40 +840,35 @@ fn validate_candidates(
     Ok(())
 }
 
-fn validate_resumption_profiles(
-    store: &CheckpointStore,
-    settings: &IdentitySettings,
-) -> Result<(), IdentityError> {
-    for (_, record) in store.table().iter() {
-        if record.lifecycle_state == LifecycleState::RotatedFinalized {
-            continue;
-        }
-        ensure_profile_compatible(record, settings)?;
-        if record.ignored_header_bytes != settings.ignored_header_bytes {
-            return Err(IdentityError::InvalidEvidence {
-                reason: "checkpoint ignored_header_bytes differs from configuration",
-            });
-        }
-    }
-    Ok(())
-}
-
-fn ensure_profile_compatible(
+fn profile_incompatibility(
     record: &SnapshotRecord,
     settings: &IdentitySettings,
-) -> Result<(), IdentityError> {
+) -> Option<BlockedIdentity> {
     if record.framing_profile_version != settings.framing_profile_version
         || record.framing_profile_digest != settings.framing_profile_digest
     {
-        return Err(IdentityError::IncompatibleProfile {
+        return Some(BlockedIdentity {
             file_id: record.file_id,
+            advisory_path: record.advisory_path.clone(),
+            reason: IdentityBlockReason::IncompatibleProfile,
             stored_version: record.framing_profile_version,
             stored_digest: record.framing_profile_digest,
             configured_version: settings.framing_profile_version,
             configured_digest: settings.framing_profile_digest,
         });
     }
-    Ok(())
+    if record.ignored_header_bytes != settings.ignored_header_bytes {
+        return Some(BlockedIdentity {
+            file_id: record.file_id,
+            advisory_path: record.advisory_path.clone(),
+            reason: IdentityBlockReason::IncompatibleIgnoredHeaderBytes,
+            stored_version: record.framing_profile_version,
+            stored_digest: record.framing_profile_digest,
+            configured_version: settings.framing_profile_version,
+            configured_digest: settings.framing_profile_digest,
+        });
+    }
+    None
 }
 
 fn has_unavailable_recovery_evidence(

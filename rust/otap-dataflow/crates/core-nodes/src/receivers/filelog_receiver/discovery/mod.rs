@@ -198,6 +198,19 @@ pub(crate) struct DurableAck {
     pub(crate) advisory_path: AdvisoryPath,
 }
 
+/// One live checkpoint binding supplied to discovery at startup.
+///
+/// This bounded index lets first-pass admission distinguish exact durable
+/// recovery and possible move/create replacements before applying the
+/// new-unrelated-file age filter. It does not synthesize reader state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DurableDiscoveryBinding {
+    /// Runtime locator owned by an `Active` or `Quarantined` record.
+    pub(crate) locator: Locator,
+    /// Durable distinguished path for move/create replacement recognition.
+    pub(crate) advisory_path: AdvisoryPath,
+}
+
 /// Discovery continuity cleanup for one runtime-vetted retention removal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RetentionRemovalAck {
@@ -370,6 +383,14 @@ pub(crate) enum DiscoveryError {
         /// Locator named by the invalid feedback.
         locator: Locator,
         /// Violated transition invariant.
+        reason: &'static str,
+    },
+    /// Startup checkpoint state cannot seed the bounded discovery index.
+    #[error("invalid durable discovery binding for locator {locator:?}: {reason}")]
+    InvalidDurableBinding {
+        /// Invalid live checkpoint locator.
+        locator: Locator,
+        /// Exact violated invariant.
         reason: &'static str,
     },
     /// The bounded admission controller received events out of generation

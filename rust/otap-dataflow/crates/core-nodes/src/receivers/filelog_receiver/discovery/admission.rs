@@ -10,9 +10,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use super::{
     CandidateEvent, DiscoveredCandidate, DiscoveryError, DiscoveryFeedback, DiscoveryIssue,
-    DiscoveryRelease, DiscoveryStats, ReconciliationBatch, RevocationReason,
+    DiscoveryRelease, DiscoveryStats, DurableDiscoveryBinding, ReconciliationBatch,
+    RevocationReason,
 };
-use crate::receivers::filelog_receiver::checkpoint::{AdvisoryPath, Locator};
+use crate::receivers::filelog_receiver::checkpoint::{AdvisoryPath, AdvisoryPathKind, Locator};
 
 use crate::receivers::filelog_receiver::identity::matcher::CandidateInventory;
 
@@ -114,6 +115,7 @@ impl Ord for SelectedCandidate {
 pub(crate) struct AdmissionController {
     max_pending_candidates: usize,
     max_live_entries: usize,
+    max_durable_bindings: usize,
     max_candidate_events: usize,
     max_denied_locators: usize,
     fingerprint_bytes: u16,
@@ -124,6 +126,7 @@ pub(crate) struct AdmissionController {
     pending_order: VecDeque<Locator>,
     selected: BinaryHeap<SelectedCandidate>,
     selected_locators: HashSet<Locator>,
+    selected_deferred_age: HashSet<Locator>,
     /// Deterministic-minimum candidate retained per not-yet-tracked locator
     /// already selected this scan. The heap above only orders bounded fair
     /// overflow eviction by `(generation, locator)`; it never compares
@@ -147,6 +150,12 @@ pub(crate) struct AdmissionController {
     /// bindings at scan start (`docs/filelog-receiver-phase1-spec.md`,
     /// "Discovery and matching").
     frozen_path_index: HashMap<AdvisoryPath, Locator>,
+    /// Live durable locator/path bindings recovered before discovery starts.
+    ///
+    /// These remain authoritative even while no reader is attached, so an
+    /// old exact-locator candidate or possible move/create replacement is
+    /// classified before the new-unrelated-file age filter.
+    durable_bindings: HashMap<Locator, AdvisoryPath>,
     /// Prior-binding owner -> newly observed claimant locator, recorded
     /// when an observation's path matches another locator's frozen
     /// distinguished binding.
@@ -190,6 +199,7 @@ impl AdmissionController {
         Ok(Self {
             max_pending_candidates,
             max_live_entries,
+            max_durable_bindings: max_tracked_files,
             max_candidate_events,
             max_denied_locators,
             fingerprint_bytes,
@@ -200,6 +210,7 @@ impl AdmissionController {
             pending_order: VecDeque::with_capacity(max_pending_candidates),
             selected: BinaryHeap::new(),
             selected_locators: HashSet::new(),
+            selected_deferred_age: HashSet::new(),
             selected_min_candidates: HashMap::new(),
             denied_locators: HashSet::with_capacity(max_denied_locators),
             present_locators: HashSet::with_capacity(max_live_entries),
@@ -212,11 +223,50 @@ impl AdmissionController {
             deferred_overflow: 0,
             overflow_since: None,
             frozen_path_index: HashMap::with_capacity(max_tracked_files),
+            durable_bindings: HashMap::with_capacity(max_tracked_files),
             rebind_claims: HashMap::with_capacity(max_tracked_files),
             rebind_conflicts: HashSet::with_capacity(max_tracked_files),
             recognized_replacement_candidates: HashSet::new(),
             recognized_replacements: HashSet::new(),
         })
+    }
+
+    /// Seeds the bounded live checkpoint bindings recovered before traversal.
+    pub(crate) fn seed_durable_bindings(
+        &mut self,
+        bindings: Vec<DurableDiscoveryBinding>,
+    ) -> Result<(), DiscoveryError> {
+        if bindings.len() > self.max_durable_bindings {
+            return Err(DiscoveryError::BoundTooLarge {
+                field: "durable discovery bindings",
+                value: u64::try_from(bindings.len()).unwrap_or(u64::MAX),
+            });
+        }
+        self.durable_bindings
+            .try_reserve(bindings.len())
+            .map_err(|source| DiscoveryError::AllocationFailed {
+                resource: "durable discovery binding index",
+                source,
+            })?;
+        for binding in bindings {
+            if binding.locator == Locator::Unspecified {
+                return Err(DiscoveryError::InvalidDurableBinding {
+                    locator: binding.locator,
+                    reason: "durable discovery binding has no supported locator",
+                });
+            }
+            if self
+                .durable_bindings
+                .insert(binding.locator, binding.advisory_path)
+                .is_some()
+            {
+                return Err(DiscoveryError::InvalidDurableBinding {
+                    locator: binding.locator,
+                    reason: "durable discovery binding repeats a live locator",
+                });
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn begin_scan(&mut self, now: SystemTime) -> Result<u64, DiscoveryError> {
@@ -243,6 +293,7 @@ impl AdmissionController {
         self.events.clear();
         self.selected.clear();
         self.selected_locators.clear();
+        self.selected_deferred_age.clear();
         self.selected_min_candidates.clear();
         self.denied_locators.clear();
         self.present_locators.clear();
@@ -252,25 +303,27 @@ impl AdmissionController {
         self.recognized_replacement_candidates.clear();
         self.recognized_replacements.clear();
         self.frozen_path_index.clear();
-        let mut ambiguous_paths = HashSet::with_capacity(self.tracked.len());
+        let mut ambiguous_paths = HashSet::with_capacity(self.max_durable_bindings);
+        for (&locator, path) in &self.durable_bindings {
+            freeze_path_binding(
+                &mut self.frozen_path_index,
+                &mut self.rebind_conflicts,
+                &mut ambiguous_paths,
+                locator,
+                path,
+            );
+        }
         for (&locator, entry) in &self.tracked {
-            if !entry.durable {
+            if !entry.durable || self.durable_bindings.contains_key(&locator) {
                 continue;
             }
-            if ambiguous_paths.contains(&entry.distinguished_path) {
-                let _ = self.rebind_conflicts.insert(locator);
-                continue;
-            }
-            if let Some(previous) = self
-                .frozen_path_index
-                .insert(entry.distinguished_path.clone(), locator)
-                && previous != locator
-            {
-                let _ = self.frozen_path_index.remove(&entry.distinguished_path);
-                let _ = ambiguous_paths.insert(entry.distinguished_path.clone());
-                let _ = self.rebind_conflicts.insert(previous);
-                let _ = self.rebind_conflicts.insert(locator);
-            }
+            freeze_path_binding(
+                &mut self.frozen_path_index,
+                &mut self.rebind_conflicts,
+                &mut ambiguous_paths,
+                locator,
+                &entry.distinguished_path,
+            );
         }
         let mut stats = DiscoveryStats::new(self.generation);
         stats.overflowed_candidates = std::mem::take(&mut self.deferred_overflow);
@@ -402,15 +455,20 @@ impl AdmissionController {
             }
             return Ok(());
         }
-        if candidate_is_too_old(
+        let possible_replacement = self
+            .frozen_path_index
+            .get(&candidate.evidence.advisory_path)
+            .is_some_and(|owner| *owner != locator);
+        let defer_age_filter = candidate_is_too_old(
             candidate.modified,
             self.scan_now.expect("active scan records its start time"),
             ignore_older_than,
-        ) {
+        ) && !self.durable_bindings.contains_key(&locator);
+        if defer_age_filter && !possible_replacement {
             return Ok(());
         }
         self.increment_eligible_candidates()?;
-        self.consider_new_candidate(candidate)
+        self.consider_new_candidate(candidate, defer_age_filter)
     }
 
     /// Records that `owner`'s frozen distinguished path was observed this
@@ -745,6 +803,33 @@ impl AdmissionController {
             .ok_or(DiscoveryError::CounterOverflow {
                 counter: "deferred candidate overflow",
             })?;
+        let new_durable_bindings = feedback
+            .durable
+            .iter()
+            .filter(|ack| !self.durable_bindings.contains_key(&ack.locator))
+            .count();
+        if self
+            .durable_bindings
+            .len()
+            .checked_add(new_durable_bindings)
+            .is_none_or(|count| count > self.max_durable_bindings)
+        {
+            return Err(DiscoveryError::BoundTooLarge {
+                field: "durable discovery bindings",
+                value: u64::try_from(
+                    self.durable_bindings
+                        .len()
+                        .saturating_add(new_durable_bindings),
+                )
+                .unwrap_or(u64::MAX),
+            });
+        }
+        self.durable_bindings
+            .try_reserve(new_durable_bindings)
+            .map_err(|source| DiscoveryError::AllocationFailed {
+                resource: "durable discovery binding index",
+                source,
+            })?;
 
         for ack in feedback.durable {
             let entry = self
@@ -755,7 +840,8 @@ impl AdmissionController {
             entry.first_seen_generation = None;
             entry.first_seen_at = None;
             entry.durable = true;
-            entry.distinguished_path = ack.advisory_path;
+            entry.distinguished_path = ack.advisory_path.clone();
+            let _ = self.durable_bindings.insert(ack.locator, ack.advisory_path);
             // The recognized-replacement identity is now durable; it must
             // never be carried forward onto a later, unrelated in-flight
             // candidate for the same locator.
@@ -876,6 +962,7 @@ impl AdmissionController {
                 }
                 DiscoveryRelease::RetentionRemoved(removal) => {
                     let locator = removal.locator;
+                    let _ = self.durable_bindings.remove(&locator);
                     if self.pending.get(&locator).is_some_and(|entry| {
                         entry.seen_generation > removal.reconciliation_generation
                     }) || self.tracked.get(&locator).is_some_and(|entry| {
@@ -916,9 +1003,13 @@ impl AdmissionController {
     fn consider_new_candidate(
         &mut self,
         candidate: DiscoveredCandidate,
+        defer_age_filter: bool,
     ) -> Result<(), DiscoveryError> {
         let locator = candidate.evidence.locator;
         if self.selected_locators.contains(&locator) {
+            if defer_age_filter {
+                let _ = self.selected_deferred_age.insert(locator);
+            }
             // Another alias for this not-yet-tracked locator was already
             // selected this scan. Retain only the deterministic-minimum
             // observation rather than every alias; the fair-overflow heap
@@ -952,6 +1043,9 @@ impl AdmissionController {
             return self.mark_incomplete_overflow();
         }
         let _ = self.selected_locators.insert(locator);
+        if defer_age_filter {
+            let _ = self.selected_deferred_age.insert(locator);
+        }
         let _ = self
             .selected_min_candidates
             .insert(locator, candidate.clone());
@@ -974,12 +1068,16 @@ impl AdmissionController {
                 .selected_locators
                 .remove(&displaced.candidate.evidence.locator);
             let _ = self
+                .selected_deferred_age
+                .remove(&displaced.candidate.evidence.locator);
+            let _ = self
                 .selected_min_candidates
                 .remove(&displaced.candidate.evidence.locator);
             self.selected.push(selected);
             self.mark_incomplete_overflow()
         } else {
             let _ = self.selected_locators.remove(&locator);
+            let _ = self.selected_deferred_age.remove(&locator);
             let _ = self.selected_min_candidates.remove(&locator);
             self.mark_incomplete_overflow()
         }
@@ -1029,6 +1127,10 @@ impl AdmissionController {
                 continue;
             }
             let recognized_replacement = self.recognized_replacement_candidates.contains(&locator);
+            let deferred_age_filter = self.selected_deferred_age.remove(&locator);
+            if deferred_age_filter && !recognized_replacement {
+                continue;
+            }
             if self.inflight_count < self.max_candidate_events {
                 let first_seen_at = self
                     .scan_started
@@ -1059,6 +1161,7 @@ impl AdmissionController {
                 self.mark_incomplete_overflow()?;
             }
         }
+        self.selected_deferred_age.clear();
         Ok(())
     }
 
@@ -1346,6 +1449,30 @@ fn candidate_is_too_old(
         && modified
             .and_then(|modified| now.duration_since(modified).ok())
             .is_some_and(|age| age > ignore_older_than)
+}
+
+fn freeze_path_binding(
+    frozen_path_index: &mut HashMap<AdvisoryPath, Locator>,
+    rebind_conflicts: &mut HashSet<Locator>,
+    ambiguous_paths: &mut HashSet<AdvisoryPath>,
+    locator: Locator,
+    path: &AdvisoryPath,
+) {
+    if path.kind() == AdvisoryPathKind::Unavailable {
+        return;
+    }
+    if ambiguous_paths.contains(path) {
+        let _ = rebind_conflicts.insert(locator);
+        return;
+    }
+    if let Some(previous) = frozen_path_index.insert(path.clone(), locator)
+        && previous != locator
+    {
+        let _ = frozen_path_index.remove(path);
+        let _ = ambiguous_paths.insert(path.clone());
+        let _ = rebind_conflicts.insert(previous);
+        let _ = rebind_conflicts.insert(locator);
+    }
 }
 
 fn candidate_signature(candidate: &DiscoveredCandidate) -> [u8; 32] {

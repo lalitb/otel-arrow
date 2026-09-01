@@ -1241,14 +1241,12 @@ fn validate_resume_transition(
         return Ok(());
     };
 
-    let (record_start_offset, expected_index) = match prior_resume {
-        FramingResume::Clean => (record.framed.body_source_range.start, 0),
+    let (record_start_offset, expected_index, prior_record_end) = match prior_resume {
+        FramingResume::Clean => (record.framed.body_source_range.start, 0, None),
         FramingResume::Continuation {
             record_start_offset,
             next_fragment_index,
-            // Not consulted by this reconstruction check: only the
-            // fragment start/index feed `fragment_id`.
-            record_end_offset: _,
+            record_end_offset,
         } => {
             if record_start_offset >= record.framed.frame_source_range.start {
                 return Err(BatchError::InvalidProgress {
@@ -1256,7 +1254,11 @@ fn validate_resume_transition(
                     reason: "continued fragment record start must precede its frame",
                 });
             }
-            (record_start_offset, next_fragment_index)
+            (
+                record_start_offset,
+                next_fragment_index,
+                Some(record_end_offset),
+            )
         }
     };
     if fragment.index != expected_index {
@@ -1277,26 +1279,60 @@ fn validate_resume_transition(
             reason: "fragment id does not match file, epoch, and record start",
         });
     }
-    let expected_resume = if fragment.last {
-        FramingResume::Clean
-    } else {
-        FramingResume::Continuation {
-            record_start_offset,
-            // Fragments produced by this framer always use the
-            // scan-to-next-physical-LF sentinel; see `framer.rs`.
-            record_end_offset: 0,
-            next_fragment_index: fragment.index.checked_add(1).ok_or(
-                BatchError::InvalidProgress {
-                    file_id: record.file_id,
-                    reason: "nonfinal fragment index cannot advance",
-                },
-            )?,
+    if fragment.last {
+        if record.framed.resulting_resume != FramingResume::Clean {
+            return Err(BatchError::InvalidProgress {
+                file_id: record.file_id,
+                reason: "final fragment must produce clean framing state",
+            });
         }
+        if let Some(prior_record_end) = prior_record_end
+            && prior_record_end != 0
+            && record.framed.frame_source_range.end != prior_record_end
+        {
+            return Err(BatchError::InvalidProgress {
+                file_id: record.file_id,
+                reason: "final fragment does not reach its durable record end",
+            });
+        }
+        return Ok(());
+    }
+    let expected_next_index = fragment
+        .index
+        .checked_add(1)
+        .ok_or(BatchError::InvalidProgress {
+            file_id: record.file_id,
+            reason: "nonfinal fragment index cannot advance",
+        })?;
+    let FramingResume::Continuation {
+        record_start_offset: resulting_start,
+        record_end_offset: resulting_end,
+        next_fragment_index,
+    } = record.framed.resulting_resume
+    else {
+        return Err(BatchError::InvalidProgress {
+            file_id: record.file_id,
+            reason: "nonfinal fragment must produce continuation state",
+        });
     };
-    if record.framed.resulting_resume != expected_resume {
+    if resulting_start != record_start_offset || next_fragment_index != expected_next_index {
         return Err(BatchError::InvalidProgress {
             file_id: record.file_id,
             reason: "fragment result does not match its continuation metadata",
+        });
+    }
+    if let Some(prior_record_end) = prior_record_end
+        && resulting_end != prior_record_end
+    {
+        return Err(BatchError::InvalidProgress {
+            file_id: record.file_id,
+            reason: "continued fragment changed its durable record end",
+        });
+    }
+    if resulting_end != 0 && resulting_end <= record.framed.frame_source_range.end {
+        return Err(BatchError::InvalidProgress {
+            file_id: record.file_id,
+            reason: "nonfinal fragment reached or crossed its known record end",
         });
     }
     Ok(())

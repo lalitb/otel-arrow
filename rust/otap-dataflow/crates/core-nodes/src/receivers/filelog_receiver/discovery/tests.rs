@@ -1451,6 +1451,113 @@ fn ignore_older_than_applies_only_to_initial_admission() {
     assert_eq!(admission.tracked_locators().len(), 1);
 }
 
+/// Scenario: discovery restarts with an old `Active` locator and its durable
+/// distinguished path, then observes both that locator and an old replacement
+/// claimant at the distinguished path.
+/// Guarantees: checkpoint-derived exact recovery and move/create recognition
+/// are classified before `ignore_older_than`; both remain eligible while an
+/// unrelated old candidate is filtered.
+#[test]
+fn durable_bindings_bypass_age_filter_for_recovery_and_replacement() {
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    let owner_locator = Locator::PosixDevIno { dev: 1, ino: 401 };
+    let owner_path = AdvisoryPath::from_unix_bytes(b"active.log").unwrap();
+    let mut admission = AdmissionController::new(4, 4, 4, 16).unwrap();
+    admission
+        .seed_durable_bindings(vec![DurableDiscoveryBinding {
+            locator: owner_locator,
+            advisory_path: owner_path,
+        }])
+        .unwrap();
+
+    let mut recovered = fake_candidate_alias(401, "moved.log");
+    recovered.modified = Some(SystemTime::UNIX_EPOCH);
+    let mut replacement = fake_candidate_alias(402, "active.log");
+    replacement.modified = Some(SystemTime::UNIX_EPOCH);
+    let replacement_locator = replacement.evidence.locator;
+    let mut unrelated = fake_candidate_alias(403, "unrelated.log");
+    unrelated.modified = Some(SystemTime::UNIX_EPOCH);
+    let unrelated_locator = unrelated.evidence.locator;
+
+    let generation = admission.begin_scan(now).unwrap();
+    for candidate in [recovered, replacement, unrelated] {
+        admission
+            .observe(generation, candidate, Duration::from_secs(10))
+            .unwrap();
+    }
+    let batch = admission.finish_scan().unwrap();
+    let emitted: HashSet<_> = observed_candidates(&batch)
+        .iter()
+        .map(|candidate| candidate.evidence.locator)
+        .collect();
+
+    assert_eq!(emitted, HashSet::from([owner_locator, replacement_locator]));
+    assert_eq!(
+        batch.recognized_replacements,
+        HashSet::from([replacement_locator])
+    );
+    assert_eq!(
+        batch.present_locators,
+        HashSet::from([owner_locator, replacement_locator, unrelated_locator])
+    );
+}
+
+/// Scenario: recovered durable bindings have unavailable advisory paths, and
+/// retention later removes one exact locator before it is observed again old.
+/// Guarantees: unavailable paths never create false rebind ambiguity, and
+/// retention removal revokes the age-filter bypass with the durable record.
+#[test]
+fn durable_binding_index_ignores_unavailable_paths_and_tracks_retention_removal() {
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    let removed_locator = Locator::PosixDevIno { dev: 1, ino: 404 };
+    let retained_locator = Locator::PosixDevIno { dev: 1, ino: 405 };
+    let mut admission = AdmissionController::new(4, 4, 4, 16).unwrap();
+    admission
+        .seed_durable_bindings(vec![
+            DurableDiscoveryBinding {
+                locator: removed_locator,
+                advisory_path: AdvisoryPath::unavailable(),
+            },
+            DurableDiscoveryBinding {
+                locator: retained_locator,
+                advisory_path: AdvisoryPath::unavailable(),
+            },
+        ])
+        .unwrap();
+
+    let generation = admission.begin_scan(now).unwrap();
+    let empty = admission.finish_scan().unwrap();
+    assert!(empty.stats.complete);
+    assert!(empty.stats.first_issue.is_none());
+    admission
+        .apply_feedback(DiscoveryFeedback {
+            released: vec![DiscoveryRelease::RetentionRemoved(RetentionRemovalAck {
+                locator: removed_locator,
+                reconciliation_generation: generation,
+            })],
+            ..DiscoveryFeedback::default()
+        })
+        .unwrap();
+
+    let mut removed = fake_candidate(404);
+    removed.modified = Some(SystemTime::UNIX_EPOCH);
+    let mut retained = fake_candidate(405);
+    retained.modified = Some(SystemTime::UNIX_EPOCH);
+    let generation = admission.begin_scan(now).unwrap();
+    admission
+        .observe(generation, removed, Duration::from_secs(10))
+        .unwrap();
+    admission
+        .observe(generation, retained, Duration::from_secs(10))
+        .unwrap();
+    let batch = admission.finish_scan().unwrap();
+    let emitted: Vec<_> = observed_candidates(&batch)
+        .iter()
+        .map(|candidate| candidate.evidence.locator)
+        .collect();
+    assert_eq!(emitted, vec![retained_locator]);
+}
+
 /// Scenario: a previously unknown locator is observed only through an
 /// excluded path during an otherwise complete reconciliation.
 /// Guarantees: policy revocation still contributes bounded presence evidence,

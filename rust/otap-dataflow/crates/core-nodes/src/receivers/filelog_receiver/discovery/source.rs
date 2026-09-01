@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use super::admission::AdmissionController;
 use super::scanner::{DiscoveryPlan, FilesystemScanner};
-use super::{DiscoveryError, DiscoveryFeedback, DiscoveryMessage};
+use super::{DiscoveryError, DiscoveryFeedback, DiscoveryMessage, DurableDiscoveryBinding};
 use crate::receivers::filelog_receiver::environment::DescriptorPressure;
 
 const EVENT_CHANNEL_CAPACITY: usize = 1;
@@ -126,6 +126,7 @@ pub(crate) fn spawn_discovery_with_shutdown_signal(
         plan,
         shutdown_requested,
         Arc::new(DescriptorPressure::default()),
+        Vec::new(),
     )
 }
 
@@ -135,13 +136,15 @@ pub(crate) fn spawn_discovery_with_shutdown_signal_and_pressure(
     plan: DiscoveryPlan,
     shutdown_requested: Arc<AtomicBool>,
     descriptor_pressure: Arc<DescriptorPressure>,
+    durable_bindings: Vec<DurableDiscoveryBinding>,
 ) -> Result<DiscoveryHandle, DiscoveryError> {
-    let admission = AdmissionController::new(
+    let mut admission = AdmissionController::new(
         plan.max_pending_candidates(),
         plan.max_tracked_files(),
         plan.max_candidate_events(),
         plan.fingerprint_bytes(),
     )?;
+    admission.seed_durable_bindings(durable_bindings)?;
     // Both channels are bounded cross-thread handoffs. The discovery thread
     // owns all mutable scan/admission state, so no shared mutex is needed.
     let (command_tx, command_rx) = sync_channel(COMMAND_CHANNEL_CAPACITY);

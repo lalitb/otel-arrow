@@ -3,7 +3,7 @@
 
 //! Bounded synchronous framing over the streaming source decoder.
 
-use std::{str::Utf8Error, time::Instant};
+use std::{collections::VecDeque, str::Utf8Error, time::Instant};
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -24,6 +24,7 @@ use crate::receivers::filelog_receiver::{
 
 const FRAGMENT_ID_DOMAIN: &[u8] = b"otel-arrow-filelog-fragment-v1\0";
 const MAX_DECODED_UNIT_BYTES: usize = 4;
+const RAW_SOURCE_TAIL_BYTES: usize = COMMITTED_FRONTIER_GUARD_WINDOW_BYTES as usize;
 
 /// The emitted OTAP body representation selected by framing and decode policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -559,6 +560,156 @@ fn reserve(vec: &mut Vec<u8>, additional: usize, context: &'static str) -> Resul
 }
 
 #[derive(Debug)]
+struct RawSourceWindow {
+    end: u64,
+    tail: [u8; RAW_SOURCE_TAIL_BYTES],
+    tail_start: usize,
+    tail_len: usize,
+    lag: VecDeque<u8>,
+    max_lag: usize,
+}
+
+impl RawSourceWindow {
+    fn new(seed: CommittedFrontierWindow, max_lag: usize) -> Result<Self, FramerError> {
+        let seed_bytes = seed.bytes();
+        if seed_bytes.len() > RAW_SOURCE_TAIL_BYTES {
+            return Err(FramerError::Invariant {
+                context: "committed frontier seed exceeds the fixed raw tail",
+            });
+        }
+        let mut tail = [0; RAW_SOURCE_TAIL_BYTES];
+        tail[..seed_bytes.len()].copy_from_slice(seed_bytes);
+        Ok(Self {
+            end: seed.end_offset(),
+            tail,
+            tail_start: 0,
+            tail_len: seed_bytes.len(),
+            lag: VecDeque::new(),
+            max_lag,
+        })
+    }
+
+    fn extend(&mut self, bytes: &[u8]) -> Result<(), FramerError> {
+        let next_end = self
+            .end
+            .checked_add(u64::try_from(bytes.len()).map_err(|_| {
+                FramerError::ArithmeticOverflow {
+                    context: "raw source window input length",
+                }
+            })?)
+            .ok_or(FramerError::ArithmeticOverflow {
+                context: "raw source window end",
+            })?;
+        let spill = self
+            .tail_len
+            .saturating_add(bytes.len())
+            .saturating_sub(RAW_SOURCE_TAIL_BYTES);
+        let target_lag_len = self.lag.len().saturating_add(spill).min(self.max_lag);
+        if target_lag_len > self.lag.len() {
+            self.lag
+                .try_reserve(target_lag_len - self.lag.len())
+                .map_err(|_| FramerError::Allocation {
+                    context: "raw source lookbehind",
+                })?;
+        }
+        for &byte in bytes {
+            if self.tail_len < RAW_SOURCE_TAIL_BYTES {
+                let index = (self.tail_start + self.tail_len) % RAW_SOURCE_TAIL_BYTES;
+                self.tail[index] = byte;
+                self.tail_len += 1;
+                continue;
+            }
+            if self.max_lag != 0 {
+                if self.lag.len() == self.max_lag {
+                    let _ = self.lag.pop_front();
+                }
+                self.lag.push_back(self.tail[self.tail_start]);
+            }
+            self.tail[self.tail_start] = byte;
+            self.tail_start = (self.tail_start + 1) % RAW_SOURCE_TAIL_BYTES;
+        }
+        self.end = next_end;
+        Ok(())
+    }
+
+    fn checkpoint_window(&self, frame_end: u64) -> Result<CommittedFrontierWindow, FramerError> {
+        if frame_end > self.end {
+            return Err(FramerError::Invariant {
+                context: "checkpoint frontier exceeds the raw source window",
+            });
+        }
+        let window_len = frame_end.min(u64::from(COMMITTED_FRONTIER_GUARD_WINDOW_BYTES)) as usize;
+        let window_start = frame_end - window_len as u64;
+        let stored_len =
+            self.lag
+                .len()
+                .checked_add(self.tail_len)
+                .ok_or(FramerError::ArithmeticOverflow {
+                    context: "raw source window retained length",
+                })?;
+        let stored_start = self
+            .end
+            .checked_sub(u64::try_from(stored_len).map_err(|_| {
+                FramerError::ArithmeticOverflow {
+                    context: "raw source window retained length conversion",
+                }
+            })?)
+            .ok_or(FramerError::Invariant {
+                context: "raw source window starts before offset zero",
+            })?;
+        if window_start < stored_start {
+            return Err(FramerError::Invariant {
+                context: "raw source window no longer covers the checkpoint frontier",
+            });
+        }
+        let relative_start = usize::try_from(window_start - stored_start).map_err(|_| {
+            FramerError::ArithmeticOverflow {
+                context: "raw source window relative start",
+            }
+        })?;
+        let relative_end =
+            relative_start
+                .checked_add(window_len)
+                .ok_or(FramerError::ArithmeticOverflow {
+                    context: "raw source window relative end",
+                })?;
+        if relative_end > stored_len {
+            return Err(FramerError::Invariant {
+                context: "raw source window is shorter than the checkpoint frontier",
+            });
+        }
+        let mut window = Vec::new();
+        window
+            .try_reserve_exact(window_len)
+            .map_err(|_| FramerError::Allocation {
+                context: "committed frontier output window",
+            })?;
+        for index in relative_start..relative_end {
+            let byte = if index < self.lag.len() {
+                self.lag[index]
+            } else {
+                let tail_offset = index - self.lag.len();
+                self.tail[(self.tail_start + tail_offset) % RAW_SOURCE_TAIL_BYTES]
+            };
+            window.push(byte);
+        }
+        CommittedFrontierWindow::new(frame_end, window).map_err(|_| FramerError::Invariant {
+            context: "checkpoint window length does not match its offset",
+        })
+    }
+
+    #[cfg(test)]
+    fn retained_dynamic_capacity(&self) -> usize {
+        self.lag.capacity()
+    }
+
+    #[cfg(test)]
+    fn retained_len(&self) -> usize {
+        self.lag.len() + self.tail_len
+    }
+}
+
+#[derive(Debug)]
 struct CompleteLine {
     content: Payload,
     delimiter: Unit,
@@ -584,11 +735,11 @@ struct BufferedRecord {
 struct SplitState {
     record_start: u64,
     /// The record's exact known final source offset, or `None` for the
-    /// scan-to-next-physical-LF termination mode. Once known (only ever
-    /// inherited from a resumed `FramingResume::Continuation`), it is
+    /// scan-to-next-physical-LF termination mode. Once known from a complete
+    /// multiline boundary, lifecycle flush, or resumed continuation, it is
     /// propagated unchanged to every subsequently emitted nonfinal fragment
-    /// of the same split -- the deterministic boundary, once established,
-    /// is never rediscarded back to the unknown/scan sentinel.
+    /// of the same split -- the deterministic boundary is never discarded
+    /// back to the unknown/scan sentinel.
     record_end: Option<u64>,
     index: u32,
     current: Payload,
@@ -617,9 +768,10 @@ enum OversizeState {
 ///
 /// where `copies` is two only for text `preserve_raw` (decoded UTF-8 plus
 /// exact source shadow), and one otherwise. The factor four covers allocator
-/// growth slack and the transient overlap of old and new allocations during
-/// reallocation. The fixed terms cover minimum small-vector allocations and
-/// one pending decoded/source unit. Decoder state, counters, regex state, and
+/// growth slack, transient old/new allocation overlap, and the bounded raw
+/// lookbehind needed when decoding runs ahead of an emitted checkpoint
+/// frontier. The fixed terms cover minimum small-vector allocations and one
+/// pending decoded/source unit. Decoder state, counters, regex state, and
 /// offsets are constant-size. An output moved to the caller is no longer
 /// retained by the framer.
 #[derive(Debug)]
@@ -646,15 +798,10 @@ pub(crate) struct Framer {
     oversize: Option<OversizeState>,
     pattern_not_matched: u64,
     deadline: Option<Instant>,
-    /// Raw source bytes consumed since `raw_window_start`, retaining at
-    /// least the last [`COMMITTED_FRONTIER_GUARD_WINDOW_BYTES`] bytes
-    /// ending at `next_frame_start` plus any not-yet-checkpointed
-    /// lookahead already consumed by the decoder.
-    ///
-    /// [`COMMITTED_FRONTIER_GUARD_WINDOW_BYTES`]: crate::receivers::filelog_receiver::checkpoint::primitives::COMMITTED_FRONTIER_GUARD_WINDOW_BYTES
-    raw_window_buffer: Vec<u8>,
-    /// Source offset of `raw_window_buffer[0]`.
-    raw_window_start: u64,
+    last_relevant_activity: Instant,
+    /// Fixed committed-frontier tail plus bounded source lookbehind for a
+    /// frame boundary that can lag the decoder by at most one physical line.
+    raw_window: RawSourceWindow,
 }
 
 impl Framer {
@@ -730,6 +877,13 @@ impl Framer {
             (_, OnDecodeError::Replace | OnDecodeError::Fail) => PayloadKind::Text,
         };
         let line_limit = max_line_bytes.min(max_record_bytes);
+        let raw_window_max_lag = line_limit
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(MAX_DECODED_UNIT_BYTES))
+            .ok_or(FramerError::ArithmeticOverflow {
+                context: "raw source lookbehind bound",
+            })?;
+        let raw_window = RawSourceWindow::new(seed_window, raw_window_max_lag)?;
         let mut oversize = None;
         match resume {
             FramingResume::Clean => {}
@@ -801,8 +955,8 @@ impl Framer {
             oversize,
             pattern_not_matched: 0,
             deadline: None,
-            raw_window_start: committed_offset - seed_window.bytes().len() as u64,
-            raw_window_buffer: seed_window.bytes().to_vec(),
+            last_relevant_activity: now,
+            raw_window,
         })
     }
 
@@ -845,12 +999,13 @@ impl Framer {
     }
 
     /// Observes source EOF and arms the idle period when pending state exists.
-    pub(crate) fn observe_eof(&mut self, now: Instant) -> Result<(), FramerError> {
+    pub(crate) fn observe_eof(&mut self, _now: Instant) -> Result<(), FramerError> {
         if self.force_flush_period.is_zero() || !self.has_pending() {
             self.deadline = None;
         } else if self.deadline.is_none() {
             self.deadline = Some(
-                now.checked_add(self.force_flush_period)
+                self.last_relevant_activity
+                    .checked_add(self.force_flush_period)
                     .ok_or(FramerError::DeadlineOverflow)?,
             );
         }
@@ -1067,13 +1222,14 @@ impl Framer {
                 .decoder
                 .next(self.decoder.next_expected_input_offset(), remaining)?;
             if decode_step.consumed != 0 {
-                self.extend_raw_window(&remaining[..decode_step.consumed]);
+                self.extend_raw_window(&remaining[..decode_step.consumed])?;
                 consumed = consumed.checked_add(decode_step.consumed).ok_or(
                     FramerError::ArithmeticOverflow {
                         context: "step consumed byte count",
                     },
                 )?;
                 self.deadline = None;
+                self.last_relevant_activity = now;
             }
             if let Some(event) = decode_step.event {
                 if let Some(output) = self.process_decode_event(event)? {
@@ -1112,6 +1268,35 @@ impl Framer {
                 context: "exact-bound start record disappeared before lookahead",
             })?;
             return self.finish_buffered_record(record, None);
+        }
+        if let Some(OversizeState::Split(state)) = self.oversize.as_ref()
+            && let Some(record_end) = state.record_end
+        {
+            if state.current.range.end > record_end {
+                return Err(FramerError::Invariant {
+                    context: "known-end split payload crossed its record boundary",
+                });
+            }
+            if !state.current.is_empty() && state.current.range.end == record_end {
+                let state = match self.oversize.take() {
+                    Some(OversizeState::Split(state)) => state,
+                    _ => unreachable!("the split state was inspected above"),
+                };
+                self.line = Payload::new(record_end, self.payload_kind.keeps_source_shadow());
+                self.line_record_fit = None;
+                return self
+                    .make_fragment(
+                        state.current,
+                        record_end,
+                        state.record_start,
+                        state.index,
+                        true,
+                        None,
+                        None,
+                        None,
+                    )
+                    .map(Some);
+            }
         }
         if let Some(OversizeState::Split(state)) = self.oversize.as_ref()
             && state.emit_current_nonfinal
@@ -1353,6 +1538,26 @@ impl Framer {
             });
         }
         if unit.range.end == end {
+            if !unit.is_lf() {
+                let state = match self.oversize.as_mut() {
+                    Some(OversizeState::Split(state)) => state,
+                    _ => {
+                        return Err(FramerError::Invariant {
+                            context: "known-end split terminator requires split state",
+                        });
+                    }
+                };
+                if state.current.prospective_measure(unit, self.payload_kind)? > self.line_limit {
+                    if state.current.is_empty() {
+                        return Err(FramerError::Invariant {
+                            context: "one decoded unit exceeds a validated split limit",
+                        });
+                    }
+                    state.emit_current_nonfinal = true;
+                    self.pending_unit = Some(unit);
+                    return self.emit_current_split_nonfinal();
+                }
+            }
             let mut state = match self.oversize.take() {
                 Some(OversizeState::Split(state)) => state,
                 _ => {
@@ -1361,7 +1566,14 @@ impl Framer {
                     });
                 }
             };
-            state.current.append_unit(unit, self.payload_kind)?;
+            if !unit.is_lf() {
+                state.current.append_unit(unit, self.payload_kind)?;
+            } else if state.current.range.end != unit.range.start {
+                return Err(FramerError::SourceDiscontinuity {
+                    expected: state.current.range.end,
+                    actual: unit.range.start,
+                });
+            }
             self.line = Payload::new(end, self.payload_kind.keeps_source_shadow());
             self.line_record_fit = None;
             self.record = None;
@@ -1730,10 +1942,11 @@ impl Framer {
                     let record_start = record.payload.range.start;
                     let prefix = record.payload;
                     let trigger_start = content.range.start;
+                    let record_end = delimiter.range.end;
                     self.pending_unit = Some(delimiter);
                     self.oversize = Some(OversizeState::Split(SplitState {
                         record_start,
-                        record_end: None,
+                        record_end: Some(record_end),
                         index: 1,
                         current: content,
                         emit_current_nonfinal: false,
@@ -1745,7 +1958,7 @@ impl Framer {
                         0,
                         false,
                         Some(1),
-                        None,
+                        Some(record_end),
                         None,
                     )
                     .map(Some)
@@ -1821,17 +2034,40 @@ impl Framer {
 
     fn flush_partial(&mut self, reason: FlushReason) -> Result<Option<FramedRecord>, FramerError> {
         let delivered = self.decoder.highest_delivered_source_boundary();
-        if matches!(
-            self.oversize.as_ref(),
-            Some(OversizeState::Split(state))
-                if state.current.is_empty() || state.record_end.is_some()
-        ) {
-            // An empty split has nothing to flush. A split with a known
-            // exact end that has not yet been reached is deterministically
-            // incomplete: a temporary EOF/idle timeout can never stand in
-            // for its real terminator, so it remains pending rather than
-            // being flushed as a spurious `last` fragment.
-            return Ok(None);
+        if let Some(OversizeState::Split(state)) = self.oversize.as_ref() {
+            if state.current.is_empty() {
+                return Ok(None);
+            }
+            if let Some(record_end) = state.record_end {
+                if state.current.range.end < record_end {
+                    // A temporary EOF/idle timeout cannot stand in for a
+                    // known boundary that has not yet been reached.
+                    return Ok(None);
+                }
+                if state.current.range.end > record_end {
+                    return Err(FramerError::Invariant {
+                        context: "known-end split payload crossed its record boundary",
+                    });
+                }
+                let state = match self.oversize.take() {
+                    Some(OversizeState::Split(state)) => state,
+                    _ => unreachable!("the split state was inspected above"),
+                };
+                self.line = Payload::new(record_end, self.payload_kind.keeps_source_shadow());
+                self.line_record_fit = None;
+                return self
+                    .make_fragment(
+                        state.current,
+                        record_end,
+                        state.record_start,
+                        state.index,
+                        true,
+                        None,
+                        None,
+                        Some(reason),
+                    )
+                    .map(Some);
+            }
         }
         if let Some(state) = self.oversize.take() {
             self.line = Payload::new(delivered, self.payload_kind.keeps_source_shadow());
@@ -1928,7 +2164,7 @@ impl Framer {
                 let record_start = record.payload.range.start;
                 self.oversize = Some(OversizeState::Split(SplitState {
                     record_start,
-                    record_end: None,
+                    record_end: Some(delivered),
                     index: 1,
                     current: line,
                     emit_current_nonfinal: false,
@@ -1940,8 +2176,8 @@ impl Framer {
                     0,
                     false,
                     Some(1),
-                    None,
-                    None,
+                    Some(delivered),
+                    Some(reason),
                 )
                 .map(Some)
             }
@@ -2106,49 +2342,18 @@ impl Framer {
         })
     }
 
-    /// Appends raw source bytes the decoder just consumed to the rolling
-    /// window buffer. Bytes are never dropped from the front here: trimming
-    /// happens only once a checkpoint frontier using them has been
-    /// produced, in [`Self::checkpoint_window_at`], so the buffer always
-    /// retains everything a not-yet-emitted frame might still need.
-    fn extend_raw_window(&mut self, consumed_bytes: &[u8]) {
-        self.raw_window_buffer.extend_from_slice(consumed_bytes);
+    /// Appends decoder-consumed source bytes to the fixed-tail, bounded-lag
+    /// raw window used for future committed-frontier evidence.
+    fn extend_raw_window(&mut self, consumed_bytes: &[u8]) -> Result<(), FramerError> {
+        self.raw_window.extend(consumed_bytes)
     }
 
-    /// Returns the exact real committed-frontier window ending at
-    /// `frame_end`, trimming the rolling buffer's now-unreachable prefix.
-    ///
-    /// `frame_end` can never regress across calls (checkpoint boundaries
-    /// only advance), so trimming to this call's window start can never
-    /// discard bytes a later call still needs.
+    /// Returns the exact real committed-frontier window ending at `frame_end`.
     fn checkpoint_window_at(
         &mut self,
         frame_end: u64,
     ) -> Result<CommittedFrontierWindow, FramerError> {
-        let window_len = frame_end.min(u64::from(COMMITTED_FRONTIER_GUARD_WINDOW_BYTES)) as usize;
-        let window_start = frame_end - window_len as u64;
-        if window_start < self.raw_window_start {
-            return Err(FramerError::Invariant {
-                context: "raw window buffer no longer covers the checkpoint frontier",
-            });
-        }
-        let rel_start = (window_start - self.raw_window_start) as usize;
-        let rel_end = (frame_end - self.raw_window_start) as usize;
-        let window_bytes = self
-            .raw_window_buffer
-            .get(rel_start..rel_end)
-            .ok_or(FramerError::Invariant {
-                context: "raw window buffer shorter than the checkpoint frontier requires",
-            })?
-            .to_vec();
-        // Everything before `window_start` can never be needed again: future
-        // frame ends only advance, so their windows never reach further
-        // back than this one.
-        let _ = self.raw_window_buffer.drain(..rel_start);
-        self.raw_window_start = window_start;
-        CommittedFrontierWindow::new(frame_end, window_bytes).map_err(|_| FramerError::Invariant {
-            context: "checkpoint window length does not match its offset",
-        })
+        self.raw_window.checkpoint_window(frame_end)
     }
 
     fn has_pending(&self) -> bool {
@@ -2182,6 +2387,7 @@ impl Framer {
                 OversizeState::Truncate(state) => payload_capacity(&state.prefix),
             });
         }
+        total = total.saturating_add(self.raw_window.retained_dynamic_capacity());
         total
     }
 }

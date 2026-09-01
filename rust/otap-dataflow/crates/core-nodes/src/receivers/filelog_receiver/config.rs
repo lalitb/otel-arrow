@@ -1302,6 +1302,14 @@ impl RuntimeConfig {
         ) = validate_framing(framing, encoding, on_decode_error, &identity)?;
         let batch = validate_batch(batch, &framing, on_decode_error)?;
         let rotation = validate_rotation(rotation)?;
+        if !framing.force_flush_period.is_zero()
+            && framing.force_flush_period >= rotation.rotate_wait
+        {
+            return Err(invalid(
+                "framing.force_flush_period must be zero (disabled) or strictly less than \
+                 rotation.rotate_wait",
+            ));
+        }
         let retry = validate_retry(retry)?;
 
         let checkpoint_id = resolve_checkpoint_id(checkpoint.id.as_deref(), default_checkpoint_id)?;
@@ -2215,6 +2223,9 @@ const fn framer_payload_copy_count(encoding: Encoding, on_decode_error: OnDecode
 ///
 /// `4 * copies * (min(max_line_bytes, max_record_bytes) + max_record_bytes)
 ///  + 16 * copies + 16`.
+///
+/// The fourfold term includes allocator growth overlap and the bounded raw
+/// lookbehind needed for an emitted checkpoint frontier that trails decoding.
 ///
 /// Returns `None` if any operation is not representable as `usize`.
 pub(crate) fn peak_framer_payload_bytes(
@@ -4464,6 +4475,32 @@ mod tests {
         let mut cfg = minimal_config();
         cfg.rotation.rotate_wait = Duration::ZERO;
         assert!(RuntimeConfig::from_config(cfg, "node-1").is_err());
+    }
+
+    /// Scenario: idle force-flush is disabled, just below rotation wait,
+    /// exactly equal to rotation wait, and greater than rotation wait.
+    /// Guarantees: zero and the strict-lower boundary validate, while equal
+    /// and greater values are rejected before either lifecycle timer starts.
+    #[test]
+    fn force_flush_period_must_precede_rotation_wait() {
+        let mut disabled = minimal_config();
+        disabled.framing.force_flush_period = Duration::ZERO;
+        disabled.rotation.rotate_wait = Duration::from_millis(10);
+        assert!(RuntimeConfig::from_config(disabled, "node-1").is_ok());
+
+        let mut below = minimal_config();
+        below.framing.force_flush_period = Duration::from_millis(9);
+        below.rotation.rotate_wait = Duration::from_millis(10);
+        assert!(RuntimeConfig::from_config(below, "node-1").is_ok());
+
+        for force_flush_period in [Duration::from_millis(10), Duration::from_millis(11)] {
+            let mut invalid = minimal_config();
+            invalid.framing.force_flush_period = force_flush_period;
+            invalid.rotation.rotate_wait = Duration::from_millis(10);
+            let error = RuntimeConfig::from_config(invalid, "node-1").unwrap_err();
+            assert!(error.to_string().contains("force_flush_period"));
+            assert!(error.to_string().contains("rotate_wait"));
+        }
     }
 
     /// Scenario: parsing each documented `rotation.on_truncate` value.

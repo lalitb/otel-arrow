@@ -1199,6 +1199,82 @@ fn fragment_metadata_must_match_durable_resume_transitions() {
     assert_eq!(batch.record_count(), 0);
 }
 
+/// Scenario: a new split establishes an exact nonzero record end, and a
+/// restarted continuation emits another nonfinal fragment before that end.
+/// Guarantees: batching accepts the established end from Clean, preserves it
+/// across continuation, and rejects any attempt to change it.
+#[test]
+fn known_split_end_is_preserved_across_batch_projection() {
+    let now = Instant::now();
+    let mut first = input(144, 0, 4, 0, now);
+    first.framed.fragment = Some(FragmentMetadata {
+        id: fragment_id(first.file_id, first.progress_base.file_epoch, 0),
+        index: 0,
+        last: false,
+    });
+    first.framed.resulting_resume = FramingResume::Continuation {
+        record_start_offset: 0,
+        record_end_offset: 12,
+        next_fragment_index: 1,
+    };
+    let mut first_batch = batch_with_settings(settings(2, 1 << 20, Duration::from_secs(1)));
+    assert!(matches!(
+        first_batch.try_append(first),
+        Ok(BatchAppendOutcome::Appended { .. })
+    ));
+
+    let mut continued = input(144, 4, 8, 4, now);
+    continued.progress_base.framing_resume = FramingResume::Continuation {
+        record_start_offset: 0,
+        record_end_offset: 12,
+        next_fragment_index: 1,
+    };
+    continued.framed.fragment = Some(FragmentMetadata {
+        id: fragment_id(continued.file_id, continued.progress_base.file_epoch, 0),
+        index: 1,
+        last: false,
+    });
+    continued.framed.resulting_resume = FramingResume::Continuation {
+        record_start_offset: 0,
+        record_end_offset: 12,
+        next_fragment_index: 2,
+    };
+    let mut continued_batch = batch_with_settings(settings(2, 1 << 20, Duration::from_secs(1)));
+    assert!(matches!(
+        continued_batch.try_append(continued.clone()),
+        Ok(BatchAppendOutcome::Appended { .. })
+    ));
+
+    continued.framed.resulting_resume = FramingResume::Continuation {
+        record_start_offset: 0,
+        record_end_offset: 13,
+        next_fragment_index: 2,
+    };
+    let mut invalid = batch_with_settings(settings(2, 1 << 20, Duration::from_secs(1)));
+    assert!(matches!(
+        invalid.try_append(continued),
+        Err(BatchError::InvalidProgress { .. })
+    ));
+
+    let mut early_final = input(144, 8, 11, 8, now);
+    early_final.progress_base.framing_resume = FramingResume::Continuation {
+        record_start_offset: 0,
+        record_end_offset: 12,
+        next_fragment_index: 2,
+    };
+    early_final.framed.fragment = Some(FragmentMetadata {
+        id: fragment_id(early_final.file_id, early_final.progress_base.file_epoch, 0),
+        index: 2,
+        last: true,
+    });
+    early_final.framed.resulting_resume = FramingResume::Clean;
+    let mut invalid_final = batch_with_settings(settings(2, 1 << 20, Duration::from_secs(1)));
+    assert!(matches!(
+        invalid_final.try_append(early_final),
+        Err(BatchError::InvalidProgress { .. })
+    ));
+}
+
 /// Scenario: an Ack conversion observes a durable epoch, offset, resume, and
 /// last-seen value after the batch was built.
 /// Guarantees: stale progress state cannot produce a checkpoint operation,

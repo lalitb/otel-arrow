@@ -6,8 +6,8 @@ use std::collections::HashSet;
 use tempfile::{TempDir, tempdir};
 
 use super::matcher::{
-    CandidateInventory, FileIdSource, IdentityMatch, IdentityResolution, IdentitySettings,
-    ResolvedIdentity, resolve_and_persist as resolve_with_inventory,
+    CandidateInventory, FileIdSource, IdentityBlockReason, IdentityMatch, IdentityResolution,
+    IdentitySettings, ResolvedIdentity, resolve_and_persist as resolve_with_inventory,
     resolve_and_persist_with_admission, resolve_and_persist_with_admission_cancellable,
     resolve_and_persist_with_source as resolve_with_inventory_and_source,
 };
@@ -642,8 +642,8 @@ fn same_locator_mismatch_retirement_keeps_later_exact_locator_lookups_unambiguou
 /// Scenario: an empty finalized identity's locator is later reused by a new
 /// nonempty file whose fingerprint necessarily extends the empty prefix.
 /// Guarantees: finalized state is never resumed and no longer owns a live
-/// locator claim; its history remains while the reused locator receives a new
-/// mismatch identity.
+/// locator claim; its history remains while the reused locator is admitted as
+/// an unrelated new identity governed by `start_at`.
 #[test]
 fn finalized_locator_reuse_never_resumes_the_old_identity() {
     let (_directory, mut store, _options) = test_store(8);
@@ -676,7 +676,7 @@ fn finalized_locator_reuse_never_resumes_the_old_identity() {
     .unwrap();
 
     assert_ne!(resolved[0].file_id, old_id);
-    assert_eq!(resolved[0].matched_by, IdentityMatch::RecoveryMismatch);
+    assert_eq!(resolved[0].matched_by, IdentityMatch::NewDiscovery);
     assert_eq!(resolved[0].committed_offset, 0);
     assert_eq!(
         store.table().get(&old_id).unwrap().lifecycle_state,
@@ -755,13 +755,12 @@ fn incompatible_resumption_profile_fails_closed() {
     );
 }
 
-/// Scenario: a namespace contains an active legacy profile-v1 record, but
-/// the current reconciliation has no file candidates.
-/// Guarantees: namespace compatibility is preflighted independently of
-/// candidate matching and legacy resumable state fails closed without a WAL
-/// mutation.
+/// Scenario: a namespace contains an active legacy-profile record, but the
+/// current reconciliation has no candidate for that locator.
+/// Guarantees: per-file compatibility does not fail an unrelated empty
+/// reconciliation and no WAL mutation occurs.
 #[test]
-fn legacy_profile_fails_closed_even_with_no_candidates() {
+fn legacy_profile_without_a_candidate_does_not_fail_the_batch() {
     let (_directory, mut store, _options) = test_store(8);
     let file_id = FileId::from_bytes([21; 16]);
     let mut operation = registration(file_id, locator(38), 0, b"abcd", b"legacy");
@@ -782,10 +781,59 @@ fn legacy_profile_fails_closed_even_with_no_candidates() {
     );
     let before = store.stats();
 
-    let error = resolve_with_inventory(&mut store, &[], &inventory, &settings(), 7).unwrap_err();
+    let resolved = resolve_with_inventory(&mut store, &[], &inventory, &settings(), 7).unwrap();
 
-    assert!(matches!(error, IdentityError::IncompatibleProfile { .. }));
+    assert!(resolved.is_empty());
     assert_eq!(store.stats().wal_transactions, before.wal_transactions);
+}
+
+/// Scenario: one exact-locator candidate has an incompatible durable framing
+/// profile while an unrelated candidate in the same reconciliation is valid.
+/// Guarantees: only the incompatible identity is blocked without mutation;
+/// the unrelated registration persists and remains readable.
+#[test]
+fn incompatible_profile_is_contained_to_the_matching_candidate() {
+    let (_directory, mut store, _options) = test_store(8);
+    let blocked_id = FileId::from_bytes([22; 16]);
+    let mut operation = registration(blocked_id, locator(39), 0, b"bad!", b"blocked");
+    let Operation::RegisterFile(register) = &mut operation else {
+        unreachable!()
+    };
+    register.framing_profile_digest = [0x99; 32];
+    let _outcome = store.append(vec![operation]).unwrap();
+    let blocked_before = store.table().get(&blocked_id).unwrap().clone();
+    let candidates = vec![
+        evidence(locator(39), 4, b"bad!", b"blocked"),
+        evidence(locator(40), 4, b"good", b"healthy"),
+    ];
+    let inventory =
+        CandidateInventory::from_complete_reconciliation(&candidates, &HashSet::new(), 4);
+    let no_replacements = HashSet::new();
+    let no_confirmed = HashSet::new();
+
+    let resolved = resolve_and_persist_with_admission(
+        &mut store,
+        &candidates,
+        &inventory,
+        &settings(),
+        8,
+        &no_replacements,
+        &no_confirmed,
+    )
+    .unwrap();
+
+    let IdentityResolution::Blocked(blocked) = &resolved[0] else {
+        panic!("incompatible exact locator must be blocked");
+    };
+    assert_eq!(blocked.file_id, blocked_id);
+    assert_eq!(blocked.reason, IdentityBlockReason::IncompatibleProfile);
+    let IdentityResolution::Resolved(healthy) = &resolved[1] else {
+        panic!("unrelated compatible candidate must resolve");
+    };
+    assert_eq!(healthy.matched_by, IdentityMatch::NewDiscovery);
+    assert_eq!(store.table().get(&blocked_id), Some(&blocked_before));
+    assert!(store.table().get(&healthy.file_id).is_some());
+    assert_eq!(store.table().len(), 2);
 }
 
 /// Scenario: a durably quarantined locator reconnects, followed by a

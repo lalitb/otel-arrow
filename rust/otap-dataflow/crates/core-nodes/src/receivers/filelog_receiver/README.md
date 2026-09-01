@@ -180,7 +180,8 @@ runtime-owned records are not removed.
 
 Set at most one of `framing.multiline.line_start_pattern` and
 `framing.multiline.line_end_pattern`. Patterns use the versioned `re2-v1`
-profile. A zero `force_flush_period` disables idle partial-record flushing.
+profile. A zero `force_flush_period` disables idle partial-record flushing. A
+nonzero force-flush period must be strictly less than `rotation.rotate_wait`.
 
 Timestamp extraction and parsing are processor responsibilities. The filelog
 receiver preserves source bytes and record boundaries but does not interpret
@@ -241,9 +242,11 @@ Treat the namespace as one storage-engine unit:
 - Changing `checkpoint.id` starts a separate namespace and applies `start_at`;
   it is not an in-place migration.
 
-Corruption, an unknown version, or an incompatible framing profile fails
-closed. A torn final WAL tail is ignored only when it cannot form the complete
-transaction length declared by its header.
+Corruption or an unknown format version fails the namespace closed. An
+incompatible framing profile blocks only the affected durable file without
+changing its progress; unrelated compatible files continue. A torn final WAL
+tail is ignored only when it cannot form the complete transaction length
+declared by its header.
 
 Quarantine is durable and is not removed by ordinary retention. Restarting or
 changing `rotation.on_truncate` does not clear an existing quarantine.

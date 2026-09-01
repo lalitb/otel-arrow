@@ -23,7 +23,6 @@ use serde_json::json;
 use tempfile::tempdir;
 
 use super::*;
-use crate::receivers::filelog_receiver::MaxLogSizeBehavior;
 use crate::receivers::filelog_receiver::batching::{FinalizationOutcome, ProgressFrontier};
 use crate::receivers::filelog_receiver::checkpoint::primitives::{
     AdvisoryPath, CommittedFrontierGuard, FRAMING_PROFILE_VERSION, FramingResume, Locator,
@@ -45,6 +44,7 @@ use crate::receivers::filelog_receiver::discovery::{
 };
 use crate::receivers::filelog_receiver::identity::matcher::{IdentityMatch, ResolvedIdentity};
 use crate::receivers::filelog_receiver::identity::platform::open_candidate;
+use crate::receivers::filelog_receiver::{Encoding, MaxLogSizeBehavior};
 
 /// Test-only zero-filled window guard: a deterministic, obviously-fake
 /// `CommittedFrontierGuard` for tests that only need a structurally valid
@@ -437,45 +437,150 @@ fn descriptor_budget_warning_is_reported_once_at_startup() {
     runtime.shutdown_resources().unwrap();
 }
 
-/// Scenario: identity planning rejects one live checkpoint record whose
-/// framing-profile version and digest differ from configuration.
-/// Guarantees: the incompatibility increments exactly one fixed telemetry
-/// counter before the structured identity error propagates.
-#[test]
-fn framing_profile_incompatibility_is_reported_once() {
+/// Scenario: one discovered file exactly matches incompatible durable
+/// framing state while another file in the same pass is unrelated and valid.
+/// Guarantees: the incompatible file stays unchanged and unread, one bounded
+/// compatibility signal is recorded, and the valid file is delivered.
+#[tokio::test]
+async fn framing_profile_incompatibility_is_contained_to_one_file() {
     let directory = tempdir().unwrap();
-    let source = directory.path().join("profile.log");
-    std::fs::write(&source, b"line\n").unwrap();
-    let config = runtime_config(
-        source.to_str().unwrap(),
-        &directory.path().join("checkpoint"),
-        1,
-    );
-    let telemetry = Arc::new(WorkerTelemetryBridge::default());
-    let mut runtime = WorkerRuntime::new_with_telemetry(
-        config,
-        Arc::clone(&telemetry),
-        Arc::new(AtomicBool::new(false)),
+    let blocked_source = directory.path().join("blocked.log");
+    let healthy_source = directory.path().join("healthy.log");
+    std::fs::write(&blocked_source, b"blocked\n").unwrap();
+    std::fs::write(&healthy_source, b"healthy\n").unwrap();
+    let include = directory.path().join("*.log");
+    let namespace = directory.path().join("checkpoint");
+    let config = runtime_config(include.to_str().unwrap(), &namespace, 1);
+    let evidence = open_candidate(
+        &blocked_source,
+        false,
+        u16::try_from(config.identity.fingerprint_bytes).unwrap(),
+        u32::try_from(config.identity.ignored_header_bytes).unwrap(),
     )
-    .unwrap();
+    .unwrap()
+    .evidence;
+    let blocked_id = FileId::from_bytes([7; 16]);
+    let mut store = CheckpointStore::open(StoreOptions::from_runtime_config(&config)).unwrap();
+    let _registered = store
+        .register_files(vec![RegisterFile {
+            file_id: blocked_id,
+            file_epoch: 1,
+            committed_offset: 0,
+            committed_frontier_guard: CommittedFrontierGuard::empty(),
+            fingerprint: evidence.fingerprint,
+            ignored_header_bytes: 0,
+            locator: evidence.locator,
+            framing_profile_version: FRAMING_PROFILE_VERSION,
+            framing_profile_digest: [0x99; 32],
+            framing_resume: FramingResume::Clean,
+            last_seen_time_unix_nano: 1,
+            advisory_path: evidence.advisory_path,
+        }])
+        .unwrap();
+    let blocked_before = store.table().get(&blocked_id).unwrap().clone();
+    drop(store);
 
-    let error = runtime.identity_plan_error(IdentityError::IncompatibleProfile {
-        file_id: FileId::from_bytes([7; 16]),
-        stored_version: 1,
-        stored_digest: [1; 32],
-        configured_version: 2,
-        configured_digest: [2; 32],
-    });
+    let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+    let worker = spawn_worker(config.clone(), event_tx).unwrap();
+    let telemetry = Arc::clone(&worker.telemetry);
+    let mut batch = receive_batch(&mut events).await;
+    let request = decode_worker_records(&mut batch.records);
+    assert_eq!(log_body_bytes(only_log(&request)), b"healthy");
+    worker
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: batch.batch_id,
+            attempt: batch.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    receive_commit(&mut events).await.3.unwrap();
+    stop_worker(worker, &mut events).await.unwrap();
 
-    assert!(matches!(
-        error,
-        WorkerError::Identity(IdentityError::IncompatibleProfile { .. })
-    ));
     assert_eq!(
         telemetry.counter_for_test(WorkerCounter::FramingProfileIncompatible),
         1
     );
-    runtime.shutdown_resources().unwrap();
+    let store = CheckpointStore::open(StoreOptions::from_runtime_config(&config)).unwrap();
+    assert_eq!(store.table().get(&blocked_id), Some(&blocked_before));
+    assert_eq!(store.table().len(), 2);
+}
+
+/// Scenario: a receiver restarts with one old exact-locator `Active` record
+/// and also sees an unrelated old file under an enabled age filter.
+/// Guarantees: durable recovery is classified before `ignore_older_than`,
+/// so the tracked file is delivered while the unrelated file stays unregistered.
+#[tokio::test]
+async fn restart_age_filter_preserves_exact_durable_recovery() {
+    let directory = tempdir().unwrap();
+    let recovered_source = directory.path().join("recovered.log");
+    let unrelated_source = directory.path().join("unrelated.log");
+    std::fs::write(&recovered_source, b"recovered\n").unwrap();
+    std::fs::write(&unrelated_source, b"unrelated\n").unwrap();
+    let old_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+    for path in [&recovered_source, &unrelated_source] {
+        OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old_time))
+            .unwrap();
+    }
+    let include = directory.path().join("*.log");
+    let namespace = directory.path().join("checkpoint");
+    let config = runtime_config_with(include.to_str().unwrap(), &namespace, 1, |config| {
+        config.ignore_older_than = Duration::from_secs(10);
+    });
+    let evidence = open_candidate(
+        &recovered_source,
+        false,
+        u16::try_from(config.identity.fingerprint_bytes).unwrap(),
+        u32::try_from(config.identity.ignored_header_bytes).unwrap(),
+    )
+    .unwrap()
+    .evidence;
+    let recovered_id = FileId::from_bytes([8; 16]);
+    let mut store = CheckpointStore::open(StoreOptions::from_runtime_config(&config)).unwrap();
+    let _registered = store
+        .register_files(vec![RegisterFile {
+            file_id: recovered_id,
+            file_epoch: 1,
+            committed_offset: 0,
+            committed_frontier_guard: CommittedFrontierGuard::empty(),
+            fingerprint: evidence.fingerprint,
+            ignored_header_bytes: 0,
+            locator: evidence.locator,
+            framing_profile_version: FRAMING_PROFILE_VERSION,
+            framing_profile_digest: config.framing_profile_digest,
+            framing_resume: FramingResume::Clean,
+            last_seen_time_unix_nano: 1,
+            advisory_path: evidence.advisory_path,
+        }])
+        .unwrap();
+    drop(store);
+
+    let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+    let worker = spawn_worker(config.clone(), event_tx).unwrap();
+    let mut batch = receive_batch(&mut events).await;
+    let request = decode_worker_records(&mut batch.records);
+    assert_eq!(log_body_bytes(only_log(&request)), b"recovered");
+    worker
+        .command_tx
+        .send(WorkerCommand::Commit {
+            batch_id: batch.batch_id,
+            attempt: batch.attempt,
+            explicit_loss: false,
+        })
+        .unwrap();
+    receive_commit(&mut events).await.3.unwrap();
+    stop_worker(worker, &mut events).await.unwrap();
+
+    let store = CheckpointStore::open(StoreOptions::from_runtime_config(&config)).unwrap();
+    assert_eq!(store.table().len(), 1);
+    assert_eq!(
+        store.table().get(&recovered_id).unwrap().committed_offset,
+        b"recovered\n".len() as u64
+    );
 }
 
 async fn receive_batch(events: &mut tokio::sync::mpsc::Receiver<WorkerEvent>) -> WorkerBatch {
@@ -830,6 +935,121 @@ async fn acked_split_fragment_resumes_across_worker_restart() {
     let checkpoint = store.table().iter().next().unwrap().1;
     assert_eq!(checkpoint.committed_offset, 9);
     assert_eq!(checkpoint.framing_resume, FramingResume::Clean);
+}
+
+/// Scenario: a durable split continuation already knows its exact record end,
+/// and each of two nonfinal fragments is Acked before a worker restart.
+/// Guarantees: batching and checkpoint projection preserve the nonzero end
+/// across both restarts, and the final fragment ends exactly there.
+#[tokio::test]
+async fn known_split_end_survives_ack_and_multiple_worker_restarts() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("known-end.log");
+    std::fs::write(&source, b"abcdefghijklmn").unwrap();
+    let namespace = directory.path().join("checkpoint");
+    let runtime = runtime_config_with(source.to_str().unwrap(), &namespace, 1, |config| {
+        config.encoding = Encoding::Raw;
+        config.framing.max_line_bytes = 4;
+        config.framing.max_record_bytes = 4;
+        config.framing.max_log_size_behavior = MaxLogSizeBehavior::Split;
+    });
+    let evidence = open_candidate(
+        &source,
+        false,
+        u16::try_from(runtime.identity.fingerprint_bytes).unwrap(),
+        u32::try_from(runtime.identity.ignored_header_bytes).unwrap(),
+    )
+    .unwrap()
+    .evidence;
+    let file_id = FileId::from_bytes([9; 16]);
+    let mut store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
+    let _registered = store
+        .register_files(vec![RegisterFile {
+            file_id,
+            file_epoch: 1,
+            committed_offset: 0,
+            committed_frontier_guard: CommittedFrontierGuard::empty(),
+            fingerprint: evidence.fingerprint,
+            ignored_header_bytes: 0,
+            locator: evidence.locator,
+            framing_profile_version: FRAMING_PROFILE_VERSION,
+            framing_profile_digest: runtime.framing_profile_digest,
+            framing_resume: FramingResume::Clean,
+            last_seen_time_unix_nano: 1,
+            advisory_path: evidence.advisory_path,
+        }])
+        .unwrap();
+    let _progress = store
+        .commit_progress(vec![UpdateProgress {
+            file_id,
+            expected_committed_offset: 0,
+            expected_file_epoch: 1,
+            new_committed_offset: 4,
+            new_committed_frontier_guard: CommittedFrontierGuard::compute(4, b"abcd").unwrap(),
+            new_framing_resume: FramingResume::Continuation {
+                record_start_offset: 0,
+                record_end_offset: 14,
+                next_fragment_index: 1,
+            },
+            new_last_seen_time_unix_nano: 2,
+            finalize: false,
+        }])
+        .unwrap();
+    drop(store);
+
+    for (expected_body, expected_index, expected_offset, expected_resume) in [
+        (
+            b"efgh".as_slice(),
+            1,
+            8,
+            FramingResume::Continuation {
+                record_start_offset: 0,
+                record_end_offset: 14,
+                next_fragment_index: 2,
+            },
+        ),
+        (
+            b"ijkl".as_slice(),
+            2,
+            12,
+            FramingResume::Continuation {
+                record_start_offset: 0,
+                record_end_offset: 14,
+                next_fragment_index: 3,
+            },
+        ),
+        (b"mn".as_slice(), 3, 14, FramingResume::Clean),
+    ] {
+        let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
+        let worker = spawn_worker(runtime.clone(), event_tx).unwrap();
+        let mut batch = receive_batch(&mut events).await;
+        let request = decode_worker_records(&mut batch.records);
+        let log = only_log(&request);
+        assert_eq!(log_body_bytes(log), expected_body);
+        assert_eq!(
+            log_attr(log, ATTR_KEY_FRAGMENT_INDEX),
+            Some(&Value::IntValue(expected_index))
+        );
+        assert_eq!(
+            log_attr(log, ATTR_KEY_FRAGMENT_IS_LAST),
+            Some(&Value::BoolValue(expected_resume == FramingResume::Clean))
+        );
+        worker
+            .command_tx
+            .send(WorkerCommand::Commit {
+                batch_id: batch.batch_id,
+                attempt: batch.attempt,
+                explicit_loss: false,
+            })
+            .unwrap();
+        receive_commit(&mut events).await.3.unwrap();
+        stop_worker(worker, &mut events).await.unwrap();
+
+        let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
+        let checkpoint = store.table().get(&file_id).unwrap();
+        assert_eq!(checkpoint.committed_offset, expected_offset);
+        assert_eq!(checkpoint.framing_resume, expected_resume);
+    }
 }
 
 /// Scenario: an unterminated record is timeout-flushed and Acked, then a new

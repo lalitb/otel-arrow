@@ -1334,8 +1334,6 @@ fn install_no_replace(temp_path: &Path, final_path: &Path) -> Result<(), Replace
             flags: libc::c_uint,
         ) -> libc::c_int;
     }
-    const RENAME_EXCL: libc::c_uint = 0x0000_0002;
-
     let temp = CString::new(temp_path.as_os_str().as_bytes()).map_err(|_| ReplaceFileError {
         source: std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1352,7 +1350,13 @@ fn install_no_replace(temp_path: &Path, final_path: &Path) -> Result<(), Replace
             destination_may_have_changed: false,
         })?;
     // SAFETY: both C strings are NUL-terminated and alive for the call.
-    let result = unsafe { renamex_np(temp.as_ptr(), final_path.as_ptr(), RENAME_EXCL) };
+    let result = unsafe {
+        renamex_np(
+            temp.as_ptr(),
+            final_path.as_ptr(),
+            libc::RENAME_EXCL as libc::c_uint,
+        )
+    };
     if result == 0 {
         Ok(())
     } else {

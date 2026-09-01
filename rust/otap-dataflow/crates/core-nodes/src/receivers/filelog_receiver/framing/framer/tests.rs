@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use super::{
     CommittedFrontierWindow, DecodeOutcome, FlushReason, FramedBody, FramedRecord, Framer,
-    FramerError, fragment_id,
+    FramerError, RawSourceWindow, fragment_id,
 };
 use crate::receivers::filelog_receiver::{
     Config, Encoding, MaxLogSizeBehavior, OnDecodeError,
@@ -590,6 +590,86 @@ fn timeout_flushes_partial_line_to_clean_progress() {
     assert_eq!(flushed.checkpoint_end, 7);
 }
 
+/// Scenario: a partial record's first EOF observation occurs after the
+/// activity-based force-flush deadline has already elapsed.
+/// Guarantees: EOF arms the original deadline and makes the record immediately
+/// eligible instead of adding another complete force-flush period.
+#[test]
+fn delayed_first_eof_observation_uses_last_activity_deadline() {
+    let start = Instant::now();
+    let settings = TestSettings {
+        flush_period: Duration::from_millis(10),
+        ..TestSettings::default()
+    };
+    let mut framer = framer(&settings, start);
+    assert!(feed(&mut framer, b"partial", start).is_empty());
+    let observed_at = start + Duration::from_millis(25);
+
+    framer.observe_eof(observed_at).unwrap();
+
+    assert_eq!(
+        framer.deadline(),
+        start.checked_add(Duration::from_millis(10))
+    );
+    let flushed = framer
+        .poll_timeout(observed_at)
+        .unwrap()
+        .output
+        .expect("the elapsed activity-based deadline is immediately eligible");
+    assert_eq!(text(&flushed), "partial");
+    assert_eq!(flushed.flush_reason, Some(FlushReason::Timeout));
+}
+
+/// Scenario: an EOF-idle timeout splits an oversized multiline partial
+/// record, then the writer appends new bytes before the remaining fragment is
+/// explicitly polled.
+/// Guarantees: the exact timeout boundary drains first without overrun; the
+/// initiating fragment carries Timeout and new bytes begin after the clean end.
+#[test]
+fn timeout_split_drains_known_end_before_new_input() {
+    let start = Instant::now();
+    let settings = TestSettings {
+        encoding: Encoding::Raw,
+        end_pattern: Some("^END$"),
+        max_line: 8,
+        max_record: 8,
+        flush_period: Duration::from_millis(10),
+        ..TestSettings::default()
+    };
+    let mut framer = framer(&settings, start);
+    assert!(feed(&mut framer, b"abc\ndefgh", start).is_empty());
+    framer.observe_eof(start).unwrap();
+
+    let first = framer
+        .poll_timeout(start + settings.flush_period)
+        .unwrap()
+        .output
+        .expect("timeout must emit the first fragment");
+    assert_eq!(bytes(&first), b"abc\n");
+    assert_eq!(first.flush_reason, Some(FlushReason::Timeout));
+    assert_eq!(
+        first.resulting_resume,
+        FramingResume::Continuation {
+            record_start_offset: 0,
+            record_end_offset: 9,
+            next_fragment_index: 1,
+        }
+    );
+
+    let appended = feed(
+        &mut framer,
+        b"next\n",
+        start + settings.flush_period + Duration::from_millis(1),
+    );
+    assert_eq!(appended.len(), 1);
+    assert_eq!(bytes(&appended[0]), b"defgh");
+    assert!(appended[0].fragment.as_ref().unwrap().last);
+    assert_eq!(appended[0].flush_reason, None);
+    assert_eq!(appended[0].checkpoint_end, 9);
+    assert_eq!(appended[0].resulting_resume, FramingResume::Clean);
+    assert_eq!(framer.pending_source_start(), Some(9));
+}
+
 /// Scenario: Partial flushing is disabled and drain observes an unterminated line.
 /// Guarantees: Drain reports recoverable pending state without committing or dropping source bytes.
 #[test]
@@ -1039,6 +1119,14 @@ fn aggregate_multiline_split_terminates_at_trigger_line_lf() {
     assert!(!outputs[0].fragment.as_ref().unwrap().last);
     assert!(outputs[1].fragment.as_ref().unwrap().last);
     assert_eq!(outputs[0].checkpoint_end, 4);
+    assert_eq!(
+        outputs[0].resulting_resume,
+        FramingResume::Continuation {
+            record_start_offset: 0,
+            record_end_offset: 10,
+            next_fragment_index: 1,
+        }
+    );
     assert_eq!(outputs[1].checkpoint_end, 10);
     assert_eq!(framer.pending_source_start(), Some(10));
 }
@@ -1357,6 +1445,41 @@ fn resumed_continuation_with_known_end_emits_multiple_bounded_fragments_before_t
     assert_eq!(outputs[2].checkpoint_end, 14);
 }
 
+/// Scenario: the final source unit of a known-end continuation would exceed
+/// the current fragment's exact body bound.
+/// Guarantees: the current fragment emits nonfinal with the known end
+/// preserved, then the retained final unit emits as the bounded last fragment.
+#[test]
+fn known_end_final_unit_still_obeys_the_fragment_bound() {
+    let now = Instant::now();
+    let settings = TestSettings {
+        encoding: Encoding::Raw,
+        max_line: 4,
+        max_record: 4,
+        behavior: MaxLogSizeBehavior::Split,
+        ..TestSettings::default()
+    };
+    let mut framer = resumed_framer_with_end(&settings, 4, 0, 9, 1, now)
+        .expect("resume with a known end must construct");
+
+    let outputs = feed(&mut framer, b"abcde", now);
+
+    assert_eq!(outputs.len(), 2);
+    assert_eq!(bytes(&outputs[0]), b"abcd");
+    assert_eq!(bytes(&outputs[1]), b"e");
+    assert_eq!(
+        outputs[0].resulting_resume,
+        FramingResume::Continuation {
+            record_start_offset: 0,
+            record_end_offset: 9,
+            next_fragment_index: 2,
+        }
+    );
+    assert!(!outputs[0].fragment.as_ref().unwrap().last);
+    assert!(outputs[1].fragment.as_ref().unwrap().last);
+    assert_eq!(outputs[1].checkpoint_end, 9);
+}
+
 /// Scenario: A decoded scalar spans a resumed continuation's exact known
 /// record end.
 /// Guarantees: The framer fails closed instead of splitting the scalar or
@@ -1483,7 +1606,7 @@ fn empty_resumed_continuation_timeout_stays_pending() {
         .unwrap();
     assert_eq!(
         framer.deadline(),
-        start.checked_add(Duration::from_millis(30))
+        start.checked_add(Duration::from_millis(10))
     );
 }
 
@@ -1576,7 +1699,9 @@ fn start_mode_returns_to_seeking_after_max_lines() {
 }
 
 /// Scenario: Truncate scans a very long raw tail without LF.
-/// Guarantees: Retained capacities stay within the documented peak-allocation formula and discarded bytes are numeric, not buffered.
+/// Guarantees: Retained capacities stay within the documented peak-allocation
+/// formula, the final guard window is exact, and discarded bytes are numeric,
+/// not buffered.
 #[test]
 fn truncate_tail_retention_is_bounded() {
     let now = Instant::now();
@@ -1591,6 +1716,7 @@ fn truncate_tail_retention_is_bounded() {
     let mut framer = framer(&settings, now);
     let tail = vec![b'x'; 100_000];
     assert!(feed(&mut framer, &tail, now).is_empty());
+    assert!(framer.raw_window.retained_len() <= 64 + (2 * 8) + 4);
     assert!(
         framer.retained_payload_capacity()
             <= framer
@@ -1601,6 +1727,26 @@ fn truncate_tail_retention_is_bounded() {
     let output = feed(&mut framer, b"\n", now).remove(0);
     assert_eq!(bytes(&output), b"xxxxxxxx");
     assert_eq!(output.discarded_source_bytes, 99_992);
+    let mut expected_window = vec![b'x'; 63];
+    expected_window.push(b'\n');
+    assert_eq!(output.checkpoint_window.bytes(), expected_window);
+}
+
+/// Scenario: the decoder has consumed beyond a frame boundary by the maximum
+/// configured raw-window lag.
+/// Guarantees: the rolling lag plus fixed tail reconstructs the exact
+/// 64-byte checkpoint window at the retained boundary and rejects an older one.
+#[test]
+fn raw_source_window_preserves_exact_lagged_frontiers() {
+    let source: Vec<u8> = (0u8..100).collect();
+    let seed = CommittedFrontierWindow::new(64, source[..64].to_vec()).unwrap();
+    let mut window = RawSourceWindow::new(seed, 20).unwrap();
+    window.extend(&source[64..]).unwrap();
+
+    let retained = window.checkpoint_window(80).unwrap();
+    assert_eq!(retained.bytes(), &source[16..80]);
+    assert!(window.checkpoint_window(79).is_err());
+    assert_eq!(window.retained_len(), 84);
 }
 
 /// Scenario: Preserve-raw payload vectors reallocate while physical-line and logical-record slots are both live.

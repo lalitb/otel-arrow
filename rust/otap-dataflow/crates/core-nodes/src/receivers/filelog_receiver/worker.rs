@@ -38,14 +38,14 @@ use super::discovery::source::{
 };
 use super::discovery::{
     CandidateEvent, DiscoveryError, DiscoveryFeedback, DiscoveryMessage, DiscoveryRelease,
-    DurableAck, ReconciliationBatch, RetentionRemovalAck,
+    DurableAck, DurableDiscoveryBinding, ReconciliationBatch, RetentionRemovalAck,
 };
 use super::environment::{DescriptorPressure, EnvironmentalErrorClass};
 use super::framing::{DecodeError, DecodeOutcome, FlushReason, FramedRecord, Framer, FramerError};
 use super::identity::CandidateEvidence;
 use super::identity::IdentityError;
 use super::identity::matcher::{
-    IdentityMatch, IdentityResolution, IdentitySettings, plan_with_admission,
+    BlockedIdentity, IdentityMatch, IdentityResolution, IdentitySettings, plan_with_admission,
 };
 use super::lease::LeaseError;
 use super::reader::{
@@ -686,6 +686,19 @@ impl WorkerRuntime {
                 source,
             })?;
         let retention_removals = reserved_vec(max_readers, "retention removal batch")?;
+        let mut durable_discovery_bindings =
+            reserved_vec(max_readers, "durable discovery binding seed")?;
+        for (_, record) in store.table().iter() {
+            if matches!(
+                record.lifecycle_state,
+                LifecycleState::Active | LifecycleState::Quarantined
+            ) {
+                durable_discovery_bindings.push(DurableDiscoveryBinding {
+                    locator: record.locator,
+                    advisory_path: record.advisory_path.clone(),
+                });
+            }
+        }
 
         if shutdown_requested.load(Ordering::Acquire) {
             return Err(WorkerError::StartupCancelled);
@@ -710,6 +723,7 @@ impl WorkerRuntime {
             discovery_plan,
             Arc::clone(&shutdown_requested),
             descriptor_pressure,
+            durable_discovery_bindings,
         )?;
         if shutdown_requested.load(Ordering::Acquire) {
             drop(discovery);
@@ -1413,7 +1427,7 @@ impl WorkerRuntime {
             return Ok(LoopControl::Shutdown);
         }
         let shutdown_requested = Arc::clone(&self.shutdown_requested);
-        let mut plan = match plan_with_admission(
+        let mut plan = plan_with_admission(
             &self.store,
             &self.candidate_evidence,
             &batch.inventory,
@@ -1421,13 +1435,7 @@ impl WorkerRuntime {
             now_unix_nano,
             &batch.recognized_replacements,
             &confirmed_path_bindings,
-        ) {
-            Ok(plan) => plan,
-            Err(error @ IdentityError::IncompatibleProfile { .. }) => {
-                return Err(self.identity_plan_error(error));
-            }
-            Err(error) => return Err(WorkerError::Identity(error)),
-        };
+        )?;
         if self.cancellation_requested() {
             return Ok(LoopControl::Shutdown);
         }
@@ -1463,6 +1471,9 @@ impl WorkerRuntime {
                             suppressed_events = suppressed
                         );
                     }
+                }
+                IdentityResolution::Blocked(_) => {
+                    self.observe_profile_incompatibility();
                 }
                 IdentityResolution::Resolved(identity) => match identity.matched_by {
                     IdentityMatch::ExactLocator => {
@@ -1507,9 +1518,20 @@ impl WorkerRuntime {
             match event {
                 CandidateEvent::Observed(candidate) => {
                     let resolution = next_resolution(&mut resolved)?;
-                    let IdentityResolution::Resolved(identity) = resolution else {
-                        feedback.deferred.push(candidate.evidence.locator);
-                        continue;
+                    let identity = match resolution {
+                        IdentityResolution::Resolved(identity) => identity,
+                        IdentityResolution::Deferred => {
+                            feedback.deferred.push(candidate.evidence.locator);
+                            continue;
+                        }
+                        IdentityResolution::Blocked(blocked) => {
+                            self.contain_profile_incompatibility(
+                                candidate.evidence.locator,
+                                blocked,
+                                &mut feedback,
+                            )?;
+                            continue;
+                        }
                     };
                     let locator = candidate.evidence.locator;
                     let advisory_path = identity.advisory_path.clone();
@@ -1563,6 +1585,14 @@ impl WorkerRuntime {
                             return Err(WorkerError::Inconsistent {
                                 reason: "an Updated identity was deferred as a new registration",
                             });
+                        }
+                        IdentityResolution::Blocked(blocked) => {
+                            self.contain_profile_incompatibility(
+                                candidate.evidence.locator,
+                                blocked,
+                                &mut feedback,
+                            )?;
+                            continue;
                         }
                     };
                     let locator = candidate.evidence.locator;
@@ -3150,19 +3180,39 @@ impl WorkerRuntime {
         }
     }
 
-    fn identity_plan_error(&mut self, error: IdentityError) -> WorkerError {
-        if matches!(error, IdentityError::IncompatibleProfile { .. }) {
-            self.telemetry
-                .add(WorkerCounter::FramingProfileIncompatible, 1);
-            if let Some(suppressed) = self.health_event(HealthEventCategory::Compatibility) {
-                otel_warn!(
-                    "filelog_receiver.framing_profile_incompatible",
-                    reason = "checkpoint_profile_mismatch",
-                    suppressed_events = suppressed
-                );
+    fn contain_profile_incompatibility(
+        &mut self,
+        locator: Locator,
+        blocked: BlockedIdentity,
+        feedback: &mut DiscoveryFeedback,
+    ) -> Result<(), WorkerError> {
+        match self.readers_ref()?.file_id_for_locator(locator) {
+            Ok(_) => {
+                return Err(WorkerError::Inconsistent {
+                    reason: "profile-incompatible locator already has an active reader",
+                });
             }
+            Err(ReaderError::UnknownLocator { .. }) => {}
+            Err(error) => return Err(WorkerError::Reader(error)),
         }
-        WorkerError::Identity(error)
+        self.remember_inactive_locator(locator, blocked.file_id)?;
+        feedback.durable.push(DurableAck {
+            locator,
+            advisory_path: blocked.advisory_path,
+        });
+        Ok(())
+    }
+
+    fn observe_profile_incompatibility(&mut self) {
+        self.telemetry
+            .add(WorkerCounter::FramingProfileIncompatible, 1);
+        if let Some(suppressed) = self.health_event(HealthEventCategory::Compatibility) {
+            otel_warn!(
+                "filelog_receiver.framing_profile_incompatible",
+                reason = "checkpoint_profile_mismatch",
+                suppressed_events = suppressed
+            );
+        }
     }
 
     fn observe_framer_counters(&mut self, framer: &mut Framer) {

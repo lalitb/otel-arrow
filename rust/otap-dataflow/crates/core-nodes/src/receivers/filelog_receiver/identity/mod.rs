@@ -127,6 +127,13 @@ pub(crate) enum IdentityError {
         locator: Locator,
     },
     /// A matching checkpoint uses an incompatible resumption profile.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the non-admission test resolver preserves its historical structured error"
+        )
+    )]
     #[error(
         "checkpoint file {file_id:?} uses framing profile version {stored_version} and digest \
          {stored_digest:02x?}, but the receiver requires version {configured_version} and digest \
