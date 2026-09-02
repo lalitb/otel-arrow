@@ -242,11 +242,18 @@ Treat the namespace as one storage-engine unit:
 - Changing `checkpoint.id` starts a separate namespace and applies `start_at`;
   it is not an in-place migration.
 
+The standalone `otel-arrow-dfe-filelog-checkpoint` crate owns version-1
+checkpoint values and byte encoding. Core-nodes owns stateful replay,
+filesystem storage, publication, administration, and receiver integration.
+
 Corruption or an unknown format version fails the namespace closed. An
 incompatible framing profile blocks only the affected durable file without
-changing its progress; unrelated compatible files continue. A torn final WAL
-tail is ignored only when it cannot form the complete transaction length
-declared by its header.
+changing its progress; unrelated compatible files continue. The codec reports
+a nonempty short suffix as `Incomplete`; it does not know whether the supplied
+slice reaches physical EOF. The store accepts that suffix as a torn final WAL
+tail only after its bounded regular-file read reaches EOF under exclusive
+namespace ownership. A short read is read again, and a complete corrupt frame
+always fails closed without truncation.
 
 Quarantine is durable and is not removed by ordinary retention. Restarting or
 changing `rotation.on_truncate` does not clear an existing quarantine.

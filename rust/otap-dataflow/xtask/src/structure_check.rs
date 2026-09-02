@@ -13,8 +13,8 @@ use toml::{Table, Value};
 /// This procedure checks that the following rules are properly followed for
 /// each crate in the cargo workspace.
 /// - Each crate must have a README.md file.
-/// - Each crate package name must start with "otap-df-" to avoid conflicts with other
-///   crates.
+/// - Each crate package name must start with "otap-df-" unless it is an
+///   explicitly approved standalone compatibility crate.
 /// - Each Cargo.toml must contain \[lints\] workspace = true and few other fields
 ///   in the \[package\] section.
 #[cfg(not(tarpaulin_include))]
@@ -160,9 +160,10 @@ fn check_package<P: AsRef<Path>>(cargo_toml_path: P, toml: &Table) -> anyhow::Re
             )
         })?;
 
-    if !package_name.starts_with("otap-df-") {
+    if !package_name_is_allowed(cargo_toml_path.as_ref(), package_name) {
         return Err(anyhow::anyhow!(
-            "\u{274C} `package.name` must start with `otap-df-` in {}",
+            "\u{274C} `package.name` must start with `otap-df-` or be the approved standalone \
+             filelog checkpoint crate in {}",
             cargo_toml_path.as_ref().display()
         ));
     }
@@ -184,6 +185,43 @@ fn check_package<P: AsRef<Path>>(cargo_toml_path: P, toml: &Table) -> anyhow::Re
     )?;
 
     Ok(())
+}
+
+#[cfg(not(tarpaulin_include))]
+fn package_name_is_allowed(cargo_toml_path: &Path, package_name: &str) -> bool {
+    package_name.starts_with("otap-df-")
+        || (package_name == "otel-arrow-dfe-filelog-checkpoint"
+            && cargo_toml_path == Path::new("crates/filelog-checkpoint/Cargo.toml"))
+}
+
+#[cfg(all(test, not(tarpaulin_include)))]
+mod tests {
+    use super::package_name_is_allowed;
+    use std::path::Path;
+
+    /// Scenario: package-name validation sees a standard workspace crate, the
+    /// exact standalone checkpoint crate, and near-matching exceptions.
+    /// Guarantees: only the normal prefix and the one path-bound standalone
+    /// package name are accepted.
+    #[test]
+    fn package_name_exception_is_exact_and_path_bound() {
+        assert!(package_name_is_allowed(
+            Path::new("crates/core-nodes/Cargo.toml"),
+            "otap-df-core-nodes"
+        ));
+        assert!(package_name_is_allowed(
+            Path::new("crates/filelog-checkpoint/Cargo.toml"),
+            "otel-arrow-dfe-filelog-checkpoint"
+        ));
+        assert!(!package_name_is_allowed(
+            Path::new("crates/other/Cargo.toml"),
+            "otel-arrow-dfe-filelog-checkpoint"
+        ));
+        assert!(!package_name_is_allowed(
+            Path::new("crates/filelog-checkpoint/Cargo.toml"),
+            "otel-arrow-dfe-filelog-checkpoint-extra"
+        ));
+    }
 }
 
 /// Checks the `lints` section of a Cargo.toml file.

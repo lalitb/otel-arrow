@@ -21,17 +21,17 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use super::super::error::DecodeError;
+use super::super::DecodeError;
 use super::super::primitives::{
-    ADVISORY_PATH_STORED_MAX_BYTES, AdvisoryPath, ByteReader, CommittedFrontierGuard,
-    FINGERPRINT_MAX_BYTES, FileId, FramingResume, LifecycleState, Locator, NAMESPACE_ID_MAX_BYTES,
-    REASON_CODE_RESERVED, TRUNCATE_RESET_REASON_READ_NEW, WAL_MAX_NON_PROGRESS_OPS_PER_TX,
-    WAL_MAX_OPS_PER_TX, crc32c,
+    ADVISORY_PATH_STORED_MAX_BYTES, AdvisoryPath, CommittedFrontierGuard, FINGERPRINT_MAX_BYTES,
+    FileId, FramingResume, LifecycleState, Locator, NAMESPACE_ID_MAX_BYTES, REASON_CODE_RESERVED,
+    TRUNCATE_RESET_REASON_READ_NEW, WAL_MAX_NON_PROGRESS_OPS_PER_TX, WAL_MAX_OPS_PER_TX, crc32c,
 };
 use super::super::snapshot::{SNAPSHOT_HEADER_LEN, SnapshotRecord, encode_snapshot};
 use super::super::wal::{
     Operation, QuarantineFile, RegisterFile, RemoveFile, ResetAfterTruncate, ResetQuarantineAction,
-    ResetQuarantinedFile, Transaction, UpdateProgress, WAL_HEADER_LEN, encode_wal,
+    ResetQuarantinedFile, Transaction, TransactionScan, UpdateProgress, WAL_HEADER_LEN,
+    encode_transaction, encode_wal_header, scan_next_transaction,
 };
 use super::error::StoreError;
 use super::fault::{FaultPlan, FaultPoint};
@@ -304,7 +304,7 @@ fn markerless_recognized_initial_artifacts_are_replaced_without_decoding() {
 }
 
 fn file_id(seed: u8) -> FileId {
-    FileId([seed; 16])
+    FileId::from_bytes([seed; 16])
 }
 
 /// Scenario: a runtime-vetted set names one finalized record together with a
@@ -1049,7 +1049,7 @@ fn windows_reparse_point_namespace_is_rejected() {
     assert!(matches!(error, StoreError::UnsafeFilesystemObject { .. }));
     assert_eq!(
         fs::read(&wal_target).expect("the target WAL remains readable"),
-        encode_wal(0, NAMESPACE_ID, &[]).expect("the empty WAL encodes")
+        encode_wal_header(0, NAMESPACE_ID).expect("the empty WAL encodes")
     );
 }
 
@@ -1172,26 +1172,16 @@ fn patch_first_snapshot_quarantine_reason(snapshot: &mut [u8], value: u16) {
             .expect("record length is present"),
     ) as usize;
     let payload_start = record_start + 4;
-    let reason_offset = {
-        let mut input = ByteReader::new(&snapshot[payload_start..payload_start + record_len]);
-        let _file_id = input.read_exact(16).expect("file id");
-        let _file_epoch = input.read_u32().expect("file epoch");
-        let _committed_offset = input.read_u64().expect("committed offset");
-        let _committed_frontier_guard =
-            CommittedFrontierGuard::read(&mut input).expect("committed frontier guard");
-        let fingerprint_len = input.read_u16().expect("fingerprint length") as usize;
-        let _fingerprint = input
-            .read_exact(fingerprint_len)
-            .expect("fingerprint bytes");
-        let _ignored_header_bytes = input.read_u32().expect("ignored header bytes");
-        let _locator = Locator::read(&mut input).expect("locator");
-        let _framing_profile_version = input.read_u16().expect("framing profile version");
-        let _framing_profile_digest = input.read_exact(32).expect("framing profile digest");
-        let _framing_resume = FramingResume::read(&mut input).expect("framing resume");
-        assert_eq!(input.read_u8().expect("lifecycle state"), 0x03);
-        input.position()
-    };
-    let reason_start = payload_start + reason_offset;
+    // This test fixture is the fixed-width Posix/Clean quarantined record
+    // produced from `registration(1)`: the reason follows 129 payload bytes.
+    const REASON_OFFSET: usize = 16 + 4 + 8 + 34 + 2 + 8 + 4 + 17 + 2 + 32 + 1 + 1;
+    assert!(record_len >= REASON_OFFSET + 2);
+    let reason_start = payload_start + REASON_OFFSET;
+    assert_eq!(snapshot[reason_start - 1], 0x03);
+    assert_eq!(
+        u16::from_be_bytes(snapshot[reason_start..reason_start + 2].try_into().unwrap()),
+        0x0001
+    );
     snapshot[reason_start..reason_start + 2].copy_from_slice(&value.to_be_bytes());
 
     let record_crc_start = payload_start + record_len;
@@ -1217,7 +1207,7 @@ fn grow_file(path: &PathBuf, len: u64) {
 fn wide_file_id(index: u64) -> FileId {
     let mut bytes = [0xEE; 16];
     bytes[0..8].copy_from_slice(&index.to_be_bytes());
-    FileId(bytes)
+    FileId::from_bytes(bytes)
 }
 
 /// A registration whose advisory path is as long as the format allows, so
@@ -1547,7 +1537,7 @@ fn open_fails_closed_when_the_wal_declares_another_generation() {
     let path = dir.path().join("namespace");
     let _seeded = seeded_namespace(&path);
 
-    let foreign = encode_wal(4, NAMESPACE_ID, &[]).expect("encodes");
+    let foreign = encode_wal_header(4, NAMESPACE_ID).expect("encodes");
     write_bytes(&path.join(wal_file_name(0)), &foreign);
 
     let error = CheckpointStore::open(options(&path)).expect_err("mismatch fails closed");
@@ -1564,6 +1554,59 @@ fn open_fails_closed_when_the_wal_declares_another_generation() {
         }
         other => panic!("expected a generation mismatch, got {other:?}"),
     }
+}
+
+/// Scenario: foreign-namespace snapshot and WAL headers are each followed by
+/// bytes that would fail later record or transaction validation.
+/// Guarantees: the store rejects the namespace digest before allocating
+/// snapshot state or scanning any WAL transaction.
+#[test]
+fn namespace_digest_is_checked_before_snapshot_or_wal_replay() {
+    let snapshot_dir = tempfile::tempdir().expect("temp dir");
+    let snapshot_path = snapshot_dir.path().join("snapshot-namespace");
+    drop(open(&snapshot_path));
+    let mut foreign_snapshot =
+        encode_snapshot(0, "foreign-namespace", &[]).expect("foreign snapshot encodes");
+    foreign_snapshot[52..56].copy_from_slice(&1u32.to_be_bytes());
+    let header_crc = crc32c(&foreign_snapshot[..56]);
+    foreign_snapshot[56..60].copy_from_slice(&header_crc.to_be_bytes());
+    write_bytes(
+        &snapshot_path.join(snapshot_file_name(0)),
+        &foreign_snapshot,
+    );
+
+    assert!(matches!(
+        CheckpointStore::open(StoreOptions {
+            max_tracked_files: 8,
+            ..options(&snapshot_path)
+        })
+        .expect_err("the foreign snapshot namespace fails first"),
+        StoreError::NamespaceMismatch {
+            artifact: "snapshot",
+            ..
+        }
+    ));
+
+    let wal_dir = tempfile::tempdir().expect("temp dir");
+    let wal_path = wal_dir.path().join("wal-namespace");
+    drop(open(&wal_path));
+    let mut foreign_wal =
+        encode_wal_header(0, "foreign-namespace").expect("foreign WAL header encodes");
+    foreign_wal.extend_from_slice(&[0x00, 0x01, 0x02]);
+    write_bytes(&wal_path.join(wal_file_name(0)), &foreign_wal);
+
+    assert!(matches!(
+        CheckpointStore::open(options(&wal_path))
+            .expect_err("the foreign WAL namespace fails before its suffix is scanned"),
+        StoreError::NamespaceMismatch {
+            artifact: "WAL",
+            ..
+        }
+    ));
+    assert_eq!(
+        fs::read(wal_path.join(wal_file_name(0))).expect("foreign WAL evidence remains readable"),
+        foreign_wal
+    );
 }
 
 /// Scenario: `CURRENT` selects a generation whose WAL file has been removed.
@@ -1613,7 +1656,7 @@ fn registrations_batch_into_bounded_synced_transactions() {
             let mut register = registration(1);
             let mut bytes = [0u8; 16];
             bytes[0..8].copy_from_slice(&(index as u64).to_be_bytes());
-            register.file_id = FileId(bytes);
+            register.file_id = FileId::from_bytes(bytes);
             register.locator = Locator::PosixDevIno {
                 dev: 7,
                 ino: index as u64 + 1,
@@ -2161,12 +2204,11 @@ fn administrative_operations_require_an_audit_reason() {
     assert_eq!(store.stats().next_sequence, sequence_before);
 }
 
-/// Scenario: a WAL whose final transaction was cut short by a crash, here
-/// simulated by appending a fragment too short to declare a frame.
-/// Guarantees: exactly the structurally incomplete trailing bytes are
-/// discarded, every complete transaction before them still replays, the WAL
-/// file is truncated back to its last complete transaction, and the next
-/// append continues the sequence from there.
+/// Scenario: a regular WAL read reaches physical EOF with a final fragment
+/// too short to declare a transaction frame.
+/// Guarantees: only after that EOF proof does the store classify the codec's
+/// `Incomplete` suffix as torn, truncate exactly those bytes, replay every
+/// complete transaction, and continue with the next sequence.
 #[test]
 fn torn_final_wal_transaction_is_discarded_and_truncated() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -2459,7 +2501,7 @@ fn wal_append_reconciliation_rejects_regular_file_replacement() {
     .expect("existing namespace opens without appending");
     assert!(store.register_files(vec![registration(1)]).is_err());
     fs::rename(&wal_path, &displaced).expect("the original WAL is displaced");
-    let replacement = encode_wal(0, NAMESPACE_ID, &[]).expect("replacement WAL encodes");
+    let replacement = encode_wal_header(0, NAMESPACE_ID).expect("replacement WAL encodes");
     write_bytes(&wal_path, &replacement);
 
     assert!(matches!(
@@ -2645,11 +2687,10 @@ fn torn_tail_repair_faults_are_resumable() {
     }
 }
 
-/// Scenario: a structurally complete WAL transaction whose bytes were
-/// altered after they were written.
-/// Guarantees: a complete frame with an invalid checksum is corruption, not
-/// a torn tail, so recovery fails closed rather than silently dropping
-/// acknowledged progress.
+/// Scenario: the final byte of a structurally complete WAL transaction's
+/// frame CRC is altered after the transaction was written.
+/// Guarantees: complete final-frame corruption fails closed, is never
+/// classified as `Incomplete`, and remains byte-for-byte intact for evidence.
 #[test]
 fn corrupted_wal_transaction_fails_recovery_closed() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -2658,9 +2699,7 @@ fn corrupted_wal_transaction_fails_recovery_closed() {
 
     let wal_path = path.join(wal_file_name(0));
     let mut bytes = fs::read(&wal_path).expect("wal reads");
-    // Flip a byte inside the first transaction's body, past the 24-byte
-    // header and its 4-byte length prefix.
-    bytes[30] ^= 0xFF;
+    *bytes.last_mut().expect("the WAL has a final frame CRC") ^= 0xFF;
     write_bytes(&wal_path, &bytes);
 
     let error = CheckpointStore::open(options(&path)).expect_err("corruption fails closed");
@@ -2668,6 +2707,10 @@ fn corrupted_wal_transaction_fails_recovery_closed() {
         StoreError::Decode { artifact, .. } => assert_eq!(artifact, "WAL"),
         other => panic!("expected a WAL decode failure, got {other:?}"),
     }
+    assert_eq!(
+        fs::read(&wal_path).expect("corrupt WAL evidence remains readable"),
+        bytes
+    );
 }
 
 /// Scenario: a snapshot file whose bytes were altered after it was written.
@@ -3741,7 +3784,7 @@ fn invalid_transactions_are_refused_before_they_are_written() {
             let mut bytes = [0u8; 16];
             bytes[0..8].copy_from_slice(&(index as u64).to_be_bytes());
             let mut register = registration(1);
-            register.file_id = FileId(bytes);
+            register.file_id = FileId::from_bytes(bytes);
             Operation::RegisterFile(register)
         })
         .collect();
@@ -3870,11 +3913,10 @@ fn byte_compaction_threshold_ignores_an_empty_wal_header() {
     assert!(!store.compaction_due());
     assert!(!store.compact_if_due().expect("empty WAL is not due"));
 
-    let transaction_bytes = Transaction {
+    let transaction_bytes = encode_transaction(&Transaction {
         sequence: 1,
         operations: vec![Operation::RegisterFile(registration(1))],
-    }
-    .encode()
+    })
     .unwrap()
     .len() as u64;
     store.wal_bytes = compact_after_bytes - transaction_bytes;
@@ -4007,11 +4049,10 @@ fn crossing_the_compaction_threshold_keeps_the_wal_within_its_recovery_cap() {
         .register_files(vec![registration(1)])
         .expect("registers");
     let update = progress(1, 0, 64);
-    let transaction_bytes = Transaction {
+    let transaction_bytes = encode_transaction(&Transaction {
         sequence: store.stats().next_sequence,
         operations: vec![Operation::UpdateProgress(update.clone())],
-    }
-    .encode()
+    })
     .unwrap()
     .len() as u64;
     store.wal_bytes = compact_after_bytes - transaction_bytes + 1;
@@ -4051,11 +4092,10 @@ fn invalid_append_is_rejected_before_required_compaction() {
     .unwrap();
     let _registered = store.register_files(vec![registration(1)]).unwrap();
     let stale = progress(1, 99, 100);
-    let transaction_bytes = Transaction {
+    let transaction_bytes = encode_transaction(&Transaction {
         sequence: store.stats().next_sequence,
         operations: vec![Operation::UpdateProgress(stale.clone())],
-    }
-    .encode()
+    })
     .unwrap()
     .len() as u64;
     store.wal_bytes = compact_after_bytes - transaction_bytes + 1;
@@ -4148,32 +4188,32 @@ fn artifacts_larger_than_the_derived_caps_are_refused_before_buffering() {
     }
 }
 
-/// Scenario: a WAL tail declares one transaction frame larger than the
-/// configured per-transaction bound while the WAL file itself remains far
-/// below its whole-artifact cap.
-/// Guarantees: recovery rejects the declared frame size before decoding or
-/// allocating its operations, preserving the peak-memory formula's
-/// one-bounded-transaction assumption.
+/// Scenario: an authenticated WAL transaction header declares a body larger
+/// than the codec and store per-transaction bound.
+/// Guarantees: recovery rejects the declared body before slicing or decoding
+/// operations, preserving the one-bounded-transaction memory assumption.
 #[test]
-fn oversized_wal_transaction_is_rejected_before_decode() {
+fn oversized_wal_transaction_is_rejected_after_header_validation() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("namespace");
     drop(open(&path));
     let limits = options(&path)
         .limits()
         .expect("the default bounds are representable");
-    // `transaction_bytes = body_len + 36-byte header + 4-byte frame CRC`;
-    // choose `body_len` so the computed total is exactly one byte over the
-    // configured bound.
+    // `transaction_bytes = body_len + 36-byte header + 4-byte frame CRC`.
     let declared_body = u32::try_from(limits.max_transaction_bytes - 39)
         .expect("the default transaction bound fits u32");
-    let mut bytes = encode_wal(0, NAMESPACE_ID, &[]).expect("the WAL header encodes");
-    // A complete 36-byte transaction envelope header with `body_len` (at
-    // its fixed offset 20) set to the oversized value; the bound is
-    // enforced before the (here, absent) body is ever read, so no other
-    // header field needs to be valid.
-    let mut header = vec![0u8; 36];
+    let mut bytes = encode_wal_header(0, NAMESPACE_ID).expect("the WAL header encodes");
+    let valid = encode_transaction(&Transaction {
+        sequence: 1,
+        operations: vec![Operation::RegisterFile(registration(1))],
+    })
+    .expect("the seed transaction encodes");
+    let mut header = valid[..36].to_vec();
     header[20..24].copy_from_slice(&declared_body.to_be_bytes());
+    header[24..28].copy_from_slice(&(!declared_body).to_be_bytes());
+    let header_crc = crc32c(&header[..32]);
+    header[32..36].copy_from_slice(&header_crc.to_be_bytes());
     bytes.extend_from_slice(&header);
     write_bytes(&path.join(wal_file_name(0)), &bytes);
 
@@ -4181,12 +4221,77 @@ fn oversized_wal_transaction_is_rejected_before_decode() {
         CheckpointStore::open(options(&path)).expect_err("the oversized transaction is refused");
     assert!(matches!(
         error,
-        StoreError::FileTooLarge {
-            artifact: "WAL transaction",
-            len,
-            max,
+        StoreError::Decode {
+            artifact: "WAL",
+            source: DecodeError::TransactionBodyOutOfBounds {
+                sequence: 1,
+                len,
+                max,
+                ..
+            },
             ..
-        } if len == limits.max_transaction_bytes + 1 && max == limits.max_transaction_bytes
+        } if len == u64::from(declared_body) && max + 40 == limits.max_transaction_bytes
+    ));
+}
+
+/// Scenario: an underlying reader returns a valid transaction in repeated
+/// short reads, and its first chunk alone is structurally `Incomplete`.
+/// Guarantees: the bounded store reader continues until physical EOF and
+/// exposes only the complete bytes, so a short read cannot authorize WAL
+/// truncation or discard.
+#[test]
+fn short_reads_are_drained_to_eof_before_wal_classification() {
+    struct ShortReader<'a> {
+        remaining: &'a [u8],
+        max_read: usize,
+        reads: usize,
+    }
+
+    impl std::io::Read for ShortReader<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.remaining.is_empty() {
+                return Ok(0);
+            }
+            let len = self.remaining.len().min(buffer.len()).min(self.max_read);
+            buffer[..len].copy_from_slice(&self.remaining[..len]);
+            self.remaining = &self.remaining[len..];
+            self.reads += 1;
+            Ok(len)
+        }
+    }
+
+    let transaction = Transaction {
+        sequence: 1,
+        operations: vec![Operation::RegisterFile(registration(1))],
+    };
+    let encoded = encode_transaction(&transaction).expect("the transaction encodes");
+    assert!(matches!(
+        scan_next_transaction(&encoded[..10], 1).expect("the short prefix scans"),
+        Some(TransactionScan::Incomplete { bytes: 10 })
+    ));
+
+    let mut reader = ShortReader {
+        remaining: &encoded,
+        max_read: 7,
+        reads: 0,
+    };
+    let path = Path::new("short-read-wal");
+    let complete = super::fsio::read_bounded_reader(
+        &mut reader,
+        encoded.len(),
+        path,
+        "WAL transaction",
+        u64::try_from(encoded.len()).expect("transaction length fits u64"),
+    )
+    .expect("short reads are accumulated through EOF");
+    assert!(reader.reads > 1);
+    assert_eq!(complete, encoded);
+    assert!(matches!(
+        scan_next_transaction(&complete, 1).expect("the complete transaction scans"),
+        Some(TransactionScan::Complete {
+            transaction: decoded,
+            consumed,
+        }) if decoded == transaction && consumed == complete.len()
     ));
 }
 
@@ -4332,6 +4437,41 @@ fn compaction_refuses_to_publish_an_oversized_snapshot() {
     .expect("the untouched generation still reopens");
     assert_eq!(reopened.generation(), 0);
     assert_eq!(reopened.table().len(), 2);
+}
+
+/// Scenario: an authenticated empty snapshot header declares one record even
+/// though its bytes contain no record frame, while the configured population
+/// limit permits that count.
+/// Guarantees: store recovery propagates the codec's physical-count guard
+/// before allocating or decoding any snapshot record.
+#[test]
+fn physically_impossible_snapshot_count_fails_before_state_allocation() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("namespace");
+    drop(open(&path));
+
+    let mut snapshot = encode_snapshot(0, NAMESPACE_ID, &[]).expect("empty snapshot encodes");
+    snapshot[52..56].copy_from_slice(&1u32.to_be_bytes());
+    let header_crc = crc32c(&snapshot[..56]);
+    snapshot[56..60].copy_from_slice(&header_crc.to_be_bytes());
+    write_bytes(&path.join(snapshot_file_name(0)), &snapshot);
+
+    assert!(matches!(
+        CheckpointStore::open(StoreOptions {
+            max_tracked_files: 8,
+            ..options(&path)
+        })
+        .expect_err("the impossible authenticated count fails closed"),
+        StoreError::Decode {
+            artifact: "snapshot",
+            source: DecodeError::SnapshotRecordCountExceedsPhysicalMaximum {
+                declared: 1,
+                max: 0,
+                ..
+            },
+            ..
+        }
+    ));
 }
 
 /// Scenario: a selected snapshot whose header declares two records is
@@ -4859,11 +4999,10 @@ fn recovered_wal_rejects_every_reserved_reason_code() {
             .expect("registers");
         drop(store);
 
-        let mut transaction = Transaction {
+        let mut transaction = encode_transaction(&Transaction {
             sequence: 2,
             operations: vec![operation],
-        }
-        .encode()
+        })
         .expect("the structurally valid transaction encodes");
         patch_first_transaction_operation_u16(&mut transaction, reason_offset, reserved_reason);
         let wal_path = path.join(wal_file_name(0));
@@ -4946,11 +5085,10 @@ fn recovered_snapshot_rejects_reserved_reason_before_wal_can_erase_it() {
             .expect("the valid snapshot encodes");
         patch_first_snapshot_quarantine_reason(&mut snapshot, reserved_reason);
         write_bytes(&path.join(snapshot_file_name(1)), &snapshot);
-        let transaction = Transaction {
+        let transaction = encode_transaction(&Transaction {
             sequence: 1,
             operations: vec![operation],
-        }
-        .encode()
+        })
         .expect("the erasing transaction encodes");
         let wal_path = path.join(wal_file_name(1));
         let mut wal = fs::OpenOptions::new()

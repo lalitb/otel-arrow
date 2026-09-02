@@ -3292,6 +3292,38 @@ mod tests {
         assert_ne!(replace, fail);
     }
 
+    /// Scenario: the default receiver configuration and the standalone
+    /// checkpoint crate independently construct the same framing-profile
+    /// parameters.
+    /// Guarantees: the digest persisted by receiver configuration is exactly
+    /// the standalone codec digest, with no divergent canonical encoder.
+    #[test]
+    fn runtime_framing_profile_digest_matches_standalone_codec() {
+        use otel_arrow_dfe_filelog_checkpoint::{FramingProfileParams, MultilineMode};
+
+        let config = minimal_config();
+        let expected = FramingProfileParams {
+            fingerprint_profile_version: FINGERPRINT_PROFILE_VERSION,
+            fingerprint_bytes: u16::try_from(config.identity.fingerprint_bytes).unwrap(),
+            ignored_header_bytes: u32::try_from(config.identity.ignored_header_bytes).unwrap(),
+            encoding: encoding_to_framing_profile(config.encoding),
+            on_decode_error: config.on_decode_error.to_framing_profile(),
+            multiline_mode: MultilineMode::Newline,
+            max_line_bytes: config.framing.max_line_bytes,
+            max_record_bytes: config.framing.max_record_bytes,
+            max_log_size_behavior: config.framing.max_log_size_behavior.to_framing_profile(),
+            max_multiline_lines: config.framing.max_multiline_lines,
+            force_flush_period_millis: u64::try_from(config.framing.force_flush_period.as_millis())
+                .unwrap(),
+        }
+        .digest()
+        .expect("the standalone framing profile encodes");
+        let runtime =
+            RuntimeConfig::from_config(config, "node-1").expect("the receiver config validates");
+
+        assert_eq!(runtime.framing_profile_digest, expected);
+    }
+
     /// Scenario: `framing.max_line_bytes`, `framing.max_record_bytes`, and
     /// `framing.max_multiline_lines` are each set to zero in turn.
     /// Guarantees: every framing bound is a "nonzero bound"; zero is

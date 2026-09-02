@@ -7559,6 +7559,7 @@ dependencies = [
  "otap-df-telemetry-macros",
  "otap-df-test-net",
  "otap-df-test-tls-certs",
+ "otel-arrow-dfe-filelog-checkpoint",
  "parking_lot",
  "parquet",
  "pretty_assertions",
@@ -8033,6 +8034,16 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "wasmtime",
+]
+
+[[package]]
+name = "otel-arrow-dfe-filelog-checkpoint"
+version = "0.51.0"
+dependencies = [
+ "crc",
+ "hex",
+ "sha2 0.11.0",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

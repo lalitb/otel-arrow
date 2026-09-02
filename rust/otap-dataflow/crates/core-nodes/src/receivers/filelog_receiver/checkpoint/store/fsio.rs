@@ -27,7 +27,7 @@
 //!   CI must verify that deployment-level ACL is private.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read as _, Write as _};
+use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
 
 use super::super::namespace::{CHECKPOINT_NAMESPACE_VERSION, FILELOG_NAMESPACE_DIRECTORY};
@@ -1723,6 +1723,29 @@ pub(super) fn read_bounded_contents_cancellable(
     max: u64,
     cancelled: &mut impl FnMut() -> bool,
 ) -> Result<Option<Vec<u8>>, StoreError> {
+    read_bounded_reader_cancellable(&mut file, capacity, path, artifact, max, cancelled)
+}
+
+#[cfg(test)]
+pub(super) fn read_bounded_reader(
+    reader: &mut impl Read,
+    capacity: usize,
+    path: &Path,
+    artifact: &'static str,
+    max: u64,
+) -> Result<Vec<u8>, StoreError> {
+    read_bounded_reader_cancellable(reader, capacity, path, artifact, max, &mut || false)
+        .map(|buffer| buffer.expect("non-cancellable checkpoint read cannot be cancelled"))
+}
+
+fn read_bounded_reader_cancellable(
+    reader: &mut impl Read,
+    capacity: usize,
+    path: &Path,
+    artifact: &'static str,
+    max: u64,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<Vec<u8>>, StoreError> {
     if cancelled() {
         return Ok(None);
     }
@@ -1750,7 +1773,7 @@ pub(super) fn read_bounded_contents_cancellable(
         }
         let remaining = max_capacity.saturating_sub(buffer.len());
         let read_capacity = remaining.saturating_add(1).min(chunk.len());
-        let read = file.read(&mut chunk[..read_capacity]);
+        let read = reader.read(&mut chunk[..read_capacity]);
         if cancelled() {
             return Ok(None);
         }

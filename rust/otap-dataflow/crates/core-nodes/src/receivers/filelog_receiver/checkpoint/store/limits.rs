@@ -218,7 +218,7 @@ const RESET_AFTER_TRUNCATE_BYTES: u64 = OPERATION_HEADER_BYTES
     + 8
     + 4
     + 8
-    + FRAMING_RESUME_MAX_BYTES
+    + FRAMING_RESUME_CLEAN_BYTES
     + VAR_LEN_PREFIX_BYTES
     + 8
     + 2;
@@ -674,7 +674,7 @@ pub fn wal_transactions(
 ) -> Result<u64, LimitsError> {
     validate_compaction_thresholds(compact_after_bytes, compact_after_transactions)?;
     let body_bytes = compact_after_bytes - WAL_HEADER_LEN as u64;
-    Ok(u64::from(compact_after_transactions).min(body_bytes / u64::from(TX_MIN_FRAME_BYTES)))
+    Ok(u64::from(compact_after_transactions).min(body_bytes / TX_MIN_FRAME_BYTES))
 }
 
 /// Minimum valid complete-WAL byte threshold.
@@ -749,7 +749,7 @@ mod tests {
     use crate::receivers::filelog_receiver::checkpoint::wal::{
         Operation, QuarantineFile, RegisterFile, RemoveFile, ResetAfterTruncate,
         ResetQuarantineAction, ResetQuarantinedFile, Transaction, UpdateFingerprint,
-        UpdateMetadata, UpdateProgress, encode_wal,
+        UpdateMetadata, UpdateProgress, encode_operation, encode_transaction, encode_wal_header,
     };
 
     /// The test namespace all fixtures in this module encode under.
@@ -780,7 +780,7 @@ mod tests {
 
     fn widest_snapshot_record(fingerprint_bytes: u64) -> SnapshotRecord {
         SnapshotRecord {
-            file_id: FileId([1; 16]),
+            file_id: FileId::from_bytes([1; 16]),
             file_epoch: u32::MAX,
             committed_offset: u64::MAX,
             committed_frontier_guard: widest_guard(),
@@ -806,8 +806,15 @@ mod tests {
         }
     }
 
+    fn encoded_snapshot_record_len(record: &SnapshotRecord) -> u64 {
+        let snapshot = encode_snapshot(0, TEST_NAMESPACE_ID, std::slice::from_ref(record))
+            .expect("the snapshot record encodes");
+        u64::try_from(snapshot.len() - SNAPSHOT_HEADER_LEN - SNAPSHOT_FOOTER_LEN)
+            .expect("snapshot record length fits u64")
+    }
+
     fn widest_operations(fingerprint_bytes: u64) -> Vec<Operation> {
-        let file_id = FileId([2; 16]);
+        let file_id = FileId::from_bytes([2; 16]);
         let fingerprint = vec![0x5A; fingerprint_bytes as usize];
         let expected_fingerprint = fingerprint[..fingerprint.len().saturating_sub(1)].to_vec();
         vec![
@@ -837,7 +844,7 @@ mod tests {
                 new_committed_frontier_guard: widest_guard(),
                 new_framing_resume: WIDEST_RESUME,
                 new_last_seen_time_unix_nano: u64::MAX,
-                finalize: true,
+                finalize: false,
             }),
             Operation::ResetAfterTruncate(ResetAfterTruncate {
                 file_id,
@@ -845,7 +852,7 @@ mod tests {
                 observed_truncated_size: u64::MAX,
                 resulting_epoch: 2,
                 new_committed_offset: 0,
-                new_framing_resume: WIDEST_RESUME,
+                new_framing_resume: FramingResume::Clean,
                 new_fingerprint: fingerprint.clone(),
                 reset_time_unix_nano: u64::MAX,
                 reason_code: 0x0001,
@@ -878,8 +885,8 @@ mod tests {
             Operation::ResetQuarantinedFile(ResetQuarantinedFile {
                 file_id,
                 expected_quarantine_epoch: 1,
-                action: ResetQuarantineAction::ResetToBeginning,
-                resulting_epoch: 2,
+                action: ResetQuarantineAction::KeepFailed,
+                resulting_epoch: 1,
                 resulting_offset: u64::MAX,
                 new_committed_frontier_guard: widest_guard(),
                 new_framing_resume: WIDEST_RESUME,
@@ -912,10 +919,9 @@ mod tests {
     fn snapshot_record_formula_matches_the_codec() {
         for fingerprint_bytes in [0u64, 16, 1_000, FINGERPRINT_MAX_BYTES as u64] {
             let record = widest_snapshot_record(fingerprint_bytes);
-            let encoded = record.encode().expect("the widest record encodes");
             assert_eq!(
                 snapshot_record_bytes(fingerprint_bytes).expect("the bound is representable"),
-                encoded.len() as u64,
+                encoded_snapshot_record_len(&record),
                 "record bound disagrees with the codec at {fingerprint_bytes} fingerprint bytes"
             );
         }
@@ -932,7 +938,7 @@ mod tests {
         let records: Vec<SnapshotRecord> = (0..4u8)
             .map(|index| {
                 let mut record = widest_snapshot_record(fingerprint_bytes);
-                record.file_id = FileId([index; 16]);
+                record.file_id = FileId::from_bytes([index; 16]);
                 record.locator = Locator::WindowsVolumeFileId {
                     volume_serial: u64::from(index),
                     file_id: [0xAB; 16],
@@ -962,7 +968,11 @@ mod tests {
             let widest_encoded = widest_operations(fingerprint_bytes)
                 .iter()
                 .filter(|operation| !matches!(operation, Operation::UpdateProgress(_)))
-                .map(|operation| operation.encode().expect("the operation encodes").len() as u64)
+                .map(|operation| {
+                    encode_operation(operation)
+                        .expect("the operation encodes")
+                        .len() as u64
+                })
                 .max()
                 .expect("there are seven non-progress operations");
             assert_eq!(
@@ -988,7 +998,11 @@ mod tests {
         let widest_non_progress = widest_operations(fingerprint_bytes)
             .into_iter()
             .filter(|operation| !matches!(operation, Operation::UpdateProgress(_)))
-            .max_by_key(|operation| operation.encode().expect("the operation encodes").len())
+            .max_by_key(|operation| {
+                encode_operation(operation)
+                    .expect("the operation encodes")
+                    .len()
+            })
             .expect("there are seven non-progress operations");
         let non_progress_operations =
             vec![widest_non_progress; WAL_MAX_NON_PROGRESS_OPS_PER_TX as usize];
@@ -996,9 +1010,8 @@ mod tests {
             sequence: 1,
             operations: non_progress_operations,
         };
-        let non_progress_encoded = non_progress_tx
-            .encode()
-            .expect("the non-progress transaction encodes");
+        let non_progress_encoded =
+            encode_transaction(&non_progress_tx).expect("the non-progress transaction encodes");
 
         let widest_progress = widest_operations(fingerprint_bytes)
             .into_iter()
@@ -1009,7 +1022,7 @@ mod tests {
                 let Operation::UpdateProgress(mut progress) = widest_progress.clone() else {
                     unreachable!("the selected fixture is update_progress");
                 };
-                progress.file_id = FileId((u128::from(index) + 1).to_be_bytes());
+                progress.file_id = FileId::from_bytes((u128::from(index) + 1).to_be_bytes());
                 Operation::UpdateProgress(progress)
             })
             .collect();
@@ -1017,9 +1030,8 @@ mod tests {
             sequence: 2,
             operations: progress_operations,
         };
-        let progress_encoded = progress_tx
-            .encode()
-            .expect("the progress transaction encodes");
+        let progress_encoded =
+            encode_transaction(&progress_tx).expect("the progress transaction encodes");
 
         let bound = transaction_bytes(fingerprint_bytes).expect("the bound is representable");
         assert_eq!(
@@ -1028,7 +1040,10 @@ mod tests {
         );
 
         let compact_after_bytes = minimum_compact_after_bytes().unwrap();
-        let wal = encode_wal(0, TEST_NAMESPACE_ID, &[non_progress_tx]).expect("the WAL encodes");
+        let mut wal = encode_wal_header(0, TEST_NAMESPACE_ID).expect("the WAL header encodes");
+        wal.extend_from_slice(
+            &encode_transaction(&non_progress_tx).expect("the transaction encodes"),
+        );
         let wal_bound = wal_bytes(compact_after_bytes, 10_000).expect("the bound is representable");
         assert_eq!(wal_bound, compact_after_bytes);
         assert!(
@@ -1262,7 +1277,7 @@ mod tests {
         assert_eq!(wal_bytes(byte_threshold, u32::MAX).unwrap(), byte_threshold);
         assert_eq!(
             wal_transactions(byte_threshold, u32::MAX).unwrap(),
-            (byte_threshold - WAL_HEADER_LEN as u64) / u64::from(TX_MIN_FRAME_BYTES)
+            (byte_threshold - WAL_HEADER_LEN as u64) / TX_MIN_FRAME_BYTES
         );
 
         let transaction_threshold = 2u32;
@@ -1288,10 +1303,10 @@ mod tests {
     #[test]
     fn snapshot_record_constants_match_the_codec() {
         let record = widest_snapshot_record(FINGERPRINT_MAX_BYTES as u64);
-        let encoded = record.encode().expect("the widest record encodes");
-        assert_eq!(encoded.len() as u64, SNAPSHOT_MAX_RECORD_FRAME_BYTES);
+        let encoded_len = encoded_snapshot_record_len(&record);
+        assert_eq!(encoded_len, SNAPSHOT_MAX_RECORD_FRAME_BYTES);
         assert_eq!(
-            encoded.len() as u64 - FRAME_OVERHEAD_BYTES,
+            encoded_len - FRAME_OVERHEAD_BYTES,
             SNAPSHOT_MAX_RECORD_PAYLOAD_BYTES
         );
     }
@@ -1307,7 +1322,11 @@ mod tests {
         let widest_encoded = operations
             .iter()
             .filter(|operation| !matches!(operation, Operation::UpdateProgress(_)))
-            .map(|operation| operation.encode().expect("the operation encodes").len() as u64)
+            .map(|operation| {
+                encode_operation(operation)
+                    .expect("the operation encodes")
+                    .len() as u64
+            })
             .max()
             .expect("there are seven non-progress operations");
         assert_eq!(widest_encoded, MAX_VALID_UPDATE_FINGERPRINT_FRAME_BYTES);
@@ -1319,9 +1338,8 @@ mod tests {
         let register_file_encoded = operations
             .iter()
             .find(|operation| matches!(operation, Operation::RegisterFile(_)))
-            .expect("widest_operations includes register_file")
-            .encode()
-            .expect("register_file encodes");
+            .map(|operation| encode_operation(operation).expect("register_file encodes"))
+            .expect("widest_operations includes register_file");
         assert_eq!(
             register_file_encoded.len() as u64 - FRAME_OVERHEAD_BYTES,
             REGISTER_FILE_MAX_OP_PAYLOAD_BYTES
@@ -1338,13 +1356,12 @@ mod tests {
         let expected = vec![0x5A; FINGERPRINT_MAX_BYTES - 1];
         let mut new_fingerprint = expected.clone();
         new_fingerprint.push(0xA5);
-        let encoded = Operation::UpdateFingerprint(UpdateFingerprint {
-            file_id: FileId([8; 16]),
+        let encoded = encode_operation(&Operation::UpdateFingerprint(UpdateFingerprint {
+            file_id: FileId::from_bytes([8; 16]),
             expected_file_epoch: 1,
             expected_fingerprint: expected,
             new_fingerprint,
-        })
-        .encode()
+        }))
         .unwrap();
         assert_eq!(
             encoded.len() as u64,
@@ -1379,7 +1396,8 @@ mod tests {
             .into_iter()
             .find(|operation| matches!(operation, Operation::UpdateProgress(_)))
             .expect("widest_operations includes update_progress");
-        let encoded_operation = widest_progress.encode().expect("update_progress encodes");
+        let encoded_operation =
+            encode_operation(&widest_progress).expect("update_progress encodes");
         assert_eq!(
             encoded_operation.len() as u64,
             UPDATE_PROGRESS_MAX_OP_FRAME_BYTES
@@ -1396,14 +1414,13 @@ mod tests {
                     let Operation::UpdateProgress(mut progress) = widest_progress.clone() else {
                         unreachable!("the selected fixture is update_progress");
                     };
-                    progress.file_id = FileId((u128::from(index) + 1).to_be_bytes());
+                    progress.file_id = FileId::from_bytes((u128::from(index) + 1).to_be_bytes());
                     Operation::UpdateProgress(progress)
                 })
                 .collect(),
         };
-        let encoded_tx = progress_tx
-            .encode()
-            .expect("the progress transaction encodes");
+        let encoded_tx =
+            encode_transaction(&progress_tx).expect("the progress transaction encodes");
         assert_eq!(encoded_tx.len() as u64, MAX_PROGRESS_TX_FRAME_BYTES);
         assert_eq!(
             encoded_tx.len() as u64 - TRANSACTION_OVERHEAD_BYTES,
@@ -1420,22 +1437,21 @@ mod tests {
     #[test]
     fn minimal_transaction_matches_tx_min_constants() {
         let minimal_operation = Operation::UpdateFingerprint(UpdateFingerprint {
-            file_id: FileId([9; 16]),
+            file_id: FileId::from_bytes([9; 16]),
             expected_file_epoch: 1,
             expected_fingerprint: Vec::new(),
             new_fingerprint: vec![1],
         });
-        let encoded_operation = minimal_operation
-            .encode()
-            .expect("a minimal update_fingerprint encodes");
-        assert_eq!(encoded_operation.len() as u64, u64::from(TX_MIN_BODY_BYTES));
+        let encoded_operation =
+            encode_operation(&minimal_operation).expect("a minimal update_fingerprint encodes");
+        assert_eq!(encoded_operation.len() as u64, TX_MIN_BODY_BYTES);
 
         let tx = Transaction {
             sequence: 1,
             operations: vec![minimal_operation],
         };
-        let encoded_tx = tx.encode().expect("the minimal transaction encodes");
-        assert_eq!(encoded_tx.len() as u64, u64::from(TX_MIN_FRAME_BYTES));
+        let encoded_tx = encode_transaction(&tx).expect("the minimal transaction encodes");
+        assert_eq!(encoded_tx.len() as u64, TX_MIN_FRAME_BYTES);
     }
 
     /// Scenario: the format's hard transaction-body ceiling

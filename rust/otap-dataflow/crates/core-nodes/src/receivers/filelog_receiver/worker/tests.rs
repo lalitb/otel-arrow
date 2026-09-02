@@ -3032,6 +3032,7 @@ fn registration_rotation_and_compaction_storm_preserves_every_identity() {
             config.limits.max_pending_candidates = tracked_u32;
             config.limits.max_open_files = files_u32;
             config.batch.max_flush_period = Duration::from_millis(20);
+            config.framing.force_flush_period = Duration::ZERO;
             config.rotation.rotate_wait = Duration::from_millis(20);
             config.checkpoint.compact_after_transactions = 1;
         });

@@ -23,7 +23,8 @@ use crate::receivers::filelog_receiver::checkpoint::store::layout::{
     PublicationRole, snapshot_file_name, temp_file_name, wal_file_name,
 };
 use crate::receivers::filelog_receiver::checkpoint::wal::{
-    QuarantineFile, RegisterFile, UpdateProgress, decode_wal, encode_wal,
+    QuarantineFile, RegisterFile, Transaction, TransactionScan, UpdateProgress, WAL_HEADER_LEN,
+    decode_wal_header, encode_wal_header, scan_next_transaction,
 };
 use crate::receivers::filelog_receiver::identity::platform::open_locator_for_stability_check_cancellable;
 
@@ -42,6 +43,39 @@ fn direct_options(namespace_dir: PathBuf, namespace_id: &str) -> StoreOptions {
     options
 }
 
+fn decode_complete_wal(bytes: &[u8], expected_namespace_digest: &[u8; 32]) -> Vec<Transaction> {
+    let header = decode_wal_header(
+        bytes
+            .get(..WAL_HEADER_LEN)
+            .expect("the complete test WAL has a header"),
+    )
+    .expect("the WAL header decodes");
+    assert_eq!(&header.namespace_digest, expected_namespace_digest);
+
+    let mut suffix = &bytes[WAL_HEADER_LEN..];
+    let mut expected_sequence = 1u64;
+    let mut transactions = Vec::new();
+    while !suffix.is_empty() {
+        match scan_next_transaction(suffix, expected_sequence)
+            .expect("the transaction decodes")
+            .expect("the nonempty suffix produces a scan result")
+        {
+            TransactionScan::Complete {
+                transaction,
+                consumed,
+            } => {
+                suffix = &suffix[consumed..];
+                transactions.push(transaction);
+                expected_sequence += 1;
+            }
+            TransactionScan::Incomplete { bytes } => {
+                panic!("the complete test WAL ended with {bytes} incomplete bytes")
+            }
+        }
+    }
+    transactions
+}
+
 fn guard(committed_offset: u64, byte: u8) -> CommittedFrontierGuard {
     let window_len = committed_offset.min(64) as usize;
     CommittedFrontierGuard::compute(committed_offset, &vec![byte; window_len]).unwrap()
@@ -49,7 +83,7 @@ fn guard(committed_offset: u64, byte: u8) -> CommittedFrontierGuard {
 
 fn registration(seed: u8, advisory_path: AdvisoryPath) -> RegisterFile {
     RegisterFile {
-        file_id: FileId([seed; 16]),
+        file_id: FileId::from_bytes([seed; 16]),
         file_epoch: 1,
         committed_offset: 0,
         committed_frontier_guard: guard(0, seed),
@@ -513,7 +547,7 @@ fn inspection_reports_exact_quarantine_evidence() {
     let _ = store.register_files(vec![registration]).unwrap();
     let _ = store
         .commit_progress(vec![UpdateProgress {
-            file_id: FileId([9; 16]),
+            file_id: FileId::from_bytes([9; 16]),
             expected_committed_offset: 0,
             expected_file_epoch: 1,
             new_committed_offset: 64,
@@ -529,7 +563,7 @@ fn inspection_reports_exact_quarantine_evidence() {
         .unwrap();
     let _ = store
         .quarantine_files(vec![QuarantineFile {
-            file_id: FileId([9; 16]),
+            file_id: FileId::from_bytes([9; 16]),
             expected_file_epoch: 1,
             reason_code: 0x0003,
             locator,
@@ -1049,7 +1083,7 @@ fn seed_quarantined_source(
     if committed_offset != 0 {
         let _ = store
             .commit_progress(vec![UpdateProgress {
-                file_id: FileId([seed; 16]),
+                file_id: FileId::from_bytes([seed; 16]),
                 expected_committed_offset: 0,
                 expected_file_epoch: 1,
                 new_committed_offset: committed_offset,
@@ -1062,7 +1096,7 @@ fn seed_quarantined_source(
     }
     let _ = store
         .quarantine_files(vec![QuarantineFile {
-            file_id: FileId([seed; 16]),
+            file_id: FileId::from_bytes([seed; 16]),
             expected_file_epoch: 1,
             reason_code: 0x0003,
             locator,
@@ -1071,7 +1105,11 @@ fn seed_quarantined_source(
             quarantine_time_unix_nano: 3_000,
         }])
         .unwrap();
-    let record = store.table().get(&FileId([seed; 16])).unwrap().clone();
+    let record = store
+        .table()
+        .get(&FileId::from_bytes([seed; 16]))
+        .unwrap()
+        .clone();
     drop(store);
     record
 }
@@ -1229,7 +1267,7 @@ fn reset_to_beginning_is_audited_synced_and_durable() {
     session.release().unwrap();
 
     let reopened = CheckpointStore::open(store_options).unwrap();
-    let record = reopened.table().get(&FileId([1; 16])).unwrap();
+    let record = reopened.table().get(&FileId::from_bytes([1; 16])).unwrap();
     assert_eq!(record.lifecycle_state, LifecycleState::Active);
     assert_eq!(record.file_epoch, 2);
     assert_eq!(record.committed_offset, 0);
@@ -1320,7 +1358,10 @@ fn keep_failed_preserves_all_record_state_after_reopen() {
     session.release().unwrap();
 
     let reopened = CheckpointStore::open(store_options).unwrap();
-    assert_eq!(reopened.table().get(&FileId([2; 16])), Some(&old));
+    assert_eq!(
+        reopened.table().get(&FileId::from_bytes([2; 16])),
+        Some(&old)
+    );
 }
 
 /// Scenario: a read-only administration session observes an allowed torn
@@ -1418,7 +1459,10 @@ fn keep_failed_retries_an_exact_pending_append() {
     session.release().unwrap();
 
     let reopened = CheckpointStore::open(store_options).unwrap();
-    assert_eq!(reopened.table().get(&FileId([23; 16])), Some(&old));
+    assert_eq!(
+        reopened.table().get(&FileId::from_bytes([23; 16])),
+        Some(&old)
+    );
     assert_eq!(
         reopened.recovery().transactions_replayed,
         usize::try_from(transactions_before + 1).unwrap()
@@ -1466,12 +1510,11 @@ fn remove_quarantined_is_exact_audited_and_durable() {
     assert_eq!(result.new_offset, None);
     assert_eq!(result.data_effect, DataEffect::DuplicateOrLossPossible);
     assert_eq!(session.validation().tracked_file_count, 0);
-    let wal = decode_wal(
+    let transactions = decode_complete_wal(
         &fs::read(store_options.namespace_dir.join(wal_file_name(0))).unwrap(),
-        &namespace_digest("Remove.Quarantine"),
-    )
-    .unwrap();
-    let removal = match &wal.transactions.last().unwrap().operations[0] {
+        &namespace_digest("Remove.Quarantine").unwrap(),
+    );
+    let removal = match &transactions.last().unwrap().operations[0] {
         Operation::RemoveFile(removal) => removal,
         other => panic!("expected administrative removal, got {other:?}"),
     };
@@ -1485,7 +1528,7 @@ fn remove_quarantined_is_exact_audited_and_durable() {
     session.release().unwrap();
 
     let reopened = CheckpointStore::open(store_options).unwrap();
-    assert!(reopened.table().get(&FileId([3; 16])).is_none());
+    assert!(reopened.table().get(&FileId::from_bytes([3; 16])).is_none());
 }
 
 /// Scenario: reset-to-end samples a regular file longer than the 64-byte
@@ -1532,7 +1575,7 @@ fn reset_to_end_commits_exact_locator_eof_and_real_guard() {
     session.release().unwrap();
 
     let reopened = CheckpointStore::open(store_options).unwrap();
-    let record = reopened.table().get(&FileId([4; 16])).unwrap();
+    let record = reopened.table().get(&FileId::from_bytes([4; 16])).unwrap();
     assert_eq!(record.file_epoch, 2);
     assert_eq!(record.committed_offset, 150);
     assert_eq!(record.committed_frontier_guard, expected_guard);
@@ -1597,7 +1640,7 @@ fn every_per_file_admin_action_retries_every_wal_fault_exactly_once() {
             session.release().unwrap();
 
             let reopened = CheckpointStore::open(store_options.clone()).unwrap();
-            let record = reopened.table().get(&FileId([seed; 16]));
+            let record = reopened.table().get(&FileId::from_bytes([seed; 16]));
             match action {
                 FaultedAdminAction::ResetToBeginning => {
                     let record = record.expect("reset-to-beginning keeps the record");
@@ -1627,17 +1670,16 @@ fn every_per_file_admin_action_retries_every_wal_fault_exactly_once() {
                     assert!(record.is_none(), "{point}");
                 }
             }
-            let wal = decode_wal(
+            let transactions = decode_complete_wal(
                 &fs::read(store_options.namespace_dir.join(wal_file_name(0))).unwrap(),
-                &namespace_digest(&namespace_id),
-            )
-            .unwrap();
+                &namespace_digest(&namespace_id).unwrap(),
+            );
             assert_eq!(
-                u64::try_from(wal.transactions.len()).unwrap(),
+                u64::try_from(transactions.len()).unwrap(),
                 transactions_before + 1,
                 "{action:?} at {point}"
             );
-            let last = wal.transactions.last().unwrap();
+            let last = transactions.last().unwrap();
             assert_eq!(last.operations.len(), 1, "{action:?} at {point}");
             match (action, &last.operations[0]) {
                 (
@@ -1783,7 +1825,7 @@ fn reset_to_beginning_rejects_epoch_overflow_without_append() {
     let store_options = options(&root.path().join("state"), "epoch-overflow");
     drop(CheckpointStore::open(store_options.clone()).unwrap());
     let record = SnapshotRecord {
-        file_id: FileId([7; 16]),
+        file_id: FileId::from_bytes([7; 16]),
         file_epoch: u32::MAX,
         committed_offset: 0,
         committed_frontier_guard: CommittedFrontierGuard::empty(),
@@ -1810,7 +1852,7 @@ fn reset_to_beginning_rejects_epoch_overflow_without_append() {
     .unwrap();
     fs::write(
         store_options.namespace_dir.join(wal_file_name(0)),
-        encode_wal(0, &store_options.namespace_id, &[]).unwrap(),
+        encode_wal_header(0, &store_options.namespace_id).unwrap(),
     )
     .unwrap();
     let wal_path = store_options.namespace_dir.join(wal_file_name(0));
@@ -2017,7 +2059,7 @@ fn reset_to_end_enforces_the_explicit_symlink_policy() {
         CheckpointStore::open(store_options)
             .unwrap()
             .table()
-            .get(&FileId([11; 16]))
+            .get(&FileId::from_bytes([11; 16]))
             .unwrap()
             .committed_offset,
         72

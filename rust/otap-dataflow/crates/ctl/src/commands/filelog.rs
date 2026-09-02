@@ -530,7 +530,7 @@ mod tests {
 
     fn registration(seed: u8, locator: Locator) -> RegisterFile {
         RegisterFile {
-            file_id: FileId([seed; 16]),
+            file_id: FileId::from_bytes([seed; 16]),
             file_epoch: 1,
             committed_offset: 0,
             committed_frontier_guard: CommittedFrontierGuard::empty(),
@@ -571,7 +571,7 @@ mod tests {
             .unwrap();
         let _ = store
             .quarantine_files(vec![QuarantineFile {
-                file_id: FileId([seed; 16]),
+                file_id: FileId::from_bytes([seed; 16]),
                 expected_file_epoch: 1,
                 reason_code: 3,
                 locator,
@@ -770,7 +770,7 @@ mod tests {
         assert_eq!(removal["data"]["data_effect"], "duplicate_or_loss_possible");
 
         let reopened = CheckpointStore::open(options).unwrap();
-        assert!(reopened.table().get(&FileId([3; 16])).is_none());
+        assert!(reopened.table().get(&FileId::from_bytes([3; 16])).is_none());
     }
 
     /// Scenario: reset-to-beginning is invoked with exact file and epoch
@@ -821,7 +821,7 @@ mod tests {
         crate::run(cli, &mut stdout).await.unwrap();
 
         let reopened = CheckpointStore::open(options).unwrap();
-        let record = reopened.table().get(&FileId([4; 16])).unwrap();
+        let record = reopened.table().get(&FileId::from_bytes([4; 16])).unwrap();
         assert_eq!(record.lifecycle_state, LifecycleState::Active);
         assert_eq!(record.file_epoch, 2);
         assert_eq!(record.committed_offset, 0);
@@ -877,7 +877,7 @@ mod tests {
         crate::run(cli, &mut stdout).await.unwrap();
 
         let reopened = CheckpointStore::open(options).unwrap();
-        let record = reopened.table().get(&FileId([5; 16])).unwrap();
+        let record = reopened.table().get(&FileId::from_bytes([5; 16])).unwrap();
         assert_eq!(record.lifecycle_state, LifecycleState::Active);
         assert_eq!(record.file_epoch, 2);
         assert_eq!(record.committed_offset, bytes.len() as u64);

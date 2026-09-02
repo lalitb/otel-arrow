@@ -2395,7 +2395,7 @@ impl Framer {
 pub(crate) fn fragment_id(file_id: FileId, file_epoch: u32, record_start: u64) -> String {
     let mut hasher = Sha256::new();
     hasher.update(FRAGMENT_ID_DOMAIN);
-    hasher.update(file_id.0);
+    hasher.update(file_id.as_bytes());
     hasher.update(file_epoch.to_be_bytes());
     hasher.update(record_start.to_be_bytes());
     hex::encode(hasher.finalize())

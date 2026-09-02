@@ -15,8 +15,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::super::error::{ApplyError, DecodeError, EncodeError};
+use super::super::error::ApplyError;
 use super::super::primitives::FileId;
+use super::super::{DecodeError, EncodeError};
 use super::fault::FaultPoint;
 use super::limits::LimitsError;
 

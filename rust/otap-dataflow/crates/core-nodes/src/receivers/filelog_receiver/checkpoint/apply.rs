@@ -12,10 +12,20 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::error::{ApplyError, DecodeError};
-use super::primitives::{CommittedFrontierGuard, FileId, FramingResume, LifecycleState, Locator};
+use super::DecodeError;
+use super::error::ApplyError;
+use super::primitives::{
+    COMMITTED_FRONTIER_GUARD_WINDOW_BYTES, CommittedFrontierGuard, FINGERPRINT_MAX_BYTES, FileId,
+    FramingResume, LifecycleState, Locator, REASON_CODE_RESERVED,
+};
 use super::snapshot::{QuarantineEvidence, SnapshotRecord};
 use super::wal::{Operation, ResetQuarantineAction, Transaction};
+
+fn guard_is_valid(committed_offset: u64, guard: &CommittedFrontierGuard) -> bool {
+    let expected = committed_offset.min(u64::from(COMMITTED_FRONTIER_GUARD_WINDOW_BYTES));
+    u64::from(guard.window_len) == expected
+        && (committed_offset != 0 || *guard == CommittedFrontierGuard::empty())
+}
 
 /// Validates that `guard.window_len` equals
 /// `min(committed_offset, COMMITTED_FRONTIER_GUARD_WINDOW_BYTES)`, the
@@ -26,17 +36,81 @@ fn validate_guard_window(
     committed_offset: u64,
     guard: &CommittedFrontierGuard,
 ) -> Result<(), ApplyError> {
-    let expected = committed_offset.min(u64::from(
-        super::primitives::COMMITTED_FRONTIER_GUARD_WINDOW_BYTES,
-    ));
-    if u64::from(guard.window_len) != expected {
+    if !guard_is_valid(committed_offset, guard) {
         return Err(ApplyError::InvalidCommittedFrontierGuard {
             operation,
             file_id,
-            reason: "window_len does not equal min(committed_offset, 64)",
+            reason: "guard is not canonical for committed_offset",
         });
     }
     Ok(())
+}
+
+fn validate_record_reachable_state(record: &SnapshotRecord) -> Result<(), &'static str> {
+    if record.file_epoch == 0 {
+        return Err("file_epoch must be >= 1");
+    }
+    if !guard_is_valid(record.committed_offset, &record.committed_frontier_guard) {
+        return Err("committed_frontier_guard is not canonical for committed_offset");
+    }
+    if record.locator == Locator::Unspecified {
+        return Err("locator must be a recognized non-Unspecified kind");
+    }
+    if record.fingerprint.len() > FINGERPRINT_MAX_BYTES {
+        return Err("fingerprint length exceeds the version-1 maximum");
+    }
+    let fingerprint_len = u64::try_from(record.fingerprint.len())
+        .map_err(|_| "fingerprint length does not fit u64")?;
+    if u64::from(record.ignored_header_bytes)
+        .checked_add(fingerprint_len)
+        .is_none()
+    {
+        return Err("ignored_header_bytes + fingerprint_len must fit u64");
+    }
+    if record.framing_profile_version == 0 {
+        return Err("framing_profile_version must be nonzero");
+    }
+    if !framing_resume_is_valid(record.committed_offset, record.framing_resume) {
+        return Err("FramingResume::Continuation violates its reachable-state invariant");
+    }
+    match (record.lifecycle_state, &record.quarantine_evidence) {
+        (LifecycleState::Active, None) => {}
+        (LifecycleState::RotatedFinalized, None)
+            if record.framing_resume == FramingResume::Clean => {}
+        (LifecycleState::RotatedFinalized, None) => {
+            return Err("RotatedFinalized record must have FramingResume::Clean");
+        }
+        (LifecycleState::Quarantined, Some(evidence)) => {
+            if evidence.reason_code == REASON_CODE_RESERVED {
+                return Err("Quarantined record requires nonzero reason_code");
+            }
+            if evidence.quarantine_epoch != record.file_epoch {
+                return Err("Quarantined record requires quarantine_epoch == file_epoch");
+            }
+        }
+        (LifecycleState::Quarantined, None) => {
+            return Err("Quarantined record must carry quarantine_evidence");
+        }
+        (LifecycleState::Active | LifecycleState::RotatedFinalized, Some(_)) => {
+            return Err("non-Quarantined record must not carry quarantine_evidence");
+        }
+    }
+    Ok(())
+}
+
+fn framing_resume_is_valid(committed_offset: u64, resume: FramingResume) -> bool {
+    match resume {
+        FramingResume::Clean => true,
+        FramingResume::Continuation {
+            record_start_offset,
+            record_end_offset,
+            next_fragment_index,
+        } => {
+            next_fragment_index >= 1
+                && record_start_offset < committed_offset
+                && (record_end_offset == 0 || committed_offset < record_end_offset)
+        }
+    }
 }
 
 /// Validates a `Continuation` framing-resume value against the offset it is
@@ -198,14 +272,10 @@ impl CheckpointTable {
         let mut table = Self::new();
         for record in records {
             let file_id = record.file_id;
-            record
-                .validate_reachable_state()
+            validate_record_reachable_state(&record)
                 .map_err(|reason| DecodeError::InvalidSnapshotState { file_id, reason })?;
             if table.records.insert(file_id, record).is_some() {
-                return Err(DecodeError::DuplicateFileId {
-                    file_id,
-                    context: "from_snapshot_records",
-                });
+                return Err(DecodeError::DuplicateFileId { file_id });
             }
             let record = table
                 .records
@@ -309,7 +379,7 @@ impl CheckpointTable {
         }
         for (&file_id, record) in &touched {
             if let Some(record) = record
-                && let Err(reason) = record.validate_reachable_state()
+                && let Err(reason) = validate_record_reachable_state(record)
             {
                 return Err(ApplyError::ImpossibleTransition {
                     operation: "transaction",
@@ -1072,21 +1142,8 @@ impl CheckpointTable {
                     ResetQuarantineAction::KeepFailed => {
                         if op.resulting_epoch != op.expected_quarantine_epoch
                             || op.resulting_epoch != stored_file_epoch
-                        {
-                            return Err(ApplyError::ImpossibleTransition {
-                                operation: "reset_quarantined_file",
-                                file_id: op.file_id,
-                                reason: "keep_failed must not change the quarantine epoch",
-                            });
-                        }
-                        if op.resulting_offset != committed_offset {
-                            return Err(ApplyError::ImpossibleTransition {
-                                operation: "reset_quarantined_file",
-                                file_id: op.file_id,
-                                reason: "keep_failed must not change the committed offset",
-                            });
-                        }
-                        if op.new_committed_frontier_guard != stored_guard
+                            || op.resulting_offset != committed_offset
+                            || op.new_committed_frontier_guard != stored_guard
                             || op.new_framing_resume != stored_framing_resume
                             || op.new_fingerprint != stored_fingerprint
                         {

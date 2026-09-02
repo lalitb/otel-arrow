@@ -44,14 +44,13 @@ use otap_df_otap::pdata::OtapPdata;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-/// Durable checkpoint state: the version-1 snapshot/WAL byte format and the
-/// file-backed store that persists it.
+/// Durable checkpoint state and the file-backed store that persists it.
 ///
-/// The codec modules encode, decode, and replay checkpoint bytes in memory
-/// and perform no I/O. [`checkpoint::store`] owns the namespace on disk; it
-/// blocks, so it belongs on the receiver's dedicated read/checkpoint OS
-/// thread. OS-specific locator lookup and recovery matching live in
-/// [`identity`].
+/// [`otel_arrow_dfe_filelog_checkpoint`] owns version-1 values and byte
+/// encoding without filesystem I/O. [`checkpoint`] owns replay semantics,
+/// and [`checkpoint::store`] owns the namespace on disk; storage blocks, so
+/// it belongs on the receiver's dedicated read/checkpoint OS thread.
+/// OS-specific locator lookup and recovery matching live in [`identity`].
 pub mod checkpoint;
 
 mod batching;

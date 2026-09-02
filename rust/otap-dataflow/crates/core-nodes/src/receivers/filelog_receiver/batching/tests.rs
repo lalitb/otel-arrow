@@ -25,7 +25,7 @@ use crate::receivers::filelog_receiver::framing::SourceRange;
 fn file_id(seed: u64) -> FileId {
     let mut bytes = [0; 16];
     bytes[8..].copy_from_slice(&seed.to_be_bytes());
-    FileId(bytes)
+    FileId::from_bytes(bytes)
 }
 
 fn settings(max_records: u32, max_bytes: u64, max_flush_period: Duration) -> BatchSettings {

@@ -8,10 +8,15 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
+use hashbrown::{HashMap as PathMap, HashSet as PathSet};
+
 use super::{
     CandidateEvent, DiscoveredCandidate, DiscoveryError, DiscoveryFeedback, DiscoveryIssue,
     DiscoveryRelease, DiscoveryStats, DurableDiscoveryBinding, ReconciliationBatch,
     RevocationReason,
+};
+use crate::receivers::filelog_receiver::checkpoint::path::{
+    AdvisoryPathKey, AdvisoryPathRef, distinguished_binding_order,
 };
 use crate::receivers::filelog_receiver::checkpoint::{AdvisoryPath, AdvisoryPathKind, Locator};
 
@@ -149,7 +154,7 @@ pub(crate) struct AdmissionController {
     /// Bounded path -> locator index frozen from tracked distinguished
     /// bindings at scan start (`docs/filelog-receiver-phase1-spec.md`,
     /// "Discovery and matching").
-    frozen_path_index: HashMap<AdvisoryPath, Locator>,
+    frozen_path_index: PathMap<AdvisoryPathKey, Locator>,
     /// Live durable locator/path bindings recovered before discovery starts.
     ///
     /// These remain authoritative even while no reader is attached, so an
@@ -222,7 +227,7 @@ impl AdmissionController {
             removal_evidence_complete: false,
             deferred_overflow: 0,
             overflow_since: None,
-            frozen_path_index: HashMap::with_capacity(max_tracked_files),
+            frozen_path_index: PathMap::with_capacity(max_tracked_files),
             durable_bindings: HashMap::with_capacity(max_tracked_files),
             rebind_claims: HashMap::with_capacity(max_tracked_files),
             rebind_conflicts: HashSet::with_capacity(max_tracked_files),
@@ -303,7 +308,7 @@ impl AdmissionController {
         self.recognized_replacement_candidates.clear();
         self.recognized_replacements.clear();
         self.frozen_path_index.clear();
-        let mut ambiguous_paths = HashSet::with_capacity(self.max_durable_bindings);
+        let mut ambiguous_paths = PathSet::with_capacity(self.max_durable_bindings);
         for (&locator, path) in &self.durable_bindings {
             freeze_path_binding(
                 &mut self.frozen_path_index,
@@ -399,7 +404,7 @@ impl AdmissionController {
         // already tracked or pending.
         if let Some(&owner) = self
             .frozen_path_index
-            .get(&candidate.evidence.advisory_path)
+            .get(&AdvisoryPathRef::new(&candidate.evidence.advisory_path))
             && owner != locator
         {
             self.record_rebind_claim(owner, locator)?;
@@ -423,11 +428,10 @@ impl AdmissionController {
                 entry.binding_candidate = Some(candidate);
             } else {
                 let replace = entry.rebind_candidate.as_ref().is_none_or(|existing| {
-                    candidate
-                        .evidence
-                        .advisory_path
-                        .distinguished_binding_order(&existing.evidence.advisory_path)
-                        == Ordering::Less
+                    distinguished_binding_order(
+                        &candidate.evidence.advisory_path,
+                        &existing.evidence.advisory_path,
+                    ) == Ordering::Less
                 });
                 if replace {
                     entry.rebind_candidate = Some(candidate);
@@ -444,11 +448,10 @@ impl AdmissionController {
                 entry.candidate = candidate;
                 entry.seen_generation = generation;
                 self.increment_eligible_candidates()?;
-            } else if candidate
-                .evidence
-                .advisory_path
-                .distinguished_binding_order(&entry.candidate.evidence.advisory_path)
-                == Ordering::Less
+            } else if distinguished_binding_order(
+                &candidate.evidence.advisory_path,
+                &entry.candidate.evidence.advisory_path,
+            ) == Ordering::Less
             {
                 entry.candidate = candidate;
                 self.increment_eligible_candidates()?;
@@ -457,7 +460,7 @@ impl AdmissionController {
         }
         let possible_replacement = self
             .frozen_path_index
-            .get(&candidate.evidence.advisory_path)
+            .get(&AdvisoryPathRef::new(&candidate.evidence.advisory_path))
             .is_some_and(|owner| *owner != locator);
         let defer_age_filter = candidate_is_too_old(
             candidate.modified,
@@ -1017,11 +1020,10 @@ impl AdmissionController {
             // the retained candidate, so replacing it here cannot disturb
             // eviction fairness.
             if let Some(existing) = self.selected_min_candidates.get(&locator)
-                && candidate
-                    .evidence
-                    .advisory_path
-                    .distinguished_binding_order(&existing.evidence.advisory_path)
-                    == Ordering::Less
+                && distinguished_binding_order(
+                    &candidate.evidence.advisory_path,
+                    &existing.evidence.advisory_path,
+                ) == Ordering::Less
             {
                 let _ = self.selected_min_candidates.insert(locator, candidate);
             }
@@ -1452,24 +1454,25 @@ fn candidate_is_too_old(
 }
 
 fn freeze_path_binding(
-    frozen_path_index: &mut HashMap<AdvisoryPath, Locator>,
+    frozen_path_index: &mut PathMap<AdvisoryPathKey, Locator>,
     rebind_conflicts: &mut HashSet<Locator>,
-    ambiguous_paths: &mut HashSet<AdvisoryPath>,
+    ambiguous_paths: &mut PathSet<AdvisoryPathKey>,
     locator: Locator,
     path: &AdvisoryPath,
 ) {
     if path.kind() == AdvisoryPathKind::Unavailable {
         return;
     }
-    if ambiguous_paths.contains(path) {
+    let path_ref = AdvisoryPathRef::new(path);
+    if ambiguous_paths.contains(&path_ref) {
         let _ = rebind_conflicts.insert(locator);
         return;
     }
-    if let Some(previous) = frozen_path_index.insert(path.clone(), locator)
+    if let Some(previous) = frozen_path_index.insert(AdvisoryPathKey::from(path), locator)
         && previous != locator
     {
-        let _ = frozen_path_index.remove(path);
-        let _ = ambiguous_paths.insert(path.clone());
+        let _ = frozen_path_index.remove(&path_ref);
+        let _ = ambiguous_paths.insert(AdvisoryPathKey::from(path));
         let _ = rebind_conflicts.insert(previous);
         let _ = rebind_conflicts.insert(locator);
     }
@@ -1488,7 +1491,7 @@ fn candidate_signature(candidate: &DiscoveredCandidate) -> [u8; 32] {
     // must never collide into the same discovery signature.
     let _ = hasher.update(&[evidence.advisory_path.kind().to_wire()]);
     let _ = hasher.update(&evidence.advisory_path.full_path_len().to_be_bytes());
-    let _ = hasher.update(&evidence.advisory_path.full_path_digest());
+    let _ = hasher.update(evidence.advisory_path.full_path_digest());
     let _ = hasher.update(&(evidence.advisory_path.stored_path_bytes().len() as u64).to_be_bytes());
     let _ = hasher.update(evidence.advisory_path.stored_path_bytes());
     let _ = hasher.update(&(resolved_path.len() as u64).to_be_bytes());

@@ -21,8 +21,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::EncodeError;
 use super::current_marker::decode_current_marker;
-use super::error::EncodeError;
 use super::namespace::{CheckpointNamespace, CheckpointNamespaceError};
 use super::primitives::{
     AUDIT_REASON_MAX_BYTES, AdvisoryPath, AdvisoryPathKind, CommittedFrontierGuard, FileId,
@@ -1729,7 +1729,7 @@ fn parse_file_id(value: &str) -> Result<FileId, CheckpointAdminError> {
     }
     let mut bytes = [0u8; 16];
     hex::decode_to_slice(value, &mut bytes).map_err(|_| CheckpointAdminError::InvalidFileId)?;
-    Ok(FileId(bytes))
+    Ok(FileId::from_bytes(bytes))
 }
 
 fn map_reset_source_error(
@@ -2337,7 +2337,7 @@ fn quarantine_reports(
         if record.lifecycle_state != LifecycleState::Quarantined {
             continue;
         }
-        let file_id = hex::encode(file_id.0);
+        let file_id = hex::encode(file_id.as_bytes());
         let evidence = record.quarantine_evidence.as_ref().ok_or_else(|| {
             CheckpointAdminError::MissingQuarantineEvidence {
                 file_id: file_id.clone(),

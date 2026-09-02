@@ -574,7 +574,7 @@ fn plan_with_source_mode(
 
     let mut records_by_locator: HashMap<Locator, Vec<&SnapshotRecord>> = HashMap::new();
     let mut records_by_fingerprint: HashMap<&[u8], Vec<&SnapshotRecord>> = HashMap::new();
-    let mut records_by_path: HashMap<&AdvisoryPath, Vec<&SnapshotRecord>> = HashMap::new();
+    let mut records_by_path: HashMap<&[u8; 32], Vec<&SnapshotRecord>> = HashMap::new();
     let mut known_file_ids = HashSet::with_capacity(store.table().len());
     for (file_id, record) in store.table().iter() {
         let _ = known_file_ids.insert(*file_id);
@@ -587,7 +587,7 @@ fn plan_with_source_mode(
             .or_default()
             .push(record);
         records_by_path
-            .entry(&record.advisory_path)
+            .entry(record.advisory_path.full_path_digest())
             .or_default()
             .push(record);
     }
@@ -874,7 +874,7 @@ fn profile_incompatibility(
 fn has_unavailable_recovery_evidence(
     candidate: &CandidateEvidence,
     records_by_fingerprint: &HashMap<&[u8], Vec<&SnapshotRecord>>,
-    records_by_path: &HashMap<&AdvisoryPath, Vec<&SnapshotRecord>>,
+    records_by_path: &HashMap<&[u8; 32], Vec<&SnapshotRecord>>,
     live_locators: &HashSet<Locator>,
 ) -> bool {
     if !candidate.fingerprint.is_empty() {
@@ -888,10 +888,11 @@ fn has_unavailable_recovery_evidence(
         }
     }
     records_by_path
-        .get(&candidate.advisory_path)
+        .get(candidate.advisory_path.full_path_digest())
         .is_some_and(|records| {
             records.iter().any(|record| {
-                record.lifecycle_state == LifecycleState::Active
+                record.advisory_path == candidate.advisory_path
+                    && record.lifecycle_state == LifecycleState::Active
                     && !live_locators.contains(&record.locator)
             })
         })

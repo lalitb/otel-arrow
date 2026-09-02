@@ -15,6 +15,7 @@ workspace = true
 [dependencies]
 otap-df-channel = { workspace = true }
 otap-df-config = { workspace = true }
+otel-arrow-dfe-filelog-checkpoint = { workspace = true }
 otap-df-engine = { workspace = true }
 otap-df-query-engine-languages = { workspace = true }
 otap-df-otap = { workspace = true }
