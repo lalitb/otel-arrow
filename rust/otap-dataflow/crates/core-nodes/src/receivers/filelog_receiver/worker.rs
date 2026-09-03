@@ -37,15 +37,17 @@ use super::discovery::source::{
     DiscoveryHandle, FeedbackSendError, spawn_discovery_with_shutdown_signal_and_pressure,
 };
 use super::discovery::{
-    CandidateEvent, DiscoveryError, DiscoveryFeedback, DiscoveryMessage, DiscoveryRelease,
-    DurableAck, DurableDiscoveryBinding, ReconciliationBatch, RetentionRemovalAck,
+    CandidateEvent, DiscoveredCandidate, DiscoveryError, DiscoveryFeedback, DiscoveryMessage,
+    DiscoveryRelease, DurableAck, DurableDiscoveryBinding, ReconciliationBatch,
+    RetentionRemovalAck,
 };
 use super::environment::{DescriptorPressure, EnvironmentalErrorClass};
 use super::framing::{DecodeError, DecodeOutcome, FlushReason, FramedRecord, Framer, FramerError};
 use super::identity::CandidateEvidence;
 use super::identity::IdentityError;
 use super::identity::matcher::{
-    BlockedIdentity, IdentityMatch, IdentityResolution, IdentitySettings, plan_with_admission,
+    BlockedIdentity, IdentityMatch, IdentityResolution, IdentitySettings, ResolvedIdentity,
+    plan_with_admission,
 };
 use super::lease::LeaseError;
 use super::reader::{
@@ -1452,6 +1454,7 @@ impl WorkerRuntime {
         let Some(resolved) = resolved else {
             return Ok(LoopControl::Shutdown);
         };
+        self.prune_inactive_locators_without_durable_records();
         if self.cancellation_requested() {
             return Ok(LoopControl::Shutdown);
         }
@@ -1616,32 +1619,7 @@ impl WorkerRuntime {
                                 }
                             }
                             Err(ReaderError::UnknownLocator { .. }) => {
-                                let detached_file_id =
-                                    self.inactive_locators.get(&locator).copied();
-                                if detached_file_id
-                                    .is_some_and(|file_id| file_id != identity.file_id)
-                                {
-                                    return Err(WorkerError::Inconsistent {
-                                        reason: "re-eligible locator changed detached durable identity",
-                                    });
-                                }
-                                if detached_file_id.is_none()
-                                    && identity.matched_by == IdentityMatch::ExactLocator
-                                {
-                                    return Err(WorkerError::Inconsistent {
-                                        reason: "re-eligible exact locator has no detached durable identity",
-                                    });
-                                }
-                                let insert_result = self.readers_mut()?.insert(candidate, identity);
-                                self.record_runtime_lease_observations()?;
-                                if let Err(error) = insert_result {
-                                    self.observe_reader_error(&error);
-                                    return Err(WorkerError::Reader(error));
-                                }
-                                if let Some(detached_file_id) = detached_file_id {
-                                    let removed = self.inactive_locators.remove(&locator);
-                                    debug_assert_eq!(removed, Some(detached_file_id));
-                                }
+                                self.reinsert_updated_active_reader(candidate, identity)?;
                             }
                             Err(error) => return Err(WorkerError::Reader(error)),
                         }
@@ -1659,32 +1637,8 @@ impl WorkerRuntime {
                     });
                 }
                 CandidateEvent::Removed { locator } => {
-                    match self.readers_ref()?.file_id_for_locator(locator) {
-                        Ok(file_id) => match self.readers_mut()?.mark_removed(locator)? {
-                            RemovalDisposition::HandleRetained => {}
-                            RemovalDisposition::DescriptorAbsent => {
-                                let Some(released) =
-                                    self.contain_removed_without_descriptor(file_id)?
-                                else {
-                                    return Ok(LoopControl::Shutdown);
-                                };
-                                if released != locator {
-                                    return Err(WorkerError::Inconsistent {
-                                        reason: "removed reader containment released a different locator",
-                                    });
-                                }
-                                feedback.finalized.push(locator);
-                            }
-                        },
-                        Err(ReaderError::UnknownLocator { .. }) => {
-                            if self.inactive_locators.remove(&locator).is_none() {
-                                return Err(WorkerError::Inconsistent {
-                                    reason: "removed locator belongs to neither a reader nor detached state",
-                                });
-                            }
-                            feedback.finalized.push(locator);
-                        }
-                        Err(error) => return Err(WorkerError::Reader(error)),
+                    if !self.handle_removed_candidate(locator, &mut feedback)? {
+                        return Ok(LoopControl::Shutdown);
                     }
                 }
                 CandidateEvent::Revoked { locator, reason: _ } => {
@@ -2228,6 +2182,40 @@ impl WorkerRuntime {
         Ok(Some(locator))
     }
 
+    fn handle_removed_candidate(
+        &mut self,
+        locator: Locator,
+        feedback: &mut DiscoveryFeedback,
+    ) -> Result<bool, WorkerError> {
+        match self.readers_ref()?.file_id_for_locator(locator) {
+            Ok(file_id) => match self.readers_mut()?.mark_removed(locator)? {
+                RemovalDisposition::HandleRetained => {}
+                RemovalDisposition::DescriptorAbsent => {
+                    let Some(released) = self.contain_removed_without_descriptor(file_id)? else {
+                        return Ok(false);
+                    };
+                    if released != locator {
+                        return Err(WorkerError::Inconsistent {
+                            reason: "removed reader containment released a different locator",
+                        });
+                    }
+                    self.remember_inactive_locator(released, file_id)?;
+                    feedback.finalized.push(locator);
+                }
+            },
+            Err(ReaderError::UnknownLocator { .. }) => {
+                if self.inactive_locators.remove(&locator).is_none() {
+                    return Err(WorkerError::Inconsistent {
+                        reason: "removed locator belongs to neither a reader nor detached state",
+                    });
+                }
+                feedback.finalized.push(locator);
+            }
+            Err(error) => return Err(WorkerError::Reader(error)),
+        }
+        Ok(true)
+    }
+
     fn handle_truncation(
         &mut self,
         file_id: FileId,
@@ -2307,6 +2295,36 @@ impl WorkerRuntime {
         Ok(())
     }
 
+    fn reinsert_updated_active_reader(
+        &mut self,
+        candidate: DiscoveredCandidate,
+        identity: ResolvedIdentity,
+    ) -> Result<(), WorkerError> {
+        let locator = candidate.evidence.locator;
+        let detached_file_id = self.inactive_locators.get(&locator).copied();
+        if detached_file_id.is_some_and(|file_id| file_id != identity.file_id) {
+            return Err(WorkerError::Inconsistent {
+                reason: "re-eligible locator changed detached durable identity",
+            });
+        }
+        if detached_file_id.is_none() && identity.matched_by == IdentityMatch::ExactLocator {
+            return Err(WorkerError::Inconsistent {
+                reason: "re-eligible exact locator has no detached durable identity",
+            });
+        }
+        let insert_result = self.readers_mut()?.insert(candidate, identity);
+        self.record_runtime_lease_observations()?;
+        if let Err(error) = insert_result {
+            self.observe_reader_error(&error);
+            return Err(WorkerError::Reader(error));
+        }
+        if let Some(detached_file_id) = detached_file_id {
+            let removed = self.inactive_locators.remove(&locator);
+            debug_assert_eq!(removed, Some(detached_file_id));
+        }
+        Ok(())
+    }
+
     fn remember_inactive_locator(
         &mut self,
         locator: Locator,
@@ -2320,6 +2338,12 @@ impl WorkerRuntime {
             });
         }
         Ok(())
+    }
+
+    fn prune_inactive_locators_without_durable_records(&mut self) {
+        let table = self.store.table();
+        self.inactive_locators
+            .retain(|_, file_id| table.get(file_id).is_some());
     }
 
     fn send_feedback_interruptibly(

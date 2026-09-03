@@ -20,7 +20,7 @@ use otap_df_pdata::{
 };
 use prost::Message;
 use serde_json::json;
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir};
 
 use super::*;
 use crate::receivers::filelog_receiver::batching::{FinalizationOutcome, ProgressFrontier};
@@ -42,8 +42,11 @@ use crate::receivers::filelog_receiver::discovery::source::spawn_discovery;
 use crate::receivers::filelog_receiver::discovery::{
     DiscoveredCandidate, DiscoveryIssue, RevocationReason,
 };
-use crate::receivers::filelog_receiver::identity::matcher::{IdentityMatch, ResolvedIdentity};
+use crate::receivers::filelog_receiver::identity::matcher::{
+    CandidateInventory, IdentityMatch, ResolvedIdentity,
+};
 use crate::receivers::filelog_receiver::identity::platform::open_candidate;
+use crate::receivers::filelog_receiver::lease::register_receiver_scope;
 use crate::receivers::filelog_receiver::{Encoding, MaxLogSizeBehavior};
 
 /// Test-only zero-filled window guard: a deterministic, obviously-fake
@@ -2515,7 +2518,8 @@ async fn read_new_reopens_a_present_nonresident_reader() {
 /// Scenario: a present file's descriptor is evicted, then move/create
 /// rotation removes that path while another file remains readable.
 /// Guarantees: the affected durable identity remains Active and unfinalized,
-/// the volatile reader is released, and unrelated file collection continues.
+/// the volatile reader is released, one capture limitation is reported, and
+/// unrelated file collection continues.
 #[tokio::test]
 async fn removed_nonresident_reader_is_contained_per_file() {
     let directory = tempdir().unwrap();
@@ -2529,6 +2533,7 @@ async fn removed_nonresident_reader_is_contained_per_file() {
     runtime.limits.max_open_files = 1;
     let (event_tx, mut events) = tokio::sync::mpsc::channel(1 + WORKER_EVENT_CONTROL_SLOTS);
     let worker = spawn_worker(runtime.clone(), event_tx).unwrap();
+    let telemetry = Arc::clone(&worker.telemetry);
 
     let initial = receive_batch(&mut events).await;
     worker
@@ -2576,6 +2581,10 @@ async fn removed_nonresident_reader_is_contained_per_file() {
         })
         .unwrap();
     receive_commit(&mut events).await.3.unwrap();
+    assert_eq!(
+        telemetry.counter_for_test(WorkerCounter::RotationDescriptorUnavailable),
+        1
+    );
     stop_worker(worker, &mut events).await.unwrap();
 
     let store = CheckpointStore::open(StoreOptions::from_runtime_config(&runtime)).unwrap();
@@ -3904,6 +3913,524 @@ fn pre_discovery_path_replacement_uses_per_file_containment() {
     let record = runtime.store.table().get(&file_id).unwrap();
     assert_eq!(record, &durable_before);
     assert_eq!(runtime.inactive_locators.get(&locator), Some(&file_id));
+    runtime.shutdown_resources().unwrap();
+}
+
+struct DescriptorEvictedRuntime {
+    _directory: TempDir,
+    runtime: WorkerRuntime,
+    candidate: DiscoveredCandidate,
+    file_id: FileId,
+    locator: Locator,
+    other_file_id: FileId,
+    other_locator: Locator,
+}
+
+fn descriptor_evicted_runtime(retention: Duration) -> DescriptorEvictedRuntime {
+    let directory = tempdir().unwrap();
+    let first_path = directory.path().join("detached.log");
+    let second_path = directory.path().join("other.log");
+    std::fs::write(&first_path, b"ab").unwrap();
+    std::fs::write(&second_path, b"z").unwrap();
+    let include = directory.path().join("*.log");
+    let namespace = directory.path().join("checkpoint");
+    let config = runtime_config_with(include.to_str().unwrap(), &namespace, 1, |config| {
+        config.limits.max_open_files = 1;
+        config.checkpoint.retention = retention;
+    });
+    let mut runtime = WorkerRuntime::new(config).unwrap();
+
+    let candidate_for = |path: &std::path::Path| {
+        let resolved_path = std::fs::canonicalize(path).unwrap();
+        let opened = open_candidate(&resolved_path, false, 16, 0).unwrap();
+        DiscoveredCandidate {
+            matched_path: path.to_path_buf(),
+            resolved_path,
+            evidence: opened.evidence,
+            modified: None,
+        }
+    };
+    let candidate = candidate_for(&first_path);
+    let other_candidate = candidate_for(&second_path);
+    let file_id = FileId::from_bytes([120; 16]);
+    let other_file_id = FileId::from_bytes([121; 16]);
+    let locator = candidate.evidence.locator;
+    let other_locator = other_candidate.evidence.locator;
+    let committed_guard = CommittedFrontierGuard::compute(1, b"a").unwrap();
+    let _registered = runtime
+        .store
+        .register_files(vec![
+            RegisterFile {
+                file_id,
+                file_epoch: 1,
+                committed_offset: 1,
+                committed_frontier_guard: committed_guard,
+                fingerprint: candidate.evidence.fingerprint.clone(),
+                ignored_header_bytes: 0,
+                locator,
+                framing_profile_version: FRAMING_PROFILE_VERSION,
+                framing_profile_digest: runtime.config.framing_profile_digest,
+                framing_resume: FramingResume::Clean,
+                last_seen_time_unix_nano: 1,
+                advisory_path: candidate.evidence.advisory_path.clone(),
+            },
+            RegisterFile {
+                file_id: other_file_id,
+                file_epoch: 1,
+                committed_offset: 0,
+                committed_frontier_guard: CommittedFrontierGuard::empty(),
+                fingerprint: other_candidate.evidence.fingerprint.clone(),
+                ignored_header_bytes: 0,
+                locator: other_locator,
+                framing_profile_version: FRAMING_PROFILE_VERSION,
+                framing_profile_digest: runtime.config.framing_profile_digest,
+                framing_resume: FramingResume::Clean,
+                last_seen_time_unix_nano: 1,
+                advisory_path: other_candidate.evidence.advisory_path.clone(),
+            },
+        ])
+        .unwrap();
+    runtime
+        .readers_mut()
+        .unwrap()
+        .insert(
+            candidate.clone(),
+            ResolvedIdentity {
+                file_id,
+                file_epoch: 1,
+                committed_offset: 1,
+                framing_resume: FramingResume::Clean,
+                lifecycle_state: LifecycleState::Active,
+                matched_by: IdentityMatch::ExactLocator,
+                committed_frontier_guard: committed_guard,
+                advisory_path: candidate.evidence.advisory_path.clone(),
+            },
+        )
+        .unwrap();
+    runtime
+        .readers_mut()
+        .unwrap()
+        .insert(
+            other_candidate.clone(),
+            ResolvedIdentity {
+                file_id: other_file_id,
+                file_epoch: 1,
+                committed_offset: 0,
+                framing_resume: FramingResume::Clean,
+                lifecycle_state: LifecycleState::Active,
+                matched_by: IdentityMatch::ExactLocator,
+                committed_frontier_guard: CommittedFrontierGuard::empty(),
+                advisory_path: other_candidate.evidence.advisory_path.clone(),
+            },
+        )
+        .unwrap();
+    runtime.record_runtime_lease_observations().unwrap();
+
+    let now = Instant::now();
+    let first_turn = match runtime.readers_mut().unwrap().poll(now).unwrap() {
+        ReaderPoll::Data(turn) => turn,
+        other => panic!("expected first reader data, got {other:?}"),
+    };
+    assert_eq!(first_turn.file_id(), file_id);
+    assert_eq!(first_turn.source_offset(), 1);
+    assert_eq!(first_turn.bytes(), b"b");
+    runtime
+        .readers_mut()
+        .unwrap()
+        .complete_turn(first_turn, 1, TurnDisposition::Ready)
+        .unwrap();
+    let eviction = match runtime.readers_mut().unwrap().poll(now).unwrap() {
+        ReaderPoll::EvictionRequired(request) => request,
+        other => panic!("expected descriptor eviction, got {other:?}"),
+    };
+    assert_eq!(eviction.victim_file_id, file_id);
+    assert_eq!(eviction.target_file_id, other_file_id);
+    runtime.discard_framer(eviction.victim_file_id).unwrap();
+    runtime
+        .readers_mut()
+        .unwrap()
+        .confirm_eviction(eviction)
+        .unwrap();
+    let frontier = runtime.readers_ref().unwrap().frontier(file_id).unwrap();
+    assert!(frontier.present);
+    assert!(!frontier.descriptor_resident);
+    assert_eq!(frontier.read_offset, frontier.committed_offset);
+
+    DescriptorEvictedRuntime {
+        _directory: directory,
+        runtime,
+        candidate,
+        file_id,
+        locator,
+        other_file_id,
+        other_locator,
+    }
+}
+
+/// Scenario: complete reconciliation removes a descriptor-evicted Active
+/// identity while another reader remains schedulable.
+/// Guarantees: reconciliation containment releases the reader and lease,
+/// clears every volatile owner, preserves the durable record exactly, records
+/// one capture limitation, and remembers the detached locator association.
+#[test]
+fn reconciled_descriptor_absence_releases_volatile_ownership() {
+    let mut fixture = descriptor_evicted_runtime(Duration::from_secs(1));
+    let runtime = &mut fixture.runtime;
+    let durable_before = runtime.store.table().get(&fixture.file_id).unwrap().clone();
+    let wal_transactions_before = runtime.store.stats().wal_transactions;
+    let telemetry_before = runtime
+        .telemetry
+        .counter_for_test(WorkerCounter::RotationDescriptorUnavailable);
+    let now = Instant::now();
+    let seed_window = runtime
+        .readers_mut()
+        .unwrap()
+        .committed_frontier_window(fixture.file_id, 1)
+        .unwrap();
+    let framer = Framer::from_runtime(
+        fixture.file_id,
+        1,
+        &runtime.config,
+        1,
+        FramingResume::Clean,
+        false,
+        seed_window,
+        now,
+    )
+    .unwrap();
+    let previous = runtime.framers.insert(
+        fixture.file_id,
+        ActiveFramer {
+            framer,
+            base: FramerBase {
+                file_epoch: 1,
+                committed_offset: 1,
+                framing_resume: FramingResume::Clean,
+            },
+            pending_bytes: 0,
+        },
+    );
+    assert!(previous.is_none());
+    let _ = runtime.rotation_waits.insert(
+        fixture.file_id,
+        RotationWait {
+            stable_since: now,
+            deadline: now,
+        },
+    );
+    let _ = runtime.drain_limits.insert(fixture.file_id, 1);
+    runtime.drain_order.push(fixture.file_id);
+
+    let mut competing_scope = register_receiver_scope(1).unwrap();
+    assert!(matches!(
+        competing_scope.try_acquire(fixture.locator),
+        Err(LeaseError::Contended { .. })
+    ));
+    let mut feedback = DiscoveryFeedback::default();
+    assert!(
+        runtime
+            .handle_removed_candidate(fixture.locator, &mut feedback)
+            .unwrap()
+    );
+
+    assert_eq!(feedback.finalized, vec![fixture.locator]);
+    assert!(feedback.durable.is_empty());
+    assert!(feedback.released.is_empty());
+    assert!(
+        !runtime
+            .readers_ref()
+            .unwrap()
+            .contains_file(fixture.file_id)
+    );
+    assert!(!runtime.framers.contains_key(&fixture.file_id));
+    assert!(!runtime.rotation_waits.contains_key(&fixture.file_id));
+    assert!(!runtime.drain_limits.contains_key(&fixture.file_id));
+    assert!(!runtime.drain_order.contains(&fixture.file_id));
+    assert_eq!(
+        runtime.inactive_locators.get(&fixture.locator),
+        Some(&fixture.file_id)
+    );
+    assert_eq!(
+        runtime.store.table().get(&fixture.file_id),
+        Some(&durable_before)
+    );
+    assert_eq!(durable_before.lifecycle_state, LifecycleState::Active);
+    assert_eq!(
+        runtime.store.stats().wal_transactions,
+        wal_transactions_before
+    );
+    assert_eq!(
+        runtime
+            .telemetry
+            .counter_for_test(WorkerCounter::RotationDescriptorUnavailable),
+        telemetry_before + 1
+    );
+    assert!(runtime.retention_schedule_dirty);
+
+    let released_lease = competing_scope.try_acquire(fixture.locator).unwrap();
+    released_lease.release().unwrap();
+    competing_scope.close().unwrap();
+
+    let other_turn = match runtime.readers_mut().unwrap().poll(Instant::now()).unwrap() {
+        ReaderPoll::Data(turn) => turn,
+        other => panic!("expected unrelated reader progress, got {other:?}"),
+    };
+    assert_eq!(other_turn.file_id(), fixture.other_file_id);
+    assert_eq!(other_turn.bytes(), b"z");
+    runtime
+        .readers_mut()
+        .unwrap()
+        .complete_turn(other_turn, 1, TurnDisposition::Paused)
+        .unwrap();
+    runtime.shutdown_resources().unwrap();
+}
+
+/// Scenario: a compatible candidate reappears with the exact locator after
+/// reconciliation detached its descriptor-free Active identity.
+/// Guarantees: identity selects the existing file ID, insertion reacquires one
+/// lease, removes detached state only after success, and reads from durable
+/// offset 1 instead of applying `start_at: beginning`.
+#[test]
+fn exact_locator_reappearance_reconnects_detached_identity() {
+    let mut fixture = descriptor_evicted_runtime(Duration::from_secs(1));
+    let runtime = &mut fixture.runtime;
+    let mut feedback = DiscoveryFeedback::default();
+    assert!(
+        runtime
+            .handle_removed_candidate(fixture.locator, &mut feedback)
+            .unwrap()
+    );
+    assert_eq!(
+        runtime.inactive_locators.get(&fixture.locator),
+        Some(&fixture.file_id)
+    );
+
+    let candidate_evidence = vec![fixture.candidate.evidence.clone()];
+    let inventory = CandidateInventory::from_complete_reconciliation(
+        &candidate_evidence,
+        &HashSet::from([fixture.other_locator]),
+        runtime.identity_settings.fingerprint_bytes,
+    );
+    let confirmed_path_bindings = HashSet::from([fixture.locator]);
+    let mut plan = plan_with_admission(
+        &runtime.store,
+        &candidate_evidence,
+        &inventory,
+        &runtime.identity_settings,
+        2,
+        &HashSet::new(),
+        &confirmed_path_bindings,
+    )
+    .unwrap();
+    let resolutions = plan
+        .persist_cancellable(&mut runtime.store, || false)
+        .unwrap()
+        .unwrap();
+    let [IdentityResolution::Resolved(identity)] = resolutions.as_slice() else {
+        panic!("exact locator must resolve one active identity");
+    };
+    assert_eq!(identity.file_id, fixture.file_id);
+    assert_eq!(identity.matched_by, IdentityMatch::ExactLocator);
+    assert_eq!(identity.committed_offset, 1);
+    let identity = identity.clone();
+    let leases_before = runtime
+        .telemetry
+        .counter_for_test(WorkerCounter::RuntimeLeaseWaits);
+    let records_before = runtime.store.table().len();
+
+    runtime
+        .reinsert_updated_active_reader(fixture.candidate.clone(), identity)
+        .unwrap();
+
+    assert_eq!(
+        runtime
+            .readers_ref()
+            .unwrap()
+            .file_id_for_locator(fixture.locator)
+            .unwrap(),
+        fixture.file_id
+    );
+    assert!(!runtime.inactive_locators.contains_key(&fixture.locator));
+    assert_eq!(runtime.store.table().len(), records_before);
+    assert_eq!(
+        runtime
+            .telemetry
+            .counter_for_test(WorkerCounter::RuntimeLeaseWaits),
+        leases_before + 1
+    );
+    runtime
+        .readers_mut()
+        .unwrap()
+        .pause(fixture.other_file_id)
+        .unwrap();
+    let resumed = match runtime
+        .readers_mut()
+        .unwrap()
+        .poll_until(Instant::now(), fixture.file_id, 2)
+        .unwrap()
+    {
+        ReaderPoll::Data(turn) => turn,
+        other => panic!("expected resumed reader data, got {other:?}"),
+    };
+    assert_eq!(resumed.file_id(), fixture.file_id);
+    assert_eq!(resumed.source_offset(), 1);
+    assert_eq!(resumed.bytes(), b"b");
+    runtime
+        .readers_mut()
+        .unwrap()
+        .complete_turn(resumed, 1, TurnDisposition::Paused)
+        .unwrap();
+    runtime.shutdown_resources().unwrap();
+}
+
+/// Scenario: after descriptor-free finalization, the operating system reuses
+/// the locator for incompatible file evidence before retention removes the old
+/// Active record.
+/// Guarantees: identity atomically retires the old record, detached-state
+/// cleanup removes its stale locator association, and the replacement identity
+/// can be admitted without a fatal mismatch.
+#[test]
+fn locator_reuse_prunes_retired_detached_association() {
+    let mut fixture = descriptor_evicted_runtime(Duration::ZERO);
+    let runtime = &mut fixture.runtime;
+    let mut feedback = DiscoveryFeedback::default();
+    assert!(
+        runtime
+            .handle_removed_candidate(fixture.locator, &mut feedback)
+            .unwrap()
+    );
+    assert_eq!(
+        runtime.inactive_locators.get(&fixture.locator),
+        Some(&fixture.file_id)
+    );
+
+    let mut reused_candidate = fixture.candidate.clone();
+    reused_candidate.evidence.fingerprint = vec![0xFF; reused_candidate.evidence.fingerprint.len()];
+    let candidate_evidence = vec![reused_candidate.evidence.clone()];
+    let inventory = CandidateInventory::from_complete_reconciliation(
+        &candidate_evidence,
+        &HashSet::from([fixture.other_locator]),
+        runtime.identity_settings.fingerprint_bytes,
+    );
+    let mut plan = plan_with_admission(
+        &runtime.store,
+        &candidate_evidence,
+        &inventory,
+        &runtime.identity_settings,
+        3,
+        &HashSet::new(),
+        &HashSet::new(),
+    )
+    .unwrap();
+    let resolutions = plan
+        .persist_cancellable(&mut runtime.store, || false)
+        .unwrap()
+        .unwrap();
+    let [IdentityResolution::Resolved(identity)] = resolutions.as_slice() else {
+        panic!("reused locator must resolve one replacement identity");
+    };
+    assert_eq!(identity.matched_by, IdentityMatch::RecoveryMismatch);
+    assert_ne!(identity.file_id, fixture.file_id);
+    assert!(runtime.store.table().get(&fixture.file_id).is_none());
+    assert!(runtime.store.table().get(&identity.file_id).is_some());
+    assert!(runtime.inactive_locators.contains_key(&fixture.locator));
+
+    runtime.prune_inactive_locators_without_durable_records();
+    assert!(!runtime.inactive_locators.contains_key(&fixture.locator));
+    runtime
+        .readers_mut()
+        .unwrap()
+        .insert(reused_candidate, identity.clone())
+        .unwrap();
+    runtime.record_runtime_lease_observations().unwrap();
+    assert_eq!(
+        runtime
+            .readers_ref()
+            .unwrap()
+            .file_id_for_locator(fixture.locator)
+            .unwrap(),
+        identity.file_id
+    );
+    runtime.shutdown_resources().unwrap();
+}
+
+/// Scenario: descriptor-free containment is followed by complete absence,
+/// an elapsed retention interval, and one deliberate rotation-wait veto.
+/// Guarantees: released runtime state no longer vetoes retention, the real
+/// veto parks removal, and clearing it enables one atomic filtered compaction
+/// that removes both the durable record and detached association.
+#[test]
+fn descriptor_free_containment_allows_revalidated_retention() {
+    let mut fixture = descriptor_evicted_runtime(Duration::from_secs(1));
+    let runtime = &mut fixture.runtime;
+    let mut removal_feedback = DiscoveryFeedback::default();
+    assert!(
+        runtime
+            .handle_removed_candidate(fixture.locator, &mut removal_feedback)
+            .unwrap()
+    );
+    assert!(!runtime.retention_vetoed(fixture.file_id));
+
+    let now = Instant::now();
+    let absent_since = now.checked_sub(Duration::from_secs(2)).unwrap();
+    runtime.observe_retention_inventory(&retention_inventory_at(absent_since, &[], true));
+    assert_eq!(
+        runtime.absence_since.get(&fixture.file_id),
+        Some(&absent_since)
+    );
+    let _ = runtime.rotation_waits.insert(
+        fixture.file_id,
+        RotationWait {
+            stable_since: absent_since,
+            deadline: absent_since,
+        },
+    );
+    runtime.retention_revalidation_requested_at =
+        Some(absent_since.checked_add(Duration::from_secs(1)).unwrap());
+    let vetoed_inventory = retention_inventory_at(now, &[], true);
+    runtime.observe_retention_inventory(&vetoed_inventory);
+    let mut vetoed_feedback = DiscoveryFeedback::default();
+    assert!(
+        runtime
+            .apply_revalidated_retention(
+                &mut vetoed_feedback,
+                vetoed_inventory.started_at,
+                vetoed_inventory.stats.generation,
+                now,
+            )
+            .unwrap()
+    );
+    assert!(runtime.store.table().get(&fixture.file_id).is_some());
+    assert!(vetoed_feedback.released.is_empty());
+
+    let _ = runtime.rotation_waits.remove(&fixture.file_id);
+    runtime.retention_revalidation_requested_at = Some(now);
+    let completed_at = now.checked_add(Duration::from_millis(1)).unwrap();
+    let revalidated = retention_inventory_at(completed_at, &[], true);
+    runtime.observe_retention_inventory(&revalidated);
+    let generation_before = runtime.store.generation();
+    let mut feedback = DiscoveryFeedback::default();
+    assert!(
+        runtime
+            .apply_revalidated_retention(
+                &mut feedback,
+                revalidated.started_at,
+                revalidated.stats.generation,
+                completed_at,
+            )
+            .unwrap()
+    );
+
+    assert!(runtime.store.table().get(&fixture.file_id).is_none());
+    assert!(!runtime.inactive_locators.contains_key(&fixture.locator));
+    assert_eq!(runtime.store.generation(), generation_before + 1);
+    assert_eq!(
+        feedback.released,
+        vec![DiscoveryRelease::RetentionRemoved(RetentionRemovalAck {
+            locator: fixture.locator,
+            reconciliation_generation: revalidated.stats.generation,
+        })]
+    );
     runtime.shutdown_resources().unwrap();
 }
 
