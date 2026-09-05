@@ -146,7 +146,7 @@ reading implementation detail first.
 | Rotation | Supports move/create; a recognized replacement needing a new identity starts at zero, while its own existing durable state wins; copytruncate remains best-effort |
 | Delivery semantics | At least once after emission when no intentional-loss policy is selected; retry or crash can produce duplicates |
 | Durability | Does not spool emitted OTAP batches to disk |
-| Resource behavior | Uses fixed workers, bounded state, bounded work turns, and backpressure |
+| Resource behavior | Uses fixed workers, bounded state and turns; descriptor turnover preserves partial progress within the local byte budget, whose exhaustion is an explicit receiver failure |
 | Failure isolation | Most source failures are per-file; batch, ownership, runtime-lease integrity, and checkpoint failures can stop the receiver |
 | Ownership | Serializes one local checkpoint namespace and prevents duplicate in-process readers; provides no distributed fencing |
 | Ack topology | Receives one engine-aggregated completion per batch attempt; required broadcast destinations use automatic Ack propagation and all-required-subscriber aggregation |
@@ -324,6 +324,14 @@ The topology is fixed: one discovery thread and one read/checkpoint thread per
 Phase 1 receiver, never one thread per file, directory, or mount. The factory
 rejects a source pipeline with more than one core for this receiver. Downstream
 topic fanout is the Phase 1 parallelism boundary.
+
+Descriptor residency is independent of bounded unfinished-record state. Closing
+an evictable handle preserves its reader's partial state for validated reopen;
+confirmed descriptor-free disappearance and terminal cleanup release it. A
+separate aggregate partial-state cap fails the receiver explicitly on exhaustion
+rather than repeatedly discarding progress or pinning unfinished files forever.
+The process memory limiter remains the outer guardrail and can pause new source
+intake while existing completion and cleanup work stays serviceable.
 
 Bounded channels separate the components. Slow downstream delivery eventually
 stops source reads, leaving unread bytes in files rather than accumulating an
@@ -565,6 +573,7 @@ receivers:
       limits:
         max_open_files: 512
         max_read_bytes_per_turn: 128KiB
+        max_partial_state_bytes: 256MiB
       batch:
         max_records: 1024
         max_bytes: 8MiB
@@ -598,6 +607,11 @@ intentionally excluded by `start_at: end`.
 Pinned rotated handles can occupy every open-file slot and pause descriptor
 admission for new/live files until finalization succeeds or capacity is raised;
 Phase 1 does not hide that condition behind a deadline-triggered loss policy.
+The proposed 256 MiB partial-state budget is independent of tracked checkpoint
+history and descriptor capacity; it is not a per-instance RSS promise. Too many
+simultaneous unfinished records can exhaust it and terminate collection without
+advancing unacknowledged progress. Its default and conservative sizing require
+workload qualification. Restart alone does not solve capacity exhaustion.
 The default eight-attempt delivery policy contributes about 11.3 seconds of
 scheduled backoff before `on_nack: fail` terminates the receiver; the same
 budget applies to pre-publication `NoRoute`. Supervisor restart can duplicate
@@ -747,7 +761,7 @@ tests alone do not establish production readiness.
 | Discovery | Growing-file admission; include/exclude and alias behavior; new-only `ignore_older_than`; complete/incomplete inventories; independently bounded jittered reconciliation and EOF reprobe; safe FIFO/device/link probing; cancellation; overflow rediscovery and fairness; no false removal |
 | Identity | Exact-locator recovery guarded by prefix and committed-frontier evidence; changed-locator equal fingerprints; lifecycle eligibility; framing-profile incompatibility; locator reuse; growing evidence; unrelated-file `start_at`; matched-path offset-zero rotation replacement; quarantine reconnection; durable registration |
 | Ownership | Namespace serialization; overlapping-pattern runtime leases; lease survival across descriptor eviction; fail-closed registry behavior; no readiness overclaim |
-| Readers and bounds | Open-descriptor cap plus process-limit warning; transient-probe cap; `EMFILE`/`ENFILE` backoff; shared source-turn buffer; eviction blocked by unresolved deltas; carry-over without reread; hot/cold fairness; EOF reprobe; checked arithmetic; conservative aggregate admission |
+| Readers and bounds | Open-descriptor cap plus process-limit warning; transient-probe cap; `EMFILE`/`ENFILE` backoff; shared source-turn buffer; eviction blocked by unresolved deltas; charged partial state across descriptor turnover and Ack waits; explicit exhaustion and process-pressure composition; carry-over without reread; hot/cold fairness; EOF reprobe; checked arithmetic; conservative aggregate admission |
 | Decoding and framing | Every supported encoding; LF, CR, BOM, NUL, malformed input, source ranges, multiline bounds, split/truncate determinism and decode-fail precedence, continuation restart, incomplete-unit idle flush, and marked D17 terminal emission |
 | OTAP boundary | Raw body; lossless registered path when available; bounded native-path/fragment registry; observed time; deferred generic offset/number; no receiver semantic parsing; bounded cardinality |
 | Delivery | Nonempty ready membership; engine-aggregated all-required Ack; graph rejection without every Ack dependency; universal unresolved-delta ordering; uniform bounded Nack retry; retry exhaustion; atomic progress bound; receiver-wide coupling |

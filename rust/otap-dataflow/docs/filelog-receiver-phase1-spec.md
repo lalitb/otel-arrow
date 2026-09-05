@@ -175,6 +175,7 @@ receivers:
         max_pending_candidates: 10000
         max_open_files: 512
         max_read_bytes_per_turn: 128KiB
+        max_partial_state_bytes: 256MiB
       batch:
         max_records: 1024
         max_bytes: 8MiB
@@ -229,6 +230,7 @@ receivers:
 | `limits.max_pending_candidates` | `10000` | Nonzero retained pending population |
 | `limits.max_open_files` | `512` | Nonzero resident tail-handle population |
 | `limits.max_read_bytes_per_turn` | `128KiB` | Nonzero source-byte turn bound |
+| `limits.max_partial_state_bytes` | `256MiB` | Aggregate charged unfinished-record state, independent of descriptor residency; provisional default, not an RSS limit; exhaustion is receiver-terminal |
 | `batch.max_records` | `1024` | `1..=65535` |
 | `batch.max_bytes` | `8MiB` | Nonzero logical batch-size bound |
 | `batch.max_flush_period` | `1s` | Nonzero first-record batch deadline |
@@ -425,6 +427,12 @@ The following relationships are enforced:
     which the conformance specification defines a provisional ceiling remains
     within that named ceiling; models without one are not compared against an
     invented limit.
+50. `limits.max_partial_state_bytes` is nonzero, fits `usize`, and admits the
+    implementation-derived conservative peak for one unfinished reader under
+    the selected encoding and framing configuration. This includes allocation
+    growth and mutable decoder/framer state. The aggregate working-set sum
+    includes this budget once, with shared buffers and batch state separately
+    accounted. Overflow or an insufficient budget rejects startup.
 
 Separately, engine topology validation rejects a filelog path that requires
 Ack-gated progress across broadcast subscribers unless it provides automatic
@@ -1093,7 +1101,14 @@ Ready logical readers are scheduled round-robin. One source turn:
 
 The bound counts source bytes, not decoded UTF-8 size. A hot file cannot consume an
 unbounded turn. Round-robin provides recurring turns among ready admitted readers, but
-it does not remove receiver-wide Ack head-of-line blocking.
+it does not remove receiver-wide Ack head-of-line blocking. Within the admitted
+partial-state budget, descriptor turnover alone cannot repeatedly erase progress
+toward an available framing-eligible record. This applies to every framing
+policy, including records that need multiple turns before their first split
+fragment. It assumes successful source I/O and downstream/checkpoint progress;
+it does not promise a boundary from a writer that never supplies one with idle
+flush disabled. Aggregate partial-state exhaustion follows the explicit
+receiver failure rule below, not silent starvation.
 
 ### EOF scheduling
 
@@ -1118,24 +1133,150 @@ Eviction is a handshake:
 3. Require that the victim owns no unresolved delta in the open batch,
    retained batch, or carry-over record. If every potential victim owns such a
    delta, seal and resolve the open batch before reclaiming a slot.
-4. Preserve applied checkpoint progress and any separately owned carry-over
-   record state.
-5. Discard decoder, physical-line, multiline, provisional record, speculative
-   rolling guard bytes, and every other state derived after applied progress.
-6. Rewind its in-memory frontier and rolling guard to applied progress.
-7. Close the descriptor.
-8. Keep its runtime lease.
-9. Make the slot available.
+4. Preserve the reader's bounded unfinished state and provisional source frontier
+   under its existing partial-state reservation.
+5. Close the descriptor without resetting decoding, framing, idle-flush evidence,
+   or the provisional frontier.
+6. Keep its runtime lease and logical scheduling state.
+7. Make the descriptor slot available.
 
-Reopen obtains a new handle, validates it as a regular file, validates the exact
-locator, fingerprint, and committed-frontier evidence, retains the validated
-raw guard window as the rolling-window seed, seeks to the latest live applied
-progress, and reconstructs all later state from source bytes. Restart recovery validates the
-authoritative snapshot, replays every complete valid WAL transaction present, and seeks
-to the resulting recovered progress. The filesystem-synced durable frontier is only
-the guaranteed recovery floor.
+A partial record alone never pins a descriptor. An EOF reader with an unfinished
+record remains an eviction candidate, including when idle flush is disabled.
+The separate pinned-rotation and unresolved-delta protections still apply.
 
-If those bytes disappeared, ordinary restart/reopen recovery cannot reconstruct them.
+### Retained partial state and reopen
+
+Each logical reader owns its unfinished state independently of its descriptor.
+The state is volatile and includes only what bounded continuation requires:
+
+- exact retained raw bytes and decoded text required by the selected policy;
+- decoder partial units and BOM state, physical-line/multiline state, pending
+  separators and lookahead, and any unread remainder of the shared source turn;
+- provisional source positions and body/frame ranges, split/scan mode and
+  counters, and the bounded prefix retained during oversize truncate;
+- the rolling 64-byte raw-source window at the provisional read frontier and
+  its digest, plus continuity evidence needed at the applied frontier; and
+- EOF, last-activity, and idle-flush scheduling evidence.
+
+Discarded truncate-tail bytes are not retained. The reader retains the bounded
+prefix, decoder state, scan position, counters, and rolling continuity window.
+Under decode `fail`, scanning still checks the complete discarded range before
+making that record emit-ready. A descriptor close neither authorizes progress
+nor changes this precedence. Mutable source-turn bytes needed after yielding
+must be transferred into charged reader-owned storage before the shared buffer
+is reused. Batch and carry-over ownership must not alias mutable partial state.
+
+Reopen validates the opened regular file, exact locator, fingerprint, and latest
+applied committed-frontier guard. Before combining retained state with any new
+bytes, it also requires current size to cover the provisional read frontier and
+validates the retained trailing window at that frontier using the existing
+frontier-guard digest recipe. It then seeks to that provisional frontier,
+processes any already-owned input remainder in source order, and continues
+without rereading the partial record. Ordinary close/reopen never resets its
+activity clock or treats reconstruction as newly appended source activity.
+
+Observed same-stream shrink or replacement evidence follows the existing
+`rotation.on_truncate` transition after resolving earlier deltas. A changed
+locator is handled through normal identity resolution and never receives the
+old reader's partial state. Evidence-read/open failures without deterministic
+change follow environmental retry, preserve charged state, and never authorize
+mixing unvalidated input or advancing progress. As with ordinary recovery,
+matching sampled prefix/frontier evidence cannot detect every rewrite of
+unchecked bytes; this is not whole-file authentication or writer fencing.
+
+An idle deadline on a nonresident reader requests descriptor service; before
+flushing it must revalidate and reprobe the source. Newly observed bytes cancel
+the old deadline under the ordinary idle-flush rule. Failure to obtain or
+validate a handle cannot manufacture EOF or an eligible timeout record.
+
+This state does not enter the checkpoint format. Process restart still loads
+the authoritative snapshot and complete valid WAL prefix, validates source
+identity, and reconstructs from recovered committed progress and surviving
+source bytes. No provisional frontier authorizes a restart seek.
+
+### Partial-state admission and exhaustion
+
+`max_tracked_files` bounds durable identity/history, `max_open_files` bounds
+resident descriptors, and `max_partial_state_bytes` bounds the aggregate
+charged unfinished state of resident and nonresident readers. They are distinct
+resources. The partial-state budget is reserved in the aggregate admission
+model, but payload allocations may be lazy.
+
+Before creating or growing unfinished state, the worker reserves its full
+additional charge, including old and new allocations that coexist during
+replacement. It first releases only state no longer required by a reader,
+batch, or carry-over. Transfers between these owners preserve accounting and
+cannot temporarily double-charge or omit shared allocations. The conformance
+resource model defines the charge and required sizing evidence.
+
+If the additional reservation cannot fit, collection stops with a distinct
+receiver-terminal `partial_state_budget_exhausted` error. It never waits
+indefinitely for another writer to finish, evicts unfinished state to retry
+from applied progress, changes framing boundaries, or invokes `on_nack` as a
+memory-loss policy. Report the budget, current and requested charge, and partial
+reader count through bounded telemetry, then use forced-shutdown cleanup.
+No allocation beyond the budget or new emission is admitted; unacknowledged
+progress remains unchanged and pending batch/carry-over data receives the
+existing terminal-failure reporting. Valid already-applied progress remains
+valid. No otherwise valid file is quarantined because of this resource error.
+A shutdown request or detached worker is not proof of memory release: charges
+remain with buffers until their actual cleanup. A kernel-blocked worker can
+outlive the async task under the existing lifecycle limitation.
+
+The 256 MiB initial default is provisional and is not a per-process reservation
+shared among receiver instances. Deployment sizing leaves room for every
+instance's other state, downstream retention, thread/runtime overhead, and
+process-memory headroom; the sum of local caps is not a safe RSS target.
+Qualification measures retained layouts and realistic workloads before claiming suitable defaults. Increasing
+the budget, reducing framing bounds, or narrowing the configured source workload
+may be necessary. Restart alone does not resolve sustained exhaustion and can
+repeat the failure. This is explicit capacity failure, not a guarantee of
+continued collection for arbitrarily many simultaneous unfinished records.
+
+### Composition with engine memory controls
+
+This local capacity bound follows the distinction in
+[Memory Resource Management](memory-resource-management.md#local-capacity-and-durable-buffering).
+It is a source-buffer safety limit, not an engine-wide retained-work quota,
+allocator measurement, or RSS guarantee. It applies at every process pressure
+level and is not disabled by memory-limiter observe-only mode. Its reservations
+are worker-local bookkeeping, not the proposed engine `MemoryTicket` API.
+
+The existing [process memory limiter](memory-limiter-phase1.md) remains the
+outer guardrail. The async receiver initializes its admission view from the
+engine snapshot, handles `MemoryPressureChanged`, ignores stale generations,
+and delivers the latest state to both workers through bounded, coalesced
+control independent of ordinary work-channel capacity. Under enforced `Hard`
+pressure, workers pause new candidate admission and source-read turns between
+bounded operations. They do not sample RSS or query allocator statistics on
+read paths. Already-running kernel calls retain the documented cancellation
+limitation.
+
+Ack/Nack handling, admitted batch delivery, checkpoint completion, control,
+telemetry, and cleanup remain serviceable while source intake is paused, within
+all existing bounds. Already-owned data may complete without admitting new
+source bytes; pressure never fabricates Ack, drops a partial record, or enables
+an allocation beyond its local capacity. On engine pressure recovery, scheduling
+resumes with the retained state. A pause can persist when live retained data
+keeps the process above its recovery threshold; this is observable process
+backpressure, not proof of local capacity exhaustion. Source/EOF deadlines
+blocked by pressure are parked until recovery rather than repeatedly scheduling
+expired timers; control and completion deadlines remain active. `Soft` alone and
+observe-only pressure do not invoke this pause or terminal failure.
+
+[RFC 0002](../rfcs/0002-pressure-aware-rate-throttling.md) limits ingress rate,
+not retained bytes. A Filelog-specific rate unit, admission point, and binding
+require separate integration; this proposal does not silently reinterpret an
+OTLP request-byte policy as a Filelog memory budget. Until that integration is
+defined, unsupported Filelog rate-policy bindings must be rejected.
+
+The [observe-only retained-work proposal](../rfcs/0000-observe-only-retained-work-accounting.md)
+can later attribute partial-reader, batch, and carry-over retention at their
+actual ownership sites. Its logical ticket estimates and allocator-origin
+telemetry are diagnostic, not inputs to this capacity decision. Allocation on
+the dedicated worker must not be assumed to appear in pipeline-thread heap
+metrics. Local capacity telemetry reports its declared conservative charge,
+separately from logical retained-work and process-memory measurements.
 
 ### Removal and pinned descriptors
 
@@ -1170,6 +1311,10 @@ When `checkpoint.retention` is zero, the detached record remains in the
 checkpoint and continues consuming one `max_tracked_files` slot until it
 reconnects or audited administration removes it. Containment releases runtime
 resources; it does not implicitly expire durable state.
+
+Unlike descriptor eviction, confirmed descriptor-free disappearance discards
+the volatile partial state and releases its reservation after the existing
+unresolved-delta conditions hold. Temporary reopen failure is not this path.
 
 This containment admits that late writes may have been missed; it does not
 claim a lossless EOF or authorize source progress. Phase 1 has no implicit
@@ -1210,10 +1355,12 @@ metadata obey the ordinary record bounds, so it always fits an empty next
 batch. A second carry-over cannot be created: source reading stops when the
 first is retained.
 
-The current open batch seals and becomes the retained batch. State after its
-last included delta, including speculative rolling guard bytes, is rewound to
-that delta's resulting frontier and guard, except that the carry-over and its
-post-frame state remain separately owned. After the retained batch reaches its
+The current open batch seals and becomes the retained batch. Unfinished state after its
+last included delta remains charged and owned by its logical reader, including
+provisional positions and rolling guard bytes; it is not discarded on sealing
+or Ack release. The carry-over and its post-frame state remain separately
+owned. Applying progress updates the applied frontier without rewinding a
+validated provisional frontier or processing owned bytes twice. After the retained batch reaches its
 terminal Ack/Nack or explicit-loss outcome and applicable checkpoint progress
 is applied, the carry-over seeds the next open batch before any source read.
 This works even if the source was renamed, truncated, or otherwise changed
@@ -1937,7 +2084,9 @@ The worker:
 6. Applies that transaction all-or-nothing to live checkpoint state.
 7. Syncs according to the checkpoint policy.
 8. Releases the retained batch at the release point defined below.
-9. Reconstructs readers and resumes source scheduling only after release.
+9. Resumes readers from their retained volatile state only after release,
+   performing reopen validation for nonresident readers before continuation and
+   respecting any enforced process-pressure pause.
 
 No retained batch is released and no source scheduling resumes if preflight, WAL
 append, or logical application fails. With a zero sync interval, sync failure also
@@ -2732,9 +2881,10 @@ On `DrainIngress` while downstream remains live:
 1. Stop discovery and new admissions.
 2. Capture each reader's current provisional source frontier and stop ordinary tail
    scheduling and advancement beyond it.
-3. Cancel pending descriptor acquisition.
-4. Permit bounded rereads only to reconstruct provisional bytes up to the captured
-   frontiers.
+3. Cancel ordinary pending descriptor acquisition; any reopen needed to
+   validate already-owned state remains bounded by the drain deadline.
+4. Process retained, already-read input only up to those captured frontiers;
+   validate reopened handles as needed without admitting later source bytes.
 5. Apply a partial-record flush only when the existing EOF-gated idle-flush condition
    is already satisfied.
 6. Seal and flush a nonempty open batch.
@@ -2747,9 +2897,9 @@ On `DrainIngress` while downstream remains live:
 11. Complete an already-eligible rotation finalization only under the full
     finalization preconditions; drain does not shorten `rotate_wait` or invoke
     permanent EOF for an ordinary live reader.
-12. Discard speculative rolling guard bytes and rewind every uncommitted
-    in-memory tail to durable progress for cleanup. Any later reopen/recovery
-    reseeds the rolling window from the validated durable guard range.
+12. Release volatile partial state and its reservations only during terminal
+    cleanup, and rewind every uncommitted in-memory tail to durable progress.
+    Any later reopen/recovery reseeds the rolling window from the validated durable guard range.
 13. Close descriptors that have no unresolved rotated source.
 14. Release runtime leases.
 15. Release namespace ownership.
@@ -2811,6 +2961,7 @@ evidence, not merely an OS error number:
 | Structurally complete checkpoint CRC failure, namespace mismatch, impossible transition, or other checkpoint/namespace corruption | Receiver startup or receiver | Fail closed; never quarantine one file and never recover an automatic WAL prefix |
 | Namespace lock timeout | Receiver startup | Terminal without reading |
 | Lease-registry integrity failure | Receiver | Fail closed |
+| Partial-state reservation exceeds `limits.max_partial_state_bytes` | Receiver | Distinct resource-exhaustion failure and forced cleanup; no rewind/retry loop, quarantine, or unacknowledged progress |
 | Worker failure | Receiver | Terminal; do not invent progress |
 | Downstream closure or pre-publication `NoRoute` | Receiver-wide batch or receiver lifecycle | Aggregate Nack after accepted publication, or typed route error before acceptance; both consume bounded attempts and apply `on_nack` at exhaustion, never Ack |
 

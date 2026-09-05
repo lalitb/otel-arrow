@@ -72,6 +72,73 @@ terms cover delimiter lookahead and a pending decoded/source unit. Regex program
 decoder objects, allocator metadata, and library overhead remain separate bounded or
 measured terms.
 
+### Aggregate partial-state capacity
+
+`limits.max_partial_state_bytes` bounds charged unfinished state across all
+resident and nonresident readers. Durable tracked identities, partial readers,
+and resident descriptors are separate populations. Neither `max_open_files`
+nor the number of recently active files proves a bound on retained partial
+state. `max_tracked_files` still bounds the total logical-reader population,
+but does not reserve a maximum-sized payload for every historical identity.
+
+For each reader, the implementation derives a conservative charge from its
+owned buffer capacities, mutable decoder/framer allocations, and partial-state
+metadata. This is explicit allocation accounting with documented conservative
+container overhead, not allocator usable-size queries, RSS, or logical PData
+`MemoryTicket` sizes. The framer payload formula above remains a conservative
+per-reader payload peak; additional mutable state must be separately bounded.
+An implementation cannot claim complete accounting merely from body lengths.
+
+```text
+partial_state_used = sum(charged unfinished state for each partial reader)
+prospective_partial_state = partial_state_used + additional_allocation_charge
+prospective_partial_state <= limits.max_partial_state_bytes
+```
+
+All arithmetic is checked. The reservation precedes allocation and covers old
+and new buffers coexisting during growth, input remainders copied from the
+shared source turn, retained source/text representations, and continuity
+windows. Release follows actual ownership release. Transfers into a batch or
+carry-over move the charge between the relevant models without an unaccounted
+interval. Independent backing copies count independently; shared allocations
+are counted once within this physical-capacity model. This does not change the
+proposed logical retained-work RFC's per-owner attribution semantics.
+
+For aggregate admission, replace an unmultiplied single-reader framer allowance
+with the complete partial-state budget. Add the one shared source-turn buffer,
+shared immutable regex programs, checkpoint/identity state, and simultaneous
+batch/carry-over allocations once in their respective models. Mutable per-reader
+regex or decoder storage belongs in the partial-state charge. Do not multiply
+shared scratch by the durable tracked population or add the same framer payload
+again outside the budget.
+
+Startup derives a worst-case single-reader charge, including growth, and
+rejects a budget smaller than that value. The budget does not promise that all
+tracked files can simultaneously hold maximum-sized partial records. Runtime
+exhaustion follows the behavioral receiver-terminal rule; it is not a wait for
+unfinished writers or permission to discard-and-rewind readers.
+
+At the proposed defaults, the payload-only framer formula is 16,777,264 bytes
+per worst-case text/preserve-raw reader. A 256 MiB budget accommodates at most
+15 such simultaneous peaks before other mutable state is included. This is a
+conservative growth estimate, not measured steady retained size or a promised
+reader count. Conversely, 10,000 readers retaining only a 1 MiB payload each
+would already need about 9.77 GiB. Qualification must report measured retained
+and transient layouts, feasible concurrent partial-reader populations, and
+representative defaults rather than equating tracked history with RAM capacity.
+
+Oversize truncate retains its bounded prefix plus decoder/scan state and
+counters, never its complete discarded tail. Multiline sizing follows actual
+byte-bound and overflow state, not `max_multiline_lines * max_line_bytes`.
+Benchmarks include many short records, simultaneous long partial records,
+UTF-16/preserve-raw amplification, multiline lookahead, and arbitrarily long
+truncate scans. They also measure descriptor churn and control latency.
+
+This cap protects only Filelog unfinished state. It neither replaces the
+process-wide memory limiter nor implements the future pipeline retained-work
+budget. Deployment qualification includes process headroom and the combined
+working set of all configured receiver instances and downstream components.
+
 ### Reader table
 
 ```text
@@ -228,6 +295,9 @@ unbounded event queue or log flood.
 | `rotations` | Move/create finalizations and descriptor-free disappearance containment by bounded outcome |
 | `copytruncate_detected` | Observable truncation detections |
 | `descriptor_evictions` | Completed resident-handle evictions |
+| `partial_state_bytes` | Gauge of current conservative unfinished-state charge, including nonresident readers |
+| `partial_readers_waiting` | Gauge by bounded wait reason: framing boundary, descriptor capacity, or enforced process pressure; each waiting reader has one current reason |
+| `partial_state_budget_exhausted` | Count of terminal local-capacity failures; distinct from process Hard-pressure pauses |
 | `descriptor_reopen_failures` | Revalidation/reopen failures by reason |
 | `descriptor_budget_warnings` | Startup descriptor-budget warnings by bounded result |
 | `pinned_rotated_handles` | Current pinned rotated-handle count |
@@ -278,6 +348,8 @@ Rate-limited operator-visible events cover:
 - incomplete reconciliation and its reason;
 - candidate overflow and prolonged admission stall;
 - descriptor-budget incompatibility and environmental open/reprobe backoff;
+- partial-state exhaustion with budget, current/requested charge, and partial-reader count;
+- process-pressure intake pause and recovery, distinct from local exhaustion;
 - pinned rotated-handle saturation and oldest pinned age;
 - discovery traversal/evidence failure;
 - exclusion revocation;
@@ -409,14 +481,32 @@ while their semantic and format definitions remain normative from version 1.
 | Ownership | Two local processes open the same effective checkpoint namespace and state directory | Exactly one owns the namespace; the other waits or times out without reading or mutation |
 | Ownership | Current namespace owner releases its lock | A waiting local store can acquire ownership and recover before reading |
 | Reader | More tracked than open files | Resident handles remain bounded |
+| Configuration | Partial-state budget is zero, unrepresentable, or smaller than conservative one-reader peak | Startup rejects with formula and contributing values |
+| Reader | 513 files, 512 descriptors, 128 KiB turns, 256 KiB newline bodies, beginning admission, sufficient partial budget | Every stable complete record emits and advances after Ack; eviction never repeatedly resets its first chunk |
+| Reader | Split or multiline record needs multiple turns before its first eligible result | Progress survives descriptor turnover under the configured budget |
+| Reader | Partial EOF readers with idle flush disabled fill resident slots | They remain eviction candidates; other complete files progress while partial state remains charged |
+| Reader | Nonresident partial reader reaches idle deadline | Reopen and reprobe before flushing; new bytes cancel deadline; failed validation never fabricates EOF |
+| Reader | Truncate/decode-fail scan greatly exceeds body bound | Prefix and scan state survive eviction; tail bytes are not retained; other readers progress and later malformed input still quarantines before same-record progress |
+| Reader | Reopen size below provisional frontier or changed provisional guard | No unvalidated continuation; existing truncate/identity transitions apply after earlier deltas resolve |
+| Reader | Temporary reopen or evidence-read failure | Retain charged state, retry environmentally, and do not assert disappearance |
+| Resource | Partial-state reservation exactly fits remaining budget | Accepted, including peak old/new allocations and input remainder |
+| Resource | Next reservation exceeds budget | Distinct receiver-terminal failure before allocation; no wait-for-writer, rewind loop, loss-policy invocation, or quarantine |
+| Resource | Exhaustion with open/retained/carry-over data | Forced cleanup reports pending work and leaves unacknowledged progress unchanged |
+| Resource | Ownership moves partial state to batch/carry-over or releases state | No unaccounted copy, leaked reservation, or double counting across capacity models |
+| Resource | Supervisor restarts under unchanged exhausting workload | Failure may repeat; no claimed automatic capacity recovery |
+| Memory pressure | Enforced Hard during source intake | Stop new reads/admission between bounded operations; continue bounded completion/control/cleanup without releasing unfinished state |
+| Memory pressure | Soft or observe-only Hard | No pressure-driven source pause or terminal failure; local byte cap remains enforced |
+| Memory pressure | Recovery or stale pressure generation | Recovery resumes retained state; stale update cannot reopen admission |
+| Memory pressure | EOF/source deadline expires while intake is paused | Deadline is parked until recovery; no expired-timer spin or loss of completion/control responsiveness |
+| Memory pressure | Paused reader owns unfinished bytes that keep process above recovery threshold | Observable continued pressure pause, never implicit drop or fabricated completion |
 | Reader | Receiver FD budget exceeds process soft limit | Startup rejected before source open |
 | Reader | Receiver FD budget exceeds warning threshold | Bounded startup warning; no aggregate process-ownership claim |
 | Reader | `EMFILE` or `ENFILE` | Bounded backoff/admission pause; no quarantine |
 | Reader | Hot and cold ready files | Round-robin bounded turns |
 | Reader | Many EOF files | Deadline reprobe, no busy loop |
 | Reader | Turn hits source-byte bound | Stops and yields |
-| Reader | Descriptor eviction with partial state and no unresolved delta | Discard and rewind to applied progress |
-| Reader | Evict mid-record, reopen, then advance fewer than 64 bytes | Rolling guard reseeded from validated applied window; next digest covers correct mixed old/new trailing bytes |
+| Reader | Descriptor eviction with partial state and no unresolved delta | Preserve charged partial state and provisional frontier; close only the handle |
+| Reader | Evict mid-record, reopen, then advance fewer than 64 bytes | Validate applied and provisional windows; continue from retained state with correct rolling guard and no repeated source units |
 | Reader | Every eviction candidate owns an open/retained/carry-over delta | Seal/resolve before descriptor reuse; no overlapping reread |
 | Reader | Reopen same identity | Exact revalidation and deterministic reread |
 | Reader | Reopen mismatch | No read under old identity |
@@ -483,6 +573,7 @@ while their semantic and format definitions remain normative from version 1.
 | OTAP | Split fragment | Exact project-experimental ID/index/finality/body/frame attributes |
 | Batch | Final projected size crosses byte bound after framing | Exact bounded record retained as sole carry-over; no reread |
 | Batch | Multiple records same file | Contiguous delta coalesces |
+| Batch | Another file has an unfinished record when a batch seals and Acks | Partial state remains charged and resumes without rewind or double processing |
 | Batch | Delta gap or epoch mismatch | Rejected |
 | Batch | Configuration permits 4,096 records and batch reaches 4,096 distinct file deltas | One atomic progress transaction remains encodable |
 | Batch | Configuration permits more than 4,096 records and scheduler selects a 4,097th distinct file | Current batch seals before any source read for that file |
@@ -728,12 +819,15 @@ fresh record.
 
 ### Example 13: Descriptor eviction
 
-A reader has committed offset 100 and speculative decoded state through 140. Its
-descriptor owns no open, retained, or carry-over delta and is evicted. The
-speculative state is discarded and the logical reader rewinds to 100. Reopen
-validates identity and rereads source bytes from 100. If `[100, 140)` were
-represented by an unresolved batch delta, the reader would not be an eviction
-victim; the batch would seal and resolve before descriptor reuse.
+A reader has applied offset 100 and unfinished state through provisional read
+frontier 140. It owns no open, retained, or carry-over delta. Eviction closes its
+descriptor but retains the charged state and frontier. Reopen validates the
+exact locator, prefix, applied guard, and provisional trailing window, then
+continues at 140 without rereading or decoding `[100, 140)` again. A failed
+source-continuity check cannot combine that state with replacement bytes.
+Process restart is different: volatile state is gone, so recovery resumes from
+the authoritative checkpoint and surviving source bytes. Confirmed
+descriptor-free disappearance follows Example 19 and releases volatile state.
 
 ### Example 14: Equal fingerprints
 
