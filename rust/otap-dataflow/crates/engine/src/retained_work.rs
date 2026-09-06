@@ -7,7 +7,7 @@
 //! installation, telemetry export, and production charge sites are layered on
 //! separately.
 
-use otap_df_config::{DeployedPipelineKey, NodeId, PipelineKey};
+use otel_arrow_dfe_config::{DeployedPipelineKey, NodeId, PipelineKey};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
@@ -20,6 +20,8 @@ use std::rc::Rc;
 /// Owners are allocated by [`WorkOwnerRegistry`]. The two reserved values keep
 /// mixed and over-capacity ownership explicit without introducing unbounded
 /// request-derived labels.
+/// Registered IDs are meaningful only within the registry that assigned them;
+/// independent registries may assign the same number to different pipelines.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(transparent)]
 pub struct WorkOwnerId(u32);
@@ -160,9 +162,13 @@ impl LocalRetainedScope {
 
     /// Starts one attributed retained-work interval.
     ///
+    /// `Some(bytes)` records a known logical size. `None` records one
+    /// unknown-size item without guessing its byte size.
+    ///
     /// Accounting failures are diagnostics, not data-path failures. A charge
     /// site must continue processing the retained work without a ticket if this
     /// returns an error; observe-only accounting must never reject or drop it.
+    #[inline]
     pub fn charge(
         &self,
         site: RetainedWorkSite,
@@ -374,8 +380,8 @@ enum LocalRetainedCharge {
 /// holds an `Rc` to runtime-local state.
 ///
 /// ```compile_fail
-/// use otap_df_config::DeployedPipelineKey;
-/// use otap_df_engine::retained_work::{
+/// use otel_arrow_dfe_config::DeployedPipelineKey;
+/// use otel_arrow_dfe_engine::retained_work::{
 ///     LocalRetainedAccount, LocalRetainedScope, RetainedWorkScopeId,
 ///     RetainedWorkSite, WorkOwnerId,
 /// };
@@ -693,5 +699,71 @@ mod tests {
         assert_eq!(ticket.scope().component_id.as_ref(), "processor");
         assert_eq!(ticket.scope().owner, WorkOwnerId(2));
         ticket.complete().expect("completion should settle");
+    }
+
+    /// Scenario: outstanding tickets outlive the scope handle that created them.
+    /// Guarantees: attribution survives until settlement, both terminal paths
+    /// refund once, and the scope is freed after the last ticket is settled.
+    #[test]
+    fn tickets_keep_scope_alive_until_settlement() {
+        let account = LocalRetainedAccount::new();
+        let scope = test_scope(Rc::clone(&account));
+        let expected_id = scope.id().clone();
+        let weak_scope = Rc::downgrade(&scope.inner);
+        let completed = scope
+            .charge(RetainedWorkSite::RetryBuffer, Some(11))
+            .expect("charge should fit");
+        let abandoned = scope
+            .charge(RetainedWorkSite::BatchPending, None)
+            .expect("charge should fit");
+
+        drop(scope);
+        assert_eq!(completed.scope(), &expected_id);
+        assert_eq!(abandoned.scope(), &expected_id);
+        completed.complete().expect("completion should settle");
+        assert!(weak_scope.upgrade().is_some());
+        drop(abandoned);
+
+        assert!(weak_scope.upgrade().is_none());
+        assert_eq!(
+            account.snapshot(),
+            LocalRetainedSnapshot {
+                abandoned_items: 1,
+                ..LocalRetainedSnapshot::default()
+            }
+        );
+    }
+
+    /// Scenario: different owners and deployment generations share an account.
+    /// Guarantees: each ticket retains its own attribution and settling one
+    /// scope's work leaves the other scope's outstanding charge intact.
+    #[test]
+    fn scopes_preserve_independent_attribution_and_settlement() {
+        let account = LocalRetainedAccount::new();
+        let first_scope = test_scope(Rc::clone(&account));
+        let mut second_id = first_scope.id().clone();
+        second_id.deployed_pipeline.deployment_generation += 1;
+        second_id.component_id = "batch_processor".into();
+        second_id.owner = WorkOwnerId::MIXED;
+        let second_scope = LocalRetainedScope::new(Rc::clone(&account), second_id);
+        let first = first_scope
+            .charge(RetainedWorkSite::RetryBuffer, Some(11))
+            .expect("charge should fit");
+        let second = second_scope
+            .charge(RetainedWorkSite::BatchPending, Some(23))
+            .expect("charge should fit");
+
+        assert_ne!(first.scope(), second.scope());
+        assert_eq!(first.scope(), first_scope.id());
+        assert_eq!(second.scope(), second_scope.id());
+        assert_eq!(first.site(), RetainedWorkSite::RetryBuffer);
+        assert_eq!(second.site(), RetainedWorkSite::BatchPending);
+        assert_eq!(account.snapshot().retained_bytes, 34);
+
+        first.complete().expect("completion should settle");
+        assert_eq!(account.snapshot().retained_bytes, 23);
+        assert_eq!(second.scope(), second_scope.id());
+        second.complete().expect("completion should settle");
+        assert_eq!(account.snapshot(), LocalRetainedSnapshot::default());
     }
 }
