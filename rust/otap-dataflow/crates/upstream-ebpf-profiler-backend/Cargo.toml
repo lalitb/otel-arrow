@@ -1,0 +1,56 @@
+[package]
+name = "otel-arrow-dfe-upstream-ebpf-profiler-backend"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "Experimental bounded Rust userspace backend for the OpenTelemetry eBPF Profiler kernel artifact"
+keywords = ["ebpf", "observability", "profiling"]
+categories = ["development-tools::profiling", "os::linux-apis"]
+
+[features]
+default = []
+native = ["dep:aya", "dep:libc"]
+
+[dependencies]
+aya-obj.workspace = true
+hex.workspace = true
+object.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion.workspace = true
+tempfile.workspace = true
+
+[[example]]
+name = "inspect"
+
+[[example]]
+name = "capture"
+required-features = ["native"]
+test = true
+
+[[bench]]
+name = "event_decode"
+harness = false
+
+[[bench]]
+name = "aggregation"
+harness = false
+
+[[bench]]
+name = "reporting_window"
+harness = false
+
+[lints]
+workspace = true

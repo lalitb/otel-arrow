@@ -1,0 +1,1058 @@
+{
+  "schema_version": 1,
+  "compatibility_version": "upstream-06ea040c-arm64-v1",
+  "upstream_commit": "06ea040c39d3d17bc1534a5dcc044368caf48782",
+  "artifact": {
+    "sha256": "200a60f6bc10f8b964fd2b8170750f90bb7514bf73761948467c275b11d0849b",
+    "architecture": "arm64",
+    "elf_machine": "bpf",
+    "license": "GPL",
+    "programs": [
+      {
+        "name": "finish_task_switch",
+        "section": "kprobe/finish_task_switch",
+        "program_type": "kprobe",
+        "instruction_count": 965
+      },
+      {
+        "name": "kprobe__dummy",
+        "section": "kprobe/dummy",
+        "program_type": "kprobe",
+        "instruction_count": 16
+      },
+      {
+        "name": "kprobe__external",
+        "section": "kprobe/external",
+        "program_type": "kprobe",
+        "instruction_count": 955
+      },
+      {
+        "name": "kprobe__generic",
+        "section": "kprobe/generic",
+        "program_type": "kprobe",
+        "instruction_count": 943
+      },
+      {
+        "name": "kprobe_go_labels",
+        "section": "kprobe/go_labels",
+        "program_type": "kprobe",
+        "instruction_count": 415
+      },
+      {
+        "name": "kprobe_unwind_beam",
+        "section": "kprobe/unwind_beam",
+        "program_type": "kprobe",
+        "instruction_count": 679
+      },
+      {
+        "name": "kprobe_unwind_dotnet",
+        "section": "kprobe/unwind_dotnet",
+        "program_type": "kprobe",
+        "instruction_count": 929
+      },
+      {
+        "name": "kprobe_unwind_dotnet10",
+        "section": "kprobe/unwind_dotnet10",
+        "program_type": "kprobe",
+        "instruction_count": 919
+      },
+      {
+        "name": "kprobe_unwind_hotspot",
+        "section": "kprobe/unwind_hotspot",
+        "program_type": "kprobe",
+        "instruction_count": 1124
+      },
+      {
+        "name": "kprobe_unwind_luajit",
+        "section": "kprobe/unwind_luajit",
+        "program_type": "kprobe",
+        "instruction_count": 74
+      },
+      {
+        "name": "kprobe_unwind_native",
+        "section": "kprobe/unwind_native",
+        "program_type": "kprobe",
+        "instruction_count": 1435
+      },
+      {
+        "name": "kprobe_unwind_perl",
+        "section": "kprobe/unwind_perl",
+        "program_type": "kprobe",
+        "instruction_count": 975
+      },
+      {
+        "name": "kprobe_unwind_php",
+        "section": "kprobe/unwind_php",
+        "program_type": "kprobe",
+        "instruction_count": 555
+      },
+      {
+        "name": "kprobe_unwind_python",
+        "section": "kprobe/unwind_python",
+        "program_type": "kprobe",
+        "instruction_count": 1834
+      },
+      {
+        "name": "kprobe_unwind_ruby",
+        "section": "kprobe/unwind_ruby",
+        "program_type": "kprobe",
+        "instruction_count": 1130
+      },
+      {
+        "name": "kprobe_unwind_stop",
+        "section": "kprobe/unwind_stop",
+        "program_type": "kprobe",
+        "instruction_count": 1111
+      },
+      {
+        "name": "kprobe_unwind_v8",
+        "section": "kprobe/unwind_v8",
+        "program_type": "kprobe",
+        "instruction_count": 1030
+      },
+      {
+        "name": "native_tracer_entry",
+        "section": "perf_event/native_tracer_entry",
+        "program_type": "perf_event",
+        "instruction_count": 943
+      },
+      {
+        "name": "perf_go_labels",
+        "section": "perf_event/go_labels",
+        "program_type": "perf_event",
+        "instruction_count": 415
+      },
+      {
+        "name": "perf_unwind_beam",
+        "section": "perf_event/unwind_beam",
+        "program_type": "perf_event",
+        "instruction_count": 679
+      },
+      {
+        "name": "perf_unwind_dotnet",
+        "section": "perf_event/unwind_dotnet",
+        "program_type": "perf_event",
+        "instruction_count": 929
+      },
+      {
+        "name": "perf_unwind_dotnet10",
+        "section": "perf_event/unwind_dotnet10",
+        "program_type": "perf_event",
+        "instruction_count": 919
+      },
+      {
+        "name": "perf_unwind_hotspot",
+        "section": "perf_event/unwind_hotspot",
+        "program_type": "perf_event",
+        "instruction_count": 1124
+      },
+      {
+        "name": "perf_unwind_luajit",
+        "section": "perf_event/unwind_luajit",
+        "program_type": "perf_event",
+        "instruction_count": 74
+      },
+      {
+        "name": "perf_unwind_native",
+        "section": "perf_event/unwind_native",
+        "program_type": "perf_event",
+        "instruction_count": 1435
+      },
+      {
+        "name": "perf_unwind_perl",
+        "section": "perf_event/unwind_perl",
+        "program_type": "perf_event",
+        "instruction_count": 975
+      },
+      {
+        "name": "perf_unwind_php",
+        "section": "perf_event/unwind_php",
+        "program_type": "perf_event",
+        "instruction_count": 555
+      },
+      {
+        "name": "perf_unwind_python",
+        "section": "perf_event/unwind_python",
+        "program_type": "perf_event",
+        "instruction_count": 1834
+      },
+      {
+        "name": "perf_unwind_ruby",
+        "section": "perf_event/unwind_ruby",
+        "program_type": "perf_event",
+        "instruction_count": 1130
+      },
+      {
+        "name": "perf_unwind_stop",
+        "section": "perf_event/unwind_stop",
+        "program_type": "perf_event",
+        "instruction_count": 1111
+      },
+      {
+        "name": "perf_unwind_v8",
+        "section": "perf_event/unwind_v8",
+        "program_type": "perf_event",
+        "instruction_count": 1030
+      },
+      {
+        "name": "read_kernel_memory",
+        "section": "tracepoint/syscalls/sys_enter_bpf",
+        "program_type": "tracepoint",
+        "instruction_count": 60
+      },
+      {
+        "name": "read_task_struct",
+        "section": "raw_tracepoint/sys_enter",
+        "program_type": "raw_tracepoint",
+        "instruction_count": 65
+      },
+      {
+        "name": "tracepoint__sched_process_free",
+        "section": "tracepoint/sched/sched_process_free/v2",
+        "program_type": "tracepoint",
+        "instruction_count": 174
+      },
+      {
+        "name": "tracepoint__sched_process_free_pre616",
+        "section": "tracepoint/sched/sched_process_free/v1",
+        "program_type": "tracepoint",
+        "instruction_count": 174
+      },
+      {
+        "name": "tracepoint__sched_switch",
+        "section": "tracepoint/sched/sched_switch",
+        "program_type": "tracepoint",
+        "instruction_count": 136
+      },
+      {
+        "name": "tracepoint__sys_exit_prctl",
+        "section": "tracepoint/syscalls/sys_exit_prctl",
+        "program_type": "tracepoint",
+        "instruction_count": 364
+      },
+      {
+        "name": "tracepoint_integration__sched_switch",
+        "section": "tracepoint/integration/sched_switch",
+        "program_type": "tracepoint",
+        "instruction_count": 204
+      }
+    ],
+    "maps": [
+      {
+        "name": ".rodata",
+        "map_type": 2,
+        "map_type_name": "array",
+        "key_size": 4,
+        "value_size": 15081,
+        "max_entries": 1,
+        "flags": 128,
+        "inner": null
+      },
+      {
+        "name": ".rodata.var",
+        "map_type": 2,
+        "map_type_name": "array",
+        "key_size": 4,
+        "value_size": 112,
+        "max_entries": 1,
+        "flags": 128,
+        "inner": null
+      },
+      {
+        "name": "apm_int_procs",
+        "map_type": 1,
+        "map_type_name": "hash",
+        "key_size": 4,
+        "value_size": 8,
+        "max_entries": 128,
+        "flags": 0,
+        "inner": null
+      },
+      {
+        "name": "beam_procs",
+        "map_type": 1,
+        "map_type_name": "hash",
+        "key_size": 4,
+        "value_size": 40,
+        "max_entries": 256,
+        "flags": 0,
+        "inner": null
+      },
+      {
+        "name": "dotnet_procs",
+        "map_type": 1,
+        "map_type_name": "hash",
+        "key_size": 4,
+        "value_size": 4,
+        "max_entries": 1024,
+        "flags": 0,
+        "inner": null
+      },
+      {
+        "name": "exe_id_to_10_stack_deltas",
+        "map_type": 13,
+        "map_type_name": "hash_of_maps",
+        "key_size": 8,
+        "value_size": 4,
+        "max_entries": 4096,
+        "flags": 0,
+        "inner": {
+          "map_type": 2,
+          "map_type_name": "array",
+          "key_size": 4,
+          "value_size": 4,
+          "max_entries": 1024,
+          "flags": 0
+        }
+      },
+      {
+        "name": "exe_id_to_11_stack_deltas",
+        "map_type": 13,
+        "map_type_name": "hash_of_maps",
+        "key_size": 8,
+        "value_size": 4,
+        "max_entries": 4096,
+        "flags": 0,
+        "inner": {
+          "map_type": 2,
+          "map_type_name": "array",
+          "key_size": 4,
+          "value_size": 4,
+          "max_entries": 2048,
+          "flags": 0
+        }
+      },
+      {
+        "name": "exe_id_to_12_stack_deltas",
+        "map_type": 13,
+        "map_type_name": "hash_of_maps",
+        "key_size": 8,
+        "value_size": 4,
+        "max_entries": 4096,
+        "flags": 0,
+        "inner": {
+          "map_type": 2,
+          "map_type_name": "array",
+          "key_size": 4,
+          "value_size": 4,
+          "max_entries": 4096,
+          "flags": 0
+        }
+      },
+      {
+        "name": "exe_id_to_13_stack_deltas",
+        "map_type": 13,
+        "map_type_name": "hash_of_maps",
+        "key_size": 8,
+        "value_size": 4,
+        "max_entries": 4096,
+        "flags": 0,
+        "inner": {
+          "map_type": 2,
+          "map_type_name": "array",
+          "key_size": 4,
+          "value_size": 4,
+          "max_entries": 8192,
+          "flags": 0
+        }
+      },
+      {
+        "name": "exe_id_to_14_stack_deltas",
+        "map_type": 13,
+        "map_type_name": "hash_of_maps",
+        "key_size": 8,
+        "value_size": 4,
+        "max_entries": 4096,
+        "flags": 0,
+        "inner": {
+          "map_type": 2,
+          "map_type_name": "array",
+          "key_size": 4,
+          "value_size": 4,
+          "max_entries": 16384,
+          "flags": 0
+        }
+      },
+      {
+        "name": "exe_id_to_15_stack_deltas",
+        "map_type": 13,
+        "map_type_name": "hash_of_maps",
+        "key_size": 8,
+        "value_size": 4,
+        "max_entries": 4096,
+        "flags": 0,
+        "inner": {
+          "map_type": 2,
+          "map_type_name": "array",
+          "key_size": 4,
+          "value_size": 4,
+          "max_entries": 32768,
+          "flags": 0
+        }
+      },
+      {
+        "name": "exe_id_to_16_stack_deltas",
+        "map_type": 13,
+        "map_type_name": "hash_of_maps",
+        "key_size": 8,
+        "value_size": 4,
+        "max_entries": 4096,
+        "flags": 0,
+        "inner": {
+          "map_type": 2,
+          "map_type_name": "array",
+          "key_size": 4,
+          "value_size": 4,
+          "max_entries": 65536,
+          "flags": 0
+        }
+      },
+      {
+        "name": "exe_id_to_17_stack_deltas",
+        "map_type": 13,
+        "map_type_name": "hash_of_maps",
+        "key_size": 8,
+        "value_size": 4,
+        "max_entries": 4096,
+        "flags": 0,
+        "inner": {
+          "map_type": 2,
+          "map_type_name": "array",
+          "key_size": 4,
+          "value_size": 4,
+          "max_entries": 131072,
+          "flags": 0
+        }
+      },
+      {
+        "name": "exe_id_to_18_stack_deltas",
+        "map_type": 13,
+        "map_type_name": "hash_of_maps",
+        "key_size": 8,
+        "value_size": 4,
+        "max_entries": 4096,
+        "flags": 0,
+        "inner": {
+          "map_type": 2,
+          "map_type_name": "array",
+          "key_size": 4,
+          "value_size": 4,
+          "max_entries": 262144,
+          "flags": 0
+        }
+      },
+      {
+        "name": "exe_id_to_19_stack_deltas",
+        "map_type": 13,
+        "map_type_name": "hash_of_maps",
+        "key_size": 8,
+        "value_size": 4,
+        "max_entries": 4096,
+        "flags": 0,
+        "inner": {
+          "map_type": 2,
+          "map_type_name": "array",
+          "key_size": 4,
+          "value_size": 4,
+          "max_entries": 524288,
+          "flags": 0
+        }
+      },
+      {
+        "name": "exe_id_to_20_stack_deltas",
+        "map_type": 13,
+        "map_type_name": "hash_of_maps",
+        "key_size": 8,
+        "value_size": 4,
+        "max_entries": 4096,
+        "flags": 0,
+        "inner": {
+          "map_type": 2,
+          "map_type_name": "array",
+          "key_size": 4,
+          "value_size": 4,
+          "max_entries": 1048576,
+          "flags": 0
+        }
+      },
+      {
+        "name": "exe_id_to_21_stack_deltas",
+        "map_type": 13,
+        "map_type_name": "hash_of_maps",
+        "key_size": 8,
+        "value_size": 4,
+        "max_entries": 4096,
+        "flags": 0,
+        "inner": {
+          "map_type": 2,
+          "map_type_name": "array",
+          "key_size": 4,
+          "value_size": 4,
+          "max_entries": 2097152,
+          "flags": 0
+        }
+      },
+      {
+        "name": "exe_id_to_22_stack_deltas",
+        "map_type": 13,
+        "map_type_name": "hash_of_maps",
+        "key_size": 8,
+        "value_size": 4,
+        "max_entries": 4096,
+        "flags": 0,
+        "inner": {
+          "map_type": 2,
+          "map_type_name": "array",
+          "key_size": 4,
+          "value_size": 4,
+          "max_entries": 4194304,
+          "flags": 0
+        }
+      },
+      {
+        "name": "exe_id_to_23_stack_deltas",
+        "map_type": 13,
+        "map_type_name": "hash_of_maps",
+        "key_size": 8,
+        "value_size": 4,
+        "max_entries": 4096,
+        "flags": 0,
+        "inner": {
+          "map_type": 2,
+          "map_type_name": "array",
+          "key_size": 4,
+          "value_size": 4,
+          "max_entries": 8388608,
+          "flags": 0
+        }
+      },
+      {
+        "name": "exe_id_to_8_stack_deltas",
+        "map_type": 13,
+        "map_type_name": "hash_of_maps",
+        "key_size": 8,
+        "value_size": 4,
+        "max_entries": 4096,
+        "flags": 0,
+        "inner": {
+          "map_type": 2,
+          "map_type_name": "array",
+          "key_size": 4,
+          "value_size": 4,
+          "max_entries": 256,
+          "flags": 0
+        }
+      },
+      {
+        "name": "exe_id_to_9_stack_deltas",
+        "map_type": 13,
+        "map_type_name": "hash_of_maps",
+        "key_size": 8,
+        "value_size": 4,
+        "max_entries": 4096,
+        "flags": 0,
+        "inner": {
+          "map_type": 2,
+          "map_type_name": "array",
+          "key_size": 4,
+          "value_size": 4,
+          "max_entries": 512,
+          "flags": 0
+        }
+      },
+      {
+        "name": "ext_probe_value",
+        "map_type": 6,
+        "map_type_name": "per_cpu_array",
+        "key_size": 4,
+        "value_size": 8,
+        "max_entries": 1,
+        "flags": 0,
+        "inner": null
+      },
+      {
+        "name": "go_procs",
+        "map_type": 1,
+        "map_type_name": "hash",
+        "key_size": 4,
+        "value_size": 36,
+        "max_entries": 1024,
+        "flags": 0,
+        "inner": null
+      },
+      {
+        "name": "hotspot_procs",
+        "map_type": 1,
+        "map_type_name": "hash",
+        "key_size": 4,
+        "value_size": 40,
+        "max_entries": 256,
+        "flags": 0,
+        "inner": null
+      },
+      {
+        "name": "inhibit_events",
+        "map_type": 1,
+        "map_type_name": "hash",
+        "key_size": 4,
+        "value_size": 1,
+        "max_entries": 2,
+        "flags": 0,
+        "inner": null
+      },
+      {
+        "name": "interpreter_offsets",
+        "map_type": 1,
+        "map_type_name": "hash",
+        "key_size": 8,
+        "value_size": 40,
+        "max_entries": 32,
+        "flags": 0,
+        "inner": null
+      },
+      {
+        "name": "kprobe_progs",
+        "map_type": 3,
+        "map_type_name": "program_array",
+        "key_size": 4,
+        "value_size": 4,
+        "max_entries": 13,
+        "flags": 0,
+        "inner": null
+      },
+      {
+        "name": "luajit_procs",
+        "map_type": 1,
+        "map_type_name": "hash",
+        "key_size": 4,
+        "value_size": 1,
+        "max_entries": 1024,
+        "flags": 0,
+        "inner": null
+      },
+      {
+        "name": "metrics",
+        "map_type": 6,
+        "map_type_name": "per_cpu_array",
+        "key_size": 4,
+        "value_size": 8,
+        "max_entries": 118,
+        "flags": 0,
+        "inner": null
+      },
+      {
+        "name": "per_cpu_records",
+        "map_type": 6,
+        "map_type_name": "per_cpu_array",
+        "key_size": 4,
+        "value_size": 26640,
+        "max_entries": 1,
+        "flags": 0,
+        "inner": null
+      },
+      {
+        "name": "per_cpu_records_kp",
+        "map_type": 6,
+        "map_type_name": "per_cpu_array",
+        "key_size": 4,
+        "value_size": 26640,
+        "max_entries": 1,
+        "flags": 0,
+        "inner": null
+      },
+      {
+        "name": "perf_progs",
+        "map_type": 3,
+        "map_type_name": "program_array",
+        "key_size": 4,
+        "value_size": 4,
+        "max_entries": 13,
+        "flags": 0,
+        "inner": null
+      },
+      {
+        "name": "perl_procs",
+        "map_type": 1,
+        "map_type_name": "hash",
+        "key_size": 4,
+        "value_size": 40,
+        "max_entries": 1024,
+        "flags": 0,
+        "inner": null
+      },
+      {
+        "name": "php_procs",
+        "map_type": 1,
+        "map_type_name": "hash",
+        "key_size": 4,
+        "value_size": 24,
+        "max_entries": 1024,
+        "flags": 0,
+        "inner": null
+      },
+      {
+        "name": "pid_events",
+        "map_type": 1,
+        "map_type_name": "hash",
+        "key_size": 8,
+        "value_size": 1,
+        "max_entries": 65536,
+        "flags": 0,
+        "inner": null
+      },
+      {
+        "name": "pid_page_to_mapping_info",
+        "map_type": 11,
+        "map_type_name": "lpm_trie",
+        "key_size": 16,
+        "value_size": 16,
+        "max_entries": 524288,
+        "flags": 1,
+        "inner": null
+      },
+      {
+        "name": "py_procs",
+        "map_type": 1,
+        "map_type_name": "hash",
+        "key_size": 4,
+        "value_size": 40,
+        "max_entries": 1024,
+        "flags": 0,
+        "inner": null
+      },
+      {
+        "name": "report_events",
+        "map_type": 4,
+        "map_type_name": "perf_event_array",
+        "key_size": 4,
+        "value_size": 4,
+        "max_entries": 0,
+        "flags": 0,
+        "inner": null
+      },
+      {
+        "name": "reported_pids",
+        "map_type": 9,
+        "map_type_name": "lru_hash",
+        "key_size": 4,
+        "value_size": 8,
+        "max_entries": 65536,
+        "flags": 0,
+        "inner": null
+      },
+      {
+        "name": "ruby_procs",
+        "map_type": 1,
+        "map_type_name": "hash",
+        "key_size": 4,
+        "value_size": 96,
+        "max_entries": 1024,
+        "flags": 0,
+        "inner": null
+      },
+      {
+        "name": "sched_times",
+        "map_type": 10,
+        "map_type_name": "lru_per_cpu_hash",
+        "key_size": 8,
+        "value_size": 8,
+        "max_entries": 256,
+        "flags": 0,
+        "inner": null
+      },
+      {
+        "name": "stack_delta_page_to_info",
+        "map_type": 1,
+        "map_type_name": "hash",
+        "key_size": 16,
+        "value_size": 8,
+        "max_entries": 40000,
+        "flags": 0,
+        "inner": null
+      },
+      {
+        "name": "system_analysis",
+        "map_type": 2,
+        "map_type_name": "array",
+        "key_size": 4,
+        "value_size": 144,
+        "max_entries": 1,
+        "flags": 0,
+        "inner": null
+      },
+      {
+        "name": "trace_events",
+        "map_type": 27,
+        "map_type_name": "ring_buffer",
+        "key_size": 0,
+        "value_size": 0,
+        "max_entries": 0,
+        "flags": 0,
+        "inner": null
+      },
+      {
+        "name": "traces_ctx_v1",
+        "map_type": 9,
+        "map_type_name": "lru_hash",
+        "key_size": 8,
+        "value_size": 24,
+        "max_entries": 16384,
+        "flags": 0,
+        "inner": null
+      },
+      {
+        "name": "unwind_info_array",
+        "map_type": 2,
+        "map_type_name": "array",
+        "key_size": 4,
+        "value_size": 12,
+        "max_entries": 16384,
+        "flags": 0,
+        "inner": null
+      },
+      {
+        "name": "v8_procs",
+        "map_type": 1,
+        "map_type_name": "hash",
+        "key_size": 4,
+        "value_size": 28,
+        "max_entries": 1024,
+        "flags": 0,
+        "inner": null
+      }
+    ],
+    "globals": [
+      {
+        "name": "filter_error_frames",
+        "offset": 2,
+        "size": 1,
+        "default_hex": "00"
+      },
+      {
+        "name": "filter_idle_frames",
+        "offset": 4,
+        "size": 1,
+        "default_hex": "00"
+      },
+      {
+        "name": "filter_min_process_age_ns",
+        "offset": 32,
+        "size": 8,
+        "default_hex": "0000000000000000"
+      },
+      {
+        "name": "go_labels_disabled",
+        "offset": 3,
+        "size": 1,
+        "default_hex": "01"
+      },
+      {
+        "name": "inverse_pac_mask",
+        "offset": 104,
+        "size": 8,
+        "default_hex": "0000000000000000"
+      },
+      {
+        "name": "off_cpu_threshold",
+        "offset": 20,
+        "size": 4,
+        "default_hex": "00000000"
+      },
+      {
+        "name": "origin_id_off_cpu",
+        "offset": 24,
+        "size": 2,
+        "default_hex": "0000"
+      },
+      {
+        "name": "origin_id_probe",
+        "offset": 0,
+        "size": 2,
+        "default_hex": "0000"
+      },
+      {
+        "name": "origin_id_sampling",
+        "offset": 16,
+        "size": 2,
+        "default_hex": "0000"
+      },
+      {
+        "name": "pid_ns_translation_enabled",
+        "offset": 72,
+        "size": 1,
+        "default_hex": "00"
+      },
+      {
+        "name": "python_frames_per_program",
+        "offset": 56,
+        "size": 4,
+        "default_hex": "0a000000"
+      },
+      {
+        "name": "ruby_skip_native_resume",
+        "offset": 60,
+        "size": 1,
+        "default_hex": "00"
+      },
+      {
+        "name": "stack_ptregs_offset",
+        "offset": 52,
+        "size": 4,
+        "default_hex": "00000000"
+      },
+      {
+        "name": "target_pid_ns_dev",
+        "offset": 80,
+        "size": 8,
+        "default_hex": "0000000000000000"
+      },
+      {
+        "name": "target_pid_ns_inode",
+        "offset": 88,
+        "size": 8,
+        "default_hex": "0000000000000000"
+      },
+      {
+        "name": "task_group_leader_offset",
+        "offset": 40,
+        "size": 4,
+        "default_hex": "00000000"
+      },
+      {
+        "name": "task_stack_offset",
+        "offset": 48,
+        "size": 4,
+        "default_hex": "00000000"
+      },
+      {
+        "name": "task_start_time_offset",
+        "offset": 44,
+        "size": 4,
+        "default_hex": "00000000"
+      },
+      {
+        "name": "tpbase_offset",
+        "offset": 64,
+        "size": 8,
+        "default_hex": "0000000000000000"
+      },
+      {
+        "name": "vma_lookup_enabled",
+        "offset": 5,
+        "size": 1,
+        "default_hex": "00"
+      },
+      {
+        "name": "vma_vm_file_offset",
+        "offset": 8,
+        "size": 4,
+        "default_hex": "00000000"
+      },
+      {
+        "name": "vma_vm_flags_offset",
+        "offset": 12,
+        "size": 4,
+        "default_hex": "00000000"
+      },
+      {
+        "name": "with_debug_output",
+        "offset": 96,
+        "size": 4,
+        "default_hex": "00000000"
+      }
+    ]
+  },
+  "tail_calls": [
+    {
+      "index": 0,
+      "name": "unwind_stop",
+      "perf_program": "perf_unwind_stop",
+      "probe_program": "kprobe_unwind_stop",
+      "native_only": true
+    },
+    {
+      "index": 1,
+      "name": "unwind_native",
+      "perf_program": "perf_unwind_native",
+      "probe_program": "kprobe_unwind_native",
+      "native_only": true
+    },
+    {
+      "index": 2,
+      "name": "unwind_hotspot",
+      "perf_program": "perf_unwind_hotspot",
+      "probe_program": "kprobe_unwind_hotspot",
+      "native_only": false
+    },
+    {
+      "index": 3,
+      "name": "unwind_perl",
+      "perf_program": "perf_unwind_perl",
+      "probe_program": "kprobe_unwind_perl",
+      "native_only": false
+    },
+    {
+      "index": 4,
+      "name": "unwind_python",
+      "perf_program": "perf_unwind_python",
+      "probe_program": "kprobe_unwind_python",
+      "native_only": false
+    },
+    {
+      "index": 5,
+      "name": "unwind_php",
+      "perf_program": "perf_unwind_php",
+      "probe_program": "kprobe_unwind_php",
+      "native_only": false
+    },
+    {
+      "index": 6,
+      "name": "unwind_ruby",
+      "perf_program": "perf_unwind_ruby",
+      "probe_program": "kprobe_unwind_ruby",
+      "native_only": false
+    },
+    {
+      "index": 7,
+      "name": "unwind_v8",
+      "perf_program": "perf_unwind_v8",
+      "probe_program": "kprobe_unwind_v8",
+      "native_only": false
+    },
+    {
+      "index": 8,
+      "name": "unwind_dotnet",
+      "perf_program": "perf_unwind_dotnet",
+      "probe_program": "kprobe_unwind_dotnet",
+      "native_only": false
+    },
+    {
+      "index": 9,
+      "name": "unwind_dotnet10",
+      "perf_program": "perf_unwind_dotnet10",
+      "probe_program": "kprobe_unwind_dotnet10",
+      "native_only": false
+    },
+    {
+      "index": 10,
+      "name": "go_labels",
+      "perf_program": "perf_go_labels",
+      "probe_program": "kprobe_go_labels",
+      "native_only": false
+    },
+    {
+      "index": 11,
+      "name": "unwind_beam",
+      "perf_program": "perf_unwind_beam",
+      "probe_program": "kprobe_unwind_beam",
+      "native_only": false
+    },
+    {
+      "index": 12,
+      "name": "unwind_luajit",
+      "perf_program": "perf_unwind_luajit",
+      "probe_program": "kprobe_unwind_luajit",
+      "native_only": false
+    }
+  ]
+}

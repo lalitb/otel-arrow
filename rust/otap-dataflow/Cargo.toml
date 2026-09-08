@@ -120,6 +120,8 @@ futures-channel = "0.3.32"
 futures-timer = "3.0.3"
 futures-util = "0.3.32"
 async-channel = { version = "2.5.0" }
+aya = "0.14.0"
+aya-obj = "0.3.0"
 hashbrown = { version = "0.17", features = ["equivalent"] }
 http = "1.4"
 humantime = "2.3.0"
@@ -149,6 +151,7 @@ num_enum = "0.7"
 oauth2 = { version = "5", default-features = false }
 object_store = {version = "0.13.2", default-features = false}
 once_cell = "1.20.2"
+object = { version = "0.39.1", default-features = false, features = ["elf", "read_core", "std"] }
 openssl = "0.10"
 
 # TODO: Note this dependency is duplicate with crates/pdata/src/proto
