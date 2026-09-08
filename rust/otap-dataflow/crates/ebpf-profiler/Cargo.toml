@@ -1,0 +1,47 @@
+[package]
+name = "otel-arrow-dfe-ebpf-profiler"
+description = "Bounded runtime-neutral native eBPF profiling library"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+keywords = ["ebpf", "profiling", "linux", "performance"]
+categories = ["development-tools::profiling"]
+
+[dependencies]
+bitflags.workspace = true
+core_affinity.workspace = true
+hex.workspace = true
+object.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya.workspace = true
+nix = { workspace = true, features = ["feature", "time"] }
+
+[dev-dependencies]
+criterion.workspace = true
+tempfile.workspace = true
+object = { workspace = true, features = ["write"] }
+clap.workspace = true
+humantime.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "event_decode"
+harness = false
+
+[[bench]]
+name = "aggregation"
+harness = false
+
+[[bench]]
+name = "snapshot"
+harness = false

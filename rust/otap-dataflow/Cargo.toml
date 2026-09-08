@@ -144,6 +144,7 @@ memmap2 = "0.9"
 memory-stats = "1"
 libc = "0.2"
 nix = { version = "0.31.0", features = ["process", "signal", "fs", "mman"] }
+object = "0.39.1"
 notify = "8.0"  # Uses platform-native backend: inotify (Linux), kqueue (macOS), ReadDirectoryChanges (Windows)
 num_enum = "0.7"
 oauth2 = { version = "5", default-features = false }
@@ -215,6 +216,7 @@ tempfile = "3"
 thiserror = "2.0.17"
 tracing = { version = ">=0.1.40", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false }
+aya = "0.14.0"
 tokio = { version = "1.48.0", features = ["rt", "time", "net", "io-util", "sync", "macros", "rt-multi-thread", "fs", "io-std", "process", "signal"] }
 tokio-tungstenite = { version = "0.29.0" }
 tokio-stream = "0.1.17"
