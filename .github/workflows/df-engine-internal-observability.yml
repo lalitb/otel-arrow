@@ -77,6 +77,23 @@ jobs:
       - name: Build df_engine
         run: cargo build --locked --release --bin df_engine
         working-directory: ./rust/otap-dataflow
+      - name: Test core scaling harness
+        run: python3 -m unittest discover -s benchmarks/core_scaling -p 'test_*.py'
+        working-directory: ./rust/otap-dataflow
+      - name: Verify pipeline worker affinity
+        run: |
+          python3 benchmarks/core_scaling/run.py \
+            --binary target/release/df_engine \
+            --output "${{ runner.temp }}/dfe-affinity" \
+            --cores 1 --warmup 0 --seconds 2 --repetitions 1
+        working-directory: ./rust/otap-dataflow
+      - name: Upload affinity evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dfe-affinity
+          path: ${{ runner.temp }}/dfe-affinity
+          if-no-files-found: ignore
       # Weaver listener lifecycle (start, readiness probe, /stop, report
       # capture, artifact upload) is owned by the upstream composite
       # actions below. The CLI and actions are pinned to v0.25.1, which
