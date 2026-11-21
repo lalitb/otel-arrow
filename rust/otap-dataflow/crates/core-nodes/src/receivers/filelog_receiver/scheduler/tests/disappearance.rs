@@ -395,3 +395,111 @@ fn closed_handle_reopen_failure_keeps_unfinished_input() {
     frames(&mut readers, &mut sink, 1, later + Duration::from_secs(1));
     assert_eq!(body(&sink.frames[0]), b"partial");
 }
+
+/// Scenario: A native tmpfs file loses its last name and a writer appends after the reader's quiet interval.
+/// Guarantees: Without discovery the validated handle captures late bytes, and confirmation requires a fresh quiet interval and same-handle size check.
+#[test]
+#[ignore = "requires writable Linux tmpfs at /dev/shm; run in filesystem qualification"]
+fn resident_unlink_captures_late_write_on_tmpfs() {
+    resident_unlink_fixture(tempfile::tempdir_in("/dev/shm").unwrap(), true);
+}
+
+/// Scenario: A file loses its last name on a backend outside the resident-unlink qualification.
+/// Guarantees: Fresh zero links and repeated EOF checks alone cannot replace discovery on this backend.
+#[test]
+#[ignore = "requires a non-tmpfs temporary directory; run in filesystem qualification"]
+fn resident_unlink_unqualified_backend_requires_discovery() {
+    resident_unlink_fixture(tempfile::tempdir().unwrap(), false);
+}
+
+fn resident_unlink_fixture(dir: tempfile::TempDir, qualified: bool) {
+    use crate::receivers::filelog_receiver::source::{SourceFile, SymlinkPolicy};
+    use io::ResidentUnlinkBackend;
+    use std::{fs, fs::File, io::Write, os::unix::fs::MetadataExt};
+
+    let path = dir.path().join("app.log");
+    let mount = File::open("/dev/shm").unwrap();
+    let backend = ResidentUnlinkBackend::tmpfs(&mount).unwrap().unwrap();
+    let parent = File::open(dir.path()).unwrap();
+    let mut writer = File::create(&path).unwrap();
+    let locator = FileLocator::from_metadata(&writer.metadata().unwrap());
+    let alias = dir.path().join("alias");
+    fs::hard_link(&path, &alias).unwrap();
+    let io = io::LinuxIo(move |_: ReaderKey, cancel: &mut dyn FnMut() -> bool| {
+        SourceFile::open_at(
+            &parent,
+            c"app.log",
+            SymlinkPolicy::Reject,
+            Some(locator),
+            cancel,
+        )
+        .map_err(Into::into)
+    });
+    let config = FramingConfig::Line(line());
+    let limits = Limits {
+        readers: 1,
+        descriptors: 1,
+        read_bytes: 64,
+        steps: 64,
+        partial_bytes: config.slot_bytes(64).unwrap(),
+        eof_interval: Duration::from_millis(250),
+    };
+    let now = Instant::now();
+    let mut readers = Scheduler::new(io, limits, config, Arc::default(), now).unwrap();
+    let registry =
+        Arc::new(crate::receivers::filelog_receiver::identity::lease::LeaseRegistry::default());
+    let owner = registry.owner("unlink-test", 1).unwrap();
+    let key = readers
+        .admit(test_seed(0, owner.acquire(locator).unwrap()))
+        .unwrap();
+    let clock = Rc::new(Cell::new(now));
+    let eof_clock = Rc::clone(&clock);
+    readers.eof_clock = Box::new(move || eof_clock.get());
+    let mut sink = Sink::default();
+    let rotation = Rotation::default();
+    let mut eof = |s: &mut Scheduler<_>, at| {
+        clock.set(at);
+        for _ in 0..16 {
+            let turn = s.turn(at, permission(), &mut sink, Waker::noop(), || false);
+            match turn.reason {
+                Reason::Eof => return,
+                Reason::Progress => {}
+                other => panic!("unexpected turn: {other:?}"),
+            }
+        }
+        panic!("did not reach EOF");
+    };
+    let probe = |s: &mut Scheduler<_>| {
+        s.probe_resident_unlink(key, &backend, &rotation, &mut || false)
+            .unwrap()
+    };
+    eof(&mut readers, now);
+    fs::remove_file(path).unwrap();
+    assert_eq!(probe(&mut readers), ResidentUnlink::Unavailable);
+    fs::remove_file(alias).unwrap();
+    assert_eq!(writer.metadata().unwrap().nlink(), 0);
+    if qualified {
+        assert_eq!(probe(&mut readers), ResidentUnlink::Following);
+    }
+    readers.pin(key).unwrap();
+    let deadline = now + rotation.rotate_wait;
+    eof(&mut readers, deadline);
+    if !qualified {
+        assert_eq!(probe(&mut readers), ResidentUnlink::Unavailable);
+        return;
+    }
+    // The write races the cutoff after the scheduled EOF probe.
+    writer.write_all(b"late\n").unwrap();
+    assert_eq!(probe(&mut readers), ResidentUnlink::Following);
+    let read_at = deadline + readers.limits.eof_interval;
+    eof(&mut readers, read_at);
+    eof(
+        &mut readers,
+        read_at + rotation.rotate_wait - Duration::from_millis(250),
+    );
+    assert_eq!(probe(&mut readers), ResidentUnlink::Following);
+    eof(&mut readers, read_at + rotation.rotate_wait);
+    assert_eq!(probe(&mut readers), ResidentUnlink::ConfirmationEligible);
+    assert_eq!(sink.frames.len(), 1);
+    assert_eq!(body(&sink.frames[0]), b"late");
+}

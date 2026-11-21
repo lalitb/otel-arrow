@@ -9,9 +9,13 @@ use super::super::{
         reconcile::{Evidence, TrackedId},
     },
     identity::IdentityOwner,
-    source::FileLocator,
+    source::{FileLocator, SourceFile},
 };
-use super::{LeaseGuard, LifecycleRefusal, ReaderIo, ReaderKey, Scheduler, batch::Batcher, cp};
+use super::io::{LinuxIo, ResidentUnlinkBackend};
+use super::{
+    LeaseGuard, LifecycleRefusal, ReaderIo, ReaderKey, ResidentUnlink, Scheduler, batch::Batcher,
+    cp,
+};
 use std::time::{Duration, Instant};
 
 struct EofInterval {
@@ -29,6 +33,7 @@ pub(crate) struct Disappearance {
     missing_this_pass: bool,
     confirmed_missing: bool,
     excluded: bool,
+    following_unlink: bool,
     pub(super) evicted: bool,
     pub(super) absent_since: Option<Duration>,
     eof: Option<EofInterval>,
@@ -103,6 +108,9 @@ impl Disappearance {
                 if self.validated_locator.is_some() && observation.locator == self.validated_locator
                 {
                     self.reset_missing();
+                    if std::mem::take(&mut self.following_unlink) {
+                        self.observe_growth();
+                    }
                     if let (Some(size), Some(eof)) = (observation.size, &self.eof)
                         && size > eof.offset
                     {
@@ -139,13 +147,63 @@ impl Disappearance {
     /// Sample at a point serialized with discovery delivery and read activity.
     /// Framing, delivery and durable progress remain separate preconditions.
     pub(crate) fn discovery_and_eof_inactivity_met(&self, rotation: &Rotation) -> bool {
-        self.confirmed_missing
-            && self.eof.as_ref().is_some_and(|interval| {
-                interval
-                    .latest_turn_started
-                    .checked_duration_since(interval.first_observed)
-                    .is_some_and(|idle| idle >= rotation.rotate_wait)
-            })
+        self.confirmed_missing && self.eof_inactivity_met(rotation)
+    }
+
+    fn eof_inactivity_met(&self, rotation: &Rotation) -> bool {
+        self.eof.as_ref().is_some_and(|interval| {
+            interval
+                .latest_turn_started
+                .checked_duration_since(interval.first_observed)
+                .is_some_and(|idle| idle >= rotation.rotate_wait)
+        })
+    }
+}
+
+impl<O> Scheduler<LinuxIo<O>>
+where
+    O: FnMut(ReaderKey, &mut dyn FnMut() -> bool) -> Result<SourceFile, super::AccessFailure>,
+{
+    /// Sample after EOF on the blocking worker, before another scheduling turn.
+    /// At the cutoff the owner must process ordered observations and sample again.
+    pub(crate) fn probe_resident_unlink(
+        &mut self,
+        key: ReaderKey,
+        backend: &ResidentUnlinkBackend<'_>,
+        rotation: &Rotation,
+        cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<ResidentUnlink, super::AccessFailure> {
+        let Some(reader) = self
+            .readers
+            .get_mut(key.0 as usize)
+            .and_then(Option::as_mut)
+        else {
+            return Ok(ResidentUnlink::Unavailable);
+        };
+        let state = &mut reader.disappearance;
+        let Some(handle) = reader.handle.as_ref().filter(|handle| {
+            self.terminal.is_none()
+                && reader.key == key
+                && reader.read_state == super::ReadState::Running
+                && reader.validation.is_none()
+                && !state.excluded
+                && state.validated_locator == Some(handle.locator())
+        }) else {
+            return Ok(ResidentUnlink::Unavailable);
+        };
+        let Some(size) = backend.unlinked_size(handle, cancel)? else {
+            state.following_unlink = false;
+            return Ok(ResidentUnlink::Unavailable);
+        };
+        state.following_unlink = true;
+        if size != reader.window.end {
+            state.observe_growth();
+        }
+        Ok(if reader.pinned && state.eof_inactivity_met(rotation) {
+            ResidentUnlink::ConfirmationEligible
+        } else {
+            ResidentUnlink::Following
+        })
     }
 }
 

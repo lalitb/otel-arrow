@@ -46,6 +46,15 @@ impl Permission {
     }
 }
 
+/// Result of a worker-local sample. Only the last two outcomes require a pin.
+#[must_use]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ResidentUnlink {
+    Unavailable,
+    Following,
+    ConfirmationEligible,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Transition {
     Replaced,

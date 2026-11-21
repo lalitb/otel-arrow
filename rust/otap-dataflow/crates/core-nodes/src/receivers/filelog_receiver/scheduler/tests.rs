@@ -210,23 +210,26 @@ fn scheduler(
     let registry = Arc::new(super::super::identity::lease::LeaseRegistry::default());
     let owner = registry.owner("scheduler-test", files.len()).unwrap();
     for (id, _) in files.iter().enumerate() {
-        let seed = ReaderSeed {
-            decision: super::super::identity::decision::Decision::Register {
-                anchor: super::super::identity::decision::Anchor::Beginning,
-                superseded: None,
-                reset: false,
-            },
-            file_id: cp::FileId::from_bytes((id as u128 + 1).to_le_bytes()),
-            epoch: 7,
-            offset: 0,
-            resume: cp::FramingResume::Clean,
-            frontier: cp::CommittedFrontierWindow::empty(),
-            fingerprint: Vec::new(),
-            lease: owner.acquire(s.io.files[id].locator).unwrap(),
-        };
+        let seed = test_seed(id, owner.acquire(s.io.files[id].locator).unwrap());
         assert_eq!(s.admit(seed).unwrap(), ReaderKey(id as u64, 0));
     }
     s
+}
+fn test_seed(id: usize, lease: LeaseGuard) -> ReaderSeed {
+    ReaderSeed {
+        decision: super::super::identity::decision::Decision::Register {
+            anchor: super::super::identity::decision::Anchor::Beginning,
+            superseded: None,
+            reset: false,
+        },
+        file_id: cp::FileId::from_bytes((id as u128 + 1).to_le_bytes()),
+        epoch: 7,
+        offset: 0,
+        resume: cp::FramingResume::Clean,
+        frontier: cp::CommittedFrontierWindow::empty(),
+        fingerprint: Vec::new(),
+        lease,
+    }
 }
 fn tick(s: &mut Scheduler<FakeIo>, sink: &mut Sink, now: Instant) -> Turn {
     let t = s.turn(now, permission(), sink, Waker::noop(), || false);

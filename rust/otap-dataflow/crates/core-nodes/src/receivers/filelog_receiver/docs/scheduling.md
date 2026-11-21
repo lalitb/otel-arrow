@@ -49,12 +49,38 @@ the interval, including when discovery validates the held locator at a size
 greater than the last EOF offset. The next EOF starts a fresh interval.
 Evicting the handle drops both kinds of evidence.
 
-A true `discovery_and_eof_inactivity_met` result is a prerequisite for permanent
-EOF. Before confirming it, the lifecycle owner must apply all delivered discovery
+Discovery-based confirmation requires `discovery_and_eof_inactivity_met`.
+Before confirming it, the lifecycle owner must apply all delivered discovery
 observations and failures, including those from an unfinished pass, then recheck
 the held handle and decide the cutoff in the same serialized reader turn. If the
 recheck finds unread bytes, continue reading and defer the cutoff. The caller
 still owns terminal framing, delivery, Ack and checkpoint checks.
+
+### Unlink on a qualified Linux filesystem
+
+The read worker can follow a file after its last hard link disappears, even if
+discovery stalls. At setup, supply a directory handle on the qualified tmpfs
+mount to `ResidentUnlinkBackend::tmpfs`. Keep the directory open for the
+worker's lifetime. Only a validated reader opened with a positive link count
+on that same filesystem can use this shortcut. Other files use discovery.
+
+After an EOF turn, call `probe_resident_unlink` before scheduling another reader.
+On `Following`, pin the reader and keep servicing it. Before confirming, process
+already-delivered discovery events and probe again. The probe reads the current
+link count and size together from the reader's handle. Unread bytes restart
+the wait. Only a pinned reader still at EOF with zero links after a full quiet
+interval can return `ConfirmationEligible`. A failed probe supplies no
+confirmation. Terminal framing, delivery and checkpoint checks still apply.
+
+Qualification used native Linux tmpfs at `/dev/shm` on arm64, kernel 6.8.
+The test holds separate reader and writer handles, removes two hard links,
+and appends through the writer without running discovery. An ext4 file outside
+the qualified mount exercises the fallback. To reproduce, set `TMPDIR` to a
+writable non-tmpfs directory and run:
+
+```sh
+cargo test -p otel-arrow-dfe-core-nodes --lib resident_unlink_ -- --ignored
+```
 
 ## Disappearance after a handle closes
 

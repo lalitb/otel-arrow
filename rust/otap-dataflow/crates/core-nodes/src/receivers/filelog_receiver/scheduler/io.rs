@@ -3,6 +3,8 @@
 
 use super::super::source::{FileAccessError, FileLocator, SourceFile};
 use super::*;
+use nix::sys::statfs::{TMPFS_MAGIC, fstatfs};
+use std::{fs::File, io, os::unix::fs::MetadataExt};
 
 /// Source operations never decide identity, admission, epochs or loss policy.
 /// Each method performs one bounded operation and checks cancellation. `open`
@@ -27,6 +29,44 @@ pub(crate) trait ReaderIo {
         bytes: &mut [u8],
         cancel: &mut dyn FnMut() -> bool,
     ) -> Result<usize, AccessFailure>;
+}
+
+/// A directory on the locally qualified native tmpfs instance. Keep the mount
+/// alive so its device number cannot be recycled for an unrelated filesystem.
+pub(crate) struct ResidentUnlinkBackend<'a> {
+    _directory: &'a File,
+    device: u64,
+}
+
+impl<'a> ResidentUnlinkBackend<'a> {
+    /// Composition supplies a directory on the tested mount at worker setup.
+    pub(crate) fn tmpfs(directory: &'a File) -> io::Result<Option<Self>> {
+        let metadata = directory.metadata()?;
+        let filesystem = fstatfs(directory)
+            .map_err(io::Error::from)?
+            .filesystem_type();
+        if !metadata.is_dir() || filesystem != TMPFS_MAGIC {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            _directory: directory,
+            device: metadata.dev(),
+        }))
+    }
+
+    /// A single fresh stat supplies both size and link count on the same handle.
+    pub(super) fn unlinked_size(
+        &self,
+        handle: &SourceFile,
+        cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<u64>, FileAccessError> {
+        let opened = handle.opened_metadata();
+        if opened.dev() != self.device || opened.nlink() == 0 {
+            return Ok(None);
+        }
+        let metadata = handle.metadata(cancelled)?;
+        Ok((metadata.nlink() == 0).then_some(metadata.len()))
+    }
 }
 
 /// Production I/O adapter. The opener is supplied by composition after it can
@@ -69,7 +109,7 @@ where
 #[derive(Debug)]
 pub(crate) enum AccessFailure {
     Cancelled,
-    Environmental(std::io::Error),
+    Environmental(io::Error),
     Transition(Transition),
     Terminal(FileAccessError),
 }
